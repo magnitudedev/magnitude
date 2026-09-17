@@ -6,6 +6,9 @@ on:
       artifact_run_id:
         required: true
         type: string
+      model:
+        type: string
+        default: 'lfm2.5-2.6b:gguf:q4'
 
 permissions:
   contents: read
@@ -27,7 +30,9 @@ jobs:
           run-id: ${{ inputs.artifact_run_id }}
           github-token: ${{ github.token }}
       - name: Run actual CPU inference from the final archive
-        run: python packages/release/scripts/test-unix-cpu.py --artifact-directory candidate --output-directory evidence
+        env:
+          CATALOG_MODEL: ${{ inputs.model }}
+        run: python packages/release/scripts/test-unix-cpu.py --artifact-directory candidate --output-directory evidence --model "$CATALOG_MODEL"
       - name: Retain inference evidence
         if: always()
         uses: actions/upload-artifact@v4

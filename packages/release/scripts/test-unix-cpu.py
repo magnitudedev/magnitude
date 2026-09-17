@@ -1,5 +1,6 @@
 """Consume a final CPU archive on its native Unix host and run real inference."""
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -8,15 +9,18 @@ import pathlib
 import platform
 import signal
 import subprocess
+import struct
 import tarfile
 import time
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--artifact-directory', type=pathlib.Path, required=True)
 parser.add_argument('--output-directory', type=pathlib.Path, required=True)
+parser.add_argument('--model', choices=['lfm2.5-2.6b:gguf:q4', 'qwen3.5-4b:gguf:q4'], default='lfm2.5-2.6b:gguf:q4')
 args = parser.parse_args()
 assert platform.system() == 'Darwin', 'This consumer currently validates macOS CPU artifacts'
 host = {'arm64': 'darwin-arm64', 'x86_64': 'darwin-x64'}[platform.machine()]
@@ -49,7 +53,7 @@ architecture = subprocess.check_output(['/usr/bin/lipo', '-archs', str(binary)],
 assert architecture == platform.machine(), architecture
 record('native-architecture', {'host': host, 'architecture': architecture})
 
-model = 'lfm2.5-2.6b:gguf:q4'
+model = args.model
 catalog_path = '/api/v1/catalog/models/' + urllib.parse.quote(model, safe='')
 
 token = uuid.uuid4().hex
@@ -121,7 +125,7 @@ with (root / 'server.log').open('w') as log:
         record('catalog-installed', installed)
         # Independently check the content-addressed bytes fetched by the product downloader.
         blobs = sorted(blob for blob in (root / 'models' / 'hub').glob('models--*/blobs/lfs-sha256-*') if blob.suffix != '.integrity')
-        assert len(blobs) == 2, 'Catalog target and DSpark draft must both be installed'
+        assert len(blobs) == 2, 'Catalog target and its required draft or projector must both be installed'
         integrity = []
         for blob in blobs:
             assert not blob.name.endswith('.incomplete'), blob
@@ -146,6 +150,22 @@ with (root / 'server.log').open('w') as log:
         assert len(ready) == 1
         assert sum(domain['modelBytes'] for domain in ready[0]['lifecycle']['allocation']['memoryDomains']) > 0
         record('resident-allocation', instances)
+        if model.startswith('qwen3.5-4b:'):
+            # Deterministic lossless RGB fixture: image understanding must use the shipped projector.
+            def png_chunk(kind, data):
+                return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+            pixels = (b'\x00' + b'\xff\x00\x00' * 96) * 96
+            png = b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('>IIBBBBB', 96, 96, 8, 2, 0, 0, 0)) + png_chunk(b'IDAT', zlib.compress(pixels)) + png_chunk(b'IEND', b'')
+            body = payload('What color fills this image? Answer with the color name.')
+            body['messages'][0]['content'] = [
+                {'type': 'text', 'text': 'What color fills this image? Answer with the color name.'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(png).decode()}},
+            ]
+            image_response = request('/v1/chat/completions', body)
+            assert 'red' in (image_response['choices'][0]['message']['content'] or '').lower(), image_response
+            assert image_response['usage']['completion_tokens'] > 0
+            assert image_response['choices'][0]['finish_reason'] in ('stop', 'length')
+            record('catalog-projector-image-inference', image_response)
         for index in range(4):
             record(f'repeat-{index}', generate('What is the capital of France? Answer in one sentence.'))
         body = payload('What is the capital of France? Answer in one sentence.')
