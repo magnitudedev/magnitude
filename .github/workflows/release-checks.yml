@@ -3,6 +3,10 @@ name: Release checks
 on:
   workflow_dispatch:
     inputs:
+      windows_backends_only:
+        description: Build only Windows CUDA and Vulkan packs for native iteration (no publication)
+        type: boolean
+        default: false
       windows_distribution:
         description: Validate Azure-signed Windows artifacts without publishing
         type: boolean
@@ -34,9 +38,11 @@ env:
 
 jobs:
   integrations:
+    if: ${{ !inputs.windows_backends_only }}
     uses: ./.github/workflows/integrations.yml
 
   static:
+    if: ${{ !inputs.windows_backends_only }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +75,7 @@ jobs:
       - run: bun run packages/release/scripts/matrix.ts
 
   release-build:
+    if: ${{ !inputs.windows_backends_only }}
     permissions:
       contents: read
       id-token: write
@@ -78,3 +85,15 @@ jobs:
       source_commit: ${{ github.sha }}
       validate_candidate: true
       windows_distribution: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_distribution }}
+
+  windows-backends:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_backends_only
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      source_commit: ${{ github.sha }}
+      validate_candidate: false
+      windows_backends_only: true
+      windows_distribution: ${{ inputs.windows_distribution }}

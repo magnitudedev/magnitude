@@ -106,8 +106,8 @@ export const inspectCudaCompatibility = async (
   const cudaRoot = process.env.CUDA_PATH?.trim()
   if (!cudaRoot) throw new Error("CUDA_PATH is required to inspect a CUDA pack")
   const [images, compilerOutput] = await Promise.all([
-    inspectPtxImagesFromModule(resolve(cudaRoot, "bin", "cuobjdump"), module),
-    run([resolve(cudaRoot, "bin", "nvcc"), "--version"]),
+    inspectPtxImagesFromModule(resolve(cudaRoot, "bin", process.platform === "win32" ? "cuobjdump.exe" : "cuobjdump"), module),
+    run([resolve(cudaRoot, "bin", process.platform === "win32" ? "nvcc.exe" : "nvcc"), "--version"]),
   ])
   const [firstImage] = images
   if (!firstImage) {

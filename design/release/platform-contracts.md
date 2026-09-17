@@ -107,6 +107,11 @@ a runner label alone is not a support contract. Before packaging, the Apple buil
 expected architecture and deployment target of every executable and native library with Apple's
 `vtool`. Those validated files are the exact inputs to the deterministic archive builder.
 
+Windows accelerator compositions follow the same dependency ownership: `nvcuda.dll` and
+`vulkan-1.dll` belong to their respective host capabilities, while CUDA toolkit DLLs are shipped
+in the pack and the Microsoft CRT is shipped with the base. CPU installations require neither
+accelerator capability.
+
 ## Required guarantees
 
 - Build-host contents cannot introduce a dependency or raise a platform floor.

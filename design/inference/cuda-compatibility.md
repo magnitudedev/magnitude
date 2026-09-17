@@ -60,7 +60,8 @@ Linux x64 and ARM64 build the same two compiler configurations independently:
 
 These four host/toolkit jobs run concurrently on Ubuntu 22.04 for both x64 and SBSA ARM64 so every
 Linux pack retains the release userspace ABI baseline. Host CPU architecture never selects a CUDA
-toolkit generation.
+toolkit generation. Windows x64 independently builds CUDA 12.9 with the same PTX targets as the
+Linux 12.9 packs, using the native MSVC toolchain and shipping the required NVIDIA runtime DLLs.
 
 Release compatibility inspection consumes `cuobjdump` output as a stream and retains only the
 distinct PTX image facts. Its memory use must not scale with the textual PTX dump.

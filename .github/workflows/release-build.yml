@@ -3,6 +3,10 @@ name: Release build
 on:
   workflow_call:
     inputs:
+      windows_backends_only:
+        required: false
+        default: false
+        type: boolean
       source_commit:
         required: true
         type: string
@@ -46,12 +50,13 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
       - id: matrix
-        run: bun run packages/release/scripts/matrix.ts
+        run: bun run packages/release/scripts/matrix.ts ${{ inputs.windows_backends_only && '--windows-backends-only' || '' }}
       - id: version
         shell: bash
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
+    if: ${{ !inputs.windows_backends_only }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +81,7 @@ jobs:
           if-no-files-found: error
 
   host:
+    if: ${{ !inputs.windows_backends_only }}
     permissions:
       contents: read
       id-token: write
@@ -190,7 +196,10 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   backend:
-    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ matrix.host == 'windows-x64-msvc' && inputs.windows_distribution && 'windows-signing' || startsWith(matrix.host, 'darwin-') && inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: matrix
     strategy:
       fail-fast: false
@@ -261,6 +270,17 @@ jobs:
           test -f "$vulkan_root/include/vulkan/vulkan.hpp"
           echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
           echo "$vulkan_root/bin" >> "$GITHUB_PATH"
+      - name: Install Windows native build components
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
+          $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
+          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows' && matrix.backend == 'vulkan'
         shell: pwsh
@@ -270,12 +290,6 @@ jobs:
           if (-not $sdk) { throw "Vulkan SDK installation did not publish VULKAN_SDK" }
           "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
           "$sdk\Bin" >> $env:GITHUB_PATH
-      - name: Use Ninja for Windows backend build
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ninja --version
-          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
       - name: Install Linux CUDA toolkit
         if: runner.os == 'Linux' && matrix.backend == 'cuda'
         shell: bash
@@ -323,7 +337,31 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-      - run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - name: Build Unix backend
+        if: runner.os != 'Windows'
+        run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - name: Install Windows signing runtime
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Authenticate Windows Artifact Signing
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build Windows backend
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/build/windows-backend.ps1 -PackId "${{ matrix.id }}" -OutputDirectory "release/${{ matrix.id }}"
+        env:
+          MAGNITUDE_WINDOWS_DISTRIBUTION: ${{ inputs.windows_distribution && 'artifact-signing' || 'unsigned' }}
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
       - uses: actions/upload-artifact@v4
         with:
           name: backend-${{ matrix.id }}
@@ -343,6 +381,7 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-consumer:
+    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     strategy:
       fail-fast: false
@@ -412,6 +451,7 @@ jobs:
             '
 
   apple-consumer:
+    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     strategy:
@@ -444,6 +484,7 @@ jobs:
           if-no-files-found: error
 
   windows-consumer:
+    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     environment: ${{ inputs.windows_distribution && 'windows-signing' || 'release-validation' }}
     runs-on: blacksmith-8vcpu-windows-2025
@@ -472,7 +513,7 @@ jobs:
 
   candidate:
     needs: [matrix, host, backend, linux-consumer, apple-consumer, windows-consumer]
-    if: inputs.validate_candidate
+    if: inputs.validate_candidate && !inputs.windows_backends_only
     runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4

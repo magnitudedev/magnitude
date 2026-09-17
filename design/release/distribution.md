@@ -29,11 +29,11 @@ artifacts. The release graph is product configuration, not a plugin system.
 | ICN backend pack | compatible hosts | one Metal, CUDA, or Vulkan module family and its redistributable runtime libraries |
 
 Release hosts are Apple arm64, Apple x64, Linux GNU arm64, Linux GNU x64, and Windows x64 MSVC.
-Windows ships a CPU base and a per-user desktop installer; Windows GPU packs are not enabled.
+Windows ships a CPU base, CUDA 12.9 and Vulkan packs, and a per-user desktop installer.
 Each backend pack names exactly one required ICN base and must have the same
 native-build identity and backend-module ABI as that base.
 
-Apple arm64 publishes Metal. Linux arm64 and x64 publish Vulkan plus CUDA 11.8 and CUDA 12.9.
+Apple arm64 publishes Metal; Apple x64 is CPU-only. Linux arm64 and x64 publish Vulkan plus CUDA 11.8 and CUDA 12.9.
 CUDA device-image and driver compatibility is defined by
 [CUDA compatibility](../inference/cuda-compatibility.md).
 
