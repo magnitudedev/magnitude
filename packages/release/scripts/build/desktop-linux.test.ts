@@ -1,6 +1,18 @@
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { validateLinuxPayloadPermissions } from "./desktop-linux"
+import { linuxDesktopInstaller } from "../../src/targets"
+
+describe("Linux prerelease asset names", () => {
+  it.each([
+    ["linux-arm64-gnu", "deb", "magnitude-desktop_0.1.0-alpha.0-40_arm64.deb"],
+    ["linux-x64-gnu", "deb", "magnitude-desktop_0.1.0-alpha.0-40_amd64.deb"],
+    ["linux-arm64-gnu", "rpm", "magnitude-desktop-0.1.0-alpha.0-40.aarch64.rpm"],
+    ["linux-x64-gnu", "rpm", "magnitude-desktop-0.1.0-alpha.0-40.x86_64.rpm"],
+  ] as const)("keeps the SemVer filename for %s %s", (host, format, expected) => {
+    expect(linuxDesktopInstaller(host, format, "0.1.0-alpha.0", 40)).toBe(expected)
+  })
+})
 
 describe("Linux package publisher-trust protection", () => {
   it.each([

@@ -130,7 +130,9 @@ export const buildLinuxDesktopInstaller = (options: {
   if (code !== 0) return yield* new DesktopBuildFailed({ message: `${options.format} desktop packaging exited ${code}` })
   const packages = (yield* fs.readDirectory(destination)).filter(path => path.endsWith(`.${options.format}`))
   if (packages.length !== 1) return yield* new DesktopBuildFailed({ message: `${options.format} desktop packaging did not produce exactly one installer` })
-  if (packages[0] !== linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", options.format, options.version, options.revision)) {
+  const filename = linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", options.format, options.version, options.revision)
+  // Package metadata uses '~' for prerelease ordering; GitHub rewrites it in asset names.
+  if (packages[0] !== filename.replace(options.version, metadata.version)) {
     return yield* new DesktopBuildFailed({ message: "Linux desktop installer filename does not match its release target" })
   }
   const candidate = join(destination, packages[0]!)
@@ -153,7 +155,7 @@ export const buildLinuxDesktopInstaller = (options: {
   }
   yield* validateLinuxDesktopInstaller({ ...options, file: candidate })
   yield* fs.makeDirectory(options.output, { recursive: true })
-  const output = resolve(options.output, packages[0]!)
+  const output = resolve(options.output, filename)
   yield* fs.copyFile(candidate, output)
   const artifact = yield* Schema.decodeUnknown(ReleaseArtifactSchema)({
     id: `desktop-linux-${options.arch}-gnu-${options.format}`,

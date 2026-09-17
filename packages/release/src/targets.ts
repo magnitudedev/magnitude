@@ -206,10 +206,9 @@ export const desktopInstaller = (host: "darwin-arm64" | "darwin-x64") => `magnit
 export const desktopUpdateArchive = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.zip`
 export const windowsDesktopInstaller = (version: string) => `magnitude-desktop-windows-x64-${version}.exe`
 export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu", format: "deb" | "rpm", version: string, revision: number) => {
-  const packageVersion = version.replace("-", "~")
   return format === "deb"
-    ? `magnitude-desktop_${packageVersion}-${revision}_${host === "linux-arm64-gnu" ? "arm64" : "amd64"}.deb`
-    : `magnitude-desktop-${packageVersion}-${revision}.${host === "linux-arm64-gnu" ? "aarch64" : "x86_64"}.rpm`
+    ? `magnitude-desktop_${version}-${revision}_${host === "linux-arm64-gnu" ? "arm64" : "amd64"}.deb`
+    : `magnitude-desktop-${version}-${revision}.${host === "linux-arm64-gnu" ? "aarch64" : "x86_64"}.rpm`
 }
 export const icnBaseArchive = (host: HostId) => `magnitude-icn-base-${host}.tar.gz`
 export const backendArchive = (pack: BackendPack) => `magnitude-icn-${pack.id}.tar.gz`

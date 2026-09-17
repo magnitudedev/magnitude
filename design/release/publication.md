@@ -29,6 +29,11 @@ private daemon coordination revision once whenever the CLI version changes, prer
 The same CLI version retains its revision. Version generation consumes the plan as data and does
 not import release implementation or RPC contracts. Generated identity sources are not committed.
 
+Automatic publication handles the closed, merged Changesets PR in the default-branch context,
+so signing environments evaluate the trusted branch. It selects the PR's actual merge commit,
+requires the Changesets branch in this repository, and verifies main ancestry before building;
+it never checks out an unmerged PR head.
+
 The RPC fingerprint covers procedure identity, encoded payload/success/error schemas, stream
 status, replay policy, public health, and transport framing. Irrelevant field order, brands,
 class identity, descriptions, and formatting do not affect it. Unsupported constructs fail

@@ -60,6 +60,10 @@ its DMG. The ZIP is a separate desktop artifact covered by the release manifest 
 receipts. It is not an inference/runtime acquisition archive. Producing it does not establish
 successful application replacement or relaunch; those remain updater acceptance requirements.
 
+Linux package metadata uses `~` for prerelease ordering. Published DEB/RPM filenames retain the
+SemVer `-` separator because GitHub rewrites `~` in asset names. Renaming the packaged file does
+not change its bytes, internal version, checksum, or installation behavior.
+
 Linux desktop packages use the name `magnitude-desktop` and place the matched application at
 `/usr/lib/magnitude-desktop/magnitude`. The application-menu launcher and headless CLI resolve
 that same installation through `/usr/bin/magnitude-desktop`, including login startup. This guarded
