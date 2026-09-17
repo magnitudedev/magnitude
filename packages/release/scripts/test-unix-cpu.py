@@ -1,0 +1,152 @@
+"""Consume a final CPU archive on its native Unix host and run real inference."""
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import signal
+import subprocess
+import tarfile
+import time
+import urllib.parse
+import urllib.request
+import uuid
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--artifact-directory', type=pathlib.Path, required=True)
+parser.add_argument('--output-directory', type=pathlib.Path, required=True)
+args = parser.parse_args()
+assert platform.system() == 'Darwin', 'This consumer currently validates macOS CPU artifacts'
+host = {'arm64': 'darwin-arm64', 'x86_64': 'darwin-x64'}[platform.machine()]
+root = args.output_directory.resolve()
+root.mkdir(parents=True, exist_ok=False)
+results = []
+def record(name, detail):
+    results.append({'test': name, 'detail': detail})
+    (root / 'results.json').write_text(json.dumps(results, indent=2))
+    print('PASS', name, flush=True)
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+metadata = json.loads((args.artifact_directory / f'icn-base-{host}.artifact.json').read_text())
+assert metadata['id'] == f'icn-base-{host}' and metadata['host'] == host
+assert metadata['kind'] == 'icn-base' and metadata['backend'] == 'cpu'
+assert metadata['filename'] == f'magnitude-icn-base-{host}.tar.gz'
+archive = args.artifact_directory / metadata['filename']
+assert archive.stat().st_size == metadata['bytes'] and digest(archive) == metadata['sha256']
+record('artifact-integrity', metadata)
+installation = root / 'installation'
+installation.mkdir()
+with tarfile.open(archive) as files:
+    files.extractall(installation, filter='data')
+declaration = dict(schemaVersion=1, backend='cpu', nativeBuild=metadata['nativeBuild'], backendModuleAbi=metadata['backendModuleAbi'])
+(installation / 'installation.json').write_text(json.dumps(declaration))
+binary = installation / 'bin/magnitude-inference'
+architecture = subprocess.check_output(['/usr/bin/lipo', '-archs', str(binary)], text=True).strip()
+assert architecture == platform.machine(), architecture
+record('native-architecture', {'host': host, 'architecture': architecture})
+
+repository = 'Qwen/Qwen2.5-0.5B-Instruct-GGUF'
+revision = '9217f5db79a29953eb74d5343926648285ec7e67'
+filename = 'qwen2.5-0.5b-instruct-q4_k_m.gguf'
+model = f'hf:{repository}/{filename}'
+model_path = root / 'hf' / ('models--' + repository.replace('/', '--')) / 'snapshots' / revision / filename
+model_path.parent.mkdir(parents=True)
+with urllib.request.urlopen(f'https://huggingface.co/{repository}/resolve/{revision}/{filename}', timeout=120) as source, model_path.open('wb') as target:
+    while chunk := source.read(1024 * 1024):
+        target.write(chunk)
+model_digest = digest(model_path)
+assert model_path.stat().st_size == 491400032
+assert model_digest == '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db'
+record('model-integrity', {'model': model, 'revision': revision, 'sha256': model_digest})
+
+token = uuid.uuid4().hex
+origin = 'http://127.0.0.1:18843'
+def request(path, body=None, raw=False):
+    req = urllib.request.Request(origin + path, data=json.dumps(body).encode() if body is not None else None,
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=600) as response:
+        value = response.read().decode()
+    return value if raw else (json.loads(value) if value else None)
+def payload(text, tokens=48):
+    return dict(model=model, messages=[dict(role='user', content=text)], temperature=0, seed=42, max_tokens=tokens)
+def generate(text):
+    response = request('/v1/chat/completions', payload(text))
+    assert response['choices'][0]['message']['content'].strip()
+    assert response['usage']['completion_tokens'] > 0
+    assert response['choices'][0]['finish_reason'] in ('stop', 'length')
+    return response
+
+environment = {key: value for key, value in os.environ.items() if not key.startswith(('DYLD_', 'LD_'))}
+environment.update(MAGNITUDE_ICN_AUTH_TOKEN=token, RUST_LOG='info')
+with (root / 'server.log').open('w') as log:
+    process = subprocess.Popen([str(binary), 'serve', '--bind', '127.0.0.1:18843', '--instance-id', 'cpu-acceptance-' + uuid.uuid4().hex,
+        '--installation', str(installation / 'installation.json'), '--model-store', str(root / 'models'),
+        '--cache-root', str(root / 'cache'), '--hf-cache', str(root / 'hf')],
+        env=environment, stdout=log, stderr=log, start_new_session=True)
+    try:
+        for _ in range(120):
+            assert process.poll() is None, 'Engine exited before readiness; inspect server.log'
+            try:
+                health = request('/health')
+                break
+            except OSError:
+                time.sleep(1)
+        else:
+            raise AssertionError('Engine did not become healthy')
+        record('health', health)
+        hardware = request('/api/v1/hardware')
+        assert hardware['native_build'] == metadata['nativeBuild']
+        assert hardware['enabled_backends'] == ['cpu']
+        record('hardware-identity', hardware)
+        for _ in range(120):
+            models = request('/v1/models')
+            if model in [item['id'] for item in models['data']]:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError('Model was not discovered')
+        response = generate('What is the capital of France? Answer in one sentence.')
+        assert 'Paris' in response['choices'][0]['message']['content']
+        record('baseline', response)
+        instances = request('/api/v1/instances')
+        ready = [item for item in instances['instances'] if item['modelId'] == model and item['lifecycle']['_tag'] == 'Ready']
+        assert len(ready) == 1
+        assert sum(domain['modelBytes'] for domain in ready[0]['lifecycle']['allocation']['memoryDomains']) > 0
+        record('resident-allocation', instances)
+        for index in range(4):
+            record(f'repeat-{index}', generate('Say hello in one sentence.'))
+        body = payload('Count from one to ten.', 80)
+        body['stream'] = True
+        stream = request('/v1/chat/completions', body, raw=True)
+        assert 'data: [DONE]' in stream
+        chunks = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith('data: {')]
+        assert ''.join(choice['delta'].get('content') or '' for chunk in chunks for choice in chunk.get('choices', []))
+        record('streaming', stream)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            record('concurrent', list(pool.map(generate, ['Write one sentence about apples.', 'Write one sentence about pears.', 'Write one sentence about peaches.'])))
+        response = generate('The gardener waters the apple trees every morning. ' * 200 + 'Summarize in one sentence.')
+        assert response['usage']['prompt_tokens'] >= 1000
+        record('long-prefill', response)
+        request('/api/v1/instances/' + ready[0]['id'] + '/stop', {})
+        assert not any(item['id'] == ready[0]['id'] and item['lifecycle']['_tag'] == 'Ready' for item in request('/api/v1/instances')['instances'])
+        record('unload', ready[0]['id'])
+        record('reload', generate('What is the capital of France?'))
+        record('final-health', request('/health'))
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        # The fixture owns this entire group, including any workers left after parent exit.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        (root / 'cleanup.json').write_text(json.dumps({'parentPid': process.pid, 'returncode': process.returncode}))

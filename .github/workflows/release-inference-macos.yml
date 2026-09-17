@@ -1,0 +1,40 @@
+name: macOS CPU inference acceptance
+
+on:
+  workflow_call:
+    inputs:
+      artifact_run_id:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  intel-cpu:
+    runs-on: macos-15-large
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-darwin-x64
+          path: candidate
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - name: Run actual CPU inference from the final archive
+        run: python packages/release/scripts/test-unix-cpu.py --artifact-directory candidate --output-directory evidence
+      - name: Retain inference evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-cpu-inference-${{ inputs.artifact_run_id }}
+          path: |
+            evidence/results.json
+            evidence/server.log
+            evidence/cleanup.json
+          if-no-files-found: warn

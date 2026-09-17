@@ -3,6 +3,10 @@ name: Release checks
 on:
   workflow_dispatch:
     inputs:
+      macos_cpu_artifact_run_id:
+        description: Test Intel CPU inference using this existing release run (no builds or publication)
+        type: string
+        default: ''
       windows_backends_only:
         description: Build only Windows CUDA and Vulkan packs for native iteration (no publication)
         type: boolean
@@ -37,12 +41,21 @@ env:
   NPM_VERSION: "11.6.2"
 
 jobs:
+  macos-cpu-inference:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_cpu_artifact_run_id != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/release-inference-macos.yml
+    with:
+      artifact_run_id: ${{ inputs.macos_cpu_artifact_run_id }}
+
   integrations:
-    if: ${{ !inputs.windows_backends_only }}
+    if: ${{ !inputs.windows_backends_only && !inputs.macos_cpu_artifact_run_id }}
     uses: ./.github/workflows/integrations.yml
 
   static:
-    if: ${{ !inputs.windows_backends_only }}
+    if: ${{ !inputs.windows_backends_only && !inputs.macos_cpu_artifact_run_id }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +88,7 @@ jobs:
       - run: bun run packages/release/scripts/matrix.ts
 
   release-build:
-    if: ${{ !inputs.windows_backends_only }}
+    if: ${{ !inputs.windows_backends_only && !inputs.macos_cpu_artifact_run_id }}
     permissions:
       contents: read
       id-token: write
@@ -87,7 +100,7 @@ jobs:
       windows_distribution: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_distribution }}
 
   windows-backends:
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_backends_only
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_backends_only && !inputs.macos_cpu_artifact_run_id
     permissions:
       contents: read
       id-token: write
