@@ -1,3 +1,4 @@
+mod support;
 use seismic_lang::{
     lower::lower,
     program::{compile, SourceFile},
@@ -90,10 +91,10 @@ fn lower_source(text: &str) -> seismic_lang::lowered_ir::LoweredIr {
     lower(&program, "evaluate", "metal", &Default::default()).unwrap()
 }
 
-const SPLIT: &str = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    for t in load(x[row,0:65], over=0):\n      acc[0] += reduce(t,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    t = load(middle[row:row+1])\n    for i in owned(t): t[i] = t[i] * 2.0 + 1.0\n    store(t,out[row:row+1])\n";
+const SPLIT: &str = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    chunk = load(x[row,0:65])\n    acc[0] += reduce(chunk,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    t = load(middle[row:row+1])\n    for i in owned(t): t[i] = t[i] * 2.0 + 1.0\n    store(t,out[row:row+1])\n";
 
 fn split_family() -> GroupFamily {
-    let lowered = lower_source(SPLIT);
+    let lowered = support::streamed(SPLIT, 17, &["chunk"]);
     let execution = seismic_metal::execution::prepare_storage_selected(
         &lowered,
         Config {

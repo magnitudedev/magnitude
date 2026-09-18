@@ -71,6 +71,12 @@ coincidence. Aliased views remain views of the same allocation. Reused addresses
 establish content identity. Mutation invalidates assumptions tied to prior content
 versions.
 
+Source alias requirements survive execution regrouping. Admission checks the used
+byte ranges of all relevant storage planes, with checked offset arithmetic; exact
+overlap is permitted only by the retained source access proof. Resident backend
+entry points and model input validation enforce the same conditions as the shared
+runtime before executing or relying on the conditional account.
+
 Static validation eliminates checks only when its retained conditions hold. Invocation
 checks establish binding properties. Necessary data-dependent checks remain in the
 selected execution with defined failure behavior and accounted costs. The runtime does

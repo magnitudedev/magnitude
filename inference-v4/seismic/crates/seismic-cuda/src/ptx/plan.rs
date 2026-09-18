@@ -90,6 +90,7 @@ pub struct Parameter {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpecialRegister {
+    LaneIndex,
     BlockIndexX,
     BlockWidthX,
     ThreadIndexX,
@@ -201,6 +202,7 @@ pub struct Predicate {
 /// contract for this form. No guessed latency or throughput is attached here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Primitive {
+    Shuffle { mode: ShuffleMode },
     Unary {
         operation: Unary,
         data_type: DataType,
@@ -245,8 +247,12 @@ pub enum Origin {
     InvocationAbi,
     Ssa { instruction: u32, block: u32 },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ShuffleMode { Butterfly, Index }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
+    /// Full-warp, convergent register communication with completion before use.
+    Shuffle { mode: ShuffleMode, destination: RegisterId, source: RegisterId, lane: Operand },
     Unary {
         operation: Unary,
         data_type: DataType,
@@ -314,6 +320,7 @@ pub enum Operation {
 impl Operation {
     pub fn primitive(&self) -> Primitive {
         match *self {
+            Self::Shuffle { mode, .. } => Primitive::Shuffle { mode },
             Self::Unary {
                 operation,
                 data_type,
@@ -443,6 +450,7 @@ impl Instruction {
             }
         }
         match self.operation {
+            Operation::Shuffle { destination, source, lane, .. } => { effect.register_writes.push(destination); effect.register_reads.push(source); operand(&mut effect, lane); }
             Operation::Unary {
                 destination,
                 source,
@@ -595,6 +603,7 @@ pub enum Requirement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkDomain {
     pub work_items: u64,
+    pub lanes_per_item: u32,
     pub dispatch: Dispatch,
     pub scratch_bytes_per_item: usize,
 }
@@ -602,7 +611,7 @@ pub struct WorkDomain {
 pub enum Target {
     Sm80Ptx70,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetPlan {
     pub(super) target: Target,
     pub(super) registers: Vec<Register>,
@@ -701,6 +710,11 @@ impl TargetPlan {
                 }
             }
             match instruction.operation {
+                Operation::Shuffle { destination, source, lane, .. } => {
+                    if self.domain.lanes_per_item != 32 || instruction.predicate.is_some() || !match lane { Operand::Register(r)=>self.registers[r.0].class==RegisterClass::Bits32,Operand::Unsigned(n)=>n<32,_=>false } || self.registers[destination.0].class != RegisterClass::Bits32 || self.registers[source.0].class != RegisterClass::Bits32 {
+                        return Err("PTX shuffle requires a convergent full warp and 32-bit register operands".into());
+                    }
+                }
                 Operation::Compare { destination, .. }
                     if self.registers[destination.0].class != RegisterClass::Predicate =>
                 {

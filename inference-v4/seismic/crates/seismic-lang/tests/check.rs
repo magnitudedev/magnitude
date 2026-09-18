@@ -206,3 +206,122 @@ fn fragment_store_initializes_only_a_complete_definite_tile() {
     let invalid = probe(8, "  simdgroup_store(a,tmp,1,0)");
     assert_error(&[file("bounds.seismic.metal", &invalid)], "block may exceed");
 }
+
+#[test]
+fn definite_assignment_uses_typed_coordinates_and_requires_the_first_write_to_cover() {
+    let valid="fn fill[N](out:tensor[N] f32):\n  t = tile[N] f32\n  for i in owned(t):\n    j = i + 0\n    t[j] = 1.0\n  store(t,out)\n";
+    assert!(errors(&[file("assignment.seismic.portable",valid)],&[]).is_empty());
+    let invalid="fn fill[N](out:tensor[N] f32):\n  t = tile[N] f32\n  for i in owned(t):\n    t[0] = 1.0\n    t[i] = t[i] + 1.0\n  store(t,out)\n";
+    assert_error(&[file("assignment.seismic.portable",invalid)],"first owned write must cover");
+}
+
+#[test]
+fn logical_loads_cannot_be_used_as_source_partition_iterators() {
+    assert_error(&[file("logical.seismic.portable", "fn f(x:tensor[8] f32):\n  for t in load(x,over=0):\n    n = extent(t,0)\n")], "logical value, not an iterator");
+}
+
+#[test]
+fn repeated_logical_windows_share_shape_only_while_their_bounds_are_unchanged() {
+    let helper="fn pair[N](a:tile[N] f32,b:tile[N] f32):\n  for i in owned(a): a[i] = a[i] + b[i]\n";
+    let text=format!("{helper}fn f(x:tensor[8] f32,bounds:tensor[2] i32):\n  a = load(x[bounds[0]:bounds[1]])\n  b = load(x[bounds[0]:bounds[1]])\n  pair(a,b)\n");
+    assert!(errors(&[file("logical.seismic.portable",&text)],&[]).is_empty());
+    let changed=text.replace("  b = load", "  next = tile[2] i32\n  for i in owned(next): next[i] = i\n  store(next,bounds)\n  b = load");
+    assert!(!errors(&[file("logical.seismic.portable",&changed)],&[]).is_empty(),"changing a bound must not reuse the old window's shape identity");
+}
+
+#[test]
+fn slice_endpoints_reject_named_non_i32_values() {
+    for dtype in ["f32", "bool", "u32"] {
+        for (parameters, binding) in [
+            (format!("bound:{dtype}"), String::new()),
+            (format!("bounds:tensor[1] {dtype}"), "  bound = bounds[0]\n".into()),
+        ] {
+            for (slice, endpoint) in [
+                ("bound:", "start"),
+                ("bound:8", "start"),
+                (":bound", "end"),
+                ("0:bound", "end"),
+            ] {
+                let source = format!(
+                    "fn f(x:tensor[8] f32,{parameters}):\n{binding}  t = load(x[{slice}])\n"
+                );
+                let es = errors(&[file("endpoints.seismic.portable", &source)], &[]);
+                let expected = format!("slice {endpoint} must be i32, found {dtype}");
+                assert!(es.iter().any(|e| e == &expected), "{source}\n{es:#?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn dynamic_i32_slice_endpoints_preserve_clamped_windows() {
+    use seismic_lang::interp::{Arg, Interpreter, TensorData};
+    use seismic_lang::types::DType;
+    use std::collections::HashMap;
+
+    for (parameters, bindings) in [
+        ("start:i32,end:i32", ""),
+        ("bounds:tensor[2] i32", "  start = bounds[0]\n  end = bounds[1]\n"),
+    ] {
+        let source = format!(
+            "fn f(x:tensor[8] f32,{parameters},out:tensor[6] i32):
+{bindings}  window = load(x[start:end])
+  tail = load(x[start:])
+  head = load(x[:end])
+  result = tile[6] i32
+  for i in owned(result): result[i] = 0
+  result[0] = extent(window,0)
+  result[1] = i32(reduce(window,0,sum))
+  result[2] = extent(tail,0)
+  result[3] = i32(reduce(tail,0,sum))
+  result[4] = extent(head,0)
+  result[5] = i32(reduce(head,0,sum))
+  store(result,out)
+"
+        );
+        let program = compile(&[file("endpoints.seismic.portable", &source)], &[])
+            .unwrap_or_else(|es| panic!("{source}\n{es:#?}"));
+        let mut interpreter = Interpreter::new(&program);
+        let x = interpreter.add_tensor(TensorData::dense(
+            DType::F32, vec![8], (1..=8).map(f64::from).collect(),
+        ));
+        let out = interpreter.add_tensor(TensorData::dense(DType::I32, vec![6], vec![0.0; 6]));
+        for (start, end, expected) in [
+            (2, 6, [4, 18, 6, 33, 6, 21]),
+            (-4, 3, [3, 6, 8, 36, 3, 6]),
+            (4, 99, [4, 26, 4, 26, 8, 36]),
+            (99, 3, [0, 0, 0, 0, 3, 6]),
+            (4, -9, [0, 0, 4, 26, 0, 0]),
+            (i32::MIN, i32::MAX, [8, 36, 8, 36, 8, 36]),
+            (i32::MAX, i32::MIN, [0; 6]),
+        ] {
+            let mut args = vec![Arg::Tensor(x)];
+            if bindings.is_empty() {
+                args.extend([Arg::Scalar(f64::from(start)), Arg::Scalar(f64::from(end))]);
+            } else {
+                let bounds = interpreter.add_tensor(TensorData::dense(
+                    DType::I32, vec![2], vec![f64::from(start), f64::from(end)],
+                ));
+                args.push(Arg::Tensor(bounds));
+            }
+            args.push(Arg::Tensor(out));
+            interpreter.run("f", &args, &HashMap::new()).unwrap();
+            let actual: Vec<_> = (0..6).map(|i| interpreter.tensors[out].get(i)).collect();
+            assert_eq!(actual, expected.map(f64::from), "{parameters}: [{start}:{end}]");
+        }
+    }
+}
+
+#[test]
+fn symbolic_slice_endpoints_keep_static_bounds_obligations() {
+    for (slice, diagnostic) in [
+        ("-1:4", "slice start may be negative"),
+        ("0:N+1", "slice end may exceed extent `N`"),
+    ] {
+        let source = format!("fn f[N](x:tensor[N] f32):\n  t = load(x[{slice}])\n");
+        assert_error(&[file("endpoints.seismic.portable", &source)], diagnostic);
+    }
+    let source = "fn f[N](x:tensor[N] f32):\n  full = load(x[:])\n  empty = load(x[N:N])\n";
+    let es = errors(&[file("endpoints.seismic.portable", source)], &[]);
+    assert!(es.is_empty(), "{es:#?}");
+}

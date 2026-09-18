@@ -33,6 +33,7 @@ impl FileDiagnostic {
     }
 }
 
+#[derive(Clone)]
 pub struct Program {
     pub functions: Vec<Function>,
     pub lowerings: Vec<Lowering>,

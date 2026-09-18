@@ -3,7 +3,7 @@
 use seismic_accounting::{
     schedule,
     selection::{self, Cost, Objective, Selected},
-    workload::{DerivationLimits, ScalarWorkload},
+    workload::{DerivationError, DerivationLimits, ScalarWorkload},
 };
 use seismic_lang::{ir, lower, lowered_ir::LoweredIr, program::Program, types::Elem};
 use std::collections::{BTreeMap, HashMap};
@@ -21,12 +21,23 @@ pub trait Backend {
         function: &LoweredIr,
         path: &[usize],
     ) -> Result<Preparation<Self::Execution>, String>;
+    /// Relax resource constraints of the partial implementation retained by the
+    /// typed domain. Counts must hold for every alternative in this interval.
+    /// No numeric bound, independent execution graph or candidate sample enters.
+    fn relax(
+        &self,
+        _alternatives: &selection::Domain,
+        _indices: std::ops::Range<usize>,
+        _workload: &ScalarWorkload,
+    ) -> Result<Option<schedule::Demand>, String> {
+        Ok(None)
+    }
     fn analyze(
         &self,
         execution: &Self::Execution,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, String>;
+    ) -> Result<schedule::Model, DerivationError>;
     fn materialize(
         &self,
         execution: &Self::Execution,
@@ -147,6 +158,36 @@ impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
         function: &LoweredIr,
         path: &[usize],
     ) -> Result<selection::Node<B::Execution>, String> {
+        function.ownership.validate(function)?;
+        if !function.ownership.intermediates.is_empty() {
+            let (parameters, _) = seismic_realization::storage::parameters(function)?;
+            if parameters.len() != self.request.workload.buffers.len() {
+                return Err("composition workload does not match the entry storage ABI".into());
+            }
+            for (index, parameter) in parameters.iter().enumerate() {
+                if !function
+                    .ownership
+                    .intermediates
+                    .contains(&parameter.parameter)
+                {
+                    continue;
+                }
+                let allocation = self.request.workload.buffers[index].allocation;
+                if self
+                    .request
+                    .workload
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .any(|(other, b)| other != index && b.allocation == allocation)
+                {
+                    return Err(format!(
+                        "private intermediate {} aliases another entry argument",
+                        parameter.parameter
+                    ));
+                }
+            }
+        }
         match self.request.backend.prepare(function, path)? {
             Preparation::Choice { name, alternatives } => {
                 Ok(selection::Node::Choice { name, alternatives })
@@ -158,10 +199,23 @@ impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
 }
 impl<B: Backend> selection::Space for Space<'_, '_, B> {
     type Execution = B::Execution;
+    type Identity = Inputs<B::Conditions>;
+    fn identity(&self) -> Self::Identity {
+        self.request.inputs()
+    }
+    fn relax(
+        &self,
+        alternatives: &selection::Domain,
+        indices: std::ops::Range<usize>,
+    ) -> Result<Option<schedule::Demand>, String> {
+        self.request
+            .backend
+            .relax(alternatives, indices, self.request.workload)
+    }
     fn context(&self) -> &selection::Context {
         &self.context
     }
-    fn analyze(&self, execution: &B::Execution) -> Result<schedule::Model, String> {
+    fn analyze(&self, execution: &B::Execution) -> Result<schedule::Model, DerivationError> {
         self.request.backend.analyze(
             execution,
             self.request.workload,
@@ -240,7 +294,10 @@ impl<E, C> TunedIr<E, C> {
     }
     pub fn into_parts(self) -> (E, Artifact<C>) {
         let objective = self.selected.objective().clone();
-        debug_assert!(objective.cost().is_exact(), "a completed global minimum resolves its selected execution's objective");
+        debug_assert!(
+            objective.cost().is_exact(),
+            "a completed global minimum resolves its selected execution's objective"
+        );
         let artifact = Artifact {
             selected_path: self.selected.selected_path().to_vec(),
             objective,
@@ -275,8 +332,7 @@ impl<C> Artifact<C> {
     }
 }
 pub struct Progress<E, C> {
-    search: selection::Progress<E>,
-    inputs: Inputs<C>,
+    search: selection::Progress<E, Inputs<C>>,
 }
 impl<E, C> Progress<E, C> {
     pub fn frontier(&self) -> &[selection::Region] {
@@ -288,16 +344,24 @@ impl<E, C> Progress<E, C> {
     pub fn lower_bound(&self) -> Result<u64, String> {
         self.search.lower_bound()
     }
+    pub fn unresolved(&self) -> selection::Unresolved {
+        self.search.unresolved()
+    }
+    pub fn exhausted_derivations(
+        &self,
+    ) -> impl Iterator<Item = (&[usize], seismic_accounting::workload::DerivationLimit)> {
+        self.search.exhausted_derivations()
+    }
 }
 pub enum Outcome<E, C> {
     Optimal(TunedIr<E, C>),
     Incomplete(Progress<E, C>),
     Infeasible,
 }
-fn finish<E, C>(outcome: selection::Outcome<E>, inputs: Inputs<C>) -> Outcome<E, C> {
+fn finish<E, C>(outcome: selection::Outcome<E, Inputs<C>>, inputs: Inputs<C>) -> Outcome<E, C> {
     match outcome {
         selection::Outcome::Optimal(selected) => Outcome::Optimal(TunedIr { selected, inputs }),
-        selection::Outcome::Incomplete(search) => Outcome::Incomplete(Progress { search, inputs }),
+        selection::Outcome::Incomplete(search) => Outcome::Incomplete(Progress { search }),
         selection::Outcome::Infeasible => Outcome::Infeasible,
     }
 }
@@ -315,11 +379,8 @@ pub fn resume<B: Backend>(
     progress: Progress<B::Execution, B::Conditions>,
     budget: selection::Budget,
 ) -> Result<Outcome<B::Execution, B::Conditions>, String> {
-    if request.inputs() != progress.inputs {
-        return Err("tuning inputs changed during resumption".into());
-    }
     Ok(finish(
         selection::resume(&Space::new(request), progress.search, budget)?,
-        progress.inputs,
+        request.inputs(),
     ))
 }

@@ -36,6 +36,15 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
         let mut width = None;
         let mut view_key = None;
         let mut stores = 0;
+        let mut scalars = f
+            .vars
+            .iter()
+            .enumerate()
+            .filter_map(|(v, p)| {
+                (matches!(p.ty, Ty::Scalar(_)) && matches!(p.kind, VarKind::Param(_))).then_some(v)
+            })
+            .collect::<HashSet<_>>();
+        scalars.extend(vars.iter().copied());
         for statement in body.iter() {
             match &statement.kind {
                 StmtKind::Assign {
@@ -46,6 +55,11 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
                     let ExprKind::Var(v) = target.kind else {
                         return Err("partition expects named tiles".into());
                     };
+                    if matches!(target.ty, Ty::Scalar(_)) {
+                        scalar(value, usize::MAX, &HashSet::new(), &scalars)?;
+                        scalars.insert(v);
+                        continue;
+                    }
                     let Ty::Tile(t) = &target.ty else {
                         return Err("partition only supports tile assignments".into());
                     };
@@ -55,12 +69,13 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
                     let n = t.shape[0]
                         .as_constant()
                         .ok_or("partition tile extent must be concrete")?;
-                    if n <= 0 || n % piece != 0 || width.is_some_and(|w| w != n) {
-                        return Err("partition must divide every equal tile extent".into());
+                    if n <= 0 || piece > n || width.is_some_and(|w| w != n) {
+                        return Err("partition must fit every equal tile extent".into());
                     }
                     width = Some(n);
                     match &value.kind {
                         ExprKind::TileAlloc { .. } => {}
+                        ExprKind::Var(source) if tiles.contains(source) => {}
                         ExprKind::Builtin {
                             name: Builtin::Load,
                             args,
@@ -81,6 +96,7 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
                     if !matches!(tile.kind,ExprKind::Var(v) if tiles.contains(&v)) {
                         return Err("partition owned domain must be a local tile".into());
                     }
+                    let mut locals = scalars.clone();
                     for statement in body {
                         let StmtKind::Assign {
                             target,
@@ -92,8 +108,20 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
                                 "partition owned body must assign independent elements".into()
                             );
                         };
-                        element(target, vars[0], &tiles)?;
-                        scalar(value, vars[0], &tiles)?;
+                        scalar(value, vars[0], &tiles, &locals)?;
+                        if let ExprKind::Var(v) = target.kind {
+                            if !matches!(target.ty, Ty::Scalar(_)) {
+                                return Err("pointwise temporary must be scalar".into());
+                            }
+                            if scalars.contains(&v) {
+                                return Err(
+                                    "pointwise iteration mutates an enclosing scalar value".into(),
+                                );
+                            }
+                            locals.insert(v);
+                        } else {
+                            element(target, vars[0], &tiles)?;
+                        }
                     }
                 }
                 StmtKind::Expr(Expr {
@@ -126,42 +154,59 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
             kind: VarKind::Index(atom.clone()),
         });
         vars.push(id);
-        extents.push(Sym::constant(width / piece));
+        extents.push(Sym::constant(width / piece + i64::from(width % piece != 0)));
         let start = Sym::atom(atom.clone()).scale(piece);
-        for v in &tiles {
-            resize(&mut f.vars[*v].ty, piece);
-        }
-        for statement in body {
-            match &mut statement.kind {
-                StmtKind::Assign { target, value, .. } => {
-                    resize(&mut target.ty, piece);
-                    resize(&mut value.ty, piece);
-                    match &mut value.kind {
-                        ExprKind::TileAlloc { shape, .. } => shape[0] = Sym::constant(piece),
-                        ExprKind::Builtin { args, .. } => {
-                            args[0] = slice(&args[0], id, &atom, &start, piece)
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                StmtKind::Owned { tile, body, .. } => {
-                    resize(&mut tile.ty, piece);
-                    for statement in body {
-                        if let StmtKind::Assign { target, value, .. } = &mut statement.kind {
-                            resize_expr(target, piece);
-                            resize_expr(value, piece);
-                        }
-                    }
-                }
-                StmtKind::Expr(Expr {
-                    kind: ExprKind::Builtin { args, .. },
-                    ..
-                }) => {
-                    resize(&mut args[0].ty, piece);
-                    args[1] = slice(&args[1], id, &atom, &start, piece);
-                }
-                _ => unreachable!(),
-            }
+        let remainder = width % piece;
+        let tail = if remainder != 0 {
+            Some(crate::widen::copy_bindings(body, &mut f.vars))
+        } else {
+            None
+        };
+        resize_body(body, &mut f.vars, &tiles, id, &atom, &start, piece);
+        if let Some((mut tail, copies)) = tail {
+            let tail_tiles = tiles
+                .iter()
+                .map(|v| copies.get(v).copied().unwrap_or(*v))
+                .collect();
+            let tail_start = Sym::constant(width - remainder);
+            resize_body(
+                &mut tail,
+                &mut f.vars,
+                &tail_tiles,
+                id,
+                &atom,
+                &tail_start,
+                remainder,
+            );
+            let cond = Expr {
+                kind: ExprKind::Binary {
+                    op: crate::ast::BinaryOp::Lt,
+                    lhs: Box::new(Expr {
+                        kind: ExprKind::Var(id),
+                        ty: Ty::Scalar(DType::I32),
+                        sym: Some(Sym::atom(atom.clone())),
+                        span: phase.span,
+                    }),
+                    rhs: Box::new(Expr {
+                        kind: ExprKind::Int(width / piece),
+                        ty: Ty::Scalar(DType::I32),
+                        sym: Some(Sym::constant(width / piece)),
+                        span: phase.span,
+                    }),
+                },
+                ty: Ty::Scalar(DType::Bool),
+                sym: None,
+                span: phase.span,
+            };
+            *body = vec![Stmt {
+                id: None,
+                kind: StmtKind::If {
+                    cond,
+                    then: std::mem::take(body),
+                    els: tail,
+                },
+                span: phase.span,
+            }];
         }
     }
     let mut parameters = parameters
@@ -181,6 +226,55 @@ pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String
         function: f,
         parameters,
     })
+}
+fn resize_body(
+    body: &mut [Stmt],
+    vars: &mut [Var],
+    tiles: &HashSet<VarId>,
+    id: VarId,
+    atom: &Atom,
+    start: &Sym,
+    piece: i64,
+) {
+    for v in tiles {
+        resize(&mut vars[*v].ty, piece);
+    }
+    for statement in body {
+        match &mut statement.kind {
+            StmtKind::Assign { target, value, .. } => {
+                if matches!(target.ty, Ty::Scalar(_)) {
+                    continue;
+                }
+                resize(&mut target.ty, piece);
+                resize(&mut value.ty, piece);
+                match &mut value.kind {
+                    ExprKind::TileAlloc { shape, .. } => shape[0] = Sym::constant(piece),
+                    ExprKind::Builtin { args, .. } => {
+                        args[0] = slice(&args[0], id, &atom, &start, piece)
+                    }
+                    ExprKind::Var(_) => {}
+                    _ => unreachable!(),
+                }
+            }
+            StmtKind::Owned { tile, body, .. } => {
+                resize(&mut tile.ty, piece);
+                for statement in body {
+                    if let StmtKind::Assign { target, value, .. } = &mut statement.kind {
+                        resize_expr(target, piece);
+                        resize_expr(value, piece);
+                    }
+                }
+            }
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Builtin { args, .. },
+                ..
+            }) => {
+                resize(&mut args[0].ty, piece);
+                args[1] = slice(&args[1], id, &atom, &start, piece);
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 // Views must address the same logical element coordinates. Equal base pointers
 // are therefore safe only with the same element width/type; shifted overlap is not.
@@ -230,14 +324,22 @@ fn element(e: &Expr, index: VarId, tiles: &HashSet<VarId>) -> Result<(), String>
         _ => Err("partition requires same-index tile access".into()),
     }
 }
-fn scalar(e: &Expr, index: VarId, tiles: &HashSet<VarId>) -> Result<(), String> {
+fn scalar(
+    e: &Expr,
+    index: VarId,
+    tiles: &HashSet<VarId>,
+    locals: &HashSet<VarId>,
+) -> Result<(), String> {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => Ok(()),
+        ExprKind::Var(v) if locals.contains(v) => Ok(()),
         ExprKind::Index { .. } => element(e, index, tiles),
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => scalar(expr, index, tiles),
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+            scalar(expr, index, tiles, locals)
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
-            scalar(lhs, index, tiles)?;
-            scalar(rhs, index, tiles)
+            scalar(lhs, index, tiles, locals)?;
+            scalar(rhs, index, tiles, locals)
         }
         ExprKind::Builtin {
             name:
@@ -255,7 +357,7 @@ fn scalar(e: &Expr, index: VarId, tiles: &HashSet<VarId>) -> Result<(), String> 
             args,
         } => {
             for arg in args {
-                scalar(arg, index, tiles)?;
+                scalar(arg, index, tiles, locals)?;
             }
             Ok(())
         }
@@ -298,15 +400,19 @@ fn slice(view: &Expr, id: VarId, atom: &Atom, start: &Sym, piece: i64) -> Expr {
         sym: Some(Sym::atom(atom.clone())),
         span: view.span,
     };
-    let begin = Expr {
-        kind: ExprKind::Binary {
-            op: BinaryOp::Mul,
-            lhs: Box::new(index),
-            rhs: Box::new(literal(piece)),
-        },
-        ty: Ty::Scalar(DType::I32),
-        sym: Some(start.clone()),
-        span: view.span,
+    let begin = if let Some(n) = start.as_constant() {
+        literal(n)
+    } else {
+        Expr {
+            kind: ExprKind::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(index),
+                rhs: Box::new(literal(piece)),
+            },
+            ty: Ty::Scalar(DType::I32),
+            sym: Some(start.clone()),
+            span: view.span,
+        }
     };
     let end = Expr {
         kind: ExprKind::Binary {

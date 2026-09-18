@@ -1,12 +1,9 @@
 use seismic_engine::execution::{Composition, CompositionSpec};
 use seismic_lang::{
-    program::{compile, SourceFile},
     Scope,
+    program::{SourceFile, compile},
 };
-use seismic_runtime::{
-    plan::{CompilationChoices, KernelChoice, PlanCompiler},
-    Candidate, Device,
-};
+use seismic_runtime::{Candidate, Device, plan::PlanCompiler};
 use std::collections::{HashMap, HashSet};
 fn names(xs: &[&str]) -> HashSet<String> {
     xs.iter().map(|s| (*s).into()).collect()
@@ -29,7 +26,8 @@ fn composition_requires_explicit_ownership_and_exact_runtime_bindings() {
     let candidate = Candidate::Cpu {
         loads: seismic_realization::LoadStrategy::Materialize,
     };
-    let mut compiler = PlanCompiler::new(&device, &program, Default::default(), candidate.clone());
+    let mut compiler =
+        PlanCompiler::diagnostic(&device, &program, Default::default(), candidate.clone());
     let mut invalid = spec();
     invalid.intermediates.clear();
     assert!(Composition::compile(&mut compiler, invalid).is_err());
@@ -53,20 +51,24 @@ fn composition_requires_explicit_ownership_and_exact_runtime_bindings() {
         .unwrap();
     let out = device.buffer_from(&[0xa5; 16]).unwrap();
     let tensors = HashMap::from([("x".into(), x), ("out".into(), out.clone())]);
-    assert!(composition
-        .execute(&tensors, &HashMap::from([("gain".into(), 3.)]))
-        .is_err());
-    assert!(composition
-        .execute(&HashMap::new(), &HashMap::new())
-        .is_err());
+    assert!(
+        composition
+            .execute(&tensors, &HashMap::from([("gain".into(), 3.)]))
+            .is_err()
+    );
+    assert!(
+        composition
+            .execute(&HashMap::new(), &HashMap::new())
+            .is_err()
+    );
     let mut actual = [0; 16];
     out.read(&mut actual).unwrap();
     assert_eq!(actual, [0xa5; 16]);
     let observations = composition
         .execute_observed(&tensors, &HashMap::new())
         .unwrap();
-    assert_eq!(observations.len(), 2);
-    assert!(observations.iter().all(|o| o.entry == "scale"
+    assert_eq!(observations.len(), 1);
+    assert!(observations.iter().all(|o| o.entry == "chain"
         && o.execution.host_seconds > 0.
         && o.execution.device_seconds.is_none()));
     second.execute(&tensors, &HashMap::new()).unwrap();
@@ -78,18 +80,4 @@ fn composition_requires_explicit_ownership_and_exact_runtime_bindings() {
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>()
     );
-    let choices = CompilationChoices {
-        default: KernelChoice {
-            candidate: candidate.clone(),
-            lowering: Default::default(),
-        },
-        kernels: std::collections::BTreeMap::from([(
-            "missing".into(),
-            KernelChoice {
-                candidate,
-                lowering: Default::default(),
-            },
-        )]),
-    };
-    assert!(PlanCompiler::with_choices(&device, &program, choices).is_err());
 }

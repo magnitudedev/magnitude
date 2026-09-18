@@ -1,6 +1,7 @@
 //! Lower checked Seismic into a concrete shared scalar realization. Native
 //! emitters own machine instructions and external math implementations.
 mod scalar;
+mod participants;
 use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use seismic_lang::lowered_ir::LoweredIr;
@@ -41,7 +42,20 @@ pub fn scalar_resolved(
     call_conv: CallConv,
     dispatch: Dispatch,
 ) -> Result<ScalarProgram, String> {
-    let mut normalized = lowered.clone();
+    scalar_participants_resolved(lowered, call_conv, dispatch, seismic_realization::dispatch::Participation::Thread)
+}
+/// A source intrinsic commits to subgroup participation; this expands through
+/// the same scalar instruction builder, preserving semantic backend calls.
+pub fn subgroup_required(lowered: &LoweredIr) -> bool { participants::required(lowered) }
+pub fn scalar_participants_resolved(
+    lowered: &LoweredIr, call_conv: CallConv, dispatch: Dispatch,
+    participation: seismic_realization::dispatch::Participation,
+) -> Result<ScalarProgram, String> {
+    let mut normalized = seismic_lang::reduction::structured::materialize(lowered)?;
+    if let seismic_realization::dispatch::Participation::Subgroup { lanes } = participation {
+        if lanes != 32 || dispatch != Dispatch::ParallelRoot { return Err("subgroup scalar form requires 32 lanes per parallel work item".into()); }
+        participants::validate(&normalized)?;
+    }
     if dispatch == Dispatch::ParallelRoot {
         seismic_lang::normalize::work_domain(&mut normalized.body);
     }
@@ -64,7 +78,7 @@ pub fn scalar_resolved(
     builder.switch_to_block(entry);
     builder.append_block_params_for_function_params(entry);
     let args = builder.block_params(entry).to_vec();
-    let mut emitter = scalar::Emitter::new(lowered, builder, args[0], args[1], args[2])?;
+    let mut emitter = scalar::Emitter::new(lowered, builder, args[0], args[1], args[2], participation)?;
     let work_items = match dispatch {
         Dispatch::Sequential => {
             emitter.body(&lowered.body)?;
@@ -75,11 +89,12 @@ pub fn scalar_resolved(
     let success = emitter.builder.ins().iconst(types::I32, 0);
     emitter.builder.ins().return_(&[success]);
     emitter.builder.seal_all_blocks();
-    let (buffers, scalars, scratch_bytes, imports, execution) = (
+    let (buffers, scalars, scratch_bytes, imports, backend_calls, execution) = (
         emitter.buffers,
         emitter.scalars,
         emitter.scratch_bytes,
         emitter.imports,
+        emitter.backend_calls,
         emitter.execution,
     );
     emitter.builder.finalize();
@@ -89,6 +104,7 @@ pub fn scalar_resolved(
     )
     .map_err(|e| format!("invalid scalar realization: {e}"))?;
     Ok(ScalarProgram {
+        conditions: seismic_realization::InvocationConditions::from_lowered(lowered)?,
         function,
         buffers,
         scalars,
@@ -97,6 +113,8 @@ pub fn scalar_resolved(
             .map(|n| n & !7)
             .ok_or("scratch alignment overflow")?,
         imports,
+        backend_calls,
+        participation,
         work_items,
         dispatch,
         loads,
@@ -123,13 +141,19 @@ pub fn scalar_sequence_resolved(
     call_conv: CallConv,
     dispatch: Dispatch,
 ) -> Result<seismic_realization::ScalarSequence, String> {
+    scalar_sequence_participants_resolved(lowered, call_conv, dispatch, seismic_realization::dispatch::Participation::Thread)
+}
+pub fn scalar_sequence_participants_resolved(
+    lowered: &LoweredIr, call_conv: CallConv, dispatch: Dispatch,
+    participation: seismic_realization::dispatch::Participation,
+) -> Result<seismic_realization::ScalarSequence, String> {
     use seismic_realization::{ScalarPhase, ScalarSequence};
     if dispatch == Dispatch::Sequential {
         return Ok(ScalarSequence {
             name: lowered.name.clone(),
             phases: vec![ScalarPhase {
                 source_statement: 0,
-                program: scalar_resolved(lowered, call_conv, dispatch)?,
+                program: scalar_participants_resolved(lowered, call_conv, dispatch, participation)?,
             }],
         });
     }
@@ -143,7 +167,7 @@ pub fn scalar_sequence_resolved(
         }
         let mut phase = lowered.clone();
         phase.body = vec![statement.clone()];
-        let program = scalar_resolved(&phase, call_conv, dispatch)
+        let program = scalar_participants_resolved(&phase, call_conv, dispatch, participation)
             .map_err(|error| format!("{} phase {source_statement}: {error}", lowered.name))?;
         phases.push(ScalarPhase {
             source_statement,

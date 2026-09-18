@@ -57,10 +57,14 @@ pub fn load_can_borrow(body: &[Stmt], var: VarId) -> bool {
 }
 /// A streamed binding's snapshot may borrow only when the complete piece body
 /// preserves its backing memory and does not mutate the loaded tile.
-pub fn stream_load_can_borrow(body: &[Stmt], var: VarId) -> bool {
+pub fn stream_load_can_borrow(body: &[Stmt], var: VarId, source: &Expr) -> bool {
+    let mut roots=Vec::new();
+    fn root(e:&Expr)->Option<VarId>{match &e.kind {ExprKind::Var(v)=>Some(*v),ExprKind::Index{base,..}|ExprKind::Transpose(base)=>root(base),ExprKind::Builtin{name:Builtin::Reshape,args}=>root(&args[0]),_=>None}}
+    let Some(v)=root(source) else {return false;};
+    roots.push(v);
     !body
         .iter()
-        .any(|stmt| tensor_effect(stmt) || tile_mutated(stmt, var))
+        .any(|stmt| tensor_effect(stmt) || tile_mutated(stmt, var) || roots.iter().any(|v|tile_mutated(stmt,*v)))
 }
 
 fn expressions(e: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
@@ -95,6 +99,7 @@ fn expressions(e: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
 }
 fn statement(s: &Stmt, predicate: &impl Fn(&Expr) -> bool) -> bool {
     match &s.kind {
+        StmtKind::Reduction(r) => r.operands().any(|e|expressions(e,predicate)) || r.bodies().flatten().any(|s|statement(s,predicate)),
         StmtKind::Assign { target, value, .. } => {
             expressions(target, predicate) || expressions(value, predicate)
         }
@@ -105,8 +110,8 @@ fn statement(s: &Stmt, predicate: &impl Fn(&Expr) -> bool) -> bool {
         StmtKind::Owned { tile, body, .. } => {
             expressions(tile, predicate) || body.iter().any(|s| statement(s, predicate))
         }
-        StmtKind::LoadLoop { views, body, .. } => {
-            views.iter().any(|e| expressions(e, predicate))
+        StmtKind::LoadLoop { domain, views, body, .. } => {
+            expressions(&domain.view,predicate) || views.iter().any(|e| expressions(e, predicate))
                 || body.iter().any(|s| statement(s, predicate))
         }
         StmtKind::If { cond, then, els } => {
@@ -114,7 +119,7 @@ fn statement(s: &Stmt, predicate: &impl Fn(&Expr) -> bool) -> bool {
         }
     }
 }
-fn uses(s: &Stmt, var: VarId) -> bool {
+pub fn uses(s: &Stmt, var: VarId) -> bool {
     statement(s, &|e| matches!(e.kind,ExprKind::Var(v) if v==var))
 }
 pub fn tensor_effect(s: &Stmt) -> bool {
@@ -129,10 +134,63 @@ pub fn tensor_effect(s: &Stmt) -> bool {
     })
 }
 
+/// Whether omitting a checked portable expression can discard an observable
+/// effect or numerical failure. Bounds rely on the original checked invocation
+/// contract; numerical operations retain their source preconditions. Callers
+/// separately establish that the value is unused or independently recomputed.
+pub fn expression_can_be_omitted(expr: &Expr) -> bool {
+    use crate::ast::BinaryOp::{Div, Rem, Shl, Shr};
+    use crate::types::{Elem, Ty};
+    !expressions(expr, &|e| match &e.kind {
+        ExprKind::Call { .. }
+        | ExprKind::Intrinsic { .. }
+        | ExprKind::Builtin { name: Builtin::Store | Builtin::Atomic, .. } => true,
+        // A reshape observes layout validity even if only its extent is used.
+        // Type-compatible dimensions alone do not prove a borrowed view can
+        // be reshaped without copying (e.g. a noncontiguous tensor slice).
+        ExprKind::Builtin { name: Builtin::Reshape, .. } => true,
+        // Symbolic points were checked under the retained source conditions.
+        // Data-dependent points still carry an execution-time bounds check;
+        // dropping a coordinate cannot silently drop that failure. Slices use
+        // the language's clamped-window semantics, so they need no such rule.
+        ExprKind::Index { indices, .. } => indices.iter().any(|index| {
+            matches!(index, Index::Point(point) if point.sym.is_none())
+        }),
+        ExprKind::Binary { op, lhs, rhs } if matches!(op, Div | Rem | Shl | Shr) => {
+            let dtype = match &e.ty {
+                Ty::Scalar(d) => Some(*d),
+                Ty::Tile(s) => match s.elem { Elem::Dtype(d) => Some(d), _ => None },
+                _ => None,
+            };
+            let Some(dtype) = dtype.filter(|d| d.is_int()) else { return false; };
+            let constant = |e: &Expr| e.sym.as_ref()?.as_constant()
+                .map(|n| crate::numeric::integer_value(dtype, n as u32));
+            match op {
+                Div | Rem => !crate::numeric::integer_division_is_defined(dtype, constant(lhs), constant(rhs)),
+                Shl | Shr => !crate::numeric::integer_shift_is_defined(constant(rhs)),
+                _ => unreachable!(),
+            }
+        }
+        _ => false,
+    })
+}
+
+/// Whether a checked expression can use its symbolic value without evaluating
+/// its expression tree. Shape queries establish view metadata even when their
+/// result is statically known and their evaluation cannot otherwise fail.
+pub fn can_substitute_symbolic_value(expr: &Expr) -> bool {
+    expr.sym.is_some()
+        && expression_can_be_omitted(expr)
+        && !expressions(expr, &|e| {
+            matches!(e.kind, ExprKind::Builtin { name: Builtin::Extent, .. })
+        })
+}
+
 /// Whether a statement can mutate a tile binding or its value storage. Tile copies
 /// are independent; ordinary expression uses and read-only intrinsic parameters
 /// do not create write effects. Unknown calls remain conservative.
 pub fn tile_mutated(s: &Stmt, var: VarId) -> bool {
+    if matches!(&s.kind, StmtKind::Reduction(r) if r.state_variables().any(|v|v==var)) { return true; }
     let mentions = |e: &Expr| expressions(e, &|e| matches!(e.kind,ExprKind::Var(v) if v==var));
     if statement(s, &|e| match &e.kind {
         ExprKind::Call { args, .. } => args.iter().any(&mentions),

@@ -133,6 +133,19 @@ over a complete alternative cover, and sums only where mandatory non-overlap or 
 joint constraint supports them. Omitted legal alternatives retain a trivial floor;
 analysis failure does not establish infeasibility.
 
+For an unresolved execution family, necessary demand must hold for every admitted
+member under its conditions. One candidate's expanded representation, retained
+intermediate or reduction tree is not universal demand. Choice-dependent quantities
+remain symbolic or use a sound envelope over the whole region. Do not prune away a
+compact representation or fused execution by charging work that exists only in an
+unfused alternative.
+
+Asynchronous overlap retains both resource reservations and completion-aware live
+storage. Compiler-controlled ordering and hardware scheduling are distinct. An
+optimistic interleaving supplies no feasible upper bound for the actual execution
+unless the relevant model establishes its achievability; native qualification is
+still required for physical claims. See [Tuning](tuning.md#lower-bounds-and-feasible-schedules).
+
 ## Construction and validation
 
 Resource analyses reference existing operations, value versions, allocations, decisions,

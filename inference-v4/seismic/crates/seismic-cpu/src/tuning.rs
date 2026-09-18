@@ -3,11 +3,11 @@ use seismic_accounting::{
     execution_model::{self, ScalarHardware},
     schedule,
     selection::Objective,
-    workload::{DerivationLimits, ScalarWorkload},
+    workload::{DerivationError, DerivationLimits, ScalarWorkload},
 };
 use seismic_compiler::tuner::{self as compiler, Preparation};
 use seismic_lang::lowered_ir::LoweredIr;
-use seismic_realization::{scheduling, ScalarProgram};
+use seismic_realization::{ScalarProgram, scheduling};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conditions {
@@ -50,28 +50,14 @@ impl compiler::Backend for Backend {
         function: &LoweredIr,
         path: &[usize],
     ) -> Result<Preparation<ScalarProgram>, String> {
-        if function.backend != "cpu" {
-            return Err("CPU preparation requires CPU Lowered IR".into());
-        }
-        match seismic_lang::normalize::loads::expand(function, path)? {
-            seismic_lang::normalize::loads::Expansion::Choice(choice) => Ok(Preparation::Choice {
-                name: format!("load site {} (variable {})", choice.site, choice.variable),
-                alternatives: seismic_accounting::selection::Domain::new(choice)?,
-            }),
-            seismic_lang::normalize::loads::Expansion::Selected { function, consumed } => {
-                if path.len() != consumed {
-                    return Err("unused CPU decisions".into());
-                }
-                Ok(Preparation::Execution(crate::prepare_resolved(&function)?))
-            }
-        }
+        prepare(function, path)
     }
     fn analyze(
         &self,
         execution: &ScalarProgram,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, String> {
+    ) -> Result<schedule::Model, DerivationError> {
         Ok(
             execution_model::derive_scalar(execution, &self.conditions.hardware, workload, limits)?
                 .model,
@@ -99,5 +85,25 @@ impl compiler::Backend for Backend {
             blocks: schedule::static_order::orders(objective.model(), objective.schedule())?,
         };
         scheduling::check_materialization(source, selected, &order)
+    }
+}
+
+/// Prepare explicit choices through the same implementation path used by tuning.
+/// No hardware timings or native compilation are needed to construct this IR.
+pub fn prepare(function: &LoweredIr, path: &[usize]) -> Result<Preparation<ScalarProgram>, String> {
+    if function.backend != "cpu" {
+        return Err("CPU preparation requires CPU Lowered IR".into());
+    }
+    match seismic_lang::normalize::loads::expand(function, path)? {
+        seismic_lang::normalize::loads::Expansion::Choice(choice) => Ok(Preparation::Choice {
+            name: format!("load site {} (variable {})", choice.site, choice.variable),
+            alternatives: seismic_accounting::selection::Domain::new(choice)?,
+        }),
+        seismic_lang::normalize::loads::Expansion::Selected { function, consumed } => {
+            if path.len() != consumed {
+                return Err("unused CPU decisions".into());
+            }
+            Ok(Preparation::Execution(crate::prepare_resolved(&function)?))
+        }
     }
 }

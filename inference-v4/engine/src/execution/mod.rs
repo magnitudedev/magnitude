@@ -1,13 +1,10 @@
 //! Resident bindings for checked numerical compositions. Model policy chooses
 //! parameters; this owner validates their contracts and retains scratch/code.
 use crate::weights::residency::ResidentWeight;
-use seismic_lang::{
-    plan::plan_specialized,
-    types::{Elem, Ty},
-};
+use seismic_lang::types::{Elem, Ty};
 use seismic_runtime::{
-    plan::{Bindings, CompiledPlan, PlanCompiler, StepObservation, Submission},
     Buffer,
+    plan::{Bindings, CompiledPlan, PlanCompiler, StepObservation, Submission},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -77,7 +74,7 @@ impl Composition {
                     }
                 }
                 concrete if concrete != weight.element() => {
-                    return Err(format!("weight {name} has wrong element type"))
+                    return Err(format!("weight {name} has wrong element type"));
                 }
                 _ => {}
             }
@@ -128,7 +125,9 @@ impl Composition {
                 (matches!(ty, Ty::Scalar(_)) && !scalars.contains_key(name)).then_some(name.clone())
             })
             .collect::<HashSet<_>>();
-        let plan = plan_specialized(compiler.program(), &entry, &shapes, &elements)?;
+        let ownership = seismic_lang::composition::Ownership {
+            intermediates: intermediates.iter().cloned().collect(),
+        };
         let mut scratch = HashMap::new();
         for (name, ty) in &function.params {
             if weights.contains_key(name) || external.contains(name) {
@@ -152,7 +151,7 @@ impl Composition {
             }
         }
         Ok(Self {
-            plan: compiler.compile(&plan)?,
+            plan: compiler.compile_entry(&entry, &shapes, &elements, &ownership)?,
             weights,
             scratch,
             external,

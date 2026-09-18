@@ -53,6 +53,7 @@ pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
             libraries: Vec::new(),
             domain: WorkDomain {
                 work_items: program.work_items,
+                lanes_per_item: program.participation.lanes(),
                 dispatch: program.dispatch,
                 scratch_bytes_per_item: program.scratch_bytes,
             },
@@ -142,7 +143,7 @@ pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
         Comparison::GreaterEqual,
         DataType::U64,
         linear.into(),
-        Operand::Unsigned(program.work_items),
+        Operand::Unsigned(program.work_items.checked_mul(u64::from(program.participation.lanes())).ok_or("CUDA participant count overflow")?),
     );
     builder.predicated(Operation::Return, false);
     builder.origin = Origin::InvocationAbi;
@@ -190,7 +191,9 @@ pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
         });
     }
     if program.dispatch == Dispatch::ParallelRoot {
-        builder.mov(DataType::U64, builder.value(params[3]), linear.into());
+        if program.participation.lanes() > 1 {
+            builder.binary_op(Binary::Divide, DataType::U64, Rounding::Default, builder.value(params[3]), linear.into(), Operand::Unsigned(u64::from(program.participation.lanes())));
+        } else { builder.mov(DataType::U64, builder.value(params[3]), linear.into()); }
         builder.binary_op(
             Binary::Multiply(Multiply::Low),
             DataType::U64,
@@ -521,6 +524,42 @@ impl Builder<'_> {
                 self.mov(bits(t), output()?, self.value(*arg).into())
             }
             D::Call { func_ref, .. } => {
+                if let Some((_, operation)) = self.program.backend_calls.iter().find(|(reference,_)|reference==func_ref) {
+                    let args=self.f.dfg.inst_args(inst);
+                    match operation {
+                        seismic_realization::ParticipantOperation::LaneIndex => {
+                            if !args.is_empty() || t != types::I32 { return Err("invalid lane-index call ABI".into()); }
+                            self.mov(DataType::U32, output()?, Operand::Special(SpecialRegister::LaneIndex));
+                        }
+                        seismic_realization::ParticipantOperation::ShuffleIndex => {
+                            if args.len()!=2 || t!=types::F32 || self.f.dfg.value_type(args[0])!=types::F32 || self.f.dfg.value_type(args[1])!=types::I32 {return Err("shuffle-index requires f32 value and i32 lane".into());}
+                            let source=self.temp(types::I32)?;let result=self.temp(types::I32)?;
+                            self.mov(DataType::B32,source,self.value(args[0]).into());
+                            self.push(Operation::Shuffle{mode:ShuffleMode::Index,destination:result,source,lane:self.value(args[1]).into()});
+                            self.mov(DataType::B32,output()?,result.into());
+                        }
+                        seismic_realization::ParticipantOperation::Reduce(seismic_lang::ir::ReduceOp::Sum) => {
+                            if args.len()!=1 || t!=types::F32 || self.f.dfg.value_type(args[0])!=types::F32 { return Err("warp sum requires f32 input and output".into()); }
+                            let accumulator=self.temp(types::F32)?;
+                            self.mov(DataType::F32,accumulator,self.value(args[0]).into());
+                            for delta in [16,8,4,2,1] {
+                                let input=self.temp(types::I32)?;let exchange=self.temp(types::I32)?;let received=self.temp(types::F32)?;
+                                self.mov(DataType::B32,input,accumulator.into());
+                                self.push(Operation::Shuffle{mode:ShuffleMode::Butterfly,destination:exchange,source:input,lane:Operand::Unsigned(delta)});
+                                self.mov(DataType::B32,received,exchange.into());
+                                self.binary_op(Binary::Add,DataType::F32,Rounding::NearestEven,accumulator,accumulator.into(),received.into());
+                            }
+                            // Uniform source results include NaN payloads: publish the
+                            // same lane-zero tree result to every participant.
+                            let input=self.temp(types::I32)?;let broadcast=self.temp(types::I32)?;
+                            self.mov(DataType::B32,input,accumulator.into());
+                            self.push(Operation::Shuffle{mode:ShuffleMode::Index,destination:broadcast,source:input,lane:Operand::Unsigned(0)});
+                            self.mov(DataType::B32,output()?,broadcast.into());
+                        }
+                        _=>return Err("participant operation has no selected PTX implementation".into()),
+                    }
+                    return Ok(());
+                }
                 let (_, math) = self
                     .program
                     .imports
@@ -668,6 +707,10 @@ impl Builder<'_> {
     ) -> Result<(), String> {
         if op == O::Srem {
             return self.signed_remainder(out, t, a, b);
+        }
+        if op == O::IrsubImm {
+            self.binary_op(Binary::Subtract, uint(t), Rounding::Default, out, b, a);
+            return Ok(());
         }
         let (operation, data_type, rounding) = match op {
             O::Iadd | O::IaddImm => (Binary::Add, uint(t), Rounding::Default),

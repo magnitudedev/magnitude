@@ -1,12 +1,12 @@
 //! Portable-algorithm work derived from checked IR. These are semantic operations,
-//! not issued instructions or necessary lower-bound obligations. A stream is taken
-//! as one whole-axis piece, matching reference semantics; splitting is realization work.
+//! not issued instructions or necessary lower-bound obligations. Compiler-selected
+//! iteration and transfers belong to execution accounting.
 
 use crate::quantity::Count;
 use seismic_lang::ast::{AssignOp, BinaryOp};
 use seismic_lang::ir::*;
 use seismic_lang::program::Program;
-use seismic_lang::sym::{Atom, Sym};
+use seismic_lang::sym::Sym;
 use seismic_lang::types::{DType, Elem, Ty};
 use std::collections::HashMap;
 
@@ -215,6 +215,14 @@ impl Walker<'_> {
         }
         for s in stmts {
             match &s.kind {
+                StmtKind::Reduction(r) => {
+                    for e in r.operands() {self.expr(e,f,b,mult);}
+                    let merges=Count::multiply(mult,&count(r.extent(),b));
+                    // Semantic work follows the source accumulation. Target execution
+                    // accounts include its selected segment and merge realization.
+                    let body=r.step.as_ref().and_then(|s|s.implementation.as_ref()).map_or_else(||r.body(),|m|m.body.as_slice());
+                    self.block(body,f,b,&merges);
+                }
                 StmtKind::Parallel { extents, body, .. } => {
                     let n = extents
                         .iter()
@@ -234,52 +242,8 @@ impl Walker<'_> {
                     };
                     self.block(body, f, b, &Count::multiply(mult, &n));
                 }
-                StmtKind::LoadLoop {
-                    views,
-                    axis,
-                    piece,
-                    body,
-                    ..
-                } => {
-                    let mut inner = b.clone();
-                    let mut extent = None;
-                    for view in views {
-                        self.expr(view, f, b, mult);
-                        let n = view
-                            .ty
-                            .shaped()
-                            .and_then(|t| t.shape.get(*axis))
-                            .and_then(|s| s.eval(&|p| b.shapes.get(p).copied()));
-                        match (extent, n) {
-                            (Some(a), Some(v)) if a != v => self
-                                .account
-                                .unavailable
-                                .push(format!("inconsistent stream extents in {}", f.name)),
-                            (_, Some(v)) => extent = Some(v),
-                            _ => {
-                                self.account.unavailable.push(format!(
-                                    "runtime stream extent in {} at {}",
-                                    f.name, s.span.start
-                                ));
-                            }
-                        }
-                    }
-                    if let (Atom::Param(name), Some(n)) = (piece, extent) {
-                        inner.shapes.insert(name.clone(), n);
-                    }
-                    if extent != Some(0) {
-                        if extent.is_none() {
-                            self.conditions.push(format!(
-                                "{}:{} stream axis is nonempty",
-                                f.name, s.span.start
-                            ));
-                        }
-                        self.block(body, f, &inner, mult);
-                        if extent.is_none() {
-                            self.conditions.pop();
-                        }
-                    }
-                }
+                StmtKind::LoadLoop { .. } => self.account.unavailable.push(
+                    "compiler-selected iteration belongs to execution accounting, not portable work".into()),
                 StmtKind::If { cond, then, els } => {
                     self.expr(cond, f, b, mult);
                     if let ExprKind::Bool(value) = cond.kind {
@@ -371,6 +335,11 @@ impl Walker<'_> {
     }
 
     fn expr(&mut self, e: &Expr, f: &Function, b: &Bindings, mult: &Count) {
+        if let Some(r)=seismic_lang::reduction::structured::Reduction::from_expr(e) {
+            for operand in r.operands() {self.expr(operand,f,b,mult);}
+            self.expr(r.step.as_ref().map_or(&r.merge,|s|&s.call),f,b,&Count::multiply(mult,&count(r.extent(),b)));
+            return;
+        }
         match &e.kind {
             ExprKind::Call {
                 callee,

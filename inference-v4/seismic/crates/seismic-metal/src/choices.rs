@@ -12,15 +12,19 @@ use std::cell::RefCell;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
+    Fold(crate::execution::FoldChoice),
     Load(loads::Choice),
     Storage(crate::storage::StorageDecision),
     Reduction(crate::reduction::Decision),
+    Allocation(crate::memory::AllocationChoices),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alternative {
+    Fold(crate::execution::FoldOwnership),
     Load(LoadMode),
     Storage(TilePlacement),
     Reduction(Algorithm),
+    Allocation(usize),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Domain {
@@ -30,28 +34,43 @@ impl Choices for Domain {
     type Alternative = Alternative;
     fn len(&self) -> usize {
         match &self.decision {
+            Decision::Fold(choice) => choice.len(),
             Decision::Load(choice) => choice.modes().len(),
             Decision::Storage(choice) => choice.alternatives.len(),
             Decision::Reduction(choice) => choice.domain.algorithms().len(),
+            Decision::Allocation(choice) => choice.len(),
         }
     }
     fn get(&self, index: usize) -> Option<Alternative> {
         match &self.decision {
+            Decision::Fold(choice) => choice.get(index).map(Alternative::Fold),
             Decision::Load(choice) => choice.modes().get(index).copied().map(Alternative::Load),
-            Decision::Storage(choice) => choice.alternatives.get(index).cloned().map(Alternative::Storage),
-            Decision::Reduction(choice) => choice.domain.algorithms().get(index).copied().map(Alternative::Reduction),
+            Decision::Storage(choice) => choice
+                .alternatives
+                .get(index)
+                .cloned()
+                .map(Alternative::Storage),
+            Decision::Reduction(choice) => choice
+                .domain
+                .algorithms()
+                .get(index)
+                .copied()
+                .map(Alternative::Reduction),
+            Decision::Allocation(choice) => choice.get(index).map(Alternative::Allocation),
         }
     }
 }
 impl Domain {
     pub fn diagnostic(&self, loads: seismic_realization::LoadStrategy) -> Alternative {
         match &self.decision {
+            Decision::Fold(_) => Alternative::Fold(crate::execution::FoldOwnership::Serial),
             Decision::Load(_) => Alternative::Load(match loads {
                 seismic_realization::LoadStrategy::Materialize => LoadMode::Materialize,
                 seismic_realization::LoadStrategy::BorrowProvenReadOnly => LoadMode::Borrow,
             }),
             Decision::Storage(choice) => Alternative::Storage(choice.diagnostic()),
             Decision::Reduction(choice) => Alternative::Reduction(choice.diagnostic()),
+            Decision::Allocation(choice) => Alternative::Allocation(choice.new_slot),
         }
     }
     pub fn index(&self, alternative: &Alternative) -> Option<usize> {
@@ -74,6 +93,14 @@ pub enum Expansion {
 /// The prefix selects indices in freshly derived domains. Storage choices can
 /// change later reduction domains; those domains are not precomputed separately.
 pub fn expand(function: &LoweredIr, config: Config, prefix: &[usize]) -> Result<Expansion, String> {
+    expand_with_mappings(function, config, None, prefix)
+}
+pub fn expand_with_mappings(
+    function: &LoweredIr,
+    config: Config,
+    mappings: Option<&[seismic_realization::dispatch::WorkMapping]>,
+    prefix: &[usize],
+) -> Result<Expansion, String> {
     struct Replay<'a> {
         prefix: &'a [usize],
         consumed: usize,
@@ -91,10 +118,9 @@ pub fn expand(function: &LoweredIr, config: Config, prefix: &[usize]) -> Result<
                 self.pending = Some(domain);
                 return Err("execution preparation suspended at an unresolved decision".into());
             };
-            let selected =
-                domain.get(*index).ok_or_else(|| {
-                    format!("choice index {index} is outside {:?}", domain.decision)
-                })?;
+            let selected = domain
+                .get(*index)
+                .ok_or_else(|| format!("choice index {index} is outside {:?}", domain.decision))?;
             self.consumed += 1;
             Ok(selected)
         }
@@ -110,13 +136,25 @@ pub fn expand(function: &LoweredIr, config: Config, prefix: &[usize]) -> Result<
     // Derive actual arrays first. Capacity exclusion below is explicit evidence,
     // rather than turning a compiler error string into permission to prune.
     unbounded_storage.max_threadgroup_bytes = i64::MAX;
-    let result = crate::execution::prepare_with_choices(
+    let result = crate::execution::prepare_with_participants(
         function,
         unbounded_storage,
+        mappings,
+        &mut |decision| match replay.borrow_mut().select(Domain {
+            decision: Decision::Fold(decision.clone()),
+        })? {
+            Alternative::Fold(ownership) => Ok(ownership),
+            _ => unreachable!("fold domain contains only ownerships"),
+        },
         &mut |site, load| {
-            if !load.can_borrow { return Ok(LoadMode::Materialize); }
+            if !load.can_borrow {
+                return Ok(LoadMode::Materialize);
+            }
             match replay.borrow_mut().select(Domain {
-                decision: Decision::Load(loads::Choice { site, variable: load.variable }),
+                decision: Decision::Load(loads::Choice {
+                    site,
+                    variable: load.variable,
+                }),
             })? {
                 Alternative::Load(mode) => Ok(mode),
                 _ => unreachable!("load domain contains only modes"),
@@ -133,6 +171,17 @@ pub fn expand(function: &LoweredIr, config: Config, prefix: &[usize]) -> Result<
         })? {
             Alternative::Reduction(algorithm) => Ok(algorithm),
             _ => unreachable!("reduction domain contains only algorithms"),
+        },
+        &mut |decision| {
+            if decision.len() == 1 {
+                return Ok(decision.new_slot);
+            }
+            match replay.borrow_mut().select(Domain {
+                decision: Decision::Allocation(decision.clone()),
+            })? {
+                Alternative::Allocation(slot) => Ok(slot),
+                _ => unreachable!("allocation domain contains only backing slots"),
+            }
         },
     );
     let replay = replay.into_inner();

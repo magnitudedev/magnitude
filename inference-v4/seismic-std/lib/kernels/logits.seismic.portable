@@ -3,6 +3,7 @@ fn logits[N, K](x: tensor[1, K] bf16, w: tensor[N, K] q4g64, out: tensor[1, N] f
   for col in parallel:
     acc = tile[1, 1] f32
     for i, j in owned(acc): acc[i, j] = 0.0
-    for xt, wt in load((x, w[col : col + 1]), over=1):
-      matmul(xt, wt, acc)
+    xt = load(x)
+    wt = load(w[col : col + 1])
+    matmul(xt, wt, acc)
     store(acc, out[0 : 1, col : col + 1])

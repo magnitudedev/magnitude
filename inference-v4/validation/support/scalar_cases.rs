@@ -24,7 +24,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
             .collect::<Vec<_>>()
     };
     let mut empty = [bytes(vec![7.0]), bytes(vec![9.0])];
-    run(&lower("empty_stream"), &mut empty, &[]);
+    run(&lower("empty_window"), &mut empty, &[]);
     assert_eq!(
         empty[1],
         bytes(vec![0.0]),
@@ -205,9 +205,9 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     );
     assert_eq!(float(&buffers[0]), 16.0, "mixed-width scalar ABI");
 
-    for name in ["large_snapshot", "stream_snapshot"] {
+    for name in ["large_snapshot", "snapshot_reduction"] {
         let input = (0..65).map(|i| i as f32 - 31.0).collect::<Vec<_>>();
-        let expected = if name == "stream_snapshot" {
+        let expected = if name == "snapshot_reduction" {
             input.iter().sum::<f32>().to_le_bytes().to_vec()
         } else {
             input
@@ -236,13 +236,13 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         .collect::<Vec<_>>();
     let mut buffers = [input.clone(), vec![255; 4]];
     run(
-        &seismic_lang::lower::lower(&program, "stream_mutation", backend, &HashMap::new()).unwrap(),
+        &seismic_lang::lower::lower(&program, "loaded_mutation", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
     );
     assert_eq!(
         buffers[0], input,
-        "stream tile mutation must not affect tensor backing"
+        "loaded tile mutation must not affect tensor backing"
     );
     assert_eq!(buffers[1], vec![0; 4]);
     let mut buffers = [0x3c01u16.to_le_bytes().to_vec(), vec![0; 4]];

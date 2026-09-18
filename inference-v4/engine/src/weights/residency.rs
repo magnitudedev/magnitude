@@ -107,17 +107,16 @@ impl Importer {
                     return Err(invalid("block weight geometry or transform is unsupported"));
                 }
                 let (entry, representation) = match encoding {
-                    Encoding::Q4K => ("import_q4k", "q4g32"),
-                    Encoding::Q5K => ("import_q5k", "q8g32a"),
-                    Encoding::Q6K => ("import_q6k", "q8g16z32"),
+                    Encoding::Q4K => ("import_q4k", "q4k"),
+                    Encoding::Q5K => ("import_q5k", "q5k"),
+                    Encoding::Q6K => ("import_q6k", "q6k"),
                     Encoding::Q8_0 => ("import_q8_0", "q8g32s"),
                     Encoding::Iq4Xs => ("import_iq4_xs", "iq4g32"),
                     _ => return Err(invalid("dense encoding cannot use block import")),
                 };
                 let repr = seismic_lang::repr::lookup(representation).unwrap();
                 if descriptor.shape.last().is_none_or(|n| {
-                    !n.is_multiple_of(u64::from(repr.group))
-                        || !n.is_multiple_of(u64::from(repr.codes_per_word()))
+                    !n.is_multiple_of(u64::from(repr.storage_group()))
                 }) {
                     return Err(invalid("resident packed row geometry is invalid"));
                 }
@@ -163,23 +162,13 @@ impl Importer {
                             .map_err(invalid)?,
                     );
                 }
-                let words = self
-                    .device
-                    .buffer(count / repr.codes_per_word() as usize * 4)
-                    .map_err(invalid)?;
-                let scale = self
-                    .device
-                    .buffer(count / repr.group as usize * repr.coefficient.bytes() as usize)
-                    .map_err(invalid)?;
-                let mut buffers = vec![input.clone(), input, words.clone(), scale.clone()];
-                let mut planes = BTreeMap::from([("words".into(), words), ("scale".into(), scale)]);
-                if repr.has_bias {
-                    let bias = self
-                        .device
-                        .buffer(count / repr.group as usize * repr.coefficient.bytes() as usize)
-                        .map_err(invalid)?;
-                    buffers.push(bias.clone());
-                    planes.insert("bias".into(), bias);
+                let mut buffers = vec![input.clone(), input];
+                let mut planes = BTreeMap::new();
+                for plane in repr.planes() {
+                    let size = plane.bytes(count as u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid("packed plane byte size overflow"))?;
+                    let buffer = self.device.buffer(size).map_err(invalid)?;
+                    buffers.push(buffer.clone());
+                    planes.insert(plane.name.into(), buffer);
                 }
                 self.block_kernels
                     .get_mut(&key)

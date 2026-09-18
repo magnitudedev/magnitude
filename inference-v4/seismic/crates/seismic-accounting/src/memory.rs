@@ -24,7 +24,7 @@ pub struct Backing {
 }
 
 /// Parameter/plane -> backing. Dense tensors use the empty plane name. Packed
-/// tensors use `words`, `scale`, `bias`. Omitted bindings get distinct diagnostic
+/// tensors use the physical planes declared by their representation. Omitted bindings get distinct diagnostic
 /// parameter/plane identities. This assumption is not an alias proof or an actual
 /// invocation binding and must never supply necessary physical-demand evidence.
 pub type Bindings = HashMap<(String, String), Backing>;
@@ -119,8 +119,8 @@ pub fn derive_specialized(
             if let Elem::Repr(name) = &elem {
                 let r =
                     repr::lookup(name).ok_or_else(|| format!("unknown representation `{name}`"))?;
-                if shape.last().is_none_or(|n| n % u64::from(r.group) != 0) {
-                    return Err(format!("packed tensor `{parameter}` requires complete groups of {} on its last axis", r.group));
+                if shape.last().is_none_or(|n| n % u64::from(r.storage_group()) != 0) {
+                    return Err(format!("packed tensor `{parameter}` requires complete groups of {} on its last axis", r.storage_group()));
                 }
             }
             let mut strides = vec![1; shape.len()];
@@ -338,6 +338,7 @@ fn tensor_expr(e: &Expr) -> bool {
 
 fn tensor_body(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
+        StmtKind::Reduction(r) => r.operands().any(tensor_expr) || r.bodies().any(tensor_body),
         StmtKind::Expr(e) => tensor_expr(e),
         StmtKind::Assign { target, value, .. } => tensor_expr(target) || tensor_expr(value),
         StmtKind::If { cond, then, els } => {
@@ -418,6 +419,12 @@ impl Walker<'_> {
     fn stmt(&mut self, s: &Stmt, f: &Function, frame: &mut Frame) -> Result<(), String> {
         self.tick()?;
         match &s.kind {
+            StmtKind::Reduction(r) => {
+                for e in r.operands() {self.expr(e,f,frame)?;}
+                // A checked merge accepts only local tile state, so it has no
+                // tensor publication. Tensor reads needed to form operands are above.
+                if r.bodies().any(tensor_body) {return Err("retained merge unexpectedly accesses tensor storage".into());}
+            }
             StmtKind::Parallel {
                 vars,
                 extents,
@@ -465,38 +472,8 @@ impl Walker<'_> {
                     self.loops(&[*var], &[(lo, hi)], body, f, frame)?;
                 }
             }
-            StmtKind::LoadLoop {
-                views,
-                axis,
-                piece,
-                body,
-                ..
-            } => {
-                let mut n = None;
-                for e in views {
-                    self.expr(e, f, frame)?;
-                    let v = view(e, frame)?;
-                    self.touch(&v, Mode::Read)?;
-                    let current = *v.shape.get(*axis).ok_or("stream axis out of range")?;
-                    if n.is_some_and(|n| n != current) {
-                        return Err("stream extents disagree".into());
-                    }
-                    n = Some(current);
-                }
-                if n == Some(0) {
-                    return Ok(());
-                }
-                let Atom::Param(name) = piece else {
-                    return Err("unresolved stream piece".into());
-                };
-                let mut inner = frame.clone();
-                inner.env.insert(
-                    name.clone(),
-                    i64::try_from(n.ok_or("stream has no views")?)
-                        .map_err(|_| "stream extent overflow")?,
-                );
-                self.block(body, f, &mut inner)?;
-            }
+            StmtKind::LoadLoop { .. } => return Err(
+                "compiler-selected iteration requires execution memory analysis".into()),
             StmtKind::If { cond, then, els } => {
                 self.expr(cond, f, frame)?;
                 match condition(cond, frame) {
@@ -695,39 +672,20 @@ impl Walker<'_> {
         Ok(())
     }
     fn span(&mut self, v: &View, start: u64, len: u64, mode: Mode) -> Result<(), String> {
+        if len == 0 { return Ok(()); }
         let end = start.checked_add(len).ok_or("region extent overflow")?;
         match &v.elem {
             Elem::Dtype(d) => self.plane(&v.parameter, "", start, end, d.bytes() as u64, mode),
             Elem::Repr(name) => {
                 let r =
                     repr::lookup(name).ok_or_else(|| format!("unknown representation `{name}`"))?;
-                let cpw = r.codes_per_word() as u64;
-                let group = r.group as u64;
-                self.plane(
-                    &v.parameter,
-                    "words",
-                    start / cpw,
-                    end.div_ceil(cpw),
-                    4,
-                    mode,
-                )?;
-                self.plane(
-                    &v.parameter,
-                    "scale",
-                    start / group,
-                    end.div_ceil(group),
-                    r.coefficient.bytes() as u64,
-                    mode,
-                )?;
-                if r.has_bias {
-                    self.plane(
-                        &v.parameter,
-                        "bias",
-                        start / group,
-                        end.div_ceil(group),
-                        r.coefficient.bytes() as u64,
-                        mode,
-                    )?;
+                for plane in r.planes() {
+                    let group = u64::from(plane.group);
+                    let bits = u64::from(plane.entry_bits());
+                    let first = (start / group).checked_mul(u64::from(plane.fields)).and_then(|n| n.checked_mul(bits)).ok_or("packed region overflow")?;
+                    let last = end.div_ceil(group).checked_mul(u64::from(plane.fields)).and_then(|n| n.checked_mul(bits)).ok_or("packed region overflow")?;
+                    let storage_bits = u64::from(plane.dtype().bytes()) * 8;
+                    self.plane(&v.parameter, plane.name, first / storage_bits, last.div_ceil(storage_bits), storage_bits / 8, mode)?;
                 }
                 Ok(())
             }

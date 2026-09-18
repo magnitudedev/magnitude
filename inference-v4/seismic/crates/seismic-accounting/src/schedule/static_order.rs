@@ -86,6 +86,37 @@ pub fn fits(model: &Model, starts: &[Option<u64>]) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Project the same common-order constraint onto interval assignments. A
+/// direction is removed only when some pair of roots cannot satisfy it anywhere
+/// in their intervals. Forced directions then apply to every dynamic visit.
+pub(super) fn interval_edges(
+    model: &Model,
+    starts: &[(u64, u64)],
+) -> Result<Option<Vec<(usize, usize)>>, String> {
+    if starts.len() != model.operations.len() {
+        return Err("static-order interval arity differs from model".into());
+    }
+    let mut result = Vec::new();
+    for constraint in &model.static_orders {
+        let Some(edges) = relations(constraint, |index| starts.get(index).copied())? else {
+            return Ok(None);
+        };
+        if topological(constraint.instructions.len(), &edges).is_none() {
+            return Ok(None);
+        }
+        for visit in &constraint.visits {
+            for &(before, after) in &edges {
+                for &a in &visit.roots[before] {
+                    for &b in &visit.roots[after] {
+                        result.push((a, b));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(result))
+}
+
 /// Independently checks the complete timing witness before selecting its common
 /// static orders. Equal-time ties use source index solely for determinism.
 pub fn orders(model: &Model, schedule: &Schedule) -> Result<Vec<BlockOrder>, String> {
@@ -109,6 +140,18 @@ pub fn orders(model: &Model, schedule: &Schedule) -> Result<Vec<BlockOrder>, Str
 }
 
 fn resolve(constraint: &Constraint, starts: &[Option<u64>]) -> Result<Option<Vec<usize>>, String> {
+    let edges = relations(constraint, |index| {
+        starts
+            .get(index)
+            .map(|value| value.map_or((0, u64::MAX), |n| (n, n)))
+    })?;
+    Ok(edges.and_then(|edges| topological(constraint.instructions.len(), &edges)))
+}
+
+fn relations(
+    constraint: &Constraint,
+    bounds: impl Fn(usize) -> Option<(u64, u64)>,
+) -> Result<Option<BTreeSet<(usize, usize)>>, String> {
     let mut edges: BTreeSet<_> = constraint.predecessors.iter().copied().collect();
     let count = constraint.instructions.len();
     for left in 0..count {
@@ -126,12 +169,10 @@ fn resolve(constraint: &Constraint, starts: &[Option<u64>]) -> Result<Option<Vec
                     .ok_or("invalid static-order visit arity")?;
                 for &a in left_roots {
                     for &b in right_roots {
-                        let a = starts.get(a).ok_or("invalid static-order issue root")?;
-                        let b = starts.get(b).ok_or("invalid static-order issue root")?;
-                        if let (Some(a), Some(b)) = (a, b) {
-                            left_first &= a <= b;
-                            right_first &= b <= a;
-                        }
+                        let a = bounds(a).ok_or("invalid static-order issue root")?;
+                        let b = bounds(b).ok_or("invalid static-order issue root")?;
+                        left_first &= a.0 <= b.1;
+                        right_first &= b.0 <= a.1;
                     }
                 }
             }
@@ -147,7 +188,7 @@ fn resolve(constraint: &Constraint, starts: &[Option<u64>]) -> Result<Option<Vec
             }
         }
     }
-    Ok(topological(count, &edges))
+    Ok(Some(edges))
 }
 fn topological(count: usize, edges: &BTreeSet<(usize, usize)>) -> Option<Vec<usize>> {
     let mut incoming = vec![0usize; count];

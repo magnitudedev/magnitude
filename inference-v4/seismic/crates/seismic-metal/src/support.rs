@@ -172,7 +172,7 @@ fn failure(condition: Expression, result: Type) -> Statement {
     }
 }
 impl Definition {
-    fn new(helper: Helper) -> Self {
+    pub(crate) fn new(helper: Helper) -> Self {
         use Binary::*;
         use Type::*;
         let status = ("status", StatusPointer);
@@ -377,13 +377,16 @@ impl Definition {
             ),
             Helper::Validate => (
                 "seismic_validate",
-                Void,
+                Bool,
                 vec![("valid", Bool), status],
                 false,
-                vec![Statement::If {
-                    condition: binary(Equal, v("valid"), Expression::Bool(false)),
-                    body: vec![Statement::FailureStatus],
-                }],
+                vec![
+                    Statement::If {
+                        condition: binary(Equal, v("valid"), Expression::Bool(false)),
+                        body: vec![Statement::FailureStatus],
+                    },
+                    ret(v("valid")),
+                ],
             ),
         };
         Self {
@@ -597,9 +600,11 @@ mod tests {
                 .count(),
             3
         );
-        assert!(recipe
-            .instantiate(&GroupDispatch::new(19, 32, 4).unwrap())
-            .is_err());
+        assert!(
+            recipe
+                .instantiate(&GroupDispatch::new(19, 32, 4).unwrap())
+                .is_err()
+        );
     }
     #[test]
     fn zero_domain_never_evaluates_axis_division_and_large_coordinates_reject() {
@@ -614,9 +619,11 @@ mod tests {
         )));
         let recipe =
             LaunchRecipe::new(WorkMapping::new(&[u32::MAX as u64], &[1]).unwrap(), 1).unwrap();
-        assert!(recipe
-            .instantiate(&GroupDispatch::new(u32::MAX as u64, 32, 4).unwrap())
-            .is_err());
+        assert!(
+            recipe
+                .instantiate(&GroupDispatch::new(u32::MAX as u64, 32, 4).unwrap())
+                .is_err()
+        );
     }
 }
 

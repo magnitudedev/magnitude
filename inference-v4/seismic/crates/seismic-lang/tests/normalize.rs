@@ -195,8 +195,18 @@ fn stream_modes_are_selected_before_emission_and_respect_mutation() {
         ("for i in owned(t): t[i] = 0.0", LoadMode::Materialize),
         ("store(load(out),out)", LoadMode::Materialize),
     ] {
-        let mut p = program(&format!("fn evaluate(x: tensor[4] f32, out: tensor[4] f32):\n  for t in load(x, over=0):\n    {use_tile}\n"));
+        let mut p = program(&format!("fn evaluate(x: tensor[4] f32, out: tensor[4] f32):\n  t = load(x)\n  {use_tile}\n"));
         let f = &mut p.functions[0];
+        // Exercise the execution node directly; it is never authored in source.
+        let load = f.body.remove(0);
+        let StmtKind::Assign {target, value, ..} = load.kind else {panic!()};
+        let seismic_lang::ir::ExprKind::Var(binding) = target.kind else {panic!()};
+        let seismic_lang::ir::ExprKind::Builtin {args,..} = value.kind else {panic!()};
+        let body = std::mem::take(&mut f.body);
+        f.body.push(seismic_lang::ir::Stmt {id:None, span:load.span, kind:StmtKind::LoadLoop {
+            domain:seismic_lang::ir::IterationDomain{view:args[0].clone(),axis:0}, offset:None, modes:None, vars:vec![binding], views:args, axes:vec![0],
+            piece:seismic_lang::sym::Atom::Param("$fixture_piece".into()), capacity:Some(4), body,
+        }});
         let StmtKind::LoadLoop { modes, .. } = &f.body[0].kind else {
             panic!("expected stream")
         };

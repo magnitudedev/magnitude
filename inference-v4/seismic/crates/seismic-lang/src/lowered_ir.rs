@@ -11,6 +11,9 @@ use std::collections::HashMap;
 pub struct LoweredIr {
     pub name: String,
     pub backend: String,
+    pub ownership: crate::composition::Ownership,
+    /// Source parallel binding requirements, retained before output regrouping.
+    pub alias_requirements: Vec<AliasRequirement>,
     pub params: Vec<(String, Ty)>,
     pub index_params: Vec<(String, Sym)>,
     pub vars: Vec<Var>,
@@ -21,6 +24,15 @@ pub struct LoweredIr {
     pub selections: Vec<Selection>,
     /// Validated decisions that produced this expanded program.
     pub decisions: Vec<DecisionRecord>,
+}
+
+/// Parameter ordinals whose storage must be disjoint unless their exact typed
+/// per-item regions were proved equal in the source computation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasRequirement {
+    pub left: usize,
+    pub right: usize,
+    pub exact_allowed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +62,9 @@ pub struct Decision {
 pub enum Alternatives {
     Explicit(Vec<Alternative>),
     StreamCapacities(StreamCapacities),
+    OutputWidths { maximum: i64 },
+    ReductionCuts { first: i64, last: i64 },
+    ReductionSegments { maximum: i64 },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamCapacities {
@@ -60,28 +75,45 @@ impl From<Vec<Alternative>> for Alternatives {
     fn from(values: Vec<Alternative>) -> Self { Self::Explicit(values) }
 }
 impl Alternatives {
+    pub fn output_widths(maximum: i64) -> Result<Self, String> {
+        if maximum <= 0 || usize::try_from(maximum).is_err() {
+            return Err("invalid independent output extent".into());
+        }
+        Ok(Self::OutputWidths { maximum })
+    }
+    pub fn reduction_segments(maximum:i64)->Result<Self,String> {if maximum<=0 || usize::try_from(maximum).is_err(){return Err("invalid fold segment extent".into());} Ok(Self::ReductionSegments{maximum})}
+    pub fn reduction_cuts(first: i64, last: i64) -> Result<Self,String> {
+        if first < 1 || first > last || usize::try_from(last-first+1).is_err() {return Err("invalid reduction cut domain".into());}
+        Ok(Self::ReductionCuts{first,last})
+    }
     pub fn stream_capacities(maximum: i64) -> Result<Self, String> {
         if maximum <= 0 { return Err("stream domain must have a positive capacity".into()); }
         let count = usize::try_from(maximum).map_err(|_| "stream domain cardinality overflow")?;
         Ok(Self::StreamCapacities(StreamCapacities { maximum, count }))
     }
     pub fn len(&self) -> usize {
-        match self { Self::Explicit(v) => v.len(), Self::StreamCapacities(r) => r.count }
+        match self { Self::OutputWidths { maximum } => *maximum as usize, Self::ReductionSegments{maximum}=>*maximum as usize, Self::Explicit(v) => v.len(), Self::StreamCapacities(r) => r.count, Self::ReductionCuts{first,last} => (last-first+1) as usize }
     }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     pub fn get(&self, index: usize) -> Option<Alternative> {
         match self {
             Self::Explicit(v) => v.get(index).cloned(),
+            Self::OutputWidths { maximum } if index < *maximum as usize => Some(Alternative::OutputWidth(index as i64 + 1)),
+            Self::ReductionSegments{maximum} if index<*maximum as usize=>Some(Alternative::ReductionSegment(*maximum-index as i64)),
             // Whole-axis is the diagnostic baseline. Enumeration order is not
             // a performance preference and the tuner must cover every value.
             Self::StreamCapacities(r) if index < r.count => Some(Alternative::StreamCapacity(r.maximum - index as i64)),
+            Self::ReductionCuts{first,last} if index < (last-first+1) as usize => Some(Alternative::ReductionCut(first+index as i64)),
             _ => None,
         }
     }
     pub fn contains(&self, alternative: &Alternative) -> bool {
         match (self, alternative) {
             (Self::Explicit(v), a) => v.contains(a),
+            (Self::OutputWidths { maximum }, Alternative::OutputWidth(n)) => (1..=*maximum).contains(n),
+            (Self::ReductionSegments{maximum},Alternative::ReductionSegment(n))=>(1..=*maximum).contains(n),
             (Self::StreamCapacities(r), Alternative::StreamCapacity(n)) => (1..=r.maximum).contains(n),
+            (Self::ReductionCuts{first,last}, Alternative::ReductionCut(n)) => (*first..=*last).contains(n),
             _ => false,
         }
     }
@@ -95,6 +127,14 @@ impl Alternatives {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecisionKind {
+    OutputGroup { coordinate: VarId, extent: i64, construct: String, parameter: String },
+    Representation { variable: VarId },
+    ReductionSegments {extent:i64},
+    Intermediate { variable: VarId, publication: usize },
+    ReductionBranch { start: i64, end: i64, fields: Vec<Ty> },
+    Reduction { merge: String, extent: Sym, fields: Vec<Ty> },
+    ParallelFusion { boundary: usize, other: usize, left_domain: Vec<Sym>, right_domain: Vec<Sym> },
+    StreamFusion { first: usize, second: usize, extent: Sym },
     Stream { piece: crate::sym::Atom, extent: Sym, maximum: i64 },
     Construct {
         name: String,
@@ -110,6 +150,18 @@ pub enum DecisionKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Alternative {
+    OutputWidth(i64),
+    /// Preserve the representation-owned compact packet storage.
+    Encoded,
+    /// Materialize exact decoded F32 values alongside the packet snapshot.
+    Decoded,
+    ReductionSegment(i64),
+    ReductionCut(i64),
+    ReductionTree(crate::reduction::structured::Tree),
+    ParallelFusion { shared_axes: usize, refine_consumer: bool },
+    RetainLocal,
+    Separate,
+    Fuse,
     StreamCapacity(i64),
     Body(Choice),
     Materialize,

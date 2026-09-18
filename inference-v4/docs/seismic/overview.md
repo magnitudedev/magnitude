@@ -4,6 +4,41 @@
 It turns portable numerical programs into hardware-specific executions, with
 resource accounting and automatic optimization built into compilation.
 
+## Principles
+
+1. **Seismic code is completely hardware-agnostic.** Hardware details and
+   backend-specific operations enter only at the lowering boundary. Ordinary code
+   cannot observe compiler-chosen partition sizes, piece counts, or physical mappings.
+
+2. **Declare only what cannot be derived.** Authors specify computation and
+   precision. The system derives shapes, dependencies, implementation sizes,
+   resource requirements, and bindings wherever the semantics determine them.
+
+3. **One unified system.** Execution, resource accounting, optimization, and code
+   generation share the same semantic and implementation definitions.
+
+4. **Correctness is built into the system.** Types, construction, transformations,
+   and validation enforce shapes, precision, ownership, and effects throughout
+   compilation and execution.
+
+5. **A minimal, compositional vocabulary.** Constructs have general meaning and
+   exist only for necessary semantics or expressiveness. Redundant source structure
+   must not be required to unlock performance: the compiler must derive efficient
+   execution from the existing semantic composition. Composition must preserve
+   optimization opportunities across function and library boundaries. Structured
+   lowerings must express efficient implementations of the admitted intrinsics;
+   documented semantics-preserving refactorings must retain those opportunities.
+
+6. **Optimize from resource relationships, with sound bounds.** Select the best
+   legal execution in the declared form under the applicable model. Performance
+   decisions follow from computation and hardware constraints, never heuristics
+   or manually tuned kernel parameters.
+
+7. **Fix the system, not the kernel.** When a natural program cannot be expressed
+   or compiled efficiently, improve the responsible abstraction, lowering, or
+   tooling. Authors should not need hidden matcher patterns or manually chosen
+   implementation sizes to obtain efficient compilation.
+
 ## Architecture
 
 | Layer | Responsibility |
@@ -24,22 +59,6 @@ flowchart LR
     H -->|bind and submit| R
 ```
 
-## Portable authoring
-
-- **Express computation and precision.** Kernels describe dataflow, logical shapes,
-  representations, independent work, and numerical requirements.
-- **Keep hardware in backend scope.** Thread and lane geometry, instruction choices,
-  physical placement, and hardware capabilities belong to lowerings and backend
-  definitions.
-- **Derive implementation sizes.** Authors express a decomposition such as streaming
-  an axis; the compiler chooses piece sizes, grouping, and placement jointly.
-  Logical problem dimensions and fixed instruction geometry retain their own meaning.
-- **Derive what the program establishes.** Shapes, access regions, dependencies,
-  lowering preconditions, resource requirements, and host bindings follow from
-  signatures and bodies. Hardware facts and runtime conditions remain explicit inputs.
-- **Serve the kernel author.** When a natural algorithm requires compiler workarounds,
-  improve the language, lowering, analysis, or tooling at the responsible layer.
-
 ## Language and vocabulary
 
 | Concept | Meaning |
@@ -50,15 +69,21 @@ flowchart LR
 | **Lowering** | Backend-scope implementation of a construct, with applicability derived from its types and constraints. |
 | **Intrinsic** | Backend operation defining instruction semantics, participation, hardware requirements, and emission. |
 
-**Keep the vocabulary small and compositional.** Admit a construct when existing
-composition cannot cleanly express a required performant implementation or
-work decomposition. Give it general semantics and coverage across supported backends.
-Revisit constructs when improved composition makes them redundant.
-
 The language provides typed tensors, logical tiles, scalars, views, bounded control
-flow, parallel and owned iteration, streaming movement, reductions, and atomic
+flow, parallel and owned iteration, logical loads and stores, reductions, and atomic
 effects. Matrix multiplication and scan are reusable constructs; attention, norms,
 routing, and sampling are library compositions rather than model-specific compiler cases.
+
+Authors specify logical problem dimensions, dataflow, precision, and semantic
+decomposition, such as algorithmic windows with defined logical boundaries. The
+compiler derives physical partitioning and streaming without exposing its pieces
+to ordinary code. Logical tiles and whole-domain operations do not require whole-domain
+materialization. Fixed instruction geometry belongs at the backend lowering boundary.
+
+Lowering authors additionally express backend implementation strategy through
+intrinsics and structured staging, streaming, and participation. The
+[authoring contract](language.md#lowering-authoring-contract) defines what remains
+free for the compiler and how unsupported analysis is reported.
 
 ## Semantics and correctness
 
@@ -96,6 +121,12 @@ Source + libraries
   for the enclosing execution. Independently optimal children need not compose optimally.
 - **Shared execution structure:** Accounting, optimization, emission, and inspection
   consume the same implementation definitions and derived views across IR stages.
+
+The [compiler contract](compiler.md#optimization-guarantees) separates intrinsic
+expressiveness, preservation of the legal execution family, completed selection,
+and native correspondence. Source validity alone establishes neither optimality
+nor hardware fidelity. Algorithms and their alternatives live in libraries;
+the compiler optimizes their supported execution forms.
 
 ## Resource accounting and optimization
 

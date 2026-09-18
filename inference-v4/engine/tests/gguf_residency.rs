@@ -54,35 +54,17 @@ fn exercise(device: Device, candidate: Candidate) {
             encoding,
         };
         let resident = importer.import(&descriptor, &stored, DType::BF16).unwrap();
-        let expected_words = case["words"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|n| (n.as_u64().unwrap() as u32).to_le_bytes())
-            .collect::<Vec<_>>();
-        let mut actual = vec![0; expected_words.len()];
-        resident.plane("words").unwrap().read(&mut actual).unwrap();
-        assert_eq!(actual, expected_words, "{:?} codes", encoding);
-        for (plane, key) in [("scale", "scales"), ("bias", "biases")] {
-            let values = case[key].as_array().unwrap();
-            if values.is_empty() {
-                assert!(resident.plane(plane).is_none());
-                continue;
-            }
-            let expected = if encoding == Encoding::Q8_0 {
-                (0..3)
-                    .flat_map(|b| bytes[b * 34..b * 34 + 2].iter().copied())
-                    .collect::<Vec<_>>()
-            } else {
-                values
-                    .iter()
-                    .flat_map(|n| (n.as_f64().unwrap() as f32).to_le_bytes())
-                    .collect::<Vec<_>>()
-            };
-            actual.resize(expected.len(), 0);
-            resident.plane(plane).unwrap().read(&mut actual).unwrap();
-            assert_eq!(actual, expected, "{:?} {plane}", encoding);
+        let Elem::Repr(name) = resident.element() else { panic!("expected packed resident"); };
+        let representation = seismic_lang::repr::lookup(name).unwrap();
+        let payload_bytes = representation.planes().iter().map(|p| p.bytes(count as u64).unwrap()).sum::<u64>();
+        if matches!(encoding, Encoding::Q4K | Encoding::Q5K | Encoding::Q6K) {
+            assert_eq!(payload_bytes, bytes.len() as u64, "compact {:?} payload", encoding);
+            assert!(resident.plane("scale").is_none());
+            assert!(resident.plane("bias").is_none());
         }
+        // Representation storage is compact; the independent V3 fixture below
+        // supplies the decoded values, rather than the former widened planes.
+        let mut actual = Vec::new();
         let lowered = lower_specialized(
             &program,
             "import_weight",

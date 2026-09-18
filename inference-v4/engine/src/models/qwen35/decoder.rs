@@ -9,7 +9,7 @@ use crate::{
 use seismic_lang::types::{DType, Elem};
 use seismic_runtime::{
     Buffer, Device, ExecutionObservation,
-    plan::{CompilationChoices, PlanCompiler, StepObservation, Submission},
+    plan::{Diagnostic, PlanCompiler, Settings, StepObservation, Submission},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -107,8 +107,43 @@ impl Decoder {
     pub fn compile(
         device: Rc<Device>,
         description: &Description,
+        import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, String>,
+        settings: Settings,
+        context_capacity: usize,
+        max_sequences: usize,
+    ) -> Result<Self, String> {
+        Self::compile_with(
+            device,
+            description,
+            import,
+            Ok(settings),
+            context_capacity,
+            max_sequences,
+        )
+    }
+    /// Explicit fixed assignments for reference and native qualification only.
+    pub fn compile_diagnostic(
+        device: Rc<Device>,
+        description: &Description,
+        import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, String>,
+        choices: Diagnostic,
+        context_capacity: usize,
+        max_sequences: usize,
+    ) -> Result<Self, String> {
+        Self::compile_with(
+            device,
+            description,
+            import,
+            Err(choices),
+            context_capacity,
+            max_sequences,
+        )
+    }
+    fn compile_with(
+        device: Rc<Device>,
+        description: &Description,
         mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, String>,
-        choices: CompilationChoices,
+        settings: Result<Settings, Diagnostic>,
         context_capacity: usize,
         max_sequences: usize,
     ) -> Result<Self, String> {
@@ -129,7 +164,12 @@ impl Decoder {
             .filter(|n| *n <= i32::MAX as usize)
             .ok_or("history capacity overflow")?;
         let program = super::program::program()?;
-        let mut compiler = PlanCompiler::with_choices(&device, &program, choices)?;
+        let mut compiler = match settings {
+            Ok(settings) => PlanCompiler::new(&device, &program, settings),
+            Err(choices) => {
+                PlanCompiler::diagnostic(&device, &program, choices.lowering, choices.candidate)
+            }
+        };
         let activation = g.activation_dtype;
         let mut bound =
             |entry: &str, shapes, weights, external: &[&str], intermediates: &[&str], scalars| {

@@ -41,7 +41,7 @@ fn metal_batch_failure_and_preflight() {
     .unwrap();
     let plan = seismic_lang::plan::plan(&program, "chain", &HashMap::new()).unwrap();
     let device = Device::metal().unwrap();
-    let mut compiler = PlanCompiler::new(
+    let mut compiler = PlanCompiler::diagnostic(
         &device,
         &program,
         Default::default(),
@@ -78,7 +78,7 @@ fn metal_batch_failure_and_preflight() {
     assert_eq!(bytes, 1f32.to_le_bytes());
     // Every pipeline's ownership must be checked before the first write.
     let other = Device::metal().unwrap();
-    let mut other_compiler = PlanCompiler::new(
+    let mut other_compiler = PlanCompiler::diagnostic(
         &other,
         &program,
         Default::default(),

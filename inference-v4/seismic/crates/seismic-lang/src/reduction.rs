@@ -1,6 +1,8 @@
 //! Numerical contracts shared by interpretation, realization and accounting.
 use crate::{ir::ReduceOp, types::DType};
 
+pub mod structured;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Identity {
     Zero,

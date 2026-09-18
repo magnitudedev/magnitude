@@ -11,6 +11,28 @@ use seismic_realization::dispatch::{GroupDispatch, WorkMapping};
 
 pub const SUBGROUP: i64 = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldOwnership {
+    Serial,
+    Participants,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldChoice {
+    pub site: usize,
+    pub lanes: u32,
+}
+impl seismic_accounting::selection::Choices for FoldChoice {
+    type Alternative = FoldOwnership;
+    fn len(&self) -> usize {
+        2
+    }
+    fn get(&self, index: usize) -> Option<FoldOwnership> {
+        [FoldOwnership::Serial, FoldOwnership::Participants]
+            .get(index)
+            .copied()
+    }
+}
+
 /// Realization choices the model will close; defaults for now.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -185,10 +207,82 @@ fn derive_merges(
     Ok(carried.iter().map(|_| Merge::Sum).collect())
 }
 
+/// The same merge applicability used by preparation bounds its supported split
+/// choice. The current admitted form uses one part count across eligible phases.
+pub(crate) fn split_domain(function: &LoweredIr) -> Result<u64, String> {
+    let candidates = seismic_lang::split::split_candidates(&function.body, &function.vars);
+    if candidates.is_empty() {
+        return Ok(1);
+    }
+    let mut phases = std::collections::HashSet::new();
+    let mut maximum = u64::MAX;
+    for candidate in candidates {
+        if !phases.insert(candidate.stmt) {
+            return Ok(1);
+        }
+        let StmtKind::Parallel { body, extents, .. } = &function.body[candidate.stmt].kind else {
+            unreachable!()
+        };
+        let StmtKind::LoadLoop {
+            body: stream,
+            vars,
+            domain,
+            ..
+        } = &body[candidate.loop_at].kind
+        else {
+            unreachable!()
+        };
+        if seismic_lang::rewrite::check_split(
+            stream,
+            &candidate.carried,
+            &seismic_lang::rewrite::namer(&function.vars),
+        )
+        .is_err()
+            || derive_merges(
+                &body[..candidate.loop_at],
+                stream,
+                &candidate.carried,
+                vars,
+                &function.vars,
+            )
+            .is_err()
+        {
+            return Ok(1);
+        }
+        let extent = domain
+            .view
+            .ty
+            .shaped()
+            .and_then(|s| s.shape.get(domain.axis))
+            .and_then(Sym::as_constant)
+            .and_then(|n| u64::try_from(n).ok());
+        // Dynamic ranges remain supported for explicit diagnostic splits. A
+        // finite symbolic domain needs a retained bound, not a guessed maximum.
+        let Some(extent) = extent else {
+            return Ok(1);
+        };
+        let items = extents
+            .iter()
+            .try_fold(1u64, |p, e| {
+                p.checked_mul(u64::try_from(e.as_constant()?).ok()?)
+            })
+            .ok_or("invalid split parallel extent")?;
+        maximum = maximum
+            .min(extent.max(1))
+            .min(u64::from(u32::MAX) / items.max(1))
+            .min(i64::MAX as u64);
+    }
+    Ok(maximum.max(1))
+}
+
 /// Owns the transformed IR. It cannot be changed independently of its mappings.
 #[derive(Clone)]
 pub struct Execution {
+    pub(crate) emission: std::sync::OnceLock<Result<crate::msl::Emitted, String>>,
     pub(crate) function: LoweredIr,
+    /// Checked source with selected structured contracts before backend
+    /// realization. The emitted function below is its selected implementation.
+    pub(crate) source: LoweredIr,
     pub(crate) config: Config,
     pub(crate) phases: Vec<Phase>,
     pub(crate) memory: crate::memory::MemoryPlan,
@@ -199,7 +293,12 @@ pub struct Execution {
 }
 
 impl Execution {
-    pub fn support(&self) -> &crate::support::Plan {&self.support}
+    pub fn source(&self) -> &LoweredIr {
+        &self.source
+    }
+    pub fn support(&self) -> &crate::support::Plan {
+        &self.support
+    }
     pub fn memory(&self) -> &crate::memory::MemoryPlan {
         &self.memory
     }
@@ -219,9 +318,7 @@ impl Execution {
 
 /// Apply a caller's choices exactly, without generating source or querying a device.
 pub fn prepare(function: &LoweredIr, config: Config) -> Result<Execution, String> {
-    prepare_storage_selected(function, config, &mut |decision| {
-        Ok(decision.diagnostic())
-    })
+    prepare_storage_selected(function, config, &mut |decision| Ok(decision.diagnostic()))
 }
 
 pub fn prepare_storage_selected(
@@ -247,9 +344,19 @@ pub fn prepare_selected(
     ) -> Result<crate::reduction::Algorithm, String>,
 ) -> Result<Execution, String> {
     let borrow = config.loads == seismic_realization::LoadStrategy::BorrowProvenReadOnly;
-    prepare_with_choices(function, config, &mut |_, site| {
-        Ok(if borrow && site.can_borrow { LoadMode::Borrow } else { LoadMode::Materialize })
-    }, select, select_reduction)
+    prepare_with_choices(
+        function,
+        config,
+        &mut |_, site| {
+            Ok(if borrow && site.can_borrow {
+                LoadMode::Borrow
+            } else {
+                LoadMode::Materialize
+            })
+        },
+        select,
+        select_reduction,
+    )
 }
 
 /// Prepare all site choices after decomposition, so widening and splitting
@@ -257,9 +364,94 @@ pub fn prepare_selected(
 pub fn prepare_with_choices(
     function: &LoweredIr,
     config: Config,
-    select_load: &mut dyn FnMut(usize, &seismic_lang::normalize::loads::Site) -> Result<LoadMode, String>,
-    select: &mut dyn FnMut(&crate::storage::StorageDecision) -> Result<seismic_realization::dispatch::TilePlacement, String>,
-    select_reduction: &mut dyn FnMut(&crate::reduction::Decision) -> Result<crate::reduction::Algorithm, String>,
+    select_load: &mut dyn FnMut(
+        usize,
+        &seismic_lang::normalize::loads::Site,
+    ) -> Result<LoadMode, String>,
+    select: &mut dyn FnMut(
+        &crate::storage::StorageDecision,
+    ) -> Result<seismic_realization::dispatch::TilePlacement, String>,
+    select_reduction: &mut dyn FnMut(
+        &crate::reduction::Decision,
+    ) -> Result<crate::reduction::Algorithm, String>,
+) -> Result<Execution, String> {
+    prepare_with_allocation_choices(
+        function,
+        config,
+        select_load,
+        select,
+        select_reduction,
+        &mut |choice| Ok(choice.new_slot),
+    )
+}
+pub fn prepare_with_allocation_choices(
+    function: &LoweredIr,
+    config: Config,
+    select_load: &mut dyn FnMut(
+        usize,
+        &seismic_lang::normalize::loads::Site,
+    ) -> Result<LoadMode, String>,
+    select: &mut dyn FnMut(
+        &crate::storage::StorageDecision,
+    ) -> Result<seismic_realization::dispatch::TilePlacement, String>,
+    select_reduction: &mut dyn FnMut(
+        &crate::reduction::Decision,
+    ) -> Result<crate::reduction::Algorithm, String>,
+    select_allocation: &mut dyn FnMut(&crate::memory::AllocationChoices) -> Result<usize, String>,
+) -> Result<Execution, String> {
+    prepare_with_mappings(
+        function,
+        config,
+        None,
+        select_load,
+        select,
+        select_reduction,
+        select_allocation,
+    )
+}
+pub fn prepare_with_mappings(
+    function: &LoweredIr,
+    config: Config,
+    mappings: Option<&[WorkMapping]>,
+    select_load: &mut dyn FnMut(
+        usize,
+        &seismic_lang::normalize::loads::Site,
+    ) -> Result<LoadMode, String>,
+    select: &mut dyn FnMut(
+        &crate::storage::StorageDecision,
+    ) -> Result<seismic_realization::dispatch::TilePlacement, String>,
+    select_reduction: &mut dyn FnMut(
+        &crate::reduction::Decision,
+    ) -> Result<crate::reduction::Algorithm, String>,
+    select_allocation: &mut dyn FnMut(&crate::memory::AllocationChoices) -> Result<usize, String>,
+) -> Result<Execution, String> {
+    prepare_with_participants(
+        function,
+        config,
+        mappings,
+        &mut |_| Ok(FoldOwnership::Serial),
+        select_load,
+        select,
+        select_reduction,
+        select_allocation,
+    )
+}
+pub fn prepare_with_participants(
+    function: &LoweredIr,
+    config: Config,
+    mappings: Option<&[WorkMapping]>,
+    select_fold: &mut dyn FnMut(&FoldChoice) -> Result<FoldOwnership, String>,
+    select_load: &mut dyn FnMut(
+        usize,
+        &seismic_lang::normalize::loads::Site,
+    ) -> Result<LoadMode, String>,
+    select: &mut dyn FnMut(
+        &crate::storage::StorageDecision,
+    ) -> Result<seismic_realization::dispatch::TilePlacement, String>,
+    select_reduction: &mut dyn FnMut(
+        &crate::reduction::Decision,
+    ) -> Result<crate::reduction::Algorithm, String>,
+    select_allocation: &mut dyn FnMut(&crate::memory::AllocationChoices) -> Result<usize, String>,
 ) -> Result<Execution, String> {
     if function.backend != "metal" {
         return Err("Metal execution requires Metal Lowered IR".into());
@@ -275,21 +467,29 @@ pub fn prepare_with_choices(
     {
         return Err("invalid Metal candidate or device resource limits".into());
     }
-    if config.per_item > 1 && config.split > 1 {
+    if (config.per_item > 1
+        || mappings.is_some_and(|m| m.iter().flat_map(WorkMapping::axes).any(|a| a.step > 1)))
+        && config.split > 1
+    {
         return Err("combined widening and splitting is not realized".into());
     }
+    let source = function.clone();
     let mut function = function.clone();
     seismic_lang::normalize::work_domain(&mut function.body);
     let mut partition_parameters = Vec::new();
     if let Some(piece) = config.tile_piece {
-        if config.per_item != 1 || config.split != 1 {
-            return Err(
-                "pointwise partition cannot combine with widening or reduction splitting".into(),
-            );
+        if config.split != 1 {
+            return Err("pointwise partition cannot combine with reduction splitting".into());
         }
         let partitioned = seismic_lang::partition::pointwise(&function, piece)?;
         function = partitioned.function;
         partition_parameters = partitioned.parameters;
+    }
+    if config.split > 1 {
+        function = seismic_lang::reduction::structured::materialize(&function)?;
+    }
+    if mappings.is_some_and(|m| m.len() != function.body.len()) {
+        return Err("one work mapping is required per normalized phase".into());
     }
     let splits = if config.split > 1 {
         seismic_lang::split::split_candidates(&function.body, &function.vars)
@@ -311,6 +511,7 @@ pub fn prepare_with_choices(
         let StmtKind::LoadLoop {
             body,
             vars: streams,
+            domain,
             views,
             ..
         } = &body[split.loop_at].kind
@@ -324,7 +525,11 @@ pub fn prepare_with_choices(
         )
         .map_err(|e| e.to_string())?;
         let merges = derive_merges(before, body, &split.carried, streams, &function.vars)?;
-        let original_views = views.clone();
+        // The iteration view carries guards even when producer projection
+        // removes every transfer. Splitting must preserve that original domain.
+        let original_views = std::iter::once(domain.view.clone())
+            .chain(views.iter().cloned())
+            .collect();
         let part = function.vars.len();
         let atom = Atom::Param(format!("part#{part}"));
         function.vars.push(Var {
@@ -333,11 +538,18 @@ pub fn prepare_with_choices(
             span: split.lo.span,
             kind: VarKind::Index(atom.clone()),
         });
-        seismic_lang::split::narrow_range(&split, &mut function.body, part, &atom, config.split)?;
+        let loop_at = seismic_lang::split::narrow_range(
+            &split,
+            &mut function.body,
+            &mut function.vars,
+            part,
+            &atom,
+            config.split,
+        )?;
         split_by_phase.insert(
             split.stmt,
             Split {
-                loop_at: split.loop_at,
+                loop_at,
                 carried: split.carried,
                 part,
                 merges,
@@ -360,13 +572,6 @@ pub fn prepare_with_choices(
             .iter()
             .map(|e| e.as_constant().ok_or("parallel extent is not concrete"))
             .collect::<Result<Vec<_>, _>>()?;
-        let inner = *extents.last().unwrap_or(&1);
-        if inner % config.per_item != 0 {
-            return Err(format!(
-                "requested widening {} does not divide parallel extent {inner}",
-                config.per_item
-            ));
-        }
         if extents.iter().any(|&e| e < 0 || e > i64::from(i32::MAX)) {
             return Err("parallel extent must fit a nonnegative Metal index".into());
         }
@@ -374,10 +579,25 @@ pub fn prepare_with_choices(
         if let Some(step) = steps.last_mut() {
             *step = config.per_item as u64;
         }
-        let mapping = WorkMapping::new(
-            &extents.iter().map(|&e| e as u64).collect::<Vec<_>>(),
-            &steps,
-        )?;
+        let mapping = if let Some(mappings) = mappings {
+            let mapping = mappings[index].clone();
+            if mapping
+                .axes()
+                .iter()
+                .map(|a| a.logical_extent)
+                .ne(extents.iter().map(|&n| n as u64))
+            {
+                return Err(
+                    "selected work mapping disagrees with the normalized iteration domain".into(),
+                );
+            }
+            mapping
+        } else {
+            WorkMapping::new(
+                &extents.iter().map(|&e| e as u64).collect::<Vec<_>>(),
+                &steps,
+            )?
+        };
         let base_items = i64::try_from(mapping.work_items())
             .map_err(|_| "work item count exceeds signed domain")?;
         let mut split = split_by_phase.remove(&index);
@@ -392,8 +612,10 @@ pub fn prepare_with_choices(
         if dispatch.dispatched_lanes() / SUBGROUP as u64 > u64::from(u32::MAX) {
             return Err("padded work item count exceeds Metal slot index width".into());
         }
-        if config.per_item > 1 {
-            let inner = *vars.last().ok_or("widening requires a parallel index")?;
+        for (&inner, axis) in vars.iter().zip(mapping.axes()).rev() {
+            if axis.step == 1 {
+                continue;
+            }
             let VarKind::Index(atom) = &function.vars[inner].kind else {
                 return Err("widening requires an index variable".into());
             };
@@ -404,11 +626,13 @@ pub fn prepare_with_choices(
                 sym: Some(Sym::atom(atom.clone())),
                 span: statement.span,
             };
-            *body = seismic_lang::widen::apply(
+            *body = seismic_lang::widen::apply_bounded(
                 body,
                 inner,
                 &atom,
-                config.per_item,
+                i64::try_from(axis.step).map_err(|_| "mapping step exceeds Metal extent domain")?,
+                i64::try_from(axis.logical_extent)
+                    .map_err(|_| "mapping extent exceeds Metal index domain")?,
                 &mut function.vars,
                 &base,
             );
@@ -438,6 +662,25 @@ pub fn prepare_with_choices(
             split,
         });
     }
+    let mut selected_folds = Vec::new();
+    for site in
+        seismic_lang::reduction::structured::participants::candidates(&function, SUBGROUP as u32)
+    {
+        if select_fold(&FoldChoice {
+            site,
+            lanes: SUBGROUP as u32,
+        })? == FoldOwnership::Participants
+        {
+            selected_folds.push(site);
+        }
+    }
+    let refinement = seismic_lang::reduction::structured::participants::apply(
+        &function,
+        &selected_folds,
+        SUBGROUP as u32,
+    )?;
+    let private_values = refinement.private_values;
+    function = seismic_lang::reduction::structured::materialize(&refinement.function)?;
     for (root, phase) in function.body.iter_mut().zip(&mut phases) {
         let StmtKind::Parallel { body, .. } = &mut root.kind else {
             unreachable!()
@@ -456,8 +699,10 @@ pub fn prepare_with_choices(
             split.loop_at = positions[split.loop_at];
         }
     }
-    let load_modes = seismic_lang::normalize::loads::sites(&function.body).iter()
-        .enumerate().map(|(index, site)| select_load(index, site))
+    let load_modes = seismic_lang::normalize::loads::sites(&function.body)
+        .iter()
+        .enumerate()
+        .map(|(index, site)| select_load(index, site))
         .collect::<Result<Vec<_>, _>>()?;
     seismic_lang::normalize::loads::resolve(&mut function.body, &load_modes)?;
     for phase in &mut phases {
@@ -478,7 +723,19 @@ pub fn prepare_with_choices(
         .iter()
         .filter_map(|p| p.split.as_ref().map(|s| s.validation_bindings.as_slice()))
         .collect::<Vec<_>>();
-    let storage = crate::storage::plan(&function.vars, &function.body, &extra, select)?;
+    let storage = crate::storage::plan(&function.vars, &function.body, &extra, &mut |decision| {
+        if private_values.contains(&decision.variable) {
+            let mut decision = decision.clone();
+            decision
+                .alternatives
+                .retain(|p| *p == seismic_realization::dispatch::TilePlacement::Replicated);
+            let placement = select(&decision)?;
+            decision.select(placement.clone())?;
+            Ok(placement)
+        } else {
+            select(decision)
+        }
+    })?;
     let reductions = crate::reduction::plan(
         &function.vars,
         &function.body,
@@ -486,20 +743,23 @@ pub fn prepare_with_choices(
         &storage,
         select_reduction,
     )?;
-    let memory = crate::memory::plan(
+    let memory = crate::memory::plan_selected(
         &function.vars,
         &function.body,
         &phases,
         &storage,
         &reductions,
         config.max_threadgroup_bytes as u64,
+        select_allocation,
     )?;
     Ok(Execution {
+        emission: Default::default(),
         support: crate::support::Plan::new(),
         memory,
         reductions,
         storage,
         function,
+        source,
         config,
         phases,
         partition_parameters,

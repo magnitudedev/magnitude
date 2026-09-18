@@ -13,6 +13,17 @@ explicit hardware queries/capability constraints. Performance choices are expose
 [tuning](tuning.md), rather than resolved through device-name dispatch or hidden
 hardware-shape preferences.
 
+Physical pieces, intrinsic geometry, and hardware queries remain within backend
+implementation scope. Each admitted assignment implements the same portable
+contract, including its permitted numerical variation. These implementation values
+cannot become portable parameters, dimensions, or observable partition identities.
+
+The intrinsic vocabulary and general decomposition facilities must let a structured
+Seismic lowering express the desired implementations within the admitted backend
+form. Optimized behavior must not depend on recognizing model names or private
+emitter patterns. Unsupported mechanisms are explicit coverage gaps; a scalar
+fallback does not establish optimized coverage.
+
 Emission accepts Tuned IR and implements its selected execution. Native compilation then
 produces the executable under a declared target/toolchain configuration. Neither stage
 silently changes the selected implementation or searches alternatives.
@@ -26,6 +37,12 @@ Each admitted implementation connects:
 - The introduced operations, storage, communication, and dependency structure.
 - The resource model and hardware parameters needed to describe that structure.
 - The emitted template or instruction mapping and permitted downstream changes.
+
+Intrinsic contracts include operand layout and ownership, participating roles,
+memory visibility, and progress requirements. Asynchronous operations distinguish
+issue from completion, identify retained source/destination storage and define
+which event or wait makes results available. Copy engines and compute collectives
+remain explicit resource users rather than zero-cost overlap annotations.
 
 These definitions are exhaustive over the admitted vocabulary. Adding a primitive
 requires extending checking, resource semantics, and emission together. Behavior and
@@ -42,14 +59,20 @@ hardware instruction. Its contract must cover its implementation and conditions.
 
 | Backend | Required execution mechanisms and resource relationships |
 | --- | --- |
-| CPU | Scalar/vector instructions, register and stack storage, instruction dependencies, memory hierarchy, worker parallelism, ABI, and required math implementations. |
-| CUDA | Thread/warp/block mappings, scalar/vector/tensor instructions where admitted, register/local/shared/device storage, transfers, barriers, launch dependencies, and residency limits. |
-| Metal | Lane/SIMD-group/threadgroup mappings, scalar/vector/matrix operations where admitted, private/threadgroup/device storage, communication, barriers, launch dependencies, and residency limits. |
-| Vulkan | SPIR-V, subgroup/workgroup ownership, supported cooperative matrix operations, storage classes, barriers, and device capability constraints. |
+| CPU | Scalar/vector covers and tails, register blocking, stack storage, memory/cache locality, worker assignment, instruction dependencies, ABI and math implementations. |
+| CUDA | Thread/warp/block and capability-dependent cooperative mappings, scalar/vector/tensor covers, operand layouts, storage hierarchy, async movement/computation, participant roles, completion protocols and residency. |
+| Metal | Lane/SIMD-group/threadgroup mappings, scalar/vector/matrix covers and tails, fragment ownership, private/threadgroup/device storage, staging, communication, synchronization and residency. |
+| Vulkan | SPIR-V, subgroup/workgroup ownership, supported cooperative matrix covers, operand layouts, storage classes, visibility/barriers and device capability constraints. |
 
 Feature availability and allocation granularities come from applicable target contracts.
 Hardware extent queries are explicit. Backend-family mechanisms are modeled
 structurally; hardware profiles supply target-specific parameters.
+
+Backends share execution semantics, not an identical list of implementations.
+Capabilities determine which alternatives exist. Hardware-managed CPU caches are
+not interchangeable with explicitly allocated GPU shared storage. Synchronization
+or persistent work protocols must establish forward progress for their actual
+participant scope.
 
 Coverage includes the constructs needed by standard kernels and their compositions:
 indexing and views, dense and packed accesses, arithmetic/conversions, reductions,
@@ -81,6 +104,12 @@ A mapping contract must cover those behaviors through a justified exact mapping 
 explicitly modeled admissible envelope. Logical temporaries cannot be relabeled as
 physical registers. A compiler flag or nominal instruction count does not establish
 native resource behavior by itself.
+
+Separate compiler-controlled ordering from hardware scheduling and cache behavior.
+An ideal block placement or instruction interleaving used by analysis is not an
+emitted decision unless a supported implementation can enforce it. The model and
+qualification must retain that distinction. A large exact search over virtual
+instructions does not qualify native spills, instruction selection or memory service.
 
 Where the necessary correspondence cannot be established, the backend must change its
 implementation, emission strategy, or control of downstream compilation. The compiler

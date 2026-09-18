@@ -12,7 +12,7 @@ fn stream_capacity(piece: Option<i64>, dynamic: bool) -> Result<Option<i64>, Str
     } else {
         "x"
     };
-    let text = format!("fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  for t in load({slice}, over=0):\n    acc[0] += reduce(t, 0, sum)\n  store(acc, out)\n");
+    let text = format!("fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load({slice})\n  acc[0] = reduce(t,0,sum,ordered=true)\n  store(acc, out)\n");
     let program = compile(
         &[SourceFile {
             path: PathBuf::from("stream.seismic.portable"),
@@ -27,16 +27,19 @@ fn stream_capacity(piece: Option<i64>, dynamic: bool) -> Result<Option<i64>, Str
         "stream",
         "cpu",
         &HashMap::from([("T".into(), 137)]),
-        &Options { piece },
+        &Options { piece, ..Default::default() },
     )?;
-    lowered
-        .body
-        .iter()
-        .find_map(|stmt| match &stmt.kind {
-            StmtKind::LoadLoop { capacity, .. } => Some(Ok(*capacity)),
-            _ => None,
-        })
-        .unwrap_or_else(|| Err("missing stream".into()))
+    use seismic_lang::lowered_ir::{DecisionKind,Alternative};
+    let selected=lowered.decisions.iter().find_map(|d|match (&d.domain.kind,&d.selected){
+        (DecisionKind::Stream{..},Alternative::StreamCapacity(n))=>Some(*n),_=>None
+    }).ok_or("missing derived stream capacity")?;
+    if dynamic {
+        assert!(lowered.body.iter().any(|s|matches!(s.kind,StmtKind::LoadLoop{..})));
+        Ok(Some(selected))
+    }else if selected<137 {
+        assert!(lowered.body.iter().any(|s|matches!(s.kind,StmtKind::Range{..})));
+        Ok(Some(selected))
+    }else{Ok(None)}
 }
 
 #[test]
@@ -63,22 +66,32 @@ fn stream_piece_domains_are_independent_and_symbolic() {
     use seismic_lang::{lower::alternatives::{expand, Expansion, Specialization}, lowered_ir::{Alternative, DecisionKind}};
     let program = compile(&[SourceFile {
         path: "pieces.seismic.portable".into(), scope: Scope::Portable,
-        text: "fn pieces[N](x: tensor[N] f32, y: tensor[3] f32):\n  for a in load(x,over=0):\n    for i in owned(a): a[i] = a[i] + 1.0\n  for b in load(y,over=0):\n    for i in owned(b): b[i] = b[i] + 1.0\n".into(),
+        text: "fn pieces[N](x: tensor[N] f32, y: tensor[3] f32, out:tensor[2] f32):\n  a = load(x)\n  b = load(y)\n  result = tile[2] f32\n  for i in owned(result): result[i] = 0.0\n  result[0] = reduce(a,0,sum,ordered=true)\n  result[1] = reduce(b,0,sum,ordered=true)\n  store(result,out)\n".into(),
     }], &[]).unwrap();
     let shapes = HashMap::from([("N".into(), 1_000_000_000)]);
     let elements = HashMap::new();
     let options = Options::default();
     let request = || Specialization { program: &program, entry: "pieces", backend: "cpu", shapes: &shapes, elements: &elements, options: &options };
-    let Expansion::Choice(first) = expand(request(), &[]).unwrap() else { panic!() };
-    assert!(matches!(first.kind, DecisionKind::Stream { maximum: 1_000_000_000, .. }));
-    assert_eq!(first.alternatives.capacity_interval(), Some((1_000_000_000, 1)));
-    assert_eq!(first.alternatives.get(999_999_999), Some(Alternative::StreamCapacity(1)));
-    let Expansion::Choice(second) = expand(request(), &[999_999_999]).unwrap() else { panic!() };
-    assert!(matches!(second.kind, DecisionKind::Stream { maximum: 3, .. }));
-    let Expansion::Lowered { function, consumed } = expand(request(), &[999_999_999, 1]).unwrap() else { panic!() };
-    assert_eq!(consumed, 2);
-    let capacities = function.body.iter().filter_map(|s| match &s.kind { StmtKind::LoadLoop { capacity, .. } => *capacity, _ => None }).collect::<Vec<_>>();
-    assert_eq!(capacities, vec![1,2]);
+    let mut path=Vec::new();let mut capacities=Vec::new();
+    let function=loop {
+        match expand(request(),&path).unwrap(){
+            Expansion::Choice(domain)=>{
+                let index=match domain.kind {
+                    DecisionKind::Stream{maximum:1_000_000_000,..}=>{
+                        assert_eq!(domain.alternatives.capacity_interval(),Some((1_000_000_000,1)));
+                        assert_eq!(domain.alternatives.get(999_999_999),Some(Alternative::StreamCapacity(1)));
+                        capacities.push(1);999_999_999
+                    }
+                    DecisionKind::Stream{maximum:3,..}=>{capacities.push(2);1}
+                    _=>0,
+                };path.push(index);
+            }
+            Expansion::Lowered{function,consumed}=>{assert_eq!(consumed,path.len());break function;}
+        }
+    };
+    assert_eq!(capacities,vec![1,2]);
+    assert!(function.vars.len()<1000,"logical domain must remain bounded rather than unrolled");
+    assert_eq!(function.body.iter().filter(|s|matches!(s.kind,StmtKind::Range{..})).count(),2);
     let mut space = seismic_lang::lower::alternatives::Space::new(request());
     assert!(space.next().unwrap().result.is_ok());
     assert!(space.next().unwrap().result.is_ok());
@@ -86,7 +99,7 @@ fn stream_piece_domains_are_independent_and_symbolic() {
 }
 
 #[test]
-fn reference_empty_stream_has_no_body_effects() {
+fn reference_empty_window_has_no_body_effects() {
     use seismic_lang::{
         interp::{Arg, Interpreter, TensorData},
         types::DType,
@@ -106,7 +119,7 @@ fn reference_empty_stream_has_no_body_effects() {
     let out = interpreter.add_tensor(TensorData::dense(DType::F32, vec![1], vec![9.0]));
     interpreter
         .run(
-            "empty_stream",
+            "empty_window",
             &[Arg::Tensor(x), Arg::Tensor(out)],
             &HashMap::new(),
         )
@@ -204,4 +217,41 @@ fn expansion_space_covers_branches_with_different_nested_decisions() {
         vec![Alternative::Body(Choice::Portable), Alternative::Body(Choice::Portable)],
     ]);
     assert!(space.next().is_none());
+}
+
+#[test]
+fn pure_temporaries_helper_extraction_and_equal_indices_preserve_producer_choices() {
+    use seismic_lang::{lower::lower_selected,lowered_ir::{Alternative,DecisionKind},interp::{Interpreter,TensorData,Arg},ir::Function,types::DType,program::Program};
+    let helper="fn write[N](x:tile[N] f32,t:tile[N] f32):\n  for i in owned(t):\n    value = x[i] * 2.0\n    t[i+0] = value + 1.0\n";
+    let forms=[
+        "  for i in owned(t): t[i] = x[i] * 2.0 + 1.0\n",
+        "  for i in owned(t):\n    value = x[i] * 2.0\n    t[0+i] = value + 1.0\n",
+        "  write(x,t)\n",
+    ];
+    let mut families=Vec::new();
+    for form in forms {
+        let text=format!("{helper}fn entry[N](a:tensor[N] f32,out:tensor[N] f32):\n  x = load(a)\n  t = tile[N] f32\n{form}  y = tile[N] f32\n  for i in owned(y): y[i] = t[i] * t[i]\n  store(y,out)\n");
+        let p=compile(&[SourceFile{path:"producer.seismic.portable".into(),scope:Scope::Portable,text}],&[]).unwrap();
+        let mut families_for_form=Vec::new();
+        for retain in [false,true] {
+            let mut choices=Vec::new();
+            let lowered=lower_selected(&p,"entry","cpu",&HashMap::from([("N".into(),7)]),&HashMap::new(),&Options::default(),&mut |d| {
+                if let DecisionKind::Producer{ty,..}=&d.kind {
+                    choices.push((ty.clone(),d.alternatives.clone()));
+                    return Ok(if retain {Alternative::Materialize}else{Alternative::Recompute});
+                }
+                Ok(d.alternatives.get(0).unwrap())
+            }).unwrap();
+            let p=Program{functions:vec![Function{name:lowered.name,is_construct:false,shape_params:vec![],elem_params:vec![],params:lowered.params,index_params:lowered.index_params,vars:lowered.vars,body:lowered.body}],lowerings:vec![],signatures:HashMap::new()};
+            let mut vm=Interpreter::new(&p);
+            let x=vm.add_tensor(TensorData::dense(DType::F32,vec![7],(0..7).map(|i|i as f64).collect()));
+            let out=vm.add_tensor(TensorData::dense(DType::F32,vec![7],vec![0.0;7]));
+            vm.run("entry",&[Arg::Tensor(x),Arg::Tensor(out)],&HashMap::new()).unwrap();
+            for i in 0..7 {assert_eq!(vm.tensors[out].get(i),((i*2+1)*(i*2+1)) as f64);}
+            assert!(!choices.is_empty(),"producer family disappeared after source refactoring");
+            families_for_form.push(choices);
+        }
+        families.push(families_for_form);
+    }
+    assert!(families.windows(2).all(|f|f[0]==f[1]));
 }

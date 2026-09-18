@@ -1,14 +1,15 @@
+mod support;
 use seismic_lang::{
-    lower::lower,
-    program::{compile, SourceFile},
     Scope,
+    lower::lower,
+    program::{SourceFile, compile},
 };
 use seismic_metal::memory::{BarrierPurpose, MemorySpace, Purpose};
 use seismic_metal::{
-    execution::{prepare_storage_selected, Config},
+    execution::{Config, prepare_storage_selected},
     msl::emit_execution,
 };
-use seismic_realization::{dispatch::TilePlacement, LoadStrategy};
+use seismic_realization::{LoadStrategy, dispatch::TilePlacement};
 
 fn prepare(text: &str, placement: TilePlacement) -> seismic_metal::execution::Execution {
     let program = compile(
@@ -45,9 +46,11 @@ fn synchronization_sites_follow_selected_memory_ownership() {
         let emitted = emit_execution(&execution).unwrap();
         if placement == TilePlacement::GroupShared {
             assert_eq!(barriers.len(), 5);
-            assert!(barriers
-                .values()
-                .all(|b| b.memory == MemorySpace::Threadgroup));
+            assert!(
+                barriers
+                    .values()
+                    .all(|b| b.memory == MemorySpace::Threadgroup)
+            );
             assert_eq!(
                 barriers
                     .keys()
@@ -113,9 +116,11 @@ fn fragment_publication_orders_owned_shared_storage() {
         .filter(|(s, _)| s.purpose == BarrierPurpose::IntrinsicStore)
         .collect();
     assert_eq!(stores.len(), 2);
-    assert!(stores
-        .iter()
-        .all(|(_, b)| b.memory == MemorySpace::Threadgroup));
+    assert!(
+        stores
+            .iter()
+            .all(|(_, b)| b.memory == MemorySpace::Threadgroup)
+    );
     let source = emit_execution(&execution).unwrap().source;
     assert_eq!(
         source
@@ -141,17 +146,8 @@ fn native_fragment_publication_preserves_cross_lane_values() {
 }
 
 fn two_split_phases() -> seismic_metal::execution::Execution {
-    let text = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    for t in load(x[row,0:65], over=0):\n      acc[0] += reduce(t,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    for t in load(middle[row:row+1], over=0):\n      acc[0] += reduce(t,0,sum)\n    store(acc,out[row:row+1])\n";
-    let program = compile(
-        &[SourceFile {
-            path: "scratch.seismic.portable".into(),
-            scope: Scope::Portable,
-            text: text.into(),
-        }],
-        &[],
-    )
-    .unwrap();
-    let lowered = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+    let text = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    chunk = load(x[row,0:65])\n    acc[0] += reduce(chunk,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    chunk = load(middle[row:row+1])\n    acc[0] += reduce(chunk,0,sum)\n    store(acc,out[row:row+1])\n";
+    let lowered = support::streamed(text, 17, &["chunk"]);
     seismic_metal::execution::prepare(
         &lowered,
         Config {
@@ -244,7 +240,7 @@ fn snapshot_in_owned(output: TilePlacement) -> Result<seismic_metal::execution::
         &[],
     )
     .unwrap();
-    let lowered = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+    let lowered = support::common_ir(&program);
     prepare_storage_selected(
         &lowered,
         Config {

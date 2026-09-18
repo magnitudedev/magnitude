@@ -35,9 +35,7 @@ pub fn explore(args: &[String]) -> Result<(), String> {
     let options = options(&filtered)?;
     let program = load_program(&options)?;
     let entry = options.function.as_deref().ok_or("--fn is required")?;
-    let lowering = Options {
-        piece: options.piece,
-    };
+    let lowering = Options { piece: options.piece, ..Default::default() };
     let mut space = Space::new(Specialization {
         program: &program,
         entry,

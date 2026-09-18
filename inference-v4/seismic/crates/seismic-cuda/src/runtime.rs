@@ -3,7 +3,6 @@ use crate::{
     ptx,
     execution::{Execution, Limits},
 };
-use cranelift_codegen::isa::CallConv;
 use seismic_lang::abi::ScalarParameter;
 use seismic_lang::lowered_ir::LoweredIr;
 use seismic_realization::{BufferSpec, Dispatch, ScalarProgram};
@@ -52,6 +51,12 @@ pub struct Buffer {
     len: usize,
 }
 impl Buffer {
+    /// Alignment of the retained allocation's actual device address. Subviews
+    /// retain this base fact; their offsets are checked separately by accounting.
+    pub fn allocation_alignment(&self) -> u64 {
+        let address = self.allocation.pointer;
+        if address == 0 { 1 } else { 1u64 << address.trailing_zeros() }
+    }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -190,8 +195,9 @@ impl Device {
         if threads_per_block == 0 || threads_per_block > self.info.max_threads_per_block {
             return Err("CUDA block size exceeds device capability".into());
         }
-        let program = seismic_compiler::scalar_candidate(lowered, CallConv::SystemV, options)?;
-        self.compile_execution(Execution::new(program, threads_per_block, self.execution_limits())?)
+        let mut executions=crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?;
+        if executions.len()!=1 {return Err("compile_candidate requires one selected launch; use compile_sequence".into());}
+        self.compile_execution(executions.remove(0))
     }
     pub fn compile_sequence(
         &self,
@@ -202,12 +208,7 @@ impl Device {
         if lowered.backend != "cuda" {
             return Err("CUDA requires a CUDA-lowered function".into());
         }
-        let sequence = seismic_compiler::scalar_sequence(lowered, CallConv::SystemV, options)?;
-        let phases = sequence
-            .phases
-            .into_iter()
-            .map(|phase| Execution::new(phase.program, threads_per_block, self.execution_limits()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let phases=crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?;
         self.compile_executions(phases)
     }
     /// Consume the complete selected launch sequence, without re-preparing IR.
@@ -238,13 +239,8 @@ impl Device {
         if lowered.backend != "cuda" {
             return Err("CUDA requires a CUDA-lowered function".into());
         }
-        let sequence = seismic_compiler::scalar_sequence(lowered, CallConv::SystemV, options)?;
-        sequence
-            .phases
-            .into_iter()
-            .map(|phase| Ok((phase.source_statement, Execution::new(phase.program, threads_per_block, self.execution_limits())?)))
-            .collect::<Result<Vec<_>,String>>()?
-            .into_iter()
+        crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?
+            .into_iter().enumerate()
             .map(|(source_statement, execution)| {
                 let code = self.compile_code(&execution)?;
                 Ok(NativeArtifact {
@@ -469,6 +465,7 @@ impl Kernel {
                 return Err("CUDA resident view violates typed storage alignment".into());
             }
         }
+        self.execution.program().conditions.validate_aliases(&self.execution.program().buffers, |i| (0, buffers[i].pointer()))?;
         let words = seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
         let bytes = words
             .iter()

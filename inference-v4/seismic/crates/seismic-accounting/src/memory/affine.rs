@@ -127,6 +127,10 @@ fn collect<'a>(
     for statement in body {
         *budget = budget.checked_sub(1)?;
         match &statement.kind {
+            StmtKind::Reduction(r) => {
+                for e in r.operands() {expression(e,out,budget)?;}
+                if r.bodies().any(tensor_body) {return None;}
+            }
             StmtKind::Assign { target, value, op } => {
                 if matches!(target.ty, Ty::Tensor(_)) && matches!(target.kind, ExprKind::Var(_)) {
                     return None;

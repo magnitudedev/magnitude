@@ -179,7 +179,10 @@ fn opaque_helper_cannot_be_replaced_with_an_authored_cost() {
         Ok(_) => panic!("unexpanded math helper acquired an execution cost"),
         Err(error) => error,
     };
-    assert!(error.contains("expanded into PTX operations"), "{error}");
+    assert!(
+        error.to_string().contains("expanded into PTX operations"),
+        "{error}"
+    );
     assert_eq!(before, seismic_cuda::ptx::print(execution.target_plan()));
 }
 
@@ -199,5 +202,42 @@ fn missing_hardware_service_is_an_analysis_error() {
         Ok(_) => panic!("missing primitive timing silently disappeared"),
         Err(error) => error,
     };
-    assert!(error.contains("missing CUDA hardware timing"), "{error}");
+    assert!(
+        error.to_string().contains("missing CUDA hardware timing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn construction_limits_are_typed_separately_from_analysis_errors() {
+    let execution = execution("x[i] + 1.0");
+    let hardware = hardware(&execution);
+    let workload = workload(&execution);
+    for (limits, expected) in [
+        (
+            workload::DerivationLimits {
+                instructions: 1,
+                operations: 100_000,
+            },
+            workload::DerivationLimit::Instructions(1),
+        ),
+        (
+            workload::DerivationLimits {
+                instructions: 100_000,
+                operations: 1,
+            },
+            workload::DerivationLimit::Operations(1),
+        ),
+    ] {
+        let Err(error) = model::derive_cuda(
+            &execution,
+            &hardware,
+            &workload,
+            &model::Placement::HomogeneousResidentSlots,
+            limits,
+        ) else {
+            panic!("construction unexpectedly fit the limit");
+        };
+        assert_eq!(error, workload::DerivationError::Exhausted(expected));
+    }
 }

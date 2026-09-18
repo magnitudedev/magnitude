@@ -187,6 +187,7 @@ pub fn print(plan: &TargetPlan) -> String {
                         register(plan, predicate)
                     )
                     .unwrap(),
+                    Operation::Shuffle { mode, destination, source, lane } => write!(out, "shfl.sync.{}.b32 {}, {}, {}, 31, 0xffffffff", match mode { ShuffleMode::Butterfly => "bfly", ShuffleMode::Index => "idx" }, register(plan,destination), register(plan,source), operand(plan,lane)).unwrap(),
                     Operation::Fma {
                         destination,
                         a,
@@ -322,6 +323,7 @@ fn operand(plan: &TargetPlan, op: Operand) -> String {
         Operand::Unsigned(n) => n.to_string(),
         Operand::Float32Bits(bits) => format!("0f{bits:08x}"),
         Operand::Special(s) => match s {
+            SpecialRegister::LaneIndex => "%laneid",
             SpecialRegister::BlockIndexX => "%ctaid.x",
             SpecialRegister::BlockWidthX => "%ntid.x",
             SpecialRegister::ThreadIndexX => "%tid.x",

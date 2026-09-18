@@ -96,7 +96,7 @@ fn exercise(device: Device, candidate: Candidate) {
         );
         close(&read(&scores, count), &f32s(&case["scores"]), 2e-7);
     }
-    let mut compiler = PlanCompiler::new(&device, &program, Options::default(), candidate);
+    let mut compiler = PlanCompiler::diagnostic(&device, &program, Options::default(), candidate);
     let mut tensors = HashMap::new();
     for (name, record) in fixture["weights"].as_object().unwrap() {
         tensors.insert(

@@ -21,9 +21,7 @@ pub fn inspect(args: &[String]) -> Result<(), String> {
         "metal",
         &options.shapes,
         &options.elements,
-        &Options {
-            piece: options.piece,
-        },
+        &Options { piece: options.piece, ..Default::default() },
     )?;
     let config = seismic_metal::execution::Config {
             loads: options.loads,

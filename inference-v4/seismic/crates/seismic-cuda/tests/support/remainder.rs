@@ -31,6 +31,7 @@ pub fn program(ty: Type, elements: usize) -> seismic_realization::ScalarProgram 
     let success = cursor.ins().iconst(types::I32, 0);
     cursor.ins().return_(&[success]);
     seismic_realization::ScalarProgram {
+            conditions: Default::default(),
         function,
         buffers: ["a", "b", "out"]
             .into_iter()
@@ -44,6 +45,7 @@ pub fn program(ty: Type, elements: usize) -> seismic_realization::ScalarProgram 
         scalars: vec![],
         scratch_bytes: 0,
         imports: vec![],
+        backend_calls: vec![], participation: seismic_realization::dispatch::Participation::Thread,
         work_items: 1,
         dispatch: seismic_realization::Dispatch::Sequential,
         loads: vec![],

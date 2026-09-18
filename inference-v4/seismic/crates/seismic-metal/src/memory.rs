@@ -15,12 +15,15 @@ use seismic_realization::dispatch::{GroupDispatch, TileDeclaration, TilePlacemen
 use seismic_realization::execution::Multiplicity;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+mod lifetime;
+pub use lifetime::Interval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Purpose {
     Value,
     ReductionInput,
     Merge,
+    PacketPlane(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AllocationId {
@@ -39,6 +42,27 @@ pub struct ArrayAllocation {
     pub id: AllocationId,
     pub declaration: TileDeclaration,
     pub scope: Vec<Scope>,
+    pub lifetime: Interval,
+    pub slot: usize,
+    /// All participating lanes reach this binding. Shared slot reuse requires
+    /// a completion barrier here, including a subsequent loop iteration.
+    pub uniform: bool,
+    pub(crate) executions: Arc<Multiplicity<ControlValue>>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllocationChoices {
+    pub allocation: AllocationId,
+    pub alternatives: Vec<usize>,
+    pub new_slot: usize,
+}
+impl seismic_accounting::selection::Choices for AllocationChoices {
+    type Alternative = usize;
+    fn len(&self) -> usize {
+        self.alternatives.len()
+    }
+    fn get(&self, index: usize) -> Option<usize> {
+        self.alternatives.get(index).copied()
+    }
 }
 /// Memory accesses ordered among lanes of one SIMD group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,8 +74,10 @@ pub enum BarrierPurpose {
     Snapshot(Purpose),
     Copy,
     Owned,
+    Lanes,
     Merge,
     IntrinsicStore,
+    Reuse(Purpose),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BarrierSite {
@@ -78,8 +104,11 @@ pub struct LaunchMemory {
     /// This launch must observe completion of its predecessor before it starts.
     pub predecessor: Option<usize>,
     pub arrays: Vec<ArrayAllocation>,
+    /// Actual backing declarations. Multiple nonoverlapping values may select
+    /// one slot; emission and capacity accounting both use these declarations.
+    pub slots: Vec<TileDeclaration>,
     pub barriers: BTreeMap<BarrierSite, Barrier>,
-    /// Sum of declared private arrays per lane, not a simultaneous residency claim.
+    /// Sum of selected private backing slots per lane, not native register usage.
     pub declared_private_bytes_per_lane: u64,
     /// Shared arrays are hoisted to launch scope by the current emission contract.
     pub shared_bytes_per_group: u64,
@@ -134,6 +163,37 @@ impl MemoryPlan {
                 if !ids.insert(allocation.id) {
                     return Err("duplicate memory allocation identity".into());
                 }
+                let slot = launch
+                    .slots
+                    .get(allocation.slot)
+                    .ok_or("allocation backing slot is absent")?;
+                if slot.dtype != allocation.declaration.dtype
+                    || slot.placement != allocation.declaration.placement
+                    || slot.capacity < allocation.declaration.capacity
+                {
+                    return Err("allocation backing slot is incompatible".into());
+                }
+                for other in launch
+                    .arrays
+                    .iter()
+                    .filter(|a| a.id != allocation.id && a.slot == allocation.slot)
+                {
+                    if allocation.lifetime.overlaps(other.lifetime) {
+                        return Err("simultaneously live allocations share storage".into());
+                    }
+                    if slot.placement == TilePlacement::GroupShared
+                        && (!allocation.uniform
+                            || !launch.barriers.contains_key(&BarrierSite {
+                                operation: allocation.id.operation,
+                                variable: allocation.id.variable,
+                                purpose: BarrierPurpose::Reuse(allocation.id.purpose),
+                            }))
+                    {
+                        return Err(
+                            "shared allocation reuse lacks completion synchronization".into()
+                        );
+                    }
+                }
             }
         }
         let mut bindings = HashSet::new();
@@ -187,7 +247,30 @@ pub fn plan(
     reductions: &ReductionPlan,
     shared_limit: u64,
 ) -> Result<MemoryPlan, String> {
+    plan_selected(
+        vars,
+        body,
+        phases,
+        storage,
+        reductions,
+        shared_limit,
+        &mut |choice| Ok(choice.new_slot),
+    )
+}
+pub fn plan_selected(
+    vars: &[Var],
+    body: &[Stmt],
+    phases: &[Phase],
+    storage: &StoragePlan,
+    reductions: &ReductionPlan,
+    shared_limit: u64,
+    select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
+) -> Result<MemoryPlan, String> {
+    let lifetimes = lifetime::Analysis::new(body)?;
     struct Planner<'a> {
+        lifetimes: &'a lifetime::Analysis,
+        select: &'a mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
+        split_launch: bool,
         vars: &'a [Var],
         uniform: HashSet<VarId>,
         uniform_views: HashSet<VarId>,
@@ -316,7 +399,9 @@ pub fn plan(
             memory: MemorySpace,
         ) -> Result<(), String> {
             if self.partial_owned {
-                return Err(format!("memory barrier {purpose:?} at {operation:?} requires proven full-lane participation inside owned or conditional control"));
+                return Err(format!(
+                    "memory barrier {purpose:?} at {operation:?} requires proven full-lane participation inside owned or conditional control"
+                ));
             }
             let site = BarrierSite {
                 operation,
@@ -390,6 +475,17 @@ pub fn plan(
                 } else {
                     self.scope.clone()
                 },
+                lifetime: if self.split_launch {
+                    Interval {
+                        begin: 0,
+                        end: usize::MAX,
+                    }
+                } else {
+                    self.lifetimes.interval(operation, variable)?
+                },
+                slot: usize::MAX,
+                uniform: !self.partial_owned,
+                executions: self.executions.clone(),
             });
             Ok(())
         }
@@ -399,6 +495,25 @@ pub fn plan(
             var: VarId,
             purpose: Purpose,
         ) -> Result<(), String> {
+            if purpose == Purpose::Value {
+                if let Some(layout) = self.storage.packets(var) {
+                    let selected = self.storage.declaration(var)?;
+                    for (plane, part) in layout.planes.iter().enumerate() {
+                        self.allocate(
+                            operation,
+                            var,
+                            Purpose::PacketPlane(plane),
+                            TileDeclaration {
+                                symbol: format!("{}_{}", selected.symbol, part.plane.name),
+                                dtype: part.plane.dtype(),
+                                capacity: part.elements,
+                                placement: selected.placement.clone(),
+                            },
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
             self.allocate(
                 operation,
                 var,
@@ -543,7 +658,8 @@ pub fn plan(
                     StmtKind::Owned { tile, .. } => {
                         self.expression(tile, operation, &mut ordinal, None)?
                     }
-                    StmtKind::LoadLoop { views, .. } => {
+                    StmtKind::LoadLoop { domain, views, .. } => {
+                        self.expression(&domain.view, operation, &mut ordinal, None)?;
                         for view in views {
                             self.expression(view, operation, &mut ordinal, None)?;
                         }
@@ -553,8 +669,9 @@ pub fn plan(
                 match &statement.kind {
                     StmtKind::LoadLoop {
                         vars,
+                        offset,
                         views,
-                        axis,
+                        domain,
                         capacity,
                         piece,
                         modes,
@@ -564,10 +681,11 @@ pub fn plan(
                         // Whole-axis empty streams have no emitted body. Chunked
                         // streams retain a loop and its declarations even when empty.
                         if capacity.is_none()
-                            && views
-                                .first()
-                                .and_then(|v| v.ty.shaped())
-                                .and_then(|s| s.shape.get(*axis))
+                            && domain
+                                .view
+                                .ty
+                                .shaped()
+                                .and_then(|s| s.shape.get(domain.axis))
                                 .and_then(|s| s.as_constant())
                                 == Some(0)
                         {
@@ -579,9 +697,10 @@ pub fn plan(
                             .ok_or("unresolved streamed allocations")?;
                         let outer = self.executions.clone();
                         let outer_partial = self.partial_owned;
-                        let uniform_extent = views.iter().all(|view| self.uniform_view(view));
+                        let uniform_extent = self.uniform_view(&domain.view)
+                            && views.iter().all(|view| self.uniform_view(view));
                         if uniform_extent {
-                            for view in views {
+                            for view in std::iter::once(&domain.view).chain(views) {
                                 if let Some(s) = view.ty.shaped() {
                                     for extent in &s.shape {
                                         self.uniform_atoms.extend(extent.atoms());
@@ -597,16 +716,31 @@ pub fn plan(
                             }
                         }
                         self.partial_owned |= !uniform_extent;
+                        if let Some(var) = offset {
+                            if uniform_extent {
+                                self.uniform.insert(*var);
+                            } else {
+                                self.uniform.remove(var);
+                            }
+                            if let VarKind::Index(atom) = &self.vars[*var].kind {
+                                if uniform_extent {
+                                    self.uniform_atoms.insert(atom.clone());
+                                } else {
+                                    self.uniform_atoms.remove(atom);
+                                }
+                            }
+                        }
                         if uniform_extent {
                             self.uniform_atoms.insert(piece.clone());
                         } else {
                             self.uniform_atoms.remove(piece);
                         }
                         if let Some(capacity) = capacity {
-                            let extent = views
-                                .first()
-                                .and_then(|v| v.ty.shaped())
-                                .and_then(|s| s.shape.get(*axis))
+                            let extent = domain
+                                .view
+                                .ty
+                                .shaped()
+                                .and_then(|s| s.shape.get(domain.axis))
                                 .ok_or("stream memory domain has no extent")?;
                             if *capacity <= 0 {
                                 return Err("stream memory capacity must be positive".into());
@@ -623,7 +757,7 @@ pub fn plan(
                             );
                             self.scope.push(Scope::Body(operation));
                         }
-                        for (var, mode) in vars.iter().zip(modes) {
+                        for ((var, mode), view) in vars.iter().zip(modes).zip(views) {
                             if *mode == LoadMode::Materialize {
                                 self.snapshot(operation, *var, Purpose::Value)?;
                             }
@@ -632,7 +766,9 @@ pub fn plan(
                                 if *mode == LoadMode::Materialize {
                                     Some(self.storage.declaration(*var)?.placement.clone())
                                 } else {
-                                    None
+                                    crate::storage::tile_root(view)
+                                        .and_then(|root| self.bound.get(&root).cloned())
+                                        .flatten()
                                 },
                             );
                         }
@@ -650,6 +786,15 @@ pub fn plan(
                         let previous = self.bound.get(&var).cloned();
                         if !self.partial_owned && self.uniform_view(value) {
                             self.uniform_views.insert(var);
+                            if let Some(shape) = value.ty.shaped() {
+                                for extent in &shape.shape {
+                                    if let [atom] = extent.atoms().as_slice() {
+                                        if *extent == Sym::atom(atom.clone()) {
+                                            self.uniform_atoms.insert(atom.clone());
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             self.uniform_views.remove(&var);
                         }
@@ -661,6 +806,12 @@ pub fn plan(
                             self.uniform.insert(var);
                         } else {
                             self.uniform.remove(&var);
+                        }
+                        if matches!(target.ty, Ty::Tile(_)) && !self.storage.requires_data(var) {
+                            // Geometry assignments retain their scalar/view
+                            // evaluation but create no element lifetime or copy.
+                            self.bound.entry(var).or_insert(None);
+                            continue;
                         }
                         match &value.kind {
                             ExprKind::TileAlloc { .. } => {
@@ -684,7 +835,16 @@ pub fn plan(
                                     );
                                 }
                             }
-                            ExprKind::Var(_) if matches!(target.ty, Ty::Tile(_)) => {
+                            ExprKind::Var(_)
+                            | ExprKind::Index { .. }
+                            | ExprKind::Transpose(_)
+                            | ExprKind::Builtin {
+                                name: Builtin::Reshape,
+                                ..
+                            } if matches!(target.ty, Ty::Tile(_)) => {
+                                if previous.is_some() {
+                                    self.snapshot(operation, var, Purpose::Value)?;
+                                }
                                 if previous.is_none() {
                                     self.materialize(operation, var, Purpose::Value)?;
                                     self.bound.insert(
@@ -747,9 +907,8 @@ pub fn plan(
                         tile,
                         body,
                     } => {
-                        let ExprKind::Var(var) = tile.kind else {
-                            return Err("owned memory domain has no binding".into());
-                        };
+                        let var = crate::storage::tile_root(tile)
+                            .ok_or("owned memory domain has no binding")?;
                         let placement = self
                             .bound
                             .get(&var)
@@ -833,6 +992,8 @@ pub fn plan(
                             .checked_mul(width)
                             .and_then(|n| i64::try_from(n).ok())
                             .ok_or("lane domain overflow")?;
+                        self.partial_owned |=
+                            extent.rem(&Sym::constant(run)).as_constant() != Some(0);
                         self.nested(
                             body,
                             Scope::Body(operation),
@@ -845,6 +1006,16 @@ pub fn plan(
                             ),
                         )?;
                         self.partial_owned = outer_partial;
+                        let mut writes = HashSet::new();
+                        for statement in body {
+                            seismic_lang::rewrite::writes(statement, &mut writes);
+                        }
+                        let mut writes = writes.into_iter().collect::<Vec<_>>();
+                        writes.sort_unstable();
+                        for variable in writes {
+                            let placement = self.bound.get(&variable).cloned().flatten();
+                            self.publish(operation, variable, BarrierPurpose::Lanes, placement)?;
+                        }
                     }
                     StmtKind::If { cond, then, els } => {
                         let outer = self.partial_owned;
@@ -892,10 +1063,79 @@ pub fn plan(
             prologue: crate::support::LaunchRecipe,
         ) -> Result<LaunchMemory, String> {
             prologue.instantiate(dispatch)?;
+            let mut slots: Vec<TileDeclaration> = Vec::new();
+            let mut occupants: Vec<Vec<usize>> = Vec::new();
+            for index in 0..self.arrays.len() {
+                let array = &self.arrays[index];
+                let shared = array.declaration.placement == TilePlacement::GroupShared;
+                let mut alternatives = slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, backing)| {
+                        (backing.dtype == array.declaration.dtype
+                            && backing.placement == array.declaration.placement
+                            && occupants[slot].iter().all(|&other| {
+                                !self.arrays[other].lifetime.overlaps(array.lifetime)
+                                    && (!shared || (array.uniform && self.arrays[other].uniform))
+                            }))
+                        .then_some(slot)
+                    })
+                    .collect::<Vec<_>>();
+                alternatives.push(slots.len());
+                let choice = AllocationChoices {
+                    allocation: array.id,
+                    alternatives,
+                    new_slot: slots.len(),
+                };
+                let slot = (self.select)(&choice)?;
+                if !choice.alternatives.contains(&slot) {
+                    return Err(
+                        "allocation selects an overlapping or incompatible backing slot".into(),
+                    );
+                }
+                if slot == slots.len() {
+                    let mut declaration = array.declaration.clone();
+                    declaration.symbol = format!("seismic_storage_{slot}");
+                    slots.push(declaration);
+                    occupants.push(Vec::new());
+                } else {
+                    slots[slot].capacity = slots[slot].capacity.max(array.declaration.capacity);
+                }
+                self.arrays[index].slot = slot;
+                occupants[slot].push(index);
+            }
+            // The barrier precedes every rebind of shared storage. This also
+            // closes the final-read -> next-iteration-write dependency in loops.
+            for members in occupants.iter().filter(|members| members.len() > 1) {
+                for &index in members {
+                    let array = &self.arrays[index];
+                    if array.declaration.placement == TilePlacement::GroupShared {
+                        let site = BarrierSite {
+                            operation: array.id.operation,
+                            variable: array.id.variable,
+                            purpose: BarrierPurpose::Reuse(array.id.purpose),
+                        };
+                        if self
+                            .barriers
+                            .insert(
+                                site,
+                                Barrier {
+                                    memory: MemorySpace::Threadgroup,
+                                    scope: array.scope.clone(),
+                                    executions: array.executions.clone(),
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err("duplicate allocation reuse barrier".into());
+                        }
+                    }
+                }
+            }
             let mut private = 0u64;
             let mut shared = 0u64;
-            for array in &self.arrays {
-                let layout = array.declaration.layout(dispatch)?;
+            for declaration in &slots {
+                let layout = declaration.layout(dispatch)?;
                 private = private
                     .checked_add(layout.private_bytes_per_lane)
                     .ok_or("private declaration sum overflow")?;
@@ -904,12 +1144,15 @@ pub fn plan(
                     .ok_or("shared declaration sum overflow")?;
             }
             if shared > limit {
-                return Err(format!("planned realization needs {shared} bytes of threadgroup memory, over this device's {limit}"));
+                return Err(format!(
+                    "planned realization needs {shared} bytes of threadgroup memory, over this device's {limit}"
+                ));
             }
             Ok(LaunchMemory {
                 prologue,
                 predecessor,
                 arrays: std::mem::take(&mut self.arrays),
+                slots,
                 barriers: std::mem::take(&mut self.barriers),
                 declared_private_bytes_per_lane: private,
                 shared_bytes_per_group: shared,
@@ -922,6 +1165,9 @@ pub fn plan(
         return Err("allocation plan phase/domain mismatch".into());
     }
     let mut planner = Planner {
+        lifetimes: &lifetimes,
+        select,
+        split_launch: false,
         vars,
         uniform: vars
             .iter()
@@ -954,6 +1200,7 @@ pub fn plan(
     let mut launches = Vec::new();
     let mut scratch = Vec::new();
     for (phase_index, (root, phase)) in body.iter().zip(phases).enumerate() {
+        planner.split_launch = phase.split.is_some();
         // Ordered launches publish predecessor tensor writes before this phase.
         planner.uniform_tensor_reads = true;
         let operation = root.id.ok_or("phase has no operation identity")?;

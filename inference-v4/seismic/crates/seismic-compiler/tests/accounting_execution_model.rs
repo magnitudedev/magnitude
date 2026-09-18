@@ -1,11 +1,13 @@
-use seismic_accounting::workload::{Allocation, BufferBinding, DerivationLimits, ScalarWorkload};
+use seismic_accounting::workload::{
+    Allocation, BufferBinding, DerivationError, DerivationLimit, DerivationLimits, ScalarWorkload,
+};
 use seismic_accounting::{
     execution_model::*,
     schedule::{CapacityUnit, Reservation, Resource, Timebase},
 };
 use seismic_lang::{
-    program::{compile, SourceFile},
     Scope as LanguageScope,
+    program::{SourceFile, compile},
 };
 use seismic_realization::{CallConv, Dispatch, ScalarProgram};
 use std::collections::{BTreeMap, HashMap};
@@ -135,14 +137,16 @@ fn actual_loop_instances_and_alias_versions_generate_checked_schedules() {
         reads.iter().map(|a| a.offset).collect::<Vec<_>>(),
         [0, 4, 8]
     );
-    assert!(d
-        .origins
-        .iter()
-        .any(|o| matches!(o, Origin::Instruction { occurrence: 2, .. })));
-    assert!(d
-        .origins
-        .iter()
-        .any(|o| matches!(o, Origin::EdgeTransfer { .. })));
+    assert!(
+        d.origins
+            .iter()
+            .any(|o| matches!(o, Origin::Instruction { occurrence: 2, .. }))
+    );
+    assert!(
+        d.origins
+            .iter()
+            .any(|o| matches!(o, Origin::EdgeTransfer { .. }))
+    );
     let solution = d.model.solve(0).unwrap();
     assert!(solution.is_optimal());
     // Resource total and serialized feasible witness meet for the declared model.
@@ -171,8 +175,11 @@ fn actual_loop_instances_and_alias_versions_generate_checked_schedules() {
             .iter()
             .find(|a| !a.write && a.allocation == write.allocation && a.offset == write.offset)
             .unwrap();
-        assert!(aliased.model.operations[write.completion]
-            .predecessors.contains(&read.completion));
+        assert!(
+            aliased.model.operations[write.completion]
+                .predecessors
+                .contains(&read.completion)
+        );
     }
 }
 
@@ -181,10 +188,11 @@ fn parallel_invocations_share_resources_but_own_scratch_and_must_not_race() {
     let p = program(COPY, "copy", 3, Dispatch::ParallelRoot);
     let (c, w) = fixture(&p);
     let d = derive(&p, &c, &w);
-    assert!(d
-        .accesses
-        .iter()
-        .any(|a| a.allocation == AllocationIdentity::Scratch(2)));
+    assert!(
+        d.accesses
+            .iter()
+            .any(|a| a.allocation == AllocationIdentity::Scratch(2))
+    );
     assert_eq!(
         d.accesses
             .iter()
@@ -198,28 +206,37 @@ fn parallel_invocations_share_resources_but_own_scratch_and_must_not_race() {
     overlap.allocations[0].bytes += 4;
     overlap.buffers[1].allocation = 0;
     overlap.buffers[1].offset = 4;
-    assert!(derive_scalar(
-        &p,
-        &c,
-        &overlap,
-        DerivationLimits {
-            instructions: 20_000,
-            operations: 60_000
-        }
-    )
-    .unwrap_err()
-    .contains("conflicting aliased"));
+    assert!(
+        derive_scalar(
+            &p,
+            &c,
+            &overlap,
+            DerivationLimits {
+                instructions: 20_000,
+                operations: 60_000
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting aliased")
+    );
 }
 
 #[test]
 fn branches_follow_typed_scalar_conditions_and_do_not_charge_both_paths() {
-    let p = program("fn branch[N](out: tensor[1] f32, choose: bool):\n  y = tile[1] f32\n  for i in owned(y): y[i] = 7.0\n  if choose:\n    store(y, out)\n", "branch",1,Dispatch::Sequential);
+    let p = program(
+        "fn branch[N](out: tensor[1] f32, choose: bool):\n  y = tile[1] f32\n  for i in owned(y): y[i] = 7.0\n  if choose:\n    store(y, out)\n",
+        "branch",
+        1,
+        Dispatch::Sequential,
+    );
     let (c, mut w) = fixture(&p);
     let off = derive(&p, &c, &w);
-    assert!(!off
-        .accesses
-        .iter()
-        .any(|a| a.write && a.allocation == AllocationIdentity::External(0)));
+    assert!(
+        !off.accesses
+            .iter()
+            .any(|a| a.write && a.allocation == AllocationIdentity::External(0))
+    );
     w.scalars[0] = 1;
     let on = derive(&p, &c, &w);
     assert_eq!(
@@ -231,54 +248,73 @@ fn branches_follow_typed_scalar_conditions_and_do_not_charge_both_paths() {
     );
     assert!(on.instructions > off.instructions);
     w.scalars[0] = 2;
-    assert!(derive_scalar(
-        &p,
-        &c,
-        &w,
-        DerivationLimits {
-            instructions: 20_000,
-            operations: 60_000
-        }
-    )
-    .is_err());
+    assert!(
+        derive_scalar(
+            &p,
+            &c,
+            &w,
+            DerivationLimits {
+                instructions: 20_000,
+                operations: 60_000
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn data_dependent_extents_require_real_workload_conditions() {
-    let source="fn stream[N](x: tensor[N] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  for t in load(x[visible[0]:visible[1]], over=0):\n    acc[0] += reduce(t, 0, sum)\n  store(acc, out)\n";
+    let source = "fn stream[N](x: tensor[N] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] = reduce(t, 0, sum, ordered=true)\n  store(acc, out)\n";
     let p = program(source, "stream", 7, Dispatch::Sequential);
     let (c, mut w) = fixture(&p);
     let limits = DerivationLimits {
         instructions: 20_000,
         operations: 60_000,
     };
-    assert!(derive_scalar(&p, &c, &w, limits)
-        .unwrap_err()
-        .contains("data-dependent branch"));
-    w.allocations[1].known_bytes = [1i32, 4]
-        .into_iter()
-        .flat_map(i32::to_le_bytes)
-        .enumerate()
-        .map(|(i, b)| (i as u64, b))
-        .collect();
-    let d = derive(&p, &c, &w);
-    assert_eq!(
-        d.accesses
-            .iter()
-            .filter(|a| !a.write && a.allocation == AllocationIdentity::External(0))
-            .map(|a| a.offset)
-            .collect::<Vec<_>>(),
-        [4, 8, 12]
+    let Err(error) = derive_scalar(&p, &c, &w, limits) else {
+        panic!("unknown slice endpoints must leave the executed path undetermined");
+    };
+    assert!(
+        error.to_string().contains("data-dependent branch"),
+        "{error}"
     );
-    w.allocations[1].known_bytes = [1i32, 9]
-        .into_iter()
-        .flat_map(i32::to_le_bytes)
-        .enumerate()
-        .map(|(i, b)| (i as u64, b))
-        .collect();
-    assert!(derive_scalar(&p, &c, &w, limits)
-        .unwrap_err()
-        .contains("successfully"));
+
+    // Source data-dependent slices clamp into the parent extent. Accounting
+    // must follow the resulting executed window, including empty windows,
+    // rather than rejecting an out-of-range raw endpoint or charging capacity.
+    for (bounds, expected) in [
+        ([1i32, 4], vec![4, 8, 12]),
+        ([1, 9], vec![4, 8, 12, 16, 20, 24]),
+        ([-3, 3], vec![0, 4, 8]),
+        ([5, 2], vec![]),
+        ([-4, -1], vec![]),
+        ([9, 12], vec![]),
+    ] {
+        w.allocations[1].known_bytes = bounds
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .enumerate()
+            .map(|(i, b)| (i as u64, b))
+            .collect();
+        let d = derive(&p, &c, &w);
+        assert_eq!(
+            d.accesses
+                .iter()
+                .filter(|a| !a.write && a.allocation == AllocationIdentity::External(0))
+                .map(|a| a.offset)
+                .collect::<Vec<_>>(),
+            expected,
+            "bounds={bounds:?}"
+        );
+        assert_eq!(
+            d.accesses
+                .iter()
+                .filter(|a| a.write && a.allocation == AllocationIdentity::External(2))
+                .count(),
+            1,
+            "even an empty reduction publishes its result: bounds={bounds:?}"
+        );
+    }
 }
 
 #[test]
@@ -311,28 +347,27 @@ fn hardware_timings_are_unambiguous_and_missing_information_remains_incomplete()
     c.timings.push(last);
     assert!(c.validate().unwrap_err().contains("overlapping"));
     c.timings.pop();
-    assert!(derive_scalar(
-        &p,
-        &c,
-        &w,
-        DerivationLimits {
-            instructions: 2,
-            operations: 60_000
-        }
-    )
-    .unwrap_err()
-    .contains("budget exhausted"));
-    assert!(derive_scalar(
-        &p,
-        &c,
-        &w,
-        DerivationLimits {
-            instructions: 20_000,
-            operations: 2
-        }
-    )
-    .unwrap_err()
-    .contains("budget exhausted"));
+    for (limits, expected) in [
+        (
+            DerivationLimits {
+                instructions: 2,
+                operations: 60_000,
+            },
+            DerivationLimit::Instructions(2),
+        ),
+        (
+            DerivationLimits {
+                instructions: 20_000,
+                operations: 2,
+            },
+            DerivationLimit::Operations(2),
+        ),
+    ] {
+        assert_eq!(
+            derive_scalar(&p, &c, &w, limits).unwrap_err(),
+            DerivationError::Exhausted(expected)
+        );
+    }
     let mut bad = c;
     bad.timings[0].services.clear();
     assert!(bad.validate().unwrap_err().contains("service fact"));
@@ -388,7 +423,9 @@ fn branch_and_address_specialization_matches_the_independent_language_interprete
         ),
     ];
     for (dtype, condition, inputs) in cases {
-        let text = format!("fn choose(out: tensor[2] f32, a: {dtype}, b: {dtype}):\n  y = tile[1] f32\n  for i in owned(y): y[i] = 1.0\n  if {condition}:\n    store(y,out[0:1])\n  else:\n    store(y,out[1:2])\n");
+        let text = format!(
+            "fn choose(out: tensor[2] f32, a: {dtype}, b: {dtype}):\n  y = tile[1] f32\n  for i in owned(y): y[i] = 1.0\n  if {condition}:\n    store(y,out[0:1])\n  else:\n    store(y,out[1:2])\n"
+        );
         let source = compile(
             &[SourceFile {
                 path: "independent.seismic.portable".into(),
@@ -452,15 +489,22 @@ fn branch_and_address_specialization_matches_the_independent_language_interprete
 
 #[test]
 fn imported_helpers_cannot_be_priced_as_hardware_instructions() {
-    let p=program("fn math(out: tensor[1] f32, x: f32):\n  y = tile[1] f32\n  for i in owned(y): y[i] = exp(x)\n  store(y,out)\n","math",1,Dispatch::Sequential);
+    let p = program(
+        "fn math(out: tensor[1] f32, x: f32):\n  y = tile[1] f32\n  for i in owned(y): y[i] = exp(x)\n  store(y,out)\n",
+        "math",
+        1,
+        Dispatch::Sequential,
+    );
     let (mut hardware, workload) = fixture(&p);
     let derived = derive(&p, &hardware, &workload);
     assert!(!derived.model.unmapped.is_empty());
     assert!(derived.model.solve(100).is_err());
-    assert!(derived
-        .accesses
-        .iter()
-        .any(|a| a.write && matches!(a.allocation, AllocationIdentity::External(_))));
+    assert!(
+        derived
+            .accesses
+            .iter()
+            .any(|a| a.write && matches!(a.allocation, AllocationIdentity::External(_)))
+    );
     let helper = requirements(&p)
         .unwrap()
         .into_iter()
@@ -477,4 +521,48 @@ fn imported_helpers_cannot_be_priced_as_hardware_instructions() {
         }],
     });
     assert!(hardware.validate().unwrap_err().contains("helper call"));
+}
+
+#[test]
+fn original_parallel_alias_admission_precedes_scalar_model_construction() {
+    let source = "construct point[K](x: tile[K] f32, y: tile[K] f32):\n  for j in owned(y): y[j] = x[j]\nfn copy[N](x: tensor[N+1] f32, out: tensor[N] f32):\n  for i in parallel:\n    a = load(x[i+1:i+2])\n    b = tile[1] f32\n    point(a,b)\n    store(b,out[i:i+1])\n";
+    let checked = compile(
+        &[
+            SourceFile {
+                path: "alias.seismic.portable".into(),
+                scope: LanguageScope::Portable,
+                text: source.into(),
+            },
+            SourceFile {
+                path: "alias.seismic.cpu".into(),
+                scope: LanguageScope::Backend("cpu".into()),
+                text: "lower point: portable\n".into(),
+            },
+        ],
+        &[],
+    )
+    .unwrap();
+    let lowered =
+        seismic_lang::lower::lower(&checked, "copy", "cpu", &HashMap::from([("N".into(), 4)]))
+            .unwrap();
+    let p =
+        seismic_compiler::scalar_with(&lowered, CallConv::SystemV, Dispatch::Sequential).unwrap();
+    assert!(!p.conditions.alias_pairs().is_empty());
+    let (hardware, mut workload) = fixture(&p);
+    derive(&p, &hardware, &workload);
+    workload.buffers[1].allocation = workload.buffers[0].allocation;
+    let Err(error) = derive_scalar(
+        &p,
+        &hardware,
+        &workload,
+        DerivationLimits {
+            instructions: 20_000,
+            operations: 60_000,
+        },
+    ) else {
+        panic!("source alias violation acquired a modeled execution");
+    };
+    assert!(
+        matches!(error, DerivationError::Analysis(message) if message.contains("source parallel binding"))
+    );
 }

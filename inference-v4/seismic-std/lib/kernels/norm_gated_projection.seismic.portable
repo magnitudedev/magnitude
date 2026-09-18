@@ -1,21 +1,22 @@
 # The feed-forward norm folded into the SwiGLU gate and up projections of one activation
-# row: out = silu(norm(x)·gate) * (norm(x)·up), with both dot products sharing the stream.
+# row: out = silu(norm(x)·gate) * (norm(x)·up), with both dot products sharing the normalized activation.
 fn norm_gated_projection[N, K](x: tensor[1, K] bf16, nw: tensor[1, K] bf16, gate: tensor[N, K] q4g64, up: tensor[N, K] q4g64, eps: f32, out: tensor[1, N] bf16):
   for col in parallel:
     g = tile[1, 1] f32
     u = tile[1, 1] f32
     for i, j in owned(g): g[i, j] = 0.0
     for i, j in owned(u): u[i, j] = 0.0
-    ss = 0.0
-    for xt, nt, gt, ut in load((x, nw, gate[col : col + 1], up[col : col + 1]), over=1):
-      a = tile[1, extent(xt, 1)] f32
-      for i, j in owned(a): a[i, j] = f32(xt[i, j]) * f32(nt[i, j])
-      sq = tile[extent(xt, 1)] f32
-      for j in owned(sq): sq[j] = f32(xt[0, j]) * f32(xt[0, j])
-      part = reduce(sq, 0, sum)
-      ss = ss + part
-      matmul(a, gt, g)
-      matmul(a, ut, u)
+    xt = load(x)
+    nt = load(nw)
+    gt = load(gate[col : col + 1])
+    ut = load(up[col : col + 1])
+    a = tile[1, K] f32
+    for i, j in owned(a): a[i, j] = f32(xt[i, j]) * f32(nt[i, j])
+    sq = tile[K] f32
+    for j in owned(sq): sq[j] = f32(xt[0, j]) * f32(xt[0, j])
+    ss = reduce(sq, 0, sum)
+    matmul(a, gt, g)
+    matmul(a, ut, u)
     y = tile[1, 1] f32
     for i, j in owned(y):
       inv = rsqrt(ss / f32(K) + eps)

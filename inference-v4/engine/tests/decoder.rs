@@ -7,10 +7,7 @@ use seismic_engine::{
     },
 };
 use seismic_lang::{lower::Options, types::DType};
-use seismic_runtime::{
-    Candidate, Device,
-    plan::{CompilationChoices, KernelChoice},
-};
+use seismic_runtime::{Candidate, Device, plan::Diagnostic};
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 fn exercise(device: Device, candidate: Candidate, routed: bool) {
@@ -142,22 +139,7 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
     };
     let device = Rc::new(device);
     let mut importer = Importer::new(device.clone(), candidate.clone()).unwrap();
-    let mut kernels = std::collections::BTreeMap::new();
-    #[cfg(target_os = "macos")]
-    if let Candidate::Metal(config) = &candidate {
-        for entry in ["silu", "sigmoid", "multiply", "add"] {
-            let mut config = config.clone();
-            config.tile_piece = Some(4);
-            kernels.insert(
-                entry.into(),
-                KernelChoice {
-                    candidate: Candidate::Metal(config),
-                    lowering: Options { piece: Some(4) },
-                },
-            );
-        }
-    }
-    let mut decoder = Decoder::compile(
+    let mut decoder = Decoder::compile_diagnostic(
         device,
         &description,
         |descriptor, target| {
@@ -173,12 +155,12 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
                 .import(descriptor, &stored, target)
                 .map_err(|e| e.to_string())
         },
-        CompilationChoices {
-            default: KernelChoice {
-                candidate,
-                lowering: Options { piece: Some(4) },
+        Diagnostic {
+            candidate,
+            lowering: Options {
+                piece: Some(4),
+                ..Default::default()
             },
-            kernels,
         },
         8,
         2,

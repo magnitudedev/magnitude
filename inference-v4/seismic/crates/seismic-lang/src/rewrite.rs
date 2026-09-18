@@ -238,6 +238,7 @@ pub fn check_split(loop_body: &[Stmt], carried: &[VarId], names: &dyn Fn(VarId) 
 fn is_local_temp(loop_body: &[Stmt], v: VarId) -> bool {
     fn defined_here(stmts: &[Stmt], v: VarId) -> bool {
         stmts.iter().any(|s| match &s.kind {
+            StmtKind::Reduction(_) => false,
             // `x = ...` replaces the whole variable, so nothing of the previous value remains.
             StmtKind::Assign { target, op: crate::ast::AssignOp::Assign, .. } => {
                 matches!(target.kind, ExprKind::Var(x) if x == v)
@@ -254,6 +255,7 @@ fn is_local_temp(loop_body: &[Stmt], v: VarId) -> bool {
 /// Variables a statement assigns, directly or through an element write.
 pub fn writes(s: &Stmt, out: &mut HashSet<VarId>) {
     match &s.kind {
+        StmtKind::Reduction(r) => { out.extend(r.state_variables()); for s in r.bodies().flatten() {writes(s,out);} }
         StmtKind::Assign { target, value, .. } => {
             expression_writes(value, out);
             expression_writes(target, out);
@@ -332,6 +334,7 @@ fn expression_writes(expr: &Expr, out: &mut HashSet<VarId>) {
 /// Whether a statement's value depends on an index, directly or through a tainted variable.
 pub fn depends(s: &Stmt, tainted: &HashSet<VarId>, atom: &Atom) -> bool {
     match &s.kind {
+        StmtKind::Reduction(r) => r.operands().any(|e|expr_depends(e,tainted,atom)) || r.extent().atoms().contains(atom) || r.bodies().flatten().any(|s|depends(s,tainted,atom)),
         StmtKind::Assign { target, value, .. } => expr_depends(target, tainted, atom) || expr_depends(value, tainted, atom),
         StmtKind::Expr(e) => expr_depends(e, tainted, atom),
         StmtKind::Owned { tile, body, .. } => expr_depends(tile, tainted, atom) || body.iter().any(|b| depends(b, tainted, atom)),
@@ -339,8 +342,8 @@ pub fn depends(s: &Stmt, tainted: &HashSet<VarId>, atom: &Atom) -> bool {
             lo.atoms().contains(atom) || hi.atoms().contains(atom) || body.iter().any(|b| depends(b, tainted, atom))
         }
         StmtKind::Lanes { extent, body, .. } => extent.atoms().contains(atom) || body.iter().any(|b| depends(b, tainted, atom)),
-        StmtKind::LoadLoop { views, body, .. } => {
-            views.iter().any(|v| expr_depends(v, tainted, atom)) || body.iter().any(|b| depends(b, tainted, atom))
+        StmtKind::LoadLoop { domain, views, body, .. } => {
+            expr_depends(&domain.view,tainted,atom) || views.iter().any(|v| expr_depends(v, tainted, atom)) || body.iter().any(|b| depends(b, tainted, atom))
         }
         StmtKind::If { cond, then, els } => {
             expr_depends(cond, tainted, atom) || then.iter().chain(els.iter()).any(|b| depends(b, tainted, atom))

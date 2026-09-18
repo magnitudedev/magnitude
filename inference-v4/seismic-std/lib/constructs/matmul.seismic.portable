@@ -1,7 +1,18 @@
-# Contraction over the last axis of both operands: acc[i, j] += sum_k A[i, k] * B[j, k].
-# B is [N, K] so a packed weight matrix, which packs along K, is consumed without a transpose.
-# The reduction over K is reassociable.
+# Contraction over the last axis of both operands. Each step retains its FMA;
+# a realization may merge contiguous partial chains with the declared addition.
+fn matmul_add[S](left: tile[S] f32, right: tile[S] f32, out: tile[S] f32):
+  for i in owned(out): out[i] = left[i] + right[i]
+
+fn matmul_accumulate[S](state: tile[S] f32, a: tile[S] T, b: tile[S] U, out: tile[S] f32):
+  for i in owned(out): out[i] = fma(a[i], b[i], state[i])
+
 construct matmul[M, N, K](A: tile[M, K] T, B: tile[N, K] U, acc: tile[M, N] f32):
   for i, j in owned(acc):
-    for k in range(K):
-      acc[i, j] = fma(A[i, k], B[j, k], acc[i, j])
+    a = A[i:i+1, :]
+    b = B[j:j+1, :]
+    state = tile[1] f32
+    zero = tile[1] f32
+    for s in owned(state): state[s] = acc[i, j]
+    for s in owned(zero): zero[s] = 0.0
+    reduce((a, b), 1, matmul_add, into=(state,), step=matmul_accumulate, identity=(zero,), ordered=false)
+    acc[i, j] = state[0]

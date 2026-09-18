@@ -34,6 +34,18 @@ fn exercise(device: Device, candidate: Candidate) {
     assert_eq!(Buffer::reclaimable_bytes([&backing, &out]).unwrap(), 0);
     drop(pin);
 
+    // Native allocation facts are derived from retained roots, including views.
+    // GPU address alignment is checked separately from CPU mapping alignment.
+    let workload = seismic_runtime::tuner::workload(
+        "native views", &[input.clone(), out.clone(), backing.clone()],
+        kernel.scalars(), &[2.0],
+    ).unwrap();
+    assert_eq!(workload.allocations.len(), 2);
+    assert!(workload.allocations.iter().all(|a| a.alignment.is_power_of_two()));
+    assert_eq!(workload.buffers[1].allocation, workload.buffers[2].allocation);
+    assert_eq!(workload.buffers[1].offset, 4);
+    assert_eq!(workload.buffers[2].offset, 0);
+
     let gpu = device.backend() != "cpu";
     drop(device);
     let observation = kernel

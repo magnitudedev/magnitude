@@ -242,18 +242,13 @@ pub fn plan(
     storage: &crate::storage::StoragePlan,
     select: &mut dyn FnMut(&Decision) -> Result<Algorithm, String>,
 ) -> Result<ReductionPlan, String> {
-    use seismic_lang::{
-        ir::*,
-        sym::{Atom, Sym},
-        types::Ty,
-    };
+    use seismic_lang::{ir::*, types::Ty};
     use std::collections::HashMap;
     struct Planner<'a> {
         vars: &'a [Var],
         storage: &'a crate::storage::StoragePlan,
         select: &'a mut dyn FnMut(&Decision) -> Result<Algorithm, String>,
         bindings: HashMap<VarId, Option<TilePlacement>>,
-        pieces: HashMap<Atom, Sym>,
         result: ReductionPlan,
         full_lanes: bool,
     }
@@ -262,16 +257,8 @@ pub fn plan(
             for statement in body {
                 match &statement.kind {
                     StmtKind::LoadLoop {
-                        vars,
-                        modes,
-                        piece,
-                        capacity,
-                        body,
-                        ..
+                        vars, modes, body, ..
                     } => {
-                        if let Some(capacity) = capacity {
-                            self.pieces.insert(piece.clone(), Sym::constant(*capacity));
-                        }
                         let modes = modes
                             .as_ref()
                             .filter(|m| m.len() == vars.len())
@@ -292,6 +279,11 @@ pub fn plan(
                         let ExprKind::Var(output) = target.kind else {
                             continue;
                         };
+                        if matches!(target.ty, Ty::Tile(_)) && !self.storage.requires_data(output) {
+                            // Geometry has no placement and cannot be a reduction operand.
+                            self.bindings.entry(output).or_insert(None);
+                            continue;
+                        }
                         match &value.kind {
                             ExprKind::TileAlloc { .. } => {
                                 self.bindings.insert(
@@ -307,7 +299,13 @@ pub fn plan(
                                 };
                                 self.bindings.entry(output).or_insert(placement);
                             }
-                            ExprKind::Var(_) if matches!(target.ty, Ty::Tile(_)) => {
+                            ExprKind::Var(_)
+                            | ExprKind::Index { .. }
+                            | ExprKind::Transpose(_)
+                            | ExprKind::Builtin {
+                                name: Builtin::Reshape,
+                                ..
+                            } if matches!(target.ty, Ty::Tile(_)) => {
                                 if !self.bindings.contains_key(&output) {
                                     self.bindings.insert(
                                         output,
@@ -331,11 +329,18 @@ pub fn plan(
                                     return Err("reduction parameters are unresolved".into());
                                 };
                                 let argmax = *operation == 3;
-                                let binding = self
-                                    .bindings
-                                    .get(input)
-                                    .ok_or("reduction input has no selected ownership")?
-                                    .clone();
+                                // Encoded snapshots own packet planes, not a
+                                // decoded element array. A primitive reduction
+                                // may need a separate dense input realization.
+                                let encoded = self.storage.packets(*input).is_some();
+                                let binding = if encoded {
+                                    None
+                                } else {
+                                    self.bindings
+                                        .get(input)
+                                        .ok_or("reduction input has no selected ownership")?
+                                        .clone()
+                                };
                                 let materialize_input = binding.is_none() && !argmax;
                                 let placement = if materialize_input {
                                     Some(self.storage.declaration(*input)?.placement.clone())
@@ -348,15 +353,7 @@ pub fn plan(
                                 let capacities = tile
                                     .shape
                                     .iter()
-                                    .map(|extent| {
-                                        let mut extent = extent.clone();
-                                        for (atom, value) in &self.pieces {
-                                            extent = extent.subst(atom, value);
-                                        }
-                                        extent.as_constant().ok_or_else(|| {
-                                            format!("reduction extent `{extent}` has no capacity")
-                                        })
-                                    })
+                                    .map(|extent| self.storage.capacity(extent))
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let dtype =
                                     tile.elem.read_dtype().ok_or("unresolved reduction dtype")?;
@@ -427,7 +424,9 @@ pub fn plan(
                                             .into(),
                                     );
                                 }
-                                self.bindings.insert(*input, placement);
+                                if !encoded {
+                                    self.bindings.insert(*input, placement);
+                                }
                                 if let Some(declaration) = &declaration {
                                     self.bindings
                                         .entry(output)
@@ -447,17 +446,35 @@ pub fn plan(
                     }
                     StmtKind::Owned { tile, body, .. } => {
                         let previous = self.full_lanes;
-                        let ExprKind::Var(var) = tile.kind else {
-                            return Err("owned domain lacks a value binding".into());
-                        };
+                        let var = crate::storage::tile_root(tile)
+                            .ok_or("owned domain lacks a value binding")?;
                         self.full_lanes &=
                             self.bindings.get(&var) == Some(&Some(TilePlacement::Replicated));
                         self.body(body)?;
                         self.full_lanes = previous;
                     }
-                    StmtKind::Parallel { body, .. }
-                    | StmtKind::Range { body, .. }
-                    | StmtKind::Lanes { body, .. } => self.body(body)?,
+                    StmtKind::Lanes {
+                        extent,
+                        width,
+                        body,
+                        ..
+                    } => {
+                        let outer = self.full_lanes;
+                        self.full_lanes &= width
+                            .checked_mul(crate::execution::SUBGROUP)
+                            .filter(|n| *n > 0)
+                            .is_some_and(|n| {
+                                extent
+                                    .rem(&seismic_lang::sym::Sym::constant(n))
+                                    .as_constant()
+                                    == Some(0)
+                            });
+                        self.body(body)?;
+                        self.full_lanes = outer;
+                    }
+                    StmtKind::Parallel { body, .. } | StmtKind::Range { body, .. } => {
+                        self.body(body)?
+                    }
                     StmtKind::If { then, els, .. } => {
                         self.body(then)?;
                         self.body(els)?;
@@ -473,7 +490,6 @@ pub fn plan(
         storage,
         select,
         bindings: HashMap::new(),
-        pieces: HashMap::new(),
         result: ReductionPlan::default(),
         full_lanes: true,
     };

@@ -3,7 +3,7 @@
 //! native registers/occupancy or select a performance-optimal block size.
 use seismic_realization::{ScalarProgram, dispatch::GroupDispatch};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub max_threads_per_block: u32,
     pub max_grid_x: u32,
@@ -15,6 +15,7 @@ pub struct InvocationStorage {
     pub scratch_bytes: usize,
     pub status_bytes: usize,
 }
+#[derive(Clone)]
 pub struct Execution {
     program: ScalarProgram,
     target: crate::ptx::TargetPlan,
@@ -27,14 +28,26 @@ impl Execution {
         threads_per_block: u32,
         limits: Limits,
     ) -> Result<Self, String> {
+        let target = crate::ptx::prepare(&program)?;
+        Self::from_plan(program, target, threads_per_block, limits)
+    }
+    /// Resolve launch geometry without replacing the already selected target IR.
+    pub(crate) fn from_plan(
+        program: ScalarProgram,
+        target: crate::ptx::TargetPlan,
+        threads_per_block: u32,
+        limits: Limits,
+    ) -> Result<Self, String> {
         if threads_per_block == 0 || threads_per_block > limits.max_threads_per_block {
             return Err("CUDA block size exceeds device capability".into());
         }
-        let dispatch = GroupDispatch::new(program.work_items, 1, u64::from(threads_per_block))?;
+        let lanes = u64::from(program.participation.lanes());
+        if lanes == 0 || !u64::from(threads_per_block).is_multiple_of(lanes) { return Err("CUDA block must contain whole logical participant groups".into()); }
+        let dispatch = GroupDispatch::new(program.work_items, lanes, u64::from(threads_per_block)/lanes)?;
         if dispatch.groups > u64::from(limits.max_grid_x) {
             return Err("CUDA domain exceeds one-dimensional grid capability".into());
         }
-        let work_items = usize::try_from(program.work_items)
+        let work_items = usize::try_from(dispatch.participating_lanes())
             .map_err(|_| "CUDA work domain exceeds address range")?;
         let storage = InvocationStorage {
             buffer_table_bytes: program
@@ -55,7 +68,6 @@ impl Execution {
                 .checked_mul(4)
                 .ok_or("CUDA status size overflow")?,
         };
-        let target = crate::ptx::prepare(&program)?;
         Ok(Self {
             program,
             target,
@@ -75,6 +87,13 @@ impl Execution {
     }
     pub fn storage(&self) -> &InvocationStorage {
         &self.storage
+    }
+    pub(crate) fn same_implementation(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.dispatch == other.dispatch
+            && self.storage == other.storage
+            && self.program.buffers == other.program.buffers
+            && self.program.scalars == other.program.scalars
     }
     pub(crate) fn validate_limits(&self, limits: Limits) -> Result<(), String> {
         if self.dispatch.threads_per_group > u64::from(limits.max_threads_per_block)

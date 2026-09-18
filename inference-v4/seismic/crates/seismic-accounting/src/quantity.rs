@@ -40,13 +40,16 @@ impl Count {
         }
     }
 
+    /// Propagate the first unavailable input as the cause. Recursively formatting
+    /// aggregate counts would duplicate and escape diagnostics exponentially.
     pub fn add(&self, other: &Self) -> Self {
         match (self.bounds(), other.bounds()) {
             (Some((a, b)), Some((c, d))) => match (a.checked_add(c), b.checked_add(d)) {
                 (Some(lower), Some(upper)) => Self::interval(lower, upper).unwrap(),
                 _ => Self::unknown("count addition exceeds u64 range"),
             },
-            _ => Self::unknown(format!("sum has unavailable term: {self:?} + {other:?}")),
+            (None, _) => self.clone(),
+            (_, None) => other.clone(),
         }
     }
 
@@ -72,9 +75,8 @@ impl Count {
                 (Some(lower), Some(upper)) => Self::interval(lower, upper).unwrap(),
                 _ => Self::unknown("count multiplication exceeds u64 range"),
             },
-            _ => Self::unknown(format!(
-                "product has unavailable term: {self:?} * {other:?}"
-            )),
+            (None, _) => self.clone(),
+            (_, None) => other.clone(),
         }
     }
     pub fn unknown(reason: impl Into<String>) -> Self {
@@ -106,6 +108,15 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_cause_does_not_grow_when_many_operations_depend_on_it() {
+        let mut count = Count::unknown("unresolved logical window");
+        for _ in 0..1_000 {
+            count = count.add(&Count::Exact(4)).multiply(&Count::Exact(3));
+        }
+        assert_eq!(count, Count::unknown("unresolved logical window"));
+    }
+
+    #[test]
     fn interval_arithmetic_preserves_both_limits() {
         let a = Count::interval(2, 8).unwrap();
         assert_eq!(
@@ -117,7 +128,10 @@ mod tests {
 
     #[test]
     fn half_open_domains_cover_the_signed_endpoint_range() {
-        assert_eq!(Count::iterations(i64::MIN, i64::MAX), Count::Exact(u64::MAX));
+        assert_eq!(
+            Count::iterations(i64::MIN, i64::MAX),
+            Count::Exact(u64::MAX)
+        );
         assert_eq!(Count::iterations(-3, 4), Count::Exact(7));
         assert_eq!(Count::iterations(4, -3), Count::Exact(0));
         assert_eq!(Count::iterations(4, 4), Count::Exact(0));

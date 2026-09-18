@@ -1,5 +1,5 @@
 use seismic_lang::{
-    interp::TensorData,
+    interp::{TensorData, Rng},
     lower::{lower_specialized, Options},
     program::{compile, SourceFile},
     repr,
@@ -12,29 +12,11 @@ fn exercise(device: Device, candidate: Candidate) {
     let mut sources = seismic_std::sources();
     sources.push(SourceFile{path:"whole_matrix.seismic.portable".into(),scope:Scope::Portable,text:"fn whole[M,N,K](x: tensor[M,K] f32, weight: tensor[N,K] W, out: tensor[M,N] f32):\n  a = load(x)\n  b = load(weight)\n  c = tile[M,N] f32\n  for i,j in owned(c): c[i,j] = 0.0\n  matmul(a,b,c)\n  store(c,out)\n".into()});
     let program = compile(&sources, &["cpu".into(), "cuda".into(), "metal".into()]).unwrap();
-    for rep in ["q4g32", "q8g32a", "q8g16z32", "q8g32s", "iq4g32"] {
+    for rep in ["q4g32", "q4k", "q5k", "q6k", "q8g32s", "iq4g32"] {
         let rep = repr::lookup(rep).unwrap();
         for m in [1, 3] {
             let (n, k) = (5usize, 256usize);
-            let cpw = rep.codes_per_word() as usize;
-            let words = (0..n * k / cpw)
-                .map(|i| 0x01234567u32.wrapping_mul(i as u32 + 1))
-                .collect::<Vec<_>>();
-            let scale = (0..n * k / rep.group as usize)
-                .map(|i| if i % 2 == 0 { 0.03125 } else { -0.015625 })
-                .collect::<Vec<_>>();
-            let bias = if rep.has_bias {
-                vec![0.125; n * k / rep.group as usize]
-            } else {
-                Vec::new()
-            };
-            let weight = TensorData::Packed {
-                repr: rep,
-                shape: vec![n, k],
-                words,
-                scale,
-                bias,
-            };
+            let weight = TensorData::random_packed(&mut Rng(0x123456789), rep, vec![n, k]);
             let x = (0..m * k)
                 .map(|i| ((i % 19) as f32 - 9.) / 32.)
                 .collect::<Vec<_>>();
@@ -74,12 +56,7 @@ fn exercise(device: Device, candidate: Candidate) {
                 .map(|slot| match slot.parameter.as_str() {
                     "x" => xb.clone(),
                     "out" => out.clone(),
-                    _ => planes[match slot.plane.as_str() {
-                        "words" => 0,
-                        "scale" => 1,
-                        "bias" => 2,
-                        _ => panic!(),
-                    }]
+                    _ => planes[rep.plane_index(&slot.plane).unwrap()]
                     .clone(),
                 })
                 .collect::<Vec<_>>();

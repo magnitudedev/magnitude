@@ -2,8 +2,7 @@
 //! declared work/storage, not register allocation, occupancy or memory service.
 use seismic_lang::types::DType;
 
-/// Row-major coordinates assigned to a work item. A step covers consecutive
-/// logical coordinates along an axis; partial steps require a different mapping.
+/// Row-major coordinates assigned to a work item, with explicit tail extents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkMapping {
     axes: Vec<AxisMapping>,
@@ -12,6 +11,7 @@ pub struct WorkMapping {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxisMapping {
+    pub logical_extent: u64,
     /// Number of work coordinates along this axis, before applying the step.
     pub extent: u64,
     pub stride: u64,
@@ -27,11 +27,12 @@ impl WorkMapping {
             .iter()
             .zip(steps)
             .map(|(&extent, &step)| {
-                if step == 0 || !extent.is_multiple_of(step) {
-                    return Err("work mapping step must be positive and divide its extent");
+                if step == 0 {
+                    return Err("work mapping step must be positive");
                 }
                 Ok(AxisMapping {
-                    extent: extent / step,
+                    logical_extent: extent,
+                    extent: extent.div_ceil(step),
                     stride: 0,
                     step,
                 })
@@ -68,6 +69,14 @@ impl WorkMapping {
             .axes
             .iter()
             .map(|axis| (item / axis.stride % axis.extent) * axis.step)
+            .collect())
+    }
+    pub fn extents(&self, item: u64) -> Result<Vec<u64>, String> {
+        Ok(self
+            .coordinates(item)?
+            .into_iter()
+            .zip(&self.axes)
+            .map(|(base, axis)| axis.step.min(axis.logical_extent - base))
             .collect())
     }
 }
@@ -164,5 +173,50 @@ impl TileDeclaration {
     pub fn bytes(&self, dispatch: &GroupDispatch) -> Result<(u64, u64), String> {
         let layout = self.layout(dispatch)?;
         Ok((layout.private_bytes_per_lane, layout.shared_bytes_per_group))
+    }
+}
+
+/// Executable coordinate ownership within a logical work item. Replication is
+/// private storage replication; publications still need a unique participant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ownership {
+    Replicated,
+    Cyclic { consecutive: u64 },
+}
+impl Ownership {
+    pub fn period(self, lanes: u64) -> Result<u64, String> {
+        if lanes == 0 {
+            return Err("ownership requires positive participation".into());
+        }
+        match self {
+            Self::Replicated => Ok(1),
+            Self::Cyclic { consecutive } if consecutive > 0 => lanes
+                .checked_mul(consecutive)
+                .ok_or_else(|| "ownership period overflow".into()),
+            _ => Err("cyclic ownership requires a positive consecutive extent".into()),
+        }
+    }
+    pub fn owner(self, coordinate: u64, lanes: u64) -> Result<Option<u64>, String> {
+        self.period(lanes)?;
+        Ok(match self {
+            Self::Replicated => None,
+            Self::Cyclic { consecutive } => Some(coordinate / consecutive % lanes),
+        })
+    }
+}
+
+/// Source work item participation, private value placement, and publication
+/// ownership retained by scalar instruction preparation and backend dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Participation {
+    Thread,
+    Subgroup { lanes: u32 },
+}
+impl Participation {
+    pub fn lanes(self) -> u32 {
+        match self {
+            Self::Thread => 1,
+            Self::Subgroup { lanes } => lanes,
+        }
     }
 }

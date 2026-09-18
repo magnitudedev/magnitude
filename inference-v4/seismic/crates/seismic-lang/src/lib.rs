@@ -2,6 +2,7 @@
 
 pub mod abi;
 pub mod effects;
+pub mod demand;
 pub mod numeric;
 pub mod reduction;
 pub mod ast;
@@ -49,3 +50,5 @@ pub fn scope_of_path(path: &str) -> Option<Scope> {
 
 pub mod partition;
 pub mod normalize;
+
+pub mod composition;

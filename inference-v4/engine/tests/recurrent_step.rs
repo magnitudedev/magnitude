@@ -72,7 +72,7 @@ fn exercise(device: Device, candidate: Candidate) {
     let plan = plan_specialized(&program, "qwen_recurrent_step", &shapes, &elements).unwrap();
     assert_eq!(plan.steps.len(), 12);
     let mut compiled =
-        CompiledPlan::compile(&device, &program, &plan, &Options::default(), candidate).unwrap();
+        CompiledPlan::compile_diagnostic(&device, &program, &plan, &Options::default(), candidate).unwrap();
     let mut dtypes = HashMap::new();
     let mut bound = Bound {
         buffers: HashMap::new(),

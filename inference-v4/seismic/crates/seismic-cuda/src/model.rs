@@ -9,7 +9,7 @@ mod trace;
 use crate::{execution::Execution, ptx};
 use seismic_accounting::{
     schedule,
-    workload::{DerivationLimits, ScalarWorkload},
+    workload::{DerivationError, DerivationLimit, DerivationLimits, ScalarWorkload},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -216,9 +216,11 @@ impl<'a> DerivedCudaModel<'a> {
 }
 
 pub fn requirements(execution: &Execution) -> Vec<Requirement> {
+    target_requirements(execution.target_plan())
+}
+pub(crate) fn target_requirements(target: &ptx::TargetPlan) -> Vec<Requirement> {
     let mut required = Vec::new();
-    for r in execution
-        .target_plan()
+    for r in target
         .requirements()
         .map(|r| match r {
             ptx::Requirement::Instruction(p) => Requirement::Instruction(p),
@@ -249,7 +251,7 @@ pub fn derive_cuda<'a>(
     workload: &'a ScalarWorkload,
     placement: &Placement,
     limits: DerivationLimits,
-) -> Result<DerivedCudaModel<'a>, String> {
+) -> Result<DerivedCudaModel<'a>, DerivationError> {
     let required = requirements(execution);
     validate(execution, hardware, placement, &required, limits)?;
     let traced = trace::derive(execution, hardware, workload, limits)?;
@@ -258,14 +260,166 @@ pub fn derive_cuda<'a>(
     )
 }
 
+/// Account the runtime's ordered launch sequence. Each phase completes before
+/// the next begins; private ABI/scratch storage is phase-local. External values
+/// (including invalidation by unknown stores) carry through canonical allocation
+/// identity, so later phases never restart from the invocation's initial bytes.
+pub fn derive_sequence(
+    executions: &[Execution],
+    hardware: &CudaHardware,
+    workload: &ScalarWorkload,
+    limits: DerivationLimits,
+) -> Result<schedule::Model, DerivationError> {
+    let first = executions
+        .first()
+        .ok_or("CUDA analysis needs a nonempty phase sequence")?;
+    if executions.iter().any(|e| {
+        e.program().buffers != first.program().buffers
+            || e.program().scalars != first.program().scalars
+    }) {
+        return Err("CUDA phase sequence has inconsistent invocation ABI".into());
+    }
+    let mut result = schedule::Model {
+        relationship: seismic_accounting::authority::ModelRelationship::hypothetical_execution(),
+        identity: format!("{}:ordered-ptx-sequence", hardware.identity),
+        timebase: hardware.timebase.clone(),
+        resources: Vec::new(),
+        operations: Vec::new(),
+        lifetimes: Vec::new(),
+        static_orders: Vec::new(),
+        unmapped: Vec::new(),
+    };
+    // Validate binding/input budgets before copying potentially large byte maps.
+    let required = requirements(first);
+    validate(
+        first,
+        hardware,
+        &Placement::HomogeneousResidentSlots,
+        &required,
+        limits,
+    )?;
+    let known_bytes = workload.allocations.iter().try_fold(0usize, |n, a| {
+        n.checked_add(a.known_bytes.len())
+            .ok_or("CUDA known-value input size overflow")
+    })?;
+    if workload.allocations.len() > limits.operations
+        || workload.buffers.len() > limits.operations
+        || workload.scalars.len() > limits.operations
+        || known_bytes > limits.operations
+    {
+        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+            limits.operations,
+        )));
+    }
+    let mut state = workload.clone();
+    let mut instructions = 0u64;
+    let mut previous_completion = None;
+    for (phase, execution) in executions.iter().enumerate() {
+        let remaining = DerivationLimits {
+            instructions: limits.instructions.checked_sub(instructions).ok_or(
+                DerivationError::Exhausted(DerivationLimit::Instructions(limits.instructions)),
+            )?,
+            operations: limits
+                .operations
+                .checked_sub(result.operations.len())
+                .ok_or(DerivationError::Exhausted(DerivationLimit::Operations(
+                    limits.operations,
+                )))?,
+        };
+        let required = requirements(execution);
+        validate(
+            execution,
+            hardware,
+            &Placement::HomogeneousResidentSlots,
+            &required,
+            remaining,
+        )?;
+        let mut traced = trace::derive(execution, hardware, &state, remaining)?;
+        instructions = instructions
+            .checked_add(traced.instructions)
+            .ok_or("CUDA sequence instruction count overflow")?;
+        let mut external_values = std::mem::take(&mut traced.external_values);
+        let mut part = build(
+            execution,
+            hardware,
+            &state,
+            &Placement::HomogeneousResidentSlots,
+            traced,
+            required,
+            remaining,
+        )?
+        .model;
+        for allocation in &mut state.allocations {
+            allocation.known_bytes = external_values
+                .remove(&allocation.id)
+                .ok_or("CUDA phase lost an external allocation")?;
+        }
+        let resource_base = result.resources.len();
+        let operation_base = result.operations.len();
+        if resource_base
+            .checked_add(part.resources.len())
+            .is_none_or(|n| n > limits.operations)
+        {
+            return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                limits.operations,
+            )));
+        }
+        for resource in &mut part.resources {
+            resource.name = format!("phase{phase}:{}", resource.name);
+        }
+        for operation in &mut part.operations {
+            operation.name = format!("phase{phase}:{}", operation.name);
+            for p in operation
+                .predecessors
+                .iter_mut()
+                .chain(&mut operation.start_predecessors)
+            {
+                *p += operation_base;
+            }
+            for reservation in &mut operation.reservations {
+                reservation.resource += resource_base;
+            }
+        }
+        // The trace owns a launch root and a completion join of every block end.
+        // Phase ordering therefore also closes all resident-capacity lifetimes.
+        if let Some(previous) = previous_completion {
+            part.operations[0].predecessors.push(previous);
+        }
+        previous_completion = Some(operation_base + part.operations.len() - 1);
+        for lifetime in &mut part.lifetimes {
+            lifetime.resource += resource_base;
+            lifetime.begin.operation += operation_base;
+            lifetime.end.operation += operation_base;
+        }
+        debug_assert!(
+            part.static_orders.is_empty(),
+            "PTX instruction order is fixed"
+        );
+        result.resources.extend(part.resources);
+        result.operations.extend(part.operations);
+        result.lifetimes.extend(part.lifetimes);
+    }
+    result.lower_bound()?;
+    Ok(result)
+}
+
 fn validate(
     execution: &Execution,
     hardware: &CudaHardware,
     placement: &Placement,
     required: &[Requirement],
     limits: DerivationLimits,
-) -> Result<(), String> {
-    execution.target_plan().validate()?;
+) -> Result<(), DerivationError> {
+    let Placement::HomogeneousResidentSlots = placement;
+    validate_target(execution.target_plan(), hardware, required, limits)
+}
+pub(crate) fn validate_target(
+    target: &ptx::TargetPlan,
+    hardware: &CudaHardware,
+    required: &[Requirement],
+    limits: DerivationLimits,
+) -> Result<(), DerivationError> {
+    target.validate()?;
     if hardware.identity.is_empty()
         || hardware.execution_units == 0
         || hardware.warp_width == 0
@@ -277,14 +431,19 @@ fn validate(
             "CUDA hardware needs identified positive geometry, alignment and timebase".into(),
         );
     }
-    let Placement::HomogeneousResidentSlots = placement;
-    if limits.instructions == 0
-        || limits.operations == 0
+    if limits.instructions == 0 {
+        return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
+            limits.instructions,
+        )));
+    }
+    if limits.operations == 0
         || hardware.resources.len() > limits.operations
         || hardware.timings.len() > limits.operations
         || hardware.per_unit_residency.len() > limits.operations
     {
-        return Err("CUDA derivation input exceeds budget".into());
+        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+            limits.operations,
+        )));
     }
     let mut names = BTreeSet::new();
     for r in &hardware.resources {
@@ -297,11 +456,15 @@ fn validate(
             .iter()
             .any(|t| t.primitive == timing.primitive)
             || timing.reservations.is_empty()
-            || timing.reservations.len() > limits.operations
         {
             return Err(
                 "CUDA primitive timing must be unique and carry bounded hardware service".into(),
             );
+        }
+        if timing.reservations.len() > limits.operations {
+            return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                limits.operations,
+            )));
         }
         validate_ticks(timing.latency)?;
         for reservation in &timing.reservations {
@@ -317,12 +480,12 @@ fn validate(
             Requirement::Instruction(primitive)
                 if !hardware.timings.iter().any(|t| &t.primitive == primitive) =>
             {
-                return Err(format!("missing CUDA hardware timing for {primitive:?}"));
+                return Err(format!("missing CUDA hardware timing for {primitive:?}").into());
             }
             Requirement::WholeBody(helper) => {
                 return Err(format!(
                     "CUDA analysis needs the retained {helper:?} implementation expanded into PTX operations; a supplied whole-body cost is not an implementation"
-                ));
+                ).into());
             }
             _ => {}
         }
@@ -440,40 +603,71 @@ fn quantity(
             if event.block.is_none() {
                 return Err("register demand outside block scope".into());
             }
-            let bits = execution
-                .target_plan()
-                .registers()
-                .iter()
-                .try_fold(0u64, |n, r| {
-                    n.checked_add(match r.class {
-                        ptx::RegisterClass::Bits64 => 64,
-                        ptx::RegisterClass::Predicate => 1,
-                        _ => 32,
-                    })
-                    .ok_or("virtual register storage overflow")
-                })?;
+            let bits = virtual_register_bits(execution.target_plan())?;
             bits.checked_mul(execution.dispatch().threads_per_group)
                 .ok_or("virtual register storage overflow")?
         }
     })
 }
+pub(crate) fn virtual_register_bits(target: &ptx::TargetPlan) -> Result<u64, String> {
+    target.registers().iter().try_fold(0u64, |n, r| {
+        n.checked_add(match r.class {
+            ptx::RegisterClass::Bits64 => 64,
+            ptx::RegisterClass::Predicate => 1,
+            _ => 32,
+        })
+        .ok_or_else(|| "virtual register storage overflow".into())
+    })
+}
 fn amount(a: Amount, e: &Event, x: &Execution, c: &CudaHardware) -> Result<u64, String> {
-    quantity(a.quantity, e, x, c)?
+    amount_from(a, &|q| quantity(q, e, x, c))
+}
+fn amount_from(
+    a: Amount,
+    quantity: &impl Fn(Quantity) -> Result<u64, String>,
+) -> Result<u64, String> {
+    quantity(a.quantity)?
         .checked_mul(a.scale)
         .ok_or_else(|| "CUDA demand overflow".into())
 }
-fn ticks(t: Ticks, e: &Event, x: &Execution, c: &CudaHardware) -> Result<u64, String> {
+fn ticks_from(
+    t: Ticks,
+    quantity: &impl Fn(Quantity) -> Result<u64, String>,
+) -> Result<u64, String> {
     match t {
         Ticks::Fixed(t) => Ok(t),
         Ticks::Service {
             demand,
             per_tick,
             base,
-        } => amount(demand, e, x, c)?
+        } => amount_from(demand, quantity)?
             .div_ceil(per_tick)
             .checked_add(base)
             .ok_or_else(|| "CUDA service time overflow".into()),
     }
+}
+
+/// One primitive's hardware service, shared by concrete trace accounting and
+/// necessary-demand relaxation. Only the derived quantity environment differs.
+pub(crate) fn primitive_service(
+    timing: &PrimitiveTiming,
+    quantity: impl Fn(Quantity) -> Result<u64, String>,
+) -> Result<(u64, Vec<schedule::Reservation>), String> {
+    let latency = ticks_from(timing.latency, &quantity)?;
+    let mut reservations = Vec::new();
+    for reservation in &timing.reservations {
+        let units = amount_from(reservation.units, &quantity)?;
+        let duration = ticks_from(reservation.duration, &quantity)?;
+        if units > 0 && duration > 0 {
+            reservations.push(schedule::Reservation {
+                resource: reservation.resource,
+                offset: reservation.offset,
+                duration,
+                units,
+            });
+        }
+    }
+    Ok((latency, reservations))
 }
 
 fn resource_instance(
@@ -500,7 +694,7 @@ fn build<'a>(
     traced: trace::Trace,
     required: Vec<Requirement>,
     limits: DerivationLimits,
-) -> Result<DerivedCudaModel<'a>, String> {
+) -> Result<DerivedCudaModel<'a>, DerivationError> {
     let mut model = schedule::Model {
         relationship: seismic_accounting::authority::ModelRelationship::hypothetical_execution(),
         identity: format!("{}:ptx-kernel", hardware.identity),
@@ -545,7 +739,9 @@ fn build<'a>(
     });
     for (event_id, event) in traced.events.iter().enumerate() {
         if model.operations.len() >= limits.operations {
-            return Err("CUDA operation derivation budget exceeded".into());
+            return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                limits.operations,
+            )));
         }
         let timing = match event.requirement {
             Requirement::Instruction(primitive) => Some(
@@ -560,17 +756,14 @@ fn build<'a>(
                 return Err("unexpanded PTX helper reached resource derivation".into());
             }
         };
-        let latency = timing
-            .map(|t| ticks(t.latency, event, execution, hardware))
+        let (latency, service) = timing
+            .map(|t| primitive_service(t, |q| quantity(q, event, execution, hardware)))
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or_default();
         let mut reservations = Vec::new();
-        for reservation in timing.into_iter().flat_map(|t| &t.reservations) {
-            let units = amount(reservation.units, event, execution, hardware)?;
-            let duration = ticks(reservation.duration, event, execution, hardware)?;
-            if units == 0 || duration == 0 {
-                continue;
-            }
+        for reservation in service {
+            let units = reservation.units;
+            let duration = reservation.duration;
             if reservation
                 .offset
                 .checked_add(duration)
@@ -676,14 +869,16 @@ fn instance(
     model: &mut schedule::Model,
     instances: &mut BTreeMap<(usize, u64), usize>,
     limits: DerivationLimits,
-) -> Result<usize, String> {
+) -> Result<usize, DerivationError> {
     let definition = &hardware.resources[resource];
     let i = resource_instance(definition.scope, event, placement)?;
     if let Some(&r) = instances.get(&(resource, i)) {
         return Ok(r);
     }
     if model.resources.len() >= limits.operations {
-        return Err("CUDA resource instance budget exceeded".into());
+        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+            limits.operations,
+        )));
     }
     let r = model.resources.len();
     model.resources.push(schedule::Resource {

@@ -1,6 +1,6 @@
 use seismic_engine::models::qwen35::program::program;
 use seismic_lang::{
-    interp::TensorData,
+    interp::{TensorData, Rng},
     lower::{Options, lower_specialized},
     numeric::bf16_round,
     repr,
@@ -11,22 +11,10 @@ use std::collections::HashMap;
 fn exercise(device: Device, candidate: Candidate) {
     let program = program().unwrap();
     let routes = [2i32, 0, 1, 2];
-    for repname in ["q4g32", "q8g32a", "q8g16z32", "q8g32s", "iq4g32"] {
+    for repname in ["q4g32", "q4k", "q5k", "q6k", "q8g32s", "iq4g32"] {
         let rep = repr::lookup(repname).unwrap();
         let (e, m, k, n, d) = (3usize, 2usize, 2usize, 5usize, 256usize);
-        let weight = TensorData::Packed {
-            repr: rep,
-            shape: vec![e, n, d],
-            words: (0..e * n * d / rep.codes_per_word() as usize)
-                .map(|i| 0x17491b37u32.wrapping_mul(i as u32 + 1))
-                .collect(),
-            scale: vec![0.015625; e * n * d / rep.group as usize],
-            bias: if rep.has_bias {
-                vec![0.0625; e * n * d / rep.group as usize]
-            } else {
-                vec![]
-            },
-        };
+        let weight = TensorData::random_packed(&mut Rng(0x17491b37), rep, vec![e, n, d]);
         let weightplanes = weight
             .device_bytes()
             .iter()
@@ -91,12 +79,7 @@ fn exercise(device: Device, candidate: Candidate) {
                     "x" => x.clone(),
                     "routes" => route.clone(),
                     "out" => out.clone(),
-                    "weight" => weightplanes[match s.plane.as_str() {
-                        "words" => 0,
-                        "scale" => 1,
-                        "bias" => 2,
-                        _ => panic!(),
-                    }]
+                    "weight" => weightplanes[rep.plane_index(&s.plane).unwrap()]
                     .clone(),
                     _ => panic!(),
                 })

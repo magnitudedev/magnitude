@@ -4,8 +4,8 @@
 //! block. It never unrolls loops, changes control flow, drops guards, substitutes
 //! values, or assigns hardware issue times. Every loop visit uses the same order.
 use crate::{
-    graph::{Graph, Instruction},
     ScalarProgram,
+    graph::{Graph, Instruction},
 };
 use cranelift_codegen::ir::{Block, Inst, InstructionData, ValueDef};
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,7 +88,7 @@ impl Space {
                                 .insert(definition);
                         }
                         ValueDef::Union(_, _) => {
-                            return Err("static scheduling requires resolved SSA values".into())
+                            return Err("static scheduling requires resolved SSA values".into());
                         }
                         _ => {}
                     }
@@ -329,6 +329,9 @@ pub fn check_materialization(
         || before.buffers != after.buffers
         || before.scalars != after.scalars
         || before.scratch_bytes != after.scratch_bytes
+        || before.conditions != after.conditions
+        || before.backend_calls != after.backend_calls
+        || before.participation != after.participation
         || before.imports != after.imports
         || before.work_items != after.work_items
         || before.dispatch != after.dispatch

@@ -10,7 +10,7 @@ pub fn account(args: &[String]) -> Result<(), String> {
     let name = options.function.as_deref().ok_or("--fn is required")?;
     print_work(&program, name, &options.shapes, &options.elements, options.analysis_steps)?;
     if matches!(options.target.as_str(), "cpu" | "cuda") {
-        let lowered = seismic_lang::lower::lower_specialized(&program, name, &options.target, &options.shapes, &options.elements, &seismic_lang::lower::Options{piece:options.piece})?;
+        let lowered = seismic_lang::lower::lower_specialized(&program, name, &options.target, &options.shapes, &options.elements, &seismic_lang::lower::Options { piece: options.piece, ..Default::default() })?;
         let dispatch = if options.target == "cuda" {
             seismic_realization::Dispatch::ParallelRoot
         } else {

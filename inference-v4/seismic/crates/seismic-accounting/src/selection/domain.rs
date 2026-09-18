@@ -133,56 +133,76 @@ impl Choices for seismic_lang::normalize::loads::Choice {
     }
 }
 
-/// Exact unresolved regions. Children retains a contiguous interval of sibling
-/// indices, including every member without allocating a path for every member.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Region {
-    Branch {
-        path: Vec<usize>,
-    },
-    Children {
-        parent: Vec<usize>,
-        indices: std::ops::Range<usize>,
-    },
+/// Exact unresolved subsets of the implementation's own typed domain. The
+/// bound is private and can only be strengthened by the owning search after
+/// deriving resource demand for every retained alternative.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    parent: Vec<usize>,
+    children: Option<(Domain, std::ops::Range<usize>)>,
+    lower_bound: u64,
 }
 impl Region {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Branch { .. } => 1,
-            Self::Children { indices, .. } => indices.len(),
+    pub(super) fn root() -> Self {
+        Self {
+            parent: Vec::new(),
+            children: None,
+            lower_bound: 0,
         }
+    }
+    pub(super) fn children(parent: Vec<usize>, domain: Domain, lower_bound: u64) -> Self {
+        let indices = 0..domain.len();
+        Self {
+            parent,
+            children: Some((domain, indices)),
+            lower_bound,
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.children
+            .as_ref()
+            .map_or(1, |(_, indices)| indices.len())
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    pub fn lower_bound(&self) -> u64 {
+        self.lower_bound
+    }
     pub fn paths(&self) -> impl Iterator<Item = Vec<usize>> + '_ {
-        (0..self.len()).map(move |offset| match self {
-            Self::Branch { path } => path.clone(),
-            Self::Children { parent, indices } => {
-                let mut path = parent.clone();
+        (0..self.len()).map(move |offset| {
+            let mut path = self.parent.clone();
+            if let Some((_, indices)) = &self.children {
                 path.push(indices.start + offset);
-                path
             }
+            path
         })
+    }
+    pub(super) fn first_path(&self) -> Vec<usize> {
+        let mut path=self.parent.clone();
+        if let Some((_,indices))=&self.children {path.push(indices.start);}
+        path
+    }
+    pub fn alternatives(&self) -> Option<(&Domain, std::ops::Range<usize>)> {
+        self.children
+            .as_ref()
+            .map(|(domain, indices)| (domain, indices.clone()))
+    }
+    pub(super) fn strengthen(&mut self, demand: &crate::schedule::Demand) -> Result<(), String> {
+        self.lower_bound = self.lower_bound.max(demand.lower_bound()?);
+        Ok(())
+    }
+    /// Disjoint, exhaustive bisection of this owner's indexed alternatives.
+    /// No implementation is constructed and no candidate is silently discarded.
+    pub(super) fn split(self) -> Result<(Self,Self),Self> {
+        let Some((domain,indices))=&self.children else {return Err(self)};
+        if indices.len()<2 {return Err(self);}
+        let middle=indices.start+indices.len()/2;
+        let mut left=self.clone();
+        left.children=Some((domain.clone(),indices.start..middle));
+        let mut right=self.clone();
+        right.children=Some((domain.clone(),middle..indices.end));
+        Ok((left,right))
     }
 }
 
-pub(super) fn pop(regions: &mut Vec<Region>) -> Option<Vec<usize>> {
-    match regions.pop()? {
-        Region::Branch { path } => Some(path),
-        Region::Children {
-            parent,
-            mut indices,
-        } => {
-            let index = indices
-                .next()
-                .expect("frontier contains only nonempty regions");
-            let mut path = parent.clone();
-            path.push(index);
-            if !indices.is_empty() {
-                regions.push(Region::Children { parent, indices });
-            }
-            Some(path)
-        }
-    }
-}

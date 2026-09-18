@@ -12,6 +12,9 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub function: String,
+    pub shapes: HashMap<String,i64>,
+    pub elements: HashMap<String,Elem>,
+    pub ownership: crate::composition::Ownership,
     pub steps: Vec<Step>,
 }
 
@@ -80,7 +83,7 @@ pub fn plan_specialized(program: &Program, name: &str, shapes: &HashMap<String, 
     }
     let mut p = Planner { program, f, env, elements: elements.clone(), param_shapes, steps: Vec::new() };
     p.block(&f.body)?;
-    Ok(Plan { function: name.to_string(), steps: p.steps })
+    Ok(Plan { function: name.to_string(), shapes:shapes.clone(), elements:elements.clone(), ownership:Default::default(), steps: p.steps })
 }
 
 fn eval(s: &Sym, env: &HashMap<String, i64>) -> Result<i64, String> {
@@ -272,6 +275,7 @@ impl<'a> Planner<'a> {
 
 fn stmt_name(s: &StmtKind) -> &'static str {
     match s {
+        StmtKind::Reduction(_) => "coupled reduction",
         StmtKind::Parallel { .. } => "parallel",
         StmtKind::LoadLoop { .. } => "load",
         StmtKind::Owned { .. } => "owned",

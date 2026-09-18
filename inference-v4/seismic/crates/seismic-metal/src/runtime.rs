@@ -214,6 +214,13 @@ impl Device {
 }
 
 impl Buffer {
+    /// Alignment of this allocation's GPU virtual address, independent of the
+    /// CPU mapping and any retained view offset. A missing address proves only
+    /// byte alignment; it does not justify an assumed page or SIMD alignment.
+    pub fn allocation_alignment(&self) -> u64 {
+        let address = self.buffer.gpuAddress();
+        if address == 0 { 1 } else { 1u64 << address.trailing_zeros() }
+    }
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn view(&self, range: std::ops::Range<usize>) -> Result<Self,String> {
@@ -260,6 +267,7 @@ kernel void stream_read(device const float4* x [[buffer(0)]], device float* out 
 }
 "#;
     let emitted = Emitted {
+        terminal: Default::default(),
         status_slot: None,
         alias_pairs: Vec::new(),
         scratch: Vec::new(),

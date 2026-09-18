@@ -4,15 +4,15 @@ fn norm_logits[N, K](x: tensor[1, K] bf16, nw: tensor[1, K] bf16, w: tensor[N, K
   for col in parallel:
     acc = tile[1, 1] f32
     for i, j in owned(acc): acc[i, j] = 0.0
-    ss = 0.0
-    for xt, nt, wt in load((x, nw, w[col : col + 1]), over=1):
-      a = tile[1, extent(xt, 1)] f32
-      for i, j in owned(a): a[i, j] = f32(xt[i, j]) * f32(nt[i, j])
-      sq = tile[extent(xt, 1)] f32
-      for j in owned(sq): sq[j] = f32(xt[0, j]) * f32(xt[0, j])
-      part = reduce(sq, 0, sum)
-      ss = ss + part
-      matmul(a, wt, acc)
+    xt = load(x)
+    nt = load(nw)
+    wt = load(w[col : col + 1])
+    a = tile[1, K] f32
+    for i, j in owned(a): a[i, j] = f32(xt[i, j]) * f32(nt[i, j])
+    sq = tile[K] f32
+    for j in owned(sq): sq[j] = f32(xt[0, j]) * f32(xt[0, j])
+    ss = reduce(sq, 0, sum)
+    matmul(a, wt, acc)
     y = tile[1, 1] f32
     for i, j in owned(y): y[i, j] = acc[i, j] * rsqrt(ss / f32(K) + eps)
     store(y, out[0 : 1, col : col + 1])

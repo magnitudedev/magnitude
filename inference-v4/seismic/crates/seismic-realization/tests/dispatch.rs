@@ -6,14 +6,14 @@ fn work_mapping_covers_each_logical_coordinate_once() {
     use seismic_realization::dispatch::WorkMapping;
     for outer in [1, 2, 3] {
         for middle in [1, 3] {
-            for inner in [2, 4, 6] {
-                for step in [1, 2] {
+            for inner in [1, 2, 3, 4, 5, 6] {
+                for step in [1, 2, 3] {
                     let mapping = WorkMapping::new(&[outer, middle, inner], &[1, 1, step]).unwrap();
                     let mut visited = std::collections::BTreeSet::new();
                     for item in 0..mapping.work_items() {
                         let base = mapping.coordinates(item).unwrap();
                         assert!(base[0] < outer && base[1] < middle);
-                        for offset in 0..step {
+                        for offset in 0..mapping.extents(item).unwrap()[2] {
                             assert!(base[2] + offset < inner);
                             assert!(visited.insert((base[0], base[1], base[2] + offset)));
                         }
@@ -51,7 +51,11 @@ fn work_mapping_distinguishes_serial_empty_and_invalid_domains() {
     }
     assert!(WorkMapping::new(&[2], &[]).is_err());
     assert!(WorkMapping::new(&[2], &[0]).is_err());
-    assert!(WorkMapping::new(&[3], &[2]).is_err());
+    let tail = WorkMapping::new(&[3], &[2]).unwrap();
+    assert_eq!(tail.work_items(), 2);
+    assert_eq!(tail.coordinates(1).unwrap(), vec![2]);
+    assert_eq!(tail.extents(0).unwrap()[0], 2);
+    assert_eq!(tail.extents(1).unwrap()[0], 1);
     assert!(WorkMapping::new(&[u64::MAX, 2], &[1, 1]).is_err());
 }
 #[test]

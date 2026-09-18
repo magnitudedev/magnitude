@@ -44,12 +44,12 @@ pub fn sites(body: &[Stmt]) -> Vec<Site> {
                     }
                 }
                 StmtKind::LoadLoop {
-                    vars, modes, body, ..
+                    vars, views, modes, body, ..
                 } => {
                     for (i, &variable) in vars.iter().enumerate() {
                         out.push(Site {
                             variable,
-                            can_borrow: crate::effects::stream_load_can_borrow(body, variable),
+                            can_borrow: views.get(i).is_some_and(|view|crate::effects::stream_load_can_borrow(body, variable, view)),
                             selected: modes.as_ref().and_then(|m| m.get(i)).copied(),
                         });
                     }
@@ -75,6 +75,27 @@ pub fn sites(body: &[Stmt]) -> Vec<Site> {
 /// Check every decision before changing the tree. Site order is lexical and
 /// includes each operand of a streamed load separately.
 pub fn resolve(body: &mut [Stmt], modes: &[LoadMode]) -> Result<Vec<Decision>, String> {
+    fn validate(body:&[Stmt])->Result<(),String> {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::LoadLoop{domain,vars,views,axes,modes,body,..}=>{
+                    let extent=domain.view.ty.shaped().and_then(|s|s.shape.get(domain.axis)).ok_or("invalid logical iteration domain")?;
+                    if vars.len()!=views.len() || axes.len()!=views.len() || modes.as_ref().is_some_and(|m|m.len()!=views.len()) {return Err("iteration transfer binding counts disagree".into());}
+                    for (view,axis) in views.iter().zip(axes) {
+                        let active=view.ty.shaped().and_then(|s|s.shape.get(*axis)).ok_or("invalid iteration transfer axis")?;
+                        if extent.as_constant().zip(active.as_constant()).is_some_and(|(a,b)|a!=b) {return Err("iteration transfer extent differs from logical domain".into());}
+                    }
+                    validate(body)?;
+                }
+                StmtKind::Reduction(r)=>for body in r.bodies(){validate(body)?;},
+                StmtKind::Parallel{body,..}|StmtKind::Owned{body,..}|StmtKind::Range{body,..}|StmtKind::Lanes{body,..}=>validate(body)?,
+                StmtKind::If{then,els,..}=>{validate(then)?;validate(els)?;},
+                _=>{}
+            }
+        }
+        Ok(())
+    }
+    validate(body)?;
     let sites = sites(body);
     if sites.len() != modes.len() {
         return Err("load decision count does not match the bound IR".into());

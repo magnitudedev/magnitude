@@ -122,7 +122,7 @@ fn exercise(device: Device, candidate: Candidate) {
             );
         }
 
-        let mut compiled = CompiledPlan::compile(
+        let mut compiled = CompiledPlan::compile_diagnostic(
             &device,
             &program,
             &plan,

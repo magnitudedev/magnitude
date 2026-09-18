@@ -20,6 +20,92 @@ Canonicalization covers supported rewrites, not arbitrary program equivalence.
 Fusion and decomposition are choices about whole executions: eliminated transfers
 can trade against longer lifetimes, lower concurrency, or added synchronization.
 
+The compilation boundary is the enclosing checked computation. Ordinary calls do
+not fix GPU launches or independent compilation units. Internal, nonescaping
+intermediates are distinguished from externally observable bindings before
+eliminating publications. Inlining alone is insufficient: iteration relationships,
+access maps, value versions, and effects remain available for joint construction.
+Construct physical decomposition from logical iteration, access maps, reductions,
+and value dependencies; do not require a source streaming loop to make an efficient
+execution reachable. Whole-domain loads and logical intermediates must admit bounded
+streaming, shared producers, and state retention within the supported execution form.
+Merely joining already-authored streams does not fulfill this requirement.
+
+Retain operation meaning until applicable instruction/implementation covers can
+be selected; premature scalar expansion must not remove supported alternatives.
+
+Independent output grouping operates on retained construct calls before
+contraction partitioning and backend body selection. Every admitted static output
+axis exposes widths 1..N with exact full and remainder rectangles. Grouped calls
+retain each output's seed, scalar calculations and conversions while sharing
+invariant operands; subsequent contraction choices remain dependent alternatives.
+The current constructor admits straight-line regions with one retained call,
+provable operand maps and rectangular publication. Dynamic operand shapes,
+unknown effects and unsupported maps remain outside this constructor's coverage.
+Its applicability cannot be inferred from a model or construct name.
+
+Later visits to retained calls reconstruct the enclosing logical domain facts,
+including proven capacities and captured view identities. Those facts follow
+lexical scope across branches and loops; moving partition selection later must
+not lose dynamic contraction alternatives.
+
+Grouping retains source alias requirements before changing work-item geometry.
+Combining all outputs into one item must not relax a source independence condition.
+Identical in-place maps may admit exact overlap where proven; shifted overlapping
+maps retain their disjointness requirement through accounting and native admission.
+
+## Optimization guarantees
+
+| Guarantee | Required property |
+| --- | --- |
+| Intrinsic expressiveness | Structured Seismic lowerings can express the required legal implementations of admitted backend mechanisms. |
+| Execution-family preservation | Normalization, composition, and lowering retain every implementation promised by the declared source/execution form, subject to established legality constraints. |
+| Selection completeness | Completed optimization minimizes the stated model objective over that family. |
+| Native correspondence | Emission and native compilation implement the selection within the qualified numerical and resource mapping. |
+
+The [language](language.md#lowering-authoring-contract) owns the authoring domain;
+[execution](execution.md) defines its legal realizations; [tuning](tuning.md) owns
+selection; [backends](backends.md) own native correspondence. These guarantees
+compose but are not interchangeable. A family containing a valid competitive
+implementation cannot produce a worse model objective after complete selection.
+Physical optimality additionally requires adequate coverage and qualified hardware
+and native mappings. Type correctness alone establishes none of those performance
+claims.
+
+## Source stability
+
+Under identical bindings, numerical permissions, effects, and compilation conditions,
+the documented normalization domain preserves the reachable execution family, up
+to identity renaming, across these variations:
+
+| Source variation | Condition |
+| --- | --- |
+| Rename values, parameters, or helpers | Bindings and semantics unchanged |
+| Extract or inline a helper | Body visible; no new opaque/ABI boundary or intrinsic-scope change |
+| Introduce or remove pure scalar temporaries | Evaluation and precision unchanged |
+| Compose views or normalize equivalent indices | Equality established by supported index algebra, including bounds and overflow |
+| Reorder independent pure statements | No observable ordering, alias dependency, or numerical change |
+| Refactor a local producer through a logical tile | Same logical values and conversions; no new observable publication |
+
+Analyses consume normalized dataflow, iteration, access and effect relationships;
+incidental AST shapes cannot restrict these guarantees. Canonicalization is
+deterministic and idempotent within the supported domain, not a claim to decide
+arbitrary program equivalence or print one universal form for every semantics.
+Document and check extensions to that domain.
+
+Eliminating redundant execution-oriented language syntax must preserve the efficient
+realizations available through it for computations with equivalent semantics. Build
+the derivation from logical composition and migrate its uses together; deleting the
+syntax while forcing full intermediates or losing efficient intrinsic covers is not
+a completed simplification. This does not promise equivalence for programs whose
+results depend on a compiler-chosen partition.
+
+New casts, reassociation, FMA changes, reduction ordering, opaque calls, and external
+writes can change the legal family. Explain the actual semantic restriction or
+missing analysis rather than recommending a hidden matcher pattern. Bounded
+refactoring-pair checks compare execution-family coverage and model optima as well
+as numerical behavior; identical native code is not required.
+
 ## Representations
 
 | Representation | Contents |
@@ -87,7 +173,7 @@ program, workload, hardware, and implementation identities govern reuse.
 | Capability | Required information |
 | --- | --- |
 | Check / interpret | Source locations, typed semantics, violated conditions, reference outputs |
-| Inspect lowering | Chosen and unresolved implementations, shapes, ownership, sizes, dependencies |
+| Inspect lowering | Applicability domain, source commitments, free choice domains, shapes, ownership, dependencies, and unsupported analysis |
 | Inspect performance | Resource terms, limiting constraints, choice explanations, scope and assumptions |
 | Inspect emission | Target code, native diagnostics, applicable mapping information |
 | Reproduce | Bounded source/library identities, inputs or references, options, device/model conditions |

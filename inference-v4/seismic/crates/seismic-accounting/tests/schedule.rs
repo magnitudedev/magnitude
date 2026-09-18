@@ -58,10 +58,11 @@ fn selected_issue_order_preserves_overlap_and_is_checked_independently() {
         starts: vec![1, 0],
         completion: 5,
     };
-    assert!(m
-        .check_schedule(&invalid)
-        .unwrap_err()
-        .contains("issue order"));
+    assert!(
+        m.check_schedule(&invalid)
+            .unwrap_err()
+            .contains("issue order")
+    );
 
     let mut chain = model(vec![
         op("producer", 3, 0, 1, vec![]),
@@ -106,12 +107,13 @@ fn resident_capacity_is_held_until_the_actual_completion_event() {
     let solution = m.solve(10000).unwrap();
     assert_eq!(solution.schedule().completion, 8);
 
-    assert!(m
-        .check_schedule(&Schedule {
+    assert!(
+        m.check_schedule(&Schedule {
             starts: vec![0, 1],
             completion: 5
         })
-        .is_err());
+        .is_err()
+    );
 
     m.resources[1].capacity = 16;
     let solution = m.solve(10000).unwrap();
@@ -157,6 +159,20 @@ fn oracle(m: &Model) -> u64 {
             {
                 return false;
             }
+            if op.start_predecessors.iter().any(|&p| starts[i] < starts[p]) {
+                return false;
+            }
+        }
+        let event = |e: Event| {
+            starts[e.operation]
+                + if e.point == Point::Completion {
+                    m.operations[e.operation].latency
+                } else {
+                    0
+                }
+        };
+        if m.lifetimes.iter().any(|l| event(l.end) < event(l.begin)) {
+            return false;
         }
         for tick in 0..completion {
             for (resource, capacity) in m.resources.iter().enumerate() {
@@ -169,6 +185,11 @@ fn oracle(m: &Model) -> u64 {
                         {
                             used += r.units;
                         }
+                    }
+                }
+                for l in &m.lifetimes {
+                    if l.resource == resource && event(l.begin) <= tick && tick < event(l.end) {
+                        used += l.units;
                     }
                 }
                 if used > capacity.capacity {
@@ -200,6 +221,97 @@ fn oracle(m: &Model) -> u64 {
     let mut best = u64::MAX;
     enumerate(m, &mut vec![0; m.operations.len()], 0, horizon, &mut best);
     best
+}
+
+#[test]
+fn large_tick_domains_are_solved_by_constraints_without_tick_enumeration() {
+    let unit = 1_000_000_000_000;
+    let m = model(vec![
+        op("independent", 2 * unit, 0, 2 * unit, vec![]),
+        op("producer", 1, 0, 1, vec![]),
+        op("dependent", 10 * unit, 1, 10 * unit, vec![1]),
+    ]);
+    let result = m.solve(1_000).unwrap();
+    assert!(result.is_optimal(), "{:?}", result);
+    assert_eq!(result.schedule().completion, 10 * unit + 1);
+    assert!(result.assignments_examined() < 1_000);
+    assert!(result.schedule().starts[0] > result.schedule().starts[1]);
+
+    let mut search = m.start_search().unwrap();
+    for step in 1..=1_000 {
+        if let SearchOutcome::Feasible(resumed) = search.advance(1).unwrap() {
+            if resumed.is_optimal() {
+                assert_eq!(resumed.schedule(), result.schedule());
+                assert_eq!(
+                    resumed.assignments_examined(),
+                    result.assignments_examined()
+                );
+                assert_eq!(resumed.assignments_examined(), step);
+                return;
+            }
+        }
+    }
+    panic!("resumption must continue the retained frontier");
+}
+
+#[test]
+fn interval_propagation_matches_oracle_for_lifetimes_offsets_and_issue_orders() {
+    for mask in 0..128 {
+        let mut m = model(vec![
+            op("a", 2, 0, 1, vec![]),
+            op("b", 1, 0, 1, vec![]),
+            op("c", 2, 0, 1, if mask & 1 != 0 { vec![0] } else { vec![] }),
+        ]);
+        m.resources[1].unit = CapacityUnit::Bytes;
+        m.resources[1].capacity = if mask & 2 != 0 { 2 } else { 1 };
+        m.operations[2].reservations[0].offset = u64::from(mask & 4 != 0);
+        if mask & 8 != 0 {
+            m.operations[1].start_predecessors.push(0);
+        }
+        m.lifetimes = vec![
+            Lifetime {
+                resource: 1,
+                units: 1,
+                begin: Event {
+                    operation: 0,
+                    point: if mask & 16 != 0 {
+                        Point::Completion
+                    } else {
+                        Point::Start
+                    },
+                },
+                end: Event {
+                    operation: 2,
+                    point: Point::Completion,
+                },
+            },
+            Lifetime {
+                resource: 1,
+                units: if mask & 32 != 0 { 2 } else { 1 },
+                begin: Event {
+                    operation: 1,
+                    point: Point::Start,
+                },
+                end: Event {
+                    operation: 1,
+                    point: if mask & 64 != 0 {
+                        Point::Start
+                    } else {
+                        Point::Completion
+                    },
+                },
+            },
+        ];
+        let expected = oracle(&m);
+        match m.search(100_000).unwrap() {
+            SearchOutcome::Feasible(solution) => {
+                assert!(solution.is_optimal(), "mask={mask}");
+                assert_eq!(solution.schedule().completion, expected, "mask={mask}");
+            }
+            SearchOutcome::Infeasible => assert_eq!(expected, u64::MAX, "mask={mask}"),
+            SearchOutcome::Incomplete { .. } => panic!("small region incomplete: mask={mask}"),
+        }
+    }
 }
 
 #[test]
@@ -327,12 +439,13 @@ fn infeasible_serial_seed_does_not_hide_a_legal_interleaving() {
             },
         })
         .collect();
-    assert!(m
-        .check_schedule(&Schedule {
+    assert!(
+        m.check_schedule(&Schedule {
             starts: vec![0, 1, 2, 3],
             completion: 4
         })
-        .is_err());
+        .is_err()
+    );
     assert!(matches!(
         m.search(0).unwrap(),
         SearchOutcome::Incomplete { lower_bound: 4 }

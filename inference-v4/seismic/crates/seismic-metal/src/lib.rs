@@ -18,3 +18,5 @@ pub mod collective;
 pub mod support;
 
 pub mod model;
+pub mod tuning;
+pub mod terminal;

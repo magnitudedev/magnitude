@@ -41,7 +41,7 @@ pub fn compile_plan(device: &Device, program: &Program, plan: &Plan, cfg: Config
         let pipeline = match index.get(&key) {
             Some(i) => *i,
             None => {
-                let lowered = seismic_lang::lower::lower_specialized(program, &step.kernel, "metal", &step.shapes, &step.elements, &seismic_lang::lower::Options { piece: cfg.piece })?;
+                let lowered = seismic_lang::lower::lower_specialized(program, &step.kernel, "metal", &step.shapes, &step.elements, &seismic_lang::lower::Options { piece: cfg.piece, ..Default::default() })?;
                 let emitted = msl::emit_with(&lowered, cfg.clone())?;
                 let p = device.compile(emitted)?;
                 pipelines.push(p);

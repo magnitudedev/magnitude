@@ -9,6 +9,8 @@ use crate::types::{DType, Elem, Shaped, Ty};
 /// are exhaustive functions of this identity, rather than independent name tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Operation {
+    LaneIndex,
+    ShuffleIndex,
     SimdSum,
     SimdMax,
     SimdMin,
@@ -20,6 +22,8 @@ pub enum Operation {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Semantics {
+    ParticipantIndex,
+    Exchange,
     Reduction(crate::ir::ReduceOp),
     Fragment {
         rows: u64,
@@ -43,6 +47,8 @@ pub enum Semantics {
 impl Operation {
     pub fn name(self) -> &'static str {
         match self {
+            Self::LaneIndex => "lane_index",
+            Self::ShuffleIndex => "shuffle_index",
             Self::SimdSum => "simd_sum",
             Self::SimdMax => "simd_max",
             Self::SimdMin => "simd_min",
@@ -55,6 +61,8 @@ impl Operation {
     }
     pub fn semantics(self) -> Semantics {
         match self {
+            Self::LaneIndex => Semantics::ParticipantIndex,
+            Self::ShuffleIndex => Semantics::Exchange,
             Self::SimdSum => Semantics::Reduction(crate::ir::ReduceOp::Sum),
             Self::SimdMax => Semantics::Reduction(crate::ir::ReduceOp::Max),
             Self::SimdMin => Semantics::Reduction(crate::ir::ReduceOp::Min),
@@ -86,19 +94,21 @@ impl Operation {
     /// Declaration creates fragment storage; all executable intrinsics involve
     /// the subgroup. This describes participation, not a barrier insertion policy.
     pub fn collective(self) -> bool {
-        !matches!(self, Self::Matrix)
+        !matches!(self, Self::Matrix | Self::LaneIndex)
     }
     pub fn writes_arguments(self) -> &'static [usize] {
         match self {
             Self::MatrixLoad | Self::MatrixLoadTranspose | Self::MatrixMultiplyAccumulate => &[0],
             Self::MatrixStore => &[1],
-            Self::SimdSum | Self::SimdMax | Self::SimdMin | Self::Matrix => &[],
+            Self::LaneIndex | Self::ShuffleIndex | Self::SimdSum | Self::SimdMax | Self::SimdMin | Self::Matrix => &[],
         }
     }
     pub fn writes_tensor_memory(self) -> bool {
         // Tile and fragment operands are value storage, not tensor backing.
         match self {
-            Self::SimdSum
+            Self::LaneIndex
+            | Self::ShuffleIndex
+            | Self::SimdSum
             | Self::SimdMax
             | Self::SimdMin
             | Self::Matrix
@@ -111,6 +121,8 @@ impl Operation {
     pub fn signature(self) -> Intrinsic {
         use IntrinsicParam::*;
         let (params, result) = match self {
+            Self::LaneIndex => (vec![], IntrinsicResult::Integer),
+            Self::ShuffleIndex => (vec![FloatScalar, Integer], IntrinsicResult::FloatScalar),
             Self::SimdSum | Self::SimdMax | Self::SimdMin => {
                 (vec![FloatScalar], IntrinsicResult::FloatScalar)
             }
@@ -152,12 +164,15 @@ pub enum IntrinsicParam {
     Frag8x8,
     /// A tile (or tile view) of rank 2.
     Tile2,
+    /// A runtime participant index, checked against the selected group.
+    Integer,
     /// A symbolic integer.
     Int,
 }
 
 #[derive(Clone, Debug)]
 pub enum IntrinsicResult {
+    Integer,
     Void,
     /// Same dtype as the `FloatScalar` params.
     FloatScalar,
@@ -170,6 +185,8 @@ pub fn table(backend: &str) -> Option<Vec<Intrinsic>> {
     match backend {
         "metal" => Some(
             [
+                LaneIndex,
+                ShuffleIndex,
                 SimdSum,
                 SimdMax,
                 SimdMin,
@@ -183,7 +200,8 @@ pub fn table(backend: &str) -> Option<Vec<Intrinsic>> {
             .map(Operation::signature)
             .collect(),
         ),
-        "cpu" | "cuda" | "vulkan" => Some(vec![]),
+        "cuda" => Some([SimdSum, LaneIndex, ShuffleIndex].into_iter().map(Operation::signature).collect()),
+        "cpu" | "vulkan" => Some(vec![]),
         _ => None,
     }
 }

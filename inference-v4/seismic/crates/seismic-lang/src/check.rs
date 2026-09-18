@@ -232,16 +232,18 @@ struct Checker<'a> {
     vars: Vec<Var>,
     scopes: Vec<HashMap<String, VarId>>,
     facts: Facts,
+    /// Current scalar definitions projected into the existing index algebra.
+    scalar_symbols: HashMap<VarId, Sym>,
     /// Tiles allocated with `tile[...]` and not yet fully assigned.
     unassigned: HashSet<VarId>,
     /// Innermost enclosing `parallel` loop's index variables.
     parallel_vars: Vec<Vec<VarId>>,
     /// Tiles whose first element-wise write inside the current `owned` loop assigns them:
     /// the loop's own tile and any unassigned tile of the same shape written at the loop indices.
-    pending_full_assign: Vec<VarId>,
-    /// One atom per dynamic slice, keyed by the slice's source span, so a slice applied to a
-    /// tuple of views yields the same extent for every element.
-    dyn_slices: HashMap<(u32, u32), Atom>,
+    pending_full_assign: Vec<(VarId, Vec<Sym>)>,
+    /// Equal logical windows share an extent while their input values remain
+    /// unchanged. Source locations and tuple spelling are not shape authority.
+    dyn_slices: Vec<(Option<Expr>, Option<Expr>, Sym, Atom)>,
     diagnostics: Vec<Diagnostic>,
     residual: Vec<Sym>,
     counter: usize,
@@ -262,10 +264,11 @@ impl<'a> Checker<'a> {
             vars: Vec::new(),
             scopes: vec![HashMap::new()],
             facts: Facts::new(),
+            scalar_symbols: HashMap::new(),
             unassigned: HashSet::new(),
             parallel_vars: Vec::new(),
             pending_full_assign: Vec::new(),
-            dyn_slices: HashMap::new(),
+            dyn_slices: Vec::new(),
             diagnostics: Vec::new(),
             residual: Vec::new(),
             counter: 0,
@@ -353,6 +356,13 @@ impl<'a> Checker<'a> {
         let mut out = Vec::new();
         for s in &b.stmts {
             if let Some(st) = self.stmt(s) {
+                if crate::effects::tensor_effect(&st) {self.dyn_slices.clear();} else {
+                    self.dyn_slices.retain(|(start,end,_,_)| {
+                        let mut reads=HashSet::new();
+                        for e in start.iter().chain(end) {collect_value_variables(e,&mut reads);}
+                        !reads.into_iter().any(|v|crate::effects::tile_mutated(&st,v))
+                    });
+                }
                 out.push(st);
             }
         }
@@ -361,8 +371,16 @@ impl<'a> Checker<'a> {
 
     fn stmt(&mut self, s: &ast::Stmt) -> Option<Stmt> {
         let kind = match &s.kind {
-            ast::StmtKind::For { targets, iter, body ,
-            } => self.for_stmt(targets, iter, body, s.span)?,
+            ast::StmtKind::For {targets,iter,body} => {
+                // Mutable values carried through a loop are not equal to their
+                // pre-loop definitions on every iteration or after an empty loop.
+                self.dyn_slices.clear();
+                let writes=assigned_names(body);
+                for name in &writes {if let Some(id)=self.lookup(name) {self.scalar_symbols.remove(&id);}}
+                let statement=self.for_stmt(targets,iter,body,s.span)?;
+                for name in &writes {if let Some(id)=self.lookup(name) {self.scalar_symbols.remove(&id);}}
+                statement
+            },
             ast::StmtKind::If { cond, then, els } => {
                 let cond = self.expr(cond, Some(&Ty::Scalar(DType::Bool)))?;
                 if cond.ty != Ty::Scalar(DType::Bool) {
@@ -374,6 +392,7 @@ impl<'a> Checker<'a> {
                 let mark = self.facts.path_mark();
                 let assignment_before = self.unassigned.clone();
                 let pending_before = self.pending_full_assign.clone();
+                let symbols_before=self.scalar_symbols.clone();
                 for (atom, lo, hi) in path_bounds(&cond, false) {
                     if let Some(lo) = lo {
                         self.facts.add_lower(atom.clone(), lo);
@@ -387,6 +406,8 @@ impl<'a> Checker<'a> {
                 self.pop_scope();
                 self.facts.path_rollback(mark);
                 let assignment_then = self.unassigned.clone();
+                let symbols_then=self.scalar_symbols.clone();
+                self.scalar_symbols=symbols_before;
                 self.unassigned = assignment_before;
                 self.pending_full_assign = pending_before.clone();
                 let els = match els {
@@ -408,9 +429,10 @@ impl<'a> Checker<'a> {
                 };
                 self.facts.path_rollback(mark);
                 self.unassigned.extend(assignment_then);
+                self.scalar_symbols.retain(|id,sym|symbols_then.get(id)==Some(sym));
                 self.pending_full_assign = pending_before
                     .into_iter()
-                    .filter(|v| self.unassigned.contains(v))
+                    .filter(|(v,_)| self.unassigned.contains(v))
                     .collect();
                 StmtKind::If { cond, then, els }
             }
@@ -441,7 +463,7 @@ impl<'a> Checker<'a> {
                 }
             },
             _ => {
-                self.error(iter.span, "`for` iterates `parallel`, `load(..., over=axis)`, `owned(tile)` or `range(...)`");
+                self.error(iter.span, "`for` iterates `parallel`, `owned(tile)` or `range(...)`");
                 return None;
             }
         };
@@ -521,8 +543,9 @@ impl<'a> Checker<'a> {
                 let mut pending = Vec::new();
                 for v in self.unassigned.iter().copied().collect::<Vec<_>>() {
                     let same_shape = matches!(&self.vars[v].ty, Ty::Tile(s) if s.shape == shape);
-                    if same_shape && body_assigns_all(body, &self.vars[v].name, targets) {
-                        pending.push(v);
+                    if same_shape {
+                        let axes=vars.iter().map(|id| {let VarKind::Index(atom)=&self.vars[*id].kind else {unreachable!()};Sym::atom(atom.clone())}).collect();
+                        pending.push((v,axes));
                     }
                 }
                 let saved = std::mem::replace(&mut self.pending_full_assign, pending);
@@ -565,12 +588,14 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let hi = self.int_arg(&args[0])?;
-                let width = if args.len() == 2 { self.int_arg(&args[1])?.as_constant().unwrap_or(1) } else { 1 };
-                // Lanes cover the extent in runs of `width` per lane across the subgroup.
-                let run = Sym::constant(32 * width);
-                let need = hi.sub(&hi.quot(&run).mul(&run));
-                self.require_nonneg(&need.neg(), iter.span, "lanes: extent must be a multiple of the subgroup run",
-                );
+                let width = if args.len() == 2 {
+                    let Some(width) = self.int_arg(&args[1])?.as_constant().filter(|&n| n > 0 && n <= i64::from(i32::MAX) / 32) else {
+                        self.error(args[1].value.span, "lane width must be a positive constant with representable subgroup extent");
+                        return None;
+                    };
+                    width
+                } else { 1 };
+                self.require_nonneg(&hi, iter.span, "lane extent must be nonnegative");
                 self.push_scope();
                 let atom = self.fresh_atom(&targets[0].name);
                 self.facts.set_range(atom.clone(), Sym::constant(0), hi.sub(&Sym::constant(1)));
@@ -582,72 +607,8 @@ impl<'a> Checker<'a> {
                 })
             }
             "load" => {
-                let mut axis = None;
-                let mut views_ast = None;
-                for a in args {
-                    match &a.name {
-                        Some(n) if n.name == "over" => {
-                            let e = self.expr(&a.value, Some(&Ty::Scalar(DType::I32)))?;
-                            match e.sym.as_ref().and_then(|s| s.as_constant()) {
-                                Some(v) if v >= 0 => axis = Some(v as usize),
-                                _ => self.error(e.span, "`over` must be a constant axis index"),
-                            }
-                        }
-                        Some(n) => self.error(n.span, format!("unknown argument `{}`", n.name)),
-                        None if views_ast.is_none() => views_ast = Some(&a.value),
-                        None => {
-                            self.error(a.value.span, "`load` takes one view or a tuple of views")}
-                    }
-                }
-                let (Some(axis), Some(views_ast)) = (axis, views_ast) else {
-                    self.error(iter.span, "a `load` loop needs a view and `over=axis`");
-                    return None;
-                };
-                let views_expr = self.expr(views_ast, None)?;
-                let views: Vec<Expr> = match views_expr.kind {
-                    ExprKind::Tuple(items) => items,
-                    _ => vec![views_expr],
-                };
-                if views.len() != targets.len() {
-                    self.error(iter.span, format!("`load` yields {} tiles but the loop binds {} names", views.len(), targets.len()),
-                    );
-                    return None;
-                }
-                let mut extent: Option<Sym> = None;
-                for v in &views {
-                    let Ty::Tensor(s) = &v.ty else {
-                        self.error(v.span, format!("`load` needs a tensor view, found {}", v.ty),
-                        );
-                        return None;
-                    };
-                    let Some(dim) = s.shape.get(axis) else {
-                        self.error(v.span, format!("axis {axis} is out of range for rank {}", s.shape.len()),
-                        );
-                        return None;
-                    };
-                    match &extent {
-                        None => extent = Some(dim.clone()),
-                        Some(e) if e != dim => self.error(v.span, format!("views streamed together must agree on axis {axis}: `{e}` vs `{dim}`")),
-                        _ => {}
-                    }
-                }
-                let extent = extent.unwrap();
-                let piece = self.fresh_atom("piece");
-                self.facts.set_range(piece.clone(), Sym::constant(1), extent.clone());
-                self.push_scope();
-                let mut vars = Vec::new();
-                for (t, v) in targets.iter().zip(&views) {
-                    let Ty::Tensor(s) = &v.ty else { unreachable!() };
-                    let mut shape = s.shape.clone();
-                    shape[axis] = Sym::atom(piece.clone());
-                    let ty = Ty::Tile(Shaped { shape, elem: s.elem.clone(), packed_axis: s.packed_axis ,
-                    });
-                    vars.push(self.declare(&t.name, ty, t.span, VarKind::Local));
-                }
-                let body = self.block(body, &vars);
-                self.pop_scope();
-                Some(StmtKind::LoadLoop { modes: None, vars, views, axis, piece, capacity: None, body ,
-                })
+                self.error(iter.span, "`load` is a logical value, not an iterator; use `t = load(view)` and express the computation over that logical tile; the compiler derives streaming");
+                None
             }
             other => {
                 self.error(callee_name.span, format!("`{other}` is not an iterator"));
@@ -681,6 +642,7 @@ impl<'a> Checker<'a> {
                 let ty = self.vars[id].ty.clone();
                 let value = self.expr(value, Some(&ty))?;
                 self.check_arith_assign(&ty, &value, op)?;
+                self.scalar_symbols.remove(&id);
                 let target = Expr { kind: ExprKind::Var(id), ty, sym: None, span: n.span ,
                 };
                 return Some(StmtKind::Assign { target, op, value });
@@ -739,6 +701,7 @@ impl<'a> Checker<'a> {
                 }
             };
             let ty = self.vars[id].ty.clone();
+            if let Some(sym)=value.sym.as_ref().filter(|_|matches!(ty,Ty::Scalar(DType::I32))) {self.scalar_symbols.insert(id,sym.clone());} else {self.scalar_symbols.remove(&id);}
             let target = Expr { kind: ExprKind::Var(id), ty, sym: None, span: n.span ,
             };
             return Some(StmtKind::Assign { target, op, value });
@@ -764,13 +727,20 @@ impl<'a> Checker<'a> {
             return None;
         }
         // A full assignment through the pending owned loop marks the tile assigned from here on.
-        let is_pending = self.pending_full_assign.contains(&id) && op == AssignOp::Assign;
-        if self.unassigned.contains(&id) && !is_pending {
-            self.error(target.span, format!("`{}` is written element-wise before it is assigned; assign every element through `for ... in owned({})`", base_name.name, base_name.name));
+        let pending=self.pending_full_assign.iter().find(|(v,_)|*v==id).map(|(_,axes)|axes.clone());
+        if self.unassigned.contains(&id) && pending.is_none() {
+            self.error(target.span,format!("`{}` is written element-wise before it is assigned; assign every element through an owned loop",base_name.name));
             return None;
         }
-        let allow_unassigned_target = is_pending;
-        let t = self.expr_inner(target, None, allow_unassigned_target)?;
+        let t=self.expr_inner(target,None,pending.is_some())?;
+        let is_pending=op==AssignOp::Assign && pending.as_ref().is_some_and(|axes| {
+            let ExprKind::Index{indices,..}=&t.kind else {return false;};
+            indices.len()==axes.len() && indices.iter().zip(axes).all(|(index,axis)|matches!(index,Index::Point(e) if e.sym.as_ref()==Some(axis)))
+        });
+        if self.unassigned.contains(&id) && !is_pending {
+            self.error(target.span,format!("`{}` is written before initialization; its first owned write must cover every element",base_name.name));
+            return None;
+        }
         let Ty::Scalar(dtype) = t.ty else {
             self.error(target.span, "assignment target must select a single element",
             );
@@ -779,7 +749,7 @@ impl<'a> Checker<'a> {
         let value = self.expr(value, Some(&Ty::Scalar(dtype)))?;
         if is_pending {
             self.unassigned.remove(&id);
-            self.pending_full_assign.retain(|v| *v != id);
+            self.pending_full_assign.retain(|(v,_)| *v != id);
         } else if self.unassigned.contains(&id) {
             self.error(target.span, format!("`{}` is written element-wise before it is assigned; assign every element through `for ... in owned({})`", base_name.name, base_name.name));
             return None;
@@ -878,7 +848,7 @@ impl<'a> Checker<'a> {
                     let ty = self.vars[id].ty.clone();
                     let sym = match &self.vars[id].kind {
                         VarKind::Index(a) => Some(Sym::atom(a.clone())),
-                        _ => None,
+                        _ => self.scalar_symbols.get(&id).cloned(),
                     };
                     return Some(Expr { kind: ExprKind::Var(id), ty, sym, span ,
                     });
@@ -1174,6 +1144,14 @@ impl<'a> Checker<'a> {
                         Some(e) => Some(self.expr(e, Some(&Ty::Scalar(DType::I32)))?),
                         None => None,
                     };
+                    for (bound, name) in [(&s, "start"), (&en, "end")] {
+                        if let Some(bound) = bound {
+                            if bound.ty != Ty::Scalar(DType::I32) {
+                                self.error(bound.span, format!("slice {name} must be i32, found {}", bound.ty));
+                                return None;
+                            }
+                        }
+                    }
                     let lo = s.as_ref().and_then(|x| x.sym.clone()).unwrap_or_else(|| Sym::constant(0));
                     let hi = en.as_ref().map(|x| x.sym.clone()).unwrap_or(Some(extent.clone()));
                     let new_extent = match hi {
@@ -1185,20 +1163,15 @@ impl<'a> Checker<'a> {
                         }
                         _ => {
                             // Data-dependent bounds: the view is clamped to the extent at run time.
-                            let key = {
-                                let a = s.as_ref().map(|x| x.span).or(en.as_ref().map(|x| x.span)).unwrap_or(span);
-                                let b = en.as_ref().map(|x| x.span).unwrap_or(a);
-                                (a.start, b.end)
-                            };
-                            let a = match self.dyn_slices.get(&key) {
-                                Some(a) => a.clone(),
-                                None => {
-                                    let a = self.fresh_atom("dyn");
-                                    self.facts.set_range(a.clone(), Sym::constant(0), extent.clone(),
-                                    );
-                                    self.dyn_slices.insert(key, a.clone());
-                                    a
-                                }
+                            let start_key=s.as_ref().map(crate::normalize::value_identity);
+                            let end_key=en.as_ref().map(crate::normalize::value_identity);
+                            let a=if let Some((_,_,_,atom))=self.dyn_slices.iter().find(|(start,end,parent,_)|*start==start_key && *end==end_key && *parent==extent) {
+                                atom.clone()
+                            } else {
+                                let atom=self.fresh_atom("dyn");
+                                self.facts.set_range(atom.clone(),Sym::constant(0),extent.clone());
+                                self.dyn_slices.push((start_key,end_key,extent.clone(),atom.clone()));
+                                atom
                             };
                             Sym::atom(a)
                         }
@@ -1249,7 +1222,7 @@ impl<'a> Checker<'a> {
                 Some(Expr { kind: ExprKind::Transpose(Box::new(base)), ty, sym: None, span ,
                 })
             }
-            "words" | "scale" | "bias" => {
+            "words" | "scale" | "bias" | "coefficients" | "scale_factor" | "bias_factor" => {
                 if self.scope == Scope::Portable {
                     self.error(span, format!("`.{}` exposes the packet structure and is only allowed in a lowering", name.name),
                     );
@@ -1273,16 +1246,18 @@ impl<'a> Checker<'a> {
                 };
                 let k = s.shape[axis].clone();
                 // Accessors keep every other axis and replace the packet axis by the packet extent.
-                let (extent, dtype) = match name.name.as_str() {
-                    "words" => (rep.words_extent(&k), DType::U32),
-                    "scale" => (rep.groups_extent(&k), rep.coefficient),
-                    _ => {
-                        if !rep.has_bias {
-                            self.error(span, format!("`{}` has no bias", rep.name));
-                            return None;
-                        }
-                        (rep.groups_extent(&k), rep.coefficient)
+                let (extent, dtype) = if name.name == "scale" || name.name == "bias" {
+                    if name.name == "bias" && !rep.has_bias() {
+                        self.error(span, format!("`{}` has no bias", rep.name));
+                        return None;
                     }
+                    (rep.groups_extent(&k), rep.coefficient_dtype())
+                } else {
+                    let Some(plane) = rep.plane(&name.name) else {
+                        self.error(span, format!("`{}` has no physical plane `{}`", rep.name, name.name));
+                        return None;
+                    };
+                    (plane.extent(&k), plane.dtype())
                 };
                 let mut shape = s.shape.clone();
                 shape[axis] = extent;
@@ -1355,6 +1330,89 @@ impl<'a> Checker<'a> {
         self.user_call(&sig, bindings, args, span)
     }
 
+    fn structured_reduce(&mut self, args: &[ast::Arg], span: Span) -> Option<Expr> {
+        if args.len() < 4 || args[..3].iter().any(|a| a.name.is_some()) {
+            self.error(span, "reduce needs positional fields, axis, merge and named into, ordered, step, identity arguments");
+            return None;
+        }
+        let mut named = HashMap::new();
+        for arg in &args[3..] {
+            let Some(name) = &arg.name else {self.error(arg.value.span,"reduction options must be named");return None;};
+            if !["into","ordered","step","identity"].contains(&name.name.as_str()) || named.insert(name.name.as_str(), &arg.value).is_some() {
+                self.error(name.span,"unknown or repeated reduction option");return None;
+            }
+        }
+        let Some(state_arg) = named.get("into") else {self.error(span,"reduction requires into=(state fields)");return None;};
+        let ordered = if let Some(arg) = named.get("ordered") {
+            let A::Bool(value) = arg.kind else {self.error(arg.span,"ordered must be a boolean literal");return None;}; value
+        } else {true};
+        if named.contains_key("step") != named.contains_key("identity") {
+            self.error(span,"a mergeable fold requires both step and identity");return None;
+        }
+        let fields = self.expr(&args[0].value,None)?;
+        let state = self.expr(state_arg,None)?;
+        let (ExprKind::Tuple(inputs),ExprKind::Tuple(outputs)) = (&fields.kind,&state.kind) else {
+            self.error(span,"reduction fields and state must be tuples");return None;
+        };
+        if inputs.is_empty() || outputs.is_empty() || (!named.contains_key("step") && inputs.len()!=outputs.len()) {
+            self.error(span,"reduction requires nonempty input/state tuples; different field counts require step and identity");return None;
+        }
+        let axis=self.expr(&args[1].value,Some(&Ty::Scalar(DType::I32)))?;
+        let Some(axis_index)=axis.sym.as_ref().and_then(Sym::as_constant).and_then(|v|usize::try_from(v).ok()) else {
+            self.error(axis.span,"reduction axis must be a nonnegative constant");return None;
+        };
+        let mut extent:Option<Sym>=None;
+        let mut leaf_inputs=Vec::new();
+        for input in inputs {
+            let Ty::Tile(input_type)=&input.ty else {self.error(input.span,"reduction inputs must be tiles");return None;};
+            let Some(length)=input_type.shape.get(axis_index) else {self.error(axis.span,"reduction axis is out of range");return None;};
+            if extent.as_ref().is_some_and(|n|!self.prover().zero(&n.sub(length))) {
+                self.error(input.span,"reduction inputs must have equal reduction extents");return None;
+            }
+            extent=Some(length.clone());
+            // This typed slice supplies the step's specialization. It is never
+            // evaluated here, including for empty inputs; expansion binds real leaves.
+            let zero=Expr{kind:ExprKind::Int(0),ty:Ty::Scalar(DType::I32),sym:Some(Sym::constant(0)),span};
+            leaf_inputs.push(crate::reduction::structured::slice(input,axis_index,&zero,span));
+        }
+        let mut destinations=HashSet::new();
+        for output in outputs {
+            let (Ty::Tile(t),ExprKind::Var(id))=(&output.ty,&output.kind) else {self.error(output.span,"state must contain initialized tile variables");return None;};
+            if matches!(t.elem,Elem::Repr(_)) || !destinations.insert(*id) {
+                self.error(output.span,"state fields must be distinct dense tile variables");return None;
+            }
+        }
+        if !named.contains_key("step") && leaf_inputs.iter().zip(outputs).any(|(a,b)|!self.same_tile_type(&a.ty,&b.ty)) {
+            self.error(span,"each state field must match its input with the reduction axis removed");return None;
+        }
+        let merge_call=self.reduction_call(&args[2].value,outputs.iter().chain(outputs).chain(outputs).cloned().collect(),2*outputs.len(),span)?;
+        let mut result=vec![fields.clone(),axis,merge_call,state.clone(),Expr{kind:ExprKind::Bool(ordered),ty:Ty::Scalar(DType::Bool),sym:None,span}];
+        if let Some(step)=named.get("step") {
+            let identity=self.expr(named["identity"],None)?;
+            let ExprKind::Tuple(identity_fields)=&identity.kind else {self.error(identity.span,"identity must be a tuple of initialized tiles");return None;};
+            if identity_fields.len()!=outputs.len() || identity_fields.iter().zip(outputs).any(|(a,b)|!self.same_tile_type(&a.ty,&b.ty)) {
+                self.error(identity.span,"identity fields must have the state field types");return None;
+            }
+            let step_call=self.reduction_call(step,outputs.iter().chain(&leaf_inputs).chain(outputs).cloned().collect(),outputs.len()+inputs.len(),span)?;
+            result.extend([step_call,identity]);
+        }
+        Some(Expr{kind:ExprKind::Builtin{name:Builtin::Reduce,args:result},ty:Ty::Void,sym:None,span})
+    }
+
+    fn same_tile_type(&self,a:&Ty,b:&Ty)->bool {
+        let (Ty::Tile(a),Ty::Tile(b))=(a,b) else {return false;};
+        a.elem==b.elem && a.shape.len()==b.shape.len() && a.shape.iter().zip(&b.shape).all(|(a,b)|self.prover().zero(&a.sub(b)))
+    }
+
+    fn reduction_call(&mut self, name:&ast::Expr,args:Vec<Expr>,output_start:usize,span:Span)->Option<Expr> {
+        let A::Name(name)=&name.kind else {self.error(name.span,"reduction operation must name a source function");return None;};
+        let Some(signature)=self.env.signatures.get(&name.name).cloned() else {self.error(name.span,"reduction operation is not declared");return None;};
+        if signature.params.len()!=args.len() || signature.params.iter().any(|(_,ty)|!matches!(ty,Ty::Tile(_))) || (output_start..args.len()).any(|i|!signature.output_tiles.contains(&i)) {
+            self.error(name.span,"reduction operation must accept state, inputs, and fully written output tile fields");return None;
+        }
+        self.typed_user_call(&signature,HashMap::new(),args,span)
+    }
+
     fn user_call(&mut self, sig: &Signature, bindings: &[(Ident, ast::Expr)], args: &[ast::Arg], span: Span,
     ) -> Option<Expr> {
         if args.len() != sig.params.len() {
@@ -1363,7 +1421,6 @@ impl<'a> Checker<'a> {
             return None;
         }
         let mut shape_bind: HashMap<String, Sym> = HashMap::new();
-        let mut elem_bind: HashMap<String, Elem> = HashMap::new();
         for (p, v) in bindings {
             if !sig.shape_params.contains(&p.name) {
                 self.error(p.span, format!("`{}` has no shape parameter `{}`", sig.name, p.name),
@@ -1392,6 +1449,11 @@ impl<'a> Checker<'a> {
             let a = self.expr_inner(&arg.value, expected.as_ref(), output)?;
             out_args.push(a);
         }
+        self.typed_user_call(sig,shape_bind,out_args,span)
+    }
+
+    fn typed_user_call(&mut self,sig:&Signature,mut shape_bind:HashMap<String,Sym>,out_args:Vec<Expr>,span:Span)->Option<Expr> {
+        let mut elem_bind:HashMap<String,Elem>=HashMap::new();
         // Shapes: bind single-parameter dimensions, then solve compound dimensions with one
         // unknown, until nothing changes; then every dimension must agree.
         let mut dims: Vec<(Sym, Sym)> = Vec::new();
@@ -1584,7 +1646,7 @@ impl<'a> Checker<'a> {
             }
             Builtin::Load => {
                 if args.len() != 1 || args[0].name.is_some() {
-                    self.error(span, "`load(view)` takes one view; the streaming form `load(view, over=axis)` is only valid in `for`");
+                    self.error(span, "`load(view)` takes one logical view; decomposition is selected by the compiler");
                     return None;
                 }
                 let v = self.expr(&args[0].value, None)?;
@@ -1673,6 +1735,9 @@ impl<'a> Checker<'a> {
                 })
             }
             Builtin::Reduce => {
+                if args.first().is_some_and(|a| matches!(a.value.kind, A::Tuple(_))) {
+                    return self.structured_reduce(args, span);
+                }
                 if !(3..=4).contains(&args.len()) {self.error(span,"`reduce` takes three positional arguments and optional `ordered=true|false`");return None;}
                 positional(self, &args[..3], 3, "reduce")?;
                 let ordered=if let Some(permission)=args.get(3) {
@@ -1882,6 +1947,13 @@ impl<'a> Checker<'a> {
                     }
                     out.push(e);
                 }
+                IntrinsicParam::Integer => {
+                    let e=self.expr(&arg.value,Some(&Ty::Scalar(DType::I32)))?;
+                    if !matches!(e.ty,Ty::Scalar(DType::I32|DType::U32)) {
+                        self.error(e.span,"participant index requires a 32-bit integer");return None;
+                    }
+                    out.push(e);
+                }
                 IntrinsicParam::Int => {
                     let e = self.expr(&arg.value, Some(&Ty::Scalar(DType::I32)))?;
                     if e.sym.is_none() {
@@ -1916,6 +1988,7 @@ impl<'a> Checker<'a> {
         }
         let ty = match intr.result {
             IntrinsicResult::Void => Ty::Void,
+            IntrinsicResult::Integer => Ty::Scalar(DType::I32),
             IntrinsicResult::FloatScalar => Ty::Scalar(float_dtype.unwrap_or(DType::F32)),
             IntrinsicResult::Frag8x8OfNamedDtype => {
                 intrinsics::frag8x8(named_dtype.unwrap_or(DType::F32))}
@@ -2290,6 +2363,7 @@ fn shape_text(shape: &[Sym]) -> String {
 fn collect_stored_views(stmts: &[Stmt], out: &mut Vec<Expr>) {
     for s in stmts {
         match &s.kind {
+            StmtKind::Reduction(r) => for body in r.bodies() {collect_stored_views(body,out)},
             StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. } | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } => collect_stored_views(body, out),
             StmtKind::If { then, els, .. } => {
                 collect_stored_views(then, out);
@@ -2376,6 +2450,30 @@ fn single_atom(s: &Sym) -> Option<Atom> {
     None
 }
 
+fn collect_value_variables(e:&Expr,out:&mut HashSet<VarId>) {
+    match &e.kind {
+        ExprKind::Var(v)=>{out.insert(*v);},
+        ExprKind::Index{base,indices}=>{collect_value_variables(base,out);for i in indices {match i {Index::Point(e)=>collect_value_variables(e,out),Index::Slice{start,end}=>for e in start.iter().chain(end) {collect_value_variables(e,out)}}}},
+        ExprKind::Load{view,..}|ExprKind::Transpose(view)|ExprKind::Unary{expr:view,..}|ExprKind::Cast{expr:view,..}|ExprKind::Accessor{base:view,..}|ExprKind::Lanes{base:view,..}=>collect_value_variables(view,out),
+        ExprKind::Binary{lhs,rhs,..}=>{collect_value_variables(lhs,out);collect_value_variables(rhs,out);},
+        ExprKind::Call{args,..}|ExprKind::Builtin{args,..}|ExprKind::Intrinsic{args,..}|ExprKind::Tuple(args)=>for e in args {collect_value_variables(e,out)},
+        _=>{}
+    }
+}
+
+fn assigned_names(body:&ast::Block)->HashSet<String> {
+    let mut names=HashSet::new();
+    for statement in &body.stmts {
+        match &statement.kind {
+            ast::StmtKind::Assign{target,..}=>{if let A::Name(n)=&target.kind {names.insert(n.name.clone());}},
+            ast::StmtKind::For{body,..}=>names.extend(assigned_names(body)),
+            ast::StmtKind::If{then,els,..}=>{names.extend(assigned_names(then));if let Some(els)=els {names.extend(assigned_names(els));}},
+            _=>{}
+        }
+    }
+    names
+}
+
 /// Whether every path through `body` assigns `name[targets...]`: a direct element assignment
 /// with the loop's own indices, or an `if` whose branches both do.
 fn body_assigns_all(body: &ast::Block, name: &str, targets: &[Ident]) -> bool {
@@ -2384,7 +2482,10 @@ fn body_assigns_all(body: &ast::Block, name: &str, targets: &[Ident]) -> bool {
             A::Index { base, indices } => {
                 matches!(&base.kind, A::Name(n) if n.name == name)
                     && indices.len() == targets.len()
-                    && indices.iter().zip(targets).all(|(i, t)| matches!(i, ast::Index::Expr(e) if matches!(&e.kind, A::Name(n) if n.name == t.name)))
+                    && indices.iter().zip(targets).all(|(i,t)| match i {
+                        ast::Index::Expr(e)=>shape_sym(e,&targets.iter().map(|t|t.name.clone()).collect::<Vec<_>>()).is_ok_and(|s|s==Sym::param(&t.name)),
+                        _=>false,
+                    })
             }
             _ => false,
         },
@@ -2397,6 +2498,16 @@ fn body_assigns_all(body: &ast::Block, name: &str, targets: &[Ident]) -> bool {
 fn collect_writes(stmts: &[Stmt], out: &mut HashMap<VarId, Vec<Vec<(Sym, Sym)>>>, vars: &[Var]) {
     for s in stmts {
         match &s.kind {
+            StmtKind::Reduction(r) => {
+                for state in &r.state {
+                    if let ExprKind::Var(v) = state.kind {
+                        if matches!(vars[v].kind,VarKind::Param(_)) {
+                            let region=state.ty.shaped().unwrap().shape.iter().map(|n|(Sym::constant(0),n.sub(&Sym::constant(1)))).collect();
+                            out.entry(v).or_default().push(region);
+                        }
+                    }
+                }
+            }
             StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. } | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } => collect_writes(body, out, vars),
             StmtKind::If { then, els, .. } => {
                 collect_writes(then, out, vars);
@@ -2508,6 +2619,7 @@ fn collect_reads(stmts: &[Stmt], out: &mut HashMap<VarId, Vec<Vec<(Sym, Sym)>>>,
                 expr(value, out, vars);
             }
             StmtKind::Expr(e) => expr(e, out, vars),
+            StmtKind::Reduction(r) => {for e in r.operands() {expr(e,out,vars);} for body in r.bodies() {collect_reads(body,out,vars)};}
         }
     }
 }

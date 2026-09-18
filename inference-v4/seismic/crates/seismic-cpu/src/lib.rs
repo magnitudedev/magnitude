@@ -18,6 +18,7 @@ pub use seismic_realization::BufferSpec;
 /// Executable memory and scratch have one owner. Mutable invocation serializes reuse
 /// of its scratch. Generated pointers cannot escape this wrapper.
 pub struct Kernel {
+    conditions: seismic_realization::InvocationConditions,
     _memory: ExecutableMemory,
     entry: unsafe extern "C" fn(*const *mut u8, *const u64, *mut u8) -> i32,
     buffers: Vec<BufferSpec>,
@@ -152,6 +153,7 @@ impl Kernel {
         self.invoke(&pointers, &words)
     }
     fn invoke(&mut self, pointers: &[*mut u8], scalar_words: &[u64]) -> Result<(), String> {
+        self.conditions.validate_aliases(&self.buffers, |i| (0, pointers[i] as u64))?;
         // All pointer capacities and scalar encodings match the checked compiled ABI.
         // The emitter rejects unresolved indexing and unsupported control semantics.
         let status = unsafe {
@@ -250,6 +252,7 @@ pub fn compile_execution(program: seismic_realization::ScalarProgram) -> Result<
     compile_execution_with(program, &codegen::Policy::host()?)
 }
 pub fn compile_execution_with(program: seismic_realization::ScalarProgram, policy: &codegen::Policy) -> Result<Kernel, String> {
+    let conditions = program.conditions.clone();
     let CompiledCode {
         memory,
         entry,
@@ -263,6 +266,7 @@ pub fn compile_execution_with(program: seismic_realization::ScalarProgram, polic
         .map_err(|e| format!("CPU scratch allocation: {e}"))?;
     scratch.resize(artifact.scratch_bytes, 0);
     Ok(Kernel {
+        conditions,
         _memory: memory,
         entry,
         buffers,

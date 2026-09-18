@@ -3,6 +3,10 @@
 //! model. Native mappings must supply dependencies, latency and every reservation;
 //! missing mappings cannot be represented by an empty reservation list.
 use std::collections::BTreeSet;
+use std::sync::Arc;
+mod demand;
+mod intervals;
+pub use demand::Demand;
 pub mod static_order;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,12 +89,29 @@ pub struct Schedule {
     pub starts: Vec<u64>,
     pub completion: u64,
 }
+
+fn validate_reservations(operation: &Operation, resources: usize) -> Result<(), String> {
+    for reservation in &operation.reservations {
+        if reservation.resource >= resources || reservation.units == 0 || reservation.duration == 0
+        {
+            return Err(format!("invalid reservation of {}", operation.name));
+        }
+        if reservation
+            .offset
+            .checked_add(reservation.duration)
+            .is_none_or(|end| end > operation.latency)
+        {
+            return Err("reservation extends beyond operation completion".into());
+        }
+    }
+    Ok(())
+}
 /// Result of this analysis's own bounded search. Private construction ties the
 /// bounds and feasible schedule to the exact constraints used to derive them.
 /// There is no separately supplied proof marker or certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Solution {
-    model: Model,
+    model: Arc<Model>,
     schedule: Schedule,
     lower_bound: u64,
     assignments_examined: u64,
@@ -177,21 +198,7 @@ impl Model {
                 followers[predecessor].push(i);
                 incoming[i] += 1;
             }
-            for reservation in &operation.reservations {
-                if reservation.resource >= self.resources.len()
-                    || reservation.units == 0
-                    || reservation.duration == 0
-                {
-                    return Err(format!("invalid reservation of {}", operation.name));
-                }
-                if reservation
-                    .offset
-                    .checked_add(reservation.duration)
-                    .is_none_or(|end| end > operation.latency)
-                {
-                    return Err("reservation extends beyond operation completion".into());
-                }
-            }
+            validate_reservations(operation, self.resources.len())?;
         }
         let mut ready: BTreeSet<_> = incoming
             .iter()
@@ -256,13 +263,9 @@ impl Model {
                 .ok_or("dependency latency overflow")?;
             result = result.max(ends[i]);
         }
-        let mut work = vec![0u128; self.resources.len()];
+        let mut demand = Demand::new(self.timebase.clone(), self.resources.clone())?;
         for op in &self.operations {
-            for r in &op.reservations {
-                work[r.resource] = work[r.resource]
-                    .checked_add(u128::from(r.units) * u128::from(r.duration))
-                    .ok_or("resource work overflow")?;
-            }
+            demand.include(op, 1)?;
         }
         // Along a dependency path, the shortest possible lifetime is a
         // necessary occupancy integral. Ignore paths that provide no floor;
@@ -302,20 +305,10 @@ impl Model {
                     .checked_add(offset(lifetime.end))
                     .ok_or("lifetime duration overflow")?
                     .saturating_sub(offset(lifetime.begin));
-                work[lifetime.resource] = work[lifetime.resource]
-                    .checked_add(u128::from(duration) * u128::from(lifetime.units))
-                    .ok_or("lifetime occupancy overflow")?;
+                demand.add_occupancy(lifetime.resource, lifetime.units, duration, 1)?;
             }
         }
-        for (work, resource) in work.into_iter().zip(&self.resources) {
-            let floor = work.div_ceil(u128::from(resource.capacity));
-            result = result.max(
-                floor
-                    .try_into()
-                    .map_err(|_| "resource lower bound overflow")?,
-            );
-        }
-        Ok(result)
+        Ok(result.max(demand.lower_bound()?))
     }
 
     /// Verify an execution upper witness, including the model's permitted claim.
@@ -432,8 +425,9 @@ impl Model {
         static_order::fits(self, starts)
     }
 
-    /// The budget counts proposed start-time assignments, including infeasible
-    /// proposals. No score, candidate cap, or floating-point comparison is hidden.
+    /// The budget counts explored start-time regions, including infeasible
+    /// regions. Each region retains intervals and propagates the execution's own
+    /// constraints; no tick-by-tick expansion or performance ranking is used.
     pub fn solve(&self, assignment_budget: u64) -> Result<Solution, String> {
         match self.search(assignment_budget)? {
             SearchOutcome::Feasible(solution) => Ok(solution),
@@ -448,10 +442,20 @@ impl Model {
     }
 
     pub fn search(&self, assignment_budget: u64) -> Result<SearchOutcome, String> {
+        self.start_search()?.advance(assignment_budget)
+    }
+
+    /// Retain exact constraints and the unresolved interval frontier across
+    /// budgeted calls. Neither derivation nor explored assignments are replayed.
+    pub fn start_search(&self) -> Result<Search, String> {
         let order = self.validate()?;
         let lower_bound = self.floor(&order)?;
         if !self.unmapped.is_empty() {
-            return Ok(SearchOutcome::Incomplete { lower_bound });
+            return Ok(Search {
+                model: Arc::new(self.clone()),
+                state: None,
+                lower_bound,
+            });
         }
         let mut serial = Schedule {
             starts: vec![0; self.operations.len()],
@@ -472,139 +476,52 @@ impl Model {
         // latency. This also covers zero-latency events at the final endpoint.
         let horizon = serial.completion;
         let best = self.check_schedule(&serial).is_ok().then_some(serial);
-        let mut search = Search {
-            model: self,
-            order: &order,
-            starts: vec![None; self.operations.len()],
-            best,
-            horizon,
-            floor: lower_bound,
-            examined: 0,
-            budget: assignment_budget,
-            interrupted: false,
+        Ok(Search {
+            model: Arc::new(self.clone()),
+            state: Some(intervals::State::new(
+                self,
+                order,
+                lower_bound,
+                horizon,
+                best,
+            )),
+            lower_bound,
+        })
+    }
+}
+
+/// An analysis in progress bound privately to its immutable execution constraints.
+pub struct Search {
+    model: Arc<Model>,
+    state: Option<intervals::State>,
+    lower_bound: u64,
+}
+impl Search {
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+    pub fn advance(&mut self, region_budget: u64) -> Result<SearchOutcome, String> {
+        let Some(state) = self.state.as_mut() else {
+            return Ok(SearchOutcome::Incomplete {
+                lower_bound: self.lower_bound,
+            });
         };
-        if search
-            .best
-            .as_ref()
-            .is_none_or(|best| best.completion > lower_bound)
-        {
-            search.run()?;
-        }
-        let Some(best) = search.best else {
-            return Ok(if search.interrupted {
-                SearchOutcome::Incomplete { lower_bound }
+        state.advance(&self.model, region_budget)?;
+        let Some(best) = state.best() else {
+            return Ok(if state.incomplete() {
+                SearchOutcome::Incomplete {
+                    lower_bound: state.lower_bound(),
+                }
             } else {
                 SearchOutcome::Infeasible
             });
         };
-        self.check_schedule(&best)?;
-        let lower_bound = if !search.interrupted || best.completion == lower_bound {
-            best.completion
-        } else {
-            lower_bound
-        };
+        self.model.check_schedule(best)?;
         Ok(SearchOutcome::Feasible(Solution {
-            model: self.clone(),
-            schedule: best,
-            lower_bound,
-            assignments_examined: search.examined,
+            model: Arc::clone(&self.model),
+            schedule: best.clone(),
+            lower_bound: state.lower_bound(),
+            assignments_examined: state.examined(),
         }))
-    }
-}
-
-struct Search<'a> {
-    model: &'a Model,
-    order: &'a [usize],
-    starts: Vec<Option<u64>>,
-    best: Option<Schedule>,
-    horizon: u64,
-    floor: u64,
-    examined: u64,
-    budget: u64,
-    interrupted: bool,
-}
-impl Search<'_> {
-    fn run(&mut self) -> Result<(), String> {
-        if self.order.is_empty() {
-            return Ok(());
-        }
-        let mut depth = 0;
-        let mut next_start = vec![Some(0u64); self.order.len()];
-        loop {
-            if self
-                .best
-                .as_ref()
-                .is_some_and(|best| best.completion == self.floor)
-            {
-                break;
-            }
-            if depth == self.order.len() {
-                let starts: Vec<_> = self.starts.iter().map(|s| s.unwrap()).collect();
-                let completion = starts
-                    .iter()
-                    .zip(&self.model.operations)
-                    .map(|(s, o)| s + o.latency)
-                    .max()
-                    .unwrap_or(0);
-                if self
-                    .best
-                    .as_ref()
-                    .is_none_or(|best| completion < best.completion)
-                {
-                    self.best = Some(Schedule { starts, completion });
-                }
-                depth -= 1;
-                self.starts[self.order[depth]] = None;
-                continue;
-            }
-            let i = self.order[depth];
-            let operation = &self.model.operations[i];
-            let start = next_start[depth];
-            if start
-                .and_then(|s| s.checked_add(operation.latency))
-                .is_none_or(|end| {
-                    self.best
-                        .as_ref()
-                        .map_or(end > self.horizon, |best| end >= best.completion)
-                })
-            {
-                self.starts[i] = None;
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-                self.starts[self.order[depth]] = None;
-                continue;
-            }
-            let start = start.expect("candidate start lies within the checked horizon");
-            if self.examined == self.budget {
-                self.interrupted = true;
-                break;
-            }
-            self.examined += 1;
-            next_start[depth] = start.checked_add(1);
-            self.starts[i] = Some(start);
-            if self.model.fits(&self.starts)? {
-                depth += 1;
-                if depth < self.order.len() {
-                    let op = &self.model.operations[self.order[depth]];
-                    next_start[depth] = Some(
-                        op.predecessors
-                            .iter()
-                            .map(|&p| self.starts[p].unwrap() + self.model.operations[p].latency)
-                            .chain(
-                                op.start_predecessors
-                                    .iter()
-                                    .map(|&p| self.starts[p].unwrap()),
-                            )
-                            .max()
-                            .unwrap_or(0),
-                    );
-                }
-            } else {
-                self.starts[i] = None;
-            }
-        }
-        Ok(())
     }
 }

@@ -3,6 +3,7 @@ fn linear[M, N, K](x: tensor[M, K] T, weight: tensor[N, K] U, out: tensor[M, N] 
   for row, col in parallel:
     acc = tile[1, 1] f32
     for i, j in owned(acc): acc[i, j] = 0.0
-    for xt, wt in load((x[row:row+1], weight[col:col+1]), over=1):
-      matmul(xt, wt, acc)
+    xt = load(x[row:row+1])
+    wt = load(weight[col:col+1])
+    matmul(xt, wt, acc)
     store(acc, out[row:row+1, col:col+1])

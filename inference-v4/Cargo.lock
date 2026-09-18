@@ -1062,6 +1062,7 @@ dependencies = [
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
+ "seismic-std",
 ]
 
 [[package]]
@@ -1090,6 +1091,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "seismic-accounting",
+ "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
 ]

@@ -11,7 +11,7 @@
 //! current finite-instance derivation is bounded by an explicit caller budget;
 //! it never truncates an execution and calls the truncated graph complete.
 use crate::schedule::{Model, Operation, Resource, Timebase};
-use crate::workload::{DerivationLimits, ScalarWorkload};
+use crate::workload::{DerivationError, DerivationLimit, DerivationLimits, ScalarWorkload};
 use cranelift_codegen::ir::{
     self, Block, BlockCall, Inst, InstructionData as Data, Opcode, Type, Value,
     condcodes::{FloatCC, IntCC},
@@ -415,7 +415,7 @@ pub fn derive_scalar(
     hardware: &ScalarHardware,
     workload: &ScalarWorkload,
     limits: DerivationLimits,
-) -> Result<DerivedModel, String> {
+) -> Result<DerivedModel, DerivationError> {
     let required = requirements(program)?;
     hardware.validate()?;
     let memory = Memory::new(program, workload)?;
@@ -496,6 +496,10 @@ impl Memory {
         if workload.buffers.len() != program.buffers.len() {
             return Err("scalar workload buffer count mismatch".into());
         }
+        program.conditions.validate_aliases(&program.buffers, |i| {
+            let binding = &workload.buffers[i];
+            (binding.allocation, binding.offset)
+        })?;
         let mut capacities = BTreeMap::new();
         let mut bytes = BTreeMap::new();
         for allocation in &workload.allocations {
@@ -659,9 +663,11 @@ struct Instance {
 }
 
 impl Derivation<'_> {
-    fn append(&mut self, operation: Operation, origin: Origin) -> Result<usize, String> {
+    fn append(&mut self, operation: Operation, origin: Origin) -> Result<usize, DerivationError> {
         if self.output.model.operations.len() == self.limits.operations {
-            return Err("scalar model derivation operation budget exhausted".into());
+            return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                self.limits.operations,
+            )));
         }
         let id = self.output.model.operations.len();
         self.output.model.operations.push(operation);
@@ -673,7 +679,7 @@ impl Derivation<'_> {
         primitive: &Primitive,
         dependencies: &[usize],
         origin: Origin,
-    ) -> Result<Instance, String> {
+    ) -> Result<Instance, DerivationError> {
         let timing = self.hardware.timing(primitive);
         let (latency, reservations) = if let Some(timing) = timing {
             (timing.latency, timing.services.clone())
@@ -703,7 +709,7 @@ impl Derivation<'_> {
         })
     }
 
-    fn invocation(&mut self, invocation: u64) -> Result<(), String> {
+    fn invocation(&mut self, invocation: u64) -> Result<(), DerivationError> {
         let function = &self.program.function;
         let entry = function
             .layout
@@ -774,7 +780,9 @@ impl Derivation<'_> {
             *block_occurrence += 1;
             for &index in &basic.instructions {
                 if self.output.instructions == self.limits.instructions {
-                    return Err("scalar model derivation instruction budget exhausted".into());
+                    return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
+                        self.limits.instructions,
+                    )));
                 }
                 self.output.instructions += 1;
                 let instruction = &self.graph.instructions[index];
@@ -887,7 +895,8 @@ impl Derivation<'_> {
                             return Err(format!(
                                 "{}: workload does not determine a data-dependent branch",
                                 instruction.id
-                            ));
+                            )
+                            .into());
                         };
                         edge = Some((
                             blocks[usize::from(condition == 0)],
@@ -956,7 +965,7 @@ impl Derivation<'_> {
         completion: usize,
         edge: BlockCall,
         values: &HashMap<Value, Binding>,
-    ) -> Result<(Block, Vec<(Value, Binding)>, usize), String> {
+    ) -> Result<(Block, Vec<(Value, Binding)>, usize), DerivationError> {
         let f = &self.program.function;
         let destination = edge.block(&f.dfg.value_lists);
         let mut arguments = Vec::new();

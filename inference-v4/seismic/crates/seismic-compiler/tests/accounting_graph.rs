@@ -39,7 +39,7 @@ fn memory_order_does_not_assume_distinct_parameter_names_are_disjoint() {
 
 #[test]
 fn compiler_graph_preserves_loop_carried_values_and_typed_memory_dependencies() {
-    let source = "fn accumulate[N](x: tensor[N] f32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  for t in load(x,over=0):\n    acc[0] += reduce(t,0,sum,ordered=true)\n  store(acc,out)\n";
+    let source = "fn accumulate[N](x: tensor[N] f32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x)\n  acc[0] = reduce(t,0,sum,ordered=true)\n  store(acc,out)\n";
     let program = compile(
         &[SourceFile {
             path: "graph.seismic.portable".into(),

@@ -149,7 +149,7 @@ fn exercise(device: Device, candidate: Candidate) {
         }
     }
     let plan = seismic_lang::plan::plan(&program, "composition", &HashMap::new()).unwrap();
-    let mut compiled = seismic_runtime::plan::CompiledPlan::compile(
+    let mut compiled = seismic_runtime::plan::CompiledPlan::compile_diagnostic(
         &device,
         &program,
         &plan,
@@ -159,8 +159,8 @@ fn exercise(device: Device, candidate: Candidate) {
     .unwrap();
     assert_eq!(
         compiled.kernel_count(),
-        2,
-        "different element types must not share compiled code"
+        1,
+        "the enclosing program compiles together while retaining each call's element types"
     );
     let a = device
         .buffer_from(
@@ -172,7 +172,9 @@ fn exercise(device: Device, candidate: Candidate) {
         .unwrap();
     let b = device
         .buffer_from(
-            &[0x4000u16; 4]
+            // BF16 3.0 has a different F16 interpretation (2.125), so this
+            // catches accidental reuse of the first call's specialization.
+            &[0x4040u16; 4]
                 .into_iter()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
@@ -190,7 +192,7 @@ fn exercise(device: Device, candidate: Candidate) {
     out.read(&mut got).unwrap();
     assert_eq!(
         &got,
-        [2f32, 2., 2., 2., 4., 4., 4., 4.]
+        [2f32, 2., 2., 2., 6., 6., 6., 6.]
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>()

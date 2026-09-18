@@ -9,6 +9,7 @@ use ptx::{
 pub(super) struct Trace {
     pub events: Vec<Event>,
     pub instructions: u64,
+    pub external_values: BTreeMap<u64, BTreeMap<u64, u8>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
@@ -63,14 +64,21 @@ impl Memory {
         workload: &ScalarWorkload,
         hardware: &CudaHardware,
         limits: DerivationLimits,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DerivationError> {
         let program = execution.program();
-        if workload.identity.is_empty()
-            || workload.buffers.len() != program.buffers.len()
-            || workload.allocations.len() > limits.operations
+        if workload.identity.is_empty() || workload.buffers.len() != program.buffers.len() {
+            return Err("invalid CUDA workload shape".into());
+        }
+        program.conditions.validate_aliases(&program.buffers, |i| {
+            let binding = &workload.buffers[i];
+            (binding.allocation, binding.offset)
+        })?;
+        if workload.allocations.len() > limits.operations
             || workload.scalars.len() > limits.operations
         {
-            return Err("invalid CUDA workload shape or budget".into());
+            return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                limits.operations,
+            )));
         }
         seismic_lang::abi::ScalarLayout::words(&program.scalars)?
             .validate_bytes(&workload.scalars)?;
@@ -80,8 +88,12 @@ impl Memory {
             known_count = known_count
                 .checked_add(a.known_bytes.len())
                 .ok_or("CUDA binding budget overflow")?;
-            if known_count > limits.operations
-                || !a.alignment.is_power_of_two()
+            if known_count > limits.operations {
+                return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                    limits.operations,
+                )));
+            }
+            if !a.alignment.is_power_of_two()
                 || a.known_bytes.keys().any(|&i| i >= a.bytes)
                 || allocations
                     .insert(
@@ -95,9 +107,7 @@ impl Memory {
                     )
                     .is_some()
             {
-                return Err(
-                    "invalid CUDA allocation identity, alignment, byte domain or budget".into(),
-                );
+                return Err("invalid CUDA allocation identity, alignment or byte domain".into());
             }
         }
         let mut pointers = BTreeMap::new();
@@ -272,9 +282,11 @@ fn lifecycle(
     warp: Option<u64>,
     predecessors: Vec<usize>,
     limits: DerivationLimits,
-) -> Result<usize, String> {
+) -> Result<usize, DerivationError> {
     if events.len() >= limits.operations {
-        return Err("CUDA event derivation budget exceeded".into());
+        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+            limits.operations,
+        )));
     }
     let i = events.len();
     events.push(Event {
@@ -297,7 +309,7 @@ pub(super) fn derive(
     hardware: &CudaHardware,
     workload: &ScalarWorkload,
     limits: DerivationLimits,
-) -> Result<Trace, String> {
+) -> Result<Trace, DerivationError> {
     let plan = execution.target_plan();
     let d = execution.dispatch();
     let state_size = plan
@@ -306,11 +318,15 @@ pub(super) fn derive(
         .checked_add(plan.parameters().len())
         .and_then(|n| n.checked_mul(hardware.warp_width as usize))
         .ok_or("CUDA trace state overflow")?;
-    if state_size as u64 > limits.instructions
-        || plan.body().len() > limits.operations
-        || d.dispatched_lanes() > limits.instructions
-    {
-        return Err("CUDA trace state exceeds derivation budget".into());
+    if state_size as u64 > limits.instructions || d.dispatched_lanes() > limits.instructions {
+        return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
+            limits.instructions,
+        )));
+    }
+    if plan.body().len() > limits.operations {
+        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+            limits.operations,
+        )));
     }
     let labels = plan
         .body()
@@ -403,8 +419,15 @@ pub(super) fn derive(
                 instructions = instructions
                     .checked_add(cohort.len() as u64)
                     .ok_or("CUDA instruction count overflow")?;
-                if instructions > limits.instructions || events.len() >= limits.operations {
-                    return Err("CUDA instruction or event derivation budget exceeded".into());
+                if instructions > limits.instructions {
+                    return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
+                        limits.instructions,
+                    )));
+                }
+                if events.len() >= limits.operations {
+                    return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                        limits.operations,
+                    )));
                 }
                 let event_id = events.len();
                 let mut event = Event {
@@ -444,6 +467,40 @@ pub(super) fn derive(
                 let body_id = matches!(instruction.operation, Operation::Call { .. })
                     .then_some(event_id + 1)
                     .filter(|_| !active.is_empty());
+                let exchange = if let Operation::Shuffle {
+                    mode,
+                    source,
+                    lane: source_lane,
+                    ..
+                } = instruction.operation
+                {
+                    if active.len() != 32 || lanes.len() != 32 {
+                        return Err(
+                            "CUDA collective reaches an incomplete or divergent participant group"
+                                .into(),
+                        );
+                    }
+                    let mut values = Vec::with_capacity(32);
+                    for &i in &active {
+                        let source_lane =
+                            operand(source_lane, &lanes[i], block, d.threads_per_group)?.bits()?;
+                        if source_lane >= 32 {
+                            return Err("shuffle source lane exceeds its participant group".into());
+                        }
+                        let from = match mode {
+                            ptx::ShuffleMode::Butterfly => i ^ (source_lane as usize),
+                            ptx::ShuffleMode::Index => source_lane as usize,
+                        };
+                        let cell = lanes[from].registers[source.0]
+                            .as_ref()
+                            .ok_or("shuffle sources an undefined register")?;
+                        event.predecessors.extend(cell.writer);
+                        values.push(cell.value.clone());
+                    }
+                    Some(values)
+                } else {
+                    None
+                };
                 for &i in &active {
                     let lane = &mut lanes[i];
                     let effects = instruction.effects();
@@ -468,6 +525,16 @@ pub(super) fn derive(
                         } else if effects.parameter_reads.contains(p) {
                             return Err("PTX reads an undefined call parameter".into());
                         }
+                    }
+                    if let (Some(values), Operation::Shuffle { destination, .. }) =
+                        (&exchange, &instruction.operation)
+                    {
+                        lane.registers[destination.0] = Some(Cell {
+                            value: values[i].clone(),
+                            writer: Some(event_id),
+                        });
+                        lane.pc = Some(next(plan, pc + 1)?);
+                        continue;
                     }
                     execute(
                         instruction,
@@ -497,7 +564,9 @@ pub(super) fn derive(
                 previous = event_id;
                 if let Some(body_id) = body_id {
                     if events.len() >= limits.operations {
-                        return Err("CUDA helper body event exceeds budget".into());
+                        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
+                            limits.operations,
+                        )));
                     }
                     let Operation::Call { function, .. } = instruction.operation else {
                         unreachable!()
@@ -521,10 +590,10 @@ pub(super) fn derive(
                 }
             }
             for lane in &lanes {
-                if lane.linear < d.work_items && lane.status != Some(0) {
+                if lane.linear < d.participating_lanes() && lane.status != Some(0) {
                     return Err("CUDA trace returns without successful invocation status".into());
                 }
-                if lane.linear >= d.work_items && lane.status.is_some() {
+                if lane.linear >= d.participating_lanes() && lane.status.is_some() {
                     return Err("padded CUDA lane wrote invocation status".into());
                 }
             }
@@ -560,6 +629,17 @@ pub(super) fn derive(
     Ok(Trace {
         events,
         instructions,
+        external_values: memory
+            .allocations
+            .into_iter()
+            .filter_map(|(allocation, storage)| {
+                if let Allocation::External(id) = allocation {
+                    Some((id, storage.known))
+                } else {
+                    None
+                }
+            })
+            .collect(),
     })
 }
 
@@ -574,6 +654,7 @@ fn operand(op: Operand, lane: &Lane, block: u64, width: u64) -> Result<Value, St
         Operand::Unsigned(v) => Value::Bits(v),
         Operand::Float32Bits(v) => Value::Bits(u64::from(v)),
         Operand::Special(s) => Value::Bits(match s {
+            ptx::SpecialRegister::LaneIndex => u64::from(lane.thread % 32),
             ptx::SpecialRegister::BlockIndexX => block,
             ptx::SpecialRegister::BlockWidthX => width,
             ptx::SpecialRegister::ThreadIndexX => u64::from(lane.thread),
@@ -708,6 +789,7 @@ fn execute(
                 )?,
             };
         }
+        Operation::Shuffle { .. } => return Err("shuffle needs participant-wide evaluation".into()),
         Operation::Fma { destination: d, .. } => {
             destination = Some(d);
         }

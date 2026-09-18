@@ -2,7 +2,8 @@
 use seismic_lang::Scope;
 use seismic_lang::{
     interp::TensorData,
-    lowered_ir::LoweredIr, lower::Options,
+    lower::Options,
+    lowered_ir::LoweredIr,
     program::{compile, SourceFile},
     types::DType,
 };
@@ -104,7 +105,10 @@ pub fn exercise(
                 "A".into(),
                 seismic_lang::types::Elem::Dtype(seismic_lang::types::DType::BF16),
             )]),
-            &Options { piece },
+            &Options {
+                piece,
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut buffers = [

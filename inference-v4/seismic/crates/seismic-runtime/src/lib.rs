@@ -1,19 +1,20 @@
 //! Native resource ownership and invocation. Numerical work stays in compiled
 //! Seismic. Candidates are explicit until accounting can justify selection.
-pub mod plan;
 pub mod execution;
+pub mod plan;
 pub mod tuner;
-pub mod choices;
 use seismic_lang::{abi::ScalarParameter, lowered_ir::LoweredIr};
 use seismic_realization::{BufferSpec, LoadStrategy, ScalarOptions};
 use std::rc::Rc;
 
+#[derive(Clone)]
 enum BackendDevice {
     Cpu,
     Cuda(Rc<seismic_cuda::Device>),
     #[cfg(target_os = "macos")]
     Metal(Rc<seismic_metal::runtime::Device>),
 }
+#[derive(Clone)]
 pub struct Device(BackendDevice);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceFacts {
@@ -78,6 +79,7 @@ pub struct ExecutionObservation {
 }
 
 pub struct Kernel {
+    conditions: seismic_realization::InvocationConditions,
     executable: Executable,
     buffers: Vec<BufferSpec>,
     scalars: Vec<ScalarParameter>,
@@ -135,13 +137,44 @@ impl Device {
         Ok(buffer)
     }
     pub fn compile_tuned(&self, tuned: tuner::TunedIr) -> Result<Kernel, String> {
-        if !matches!(self.0,BackendDevice::Cpu) { return Err("CPU tuned execution requires a CPU device".into()); }
-        let (program, artifact) = tuned.into_parts();
-        let kernel = seismic_cpu::compile_execution_with(program,&artifact.conditions().codegen)?;
-        let buffers=kernel.buffers().to_vec();
-        let scalars=kernel.scalars().to_vec();
-        Ok(Kernel { executable:Executable::Cpu(Box::new(kernel)),buffers,scalars,tuning:Some(artifact) })
+        tuned.conditions().validate_device(&self.facts())?;
+        let (execution, artifact) = tuned.into_parts();
+        let mut kernel = match (execution, artifact.conditions().implementation()) {
+            (
+                execution::Execution::Cpu(program),
+                tuner::ImplementationConditions::Cpu(conditions),
+            ) => {
+                let invocation_conditions = program.conditions.clone();
+                let native = seismic_cpu::compile_execution_with(program, &conditions.codegen)?;
+                let buffers = native.buffers().to_vec();
+                let scalars = native.scalars().to_vec();
+                Kernel {
+                    conditions: invocation_conditions,
+                    executable: Executable::Cpu(Box::new(native)),
+                    buffers,
+                    scalars,
+                    tuning: None,
+                }
+            }
+            (
+                execution @ execution::Execution::Cuda(_),
+                tuner::ImplementationConditions::Cuda(_),
+            ) => self.compile_execution(execution)?,
+            #[cfg(target_os = "macos")]
+            (
+                execution @ execution::Execution::Metal(_),
+                tuner::ImplementationConditions::Metal(_),
+            ) => self.compile_execution(execution)?,
+            _ => {
+                return Err(
+                    "selected execution and retained implementation conditions differ".into(),
+                );
+            }
+        };
+        kernel.tuning = Some(artifact);
+        Ok(kernel)
     }
+
     pub fn compile(&self, lowered: &LoweredIr, candidate: Candidate) -> Result<Kernel, String> {
         let execution = execution::Execution::prepare(lowered, candidate, &self.facts())?;
         self.compile_execution(execution)
@@ -150,6 +183,23 @@ impl Device {
     /// replace a candidate by re-running lowering or preparation.
     pub fn compile_execution(&self, execution: execution::Execution) -> Result<Kernel, String> {
         use execution::Execution;
+        let conditions = match &execution {
+            Execution::Cpu(p) => p.conditions.clone(),
+            Execution::Cuda(phases) => {
+                let conditions = phases
+                    .first()
+                    .map(|p| p.program().conditions.clone())
+                    .unwrap_or_default();
+                if phases.iter().any(|p| p.program().conditions != conditions) {
+                    return Err("CUDA phases disagree on invocation conditions".into());
+                }
+                conditions
+            }
+            #[cfg(target_os = "macos")]
+            Execution::Metal(e) => {
+                seismic_realization::InvocationConditions::from_lowered(e.source())?
+            }
+        };
         let (executable, buffers, scalars) = match (&self.0, execution) {
             (BackendDevice::Cpu, Execution::Cpu(program)) => {
                 let kernel = seismic_cpu::compile_execution(program)?;
@@ -169,11 +219,24 @@ impl Device {
                 let buffers = emitted.buffers.clone();
                 let scalars = emitted.scalars.clone();
                 let pipeline = device.compile(emitted)?;
-                (Executable::Metal { device: device.clone(), pipeline: Box::new(pipeline) }, buffers, scalars)
+                (
+                    Executable::Metal {
+                        device: device.clone(),
+                        pipeline: Box::new(pipeline),
+                    },
+                    buffers,
+                    scalars,
+                )
             }
             _ => return Err("selected execution and device backend differ".into()),
         };
-        Ok(Kernel { executable, buffers, scalars, tuning: None })
+        Ok(Kernel {
+            conditions,
+            executable,
+            buffers,
+            scalars,
+            tuning: None,
+        })
     }
 }
 impl Buffer {
@@ -182,7 +245,9 @@ impl Buffer {
             // The owner allocates Vec<u64>; this is a stable guaranteed minimum,
             // independent of allocator luck or the offset of this view.
             Storage::Cpu(_) => Ok(std::mem::align_of::<u64>() as u64),
-            _ => Err("GPU buffer model admission requires its backend contract".into()),
+            Storage::Cuda(buffer) => Ok(buffer.allocation_alignment()),
+            #[cfg(target_os = "macos")]
+            Storage::Metal(buffer) => Ok(buffer.allocation_alignment()),
         }
     }
     /// Allocation identity survives cloning and byte views. It is distinct from
@@ -236,7 +301,10 @@ impl Buffer {
         self.2
     }
     pub fn view(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
-        let offset = self.2.checked_add(range.start).ok_or("buffer view offset overflow")?;
+        let offset = self
+            .2
+            .checked_add(range.start)
+            .ok_or("buffer view offset overflow")?;
         Ok(Self(
             match &self.0 {
                 Storage::Cpu(b) => Storage::Cpu(b.view(range)?),
@@ -278,8 +346,28 @@ impl Buffer {
     }
 }
 impl Kernel {
-    pub fn tuning(&self) -> Option<&tuner::Artifact> { self.tuning.as_ref() }
+    pub fn tuning(&self) -> Option<&tuner::Artifact> {
+        self.tuning.as_ref()
+    }
     fn validate_tuning(&self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
+        if buffers.len() != self.buffers.len() {
+            return Err("invocation buffer count differs from the retained entry ABI".into());
+        }
+        for &index in self.conditions.independent_buffers() {
+            if buffers
+                .iter()
+                .enumerate()
+                .any(|(other, b)| other != index && buffers[index].shares_allocation(b))
+            {
+                return Err(format!(
+                    "private intermediate {} aliases another entry argument",
+                    self.buffers[index].parameter
+                ));
+            }
+        }
+        self.conditions.validate_aliases(&self.buffers, |i| {
+            (Rc::as_ptr(&buffers[i].1) as usize as u64, buffers[i].2 as u64)
+        })?;
         if let Some(artifact) = &self.tuning {
             tuner::validate_bindings(artifact.workload(), buffers, &self.scalars, scalars)?;
         }
@@ -287,7 +375,10 @@ impl Kernel {
     }
     #[cfg(target_os = "macos")]
     pub fn metal_pipeline_facts(&self) -> Option<&[seismic_metal::runtime::PipelineFacts]> {
-        match &self.executable { Executable::Metal {pipeline,..}=>Some(&pipeline.facts), _=>None }
+        match &self.executable {
+            Executable::Metal { pipeline, .. } => Some(&pipeline.facts),
+            _ => None,
+        }
     }
     pub fn phase_count(&self) -> usize {
         match &self.executable {

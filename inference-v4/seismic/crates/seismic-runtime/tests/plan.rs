@@ -33,12 +33,12 @@ fn exercise(device: Device, candidate: Candidate) {
     )
     .unwrap();
     let plan = seismic_lang::plan::plan(&program, "chain", &HashMap::new()).unwrap();
-    let mut compiler = PlanCompiler::new(&device, &program, Default::default(), candidate);
+    let mut compiler = PlanCompiler::diagnostic(&device, &program, Default::default(), candidate);
     let mut compiled = compiler.compile(&plan).unwrap();
     let shared = compiler.compile(&plan).unwrap();
     assert_eq!(compiler.kernel_count(), 1);
     drop(compiler);
-    assert_eq!(compiled.step_count(), 2);
+    assert_eq!(compiled.step_count(), 1);
     assert_eq!(compiled.kernel_count(), 1);
     let input = [99f32, 1., 2., 3., 4., 99.]
         .into_iter()
@@ -80,7 +80,7 @@ fn exercise(device: Device, candidate: Candidate) {
     bindings.gain = Some(4.);
     let mut submission = compiled.prepare(&bindings).unwrap();
     submission.append(shared.prepare(&bindings).unwrap());
-    assert_eq!(submission.len(), 4);
+    assert_eq!(submission.len(), 2);
     drop(bindings);
     drop(compiled);
     drop(shared);

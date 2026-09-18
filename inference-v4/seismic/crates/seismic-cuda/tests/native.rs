@@ -134,10 +134,9 @@ fn compare_candidate(
         .iter()
         .map(|s| {
             let parts = data[&s.parameter].0.device_bytes();
-            parts[match s.plane.as_str() {
-                "" | "words" => 0,
-                "scale" => 1,
-                _ => 2,
+            parts[match &data[&s.parameter].0 {
+                TensorData::Packed { repr, .. } => repr.plane_index(&s.plane).unwrap(),
+                TensorData::Dense { .. } => 0,
             }]
             .clone()
         })

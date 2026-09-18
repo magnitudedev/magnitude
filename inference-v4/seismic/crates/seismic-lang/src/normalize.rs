@@ -11,6 +11,10 @@ pub fn bind_values(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> Vec<usize> {
     let mut result = Vec::new();
     for mut statement in std::mem::take(body) {
         match &mut statement.kind {
+            StmtKind::Reduction(r) => {
+                for e in &mut r.inputs { bind_expr(e,vars,&mut result,false); }
+                for merge in r.implementations_mut() {bind_values(&mut merge.body,vars);}
+            }
             StmtKind::Assign { target, op, value } => {
                 bind_expr(target, vars, &mut result, false);
                 let already_bound =
@@ -27,7 +31,8 @@ pub fn bind_values(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> Vec<usize> {
                 bind_expr(tile, vars, &mut result, false);
                 bind_values(body, vars);
             }
-            StmtKind::LoadLoop { views, body, .. } => {
+            StmtKind::LoadLoop { domain, views, body, .. } => {
+                bind_expr(&mut domain.view,vars,&mut result,false);
                 for view in views {
                     bind_expr(view, vars, &mut result, false);
                 }
@@ -189,11 +194,11 @@ pub fn lift_owned_reductions(body: &mut Vec<Stmt>) -> Vec<usize> {
                     ids.insert(*v);
                 }
                 StmtKind::Owned { vars, body, .. }
-                | StmtKind::Parallel { vars, body, .. }
-                | StmtKind::LoadLoop { vars, body, .. } => {
+                | StmtKind::Parallel { vars, body, .. } => {
                     ids.extend(vars);
                     definitions(body, ids);
                 }
+                StmtKind::LoadLoop { vars,offset,body,.. } => {ids.extend(vars);ids.extend(offset);definitions(body,ids);}
                 StmtKind::Range { var, body, .. } | StmtKind::Lanes { var, body, .. } => {
                     ids.insert(*var);
                     definitions(body, ids);
@@ -342,4 +347,29 @@ pub fn remove_empty_ranges(body: &mut Vec<Stmt>) -> Vec<usize> {
     }
     *body = result;
     positions
+}
+
+/// Structural value identity ignores source locations. The caller still owns
+/// reaching definitions and memory versions; equality alone permits no motion.
+pub fn value_identity(expr: &Expr) -> Expr {
+    let mut e=expr.clone();
+    fn visit(e:&mut Expr) {
+        e.span=crate::span::Span::default();
+        match &mut e.kind {
+            ExprKind::Index{base,indices}=>{
+                visit(base);
+                for i in indices {match i {Index::Point(e)=>visit(e),Index::Slice{start,end}=>for e in start.iter_mut().chain(end){visit(e)}}}
+            }
+            ExprKind::Load{view,..}|ExprKind::Transpose(view)|ExprKind::Unary{expr:view,..}|ExprKind::Cast{expr:view,..}|ExprKind::Accessor{base:view,..}|ExprKind::Lanes{base:view,..}=>visit(view),
+            ExprKind::Binary{lhs,rhs,..}=>{visit(lhs);visit(rhs);},
+            ExprKind::Call{args,..}|ExprKind::Builtin{args,..}|ExprKind::Intrinsic{args,..}|ExprKind::Tuple(args)=>for e in args {visit(e)},
+            _=>{}
+        }
+        if let Some(sym)=&e.sym {
+            // Equal checked symbolic coordinates have one structural identity,
+            // whether written as i, i+0, or a checked scalar alias.
+            e.kind=ExprKind::ShapeParam(sym.to_string());
+        }
+    }
+    visit(&mut e);e
 }

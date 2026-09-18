@@ -7,6 +7,8 @@ use seismic_accounting::quantity::Count;
 use seismic_realization::dispatch::GroupDispatch;
 use seismic_realization::execution::Multiplicity;
 use std::{collections::HashMap, sync::Arc};
+mod execution;
+pub use execution::{execution, requirements, Hardware, Requirements, Service, Timing, Units};
 
 #[derive(Clone, Debug)]
 pub struct LaunchStorage {
@@ -14,7 +16,7 @@ pub struct LaunchStorage {
     pub prologue: Vec<LaunchOperationAccount>,
     /// Scalar lane executions of the padding guard, including padding lanes.
     pub prologue_guard_executions: Count,
-    /// Sum of all private array declarations, including disjoint lexical scopes.
+    /// Sum of selected private backing slots after lifetime-based reuse.
     pub declared_private_array_bytes_per_lane: Count,
     pub declared_shared_array_bytes_per_group: Count,
     pub static_barrier_sites: Count,
@@ -84,8 +86,8 @@ pub fn derive(plan: &MemoryPlan, dispatches: &[GroupDispatch]) -> Result<Storage
             }
             let mut private = 0u128;
             let mut shared = 0u128;
-            for array in &launch.arrays {
-                let layout = array.declaration.layout(dispatch)?;
+            for declaration in &launch.slots {
+                let layout = declaration.layout(dispatch)?;
                 private += u128::from(layout.private_bytes_per_lane);
                 shared += u128::from(layout.shared_bytes_per_group);
             }
@@ -217,6 +219,7 @@ mod tests {
             .unwrap(),
             predecessor: index.checked_sub(1),
             arrays: Vec::new(),
+            slots: Vec::new(),
             barriers: BTreeMap::new(),
             declared_private_bytes_per_lane: 0,
             shared_bytes_per_group: 0,
@@ -264,7 +267,17 @@ mod tests {
                     placement,
                 },
                 scope: vec![Scope::Body(OperationId(99))],
+                lifetime: Interval {
+                    begin: id * 2,
+                    end: id * 2 + 1,
+                },
+                slot: id,
+                uniform: true,
+                executions: Arc::new(Multiplicity::Constant(1)),
             });
+            selected
+                .slots
+                .push(selected.arrays.last().unwrap().declaration.clone());
         }
         selected.declared_private_bytes_per_lane = 28;
         selected.shared_bytes_per_group = 80;

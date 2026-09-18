@@ -1,6 +1,7 @@
 //! Runtime domains, tails and loop-carried state with independent integer-exact sums.
 use seismic_lang::{
-    lowered_ir::LoweredIr, lower::Options,
+    lower::Options,
+    lowered_ir::LoweredIr,
     program::{compile, SourceFile},
     Scope,
 };
@@ -11,7 +12,7 @@ pub fn exercise(
 ) {
     let p = compile(&[SourceFile {
         path: "stream.seismic.portable".into(), scope: Scope::Portable,
-        text: "fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  for t in load(x[visible[0]:visible[1]], over=0):\n    acc[0] += reduce(t, 0, sum)\n  store(acc, out)\n".into(),
+        text: "fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] = reduce(t, 0, sum, ordered=true)\n  store(acc, out)\n".into(),
     }], &[]).unwrap();
     for piece in [None, Some(1), Some(17), Some(64), Some(200)] {
         let l = seismic_lang::lower::lower_with(
@@ -19,7 +20,10 @@ pub fn exercise(
             "stream",
             backend,
             &HashMap::from([("T".into(), 137)]),
-            &Options { piece },
+            &Options {
+                piece,
+                ..Default::default()
+            },
         )
         .unwrap();
         for (start, end) in [
@@ -32,6 +36,8 @@ pub fn exercise(
             (1, 0),
             (-1, 2),
             (0, 138),
+            (-8, -2),
+            (140, 150),
         ] {
             let input: Vec<f32> = (0..137).map(|i| i as f32 - 68.0).collect();
             let mut buffers = [
@@ -42,18 +48,18 @@ pub fn exercise(
                     .collect(),
                 vec![0; 4],
             ];
-            let result = run(&l, &mut buffers);
-            if start < 0 || end < start || end > 137 {
-                assert!(result.is_err(), "invalid domain [{start},{end}) admitted");
-            } else {
-                result.unwrap_or_else(|e| panic!("piece={piece:?} [{start},{end}): {e}"));
-                let expected: f32 = input[start as usize..end as usize].iter().sum();
-                assert_eq!(
-                    f32::from_le_bytes(buffers[2].as_slice().try_into().unwrap()),
-                    expected,
-                    "piece={piece:?} [{start},{end})"
-                );
-            }
+            run(&l, &mut buffers)
+                .unwrap_or_else(|e| panic!("piece={piece:?} [{start},{end}): {e}"));
+            // Data-dependent slices clamp; unlike points, out-of-range
+            // endpoints and reversed windows are valid empty/partial views.
+            let clipped_end = end.clamp(0, 137) as usize;
+            let clipped_start = start.clamp(0, clipped_end as i32) as usize;
+            let expected: f32 = input[clipped_start..clipped_end].iter().sum();
+            assert_eq!(
+                f32::from_le_bytes(buffers[2].as_slice().try_into().unwrap()),
+                expected,
+                "piece={piece:?} [{start},{end})"
+            );
         }
     }
 }

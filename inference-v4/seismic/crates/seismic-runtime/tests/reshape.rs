@@ -74,7 +74,7 @@ fn exercise(device: Device, candidate: Candidate) {
     }
     for name in ["composition", "reshaped_composition"] {
         let plan = seismic_lang::plan::plan(&program, name, &HashMap::new()).unwrap();
-        let mut compiled = CompiledPlan::compile(
+        let mut compiled = CompiledPlan::compile_diagnostic(
             &device,
             &program,
             &plan,

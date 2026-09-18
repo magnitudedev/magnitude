@@ -3,8 +3,8 @@
 //! The family varies a common grouping across launches; other execution choices
 //! remain fixed. Constructing and selecting this family never emits target code.
 use crate::execution::Execution;
-use seismic_realization::dispatch::GroupDispatch;
 use seismic_accounting::selection::Choices;
+use seismic_realization::dispatch::GroupDispatch;
 
 /// Legal groupings derived for one actual launch, including padding constraints.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,13 +13,21 @@ pub struct GroupingChoices {
     alternatives: Vec<u64>,
 }
 impl GroupingChoices {
-    pub fn values(&self) -> &[u64] { &self.alternatives }
-    pub fn index(&self, value: u64) -> Option<usize> { self.alternatives.binary_search(&value).ok() }
+    pub fn values(&self) -> &[u64] {
+        &self.alternatives
+    }
+    pub fn index(&self, value: u64) -> Option<usize> {
+        self.alternatives.binary_search(&value).ok()
+    }
 }
 impl Choices for GroupingChoices {
     type Alternative = u64;
-    fn len(&self) -> usize { self.alternatives.len() }
-    fn get(&self, index: usize) -> Option<u64> { self.alternatives.get(index).copied() }
+    fn len(&self) -> usize {
+        self.alternatives.len()
+    }
+    fn get(&self, index: usize) -> Option<u64> {
+        self.alternatives.get(index).copied()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -69,8 +77,8 @@ impl GroupFamily {
         {
             let mut launch_maximum = u64::MAX;
             let unit = GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, 1)?;
-            let shared = memory.arrays.iter().try_fold(0u64, |sum, array| {
-                sum.checked_add(array.declaration.layout(&unit)?.shared_bytes_per_group)
+            let shared = memory.slots.iter().try_fold(0u64, |sum, declaration| {
+                sum.checked_add(declaration.layout(&unit)?.shared_bytes_per_group)
                     .ok_or_else(|| "group family storage sum overflow".to_string())
             })?;
             shared_bytes_per_item.push(shared);
@@ -161,30 +169,58 @@ impl GroupFamily {
     /// Each launch has its own resource domain. Neither an earlier launch's
     /// shared arrays nor a common convenience grouping restricts this choice.
     pub fn grouping_choices(&self, launch: usize) -> Result<GroupingChoices, String> {
-        let maximum = *self.maximum_by_launch.get(launch).ok_or("unknown grouping launch")?;
+        let maximum = *self
+            .maximum_by_launch
+            .get(launch)
+            .ok_or("unknown grouping launch")?;
         let domain = &self.launches[launch];
-        let alternatives = (1..=maximum).filter(|&items| {
-            // Padding is a typed index-width constraint, not a failed compiler
-            // attempt used as a proxy for legality.
-            u128::from(domain.work_items).div_ceil(u128::from(items)) * u128::from(items) <= u128::from(u32::MAX)
-        }).collect();
-        Ok(GroupingChoices { launch, alternatives })
+        let alternatives = (1..=maximum)
+            .filter(|&items| {
+                // Padding is a typed index-width constraint, not a failed compiler
+                // attempt used as a proxy for legality.
+                u128::from(domain.work_items).div_ceil(u128::from(items)) * u128::from(items)
+                    <= u128::from(u32::MAX)
+            })
+            .collect();
+        Ok(GroupingChoices {
+            launch,
+            alternatives,
+        })
     }
 
     pub fn select_launches(&self, items: &[u64]) -> Result<Execution, String> {
-        if items.len() != self.launches.len() { return Err("one grouping is required for every launch".into()); }
+        if items.len() != self.launches.len() {
+            return Err("one grouping is required for every launch".into());
+        }
         let mut launches = Vec::new();
         let mut shared_bytes_per_group = Vec::new();
         for (index, (&items, domain)) in items.iter().zip(&self.launches).enumerate() {
-            if self.grouping_choices(index)?.index(items).is_none() { return Err(format!("grouping is outside launch {index}'s resource domain")); }
-            launches.push(GroupDispatch::new(domain.work_items, domain.lanes_per_item, items)?);
-            shared_bytes_per_group.push(self.shared_bytes_per_item[index].checked_mul(items).ok_or("grouping storage overflow")?);
+            if self.grouping_choices(index)?.index(items).is_none() {
+                return Err(format!(
+                    "grouping is outside launch {index}'s resource domain"
+                ));
+            }
+            launches.push(GroupDispatch::new(
+                domain.work_items,
+                domain.lanes_per_item,
+                items,
+            )?);
+            shared_bytes_per_group.push(
+                self.shared_bytes_per_item[index]
+                    .checked_mul(items)
+                    .ok_or("grouping storage overflow")?,
+            );
         }
-        self.select_grouping(Grouping { items_per_group: items.first().copied().ok_or("empty launch domain")?, launches, shared_bytes_per_group })
+        self.select_grouping(Grouping {
+            items_per_group: items.first().copied().ok_or("empty launch domain")?,
+            launches,
+            shared_bytes_per_group,
+        })
     }
 
     fn select_grouping(&self, grouping: Grouping) -> Result<Execution, String> {
         let mut execution = self.execution.clone();
+        execution.emission = Default::default();
         execution.config.sg_per_tg =
             i64::try_from(grouping.items_per_group).map_err(|_| "group count overflow")?;
         let mut launches = grouping.launches.into_iter();
@@ -194,13 +230,25 @@ impl GroupFamily {
                 phase.merge_dispatch = Some(launches.next().ok_or("merge dispatch missing")?);
             }
         }
-        execution.memory = crate::memory::plan(
+        let allocation_choices = execution
+            .memory
+            .launches()
+            .iter()
+            .flat_map(|l| l.arrays.iter().map(|a| (a.id, a.slot)))
+            .collect::<std::collections::HashMap<_, _>>();
+        execution.memory = crate::memory::plan_selected(
             &execution.function.vars,
             &execution.function.body,
             &execution.phases,
             &execution.storage,
             &execution.reductions,
             execution.config.max_threadgroup_bytes as u64,
+            &mut |choice| {
+                allocation_choices
+                    .get(&choice.allocation)
+                    .copied()
+                    .ok_or_else(|| "grouping changed an allocation identity".into())
+            },
         )?;
         if execution
             .memory

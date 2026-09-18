@@ -2,8 +2,8 @@
 //! emitters. Control-flow edges and block arguments remain explicit: flattening a
 //! loop or a branch into an unordered operation count would lose dependencies.
 use crate::{
-    execution::{MemoryObject, Multiplicity},
     MathFunction, ScalarProgram,
+    execution::{MemoryObject, Multiplicity},
 };
 use cranelift_codegen::ir::{
     Block, BlockArg, Inst, InstructionData as Data, Opcode, Type, Value, ValueDef,

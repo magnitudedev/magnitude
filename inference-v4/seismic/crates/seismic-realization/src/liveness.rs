@@ -6,8 +6,8 @@
 //! analysis is the least fixed point over admitted CFG edges; value-dependent
 //! path infeasibility is not assumed.
 use crate::{
-    graph::{Graph, Instruction},
     ScalarProgram,
+    graph::{Graph, Instruction},
 };
 use cranelift_codegen::ir::{Block, Inst, Opcode, Type, Value};
 use std::collections::{BTreeMap, BTreeSet};

@@ -1,6 +1,6 @@
 //! Exact scalar integer operations of the retained Cranelift IR. Consumers keep
 //! their own policies for unknown values and traps; arithmetic has one owner.
-use cranelift_codegen::ir::{InstructionData as Data, Opcode as O, Type, condcodes::IntCC, types};
+use cranelift_codegen::ir::{condcodes::IntCC, types, InstructionData as Data, Opcode as O, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trap {
@@ -50,6 +50,34 @@ pub fn evaluate(
     let exact = |value| Evaluation::Exact(value & output_mask);
     let unknown = Evaluation::Unknown { may_trap: false };
     match *data {
+        Data::Ternary {
+            opcode: O::Select, ..
+        } => {
+            let Some((condition_type, condition)) = operand(0) else {
+                return Evaluation::Unsupported;
+            };
+            let Some((left_type, left)) = operand(1) else {
+                return Evaluation::Unsupported;
+            };
+            let Some((right_type, right)) = operand(2) else {
+                return Evaluation::Unsupported;
+            };
+            if condition_type != types::I8 || left_type != output || right_type != output {
+                return Evaluation::Unsupported;
+            }
+            let selected = match condition {
+                Some(c) => {
+                    if c & 0xff != 0 {
+                        left
+                    } else {
+                        right
+                    }
+                }
+                None if left == right => left,
+                None => None,
+            };
+            return selected.map(exact).unwrap_or(unknown);
+        }
         Data::UnaryImm {
             opcode: O::Iconst,
             imm,
@@ -197,6 +225,17 @@ pub fn evaluate(
             return exact(0);
         }
     }
+    // Absorbing integer operands determine the value without guessing the other
+    // operand. Operand evaluation/trapping remains the caller's responsibility.
+    if matches!(op, O::Imul | O::ImulImm | O::Band | O::BandImm) && (a == Some(0) || b == Some(0)) {
+        return exact(0);
+    }
+    if matches!(op, O::Bor | O::BorImm) && (a == Some(output_mask) || b == Some(output_mask)) {
+        return exact(output_mask);
+    }
+    if matches!(op, O::Urem | O::UremImm) && b == Some(1) {
+        return exact(0);
+    }
     let Some((a, b)) = a.zip(b) else {
         return unknown;
     };
@@ -218,6 +257,52 @@ pub fn evaluate(
         O::Srem | O::SremImm => (signed(a, output).unwrap() % signed(b, output).unwrap()) as u64,
         _ => return Evaluation::Unsupported,
     })
+}
+
+/// Project the same wrapping operations onto their low bits. These operations
+/// commute with reduction modulo 2^bits, so upper operand bits cannot change the
+/// result. This is a derived fact about existing instructions, never a substitute
+/// execution or an assumption that an arbitrary offset is aligned.
+pub fn low_bits(
+    data: &Data,
+    output: Type,
+    bits: u32,
+    mut operand: impl FnMut(usize, u32) -> Option<(Type, Option<u64>)>,
+) -> Option<u64> {
+    if bits == 0 || bits > output.bits() as u32 || mask(output).is_none() {
+        return None;
+    }
+    if !matches!(
+        data.opcode(),
+        O::Iconst
+            | O::Iadd
+            | O::IaddImm
+            | O::Isub
+            | O::Imul
+            | O::ImulImm
+            | O::Band
+            | O::BandImm
+            | O::Bor
+            | O::BorImm
+            | O::Bxor
+            | O::BxorImm
+            | O::Ineg
+            | O::Bnot
+            | O::Ireduce
+            | O::Uextend
+            | O::Sextend
+    ) {
+        return None;
+    }
+    let bit_mask=if bits==64 {u64::MAX}else{(1u64<<bits)-1};
+    // An immediate is an operand too: project it into the same residue ring.
+    let mut projected=data.clone();
+    if let Data::BinaryImm64{imm,..}=&mut projected {
+        *imm=cranelift_codegen::ir::immediates::Imm64::new((imm.bits() as u64 & bit_mask) as i64);
+    }
+    let result = evaluate(&projected, output, |index| operand(index, bits));
+    let Evaluation::Exact(value) = result else {return None;};
+    Some(value & bit_mask)
 }
 
 fn compare(cond: IntCC, a: u64, b: u64, ty: Type) -> bool {
@@ -250,6 +335,90 @@ mod tests {
         evaluate(&data, ty, |index| {
             [a, b].get(index).map(|&value| (ty, value))
         })
+    }
+
+    #[test]
+    fn integer_select_and_absorbing_values_preserve_partial_information() {
+        let data = Data::Ternary {
+            opcode: O::Select,
+            args: [Value::from_u32(0), Value::from_u32(1), Value::from_u32(2)],
+        };
+        for (condition, left, right, expected) in [
+            (Some(1), Some(7), None, Evaluation::Exact(7)),
+            (Some(0), None, Some(9), Evaluation::Exact(9)),
+            (None, Some(5), Some(5), Evaluation::Exact(5)),
+            (
+                None,
+                Some(5),
+                Some(9),
+                Evaluation::Unknown { may_trap: false },
+            ),
+        ] {
+            assert_eq!(
+                evaluate(&data, types::I32, |i| Some((
+                    if i == 0 { types::I8 } else { types::I32 },
+                    [condition, left, right][i]
+                ))),
+                expected
+            );
+        }
+        for op in [O::Imul, O::Band] {
+            assert_eq!(binary(types::I32, op, None, Some(0)), Evaluation::Exact(0));
+        }
+        assert_eq!(
+            binary(types::I32, O::Urem, None, Some(1)),
+            Evaluation::Exact(0)
+        );
+    }
+
+    #[test]
+    fn low_bit_projection_is_independent_of_every_discarded_operand_bit() {
+        for bits in 1..=8 {
+            let mask = (1u64 << bits) - 1;
+            for op in [O::Iadd, O::Isub, O::Imul, O::Band, O::Bor, O::Bxor] {
+                let data = Data::Binary {
+                    opcode: op,
+                    args: [Value::from_u32(0), Value::from_u32(1)],
+                };
+                for a in 0..=255u64 {
+                    for b in [0, 1, 63, 128, 255] {
+                        let projected = low_bits(&data, types::I8, bits, |i, _| {
+                            Some((types::I8, Some([a, b][i] & mask)))
+                        })
+                        .unwrap();
+                        let Evaluation::Exact(actual) = binary(types::I8, op, Some(a), Some(b))
+                        else {
+                            panic!()
+                        };
+                        assert_eq!(projected, actual & mask);
+                    }
+                }
+            }
+        }
+        let product = Data::Binary {
+            opcode: O::Imul,
+            args: [Value::from_u32(0), Value::from_u32(1)],
+        };
+        assert_eq!(
+            low_bits(&product, types::I64, 6, |i, _| Some((
+                types::I64,
+                if i == 0 { None } else { Some(0) }
+            ))),
+            Some(0)
+        );
+        let aligned=Data::BinaryImm64{opcode:O::ImulImm,arg:Value::from_u32(0),imm:cranelift_codegen::ir::immediates::Imm64::new(256)};
+        assert_eq!(low_bits(&aligned,types::I64,6,|_,_|Some((types::I64,None))),Some(0));
+        let remainder = Data::Binary {
+            opcode: O::Urem,
+            args: [Value::from_u32(0), Value::from_u32(1)],
+        };
+        assert_eq!(
+            low_bits(&remainder, types::I64, 6, |_, _| Some((
+                types::I64,
+                Some(0)
+            ))),
+            None
+        );
     }
 
     #[test]

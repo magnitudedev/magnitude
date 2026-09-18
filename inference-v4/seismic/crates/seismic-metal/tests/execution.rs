@@ -1,12 +1,13 @@
+mod support;
 use seismic_lang::{
-    ir::{StmtKind, VarKind},
-    lower::{lower_with, Options},
-    lowered_ir::LoweredIr,
-    program::{compile, SourceFile},
     Scope,
+    ir::{StmtKind, VarKind},
+    lower::{Options, lower_with},
+    lowered_ir::LoweredIr,
+    program::{SourceFile, compile},
 };
 use seismic_metal::{
-    execution::{prepare, Config},
+    execution::{Config, prepare},
     msl::emit_execution,
 };
 
@@ -25,14 +26,19 @@ fn lower(text: &str) -> LoweredIr {
         "evaluate",
         "metal",
         &Default::default(),
-        &Options { piece: Some(17) },
+        &Options {
+            piece: Some(17),
+            ..Default::default()
+        },
     )
     .unwrap()
 }
 
 #[test]
 fn widening_is_present_in_ir_before_emission() {
-    let original = lower("fn evaluate(x: tensor[6,65] f32, out: tensor[6,65] f32):\n  for row in parallel:\n    t = load(x[row])\n    for i in owned(t): t[i] = t[i] + 1.0\n    store(t,out[row])\n");
+    let original = lower(
+        "fn evaluate(x: tensor[6,65] f32, out: tensor[6,65] f32):\n  for row in parallel:\n    t = load(x[row])\n    for i in owned(t): t[i] = t[i] + 1.0\n    store(t,out[row])\n",
+    );
     let original_debug = format!("{original:?}");
     let execution = prepare(
         &original,
@@ -77,21 +83,24 @@ fn widening_is_present_in_ir_before_emission() {
         first.launches[0].dispatch.as_ref(),
         Some(&execution.phases()[0].dispatch)
     );
-    assert!(prepare(
+    let tailed = prepare(
         &original,
         Config {
             per_item: 4,
             ..Default::default()
-        }
+        },
     )
-    .is_err());
+    .unwrap();
+    assert_eq!(tailed.phases()[0].mapping.extents(1).unwrap(), [2]);
+    assert_eq!(tailed.phases()[0].dispatch.work_items, 2);
+    assert!(emit_execution(&tailed).is_ok());
 }
 
-const SPLIT_THEN_READ: &str = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    for t in load(x[row,0:65], over=0):\n      acc[0] += reduce(t,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    t = load(middle[row:row+1])\n    for i in owned(t): t[i] = t[i] * 2.0 + 1.0\n    store(t,out[row:row+1])\n";
+const SPLIT_THEN_READ: &str = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    chunk = load(x[row,0:65])\n    acc[0] += reduce(chunk,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    t = load(middle[row:row+1])\n    for i in owned(t): t[i] = t[i] * 2.0 + 1.0\n    store(t,out[row:row+1])\n";
 
 #[test]
 fn split_indices_and_phase_dependencies_exist_before_emission() {
-    let original = lower(SPLIT_THEN_READ);
+    let original = support::streamed(SPLIT_THEN_READ, 17, &["chunk"]);
     let execution = prepare(
         &original,
         Config {
@@ -127,7 +136,7 @@ fn split_indices_and_phase_dependencies_exist_before_emission() {
 fn reduction_bindings_preserve_the_split_loop_and_original_domain_inputs() {
     let text = SPLIT_THEN_READ.replace("    acc = tile[1] f32", "    probe = load(x[row,0:1])\n    unused = 1.0 + reduce(probe,0,sum)\n    acc = tile[1] f32")
         .replace("x[row,0:65]", "x[row,reduce(probe,0,argmax):65]");
-    let original = lower(&text);
+    let original = support::streamed(&text, 17, &["chunk"]);
     let execution = prepare(
         &original,
         Config {
@@ -157,7 +166,7 @@ fn split_merge_finishes_before_the_next_phase_reads_its_output() {
     let device = seismic_metal::runtime::Device::open().unwrap();
     for parts in [2, 3, 7, 100] {
         let execution = prepare(
-            &lower(SPLIT_THEN_READ),
+            &support::streamed(SPLIT_THEN_READ, 17, &["chunk"]),
             Config {
                 split: parts,
                 ..Default::default()
@@ -196,14 +205,14 @@ fn split_merge_finishes_before_the_next_phase_reads_its_output() {
 fn split_requires_a_proven_identity_and_chunk_independent_merge() {
     for text in [
         SPLIT_THEN_READ.replace("acc[i] = 0.0", "acc[i] = 1.0"),
-        SPLIT_THEN_READ.replace("reduce(t,0,sum)", "reduce(t,0,max)"),
-        SPLIT_THEN_READ.replace("reduce(t,0,sum)", "reduce(t,0,sum,ordered=true)"),
+        SPLIT_THEN_READ.replace("reduce(chunk,0,sum)", "reduce(chunk,0,max)"),
+        SPLIT_THEN_READ.replace("reduce(chunk,0,sum)", "reduce(chunk,0,sum,ordered=true)"),
         SPLIT_THEN_READ.replace("acc[0] +=", "acc[0] *= "),
-        SPLIT_THEN_READ.replace("reduce(t,0,sum)", "reduce(t,0,sum) + acc[0]"),
+        SPLIT_THEN_READ.replace("reduce(chunk,0,sum)", "reduce(chunk,0,sum) + acc[0]"),
     ] {
         assert!(
             prepare(
-                &lower(&text),
+                &support::streamed(&text, 17, &["chunk"]),
                 Config {
                     split: 3,
                     ..Default::default()
@@ -218,7 +227,7 @@ fn split_requires_a_proven_identity_and_chunk_independent_merge() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
-fn split_preserves_dynamic_domains_including_empty_and_invalid_ranges() {
+fn split_preserves_clamped_dynamic_domains_including_empty_ranges() {
     let text = SPLIT_THEN_READ
         .replace(
             "middle: tensor[2]",
@@ -226,7 +235,7 @@ fn split_preserves_dynamic_domains_including_empty_and_invalid_ranges() {
         )
         .replace("x[row,0:65]", "x[row,limits[0]:limits[1]]");
     let execution = prepare(
-        &lower(&text),
+        &support::streamed(&text, 17, &["chunk"]),
         Config {
             split: 7,
             ..Default::default()
@@ -254,6 +263,8 @@ fn split_preserves_dynamic_domains_including_empty_and_invalid_ranges() {
         (-1, 2),
         (2, 1),
         (0, 66),
+        (-8, -2),
+        (70, 80),
     ] {
         let limits = device
             .buffer_from(
@@ -264,19 +275,13 @@ fn split_preserves_dynamic_domains_including_empty_and_invalid_ranges() {
             )
             .unwrap();
         let result = device.run(&pipeline, &[&input, &limits, &middle, &output], &[], 1);
-        if lo < 0 || hi < lo || hi > 65 {
-            assert!(result.is_err(), "{lo}:{hi}");
-            continue;
-        }
         result.unwrap();
+        let end = hi.clamp(0, 65) as usize;
+        let start = lo.clamp(0, end as i32) as usize;
         for (row, bytes) in output.read(8).chunks_exact(4).enumerate() {
             assert_eq!(
                 f32::from_le_bytes(bytes.try_into().unwrap()),
-                values[row * 65 + lo as usize..row * 65 + hi as usize]
-                    .iter()
-                    .sum::<f32>()
-                    * 2.0
-                    + 1.0,
+                values[row * 65 + start..row * 65 + end].iter().sum::<f32>() * 2.0 + 1.0,
                 "{lo}:{hi}"
             );
         }
@@ -287,9 +292,9 @@ fn split_preserves_dynamic_domains_including_empty_and_invalid_ranges() {
 #[test]
 #[ignore = "requires Metal hardware"]
 fn split_keeps_each_streams_own_slice_origin() {
-    let text = "fn evaluate(x: tensor[65] f32, out: tensor[1] f32):\n  a = tile[1] f32\n  b = tile[1] f32\n  for i in owned(a): a[i] = 0.0\n  for i in owned(b): b[i] = 0.0\n  for u, v in load((x[0:64],x[1:65]), over=0):\n    a[0] += reduce(u,0,sum)\n    b[0] += reduce(v,0,sum)\n  a[0] += b[0]\n  store(a,out)\n";
+    let text = "fn evaluate(x: tensor[65] f32, out: tensor[1] f32):\n  a = tile[1] f32\n  b = tile[1] f32\n  for i in owned(a): a[i] = 0.0\n  for i in owned(b): b[i] = 0.0\n  u = load(x[0:64])\n  v = load(x[1:65])\n  a[0] += reduce(u,0,sum)\n  b[0] += reduce(v,0,sum)\n  a[0] += b[0]\n  store(a,out)\n";
     let execution = prepare(
-        &lower(text),
+        &support::streamed(text, 17, &["u", "v"]),
         Config {
             split: 3,
             ..Default::default()
@@ -319,7 +324,9 @@ fn split_keeps_each_streams_own_slice_origin() {
 fn multidimensional_work_mapping_preserves_coordinates_and_empty_domains() {
     let device = seismic_metal::runtime::Device::open().unwrap();
     for middle in [0, 6] {
-        let text = format!("fn evaluate(x: tensor[2,{middle},5] f32, out: tensor[2,{middle},5] f32):\n  for a, b in parallel:\n    t = load(x[a,b])\n    for i in owned(t): t[i] = t[i] + 1.0\n    store(t,out[a,b])\n");
+        let text = format!(
+            "fn evaluate(x: tensor[2,{middle},5] f32, out: tensor[2,{middle},5] f32):\n  for a, b in parallel:\n    t = load(x[a,b])\n    for i in owned(t): t[i] = t[i] + 1.0\n    store(t,out[a,b])\n"
+        );
         let original = lower(&text);
         for per_item in [1, 2, 3, 6] {
             let execution = prepare(
@@ -364,7 +371,9 @@ fn multidimensional_work_mapping_preserves_coordinates_and_empty_domains() {
 
 #[test]
 fn duplicated_source_spans_have_distinct_execution_decisions() {
-    let mut original = lower("fn evaluate(x: tensor[65] f32, out: tensor[1] f32):\n  a = load(x)\n  r = reduce(a,0,sum)\n  y = tile[1] f32\n  for i in owned(y): y[i] = r\n  store(y,out)\n");
+    let mut original = support::checked(
+        "fn evaluate(x: tensor[65] f32, out: tensor[1] f32):\n  a = load(x)\n  r = reduce(a,0,sum)\n  y = tile[1] f32\n  for i in owned(y): y[i] = r\n  store(y,out)\n",
+    );
     // Inlining and expansion can preserve source provenance for distinct operations.
     let repeated = original.body[1].clone();
     original.body.insert(2, repeated);
@@ -404,7 +413,7 @@ fn operation_ids_cover_main_and_split_validation_bodies_without_collisions() {
             "    probe = load(x[row,0:1])\n    acc = tile[1] f32",
         )
         .replace("x[row,0:65]", "x[row,reduce(probe,0,argmax):65]");
-    let original = lower(&text);
+    let original = support::streamed(&text, 17, &["chunk"]);
     let execution = prepare(
         &original,
         Config {
@@ -432,4 +441,179 @@ fn operation_ids_cover_main_and_split_validation_bodies_without_collisions() {
     .unwrap();
     assert_eq!(execution.function().body, repeated.function().body);
     emit_execution(&execution).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires Metal hardware"]
+fn split_rebases_projected_logical_offsets_from_nonzero_view_origins() {
+    use seismic_lang::{ir::*, sym::Atom};
+    let device = seismic_metal::runtime::Device::open().unwrap();
+    for parts in [1, 2, 3, 7, 23] {
+        let text = format!(
+            "fn evaluate(x:tensor[32] f32,out:tensor[{parts}] f32):\n  for part in parallel:\n    acc=tile[1] f32\n    for i in owned(acc): acc[i]=0.0\n    for start in range(1):\n      chunk=load(x[3:20])\n      acc[0]+=reduce(chunk,0,sum)\n      for i in owned(chunk): chunk[i]=chunk[i]+f32(start+i)+2.0*x[3+start+i]\n    store(acc,out[part:part+1])\n"
+        );
+        let mut function = support::streamed(&text, 4, &["chunk"]);
+        let StmtKind::Parallel { vars, body, .. } = &mut function.body[0].kind else {
+            panic!()
+        };
+        let part = vars[0];
+        let at = body
+            .iter()
+            .position(|s| matches!(s.kind, StmtKind::Range { .. }))
+            .unwrap();
+        let StmtKind::Range {
+            var: offset,
+            body: mut inner,
+            ..
+        } = body.remove(at).kind
+        else {
+            panic!()
+        };
+        let mut stream = inner.remove(0);
+        let StmtKind::LoadLoop {
+            offset: binding,
+            body: piece,
+            ..
+        } = &mut stream.kind
+        else {
+            panic!()
+        };
+        *binding = Some(offset);
+        inner.extend(std::mem::take(piece));
+        *piece = inner;
+        body.insert(at, stream);
+        let candidate =
+            seismic_lang::split::split_candidates(&function.body, &function.vars).remove(0);
+        let VarKind::Index(atom) = function.vars[part].kind.clone() else {
+            panic!()
+        };
+        assert!(matches!(atom, Atom::Param(_)));
+        let actual = seismic_lang::split::narrow_range(
+            &candidate,
+            &mut function.body,
+            &mut function.vars,
+            part,
+            &atom,
+            parts,
+        )
+        .unwrap();
+        assert_eq!(actual, candidate.loop_at + 1);
+        let execution = prepare(
+            &function,
+            Config {
+                loads: seismic_realization::LoadStrategy::Materialize,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pipeline = device.compile(emit_execution(&execution).unwrap()).unwrap();
+        let values = (0..32).map(|i| i as f32 * 0.5 - 2.).collect::<Vec<_>>();
+        let input = device
+            .buffer_from(
+                &values
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let output = device.buffer((parts * 4) as usize).unwrap();
+        device.run(&pipeline, &[&input, &output], &[], 1).unwrap();
+        let width = (17 + parts - 1) / parts;
+        for (part, bytes) in output
+            .read((parts * 4) as usize)
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let start = (part as i64 * width).min(17);
+            let end = (start + width).min(17);
+            let expected = (start..end)
+                .map(|i| 3.0 * values[(3 + i) as usize] + i as f32)
+                .sum::<f32>();
+            assert_eq!(
+                f32::from_le_bytes(bytes.try_into().unwrap()),
+                expected,
+                "parts={parts}, part={part}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires Metal hardware"]
+fn metadata_only_iteration_domain_retains_bounds_empty_ranges_and_offsets() {
+    use seismic_lang::ir::*;
+    let text = "fn evaluate(x:tensor[32] f32,visible:index[33],out:tensor[1] f32):\n  acc=tile[1] f32\n  for i in owned(acc): acc[i]=0.0\n  for start in range(1):\n    chunk=load(x[3:visible])\n    acc[0]+=f32(start)\n  store(acc,out)\n";
+    let mut function = support::streamed(text, 4, &["chunk"]);
+    let at = function
+        .body
+        .iter()
+        .position(|s| matches!(s.kind, StmtKind::Range { .. }))
+        .unwrap();
+    let StmtKind::Range {
+        var: offset,
+        body: mut inner,
+        ..
+    } = function.body.remove(at).kind
+    else {
+        panic!()
+    };
+    assert_eq!(inner.len(), 1);
+    let mut stream = inner.remove(0);
+    let StmtKind::LoadLoop {
+        vars,
+        views,
+        axes,
+        modes,
+        offset: binding,
+        ..
+    } = &mut stream.kind
+    else {
+        panic!()
+    };
+    vars.clear();
+    views.clear();
+    axes.clear();
+    *modes = None;
+    *binding = Some(offset);
+    function.body.insert(at, stream);
+    let execution = prepare(&function, Config::default()).unwrap();
+    // The domain is metadata: no array is allocated for the removed load.
+    let chunk = function
+        .vars
+        .iter()
+        .position(|v| v.name == "chunk")
+        .unwrap();
+    assert!(
+        execution
+            .memory()
+            .launches()
+            .iter()
+            .flat_map(|l| &l.arrays)
+            .all(|a| a.id.variable != chunk)
+    );
+    let emitted = emit_execution(&execution).unwrap();
+    let device = seismic_metal::runtime::Device::open().unwrap();
+    let input = device.buffer(32 * 4).unwrap();
+    let output = device.buffer(4).unwrap();
+    let pipeline = device.compile(emitted.clone()).unwrap();
+    for visible in [3, 4, 20, 32] {
+        let scalars = emitted.encode_scalars(&[visible as f64]).unwrap();
+        device
+            .run(&pipeline, &[&input, &output], &scalars, 1)
+            .unwrap();
+        let expected = (0..visible - 3).step_by(4).sum::<i32>() as f32;
+        assert_eq!(
+            f32::from_le_bytes(output.read(4).try_into().unwrap()),
+            expected,
+            "visible={visible}"
+        );
+    }
+    let invalid = emitted.encode_scalars(&[2.0]).unwrap();
+    assert!(
+        device
+            .run(&pipeline, &[&input, &output], &invalid, 1)
+            .is_err()
+    );
 }

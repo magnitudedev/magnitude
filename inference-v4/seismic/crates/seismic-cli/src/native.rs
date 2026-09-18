@@ -35,9 +35,7 @@ pub fn native(args: &[String]) -> Result<(), String> {
         &options.target,
         &options.shapes,
         &options.elements,
-        &Options {
-            piece: options.piece,
-        },
+        &Options { piece: options.piece, ..Default::default() },
     )?;
     if options.target == "cpu" {
         return cpu(&options, &lowered, &directory);

@@ -65,25 +65,21 @@ fn large_snapshot(x: tensor[65] f32, out: tensor[65] f32):
   for i in owned(y): y[i] = t[64 - i]
   store(y, out)
 
-fn stream_snapshot(x: tensor[65] f32, out: tensor[1] f32):
+fn snapshot_reduction(x: tensor[65] f32, out: tensor[1] f32):
+  t = load(x)
+  zero = tile[65] f32
+  for i in owned(zero): zero[i] = 0.0
+  store(zero, x)
   acc = tile[1] f32
-  for i in owned(acc): acc[i] = 0.0
-  for t in load(x, over=0):
-    zero = tile[65] f32
-    for i in owned(zero): zero[i] = 0.0
-    store(zero, x)
-    total = reduce(t, 0, sum)
-    for i in owned(acc): acc[i] += total
+  for i in owned(acc): acc[i] = reduce(t, 0, sum)
   store(acc, out)
 
-# Mutating a streamed tile does not mutate its source tensor.
-fn stream_mutation(x: tensor[65] f32, out: tensor[1] f32):
+# Mutating a logical loaded tile does not mutate its source tensor.
+fn loaded_mutation(x: tensor[65] f32, out: tensor[1] f32):
+  t = load(x)
+  for i in owned(t): t[i] = 0.0
   acc = tile[1] f32
-  for i in owned(acc): acc[i] = 0.0
-  for t in load(x, over=0):
-    for i in owned(t): t[i] = 0.0
-    total = reduce(t, 0, sum)
-    for i in owned(acc): acc[i] += total
+  for i in owned(acc): acc[i] = reduce(t, 0, sum)
   store(acc, out)
 
 fn half_rounding(x: tensor[1] f16, out: tensor[1] f32, value: f16):
@@ -157,10 +153,12 @@ fn explicit_fma(x: tensor[3] f32, out: tensor[2] f32):
     else: y[i] = fma(t[0], t[1], t[2])
   store(y, out)
 
-# Empty streams have no pieces; their body must not publish any effects.
-fn empty_stream(x: tensor[1] f32, out: tensor[1] f32):
+# An empty logical reduction returns its identity; a logical window guard
+# has no body effects for the empty domain, regardless of decomposition.
+fn empty_window(x: tensor[1] f32, out: tensor[1] f32):
+  t = load(x[0:0])
   acc = tile[1] f32
-  for i in owned(acc): acc[i] = 0.0
-  for t in load(x[0:0], over=0):
+  for i in owned(acc): acc[i] = reduce(t,0,sum)
+  if extent(t,0) > 0:
     acc[0] += 1.0
   store(acc, out)

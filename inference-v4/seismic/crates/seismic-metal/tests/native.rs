@@ -7,35 +7,37 @@ fn value_semantics_and_precision_boundaries() {
     use seismic_metal::{msl, runtime::Device};
     let device = Device::open().unwrap();
     let info = device.info();
-    for loads in [seismic_realization::LoadStrategy::Materialize,
-        seismic_realization::LoadStrategy::BorrowProvenReadOnly] {
-    scalar_cases::exercise(
-        |lowered, values, scalars| {
-            let emitted = msl::emit_with(
-                lowered,
-                seismic_metal::execution::Config {
-                    loads,
-                    max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
-                    max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let scalars = emitted.encode_scalars(scalars).unwrap();
-            let pipeline = device.compile(emitted).unwrap();
-            let buffers = values
-                .iter()
-                .map(|v| device.buffer_from(v).unwrap())
-                .collect::<Vec<_>>();
-            device
-                .run(&pipeline, &buffers.iter().collect::<Vec<_>>(), &scalars, 1)
+    for loads in [
+        seismic_realization::LoadStrategy::Materialize,
+        seismic_realization::LoadStrategy::BorrowProvenReadOnly,
+    ] {
+        scalar_cases::exercise(
+            |lowered, values, scalars| {
+                let emitted = msl::emit_with(
+                    lowered,
+                    seismic_metal::execution::Config {
+                        loads,
+                        max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
+                        max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
-            for (value, buffer) in values.iter_mut().zip(&buffers) {
-                *value = buffer.read(value.len());
-            }
-        },
-        "metal",
-    );
+                let scalars = emitted.encode_scalars(scalars).unwrap();
+                let pipeline = device.compile(emitted).unwrap();
+                let buffers = values
+                    .iter()
+                    .map(|v| device.buffer_from(v).unwrap())
+                    .collect::<Vec<_>>();
+                device
+                    .run(&pipeline, &buffers.iter().collect::<Vec<_>>(), &scalars, 1)
+                    .unwrap();
+                for (value, buffer) in values.iter_mut().zip(&buffers) {
+                    *value = buffer.read(value.len());
+                }
+            },
+            "metal",
+        );
     }
 }
 
@@ -161,7 +163,7 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
             None
         }
     }
-    let text="fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  for t in load(x[visible[0]:visible[1]], over=0):\n    acc[0] += reduce(t, 0, sum)\n  store(acc, out)\n\nfn composition(x: tensor[4] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  stream(x,visible,out)\n";
+    let text="fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] += reduce(t, 0, sum) + x[visible[0]]\n  store(acc, out)\n\nfn composition(x: tensor[4] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  stream(x,visible,out)\n";
     let p = compile(
         &[SourceFile {
             path: "plan.seismic.portable".into(),
@@ -173,7 +175,13 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
     .unwrap();
     let plan = seismic_lang::plan::plan(&p, "composition", &HashMap::new()).unwrap();
     let device = Device::open().unwrap();
-    let compiled = compile_plan(&device, &p, &plan, seismic_metal::execution::Config::default()).unwrap();
+    let compiled = compile_plan(
+        &device,
+        &p,
+        &plan,
+        seismic_metal::execution::Config::default(),
+    )
+    .unwrap();
     let inputs = Inputs(HashMap::from([
         (
             "x".into(),
@@ -190,7 +198,7 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
             "visible".into(),
             device
                 .buffer_from(
-                    &[0i32, 5]
+                    &[-1i32, 5]
                         .into_iter()
                         .flat_map(i32::to_le_bytes)
                         .collect::<Vec<_>>(),
@@ -199,18 +207,19 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
         ),
         ("out".into(), device.buffer_from(&[0; 4]).unwrap()),
     ]));
+    // Dynamic slices clamp; the explicit point access supplies the failure.
     assert!(device
         .run_plan(&compiled, &inputs)
         .unwrap_err()
         .contains("out-of-bounds"));
     inputs.0["visible"].write(
-        &[0i32, 4]
+        &[0i32, 5]
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>(),
     );
     device.run_plan(&compiled, &inputs).unwrap();
-    assert_eq!(inputs.0["out"].read(4), 10f32.to_le_bytes());
+    assert_eq!(inputs.0["out"].read(4), 11f32.to_le_bytes());
     assert!(device
         .run_plan_steps_repeated(&compiled, &inputs, 0..1, 0)
         .is_err());

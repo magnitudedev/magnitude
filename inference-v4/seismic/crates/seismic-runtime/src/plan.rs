@@ -1,12 +1,15 @@
 //! Reusable compiled compositions with retained, checked runtime bindings.
 use crate::{Buffer, Candidate, Device, ExecutionObservation, Kernel};
 use seismic_lang::{
-    lower::{lower_specialized, Options},
+    lower::{Options, lower_specialized},
     plan::{Plan, ScalarSource},
     program::Program,
 };
-use seismic_realization::storage::plane_byte_offset;
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 pub trait Bindings {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
     fn scalar(&self, name: &str) -> Option<f64>;
@@ -29,24 +32,27 @@ pub struct StepObservation {
     pub execution: ExecutionObservation,
 }
 pub struct CompiledPlan {
+    enclosing: Option<Enclosing>,
     kernels: Vec<Rc<RefCell<Kernel>>>,
     steps: Vec<Step>,
 }
 impl CompiledPlan {
-    pub fn compile(
+    pub fn compile_diagnostic(
         device: &Device,
         program: &Program,
         plan: &Plan,
         lowering: &Options,
         candidate: Candidate,
     ) -> Result<Self, String> {
-        PlanCompiler::new(device, program, lowering.clone(), candidate).compile(plan)
+        PlanCompiler::diagnostic(device, program, lowering.clone(), candidate).compile(plan)
     }
     pub fn step_count(&self) -> usize {
-        self.steps.len()
+        self.enclosing.as_ref().map_or(self.steps.len(), |_| 1)
     }
     pub fn kernel_count(&self) -> usize {
-        self.kernels.len()
+        self.enclosing
+            .as_ref()
+            .map_or(self.kernels.len(), |e| e.kernels.borrow().len())
     }
     /// Resolve all named inputs and checked subviews before the first kernel.
     /// This baseline completes each kernel synchronously; batched native submission
@@ -61,6 +67,9 @@ impl CompiledPlan {
         self.invoke(bindings, true)
     }
     pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
+        if let Some(enclosing) = &self.enclosing {
+            return enclosing.prepare(bindings);
+        }
         let mut prepared = Vec::new();
         for step in &self.steps {
             let buffers = step
@@ -248,29 +257,165 @@ impl Submission {
     }
 }
 
+/// External hardware facts and explicit search budgets for the existing tuner.
+/// The backend's form defines admissible mechanisms, not handpicked kernels.
 #[derive(Clone)]
-pub struct KernelChoice {
+pub struct Settings {
+    pub hardware: crate::tuner::Hardware,
+    pub form: crate::tuner::Form,
+    pub derivation_limits: seismic_accounting::workload::DerivationLimits,
+    pub search: seismic_accounting::selection::Budget,
+}
+struct Enclosing {
+    device: Device,
+    program: Rc<Program>,
+    entry: String,
+    shapes: HashMap<String, i64>,
+    elements: HashMap<String, seismic_lang::types::Elem>,
+    options: Options,
+    settings: Settings,
+    buffers: Vec<seismic_realization::BufferSpec>,
+    scalars: Vec<seismic_lang::abi::ScalarParameter>,
+    pending: RefCell<
+        Vec<(
+            seismic_accounting::workload::ScalarWorkload,
+            crate::tuner::Progress,
+        )>,
+    >,
+    kernels: RefCell<
+        Vec<(
+            seismic_accounting::workload::ScalarWorkload,
+            Rc<RefCell<Kernel>>,
+        )>,
+    >,
+}
+impl Enclosing {
+    fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
+        let buffers = self
+            .buffers
+            .iter()
+            .map(|s| {
+                let b = bindings
+                    .buffer(&s.parameter, &s.plane)
+                    .ok_or_else(|| format!("unbound tensor {}.{}", s.parameter, s.plane))?;
+                b.view(0..s.bytes)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let scalars = self
+            .scalars
+            .iter()
+            .map(|s| {
+                bindings
+                    .scalar(&s.name)
+                    .ok_or_else(|| format!("unbound scalar {}", s.name))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let workload = crate::tuner::workload(&self.entry, &buffers, &self.scalars, &scalars)?;
+        let existing = self
+            .kernels
+            .borrow()
+            .iter()
+            .find(|(w, _)| w == &workload)
+            .map(|(_, k)| k.clone());
+        let kernel = match existing {
+            Some(k) => k,
+            None => {
+                let facts = self.device.facts();
+                let request = crate::tuner::Request {
+                    input: crate::tuner::Input::Portable {
+                        program: &self.program,
+                        entry: &self.entry,
+                        shapes: &self.shapes,
+                        elements: &self.elements,
+                        options: &self.options,
+                    },
+                    device: &facts,
+                    form: self.settings.form.clone(),
+                    hardware: &self.settings.hardware,
+                    workload: &workload,
+                    derivation_limits: self.settings.derivation_limits,
+                };
+                let previous = {
+                    let mut pending = self.pending.borrow_mut();
+                    pending
+                        .iter()
+                        .position(|(w, _)| w == &workload)
+                        .map(|at| pending.swap_remove(at).1)
+                };
+                let outcome = match previous {
+                    Some(progress) => {
+                        crate::tuner::resume(&request, progress, self.settings.search)?
+                    }
+                    None => crate::tuner::tune(&request, self.settings.search)?,
+                };
+                let selected = match outcome {
+                    crate::tuner::Outcome::Optimal(selected) => selected,
+                    crate::tuner::Outcome::Incomplete(progress) => {
+                        let unresolved = progress.unresolved();
+                        let exhausted = progress.exhausted_derivations().collect::<Vec<_>>();
+                        let message = format!(
+                            "composition tuning incomplete: lower bound {}, feasible upper {:?}; {} choice regions, {} deferred model derivations, {} unfinished schedules, {} models with unavailable resource mappings; exhausted limits: {exhausted:?}",
+                            progress.lower_bound()?,
+                            progress.feasible_upper(),
+                            unresolved.choice_regions,
+                            unresolved.derivations,
+                            unresolved.schedules,
+                            unresolved.unmapped_models
+                        );
+                        self.pending.borrow_mut().push((workload, progress));
+                        return Err(message);
+                    }
+                    crate::tuner::Outcome::Infeasible => {
+                        return Err(
+                            "composition has no legal execution in the selected form".into()
+                        );
+                    }
+                };
+                let compiled = self.device.compile_tuned(selected)?;
+                if compiled.buffers() != self.buffers || compiled.scalars() != self.scalars {
+                    return Err("selected execution changed the enclosing entry ABI".into());
+                }
+                let k = Rc::new(RefCell::new(compiled));
+                self.kernels.borrow_mut().push((workload, k.clone()));
+                k
+            }
+        };
+        Ok(Submission {
+            invocations: vec![BoundInvocation {
+                entry: self.entry.clone(),
+                kernel,
+                buffers,
+                scalars,
+            }],
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Diagnostic {
     pub lowering: Options,
     pub candidate: Candidate,
 }
-#[derive(Clone)]
-pub struct CompilationChoices {
-    pub default: KernelChoice,
-    pub kernels: BTreeMap<String, KernelChoice>,
+type KernelKey = (
+    String,
+    Vec<(String, i64)>,
+    Vec<(String, String)>,
+    Vec<String>,
+);
+enum Configuration {
+    Tune(Settings),
+    Diagnostic(Diagnostic),
 }
-type KernelKey = (String, Vec<(String, i64)>, Vec<(String, String)>);
-/// Compilation reuse scoped to one immutable program, device and explicit
-/// realization. Native code and scratch remain alive through retained plans.
-/// Shared kernels execute serially; asynchronous parallelism needs separate
-/// invocation scratch ownership before relaxing that rule.
+/// Reuse is scoped to the same program/device/settings. Both explicit assignments
+/// and selection consume the enclosing source and produce its invocation ABI.
 pub struct PlanCompiler<'a> {
     device: &'a Device,
     program: &'a Program,
-    choices: CompilationChoices,
+    configuration: Configuration,
     kernels: BTreeMap<KernelKey, Rc<RefCell<Kernel>>>,
 }
 impl<'a> PlanCompiler<'a> {
-    pub fn new(
+    pub fn diagnostic(
         device: &'a Device,
         program: &'a Program,
         lowering: Options,
@@ -279,31 +424,159 @@ impl<'a> PlanCompiler<'a> {
         Self {
             device,
             program,
-            choices: CompilationChoices {
-                default: KernelChoice {
-                    lowering,
-                    candidate,
-                },
-                kernels: BTreeMap::new(),
-            },
+            configuration: Configuration::Diagnostic(Diagnostic {
+                lowering,
+                candidate,
+            }),
             kernels: BTreeMap::new(),
         }
     }
-    pub fn with_choices(
-        device: &'a Device,
-        program: &'a Program,
-        choices: CompilationChoices,
-    ) -> Result<Self, String> {
-        for name in choices.kernels.keys() {
-            if !program.functions.iter().any(|f| &f.name == name) {
-                return Err(format!("choice names unknown kernel {name}"));
-            }
-        }
-        Ok(Self {
+    pub fn new(device: &'a Device, program: &'a Program, settings: Settings) -> Self {
+        Self {
             device,
             program,
-            choices,
+            configuration: Configuration::Tune(settings),
             kernels: BTreeMap::new(),
+        }
+    }
+    pub fn compile_entry(
+        &mut self,
+        entry: &str,
+        shapes: &HashMap<String, i64>,
+        elements: &HashMap<String, seismic_lang::types::Elem>,
+        ownership: &seismic_lang::composition::Ownership,
+    ) -> Result<CompiledPlan, String> {
+        let settings = match &self.configuration {
+            Configuration::Tune(settings) => settings,
+            Configuration::Diagnostic(assignment) => {
+                let mut shape_key = shapes
+                    .iter()
+                    .map(|(n, v)| (n.clone(), *v))
+                    .collect::<Vec<_>>();
+                shape_key.sort();
+                let mut element_key = elements
+                    .iter()
+                    .map(|(n, v)| (n.clone(), v.to_string()))
+                    .collect::<Vec<_>>();
+                element_key.sort();
+                let mut options = assignment.lowering.clone();
+                options
+                    .ownership
+                    .intermediates
+                    .extend(ownership.intermediates.iter().cloned());
+                let key = (
+                    entry.to_string(),
+                    shape_key,
+                    element_key,
+                    options.ownership.intermediates.iter().cloned().collect(),
+                );
+                let kernel = if let Some(k) = self.kernels.get(&key) {
+                    k.clone()
+                } else {
+                    let lowered = lower_specialized(
+                        self.program,
+                        entry,
+                        self.device.backend(),
+                        shapes,
+                        elements,
+                        &options,
+                    )?;
+                    let kernel = Rc::new(RefCell::new(
+                        self.device
+                            .compile(&lowered, assignment.candidate.clone())?,
+                    ));
+                    self.kernels.insert(key, kernel.clone());
+                    kernel
+                };
+                let k = kernel.borrow();
+                let slots = k
+                    .buffers()
+                    .iter()
+                    .map(|b| Slot {
+                        root: b.parameter.clone(),
+                        plane: b.plane.clone(),
+                        offset: 0,
+                        bytes: b.bytes,
+                    })
+                    .collect();
+                let scalars = k
+                    .scalars()
+                    .iter()
+                    .map(|s| ScalarSource::Param(s.name.clone()))
+                    .collect();
+                drop(k);
+                return Ok(CompiledPlan {
+                    enclosing: None,
+                    kernels: vec![kernel],
+                    steps: vec![Step {
+                        entry: entry.into(),
+                        kernel: 0,
+                        slots,
+                        scalars,
+                    }],
+                });
+            }
+        };
+        let source = self
+            .program
+            .functions
+            .iter()
+            .find(|f| f.name == entry)
+            .ok_or("unknown composition entry")?;
+        seismic_lang::program::validate_element_bindings(source, elements)?;
+        for name in &source.shape_params {
+            if !shapes.contains_key(name) {
+                return Err(format!("unbound entry shape {name}"));
+            }
+        }
+        let env = shapes
+            .iter()
+            .map(|(n, v)| (n.clone(), seismic_lang::sym::Sym::constant(*v)))
+            .collect();
+        let params = source
+            .params
+            .iter()
+            .map(|(n, t)| {
+                (
+                    n.clone(),
+                    seismic_lang::lower::subst_elem_ty(
+                        &seismic_lang::lower::subst_ty(t, &env),
+                        elements,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let indices = source
+            .index_params
+            .iter()
+            .map(|(n, b)| {
+                (
+                    n.clone(),
+                    seismic_lang::lower::subst_sym(b, &env, &HashMap::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (buffers, scalars) = seismic_realization::storage::parameter_types(&params, &indices)?;
+        let enclosing = Enclosing {
+            device: self.device.clone(),
+            program: Rc::new(self.program.clone()),
+            entry: entry.into(),
+            shapes: shapes.clone(),
+            elements: elements.clone(),
+            options: Options {
+                piece: None,
+                ownership: ownership.clone(),
+            },
+            settings: settings.clone(),
+            buffers,
+            scalars,
+            pending: RefCell::new(Vec::new()),
+            kernels: RefCell::new(Vec::new()),
+        };
+        Ok(CompiledPlan {
+            enclosing: Some(enclosing),
+            kernels: Vec::new(),
+            steps: Vec::new(),
         })
     }
     pub fn program(&self) -> &Program {
@@ -316,92 +589,11 @@ impl<'a> PlanCompiler<'a> {
         self.kernels.len()
     }
     pub fn compile(&mut self, plan: &Plan) -> Result<CompiledPlan, String> {
-        let mut kernels: Vec<Rc<RefCell<Kernel>>> = Vec::new();
-        let mut keys = BTreeMap::new();
-        let mut steps = Vec::new();
-        for step in &plan.steps {
-            let mut shapes = step
-                .shapes
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect::<Vec<_>>();
-            shapes.sort();
-            let mut elements = step
-                .elements
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect::<Vec<_>>();
-            elements.sort();
-            let key = (step.kernel.clone(), shapes, elements);
-            let index = if let Some(index) = keys.get(&key) {
-                *index
-            } else {
-                let kernel = if let Some(kernel) = self.kernels.get(&key) {
-                    kernel.clone()
-                } else {
-                    let choice = self
-                        .choices
-                        .kernels
-                        .get(&step.kernel)
-                        .unwrap_or(&self.choices.default);
-                    let lowered = lower_specialized(
-                        self.program,
-                        &step.kernel,
-                        self.device.backend(),
-                        &step.shapes,
-                        &step.elements,
-                        &choice.lowering,
-                    ).map_err(|error| format!("lowering {} with shapes {:?}: {error}", step.kernel, key.1))?;
-                    let kernel = Rc::new(RefCell::new(
-                        self.device.compile(&lowered, choice.candidate.clone()).map_err(|error| format!("compiling {} with shapes {:?}: {error}", step.kernel, key.1))?,
-                    ));
-                    self.kernels.insert(key.clone(), kernel.clone());
-                    kernel
-                };
-                let index = kernels.len();
-                kernels.push(kernel);
-                keys.insert(key, index);
-                index
-            };
-            let kernel = kernels[index].borrow();
-            let mut slots = Vec::new();
-            for slot in kernel.buffers() {
-                let binding = step
-                    .tensors
-                    .iter()
-                    .find(|t| t.param == slot.parameter)
-                    .ok_or_else(|| {
-                        format!(
-                            "plan kernel {} has no binding for {}",
-                            step.kernel, slot.parameter
-                        )
-                    })?;
-                let offset = plane_byte_offset(&binding.elem, &slot.plane, binding.elem_offset)?;
-                slots.push(Slot {
-                    root: binding.root.clone(),
-                    plane: slot.plane.clone(),
-                    offset,
-                    bytes: slot.bytes,
-                });
-            }
-            let scalars = kernel
-                .scalars()
-                .iter()
-                .map(|p| {
-                    step.scalars
-                        .iter()
-                        .find(|(name, _)| name == &p.name)
-                        .map(|(_, source)| source.clone())
-                        .ok_or_else(|| format!("unbound plan scalar {}", p.name))
-                })
-                .collect::<Result<_, _>>()?;
-            steps.push(Step {
-                entry: step.kernel.clone(),
-                kernel: index,
-                slots,
-                scalars,
-            });
-        }
-        Ok(CompiledPlan { kernels, steps })
+        self.compile_entry(
+            &plan.function,
+            &plan.shapes,
+            &plan.elements,
+            &plan.ownership,
+        )
     }
 }

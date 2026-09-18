@@ -100,12 +100,92 @@ pub fn plan_at(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64) -> Widenin
 /// Statements that do not depend on the index are left alone, so their work is done once.
 /// This runs at every level, so a loop that mixes a shared operand with an index-dependent
 /// one keeps its shared reads single while the dependent reads multiply.
-pub fn apply(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>, base: &Expr) -> Vec<Stmt> {
-    let mut copies: Vec<std::collections::HashMap<VarId, VarId>> = vec![std::collections::HashMap::new(); factor as usize];
+pub fn apply(
+    body: &[Stmt],
+    inner: VarId,
+    atom: &Atom,
+    factor: i64,
+    vars: &mut Vec<Var>,
+    base: &Expr,
+) -> Vec<Stmt> {
+    let mut copies: Vec<std::collections::HashMap<VarId, VarId>> =
+        vec![std::collections::HashMap::new(); factor as usize];
     rewrite_block(body, inner, atom, factor, vars, base, &mut copies)
 }
 
-fn rewrite_block(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>, base: &Expr, copies: &mut [std::collections::HashMap<VarId, VarId>]) -> Vec<Stmt> {
+/// Cover a bounded axis, including a final partial work item. Full items retain
+/// shared producers. The partial item guards each complete original occurrence,
+/// so no invalid address, effect or collective is evaluated for a padded output.
+pub fn apply_bounded(
+    body: &[Stmt],
+    inner: VarId,
+    atom: &Atom,
+    factor: i64,
+    extent: i64,
+    vars: &mut Vec<Var>,
+    base: &Expr,
+) -> Vec<Stmt> {
+    if extent % factor == 0 {
+        return apply(body, inner, atom, factor, vars, base);
+    }
+    use crate::{ast::BinaryOp, types::DType};
+    let literal = |n| Expr {
+        kind: ExprKind::Int(n),
+        ty: Ty::Scalar(DType::I32),
+        sym: Some(Sym::constant(n)),
+        span: base.span,
+    };
+    let below = |value: Expr, n: i64| Expr {
+        kind: ExprKind::Binary {
+            op: BinaryOp::Lt,
+            lhs: Box::new(value),
+            rhs: Box::new(literal(n)),
+        },
+        ty: Ty::Scalar(DType::Bool),
+        sym: None,
+        span: base.span,
+    };
+    let full = apply(body, inner, atom, factor, vars, base);
+    let mut tail = Vec::new();
+    for k in 0..factor {
+        let mut copies = std::collections::HashMap::new();
+        let value = offset(base, k);
+        let occurrence = body
+            .iter()
+            .map(|s| substitute(s, inner, atom, &value, vars, &mut copies))
+            .collect();
+        // Compare the base against extent-k before evaluating base+k. This
+        // preserves the checked source index width even near its maximum.
+        tail.push(Stmt {
+            id: None,
+            kind: StmtKind::If {
+                cond: below(base.clone(), extent - k),
+                then: occurrence,
+                els: Vec::new(),
+            },
+            span: base.span,
+        });
+    }
+    vec![Stmt {
+        id: None,
+        kind: StmtKind::If {
+            cond: below(base.clone(), extent - factor + 1),
+            then: full,
+            els: tail,
+        },
+        span: base.span,
+    }]
+}
+
+fn rewrite_block(
+    body: &[Stmt],
+    inner: VarId,
+    atom: &Atom,
+    factor: i64,
+    vars: &mut Vec<Var>,
+    base: &Expr,
+    copies: &mut [std::collections::HashMap<VarId, VarId>],
+) -> Vec<Stmt> {
     // What the index-dependent statements of this block write, so reads of those variables
     // are redirected to the copy belonging to each covered value.
     let mut tainted: HashSet<VarId> = HashSet::new();
@@ -141,7 +221,14 @@ fn rewrite_block(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &m
         }
         for k in 0..factor as usize {
             let index_value = offset(base, k as i64);
-            out.push(substitute(s, inner, atom, &index_value, vars, &mut copies[k]));
+            out.push(substitute(
+                s,
+                inner,
+                atom,
+                &index_value,
+                vars,
+                &mut copies[k],
+            ));
         }
     }
     out
@@ -149,20 +236,43 @@ fn rewrite_block(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &m
 
 /// If a compound statement's own operands do not depend on the index, rewrite its body
 /// instead of replicating the statement.
-fn descend(s: &Stmt, inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>, base: &Expr, copies: &mut [std::collections::HashMap<VarId, VarId>]) -> Option<Stmt> {
+fn descend(
+    s: &Stmt,
+    inner: VarId,
+    atom: &Atom,
+    factor: i64,
+    vars: &mut Vec<Var>,
+    base: &Expr,
+    copies: &mut [std::collections::HashMap<VarId, VarId>],
+) -> Option<Stmt> {
     let mut shallow = HashSet::new();
     shallow.insert(inner);
     let rewritten = match &s.kind {
-        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, modes, body } => {
+        StmtKind::LoadLoop {
+            offset,
+            vars: lv,
+            views,
+            domain,
+            axes,
+            piece,
+            capacity,
+            modes,
+            body,
+        } => {
             // The loop itself is shared only when no view reads the index.
-            if views.iter().any(|v| expr_depends_shallow(v, &shallow, atom)) {
+            if std::iter::once(&domain.view)
+                .chain(views)
+                .any(|v| expr_depends_shallow(v, &shallow, atom))
+            {
                 return None;
             }
             StmtKind::LoadLoop {
+                offset: *offset,
                 modes: modes.clone(),
                 vars: lv.clone(),
                 views: views.clone(),
-                axis: *axis,
+                domain: domain.clone(),
+                axes: axes.clone(),
                 piece: piece.clone(),
                 capacity: *capacity,
                 body: rewrite_block(body, inner, atom, factor, vars, base, copies),
@@ -172,11 +282,20 @@ fn descend(s: &Stmt, inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>
             if lo.atoms().contains(atom) || hi.atoms().contains(atom) {
                 return None;
             }
-            StmtKind::Range { var: *var, lo: lo.clone(), hi: hi.clone(), body: rewrite_block(body, inner, atom, factor, vars, base, copies) }
+            StmtKind::Range {
+                var: *var,
+                lo: lo.clone(),
+                hi: hi.clone(),
+                body: rewrite_block(body, inner, atom, factor, vars, base, copies),
+            }
         }
         _ => return None,
     };
-    Some(Stmt { id: None, kind: rewritten, span: s.span })
+    Some(Stmt {
+        id: None,
+        kind: rewritten,
+        span: s.span,
+    })
 }
 
 /// Whether an expression reads the index directly, without following variables.
@@ -207,8 +326,16 @@ fn expr_depends_shallow(e: &Expr, tainted: &HashSet<VarId>, atom: &Atom) -> bool
                     }
                 }
             }
-            ExprKind::Load { view: x2, .. } | ExprKind::Transpose(x2) | ExprKind::Accessor { base: x2, .. } | ExprKind::Lanes { base: x2, .. } | ExprKind::Unary { expr: x2, .. } | ExprKind::Cast { expr: x2, .. } => st.push(x2),
-            ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => st.extend(args.iter()),
+            ExprKind::Load { view: x2, .. }
+            | ExprKind::Transpose(x2)
+            | ExprKind::Accessor { base: x2, .. }
+            | ExprKind::Lanes { base: x2, .. }
+            | ExprKind::Unary { expr: x2, .. }
+            | ExprKind::Cast { expr: x2, .. } => st.push(x2),
+            ExprKind::Builtin { args, .. }
+            | ExprKind::Intrinsic { args, .. }
+            | ExprKind::Call { args, .. }
+            | ExprKind::Tuple(args) => st.extend(args.iter()),
             ExprKind::Binary { lhs, rhs, .. } => {
                 st.push(lhs);
                 st.push(rhs);
@@ -224,14 +351,35 @@ fn offset(base: &Expr, k: i64) -> Expr {
     if k == 0 {
         return base.clone();
     }
-    let n = Expr { kind: ExprKind::Int(k), ty: base.ty.clone(), sym: Some(Sym::constant(k)), span: base.span };
+    let n = Expr {
+        kind: ExprKind::Int(k),
+        ty: base.ty.clone(),
+        sym: Some(Sym::constant(k)),
+        span: base.span,
+    };
     let sym = base.sym.as_ref().map(|s| s.add(&Sym::constant(k)));
-    Expr { kind: ExprKind::Binary { op: crate::ast::BinaryOp::Add, lhs: Box::new(base.clone()), rhs: Box::new(n) }, ty: base.ty.clone(), sym, span: base.span }
+    Expr {
+        kind: ExprKind::Binary {
+            op: crate::ast::BinaryOp::Add,
+            lhs: Box::new(base.clone()),
+            rhs: Box::new(n),
+        },
+        ty: base.ty.clone(),
+        sym,
+        span: base.span,
+    }
 }
 
 /// One covered value's copy of a statement: the index takes that value, and each variable the
 /// statement writes gets its own copy so the values stay live together.
-fn substitute(s: &Stmt, inner: VarId, atom: &Atom, value: &Expr, vars: &mut Vec<Var>, copy: &mut std::collections::HashMap<VarId, VarId>) -> Stmt {
+fn substitute(
+    s: &Stmt,
+    inner: VarId,
+    atom: &Atom,
+    value: &Expr,
+    vars: &mut Vec<Var>,
+    copy: &mut std::collections::HashMap<VarId, VarId>,
+) -> Stmt {
     let mut w = HashSet::new();
     crate::rewrite::writes(s, &mut w);
     // Variables a loop inside this statement binds are defined by that loop, so each copy of
@@ -252,10 +400,49 @@ fn substitute(s: &Stmt, inner: VarId, atom: &Atom, value: &Expr, vars: &mut Vec<
     map_stmt(s, inner, atom, value, copy)
 }
 
+pub(crate) fn copy_bindings(
+    body: &[Stmt],
+    vars: &mut Vec<Var>,
+) -> (Vec<Stmt>, std::collections::HashMap<VarId, VarId>) {
+    let mut copies = std::collections::HashMap::new();
+    let atom = Atom::Param(format!("copy#{}", vars.len()));
+    let Some(first) = body.first() else {
+        return (Vec::new(), copies);
+    };
+    let value = Expr {
+        kind: ExprKind::Int(0),
+        ty: Ty::Scalar(crate::types::DType::I32),
+        sym: Some(Sym::constant(0)),
+        span: first.span,
+    };
+    let result = body
+        .iter()
+        .map(|s| substitute(s, usize::MAX, &atom, &value, vars, &mut copies))
+        .collect();
+    (result, copies)
+}
+
 /// Variables bound by loops inside a statement.
 fn bound_vars(s: &Stmt, out: &mut HashSet<VarId>) {
     match &s.kind {
-        StmtKind::LoadLoop { vars, body, .. } => {
+        StmtKind::Reduction(r) => {
+            for merge in r.implementations() {
+                for p in merge.left.iter().chain(&merge.right).chain(&merge.output) {
+                    if let ExprKind::Var(v) = p.kind {
+                        out.insert(v);
+                    }
+                }
+                for s in &merge.body {
+                    bound_vars(s, out);
+                }
+            }
+        }
+        StmtKind::LoadLoop {
+            vars, offset, body, ..
+        } => {
+            if let Some(v) = offset {
+                out.insert(*v);
+            }
             for v in vars {
                 out.insert(*v);
             }
@@ -291,48 +478,147 @@ fn bound_vars(s: &Stmt, out: &mut HashSet<VarId>) {
     }
 }
 
-fn map_stmt(s: &Stmt, inner: VarId, atom: &Atom, value: &Expr, copy: &std::collections::HashMap<VarId, VarId>) -> Stmt {
+fn map_stmt(
+    s: &Stmt,
+    inner: VarId,
+    atom: &Atom,
+    value: &Expr,
+    copy: &std::collections::HashMap<VarId, VarId>,
+) -> Stmt {
     let kind = match &s.kind {
-        StmtKind::Assign { target, op, value: v } => StmtKind::Assign {
+        StmtKind::Reduction(r) => {
+            let mut r = r.clone();
+            for e in r.operands_mut() {
+                *e = map_expr(e, inner, atom, value, copy);
+            }
+            r.merge = map_expr(&r.merge, inner, atom, value, copy);
+            if let Some(step) = &mut r.step {
+                step.call = map_expr(&step.call, inner, atom, value, copy);
+            }
+            for merge in r.implementations_mut() {
+                for e in merge
+                    .left
+                    .iter_mut()
+                    .chain(&mut merge.right)
+                    .chain(&mut merge.output)
+                {
+                    *e = map_expr(e, inner, atom, value, copy);
+                }
+                merge.body = merge
+                    .body
+                    .iter()
+                    .map(|s| map_stmt(s, inner, atom, value, copy))
+                    .collect();
+            }
+            StmtKind::Reduction(r)
+        }
+        StmtKind::Assign {
+            target,
+            op,
+            value: v,
+        } => StmtKind::Assign {
             target: map_expr(target, inner, atom, value, copy),
             op: *op,
             value: map_expr(v, inner, atom, value, copy),
         },
         StmtKind::Expr(e) => StmtKind::Expr(map_expr(e, inner, atom, value, copy)),
-        StmtKind::Owned { vars: ov, tile, body } => StmtKind::Owned {
+        StmtKind::Owned {
+            vars: ov,
+            tile,
+            body,
+        } => StmtKind::Owned {
             vars: ov.clone(),
             tile: map_expr(tile, inner, atom, value, copy),
-            body: body.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
+            body: body
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
         },
         StmtKind::Range { var, lo, hi, body } => StmtKind::Range {
             var: copy.get(var).copied().unwrap_or(*var),
             lo: map_sym(lo, atom, value),
             hi: map_sym(hi, atom, value),
-            body: body.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
+            body: body
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
         },
-        StmtKind::Lanes { var, extent, width, body } => StmtKind::Lanes {
+        StmtKind::Lanes {
+            var,
+            extent,
+            width,
+            body,
+        } => StmtKind::Lanes {
             var: copy.get(var).copied().unwrap_or(*var),
             extent: map_sym(extent, atom, value),
             width: *width,
-            body: body.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
+            body: body
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
         },
-        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, modes, body } => StmtKind::LoadLoop {
+        StmtKind::LoadLoop {
+            offset,
+            vars: lv,
+            views,
+            domain,
+            axes,
+            piece,
+            capacity,
+            modes,
+            body,
+        } => StmtKind::LoadLoop {
+            offset: offset.map(|v| copy.get(&v).copied().unwrap_or(v)),
             modes: modes.clone(),
-            vars: lv.iter().map(|v| copy.get(v).copied().unwrap_or(*v)).collect(),
-            views: views.iter().map(|v| map_expr(v, inner, atom, value, copy)).collect(),
-            axis: *axis,
+            vars: lv
+                .iter()
+                .map(|v| copy.get(v).copied().unwrap_or(*v))
+                .collect(),
+            views: views
+                .iter()
+                .map(|v| map_expr(v, inner, atom, value, copy))
+                .collect(),
+            domain: crate::ir::IterationDomain {
+                view: map_expr(&domain.view, inner, atom, value, copy),
+                axis: domain.axis,
+            },
+            axes: axes.clone(),
             piece: piece.clone(),
             capacity: *capacity,
-            body: body.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
+            body: body
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
         },
         StmtKind::If { cond, then, els } => StmtKind::If {
             cond: map_expr(cond, inner, atom, value, copy),
-            then: then.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
-            els: els.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
+            then: then
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
+            els: els
+                .iter()
+                .map(|b| map_stmt(b, inner, atom, value, copy))
+                .collect(),
         },
         StmtKind::Parallel { .. } => s.kind.clone(),
     };
-    Stmt { id: None, kind, span: s.span }
+    Stmt {
+        id: None,
+        kind,
+        span: s.span,
+    }
+}
+
+/// Replace an index's expression and symbolic uses while preserving binders.
+/// The replacement has a symbolic value, so control bounds and element addresses
+/// observe the same coordinate as ordinary scalar arithmetic.
+pub(crate) fn replace_index(body: &mut [Stmt], index: VarId, atom: &Atom, value: &Expr) {
+    debug_assert!(value.sym.is_some());
+    let copy = std::collections::HashMap::new();
+    for statement in body {
+        *statement = map_stmt(statement, index, atom, value, &copy);
+    }
 }
 
 fn map_sym(s: &Sym, atom: &Atom, value: &Expr) -> Sym {
@@ -342,7 +628,13 @@ fn map_sym(s: &Sym, atom: &Atom, value: &Expr) -> Sym {
     }
 }
 
-fn map_expr(e: &Expr, inner: VarId, atom: &Atom, value: &Expr, copy: &std::collections::HashMap<VarId, VarId>) -> Expr {
+fn map_expr(
+    e: &Expr,
+    inner: VarId,
+    atom: &Atom,
+    value: &Expr,
+    copy: &std::collections::HashMap<VarId, VarId>,
+) -> Expr {
     if matches!(e.kind, ExprKind::Var(v) if v == inner) {
         return value.clone();
     }
@@ -356,36 +648,88 @@ fn map_expr(e: &Expr, inner: VarId, atom: &Atom, value: &Expr, copy: &std::colle
                 .map(|i| match i {
                     Index::Point(p) => Index::Point(map_expr(p, inner, atom, value, copy)),
                     Index::Slice { start, end } => Index::Slice {
-                        start: start.as_ref().map(|x| map_expr(x, inner, atom, value, copy)),
+                        start: start
+                            .as_ref()
+                            .map(|x| map_expr(x, inner, atom, value, copy)),
                         end: end.as_ref().map(|x| map_expr(x, inner, atom, value, copy)),
                     },
                 })
                 .collect(),
         },
-        ExprKind::Load { view, mode } => ExprKind::Load { view: Box::new(map_expr(view, inner, atom, value, copy)), mode: *mode },
-        ExprKind::Transpose(x) => ExprKind::Transpose(Box::new(map_expr(x, inner, atom, value, copy))),
-        ExprKind::Accessor { base, name } => ExprKind::Accessor { base: Box::new(map_expr(base, inner, atom, value, copy)), name: name.clone() },
-        ExprKind::Lanes { base, extent } => ExprKind::Lanes { base: Box::new(map_expr(base, inner, atom, value, copy)), extent: map_sym(extent, atom, value) },
-        ExprKind::Builtin { name, args } => ExprKind::Builtin { name: *name, args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect() },
-        ExprKind::Intrinsic { op: name, args } => ExprKind::Intrinsic { op: *name, args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect() },
-        ExprKind::Call { callee, shape_args, elem_args, args } => ExprKind::Call {
+        ExprKind::Load { view, mode } => ExprKind::Load {
+            view: Box::new(map_expr(view, inner, atom, value, copy)),
+            mode: *mode,
+        },
+        ExprKind::Transpose(x) => {
+            ExprKind::Transpose(Box::new(map_expr(x, inner, atom, value, copy)))
+        }
+        ExprKind::Accessor { base, name } => ExprKind::Accessor {
+            base: Box::new(map_expr(base, inner, atom, value, copy)),
+            name: name.clone(),
+        },
+        ExprKind::Lanes { base, extent } => ExprKind::Lanes {
+            base: Box::new(map_expr(base, inner, atom, value, copy)),
+            extent: map_sym(extent, atom, value),
+        },
+        ExprKind::Builtin { name, args } => ExprKind::Builtin {
+            name: *name,
+            args: args
+                .iter()
+                .map(|a| map_expr(a, inner, atom, value, copy))
+                .collect(),
+        },
+        ExprKind::Intrinsic { op: name, args } => ExprKind::Intrinsic {
+            op: *name,
+            args: args
+                .iter()
+                .map(|a| map_expr(a, inner, atom, value, copy))
+                .collect(),
+        },
+        ExprKind::Call {
+            callee,
+            shape_args,
+            elem_args,
+            args,
+        } => ExprKind::Call {
             callee: callee.clone(),
             shape_args: shape_args.iter().map(|s| map_sym(s, atom, value)).collect(),
             elem_args: elem_args.clone(),
-            args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect(),
+            args: args
+                .iter()
+                .map(|a| map_expr(a, inner, atom, value, copy))
+                .collect(),
         },
-        ExprKind::Tuple(items) => ExprKind::Tuple(items.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect()),
-        ExprKind::Unary { op, expr } => ExprKind::Unary { op: *op, expr: Box::new(map_expr(expr, inner, atom, value, copy)) },
-        ExprKind::Cast { dtype, expr } => ExprKind::Cast { dtype: *dtype, expr: Box::new(map_expr(expr, inner, atom, value, copy)) },
+        ExprKind::Tuple(items) => ExprKind::Tuple(
+            items
+                .iter()
+                .map(|a| map_expr(a, inner, atom, value, copy))
+                .collect(),
+        ),
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: Box::new(map_expr(expr, inner, atom, value, copy)),
+        },
+        ExprKind::Cast { dtype, expr } => ExprKind::Cast {
+            dtype: *dtype,
+            expr: Box::new(map_expr(expr, inner, atom, value, copy)),
+        },
         ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
             op: *op,
             lhs: Box::new(map_expr(lhs, inner, atom, value, copy)),
             rhs: Box::new(map_expr(rhs, inner, atom, value, copy)),
         },
-        ExprKind::TileAlloc { shape, dtype } => ExprKind::TileAlloc { shape: shape.iter().map(|s| map_sym(s, atom, value)).collect(), dtype: dtype.clone() },
+        ExprKind::TileAlloc { shape, dtype } => ExprKind::TileAlloc {
+            shape: shape.iter().map(|s| map_sym(s, atom, value)).collect(),
+            dtype: dtype.clone(),
+        },
         other => other.clone(),
     };
-    Expr { kind, ty: e.ty.clone(), sym, span: e.span }
+    Expr {
+        kind,
+        ty: e.ty.clone(),
+        sym,
+        span: e.span,
+    }
 }
 
 /// Widen a tile's type: it holds `factor` of what it held, along a new leading axis.
@@ -394,10 +738,17 @@ pub fn widen_ty(ty: &Ty, factor: i64) -> Ty {
         Ty::Tile(s) => {
             let mut shape = vec![Sym::constant(factor)];
             shape.extend(s.shape.iter().cloned());
-            Ty::Tile(Shaped { shape, elem: s.elem.clone(), packed_axis: s.packed_axis.map(|a| a + 1) })
+            Ty::Tile(Shaped {
+                shape,
+                elem: s.elem.clone(),
+                packed_axis: s.packed_axis.map(|a| a + 1),
+            })
         }
         // A scalar becomes a tile of `factor` scalars.
-        Ty::Scalar(d) => Ty::Tile(Shaped::new(vec![Sym::constant(factor)], crate::types::Elem::Dtype(*d))),
+        Ty::Scalar(d) => Ty::Tile(Shaped::new(
+            vec![Sym::constant(factor)],
+            crate::types::Elem::Dtype(*d),
+        )),
         other => other.clone(),
     }
 }
@@ -425,8 +776,16 @@ pub fn reads(s: &Stmt, out: &mut HashSet<VarId>) {
                     }
                 }
             }
-            ExprKind::Load { view: x, .. } | ExprKind::Transpose(x) | ExprKind::Accessor { base: x, .. } | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => expr(x, out),
-            ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => {
+            ExprKind::Load { view: x, .. }
+            | ExprKind::Transpose(x)
+            | ExprKind::Accessor { base: x, .. }
+            | ExprKind::Lanes { base: x, .. }
+            | ExprKind::Unary { expr: x, .. }
+            | ExprKind::Cast { expr: x, .. } => expr(x, out),
+            ExprKind::Builtin { args, .. }
+            | ExprKind::Intrinsic { args, .. }
+            | ExprKind::Call { args, .. }
+            | ExprKind::Tuple(args) => {
                 for a in args {
                     expr(a, out);
                 }
@@ -444,18 +803,36 @@ pub fn reads(s: &Stmt, out: &mut HashSet<VarId>) {
             expr(value, out);
         }
         StmtKind::Expr(e) => expr(e, out),
+        StmtKind::Reduction(r) => {
+            for e in r.operands() {
+                expr(e, out);
+            }
+            for body in r.bodies() {
+                for s in body {
+                    reads(s, out);
+                }
+            }
+        }
         StmtKind::Owned { tile, body, .. } => {
             expr(tile, out);
             for b in body {
                 reads(b, out);
             }
         }
-        StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } | StmtKind::Parallel { body, .. } => {
+        StmtKind::Range { body, .. }
+        | StmtKind::Lanes { body, .. }
+        | StmtKind::Parallel { body, .. } => {
             for b in body {
                 reads(b, out);
             }
         }
-        StmtKind::LoadLoop { views, body, .. } => {
+        StmtKind::LoadLoop {
+            domain,
+            views,
+            body,
+            ..
+        } => {
+            expr(&domain.view, out);
             for v in views {
                 expr(v, out);
             }

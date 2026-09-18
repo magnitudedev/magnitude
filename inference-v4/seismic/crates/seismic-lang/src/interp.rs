@@ -19,8 +19,8 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub enum TensorData {
     Dense { dtype: DType, shape: Vec<usize>, data: Vec<f64> },
-    /// Packed along the last axis: `words` holds `codes_per_word` codes each; coefficients per group.
-    Packed { repr: &'static repr::Repr, shape: Vec<usize>, words: Vec<u32>, scale: Vec<f32>, bias: Vec<f32> },
+    /// Physical byte planes in representation ABI order.
+    Packed { repr: &'static repr::Repr, shape: Vec<usize>, planes: Vec<Vec<u8>> },
 }
 
 impl TensorData {
@@ -39,18 +39,32 @@ impl TensorData {
     pub fn get(&self, flat: usize) -> f64 {
         match self {
             TensorData::Dense { data, .. } => data[flat],
-            TensorData::Packed { repr, shape, words, scale, bias } => {
-                let k = *shape.last().unwrap();
-                let row = flat / k;
-                let col = flat % k;
-                let cpw = repr.codes_per_word() as usize;
-                let words_per_row = k / cpw;
-                let word = words[row * words_per_row + col / cpw];
-                let code = (word >> ((col % cpw) as u32 * repr.bits)) & ((1u32 << repr.bits) - 1);
-                let groups_per_row = k / repr.group as usize;
-                let g = row * groups_per_row + col / repr.group as usize;
-                let b = if repr.has_bias { bias[g] } else { 0.0 };
-                (scale[g] as f64 * repr.decode_code(code) as f64 + b as f64) as f32 as f64
+            TensorData::Packed { repr, planes, .. } => {
+                let plane_value = |plane: &repr::Plane, entry: usize| -> f32 {
+                    let bytes = &planes[repr.plane_index(plane.name).unwrap()];
+                    match &plane.encoding {
+                        repr::PlaneEncoding::Packed { bits, interpretation } => interpretation.decode(repr::read_packed(bytes, entry, *bits), *bits) as f32,
+                        repr::PlaneEncoding::Dense(dtype) => {
+                            let start = entry * dtype.bytes() as usize;
+                            match dtype {
+                                DType::F32 => f32::from_le_bytes(bytes[start..start+4].try_into().unwrap()),
+                                DType::F16 => f16_to_f32(u16::from_le_bytes(bytes[start..start+2].try_into().unwrap())),
+                                DType::BF16 => f32::from_bits(u32::from(u16::from_le_bytes(bytes[start..start+2].try_into().unwrap())) << 16),
+                                _ => unreachable!("nonfloating coefficient"),
+                            }
+                        }
+                    }
+                };
+                let coefficient = |bias| match repr.coefficient(bias) {
+                    None => 0.0,
+                    Some(repr::Coefficient::Direct { plane }) => plane_value(&plane, flat / plane.group as usize),
+                    Some(repr::Coefficient::Product { factor, coefficients, field, sign }) => {
+                        let code = plane_value(&coefficients, flat / coefficients.group as usize * coefficients.fields as usize + field as usize);
+                        (plane_value(&factor, flat / factor.group as usize) * code) * sign as f32
+                    }
+                };
+                let code = repr::read_packed(&planes[0], flat, repr.bits);
+                (coefficient(false) as f64 * repr.decode_code(code) as f64 + coefficient(true) as f64) as f32 as f64
             }
         }
     }
@@ -65,7 +79,7 @@ impl TensorData {
     pub fn bytes(&self) -> usize {
         match self {
             TensorData::Dense { dtype, shape, .. } => shape.iter().product::<usize>() * dtype.bytes() as usize,
-            TensorData::Packed { words, scale, bias, .. } => words.len() * 4 + scale.len() * 4 + bias.len() * 4,
+            TensorData::Packed { planes, .. } => planes.iter().map(Vec::len).sum(),
         }
     }
 }
@@ -120,8 +134,6 @@ enum Value {
     Bool(bool),
     View(View),
     Tile(Tile),
-    /// A view of a tile: indices into a tile variable with a mapping.
-    TileView { tile: usize, shape: Vec<usize>, strides: Vec<usize>, offset: usize },
     Tuple(Vec<Value>),
     Void,
 }
@@ -211,6 +223,16 @@ impl<'a> Interpreter<'a> {
 
     fn stmt(&mut self, s: &Stmt, frame: &mut Frame) -> Result<(), String> {
         match &s.kind {
+            StmtKind::Reduction(reduction) => {
+                let original = frame.vars.len();
+                let vars = self.vars_stack.last_mut().unwrap();
+                let body = reduction.expand(reduction.tree.unwrap_or(crate::reduction::structured::Tree::Ordered), vars)?;
+                frame.vars.resize(vars.len(), None);
+                let result = self.block(&body, frame);
+                frame.vars.truncate(original);
+                self.vars_stack.last_mut().unwrap().truncate(original);
+                result
+            }
             StmtKind::Parallel { vars, extents, body } => {
                 let ext: Vec<i64> = extents.iter().map(|e| self.eval_sym(e, frame)).collect();
                 let names = self.index_names(vars);
@@ -220,7 +242,6 @@ impl<'a> Interpreter<'a> {
                 let t = self.expr(tile, frame)?;
                 let shape: Vec<i64> = match &t {
                     Value::Tile(t) => t.shape.iter().map(|d| *d as i64).collect(),
-                    Value::TileView { shape, .. } => shape.iter().map(|d| *d as i64).collect(),
                     _ => return Err("owned() of a non-tile".into()),
                 };
                 let names = self.index_names(vars);
@@ -238,19 +259,21 @@ impl<'a> Interpreter<'a> {
                 Ok(())
             }
             StmtKind::Lanes { .. } => Err("lanes cannot be interpreted; interpret the portable body".into()),
-            StmtKind::LoadLoop { vars, views, axis, piece, body, .. } => {
+            StmtKind::LoadLoop { domain, offset, vars, views, axes, piece, body, .. } => {
                 // The interpreter takes the whole axis as one piece; pieces are a lowering choice.
                 let mut tiles = Vec::new();
-                let mut extent = 0;
-                for v in views {
-                    let view = match self.expr(v, frame)? {
-                        Value::View(v) => v,
-                        other => return Err(format!("load of non-view {other:?}")),
+                let extent = match self.expr(&domain.view,frame)? {Value::View(v)=>v.shape[domain.axis],Value::Tile(t)=>t.shape[domain.axis],other=>return Err(format!("iteration domain is not shaped: {other:?}"))};
+                for (v,axis) in views.iter().zip(axes) {
+                    let tile = match self.expr(v, frame)? {
+                        Value::View(view) => self.materialize(&view),
+                        Value::Tile(tile) => tile,
+                        other => return Err(format!("streamed binding is not shaped: {other:?}")),
                     };
-                    extent = view.shape[*axis];
-                    tiles.push(self.materialize(&view));
+                    if extent != tile.shape[*axis] {return Err("streamed binding extent differs from logical domain".into());}
+                    tiles.push(tile);
                 }
                 if extent == 0 { return Ok(()); }
+                if let Some(id)=offset {let VarKind::Index(Atom::Param(name))=&self.vars_stack.last().ok_or("missing interpreter variable scope")?[*id].kind else{return Err("stream offset must be an index".into())};frame.index.insert(name.clone(),0);frame.vars[*id]=Some(Value::Int(0));}
                 let Atom::Param(pname) = piece else { unreachable!() };
                 frame.index.insert(pname.clone(), extent as i64);
                 for (var, t) in vars.iter().zip(tiles) {
@@ -275,10 +298,10 @@ impl<'a> Interpreter<'a> {
                                 let d = scalar_dtype(&target.ty);
                                 Value::Scalar(round_to(d, arith(*op, a, *b)))
                             }
-                            (op, Some(Value::Int(a)), Value::Int(b)) => Value::Int(arith(*op, a as f64, *b as f64) as i64),
+                            (op, Some(Value::Int(a)), Value::Int(b)) => Value::Int(integer_arith(*op, scalar_dtype(&target.ty), a, *b)),
                             (op, Some(Value::Tile(mut t)), Value::Tile(b)) => {
                                 for (x, y) in t.data.iter_mut().zip(&b.data) {
-                                    *x = round_to(t.dtype, arith(*op, *x, *y));
+                                    *x = typed_arith(*op, t.dtype, *x, *y);
                                 }
                                 Value::Tile(t)
                             }
@@ -314,7 +337,7 @@ impl<'a> Interpreter<'a> {
                         let cur = t.data[flat];
                         t.data[flat] = round_to(t.dtype, match op {
                             AssignOp::Assign => scalar,
-                            _ => arith(*op, cur, scalar),
+                            _ => typed_arith(*op, t.dtype, cur, scalar),
                         });
                         Ok(())
                     }
@@ -415,7 +438,7 @@ impl<'a> Interpreter<'a> {
             ExprKind::Index { base, indices } => {
                 // Fast path: an element read of a tile or view variable, without cloning the tile.
                 if let ExprKind::Var(id) = base.kind {
-                    if indices.iter().all(|i| matches!(i, Index::Point(_))) {
+                    if matches!(e.ty, Ty::Scalar(_)) && indices.iter().all(|i| matches!(i, Index::Point(_))) {
                         let mut idx = Vec::with_capacity(indices.len());
                         for i in indices {
                             let Index::Point(p) = i else { unreachable!() };
@@ -433,14 +456,13 @@ impl<'a> Interpreter<'a> {
                                 if idx.iter().zip(&t.shape).any(|(i,n)| i >= n) { return Err("point index outside tile bounds".into()); }
                                 let flat = t.flat(&idx);
                                 let x = t.data[flat];
-                                return Ok(if t.dtype.is_int() { Value::Int(x as i64) } else { Value::Scalar(x) });
+                                return Ok(scalar_value(t.dtype, x));
                             }
                             Some(Value::View(v)) if idx.len() == v.shape.len() => {
                                 if idx.iter().zip(&v.shape).any(|(i,n)| i >= n) { return Err("point index outside view bounds".into()); }
                                 let flat = v.flat(&idx);
                                 let x = self.tensors[v.tensor].get(flat);
-                                let is_int = matches!(&self.tensors[v.tensor], TensorData::Dense { dtype, .. } if dtype.is_int());
-                                return Ok(if is_int { Value::Int(x as i64) } else { Value::Scalar(x) });
+                                return Ok(scalar_value(scalar_dtype(&e.ty), x));
                             }
                             _ => {}
                         }
@@ -506,10 +528,9 @@ impl<'a> Interpreter<'a> {
                 match b {
                     Value::View(v) => {
                         let (shape, strides, offset) = apply(&v.shape, &v.strides, v.offset)?;
-                        if shape.is_empty() {
+                        if shape.is_empty() && matches!(e.ty, Ty::Scalar(_)) {
                             let x = self.tensors[v.tensor].get(offset);
-                            let is_int = matches!(&self.tensors[v.tensor], TensorData::Dense { dtype, .. } if dtype.is_int());
-                            Ok(if is_int { Value::Int(x as i64) } else { Value::Scalar(x) })
+                            Ok(scalar_value(scalar_dtype(&e.ty), x))
                         } else {
                             Ok(Value::View(View { tensor: v.tensor, shape, strides, offset }))
                         }
@@ -517,12 +538,11 @@ impl<'a> Interpreter<'a> {
                     Value::Tile(t) => {
                         let strides = row_major(&t.shape);
                         let (shape, strides, offset) = apply(&t.shape, &strides, 0)?;
-                        if shape.is_empty() {
-                            return Ok(if t.dtype.is_int() { Value::Int(t.data[offset] as i64) } else { Value::Scalar(t.data[offset]) });
+                        if shape.is_empty() && matches!(e.ty, Ty::Scalar(_)) {
+                            return Ok(scalar_value(t.dtype, t.data[offset]));
                         }
                         Ok(Value::Tile(gather(&t, &shape, &strides, offset)))
                     }
-                    Value::TileView { .. } => Err("nested tile views are not supported".into()),
                     Value::Tuple(items) => {
                         let mut out = Vec::new();
                         for item in items {
@@ -544,7 +564,37 @@ impl<'a> Interpreter<'a> {
                 other => Err(format!("cannot transpose {other:?}")),
             },
             ExprKind::Accessor { .. } | ExprKind::Lanes { .. } | ExprKind::Intrinsic { .. } => Err("backend constructs cannot be interpreted; interpret the portable body".into()),
-            ExprKind::Builtin { name, args } => self.builtin(*name, args, frame),
+            ExprKind::Builtin { name, args } => {
+                if let Some(mut reduction) = crate::reduction::structured::Reduction::from_expr(e) {
+                    // The reference interpreter's tiles are logical decoded
+                    // values. Resolve generic types before constructing local
+                    // state/leaf snapshots; physical packed planes belong to tensors.
+                    for operand in reduction.operands_mut() {
+                        if let Ty::Tile(shape)=&mut operand.ty {
+                            let element=crate::lower::subst_elem(&shape.elem,&frame.elements);
+                            shape.elem=Elem::Dtype(element.read_dtype().ok_or("unresolved reduction input element")?);
+                            shape.packed_axis=None;
+                        }
+                    }
+                    for call in std::iter::once(&mut reduction.merge).chain(reduction.step.iter_mut().map(|s|&mut s.call)) {
+                        if let ExprKind::Call{elem_args,..}=&mut call.kind {
+                            for element in elem_args {
+                                let resolved=crate::lower::subst_elem(element,&frame.elements);
+                                *element=Elem::Dtype(resolved.read_dtype().ok_or("unresolved reduction helper element")?);
+                            }
+                        }
+                    }
+                    let original = frame.vars.len();
+                    let vars = self.vars_stack.last_mut().unwrap();
+                    let body = reduction.expand(crate::reduction::structured::Tree::Ordered, vars)?;
+                    frame.vars.resize(vars.len(), None);
+                    let result = self.block(&body, frame);
+                    frame.vars.truncate(original);
+                    self.vars_stack.last_mut().unwrap().truncate(original);
+                    result?;
+                    Ok(Value::Void)
+                } else { self.builtin(*name, args, frame) }
+            }
             ExprKind::Call { callee, shape_args, elem_args, args } => {
                 let f = self.program.functions.iter().find(|f| &f.name == callee).ok_or_else(|| format!("no function `{callee}`"))?.clone();
                 let mut inner = Frame { vars: vec![None; f.vars.len()], index: HashMap::new(), shapes: HashMap::new(), elements: HashMap::new() };
@@ -579,9 +629,9 @@ impl<'a> Interpreter<'a> {
                 let v = self.expr(expr, frame)?;
                 Ok(match (op, v) {
                     (UnaryOp::Neg, Value::Scalar(x)) => Value::Scalar(-x),
-                    (UnaryOp::Neg, Value::Int(x)) => Value::Int(-x),
+                    (UnaryOp::Neg, Value::Int(x)) => Value::Int(crate::numeric::integer_value(scalar_dtype(&e.ty),(x as u32).wrapping_neg())),
                     (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
-                    (UnaryOp::BitNot, Value::Int(x)) => Value::Int(!x),
+                    (UnaryOp::BitNot, Value::Int(x)) => Value::Int(crate::numeric::integer_value(scalar_dtype(&e.ty),!(x as u32))),
                     (op, v) => return Err(format!("unary {op:?} on {v:?}")),
                 })
             }
@@ -592,6 +642,7 @@ impl<'a> Interpreter<'a> {
             }
             ExprKind::Cast { dtype, expr } => {
                 let v = self.expr(expr, frame)?;
+                if let Value::Int(x)=v {if dtype.is_int() {return Ok(Value::Int(crate::numeric::integer_value(*dtype,x as u32)));}}
                 let x = match v {
                     Value::Scalar(x) => x,
                     Value::Int(x) => x as f64,
@@ -655,17 +706,17 @@ impl<'a> Interpreter<'a> {
                 })
             }
             (Value::Int(a), Value::Int(b)) => Ok(match op {
-                BinaryOp::Add => Value::Int(a + b),
-                BinaryOp::Sub => Value::Int(a - b),
-                BinaryOp::Mul => Value::Int(a * b),
+                BinaryOp::Add => Value::Int(crate::numeric::integer_value(scalar_dtype(ty),(a as u32).wrapping_add(b as u32))),
+                BinaryOp::Sub => Value::Int(crate::numeric::integer_value(scalar_dtype(ty),(a as u32).wrapping_sub(b as u32))),
+                BinaryOp::Mul => Value::Int(crate::numeric::integer_value(scalar_dtype(ty),(a as u32).wrapping_mul(b as u32))),
                 BinaryOp::Div => Value::Int(checked_integer_division(a,b,ty,false)?),
                 BinaryOp::Rem => Value::Int(checked_integer_division(a,b,ty,true)?),
                 BinaryOp::Shl | BinaryOp::Shr => {
-                    if !(0..32).contains(&b) {return Err("integer shift count must be in 0..32".into());}
+                    if !crate::numeric::integer_shift_is_defined(Some(b)) {return Err("integer shift count must be in 0..32".into());}
                     let bits=if op==BinaryOp::Shl {(a as u32).wrapping_shl(b as u32)}
                         else if *ty==Ty::Scalar(DType::I32) {((a as i32) >> b) as u32}
                         else {(a as u32) >> b};
-                    Value::Int(if *ty==Ty::Scalar(DType::I32) {i64::from(bits as i32)}else{i64::from(bits)})
+                    Value::Int(crate::numeric::integer_value(scalar_dtype(ty),bits))
                 },
                 BinaryOp::BitAnd => Value::Int(a & b),
                 BinaryOp::BitOr => Value::Int(a | b),
@@ -690,16 +741,40 @@ impl<'a> Interpreter<'a> {
             (Value::Tile(a), Value::Tile(b)) => {
                 let Ty::Tile(s) = ty else { unreachable!() };
                 let Elem::Dtype(d) = s.elem else { unreachable!() };
-                let data = a.data.iter().zip(&b.data).map(|(x, y)| float_op(op, *x, *y).map(|v| round_to(d, v))).collect::<Result<Vec<_>, _>>()?;
+                if a.shape != b.shape { return Err("elementwise shape mismatch".into()); }
+                let data = a.data.iter().zip(&b.data).map(|(x,y)| {
+                    self.binary_element(op, scalar_value(a.dtype,*x), scalar_value(b.dtype,*y), d)
+                }).collect::<Result<Vec<_>,_>>()?;
                 Ok(Value::Tile(Tile { shape: a.shape, dtype: d, data }))
             }
-            (Value::Tile(a), Value::Scalar(b)) | (Value::Scalar(b), Value::Tile(a)) => {
+            (Value::Tile(a), b @ (Value::Scalar(_) | Value::Int(_) | Value::Bool(_))) => {
                 let Ty::Tile(s) = ty else { unreachable!() };
                 let Elem::Dtype(d) = s.elem else { unreachable!() };
-                let data = a.data.iter().map(|x| float_op(op, *x, b).map(|v| round_to(d, v))).collect::<Result<Vec<_>, _>>()?;
+                let data = a.data.iter().map(|x| {
+                    self.binary_element(op, scalar_value(a.dtype,*x), b.clone(), d)
+                }).collect::<Result<Vec<_>,_>>()?;
                 Ok(Value::Tile(Tile { shape: a.shape, dtype: d, data }))
             }
+            (a @ (Value::Scalar(_) | Value::Int(_) | Value::Bool(_)), Value::Tile(b)) => {
+                let Ty::Tile(s) = ty else { unreachable!() };
+                let Elem::Dtype(d) = s.elem else { unreachable!() };
+                let data = b.data.iter().map(|y| {
+                    self.binary_element(op, a.clone(), scalar_value(b.dtype,*y), d)
+                }).collect::<Result<Vec<_>,_>>()?;
+                Ok(Value::Tile(Tile { shape: b.shape, dtype: d, data }))
+            }
             (l, r) => Err(format!("binary {op:?} on {l:?} and {r:?}")),
+        }
+    }
+
+    // Tile expressions have the same operation and rounding semantics as
+    // evaluating the expression at each logical coordinate.
+    fn binary_element(&self, op: BinaryOp, left: Value, right: Value, dtype: DType) -> Result<f64, String> {
+        match self.binary(op,left,right,&Ty::Scalar(dtype))? {
+            Value::Scalar(x) => Ok(x),
+            Value::Int(x) => Ok(x as f64),
+            Value::Bool(x) => Ok(u8::from(x) as f64),
+            _ => Err("elementwise operation did not return a scalar".into()),
         }
     }
 
@@ -817,7 +892,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 if out_shape.is_empty() {
-                    Ok(if dtype.is_int() { Value::Int(out[0] as i64) } else { Value::Scalar(out[0]) })
+                    Ok(scalar_value(dtype,out[0]))
                 } else {
                     Ok(Value::Tile(Tile { shape: out_shape, dtype, data: out }))
                 }
@@ -869,7 +944,7 @@ impl<'a> Interpreter<'a> {
             Builtin::Abs => {
                 let d = scalar_dtype(&args[0].ty);
                 let a = self.scalar(&args[0], frame)?;
-                Ok(if d.is_int() { Value::Int(a.abs() as i64) } else { Value::Scalar(round_to(d, a.abs())) })
+                Ok(if d.is_int() { Value::Int(if d==DType::I32 {i64::from((a as i32).wrapping_abs())}else{a as i64}) } else { Value::Scalar(round_to(d, a.abs())) })
             }
             Builtin::Max | Builtin::Min => {
                 let a = self.scalar(&args[0], frame)?;
@@ -934,6 +1009,25 @@ fn scalar_dtype(ty: &Ty) -> DType {
     }
 }
 
+fn scalar_value(dtype: DType, value: f64) -> Value {
+    if dtype == DType::Bool { Value::Bool(value != 0.0) }
+    else if dtype.is_int() { Value::Int(value as i64) }
+    else { Value::Scalar(value) }
+}
+fn integer_arith(op: AssignOp, dtype: DType, a: i64, b: i64) -> i64 {
+    let (a,b) = (a as u32, b as u32);
+    let bits = match op {
+        AssignOp::Assign => b,
+        AssignOp::Add => a.wrapping_add(b),
+        AssignOp::Sub => a.wrapping_sub(b),
+        AssignOp::Mul => a.wrapping_mul(b),
+    };
+    crate::numeric::integer_value(dtype,bits)
+}
+fn typed_arith(op: AssignOp, dtype: DType, a: f64, b: f64) -> f64 {
+    if dtype.is_int() { integer_arith(op,dtype,a as i64,b as i64) as f64 }
+    else { round_to(dtype,arith(op,a,b)) }
+}
 fn arith(op: AssignOp, a: f64, b: f64) -> f64 {
     match op {
         AssignOp::Assign => b,
@@ -983,21 +1077,32 @@ impl TensorData {
     pub fn random_packed(rng: &mut Rng, rep: &'static repr::Repr, shape: Vec<usize>) -> TensorData {
         let k = *shape.last().unwrap();
         let rows: usize = shape[..shape.len() - 1].iter().product();
-        let cpw = rep.codes_per_word() as usize;
-        assert!(k % cpw == 0 && k % rep.group as usize == 0, "packed extent must be a multiple of the packet and group");
-        let mut words = vec![0u32; rows * k / cpw];
-        let groups = rows * k / rep.group as usize;
-        let coeff = |x: f32| round_to(rep.coefficient, x as f64) as f32;
-        let scale: Vec<f32> = (0..groups).map(|_| coeff((rng.unit() * 0.1 + 0.01) as f32)).collect();
-        let bias: Vec<f32> = (0..groups).map(|_| coeff((rng.unit() - 0.5) as f32)).collect();
-        for w in words.iter_mut() {
-            let mut v = 0u32;
-            for c in 0..cpw {
-                v |= ((rng.next() as u32) & ((1 << rep.bits) - 1)) << (c as u32 * rep.bits);
+        assert!(k % rep.storage_group() as usize == 0, "packed rows require complete storage groups");
+        let count = rows * k;
+        let mut planes = Vec::new();
+        for plane in rep.planes() {
+            let mut bytes = vec![0; plane.bytes(count as u64).unwrap() as usize];
+            let entries = plane.entries(count as u64).unwrap() as usize;
+            match plane.encoding {
+                repr::PlaneEncoding::Packed { bits, .. } => {
+                    for entry in 0..entries { repr::write_packed(&mut bytes, entry, bits, rng.next() as u32); }
+                }
+                repr::PlaneEncoding::Dense(dtype) => {
+                    for entry in 0..entries {
+                        let value = if plane.name == "bias" { (rng.unit() - 0.5) as f32 } else { (rng.unit() * 0.01 + 0.001) as f32 };
+                        let start = entry * dtype.bytes() as usize;
+                        match dtype {
+                            DType::F32 => bytes[start..start+4].copy_from_slice(&value.to_le_bytes()),
+                            DType::F16 => bytes[start..start+2].copy_from_slice(&f16_bits(value).to_le_bytes()),
+                            DType::BF16 => bytes[start..start+2].copy_from_slice(&((bf16_round(value).to_bits() >> 16) as u16).to_le_bytes()),
+                            _ => unreachable!("nonfloating coefficient"),
+                        }
+                    }
+                }
             }
-            *w = v;
+            planes.push(bytes);
         }
-        TensorData::Packed { repr: rep, shape, words, scale, bias: if rep.has_bias { bias } else { Vec::new() } }
+        TensorData::Packed { repr: rep, shape, planes }
     }
 
     /// Byte images of the buffers this tensor occupies on a device, in ABI order.
@@ -1017,28 +1122,7 @@ impl TensorData {
                 }
                 vec![out]
             }
-            TensorData::Packed { words, scale, bias, repr, .. } => {
-                let mut w = Vec::with_capacity(words.len() * 4);
-                for x in words {
-                    w.extend_from_slice(&x.to_le_bytes());
-                }
-                let coeff_bytes = |values: &Vec<f32>| -> Vec<u8> {
-                    let mut out = Vec::with_capacity(values.len() * repr.coefficient.bytes() as usize);
-                    for x in values {
-                        match repr.coefficient {
-                            DType::BF16 => out.extend_from_slice(&(x.to_bits() >> 16).to_le_bytes()[..2]),
-                            DType::F16 => out.extend_from_slice(&f16_bits(*x).to_le_bytes()),
-                            _ => out.extend_from_slice(&x.to_le_bytes()),
-                        }
-                    }
-                    out
-                };
-                let mut out = vec![w, coeff_bytes(scale)];
-                if repr.has_bias {
-                    out.push(coeff_bytes(bias));
-                }
-                out
-            }
+            TensorData::Packed { planes, .. } => planes.clone(),
         }
     }
 
@@ -1061,6 +1145,6 @@ impl TensorData {
 }
 
 fn checked_integer_division(a:i64,b:i64,ty:&Ty,remainder:bool)->Result<i64,String>{
-    if b==0 || (matches!(ty,Ty::Scalar(DType::I32)) && a==i64::from(i32::MIN) && b == -1) { return Err("integer division by zero or signed overflow".into()); }
+    if !crate::numeric::integer_division_is_defined(scalar_dtype(ty),Some(a),Some(b)) { return Err("integer division by zero or signed overflow".into()); }
     (if remainder {a.checked_rem_euclid(b)} else {a.checked_div_euclid(b)}).ok_or_else(||"integer division overflow".into())
 }

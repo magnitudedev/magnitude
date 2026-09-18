@@ -65,12 +65,16 @@ pub struct Stmt {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
+    /// Coupled source state and its merge remain visible until execution choices
+    /// have been resolved. Backend realization expands this same operation.
+    Reduction(Box<crate::reduction::structured::Reduction>),
     Parallel { vars: Vec<VarId>, extents: Vec<Sym>, body: Vec<Stmt> },
-    /// `for vars in load(views, over=axis)`; `piece` is the lowering-chosen extent along `axis`.
+    /// Internal selected streaming execution. `piece` is the compiler-chosen extent
+    /// along `axis`; ordinary source code cannot observe or author this node.
     /// After lowering, `capacity` is the static piece size when the axis extent is dynamic
     /// (the piece atom then stays symbolic and denotes the runtime extent of each piece).
     /// `modes` is unresolved before selection; afterward it contains one load mode per binding.
-    LoadLoop { modes: Option<Vec<LoadMode>>, vars: Vec<VarId>, views: Vec<Expr>, axis: usize, piece: Atom, capacity: Option<i64>, body: Vec<Stmt> },
+    LoadLoop { domain: IterationDomain, offset: Option<VarId>, modes: Option<Vec<LoadMode>>, vars: Vec<VarId>, views: Vec<Expr>, axes: Vec<usize>, piece: Atom, capacity: Option<i64>, body: Vec<Stmt> },
     Owned { vars: Vec<VarId>, tile: Expr, body: Vec<Stmt> },
     Range { var: VarId, lo: Sym, hi: Sym, body: Vec<Stmt> },
     /// Lowering scope: iterate `extent` across the subgroup's lanes, `width` consecutive per lane.
@@ -78,6 +82,14 @@ pub enum StmtKind {
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
     Assign { target: Expr, op: AssignOp, value: Expr },
     Expr(Expr),
+}
+
+/// Logical iteration geometry independent of the transfers chosen for its body.
+/// The view is evaluated only for metadata and extent guards, never materialized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IterationDomain {
+    pub view: Expr,
+    pub axis: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]

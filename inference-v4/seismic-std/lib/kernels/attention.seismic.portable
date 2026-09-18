@@ -1,5 +1,6 @@
-# One online-softmax update. Running state is explicit and initialized by its caller.
-fn attention_piece[M, K, W](qt: tile[M, W] A, kt: tile[K, W] A, vt: tile[K, W] A,
+# Softmax update over a logical history domain. Its matrix contractions and
+# reductions remain available for compiler-derived blocking and retained state.
+fn attention_update[M, K, W](qt: tile[M, W] A, kt: tile[K, W] A, vt: tile[K, W] A,
                            m: tile[M] f32, l: tile[M] f32, acc: tile[M, W] f32, scale: f32):
   s = tile[M, K] f32
   for i, j in owned(s): s[i, j] = 0.0
@@ -16,11 +17,9 @@ fn attention_piece[M, K, W](qt: tile[M, W] A, kt: tile[K, W] A, vt: tile[K, W] A
   matmul(s, vt.T, acc)
   m = m2
 
-# Streaming causal attention over grouped query heads. Q query rows attend to a history of
-# T positions; H query heads share KV key-value heads, H / KV per group. visible[q] is the
-# [start, end) of the history query row q may read. The history is streamed in pieces the
-# model sizes, with the running maximum and denominator carried across them, so no partial
-# results and no merge phase appear in the text.
+# Causal attention over grouped query heads. Each visible range is a logical
+# algorithmic window, independent of compiler partitioning. Empty history has no
+# update effect; decoding consumes the fresh dense row before cache-codec rounding.
 fn attention[Q, T, H, KV, W](q: tensor[Q, H, W] A, k: tensor[T, KV, W] A, v: tensor[T, KV, W] A,
                              visible: tensor[Q, 2] i32, out: tensor[Q, H, W] A, scale: f32):
   for row, kv_head in parallel:
@@ -30,8 +29,10 @@ fn attention[Q, T, H, KV, W](q: tensor[Q, H, W] A, k: tensor[T, KV, W] A, v: ten
     acc = tile[H / KV, W] f32
     for i in owned(m): m[i] = -inf; l[i] = 0.0
     for i, j in owned(acc): acc[i, j] = 0.0
-    for kt, vt in load((k, v)[visible[row, 0] : visible[row, 1], kv_head], over=0):
-      attention_piece(qt, kt, vt, m, l, acc, scale)
+    kt = load(k[visible[row, 0] : visible[row, 1], kv_head])
+    vt = load(v[visible[row, 0] : visible[row, 1], kv_head])
+    if extent(kt, 0) > 0:
+      attention_update(qt, kt, vt, m, l, acc, scale)
     y = tile[H / KV, W] f32
     for i, j in owned(y): y[i, j] = acc[i, j] / l[i]
     store(y, out[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
@@ -48,11 +49,13 @@ fn attention_decode[T, H, KV, W](q: tensor[1, H, W] A, k: tensor[T, KV, W] A,
     acc = tile[H / KV, W] f32
     for i in owned(m): m[i] = -inf; l[i] = 0.0
     for i, j in owned(acc): acc[i, j] = 0.0
-    for kt, vt in load((k, v)[visible[0, 0]:visible[0, 1], kv_head], over=0):
-      attention_piece(qt, kt, vt, m, l, acc, scale)
-    kt = load(fresh_key[0:1, kv_head])
-    vt = load(fresh_value[0:1, kv_head])
-    attention_piece(qt, kt, vt, m, l, acc, scale)
+    kt = load(k[visible[0, 0]:visible[0, 1], kv_head])
+    vt = load(v[visible[0, 0]:visible[0, 1], kv_head])
+    if extent(kt, 0) > 0:
+      attention_update(qt, kt, vt, m, l, acc, scale)
+    fresh_kt = load(fresh_key[0:1, kv_head])
+    fresh_vt = load(fresh_value[0:1, kv_head])
+    attention_update(qt, fresh_kt, fresh_vt, m, l, acc, scale)
     y = tile[H / KV, W] f32
     for i, j in owned(y): y[i, j] = acc[i, j] / l[i]
     store(y, out[0, kv_head * (H / KV):(kv_head + 1) * (H / KV)])

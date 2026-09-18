@@ -18,26 +18,9 @@ use seismic_lang::interp::Rng;
 /// Pack a [n, k] matrix of q4 codes with per-group scale and bias; returns the tensor and the decoded values.
 fn packed_q4g64(rng: &mut Rng, n: usize, k: usize) -> (TensorData, Vec<f64>) {
     let rep = repr::lookup("q4g64").unwrap();
-    let cpw = rep.codes_per_word() as usize;
-    let mut words = vec![0u32; n * k / cpw];
-    let groups = n * k / rep.group as usize;
-    let mut scale = Vec::with_capacity(groups);
-    let mut bias = Vec::with_capacity(groups);
-    for _ in 0..groups {
-        scale.push((rng.unit() * 0.1 + 0.01) as f32);
-        bias.push((rng.unit() - 0.5) as f32);
-    }
-    let mut decoded = vec![0f64; n * k];
-    for row in 0..n {
-        for col in 0..k {
-            let code = (rng.next() % 16) as u32;
-            let w = row * (k / cpw) + col / cpw;
-            words[w] |= code << ((col % cpw) as u32 * rep.bits);
-            let g = row * (k / rep.group as usize) + col / rep.group as usize;
-            decoded[row * k + col] = (scale[g] as f64 * code as f64 + bias[g] as f64) as f32 as f64;
-        }
-    }
-    (TensorData::Packed { repr: rep, shape: vec![n, k], words, scale, bias }, decoded)
+    let tensor = TensorData::random_packed(rng, rep, vec![n, k]);
+    let decoded = (0..n * k).map(|i| tensor.get(i)).collect();
+    (tensor, decoded)
 }
 
 #[test]
@@ -51,8 +34,7 @@ fn projection_matches_direct_dot_products() {
     let xt = interp.add_tensor(TensorData::dense(DType::BF16, vec![1, k], x.clone()));
     let wt = interp.add_tensor(w);
     let out = interp.add_tensor(TensorData::dense(DType::BF16, vec![1, n], vec![0.0; n]));
-    // `projection` computes RPI output rows per work item; one row per item here.
-    let shapes = HashMap::from([("N".to_string(), n as i64), ("K".to_string(), k as i64), ("RPI".to_string(), 1)]);
+    let shapes = HashMap::from([("N".to_string(), n as i64), ("K".to_string(), k as i64)]);
     interp.run("projection", &[Arg::Tensor(xt), Arg::Tensor(wt), Arg::Tensor(out)], &shapes).unwrap();
     for col in 0..n {
         let expect: f64 = (0..k).map(|i| x[i] * decoded[col * k + i]).sum();
@@ -98,5 +80,73 @@ fn integer_division_is_euclidean_and_invalid_inputs_return_errors() {
     }
     for (a,b) in [(1,0),(i32::MIN,-1)] {
         assert!(interpreter.run("division",&[Arg::Scalar(f64::from(a)),Arg::Scalar(f64::from(b)),Arg::Tensor(output)],&HashMap::new()).is_err());
+    }
+}
+
+#[test]
+fn integer_arithmetic_and_bit_casts_preserve_32bit_wrapping() {
+    use seismic_lang::{program::SourceFile,Scope};
+    let p=compile(&[SourceFile{path:"wrapping.seismic.portable".into(),scope:Scope::Portable,text:r#"
+fn wrapping(a:i32,b:i32,out:tensor[11] i32):
+  t=tile[11] i32
+  for i in owned(t): t[i]=0
+  t[0]=a+b
+  t[1]=a-b
+  t[2]=a*b
+  t[3]=-a
+  t[4]=abs(a)
+  t[5]=i32(u32(a))
+  t[6]=i32(~u32(a))
+  t[7]=i32(u32(a)+u32(b))
+  c=a
+  c+=b
+  t[8]=c
+  t[9]=a
+  t[9]-=b
+  t[10]=a
+  t[10]*=b
+  store(t,out)
+"#.into()}],&[]).unwrap();
+    let mut vm=Interpreter::new(&p);
+    let out=vm.add_tensor(TensorData::dense(DType::I32,vec![11],vec![0.0;11]));
+    for (a,b) in [(i32::MAX,1),(i32::MIN,-1),(-1,i32::MAX),(65536,65536)] {
+        vm.run("wrapping",&[Arg::Scalar(a as f64),Arg::Scalar(b as f64),Arg::Tensor(out)],&HashMap::new()).unwrap();
+        for (i,want) in [a.wrapping_add(b),a.wrapping_sub(b),a.wrapping_mul(b),a.wrapping_neg(),a.wrapping_abs(),a,!a,a.wrapping_add(b),a.wrapping_add(b),a.wrapping_sub(b),a.wrapping_mul(b)].into_iter().enumerate() {assert_eq!(vm.tensors[out].get(i),want as f64);}
+    }
+}
+
+#[test]
+fn tile_expressions_share_scalar_order_wrapping_rounding_and_errors() {
+    use seismic_lang::{program::SourceFile, Scope};
+    for dtype in [DType::I32, DType::U32, DType::F16, DType::F32] {
+        let expressions = ["a+b", "a-b", "a*b", "s-a", "s/a", "a/s", "a%s", "s%a"];
+        let vector = expressions.iter().enumerate().map(|(i,e)| {
+            format!("  v{i} = {e}\n  store(v{i},out[{i},:])\n")
+        }).collect::<String>();
+        let scalar = expressions.iter().enumerate().map(|(i,e)| {
+            format!("    if i == {i}: r[i,j] = {}\n",e.replace('a',"a[j]").replace('b',"b[j]"))
+        }).collect::<String>();
+        let name = dtype.name();
+        let text = format!("fn vector(x:tensor[4] {name},y:tensor[4] {name},s:{name},out:tensor[8,4] {name}):\n  a=load(x)\n  b=load(y)\n{vector}\nfn scalar(x:tensor[4] {name},y:tensor[4] {name},s:{name},out:tensor[8,4] {name}):\n  a=load(x)\n  b=load(y)\n  r=tile[8,4] {name}\n  for i,j in owned(r):\n    r[i,j] = 0\n{scalar}  store(r,out)\n");
+        let p=compile(&[SourceFile{path:"elementwise.seismic.portable".into(),scope:Scope::Portable,text}],&[]).unwrap();
+        let mut vm=Interpreter::new(&p);
+        let values = match dtype {
+            DType::I32 => vec![i32::MAX as f64,i32::MIN as f64,-7.0,3.0],
+            DType::U32 => vec![u32::MAX as f64,2147483648.0,7.0,3.0],
+            _ => vec![65504.0,-0.25,-7.0,3.0],
+        };
+        let x=vm.add_tensor(TensorData::dense(dtype,vec![4],values));
+        let y=vm.add_tensor(TensorData::dense(dtype,vec![4],vec![2.0,1.0,6.0,3.0]));
+        let vector=vm.add_tensor(TensorData::dense(dtype,vec![8,4],vec![0.0;32]));
+        let scalar=vm.add_tensor(TensorData::dense(dtype,vec![8,4],vec![0.0;32]));
+        for (entry,out) in [("vector",vector),("scalar",scalar)] {
+            vm.run(entry,&[Arg::Tensor(x),Arg::Tensor(y),Arg::Scalar(7.0),Arg::Tensor(out)],&HashMap::new()).unwrap();
+        }
+        assert_eq!(vm.tensors[vector].device_bytes(),vm.tensors[scalar].device_bytes(),"{name}");
+        if dtype.is_int() {
+            for (entry,out) in [("vector",vector),("scalar",scalar)] {
+                assert!(vm.run(entry,&[Arg::Tensor(x),Arg::Tensor(y),Arg::Scalar(0.0),Arg::Tensor(out)],&HashMap::new()).is_err(),"{name} {entry} division by zero");
+            }
+        }
     }
 }

@@ -106,3 +106,35 @@ mod tests {
         }
     }
 }
+
+/// Integer arithmetic is modulo 2^32. Signedness determines the interpretation
+/// of those bits; integer-to-integer casts preserve them. Float-to-integer casts
+/// have their separate saturating conversion semantics.
+pub fn integer_value(dtype: crate::types::DType, bits: u32) -> i64 {
+    match dtype {
+        crate::types::DType::I32 => i64::from(bits as i32),
+        crate::types::DType::U32 => i64::from(bits),
+        _ => panic!("integer bits require an integer dtype"),
+    }
+}
+
+/// Whether the available source operands establish defined integer division or
+/// remainder. Unknown dividends are sufficient unless signed overflow remains
+/// possible. These are the same preconditions for evaluation and omission.
+pub fn integer_division_is_defined(
+    dtype: crate::types::DType,
+    dividend: Option<i64>,
+    divisor: Option<i64>,
+) -> bool {
+    match divisor {
+        None | Some(0) => false,
+        Some(-1) if dtype == crate::types::DType::I32 => {
+            dividend.is_some_and(|a| a != i64::from(i32::MIN))
+        }
+        Some(_) => true,
+    }
+}
+
+pub fn integer_shift_is_defined(count: Option<i64>) -> bool {
+    count.is_some_and(|n| (0..32).contains(&n))
+}

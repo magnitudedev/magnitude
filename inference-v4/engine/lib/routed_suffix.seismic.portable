@@ -37,8 +37,9 @@ fn routed_input[M, E, K, H, F](x: tensor[M, H] A, routes: tensor[M, K] i32,
     expert = route[0]
     acc = tile[1, 1] f32
     for i,j in owned(acc): acc[i,j] = 0.0
-    for xt, wt in load((x[row:row+1], weight[expert, col:col+1]), over=1):
-      matmul(xt, wt, acc)
+    xt = load(x[row:row+1])
+    wt = load(weight[expert, col:col+1])
+    matmul(xt, wt, acc)
     store(acc, out[row, choice:choice+1, col:col+1])
 
 # Unlike the dense shared expert, routed SiLU has no separate compact publication.
@@ -58,8 +59,9 @@ fn routed_output[M, E, K, H, F](x: tensor[M, K, F] A, routes: tensor[M, K] i32,
     expert = route[0]
     acc = tile[1, 1] f32
     for i,j in owned(acc): acc[i,j] = 0.0
-    for xt, wt in load((x[row, choice:choice+1], weight[expert, col:col+1]), over=1):
-      matmul(xt, wt, acc)
+    xt = load(x[row, choice:choice+1])
+    wt = load(weight[expert, col:col+1])
+    matmul(xt, wt, acc)
     store(acc, out[row, choice:choice+1, col:col+1])
 
 fn shared_coefficient[M, H](x: tensor[M, H] A, weight: tensor[H] W, out: tensor[M, 1] A):

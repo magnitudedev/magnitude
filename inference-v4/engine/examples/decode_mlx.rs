@@ -10,18 +10,9 @@ use seismic_engine::{
     },
 };
 use seismic_lang::{lower::Options, types::DType};
-use seismic_runtime::{
-    plan::{CompilationChoices, KernelChoice},
-    Candidate, Device,
-};
+use seismic_runtime::{Candidate, Device, plan::Diagnostic};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, rc::Rc, time::Instant};
-#[derive(Clone, Copy)]
-enum Override {
-    Stream,
-    Tile,
-    Groups,
-}
 
 enum Artifact {
     Mlx(MlxArtifact),
@@ -41,7 +32,7 @@ impl Artifact {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     if !(args.len() == 6 || args.len() == 7) {
-        return Err("usage: decode_mlx cpu|cuda|metal ARTIFACT PIECE[,KERNEL=PIECE] CONTEXT TOKEN_IDS_COMMA_SEPARATED [batch]".into());
+        return Err("usage: decode_mlx cpu|cuda|metal ARTIFACT PIECE CONTEXT TOKEN_IDS_COMMA_SEPARATED [batch]".into());
     }
     if args.get(6).is_some_and(|mode| mode != "batch") {
         return Err("execution mode must be batch when specified".into());
@@ -56,23 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(Some(n))
     };
-    let mut parts = args[3].split(',');
-    let piece = parse_piece(parts.next().unwrap())?;
-    let overrides = parts
-        .map(|part| {
-            let (entry, value) = part
-                .split_once('=')
-                .ok_or("expected kernel=piece override")?;
-            let (kind, value) = if let Some(value) = value.strip_prefix("tile:") {
-                (Override::Tile, value)
-            } else if let Some(value) = value.strip_prefix("groups:") {
-                (Override::Groups, value)
-            } else {
-                (Override::Stream, value)
-            };
-            Ok((entry.to_string(), parse_piece(value)?, kind))
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let piece = parse_piece(&args[3])?;
     let (device, candidate) = match args[1].as_str() {
         "cpu" => (
             Device::cpu(),
@@ -120,48 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = Importer::new(device.clone(), candidate.clone())?;
     let mut cache: HashMap<(String, String, String), ResidentWeight> = HashMap::new();
     let start = Instant::now();
-    let choices = CompilationChoices {
-        default: KernelChoice {
-            candidate: candidate.clone(),
-            lowering: Options { piece },
+    let choices = Diagnostic {
+        candidate: candidate.clone(),
+        lowering: Options {
+            piece,
+            ..Default::default()
         },
-        kernels: overrides
-            .into_iter()
-            .map(|(entry, selected, kind)| {
-                let mut realization = candidate.clone();
-                if !matches!(kind, Override::Stream) {
-                    #[cfg(target_os = "macos")]
-                    if let Candidate::Metal(config) = &mut realization {
-                        let selected =
-                            selected.ok_or("realization override needs a positive extent")?;
-                        match kind {
-                            Override::Tile => config.tile_piece = Some(selected),
-                            Override::Groups => config.sg_per_tg = selected,
-                            Override::Stream => unreachable!(),
-                        }
-                    } else {
-                        return Err("tile/group overrides currently require Metal");
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    return Err("tile/group overrides currently require Metal");
-                }
-                Ok((
-                    entry,
-                    KernelChoice {
-                        candidate: realization,
-                        lowering: Options {
-                            piece: if matches!(kind, Override::Stream) {
-                                selected
-                            } else {
-                                piece
-                            },
-                        },
-                    },
-                ))
-            })
-            .collect::<Result<_, &str>>()?,
     };
-    let mut decoder = Decoder::compile(
+    let mut decoder = Decoder::compile_diagnostic(
         device,
         &description,
         |descriptor, target: DType| {

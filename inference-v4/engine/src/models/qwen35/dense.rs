@@ -89,7 +89,7 @@ impl DenseSuffix {
             ("DW".into(), weights.down.element().clone()),
         ]);
         let planned = plan_specialized(program, "qwen_dense_suffix", &shapes, &elements)?;
-        let plan = CompiledPlan::compile(device, program, &planned, options, candidate)?;
+        let plan = CompiledPlan::compile_diagnostic(device, program, &planned, options, candidate)?;
         let mut scratch = HashMap::new();
         for (name, width) in [
             ("normalized", hidden),

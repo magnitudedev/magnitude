@@ -1,7 +1,7 @@
 use seismic_lang::{
-    lower::lower,
-    program::{compile, SourceFile},
     Scope,
+    lower::lower,
+    program::{SourceFile, compile},
 };
 use seismic_metal::{execution::Config, msl::emit_storage_selected};
 use seismic_realization::dispatch::TilePlacement;
@@ -50,13 +50,18 @@ fn emitted_storage_is_the_selected_form_and_cross_owner_reads_reject() {
         )
         .unwrap();
         assert_eq!(count, 2);
-        assert!(emitted
-            .launches
-            .iter()
-            .flat_map(|l| &l.tiles)
-            .all(|t| t.placement == placement));
+        assert!(
+            emitted
+                .launches
+                .iter()
+                .flat_map(|l| &l.tiles)
+                .all(|t| t.placement == placement)
+        );
     }
-    let lowered = program("fn evaluate[M,N](x: tensor[M,N] f32, out: tensor[M,N] f32):\n  for row in parallel:\n    t = load(x[row])\n    for i in owned(t): t[i] = t[i] + 1.0\n    y = tile[N] f32\n    for i in owned(y): y[i] = t[(i+1)%N]\n    store(y,out[row])\n", 65);
+    let lowered = program(
+        "fn evaluate[M,N](x: tensor[M,N] f32, out: tensor[M,N] f32):\n  for row in parallel:\n    t = load(x[row])\n    for i in owned(t): t[i] = t[i] + 1.0\n    y = tile[N] f32\n    for i in owned(y): y[i] = t[(i+1)%N]\n    store(y,out[row])\n",
+        65,
+    );
     let error = emit_storage_selected(
         &lowered,
         Config {
@@ -142,7 +147,10 @@ fn load_strategy_is_explicit_and_independent_of_tile_size() {
     }
     // A store may alias the source of the snapshot. Borrowing is not legal merely
     // because that source has a different parameter name from the store target.
-    let lowered = program("fn evaluate[M,N](x: tensor[M,N] f32, out: tensor[M,N] f32):\n  for row in parallel:\n    t = load(x[row])\n    zeros = tile[N] f32\n    for i in owned(zeros): zeros[i] = 0.0\n    store(zeros,out[row])\n    store(t,out[row])\n", 65);
+    let lowered = program(
+        "fn evaluate[M,N](x: tensor[M,N] f32, out: tensor[M,N] f32):\n  for row in parallel:\n    t = load(x[row])\n    zeros = tile[N] f32\n    for i in owned(zeros): zeros[i] = 0.0\n    store(zeros,out[row])\n    store(t,out[row])\n",
+        65,
+    );
     let emitted = seismic_metal::msl::emit_with(
         &lowered,
         Config {
@@ -151,11 +159,13 @@ fn load_strategy_is_explicit_and_independent_of_tile_size() {
         },
     )
     .unwrap();
-    assert!(emitted
-        .launches
-        .iter()
-        .flat_map(|l| &l.tiles)
-        .any(|t| t.symbol == "t"));
+    assert!(
+        emitted
+            .launches
+            .iter()
+            .flat_map(|l| &l.tiles)
+            .any(|t| t.symbol == "t")
+    );
 }
 
 #[test]
@@ -179,19 +189,25 @@ fn storage_domains_are_available_from_ir_and_widening_recomputes_ownership() {
             .unwrap(),
         (0, 1040)
     );
-    assert!(analysis
-        .decision(t, 65, seismic_lang::types::DType::F16)
-        .is_err());
+    assert!(
+        analysis
+            .decision(t, 65, seismic_lang::types::DType::F16)
+            .is_err()
+    );
     assert_eq!(
         domain.alternatives,
         vec![TilePlacement::Replicated, TilePlacement::GroupShared]
     );
-    assert!(analysis
-        .decision(lowered.vars.len(), 65, seismic_lang::types::DType::F32)
-        .is_err());
-    assert!(analysis
-        .decision(t, -1, seismic_lang::types::DType::F32)
-        .is_err());
+    assert!(
+        analysis
+            .decision(lowered.vars.len(), 65, seismic_lang::types::DType::F32)
+            .is_err()
+    );
+    assert!(
+        analysis
+            .decision(t, -1, seismic_lang::types::DType::F32)
+            .is_err()
+    );
     let mut cross_reads = 0;
     emit_storage_selected(
         &lowered,
@@ -286,4 +302,42 @@ fn storage_is_resolved_before_printing_and_reused_without_selection() {
         }
     }
     assert_eq!(decisions.len(), 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Metal hardware"]
+fn tile_reassignment_snapshots_overlapping_views_before_writing() {
+    let lowered = program(
+        "fn evaluate[M,N](x: tensor[N,N] f32, out: tensor[N,N] f32):\n  a = load(x)\n  a = a.T\n  for step in range(0,2):\n    a = a.T\n  store(a,out)\n",
+        7,
+    );
+    let device = seismic_metal::runtime::Device::open().unwrap();
+    let facts = device.info();
+    let values: Vec<_> = (0..49).map(|i| i as f32 * 0.25).collect();
+    let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    for placement in [TilePlacement::Replicated, TilePlacement::GroupShared] {
+        let emitted = emit_storage_selected(
+            &lowered,
+            Config {
+                loads: seismic_realization::LoadStrategy::Materialize,
+                max_threads_per_threadgroup: facts.max_threads_per_threadgroup as i64,
+                max_threadgroup_bytes: facts.max_threadgroup_bytes as i64,
+                ..Default::default()
+            },
+            &mut |_| Ok(placement.clone()),
+        )
+        .unwrap();
+        let pipeline = device.compile(emitted).unwrap();
+        let input = device.buffer_from(&bytes).unwrap();
+        let output = device.buffer(bytes.len()).unwrap();
+        device.run(&pipeline, &[&input, &output], &[], 1).unwrap();
+        for (i, value) in output.read(bytes.len()).chunks_exact(4).enumerate() {
+            assert_eq!(
+                f32::from_le_bytes(value.try_into().unwrap()),
+                values[(i % 7) * 7 + i / 7],
+                "{placement:?} at {i}"
+            );
+        }
+    }
 }

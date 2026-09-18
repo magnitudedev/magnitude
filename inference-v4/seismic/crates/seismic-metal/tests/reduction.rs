@@ -1,3 +1,6 @@
+// These tests exercise the admitted internal primitive reduction forms. Source
+// reductions retain exact trees; their production path is covered in native/tuning.
+mod support;
 use seismic_lang::types::DType;
 use seismic_metal::reduction::{Algorithm, ReductionDomain};
 use seismic_realization::dispatch::{GroupDispatch, TilePlacement};
@@ -66,10 +69,12 @@ fn empty_reduction_axes_and_empty_outputs_are_distinct() {
     assert!(identity.scalar_output());
     assert_eq!(identity.output_capacity(), 1);
     assert_eq!(identity.algorithms(), [Algorithm::Ordered]);
-    assert!(identity
-        .output(Algorithm::Ordered, "scalar".into())
-        .unwrap()
-        .is_none());
+    assert!(
+        identity
+            .output(Algorithm::Ordered, "scalar".into())
+            .unwrap()
+            .is_none()
+    );
     let empty = ReductionDomain::new(
         &[3, 0],
         0,
@@ -95,9 +100,8 @@ fn empty_reduction_axes_and_empty_outputs_are_distinct() {
 #[ignore = "requires Metal hardware"]
 fn boolean_reductions_use_boolean_identities_and_no_numeric_collective() {
     use seismic_lang::{
-        lower::lower,
-        program::{compile, SourceFile},
         Scope,
+        program::{SourceFile, compile},
     };
     use seismic_metal::{execution::Config, msl::emit_storage_selected, runtime::Device};
     let device = Device::open().unwrap();
@@ -105,7 +109,9 @@ fn boolean_reductions_use_boolean_identities_and_no_numeric_collective() {
         .map(|i| u8::from(i % 5 == 1 || (i % 5 == 2 && i / 5 == 0)))
         .collect();
     for op in ["sum", "max", "min"] {
-        let source = format!("fn evaluate(x: tensor[3,5] bool, out: tensor[5] bool):\n  t = load(x)\n  y = reduce(t,0,{op})\n  store(y,out)\n");
+        let source = format!(
+            "fn evaluate(x: tensor[3,5] bool, out: tensor[5] bool):\n  t = load(x)\n  y = reduce(t,0,{op})\n  store(y,out)\n"
+        );
         let program = compile(
             &[SourceFile {
                 path: "boolean-reduction.seismic.portable".into(),
@@ -115,7 +121,7 @@ fn boolean_reductions_use_boolean_identities_and_no_numeric_collective() {
             &[],
         )
         .unwrap();
-        let ir = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+        let ir = support::common_ir(&program);
         for placement in [
             TilePlacement::Replicated,
             TilePlacement::GroupShared,
@@ -157,16 +163,18 @@ fn boolean_reductions_use_boolean_identities_and_no_numeric_collective() {
 #[ignore = "requires Metal hardware"]
 fn reduction_forms_match_reference_and_report_output_allocations() {
     use seismic_lang::{
-        lower::lower,
-        program::{compile, SourceFile},
         Scope,
+        program::{SourceFile, compile},
     };
     use seismic_metal::{execution::Config, msl::emit_storage_selected, runtime::Device};
     let device = Device::open().unwrap();
     for (rows, cols, axis) in [(3, 64, 0), (3, 65, 0), (4, 33, 1), (0, 4, 0), (3, 0, 0)] {
         let output_count = if axis == 0 { cols } else { rows };
         for ordered in [false, true] {
-            let source = format!("fn evaluate(x: tensor[{rows},{cols}] f32, out: tensor[{output_count}] f32):\n  t = load(x)\n  y = reduce(t,{axis},sum,ordered={})\n  store(y,out)\n",if ordered {"true"}else{"false"});
+            let source = format!(
+                "fn evaluate(x: tensor[{rows},{cols}] f32, out: tensor[{output_count}] f32):\n  t = load(x)\n  y = reduce(t,{axis},sum,ordered={})\n  store(y,out)\n",
+                if ordered { "true" } else { "false" }
+            );
             let program = compile(
                 &[SourceFile {
                     path: "reduction.seismic.portable".into(),
@@ -176,7 +184,7 @@ fn reduction_forms_match_reference_and_report_output_allocations() {
                 &[],
             )
             .unwrap();
-            let ir = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+            let ir = support::common_ir(&program);
             let values: Vec<f32> = (0..rows * cols).map(|i| (i % 7) as f32 - 3.).collect();
             for placement in [
                 TilePlacement::Replicated,
@@ -233,15 +241,14 @@ fn reduction_forms_match_reference_and_report_output_allocations() {
 
 fn nested_reduction() -> seismic_lang::lowered_ir::LoweredIr {
     use seismic_lang::{
-        lower::lower,
-        program::{compile, SourceFile},
         Scope,
+        program::{SourceFile, compile},
     };
     let program = compile(&[SourceFile {
         path: "planned-reduction.seismic.portable".into(), scope: Scope::Portable,
         text: "fn evaluate(x: tensor[3,64] f32, out: tensor[1] f32):\n  a = load(x)\n  y = reduce(a,0,sum)\n  z = tile[1] f32\n  for i in owned(z): z[i] = reduce(y,0,sum)\n  store(z,out)\n".into(),
     }], &[]).unwrap();
-    lower(&program, "evaluate", "metal", &Default::default()).unwrap()
+    support::common_ir(&program)
 }
 
 fn selected_nested(algorithm: Algorithm) -> seismic_metal::execution::Execution {
@@ -336,15 +343,14 @@ fn every_selected_reduction_algorithm_executes_the_same_composition() {
 #[test]
 fn partially_active_owned_domain_cannot_select_a_cross_lane_reduction() {
     use seismic_lang::{
-        lower::lower,
-        program::{compile, SourceFile},
         Scope,
+        program::{SourceFile, compile},
     };
     let program = compile(&[SourceFile {
         path: "masked-reduction.seismic.portable".into(), scope: Scope::Portable,
         text: "fn evaluate(x: tensor[64] f32, out: tensor[1] f32):\n  a = load(x)\n  z = tile[1] f32\n  for i in owned(z): z[i] = 0.0\n  for i in owned(z):\n    if i == 0: z[i] = reduce(a,0,sum)\n  store(z,out)\n".into(),
     }], &[]).unwrap();
-    let ir = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+    let ir = support::common_ir(&program);
     let result = seismic_metal::execution::prepare_selected(
         &ir,
         Default::default(),
@@ -399,12 +405,11 @@ fn argmax_domains_include_direct_reads_and_check_lane_participation() {
 #[ignore = "requires Metal hardware"]
 fn argmax_plans_preserve_nan_ties_empty_outputs_and_large_shapes() {
     use seismic_lang::{
-        lower::lower,
-        program::{compile, SourceFile},
         Scope,
+        program::{SourceFile, compile},
     };
     use seismic_metal::{
-        execution::{prepare_selected, Config},
+        execution::{Config, prepare_selected},
         msl::emit_execution,
         runtime::Device,
     };
@@ -416,7 +421,7 @@ fn argmax_plans_preserve_nan_ties_empty_outputs_and_large_shapes() {
             path: "argmax-plan.seismic.portable".into(), scope: Scope::Portable,
             text: format!("fn evaluate(x: tensor[{rows},{cols}] f32, out: tensor[{count}] i32):\n  a = load(x)\n  y = reduce(a,{axis},argmax)\n  store(y,out)\n"),
         }], &[]).unwrap();
-        let ir = lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+        let ir = support::common_ir(&program);
         let values: Vec<f32> = (0..rows * cols)
             .map(|i| {
                 let (out, k) = if axis == 0 {
@@ -506,13 +511,15 @@ fn argmax_plans_preserve_nan_ties_empty_outputs_and_large_shapes() {
                     let selected = execution.reductions().selections().values().next().unwrap();
                     assert!(!selected.decision.materialize_input);
                     let emitted = emit_execution(&execution).unwrap();
-                    assert!(emitted
-                        .launches
-                        .iter()
-                        .flat_map(|l| &l.tiles)
-                        .any(|t| t.symbol == "y"
-                            && t.dtype == DType::I32
-                            && t.capacity == count as u64));
+                    assert!(
+                        emitted
+                            .launches
+                            .iter()
+                            .flat_map(|l| &l.tiles)
+                            .any(|t| t.symbol == "y"
+                                && t.dtype == DType::I32
+                                && t.capacity == count as u64)
+                    );
                     let pipeline = device.compile(emitted).unwrap();
                     let mut bytes = values
                         .iter()
@@ -539,6 +546,61 @@ fn argmax_plans_preserve_nan_ties_empty_outputs_and_large_shapes() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Metal hardware"]
+fn primitive_reduction_preserves_encoded_packet_identity() {
+    use seismic_lang::{
+        Scope,
+        program::{SourceFile, compile},
+    };
+    use seismic_metal::{execution::Config, msl::emit_storage_selected, runtime::Device};
+    let source = "fn evaluate(x:tensor[32] q4g32,out:tensor[1] f32,raw:tensor[4] u32):\n  values=load(x)\n  total=reduce(values,0,sum)\n  result=tile[1] f32\n  for i in owned(result): result[i]=total+values[0]\n  store(result,out)\n  store(values.words,raw)\n";
+    let p = compile(
+        &[SourceFile {
+            path: "packets.seismic.metal".into(),
+            scope: Scope::Backend("metal".into()),
+            text: source.into(),
+        }],
+        &["metal".into()],
+    )
+    .unwrap();
+    let ir = support::common_ir(&p);
+    let device = Device::open().unwrap();
+    let words = vec![0x33u8; 16];
+    let input = device.buffer_from(&words).unwrap();
+    let scale = device.buffer_from(&2f32.to_le_bytes()).unwrap();
+    let bias = device.buffer_from(&1f32.to_le_bytes()).unwrap();
+    for loads in [
+        seismic_realization::LoadStrategy::Materialize,
+        seismic_realization::LoadStrategy::BorrowProvenReadOnly,
+    ] {
+        for placement in [TilePlacement::Replicated, TilePlacement::GroupShared] {
+            let emitted = emit_storage_selected(
+                &ir,
+                Config {
+                    loads,
+                    ..Default::default()
+                },
+                &mut |_| Ok(placement.clone()),
+            )
+            .unwrap();
+            let pipeline = device.compile(emitted).unwrap();
+            let output = device.buffer(4).unwrap();
+            let raw = device.buffer(16).unwrap();
+            device
+                .run(&pipeline, &[&input, &scale, &bias, &output, &raw], &[], 1)
+                .unwrap();
+            assert_eq!(
+                f32::from_le_bytes(output.read(4).try_into().unwrap()),
+                231.0,
+                "{loads:?}/{placement:?}"
+            );
+            assert_eq!(raw.read(16), words, "{loads:?}/{placement:?}");
         }
     }
 }

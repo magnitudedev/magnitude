@@ -7,6 +7,19 @@ use seismic_lang::{
 };
 use seismic_realization::dispatch::{TileDeclaration, TilePlacement};
 
+/// Storage identity is unchanged by an ordinary view of a tile.
+pub(crate) fn tile_root(expr: &Expr) -> Option<VarId> {
+    match &expr.kind {
+        ExprKind::Var(v) => Some(*v),
+        ExprKind::Index { base, .. } | ExprKind::Transpose(base) => tile_root(base),
+        ExprKind::Builtin {
+            name: seismic_lang::ir::Builtin::Reshape,
+            args,
+        } => args.first().and_then(tile_root),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageDecision {
     pub variable: VarId,
@@ -23,7 +36,7 @@ pub struct StorageDecision {
 impl StorageDecision {
     /// Existing explicit diagnostic policy; this does not rank performance.
     pub fn diagnostic(&self) -> TilePlacement {
-        if self.intrinsic_operand
+        let placement = if self.intrinsic_operand
             || (self.cross_lane_read && self.capacity > crate::execution::SUBGROUP)
         {
             TilePlacement::GroupShared
@@ -31,6 +44,14 @@ impl StorageDecision {
             TilePlacement::Replicated
         } else {
             TilePlacement::Distributed
+        };
+        if self.alternatives.contains(&placement) {
+            placement
+        } else {
+            self.alternatives
+                .first()
+                .cloned()
+                .expect("storage domain is nonempty")
         }
     }
 
@@ -62,6 +83,7 @@ struct VariableStorage {
     dtype: Option<DType>,
     intrinsic_operand: bool,
     cross_lane_read: bool,
+    packed: bool,
 }
 impl StorageAnalysis {
     pub fn new(vars: &[Var], body: &[Stmt]) -> Self {
@@ -79,6 +101,7 @@ impl StorageAnalysis {
                     },
                     intrinsic_operand: intrinsic.contains(&id),
                     cross_lane_read: cross.contains(&id),
+                    packed:matches!(&v.ty,Ty::Tile(t) if matches!(t.elem,seismic_lang::types::Elem::Repr(_))),
                 })
                 .collect(),
         }
@@ -97,6 +120,7 @@ impl StorageAnalysis {
             dtype: expected_dtype,
             intrinsic_operand,
             cross_lane_read,
+            packed,
         } = self
             .variables
             .get(variable)
@@ -109,7 +133,7 @@ impl StorageAnalysis {
         let mut alternatives = vec![TilePlacement::GroupShared];
         if !intrinsic_operand {
             alternatives.insert(0, TilePlacement::Replicated);
-            if !cross_lane_read {
+            if !cross_lane_read && !packed {
                 alternatives.push(TilePlacement::Distributed);
             }
         }
@@ -129,6 +153,11 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
     fn visit(stmts: &[Stmt], operands: &mut std::collections::HashSet<VarId>) {
         for stmt in stmts {
             match &stmt.kind {
+                StmtKind::Reduction(r) => {
+                    for body in r.bodies() {
+                        visit(body, operands);
+                    }
+                }
                 StmtKind::Parallel { body, .. }
                 | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Owned { body, .. }
@@ -139,10 +168,15 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
                     visit(els, operands);
                 }
                 StmtKind::Expr(expr) | StmtKind::Assign { value: expr, .. } => {
-                    if let ExprKind::Intrinsic { args, .. } = &expr.kind {
-                        for arg in args {
-                            if let ExprKind::Var(id) = arg.kind {
-                                operands.insert(id);
+                    if let ExprKind::Intrinsic { op, args } = &expr.kind {
+                        if matches!(
+                            op,
+                            seismic_lang::intrinsics::Operation::MatrixLoad
+                                | seismic_lang::intrinsics::Operation::MatrixLoadTranspose
+                                | seismic_lang::intrinsics::Operation::MatrixStore
+                        ) {
+                            if let Some(root) = args.get(1).and_then(tile_root) {
+                                operands.insert(root);
                             }
                         }
                     }
@@ -152,6 +186,66 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
     }
     let mut operands = std::collections::HashSet::new();
     visit(stmts, &mut operands);
+    fn aliases(body: &[Stmt], out: &mut Vec<(VarId, VarId)>) {
+        for s in body {
+            match &s.kind {
+                StmtKind::LoadLoop {
+                    vars,
+                    views,
+                    modes,
+                    body,
+                    ..
+                } => {
+                    if let Some(modes) = modes {
+                        for ((var, view), mode) in vars.iter().zip(views).zip(modes) {
+                            if *mode == seismic_lang::ir::LoadMode::Borrow {
+                                if let Some(root) = tile_root(view) {
+                                    out.push((*var, root));
+                                }
+                            }
+                        }
+                    }
+                    aliases(body, out);
+                }
+                StmtKind::Assign { target, value, .. } => {
+                    if let (
+                        ExprKind::Var(var),
+                        ExprKind::Load {
+                            view,
+                            mode: seismic_lang::ir::LoadMode::Borrow,
+                        },
+                    ) = (&target.kind, &value.kind)
+                    {
+                        if let Some(root) = tile_root(view) {
+                            out.push((*var, root));
+                        }
+                    }
+                }
+                StmtKind::Parallel { body, .. }
+                | StmtKind::Owned { body, .. }
+                | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => aliases(body, out),
+                StmtKind::If { then, els, .. } => {
+                    aliases(then, out);
+                    aliases(els, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut borrowed = Vec::new();
+    aliases(stmts, &mut borrowed);
+    loop {
+        let count = operands.len();
+        for (view, root) in &borrowed {
+            if operands.contains(view) {
+                operands.insert(*root);
+            }
+        }
+        if operands.len() == count {
+            break;
+        }
+    }
     operands
 }
 
@@ -174,6 +268,44 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
             _ => false,
         }
     }
+    // Querying a view's shape does not read its elements. Its address expressions
+    // still run, and their reads retain ordinary participant ownership rules.
+    fn visit_metadata(
+        e: &Expr,
+        vars: &[Var],
+        owned: &[(VarId, Vec<String>)],
+        cross: &mut HashSet<VarId>,
+    ) {
+        match &e.kind {
+            ExprKind::Var(_) => {}
+            ExprKind::Transpose(base) => visit_metadata(base, vars, owned, cross),
+            ExprKind::Index { base, indices } => {
+                visit_metadata(base, vars, owned, cross);
+                for index in indices {
+                    match index {
+                        Index::Point(point) => visit_expr(point, vars, owned, cross),
+                        Index::Slice { start, end } => {
+                            for endpoint in start.iter().chain(end) {
+                                visit_expr(endpoint, vars, owned, cross);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Builtin {
+                name: seismic_lang::ir::Builtin::Reshape,
+                args,
+            } => {
+                if let Some(source) = args.first() {
+                    visit_metadata(source, vars, owned, cross);
+                }
+                for dimension in args.iter().skip(1) {
+                    visit_expr(dimension, vars, owned, cross);
+                }
+            }
+            _ => visit_expr(e, vars, owned, cross),
+        }
+    }
     fn visit_expr(
         e: &Expr,
         vars: &[Var],
@@ -181,6 +313,17 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
         cross: &mut HashSet<VarId>,
     ) {
         match &e.kind {
+            ExprKind::Builtin {
+                name: seismic_lang::ir::Builtin::Extent,
+                args,
+            } => {
+                if let Some(view) = args.first() {
+                    visit_metadata(view, vars, owned, cross);
+                }
+                for axis in args.iter().skip(1) {
+                    visit_expr(axis, vars, owned, cross);
+                }
+            }
             ExprKind::Accessor { base, .. } => {
                 // Packet coordinates differ from decoded element ownership.
                 // Preserve a proven read-only packed view when lowering uses them.
@@ -260,6 +403,14 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
     ) {
         for s in stmts {
             match &s.kind {
+                StmtKind::Reduction(r) => {
+                    for e in r.operands() {
+                        visit_expr(e, vars, owned, cross);
+                    }
+                    for body in r.bodies() {
+                        visit(body, vars, owned, cross);
+                    }
+                }
                 StmtKind::Owned {
                     vars: ids,
                     tile,
@@ -269,10 +420,27 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
                         owned.push((t, atoms_of(vars, ids)));
                         visit(body, vars, owned, cross);
                         owned.pop();
+                    } else {
+                        // A sliced domain retains its root allocation. Until a
+                        // distributed coordinate cover is selected, require an
+                        // addressable shared or replicated root.
+                        if let Some(t) = tile_root(tile) {
+                            cross.insert(t);
+                        }
+                        visit_expr(tile, vars, owned, cross);
+                        visit(body, vars, owned, cross);
                     }
                 }
+                StmtKind::LoadLoop { views, body, .. } => {
+                    for view in views {
+                        if let Some(root) = tile_root(view) {
+                            cross.insert(root);
+                        }
+                        visit_expr(view, vars, owned, cross);
+                    }
+                    visit(body, vars, owned, cross);
+                }
                 StmtKind::Parallel { body, .. }
-                | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Range { body, .. }
                 | StmtKind::Lanes { body, .. } => visit(body, vars, owned, cross),
                 StmtKind::If { cond, then, els } => {
@@ -281,13 +449,15 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
                     visit(els, vars, owned, cross);
                 }
                 StmtKind::Assign { target, value, .. } => {
-                    if let ExprKind::Index { indices, .. } = &target.kind {
-                        for i in indices {
-                            if let Index::Point(p) = i {
-                                visit_expr(p, vars, owned, cross);
-                            }
+                    // A logical view copy may permute or slice coordinates. Its
+                    // source needs addressable storage unless a matching lane
+                    // transfer cover is selected by this analysis.
+                    if matches!(target.ty, Ty::Tile(_)) && !matches!(value.kind, ExprKind::Var(_)) {
+                        if let Some(root) = tile_root(value) {
+                            cross.insert(root);
                         }
                     }
+                    visit_expr(target, vars, owned, cross);
                     visit_expr(value, vars, owned, cross);
                 }
                 StmtKind::Expr(e) => {
@@ -305,8 +475,25 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
 #[derive(Clone, Debug, Default)]
 pub struct StoragePlan {
     declarations: std::collections::BTreeMap<VarId, TileDeclaration>,
+    data_variables: std::collections::HashSet<VarId>,
+    bounds: seismic_lang::sym::Facts,
+    packets: std::collections::BTreeMap<VarId, seismic_lang::repr::SnapshotLayout>,
 }
 impl StoragePlan {
+    pub fn requires_data(&self, variable: VarId) -> bool {
+        self.data_variables.contains(&variable)
+    }
+    pub fn packets(&self, variable: VarId) -> Option<&seismic_lang::repr::SnapshotLayout> {
+        self.packets.get(&variable)
+    }
+    pub fn capacity(&self, extent: &Sym) -> Result<i64, String> {
+        seismic_lang::sym::Prover::new(&self.bounds)
+            .interval(extent)
+            .hi
+            .as_constant()
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| format!("storage extent `{extent}` has no static capacity"))
+    }
     pub fn declarations(&self) -> &std::collections::BTreeMap<VarId, TileDeclaration> {
         &self.declarations
     }
@@ -374,7 +561,13 @@ pub fn plan(
                                     requests.borrowed.insert(var);
                                 }
                             }
-                            ExprKind::Var(_) if matches!(vars[var].ty, Ty::Tile(_)) => {
+                            ExprKind::Var(_)
+                            | ExprKind::Index { .. }
+                            | ExprKind::Transpose(_)
+                            | ExprKind::Builtin {
+                                name: Builtin::Reshape,
+                                ..
+                            } if matches!(vars[var].ty, Ty::Tile(_)) => {
                                 requests.values.insert(var);
                             }
                             ExprKind::Builtin {
@@ -420,20 +613,119 @@ pub fn plan(
             .intersection(&requests.borrowed)
             .copied(),
     );
-    let analysis = StorageAnalysis::new(vars, body);
     let mut result = StoragePlan::default();
+    let demand_body = body.iter().chain(extra.iter().flat_map(|body| body.iter()))
+        .cloned().collect::<Vec<_>>();
+    result.data_variables = seismic_lang::demand::data_variables(&demand_body);
+    requests.values.retain(|variable| result.requires_data(*variable));
+    // A logical slice keeps its invocation extent; its backing axis supplies a
+    // finite allocation bound. The same symbolic facts feed emission and
+    // reduction geometry, rather than substituting guessed piece sizes.
+    fn expression_bounds(e: &Expr, facts: &mut seismic_lang::sym::Facts) {
+        if let Ty::Tensor(shaped) | Ty::Tile(shaped) = &e.ty {
+            for (axis, extent) in shaped.shape.iter().enumerate() {
+                if let [atom] = extent.atoms().as_slice() {
+                    if *extent == Sym::atom(atom.clone()) {
+                        if let Ok(bound) = seismic_lang::lower::view_axis_capacity(e, axis) {
+                            let bound = facts
+                                .upper_of(atom)
+                                .and_then(|b| b.as_constant())
+                                .map_or(bound, |n| n.max(bound));
+                            facts.set_range(atom.clone(), Sym::constant(0), Sym::constant(bound));
+                        }
+                    }
+                }
+            }
+        }
+        match &e.kind {
+            ExprKind::Index { base, indices } => {
+                expression_bounds(base, facts);
+                for i in indices {
+                    match i {
+                        Index::Point(e) => expression_bounds(e, facts),
+                        Index::Slice { start, end } => {
+                            for e in start.iter().chain(end) {
+                                expression_bounds(e, facts);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Load { view: e, .. }
+            | ExprKind::Transpose(e)
+            | ExprKind::Unary { expr: e, .. }
+            | ExprKind::Cast { expr: e, .. }
+            | ExprKind::Accessor { base: e, .. }
+            | ExprKind::Lanes { base: e, .. } => expression_bounds(e, facts),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expression_bounds(lhs, facts);
+                expression_bounds(rhs, facts);
+            }
+            ExprKind::Builtin { args, .. }
+            | ExprKind::Intrinsic { args, .. }
+            | ExprKind::Call { args, .. }
+            | ExprKind::Tuple(args) => {
+                for e in args {
+                    expression_bounds(e, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn body_bounds(body: &[Stmt], facts: &mut seismic_lang::sym::Facts) {
+        for s in body {
+            match &s.kind {
+                StmtKind::Assign { target, value, .. } => {
+                    expression_bounds(target, facts);
+                    expression_bounds(value, facts);
+                }
+                StmtKind::Expr(e) => expression_bounds(e, facts),
+                StmtKind::Owned { tile, body, .. } => {
+                    expression_bounds(tile, facts);
+                    body_bounds(body, facts);
+                }
+                StmtKind::LoadLoop {
+                    domain,
+                    views,
+                    body,
+                    ..
+                } => {
+                    expression_bounds(&domain.view, facts);
+                    for e in views {
+                        expression_bounds(e, facts);
+                    }
+                    body_bounds(body, facts);
+                }
+                StmtKind::Parallel { body, .. }
+                | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => body_bounds(body, facts),
+                StmtKind::If { cond, then, els } => {
+                    expression_bounds(cond, facts);
+                    body_bounds(then, facts);
+                    body_bounds(els, facts);
+                }
+                StmtKind::Reduction(_) => {
+                    unreachable!("reductions materialize before storage planning")
+                }
+            }
+        }
+    }
+    body_bounds(body, &mut result.bounds);
+    for body in extra {
+        body_bounds(body, &mut result.bounds);
+    }
+    for (atom, bound) in &requests.pieces {
+        result
+            .bounds
+            .set_range(atom.clone(), Sym::constant(0), bound.clone());
+    }
+    let analysis = StorageAnalysis::new(vars, body);
     for variable in requests.values {
         let Ty::Tile(tile) = &vars[variable].ty else {
             return Err("materialized value is not a tile".into());
         };
         let capacity = tile.shape.iter().try_fold(1i64, |capacity, extent| {
-            let mut extent = extent.clone();
-            for (atom, value) in &requests.pieces {
-                extent = extent.subst(atom, value);
-            }
-            let extent = extent
-                .as_constant()
-                .ok_or_else(|| format!("storage extent `{extent}` has no static capacity"))?;
+            let extent = result.capacity(extent)?;
             if extent < 0 {
                 return Err("negative storage extent".to_string());
             }
@@ -446,6 +738,22 @@ pub fn plan(
             capacity,
             tile.elem.read_dtype().ok_or("unresolved storage dtype")?,
         )?;
+        if let seismic_lang::types::Elem::Repr(name) = &tile.elem {
+            let capacities = tile
+                .shape
+                .iter()
+                .map(|e| {
+                    result
+                        .capacity(e)
+                        .and_then(|n| u64::try_from(n).map_err(|_| "negative packet extent".into()))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let layout = seismic_lang::repr::lookup(name)
+                .ok_or("unknown packet representation")?
+                .snapshot_layout(&capacities)
+                .ok_or("packet snapshot capacity overflow")?;
+            result.packets.insert(variable, layout);
+        }
         let declaration = decision.select(select(&decision)?)?;
         result.declarations.insert(variable, declaration);
     }

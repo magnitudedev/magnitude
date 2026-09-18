@@ -4,10 +4,12 @@ fn gate_projection_add[N, K](x: tensor[1, K] bf16, gate: tensor[1, K] bf16, w: t
   for col in parallel:
     acc = tile[1, 1] f32
     for i, j in owned(acc): acc[i, j] = 0.0
-    for xt, gt, wt in load((x, gate, w[col : col + 1]), over=1):
-      a = tile[1, extent(xt, 1)] f32
-      for i, j in owned(a): a[i, j] = f32(xt[i, j]) / (1.0 + exp(-f32(gt[i, j])))
-      matmul(a, wt, acc)
+    xt = load(x)
+    gt = load(gate)
+    wt = load(w[col : col + 1])
+    a = tile[1, K] f32
+    for i, j in owned(a): a[i, j] = f32(xt[i, j]) / (1.0 + exp(-f32(gt[i, j])))
+    matmul(a, wt, acc)
     y = tile[1, 1] f32
     for i, j in owned(y): y[i, j] = acc[i, j] + f32(residual[0, col])
     store(y, out[0 : 1, col : col + 1])

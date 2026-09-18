@@ -38,6 +38,13 @@ or in explicit checked specializations. Per-binding, worst-case, and expected-va
 objectives are different propositions. A distributional assumption cannot justify a
 universal claim about every invocation.
 
+Specialization cannot rely on future route IDs, sequence lengths or tensor values
+unavailable at compilation. Unknown control/addressing facts remain in the workload
+domain or checked variants. Representation preparation and retained storage are
+charged at the declared boundary; amortized conversion needs an explicit reuse
+horizon. Lossy representation changes require semantic permission, not just a
+better objective.
+
 All compared bounds and feasible schedules share the same objective, conditions, model,
 and time units. A physical floor cannot be paired with a predicted or measured upper
 bound to claim guaranteed physical optimality.
@@ -48,14 +55,27 @@ bound to claim guaranteed physical optimality.
 tuner consumes symbolic domains, dependent alternatives, and constraints. Different
 branches may introduce different operations and further choices.
 
-Construct/lowering alternatives, instruction covers, tiling, mapping, storage,
-recomputation, fusion, synchronization, and launches participate in one space. A fixed
-decomposition or preferred placement list is not coverage of the full form.
+All decision families in the execution contract participate in one space, including
+composition, layouts, completion-aware lifetimes and asynchronous pipelines. Domains
+are dependent: decisions can introduce operations and further domains or constrain
+earlier choices. A fixed decomposition or preferred placement list is not coverage
+of the full form.
+
+Decomposition choices implement a fixed logical computation. Candidate-dependent
+piece shapes or counts must not feed back into portable arithmetic or effects.
+Compare candidates under the same numerical permissions, including allowed merge
+orders; reject partition-dependent source meaning before constructing this space.
 
 A region is a mechanically described subset of assignments. Every subdivision preserves
 coverage of the parent by construction, including dependent domains. Regions are removed
 as infeasible only when their own constraints establish it. Compiler failures,
 unsupported analysis, and timeouts cannot be reclassified as illegal executions.
+
+Selection completeness is relative to the preserved execution family promised by
+the [compiler](compiler.md#optimization-guarantees), not just the candidates its
+current implementation happened to expose. Missing promised construction support
+is a compiler failure or unresolved coverage, not an optimum over a silently smaller
+space. Diagnostic restrictions remain explicitly scoped.
 
 ## Optimization procedure
 
@@ -74,6 +94,12 @@ Search operates on shared structures and partial assignments rather than requiri
 separate complete tree for every candidate. Bounds and constraints specialize as choices
 resolve. Reuse of subproblems or derived analyses is valid only under compatible
 identities and conditions.
+
+Retain structured iteration, predicates and symbolic resource relationships where
+possible; full scalar expansion of each candidate is not the production scaling
+strategy. Search decomposition requires independence or a frontier retaining the
+resource/interface alternatives needed by enclosing decisions. Independently
+choosing each child's best implementation can discard the best composition.
 
 Deterministic traversal and ordering by sound bounds are allowed. Symmetry elimination
 and decomposition require evidence that they preserve coverage and the optimum. Source
@@ -101,6 +127,17 @@ feasible schedule in an optimistic relaxation is not automatically feasible in t
 original model. Resource models and objective evaluations must be derived from the
 selected execution, not supplied as arbitrary scores.
 
+Compiler-controlled schedules include executable local order, transfer issue/wait
+sites, launch dependencies and admitted work-assignment policies. Hardware block
+placement, warp issue, cache replacement and CPU out-of-order issue are machine
+behavior. The best resource-feasible interleaving of that behavior is only an
+optimistic bound unless the model establishes its achievability. Do not materialize
+an unenforceable ideal schedule by merely retaining an unchanged program.
+
+Model feasibility and physical achievability remain distinct. A model upper bound
+requires a schedule achievable under that model's execution semantics; physical
+claims additionally require qualified mappings and hardware assumptions.
+
 A region can be excluded when its derived lower bound cannot improve a compatible
 validated incumbent. Search state records the region, applicable bound, and exclusion so
 coverage remains complete within the search itself. It does not construct a second graph
@@ -118,6 +155,11 @@ invariants; existing stage boundaries validate the applicable global constraints
 5. Coverage of all admitted choices, including excluded regions.
 6. Exclusion of every strictly better legal execution.
 7. Agreement between the evaluated execution and the actual Tuned IR.
+
+Small exhaustive cases check both coupled-domain coverage and sound pruning.
+Documented source-refactoring pairs must retain their execution families and model
+optima. Search limits preserve the frontier; they neither narrow the declared form
+nor weaken the source-stability contract.
 
 Costs are computed from the execution, not accepted from a caller or justified by
 repeating a callback. Sound domain partitioning, relaxations, and pruning are compiler
@@ -139,6 +181,15 @@ For compatible sound lower and feasible upper bounds, a positive lower bound per
 model-gap ratio. A zero lower bound gives no finite ratio. A nonzero gap does not
 satisfy exact optimality. The qualified production path does not silently execute an
 incumbent from incomplete search as if tuning had completed.
+
+Instruction/operation derivation limits produce typed budget exhaustion, distinct
+from unsupported analysis or invalid model construction. The frontier retains the
+unfinished execution and its inherited bound alongside any incumbent. Increasing
+those limits under the same semantic inputs retries that derivation; completed
+models and schedule searches remain cached. Partial model construction can be
+restarted from its retained IR without changing the legal family. Progress reports
+unresolved choice regions, derivations, schedules and missing model mappings
+separately, so an empty choice frontier does not imply completed optimization.
 
 Cache reuse binds to semantic program/form/workload identities, hardware and mapping
 contracts, objective, and analysis versions. Reusing a result under changed conditions

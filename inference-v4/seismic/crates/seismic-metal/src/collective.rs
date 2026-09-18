@@ -88,6 +88,10 @@ pub struct MatrixMemory {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Implementation {
+    ParticipantIndex,
+    Exchange {
+        dtype: DType,
+    },
     Reduction {
         operation: Operation,
         dtype: DType,
@@ -115,6 +119,8 @@ pub enum Implementation {
 impl Implementation {
     pub fn operation(&self) -> Operation {
         match self {
+            Self::ParticipantIndex => Operation::LaneIndex,
+            Self::Exchange { .. } => Operation::ShuffleIndex,
             Self::Reduction { operation, .. } => *operation,
             Self::Declare { .. } => Operation::Matrix,
             Self::Load {
@@ -130,6 +136,8 @@ impl Implementation {
     /// Selected target builtin, consumed by emission and resource-mapping keys.
     pub fn metal_builtin(&self) -> Option<&'static str> {
         match self {
+            Self::ParticipantIndex => None,
+            Self::Exchange { .. } => Some("simd_shuffle"),
             Self::Declare { .. } => None,
             Self::Load { .. } => Some("simdgroup_load"),
             Self::Store { .. } => Some("simdgroup_store"),
@@ -162,6 +170,12 @@ impl Implementation {
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::ParticipantIndex => {}
+            Self::Exchange { dtype } => {
+                if !dtype.is_float() {
+                    return Err("Metal exchange requires floating scalar storage".into());
+                }
+            }
             Self::Reduction { operation, dtype } => {
                 if !matches!(
                     operation,
@@ -227,6 +241,24 @@ pub(crate) fn implementation(
     };
     let layout = |expr: &Expr| FragmentLayout::from_type(&expr.ty);
     let instruction = match op {
+        Operation::LaneIndex => {
+            if !args.is_empty() {
+                return Err("lane index has no operands".into());
+            }
+            Implementation::ParticipantIndex
+        }
+        Operation::ShuffleIndex => {
+            let [value, index] = args else {
+                return Err("shuffle needs a value and participant index".into());
+            };
+            let Ty::Scalar(dtype) = value.ty else {
+                return Err("shuffle needs a scalar value".into());
+            };
+            if !matches!(index.ty,Ty::Scalar(d) if d.is_int()) {
+                return Err("shuffle participant index is not integral".into());
+            }
+            Implementation::Exchange { dtype }
+        }
         Operation::Matrix => {
             let Ty::Scalar(dtype) = args.first().ok_or("matrix dtype missing")?.ty else {
                 return Err("matrix dtype is not a scalar type".into());
@@ -258,15 +290,12 @@ pub(crate) fn implementation(
             let Elem::Dtype(dtype) = tile.elem else {
                 return Err("matrix transfer requires dense elements".into());
             };
-            let space = match args[1].kind {
-                ExprKind::Var(v) => match bound.get(&v) {
-                    Some(Some(TilePlacement::GroupShared)) => StorageSpace::Threadgroup,
-                    Some(None) => StorageSpace::Device,
-                    _ => {
-                        return Err("matrix operand lacks shared or borrowed device storage".into())
-                    }
-                },
-                _ => StorageSpace::Device,
+            let root = crate::storage::tile_root(&args[1])
+                .ok_or("matrix memory operand has no allocation root")?;
+            let space = match bound.get(&root) {
+                Some(Some(TilePlacement::GroupShared)) => StorageSpace::Threadgroup,
+                Some(None) => StorageSpace::Device,
+                _ => return Err("matrix operand lacks shared or borrowed device storage".into()),
             };
             let memory = MatrixMemory {
                 operand: args[1].clone(),

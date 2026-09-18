@@ -8,6 +8,7 @@ license.workspace = true
 seismic-lang.workspace = true
 seismic-realization.workspace = true
 seismic-accounting.workspace = true
+seismic-compiler.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
