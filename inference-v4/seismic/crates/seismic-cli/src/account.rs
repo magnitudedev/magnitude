@@ -8,9 +8,9 @@ pub fn account(args: &[String]) -> Result<(), String> {
     let options = options(args)?;
     let program = load_program(&options)?;
     let name = options.function.as_deref().ok_or("--fn is required")?;
-    print_work(&program, name, &options.shapes, options.analysis_steps)?;
+    print_work(&program, name, &options.shapes, &options.elements, options.analysis_steps)?;
     if matches!(options.target.as_str(), "cpu" | "cuda") {
-        let lowered = seismic_lang::lower::lower(&program, name, &options.target, &options.shapes)?;
+        let lowered = seismic_lang::lower::lower_specialized(&program, name, &options.target, &options.shapes, &options.elements, &seismic_lang::lower::Options{piece:options.piece})?;
         let dispatch = if options.target == "cuda" {
             seismic_realization::Dispatch::ParallelRoot
         } else {
@@ -33,10 +33,11 @@ pub fn print_work(
     program: &Program,
     name: &str,
     shapes: &HashMap<String, i64>,
+    elements: &HashMap<String,seismic_lang::types::Elem>,
     analysis_steps: usize,
 ) -> Result<(), String> {
     let derived =
-        seismic_accounting::derive(program, name, shapes, &Default::default(), analysis_steps)?;
+        seismic_accounting::derive_specialized(program, name, shapes, elements, &Default::default(), analysis_steps)?;
     let account = derived.work;
     println!(
         "portable-algorithm work: {name} ({})",

@@ -9,7 +9,7 @@
 
 use crate::numeric::{bf16_round, f16_round, f16_bits, f16_to_f32};
 use crate::ast::{AssignOp, BinaryOp, UnaryOp};
-use crate::hir::*;
+use crate::ir::*;
 use crate::program::Program;
 use crate::repr;
 use crate::sym::{Atom, Sym};
@@ -392,6 +392,7 @@ impl<'a> Interpreter<'a> {
 
     fn expr(&mut self, e: &Expr, frame: &mut Frame) -> Result<Value, String> {
         match &e.kind {
+            ExprKind::Load { view, .. } => self.builtin(Builtin::Load, std::slice::from_ref(view), frame),
             ExprKind::Int(v) => Ok(if scalar_dtype(&e.ty).is_float() { Value::Scalar(*v as f64) } else { Value::Int(*v) }),
             ExprKind::ShapeParam(_) => Ok(Value::Int(self.eval_sym(e.sym.as_ref().unwrap(), frame))),
             ExprKind::Float(v) => Ok(Value::Scalar(round_to(scalar_dtype(&e.ty), *v))),
@@ -782,12 +783,9 @@ impl<'a> Interpreter<'a> {
                     _ => unreachable!(),
                 };
                 let ExprKind::Int(op) = args[2].kind else { unreachable!() };
-                let op = match op {
-                    0 => ReduceOp::Sum,
-                    1 => ReduceOp::Max,
-                    2 => ReduceOp::Min,
-                    _ => ReduceOp::Argmax,
-                };
+                let op = ReduceOp::from_tag(op).ok_or("invalid reduction operation")?;
+                let contract = crate::reduction::Contract::new(op, t.dtype,
+                    matches!(args.get(3).map(|e| &e.kind), Some(ExprKind::Bool(true))));
                 let mut out_shape = t.shape.clone();
                 out_shape.remove(axis);
                 let n: usize = out_shape.iter().product();
@@ -795,16 +793,11 @@ impl<'a> Interpreter<'a> {
                 let inner: usize = t.shape[axis + 1..].iter().product();
                 let outer: usize = t.shape[..axis].iter().product();
                 let extent = t.shape[axis];
-                if op==ReduceOp::Argmax && extent==0 {return Err("argmax requires a nonempty axis".into());}
-                let dtype = if op == ReduceOp::Argmax { DType::I32 } else { t.dtype };
+                if !contract.allows_empty_axis() && extent==0 {return Err("argmax requires a nonempty axis".into());}
+                let dtype = contract.output();
                 for o in 0..outer {
                     for i in 0..inner {
-                        let mut acc = match op {
-                            ReduceOp::Sum => 0.0,
-                            ReduceOp::Max => f64::NEG_INFINITY,
-                            ReduceOp::Min => f64::INFINITY,
-                            ReduceOp::Argmax => f64::NEG_INFINITY,
-                        };
+                        let mut acc = contract.identity().value();
                         let mut arg = 0usize;
                         for k in 0..extent {
                             let x = t.data[(o * extent + k) * inner + i];

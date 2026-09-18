@@ -3,7 +3,7 @@
 
 use crate::ast;
 use crate::ast::{AssignOp, BinaryOp, ExprKind as A, Ident, UnaryOp};
-use crate::hir::*;
+use crate::ir::*;
 use crate::intrinsics::{self, Intrinsic, IntrinsicParam, IntrinsicResult};
 use crate::repr;
 use crate::span::{Diagnostic, Span};
@@ -424,7 +424,7 @@ impl<'a> Checker<'a> {
                 StmtKind::Expr(e)
             }
         };
-        Some(Stmt { kind, span: s.span })
+        Some(Stmt { id: None, kind, span: s.span })
     }
 
     fn for_stmt(&mut self, targets: &[Ident], iter: &ast::Expr, body: &ast::Block, _span: Span,
@@ -646,7 +646,7 @@ impl<'a> Checker<'a> {
                 }
                 let body = self.block(body, &vars);
                 self.pop_scope();
-                Some(StmtKind::LoadLoop { vars, views, axis, piece, capacity: None, body ,
+                Some(StmtKind::LoadLoop { modes: None, vars, views, axis, piece, capacity: None, body ,
                 })
             }
             other => {
@@ -1333,10 +1333,10 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        if let Some(intr) = self.intrinsics.iter().find(|i| i.name == name_str).cloned() {
+        if let Some(intr) = self.intrinsics.iter().find(|i| i.operation.name() == name_str).cloned() {
             return self.intrinsic_call(&intr, args, span);
         }
-        if intrinsics::table("metal").unwrap().iter().any(|i| i.name == name_str) {
+        if intrinsics::table("metal").unwrap().iter().any(|i| i.operation.name() == name_str) {
             self.error(span, format!("`{name_str}` is a Metal intrinsic and is not available in this file's scope"),
             );
             return None;
@@ -1825,7 +1825,7 @@ impl<'a> Checker<'a> {
 
     fn intrinsic_call(&mut self, intr: &Intrinsic, args: &[ast::Arg], span: Span) -> Option<Expr> {
         if args.len() != intr.params.len() || args.iter().any(|a| a.name.is_some()) {
-            self.error(span, format!("`{}` takes {} positional argument(s)", intr.name, intr.params.len()),
+            self.error(span, format!("`{}` takes {} positional argument(s)", intr.operation.name(), intr.params.len()),
             );
             return None;
         }
@@ -1850,12 +1850,12 @@ impl<'a> Checker<'a> {
                 IntrinsicParam::FloatScalar => {
                     let e = self.expr(&arg.value, float_dtype.map(Ty::Scalar).as_ref())?;
                     let Ty::Scalar(d) = e.ty else {
-                        self.error(e.span, format!("`{}` needs a float scalar, found {}", intr.name, e.ty),
+                        self.error(e.span, format!("`{}` needs a float scalar, found {}", intr.operation.name(), e.ty),
                         );
                         return None;
                     };
                     if !d.is_float() {
-                        self.error(e.span, format!("`{}` needs a float scalar, found {}", intr.name, d.name()),
+                        self.error(e.span, format!("`{}` needs a float scalar, found {}", intr.operation.name(), d.name()),
                         );
                         return None;
                     }
@@ -1865,16 +1865,18 @@ impl<'a> Checker<'a> {
                 IntrinsicParam::Frag8x8 => {
                     let e = self.expr(&arg.value, None)?;
                     if !matches!(&e.ty, Ty::Frag(s) if s.shape == vec![Sym::constant(8), Sym::constant(8)]) {
-                        self.error(e.span, format!("`{}` needs an 8x8 fragment, found {}", intr.name, e.ty),
+                        self.error(e.span, format!("`{}` needs an 8x8 fragment, found {}", intr.operation.name(), e.ty),
                         );
                         return None;
                     }
                     out.push(e);
                 }
                 IntrinsicParam::Tile2 => {
-                    let e = self.expr(&arg.value, None)?;
+                    // A block store overwrites its destination window; it does
+                    // not read the tile's previous contents.
+                    let e = self.expr_inner(&arg.value, None, intr.operation == intrinsics::Operation::MatrixStore)?;
                     if !matches!(&e.ty, Ty::Tile(s) if s.shape.len() == 2) {
-                        self.error(e.span, format!("`{}` needs a rank-2 tile, found {}", intr.name, e.ty),
+                        self.error(e.span, format!("`{}` needs a rank-2 tile, found {}", intr.operation.name(), e.ty),
                         );
                         return None;
                     }
@@ -1883,7 +1885,7 @@ impl<'a> Checker<'a> {
                 IntrinsicParam::Int => {
                     let e = self.expr(&arg.value, Some(&Ty::Scalar(DType::I32)))?;
                     if e.sym.is_none() {
-                        self.error(e.span, format!("`{}` needs a static integer offset", intr.name),
+                        self.error(e.span, format!("`{}` needs a static integer offset", intr.operation.name()),
                         );
                         return None;
                     }
@@ -1892,14 +1894,24 @@ impl<'a> Checker<'a> {
             }
         }
         // Block loads and stores read an 8x8 window at (row, col): prove it fits.
-        if matches!(intr.name, "simdgroup_load" | "simdgroup_load_t" | "simdgroup_store") {
+        if let intrinsics::Semantics::Load { rows, columns, .. }
+            | intrinsics::Semantics::Store { rows, columns } = intr.operation.semantics() {
             let Ty::Tile(s) = out[1].ty.clone() else { unreachable!() };
-            for (k, dim) in s.shape.iter().enumerate() {
+            for (k, (dim, extent)) in s.shape.iter().zip([rows, columns]).enumerate() {
                 let off = out[2 + k].sym.clone().unwrap();
                 let iv = self.prover().interval(&off);
                 self.require_nonneg(&iv.lo, out[2 + k].span, "block offset may be negative");
-                self.require_nonneg(&dim.sub(&iv.hi).sub(&Sym::constant(8)), out[2 + k].span, &format!("8-wide block may exceed extent `{dim}`"),
+                self.require_nonneg(&dim.sub(&iv.hi).sub(&Sym::constant(extent as i64)), out[2 + k].span, &format!("{extent}-wide block may exceed extent `{dim}`"),
                 );
+            }
+        }
+        if intr.operation == intrinsics::Operation::MatrixStore {
+            // The current definite-assignment domain tracks whole tiles. A
+            // partial store is legal, but cannot prove untouched elements ready.
+            if let (ExprKind::Var(id), Ty::Tile(tile)) = (&out[1].kind, &out[1].ty) {
+                let full = tile.shape.iter().all(|s| s.as_constant() == Some(8))
+                    && out[2..4].iter().all(|e| e.sym.as_ref().and_then(Sym::as_constant) == Some(0));
+                if full { self.unassigned.remove(id); }
             }
         }
         let ty = match intr.result {
@@ -1908,7 +1920,7 @@ impl<'a> Checker<'a> {
             IntrinsicResult::Frag8x8OfNamedDtype => {
                 intrinsics::frag8x8(named_dtype.unwrap_or(DType::F32))}
         };
-        Some(Expr { kind: ExprKind::Intrinsic { name: intr.name.to_string(), args: out ,
+        Some(Expr { kind: ExprKind::Intrinsic { op: intr.operation, args: out ,
             }, ty, sym: None, span ,
         })
     }
@@ -2410,8 +2422,8 @@ fn collect_writes(stmts: &[Stmt], out: &mut HashMap<VarId, Vec<Vec<(Sym, Sym)>>>
                 }
             }
             StmtKind::Expr(e) => {
-                if let ExprKind::Intrinsic { name, args } = &e.kind {
-                    if name == "simdgroup_store" {
+                if let ExprKind::Intrinsic { op: name, args } = &e.kind {
+                    if *name == crate::intrinsics::Operation::MatrixStore {
                         if let ExprKind::Var(v) = args[1].kind {
                             if matches!(vars[v].kind, VarKind::Param(_)) {
                                 let r = args[2].sym.clone().unwrap();
@@ -2454,7 +2466,7 @@ fn collect_reads(stmts: &[Stmt], out: &mut HashMap<VarId, Vec<Vec<(Sym, Sym)>>>,
                     }
                 }
             }
-            ExprKind::Intrinsic { name, args } if name == "simdgroup_load" || name == "simdgroup_load_t" => {
+            ExprKind::Intrinsic { op: name, args } if *name == crate::intrinsics::Operation::MatrixLoad || *name == crate::intrinsics::Operation::MatrixLoadTranspose => {
                 if let ExprKind::Var(v) = args[1].kind {
                     if matches!(vars[v].kind, VarKind::Param(_)) {
                         let r = args[2].sym.clone().unwrap();

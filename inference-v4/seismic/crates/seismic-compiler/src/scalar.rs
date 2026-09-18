@@ -7,13 +7,12 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use seismic_lang::abi::ScalarParameter;
 use seismic_lang::{
     ast::{AssignOp, BinaryOp, UnaryOp},
-    hir::{self, Builtin, Expr, ExprKind, Index, Stmt, StmtKind, VarId, VarKind},
-    lower::Lowered,
+    ir::{Builtin, Expr, ExprKind, Index, ReduceOp, Stmt, StmtKind, VarId, VarKind},
+    lowered_ir::LoweredIr,
     repr,
     sym::{Atom, Sym},
     types::{DType, Elem, Ty},
 };
-use seismic_realization::LoadStrategy;
 use seismic_realization::{
     execution::{ExecutionEvidence, MemoryObject, Multiplicity},
     BufferSpec, MathFunction,
@@ -86,9 +85,8 @@ impl ResultValue {
 
 pub(crate) struct Emitter<'a, 'b> {
     pub builder: FunctionBuilder<'a>,
-    loads: LoadStrategy,
     pub imports: Vec<(ir::FuncRef, MathFunction)>,
-    lowered: &'b Lowered,
+    lowered: &'b LoweredIr,
     bindings: HashMap<VarId, Binding>,
     indices: HashMap<String, Value>,
     constants: HashMap<String, i64>,
@@ -134,18 +132,16 @@ fn elements(shape: &[Dimension]) -> Result<i64, String> {
 
 impl<'a, 'b> Emitter<'a, 'b> {
     pub fn new(
-        lowered: &'b Lowered,
+        lowered: &'b LoweredIr,
         mut builder: FunctionBuilder<'a>,
         buffers: Value,
         scalars: Value,
         scratch: Value,
-        loads: LoadStrategy,
     ) -> Result<Self, String> {
         let zero = builder.ins().iconst(types::I64, 0);
         let entry = builder.current_block().unwrap();
         let mut s = Self {
             builder,
-            loads,
             imports: Vec::new(),
             lowered,
             bindings: HashMap::new(),
@@ -895,7 +891,9 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 piece,
                 body,
                 capacity,
+                modes,
             } => {
+                let modes = modes.as_ref().filter(|m| m.len() == vars.len()).ok_or("unresolved stream loads reached scalar emission")?;
                 let sources = views
                     .iter()
                     .map(|expr| self.expr(expr)?.view())
@@ -925,21 +923,12 @@ impl<'a, 'b> Emitter<'a, 'b> {
                             s.constants.remove(name);
                         }
                         s.dimensions.insert(name.clone(), dim);
-                        for (var, source) in vars.iter().zip(&sources) {
+                        for ((var, source), mode) in vars.iter().zip(&sources).zip(modes) {
                             let mut view = source.clone();
                             view.shape[*axis] = dim;
                             let delta = s.builder.ins().imul_imm(start, view.strides[*axis]);
                             view.offset = s.builder.ins().iadd(view.offset, delta);
-                            let borrow = s.loads == LoadStrategy::BorrowProvenReadOnly
-                                && !body.iter().any(|stmt| {
-                                    seismic_lang::effects::tensor_effect(stmt, &s.lowered.backend)
-                                        || seismic_lang::effects::tile_mutated(
-                                            stmt,
-                                            *var,
-                                            &s.lowered.backend,
-                                        )
-                                });
-                            let tile = if borrow { view } else { s.materialize(view)? };
+                            let tile = if *mode == seismic_lang::ir::LoadMode::Borrow { view } else { s.materialize(view)? };
                             s.bindings.insert(*var, Binding::View(tile));
                         }
                         s.body(body)
@@ -986,27 +975,13 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 Ok(())
             }
             StmtKind::Assign { target, op, value } => {
-                if self.loads == LoadStrategy::BorrowProvenReadOnly && *op == AssignOp::Assign {
-                    if let (
-                        ExprKind::Var(var),
-                        ExprKind::Builtin {
-                            name: Builtin::Load,
-                            args,
-                        },
-                    ) = (&target.kind, &value.kind)
-                    {
-                        if !self.bindings.contains_key(var)
-                            && seismic_lang::effects::load_can_borrow(
-                                &self.lowered.body,
-                                *var,
-                                &self.lowered.backend,
-                            )
-                        {
-                            let view = self.expr(&args[0])?.view()?;
-                            self.bindings.insert(*var, Binding::View(view));
-                            return Ok(());
-                        }
+                if let (ExprKind::Var(var), ExprKind::Load { view, mode: seismic_lang::ir::LoadMode::Borrow }) = (&target.kind, &value.kind) {
+                    if *op != AssignOp::Assign || self.bindings.contains_key(var) {
+                        return Err("borrowed load must define fresh tile storage".into());
                     }
+                    let view = self.expr(view)?.view()?;
+                    self.bindings.insert(*var, Binding::View(view));
+                    return Ok(());
                 }
                 let value = self.expr(value)?;
                 match &target.kind {
@@ -1380,6 +1355,17 @@ impl<'a, 'b> Emitter<'a, 'b> {
     fn expr(&mut self, e: &Expr) -> Result<ResultValue, String> {
         use ResultValue as R;
         match &e.kind {
+            ExprKind::Load { view, mode } => {
+                let input = self.expr(view)?;
+                if *mode == seismic_lang::ir::LoadMode::Borrow {
+                    return Err("borrowed load requires an explicit IR value binding".into());
+                }
+                match input {
+                    R::View(view) => Ok(R::View(self.materialize(view)?)),
+                    R::Tuple(items) => Ok(R::Tuple(items.into_iter().map(|v| self.materialize(v.view()?).map(R::View)).collect::<Result<_,String>>()?)),
+                    _ => Err("invalid scalar realization load".into()),
+                }
+            }
             ExprKind::Int(n) => {
                 let d = match e.ty {
                     Ty::Scalar(d) => d,
@@ -1525,19 +1511,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 view.shape = target;
                 Ok(R::View(view))
             }
-            Builtin::Load => {
-                let input = self.expr(&args[0])?;
-                match input {
-                    R::View(view) => Ok(R::View(self.materialize(view)?)),
-                    R::Tuple(items) => Ok(R::Tuple(
-                        items
-                            .into_iter()
-                            .map(|v| self.materialize(v.view()?).map(R::View))
-                            .collect::<Result<_, String>>()?,
-                    )),
-                    _ => Err("invalid scalar realization load".into()),
-                }
-            }
+            Builtin::Load => Err("unresolved load reached scalar emission".into()),
             Builtin::Store => {
                 let source = self.expr(&args[0])?.view()?;
                 let target = self.expr(&args[1])?.view()?;
@@ -1639,6 +1613,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
             let bnan = self.builder.ins().fcmp(FloatCC::Unordered, b, b);
             let value = self.builder.ins().select(anan, b, value);
             Ok(self.builder.ins().select(bnan, a, value))
+        } else if dtype == DType::Bool {
+            Ok(if maximum { self.builder.ins().bor(a,b) } else { self.builder.ins().band(a,b) })
         } else if dtype.is_int() {
             let cc = match (dtype == DType::U32, maximum) {
                 (true, true) => IntCC::UnsignedGreaterThan,
@@ -1660,13 +1636,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
             .and_then(Sym::as_constant)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or("scalar realization reduction axis unresolved")?;
-        let operation = match args[2].kind {
-            ExprKind::Int(0) => hir::ReduceOp::Sum,
-            ExprKind::Int(1) => hir::ReduceOp::Max,
-            ExprKind::Int(2) => hir::ReduceOp::Min,
-            ExprKind::Int(3) => hir::ReduceOp::Argmax,
-            _ => return Err("scalar realization reduction operation unresolved".into()),
-        };
+        let operation = match args[2].kind { ExprKind::Int(tag) => seismic_lang::ir::ReduceOp::from_tag(tag), _ => None }
+            .ok_or("scalar realization reduction operation unresolved")?;
         let dtype = match &source.storage {
             Storage::Dense { dtype, .. } => *dtype,
             Storage::Packed { .. } => {
@@ -1675,49 +1646,31 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 )
             }
         };
-        if !dtype.is_numeric() || (dtype.is_int() && operation == hir::ReduceOp::Sum) {
-            return Err(
-                "scalar realization reduction needs floating sum or numeric extrema".into(),
-            );
-        }
+        let contract = seismic_lang::reduction::Contract::new(operation, dtype,
+            matches!(args.get(3).map(|e| &e.kind), Some(ExprKind::Bool(true))));
         let extent = *source
             .shape
             .get(axis)
             .ok_or("scalar realization reduction axis out of bounds")?;
-        if operation == hir::ReduceOp::Argmax
+        if operation == ReduceOp::Argmax
             && (extent.extent.is_some()
                 || !(1..=i64::from(i32::MAX) + 1).contains(&extent.capacity))
         {
             return Err("argmax requires a nonempty axis with i32-representable indices".into());
         }
-        let output_dtype = if operation == hir::ReduceOp::Argmax {
-            DType::I32
-        } else {
-            dtype
-        };
+        let output_dtype = contract.output();
         let mut output_shape = source.shape.clone();
         output_shape.remove(axis);
         let out = self.tile(output_shape.clone(), output_dtype)?;
         self.each(&output_shape, |s, indices| {
             let accumulator = s.builder.declare_var(scalar_type(dtype)?);
             let initial = if dtype.is_float() {
-                let value = match operation {
-                    hir::ReduceOp::Sum => 0.0,
-                    hir::ReduceOp::Min => f32::INFINITY,
-                    _ => f32::NEG_INFINITY,
-                };
-                s.builder.ins().f32const(value)
+                s.builder.ins().f32const(contract.identity().value() as f32)
             } else {
-                let value = match (dtype, operation) {
-                    (DType::I32, hir::ReduceOp::Min) => i64::from(i32::MAX),
-                    (DType::I32, _) => i64::from(i32::MIN),
-                    (DType::U32, hir::ReduceOp::Min) => i64::from(u32::MAX),
-                    _ => 0,
-                };
-                s.builder.ins().iconst(types::I32, value)
+                s.builder.ins().iconst(scalar_type(dtype)?, contract.identity().value() as i64)
             };
             s.builder.def_var(accumulator, initial);
-            let winner = if operation == hir::ReduceOp::Argmax {
+            let winner = if operation == ReduceOp::Argmax {
                 let var = s.builder.declare_var(types::I32);
                 let zero = s.builder.ins().iconst(types::I32, 0);
                 s.builder.def_var(var, zero);
@@ -1733,13 +1686,30 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let value = s.read(&source, &input)?.0;
                 let acc = s.builder.use_var(accumulator);
                 let next = match operation {
-                    hir::ReduceOp::Sum => {
-                        let sum = s.builder.ins().fadd(acc, value);
-                        s.publish(sum, dtype)
+                    ReduceOp::Sum => {
+                        if dtype.is_float() {
+                            let sum = s.builder.ins().fadd(acc, value);
+                            s.publish(sum, dtype)
+                        } else if dtype == DType::Bool {
+                            s.builder.ins().bor(acc, value)
+                        } else {
+                            // Integer reduction publication saturates after each step.
+                            let extend = |s: &mut Self, v| if dtype == DType::I32 { s.builder.ins().sextend(types::I64, v) } else { s.builder.ins().uextend(types::I64, v) };
+                            let a = extend(s, acc);
+                            let b = extend(s, value);
+                            let sum = s.builder.ins().iadd(a,b);
+                            let lo = s.builder.ins().iconst(types::I64, if dtype == DType::I32 { i64::from(i32::MIN) } else { 0 });
+                            let hi = s.builder.ins().iconst(types::I64, if dtype == DType::I32 { i64::from(i32::MAX) } else { i64::from(u32::MAX) });
+                            let below = s.builder.ins().icmp(IntCC::SignedLessThan, sum, lo);
+                            let sum = s.builder.ins().select(below, lo, sum);
+                            let above = s.builder.ins().icmp(IntCC::SignedGreaterThan, sum, hi);
+                            let sum = s.builder.ins().select(above, hi, sum);
+                            s.builder.ins().ireduce(types::I32, sum)
+                        }
                     }
-                    hir::ReduceOp::Max => s.extremum(acc, value, dtype, true)?,
-                    hir::ReduceOp::Min => s.extremum(acc, value, dtype, false)?,
-                    hir::ReduceOp::Argmax => {
+                    ReduceOp::Max => s.extremum(acc, value, dtype, true)?,
+                    ReduceOp::Min => s.extremum(acc, value, dtype, false)?,
+                    ReduceOp::Argmax => {
                         // Strict improvement preserves the first index on ties;
                         // unordered floats never replace a valid winner.
                         let better = if dtype.is_float() {

@@ -3,7 +3,7 @@
 //! of every kernel call, with tensor arguments bound as buffer offsets into the caller's
 //! parameters.
 
-use crate::msl::{self, Config};
+use crate::{execution::Config, msl};
 use crate::runtime::{Buffer, Device, Pipeline};
 use seismic_lang::plan::{Plan, ScalarSource, Step};
 use seismic_lang::program::Program;

@@ -1024,6 +1024,8 @@ dependencies = [
  "seismic-lang",
  "seismic-metal",
  "seismic-realization",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1102,6 +1104,7 @@ name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
  "seismic-accounting",
+ "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
  "seismic-lang",

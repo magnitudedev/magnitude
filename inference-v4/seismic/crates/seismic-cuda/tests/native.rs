@@ -159,7 +159,7 @@ fn row_norm_native_matches_reference() {
     compare("rms_norm", &[("R", 3), ("W", 17)], &[("eps", 1e-6)]);
 }
 
-fn copy_program(n: i64) -> seismic_lang::lower::Lowered {
+fn copy_program(n: i64) -> seismic_lang::lowered_ir::LoweredIr {
     use seismic_lang::{program::SourceFile, Scope};
     let p=compile(&[SourceFile {path:"copy.seismic.portable".into(),scope:Scope::Portable,text:"fn copy[N](x: tensor[N] f32, out: tensor[N] f32):\n  for i in parallel:\n    t = load(x[i:i+1])\n    store(t, out[i:i+1])\n".into()}],&[]).unwrap_or_else(|e|panic!("{e:?}"));
     seismic_lang::lower::lower(&p, "copy", "cuda", &HashMap::from([("N".into(), n)])).unwrap()
@@ -194,7 +194,7 @@ fn native_bindings_bounds_and_repeated_submission() {
     kernel.run(&mut [&mut input, &mut output], &[]).unwrap();
     assert_eq!(output, input);
     let mut invalid = lowered;
-    let seismic_lang::hir::StmtKind::Parallel { extents, .. } = &mut invalid.body[0].kind else {
+    let seismic_lang::ir::StmtKind::Parallel { extents, .. } = &mut invalid.body[0].kind else {
         panic!()
     };
     extents[0] = seismic_lang::sym::Sym::constant(38);
@@ -729,4 +729,35 @@ fn rotary_and_recurrent_preparation_use_native_math() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn native_artifacts_do_not_allocate_invocation_storage() {
+    let device = seismic_cuda::Device::open(0).unwrap();
+    // The invocation would need hundreds of GB of scratch, independent of tensors.
+    let lowered = copy_program(1i64 << 36);
+    let artifacts = device.compile_artifacts(&lowered, seismic_realization::ScalarOptions {
+        dispatch: Dispatch::ParallelRoot,
+        loads: seismic_realization::LoadStrategy::Materialize,
+    }, 128).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let artifact = &artifacts[0];
+    assert_eq!(artifact.work_items, 1u64 << 36);
+    assert_eq!(artifact.blocks, 1u32 << 29);
+    assert!(artifact.image.cubin.starts_with(b"\x7fELF"));
+    assert_eq!(artifact.image.driver_version, device.info.driver_version);
+    assert_eq!(artifact.image.compute_capability, device.info.compute_capability);
+    assert!(artifact.native.registers_per_thread > 0);
+    assert!(artifact.native.max_active_blocks_per_multiprocessor > 0);
+    // Inspection and execution use one compiler, retaining the image actually loaded.
+    let small = copy_program(17);
+    let options = seismic_realization::ScalarOptions {
+        dispatch: Dispatch::ParallelRoot,
+        loads: seismic_realization::LoadStrategy::Materialize,
+    };
+    let inspected = device.compile_artifacts(&small, options, 128).unwrap();
+    let executed = device.compile_candidate(&small, options, 128).unwrap();
+    assert_eq!(inspected[0].ptx, executed.ptx);
+    assert_eq!(inspected[0].image.cubin, executed.native_image().cubin);
 }

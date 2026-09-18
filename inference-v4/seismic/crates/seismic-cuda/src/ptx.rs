@@ -10,7 +10,7 @@ use seismic_realization::{Dispatch, MathFunction, ScalarProgram};
 use std::fmt::Write;
 
 /// Compile the explicit SIMT baseline without requiring a driver or device.
-pub fn lower(lowered: &seismic_lang::lower::Lowered, dispatch: Dispatch) -> Result<String, String> {
+pub fn lower(lowered: &seismic_lang::lowered_ir::LoweredIr, dispatch: Dispatch) -> Result<String, String> {
     lower_candidate(
         lowered,
         seismic_realization::ScalarOptions {
@@ -20,7 +20,7 @@ pub fn lower(lowered: &seismic_lang::lower::Lowered, dispatch: Dispatch) -> Resu
     )
 }
 pub fn lower_candidate(
-    lowered: &seismic_lang::lower::Lowered,
+    lowered: &seismic_lang::lowered_ir::LoweredIr,
     options: seismic_realization::ScalarOptions,
 ) -> Result<String, String> {
     if lowered.backend != "cuda" {
@@ -361,6 +361,7 @@ impl Emitter<'_> {
             O::Bxor | O::BxorImm => format!("xor.{}", bits(t)),
             O::Ishl | O::IshlImm => format!("shl.{}", bits(t)),
             O::Ushr | O::UshrImm => format!("shr.{}", uint(t)),
+            O::Sshr | O::SshrImm => format!("shr.{}", sint(t)),
             O::Fadd => "add.rn.f32".into(),
             O::Fsub => "sub.rn.f32".into(),
             O::Fmul => "mul.rn.f32".into(),

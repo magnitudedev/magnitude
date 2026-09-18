@@ -9,7 +9,7 @@
 //! repeated region only if the region neither reads a value the statement makes stale nor
 //! rewrites what the statement wrote.**
 
-use crate::hir::{Expr, ExprKind, Index, Stmt, StmtKind, VarId, VarKind};
+use crate::ir::{Expr, ExprKind, Index, Stmt, StmtKind, VarId, VarKind};
 use crate::sym::Atom;
 use std::collections::HashSet;
 
@@ -326,7 +326,7 @@ fn expr_depends(e: &Expr, tainted: &HashSet<VarId>, atom: &Atom) -> bool {
                     }
                 })
         }
-        ExprKind::Transpose(x) | ExprKind::Accessor { base: x, .. } | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => expr_depends(x, tainted, atom),
+        ExprKind::Load { view: x, .. } | ExprKind::Transpose(x) | ExprKind::Accessor { base: x, .. } | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => expr_depends(x, tainted, atom),
         ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => args.iter().any(|a| expr_depends(a, tainted, atom)),
         ExprKind::Binary { lhs, rhs, .. } => expr_depends(lhs, tainted, atom) || expr_depends(rhs, tainted, atom),
         _ => false,
@@ -334,7 +334,7 @@ fn expr_depends(e: &Expr, tainted: &HashSet<VarId>, atom: &Atom) -> bool {
 }
 
 /// A variable's name, for messages.
-pub fn namer(vars: &[crate::hir::Var]) -> impl Fn(VarId) -> String + '_ {
+pub fn namer(vars: &[crate::ir::Var]) -> impl Fn(VarId) -> String + '_ {
     move |v| vars.get(v).map(|x| x.name.clone()).unwrap_or_else(|| format!("#{v}"))
 }
 

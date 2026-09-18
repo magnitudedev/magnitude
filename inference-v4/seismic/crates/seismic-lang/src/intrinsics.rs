@@ -1,20 +1,145 @@
-//! Backend intrinsic tables. An intrinsic is the floor: a backend operation
-//! with no body in the language, defined here with its signature, its
-//! ownership where it has fragment operands, and (later) its printer.
+//! Typed backend operations shared by checking, effects, realization and emission.
+//! Every admitted operation defines its signature and semantic execution contract
+//! exhaustively. These semantics are not native latency or instruction counts.
 
 use crate::sym::Sym;
 use crate::types::{DType, Elem, Shaped, Ty};
 
+/// The admitted intrinsic vocabulary. Signatures, effects and execution semantics
+/// are exhaustive functions of this identity, rather than independent name tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Operation {
+    SimdSum,
+    SimdMax,
+    SimdMin,
+    Matrix,
+    MatrixLoad,
+    MatrixLoadTranspose,
+    MatrixStore,
+    MatrixMultiplyAccumulate,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Semantics {
+    Reduction(crate::ir::ReduceOp),
+    Fragment {
+        rows: u64,
+        columns: u64,
+    },
+    Load {
+        rows: u64,
+        columns: u64,
+        transpose: bool,
+    },
+    Store {
+        rows: u64,
+        columns: u64,
+    },
+    MultiplyAccumulate {
+        rows: u64,
+        columns: u64,
+        inner: u64,
+    },
+}
+impl Operation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SimdSum => "simd_sum",
+            Self::SimdMax => "simd_max",
+            Self::SimdMin => "simd_min",
+            Self::Matrix => "simdgroup_matrix",
+            Self::MatrixLoad => "simdgroup_load",
+            Self::MatrixLoadTranspose => "simdgroup_load_t",
+            Self::MatrixStore => "simdgroup_store",
+            Self::MatrixMultiplyAccumulate => "simdgroup_multiply_accumulate",
+        }
+    }
+    pub fn semantics(self) -> Semantics {
+        match self {
+            Self::SimdSum => Semantics::Reduction(crate::ir::ReduceOp::Sum),
+            Self::SimdMax => Semantics::Reduction(crate::ir::ReduceOp::Max),
+            Self::SimdMin => Semantics::Reduction(crate::ir::ReduceOp::Min),
+            Self::Matrix => Semantics::Fragment {
+                rows: 8,
+                columns: 8,
+            },
+            Self::MatrixLoad => Semantics::Load {
+                rows: 8,
+                columns: 8,
+                transpose: false,
+            },
+            Self::MatrixLoadTranspose => Semantics::Load {
+                rows: 8,
+                columns: 8,
+                transpose: true,
+            },
+            Self::MatrixStore => Semantics::Store {
+                rows: 8,
+                columns: 8,
+            },
+            Self::MatrixMultiplyAccumulate => Semantics::MultiplyAccumulate {
+                rows: 8,
+                columns: 8,
+                inner: 8,
+            },
+        }
+    }
+    /// Declaration creates fragment storage; all executable intrinsics involve
+    /// the subgroup. This describes participation, not a barrier insertion policy.
+    pub fn collective(self) -> bool {
+        !matches!(self, Self::Matrix)
+    }
+    pub fn writes_arguments(self) -> &'static [usize] {
+        match self {
+            Self::MatrixLoad | Self::MatrixLoadTranspose | Self::MatrixMultiplyAccumulate => &[0],
+            Self::MatrixStore => &[1],
+            Self::SimdSum | Self::SimdMax | Self::SimdMin | Self::Matrix => &[],
+        }
+    }
+    pub fn writes_tensor_memory(self) -> bool {
+        // Tile and fragment operands are value storage, not tensor backing.
+        match self {
+            Self::SimdSum
+            | Self::SimdMax
+            | Self::SimdMin
+            | Self::Matrix
+            | Self::MatrixLoad
+            | Self::MatrixLoadTranspose
+            | Self::MatrixStore
+            | Self::MatrixMultiplyAccumulate => false,
+        }
+    }
+    pub fn signature(self) -> Intrinsic {
+        use IntrinsicParam::*;
+        let (params, result) = match self {
+            Self::SimdSum | Self::SimdMax | Self::SimdMin => {
+                (vec![FloatScalar], IntrinsicResult::FloatScalar)
+            }
+            Self::Matrix => (vec![DTypeName], IntrinsicResult::Frag8x8OfNamedDtype),
+            Self::MatrixLoad | Self::MatrixLoadTranspose | Self::MatrixStore => {
+                (vec![Frag8x8, Tile2, Int, Int], IntrinsicResult::Void)
+            }
+            Self::MatrixMultiplyAccumulate => (
+                vec![Frag8x8, Frag8x8, Frag8x8, Frag8x8],
+                IntrinsicResult::Void,
+            ),
+        };
+        Intrinsic {
+            operation: self,
+            params,
+            result,
+        }
+    }
+}
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Intrinsic {
-    pub name: &'static str,
+    pub operation: Operation,
     pub params: Vec<IntrinsicParam>,
     pub result: IntrinsicResult,
-    /// Whether this operation can write tensor backing memory. Local tiles and
-    /// fragments are value storage and do not alias tensor backing.
-    pub writes_tensor_memory: bool,
-    /// Mutable value-storage parameters (zero-based); all other operands are read-only.
-    pub writes_arguments: &'static [usize],
 }
 
 #[derive(Clone, Debug)]
@@ -41,25 +166,31 @@ pub enum IntrinsicResult {
 }
 
 pub fn table(backend: &str) -> Option<Vec<Intrinsic>> {
-    use IntrinsicParam::*;
+    use Operation::*;
     match backend {
-        "metal" => Some(vec![
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[], name: "simd_sum", params: vec![FloatScalar], result: IntrinsicResult::FloatScalar },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[], name: "simd_max", params: vec![FloatScalar], result: IntrinsicResult::FloatScalar },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[], name: "simd_min", params: vec![FloatScalar], result: IntrinsicResult::FloatScalar },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[], name: "simdgroup_matrix", params: vec![DTypeName], result: IntrinsicResult::Frag8x8OfNamedDtype },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[0], name: "simdgroup_load", params: vec![Frag8x8, Tile2, Int, Int], result: IntrinsicResult::Void },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[0], name: "simdgroup_load_t", params: vec![Frag8x8, Tile2, Int, Int], result: IntrinsicResult::Void },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[1], name: "simdgroup_store", params: vec![Frag8x8, Tile2, Int, Int], result: IntrinsicResult::Void },
-            Intrinsic { writes_tensor_memory: false, writes_arguments: &[0], name: "simdgroup_multiply_accumulate", params: vec![Frag8x8, Frag8x8, Frag8x8, Frag8x8], result: IntrinsicResult::Void },
-        ]),
-        "cpu" => Some(vec![]),
-        "cuda" => Some(vec![]),
-        "vulkan" => Some(vec![]),
+        "metal" => Some(
+            [
+                SimdSum,
+                SimdMax,
+                SimdMin,
+                Matrix,
+                MatrixLoad,
+                MatrixLoadTranspose,
+                MatrixStore,
+                MatrixMultiplyAccumulate,
+            ]
+            .into_iter()
+            .map(Operation::signature)
+            .collect(),
+        ),
+        "cpu" | "cuda" | "vulkan" => Some(vec![]),
         _ => None,
     }
 }
 
 pub fn frag8x8(dtype: DType) -> Ty {
-    Ty::Frag(Shaped::new(vec![Sym::constant(8), Sym::constant(8)], Elem::Dtype(dtype)))
+    Ty::Frag(Shaped::new(
+        vec![Sym::constant(8), Sym::constant(8)],
+        Elem::Dtype(dtype),
+    ))
 }

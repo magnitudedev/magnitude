@@ -2,7 +2,7 @@
 
 use crate::{load_program, options};
 use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData};
-use seismic_lang::lower::Choice;
+use seismic_lang::lowered_ir::Choice;
 use seismic_lang::repr;
 use seismic_lang::types::{Elem, Ty};
 use seismic_metal::msl;
@@ -14,8 +14,8 @@ pub fn lower(args: &[String]) -> Result<(), String> {
     let o = options(args)?;
     let program = load_program(&o)?;
     let name = o.function.as_ref().ok_or("--fn is required")?;
-    let lowered = seismic_lang::lower::lower_with(&program, name, &o.target, &o.shapes, &seismic_lang::lower::Options { piece: o.piece })?;
-    for sp in seismic_lang::split::splittable(&lowered.body, &lowered.vars) {
+    let lowered = seismic_lang::lower::lower_specialized(&program, name, &o.target, &o.shapes, &o.elements, &seismic_lang::lower::Options { piece: o.piece })?;
+    for sp in seismic_lang::split::split_candidates(&lowered.body, &lowered.vars) {
         let names: Vec<&str> = sp.carried.iter().map(|v| lowered.vars[*v].name.as_str()).collect();
         eprintln!("splittable: streamed range carrying {}", names.join(", "));
     }
@@ -28,7 +28,7 @@ pub fn lower(args: &[String]) -> Result<(), String> {
     }
     if o.target == "cpu" {
         let kernel = seismic_cpu::compile_candidate(&lowered,o.loads)?;
-        print!("{}", kernel.ir);
+        print!("{}", kernel.native_artifact().ir);
         return Ok(());
     }
     if o.target == "cuda" {
@@ -37,7 +37,7 @@ pub fn lower(args: &[String]) -> Result<(), String> {
     }
     if o.target != "metal" { return Err(format!("target `{}` has no printer yet", o.target)); }
     // `lower` prints without a device, so the architectural maximum stands in for a query.
-    let emitted = msl::emit_with(&lowered, msl::Config { tile_piece: None, sg_per_tg: o.sg_per_tg, piece: o.piece, per_item: o.per_item, split: o.split, max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768 })?;
+    let emitted = msl::emit_with(&lowered, seismic_metal::execution::Config { loads: o.loads, tile_piece: None, sg_per_tg: o.sg_per_tg, piece: o.piece, per_item: o.per_item, split: o.split, max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768 })?;
     print!("{}", emitted.source);
     for l in &emitted.launches {
         eprintln!("launch {}: {} threadgroups x {} threads", l.kernel, l.threadgroups, l.threads_per_threadgroup);
@@ -50,7 +50,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let program = load_program(&o)?;
     let name = o.function.as_ref().ok_or("--fn is required")?;
     let f = program.functions.iter().find(|f| &f.name == name).ok_or_else(|| format!("no function `{name}`"))?.clone();
-    let lowered = seismic_lang::lower::lower_with(&program, name, &o.target, &o.shapes, &seismic_lang::lower::Options { piece: o.piece })?;
+    let lowered = seismic_lang::lower::lower_specialized(&program, name, &o.target, &o.shapes, &o.elements, &seismic_lang::lower::Options { piece: o.piece })?;
     for p in &f.shape_params {
         if !o.shapes.contains_key(p) {
             return Err(format!("shape parameter `{p}` is not bound; pass --shape {p}=<value>"));
@@ -67,7 +67,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut interp = Interpreter::new(&program);
     let mut scalar_schema = Vec::new();
     let mut scalar_values = Vec::new();
-    for (pname, ty) in &f.params {
+    for (pname, ty) in &lowered.params {
         match ty {
             Ty::Tensor(s) => {
                 let shape: Vec<usize> = s.shape.iter().map(shape_env).collect::<Result<_, _>>()?;
@@ -143,11 +143,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn run_metal(o: &crate::Options, program: &seismic_lang::program::Program, name: &str,
-    lowered: &seismic_lang::lower::Lowered, tensors: &[(String, TensorData)], interp: &Interpreter<'_>, scalar_bytes: &[u8]) -> Result<(), String> {
+    lowered: &seismic_lang::lowered_ir::LoweredIr, tensors: &[(String, TensorData)], interp: &Interpreter<'_>, scalar_bytes: &[u8]) -> Result<(), String> {
     let device = Device::open()?;
     let info = device.info();
     eprintln!("device: {} (unified memory: {})", info.name, info.unified_memory);
-    let emitted = msl::emit_with(&lowered, msl::Config { tile_piece: None, sg_per_tg: o.sg_per_tg, piece: o.piece, per_item: o.per_item, split: o.split, max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64, max_threadgroup_bytes: info.max_threadgroup_bytes as i64 })?;
+    let emitted = msl::emit_with(lowered, seismic_metal::execution::Config { loads: o.loads, tile_piece: None, sg_per_tg: o.sg_per_tg, piece: o.piece, per_item: o.per_item, split: o.split, max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64, max_threadgroup_bytes: info.max_threadgroup_bytes as i64 })?;
     let t1 = Instant::now();
     let pipeline = device.compile(emitted)?;
     eprintln!("metal compile: {:.3} s", t1.elapsed().as_secs_f64());
@@ -169,7 +169,7 @@ fn run_metal(o: &crate::Options, program: &seismic_lang::program::Program, name:
     let refs: Vec<&Buffer> = buffers.iter().collect();
 
     // Run once, compare, then time.
-    let gpu = device.run(&pipeline, &refs, &scalar_bytes, 1)?;
+    let gpu = device.run(&pipeline, &refs, scalar_bytes, 1)?;
     let mut worst_abs = 0f64;
     let mut worst_rel = 0f64;
     for (pname, data) in tensors.iter() {
@@ -214,7 +214,7 @@ fn run_metal(o: &crate::Options, program: &seismic_lang::program::Program, name:
     }
     let mut times = Vec::new();
     for _ in 0..o.iters {
-        times.push(device.run(&pipeline, &refs, &scalar_bytes, o.repeat)? / o.repeat as f64);
+        times.push(device.run(&pipeline, &refs, scalar_bytes, o.repeat)? / o.repeat as f64);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = times[times.len() / 2];
@@ -222,7 +222,7 @@ fn run_metal(o: &crate::Options, program: &seismic_lang::program::Program, name:
     eprintln!("bound buffer storage: {:.1} MB (allocation size, not measured traffic)", total_bytes as f64 / 1e6);
     // The former byte/FLOP shortcut did not establish a roofline. Do not publish a
     // percentage until checked region/operation accounts and a compatible profile exist.
-    crate::account::print_work(&program, name, &o.shapes, o.analysis_steps)?;
+    crate::account::print_work(program, name, &o.shapes, &o.elements, o.analysis_steps)?;
     let ok = worst_rel <= 2e-2;
     println!("{}: {name} on {}: max rel err {worst_rel:.2e}, {:.3} ms", if !o.check { "unchecked" } else if ok { "ok" } else { "MISMATCH" }, o.target, median * 1e3);
     if ok { Ok(()) } else { Err("device result differs from the reference".into()) }
@@ -243,7 +243,7 @@ pub fn calibrate() -> Result<(), String> {
 pub fn calibrate() -> Result<(), String> { Err("Metal calibration requires macOS".into()) }
 
 fn run_cpu(o: &crate::Options, program: &seismic_lang::program::Program, name: &str,
-    lowered: &seismic_lang::lower::Lowered, tensors: &[(String, TensorData)], reference: &Interpreter<'_>) -> Result<(), String> {
+    lowered: &seismic_lang::lowered_ir::LoweredIr, tensors: &[(String, TensorData)], reference: &Interpreter<'_>) -> Result<(), String> {
     if o.iters == 0 || o.repeat == 0 { return Err("--iters and --repeat must be positive".into()); }
     let start = Instant::now();
     let mut kernel = seismic_cpu::compile_candidate(lowered,o.loads)?;
@@ -261,7 +261,7 @@ fn run_cpu(o: &crate::Options, program: &seismic_lang::program::Program, name: &
         times.push(start.elapsed().as_secs_f64() / o.repeat as f64);
     }
     times.sort_by(f64::total_cmp);
-    crate::account::print_work(program, name, &o.shapes, o.analysis_steps)?;
+    crate::account::print_work(program, name, &o.shapes, &o.elements, o.analysis_steps)?;
     println!("{}: {name} on CPU {}: median {:.3} ms including invocation, scratch {} bytes", if o.check {"ok"} else {"unchecked"}, std::env::consts::ARCH, times[times.len()/2]*1000.0,kernel.scratch_bytes());
     Ok(())
 }
@@ -292,7 +292,7 @@ fn check_scalar_buffers(specs: &[seismic_realization::BufferSpec], buffers: &[Ve
     Ok(())
 }
 fn run_cuda(o: &crate::Options, program: &seismic_lang::program::Program, name: &str,
-    lowered: &seismic_lang::lower::Lowered, tensors: &[(String, TensorData)], reference: &Interpreter<'_>) -> Result<(), String> {
+    lowered: &seismic_lang::lowered_ir::LoweredIr, tensors: &[(String, TensorData)], reference: &Interpreter<'_>) -> Result<(), String> {
     let threads = o.threads_per_block.ok_or("CUDA scalar baseline requires an explicit --threads-per-block candidate; automatic selection is not implemented yet")?;
     let device = seismic_cuda::Device::open(0)?;
     eprintln!("CUDA device: {:?}", device.info);
@@ -315,7 +315,7 @@ fn run_cuda(o: &crate::Options, program: &seismic_lang::program::Program, name: 
     }
     times.sort_by(f64::total_cmp);
     device_times.sort_by(f64::total_cmp);
-    crate::account::print_work(program, name, &o.shapes, o.analysis_steps)?;
+    crate::account::print_work(program, name, &o.shapes, &o.elements, o.analysis_steps)?;
     println!("{}: {name} on CUDA {}: median {:.3} ms including launch, synchronization and status download; scratch {} bytes", if o.check {"ok"} else {"unchecked"}, device.info.name, times[times.len()/2]*1000.0, kernel.scratch_bytes());
     println!("CUDA event interval: median {:.3} ms/kernel; input reset/transfer and host validation excluded",device_times[device_times.len()/2]*1000.0);
     Ok(())
@@ -325,7 +325,7 @@ pub fn plan(args: &[String]) -> Result<(), String> {
     let o = options(args)?;
     let program = load_program(&o)?;
     let name = o.function.as_ref().ok_or("--fn is required")?;
-    let plan = seismic_lang::plan::plan(&program, name, &o.shapes)?;
+    let plan = seismic_lang::plan::plan_specialized(&program, name, &o.shapes, &o.elements)?;
     let mut distinct = std::collections::BTreeMap::new();
     for (i, step) in plan.steps.iter().enumerate() {
         let mut shapes: Vec<String> = step.shapes.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -350,6 +350,7 @@ pub fn plan(args: &[String]) -> Result<(), String> {
 /// Metal plan executor consumes.
 pub fn bindings(args: &[String]) -> Result<(), String> {
     let o = options(args)?;
+    if !o.elements.is_empty() {return Err("bindings generator does not yet accept concrete element substitutions".into());}
     let program = load_program(&o)?;
     let name = o.function.as_ref().ok_or("--fn is required")?;
     let f = program.functions.iter().find(|f| &f.name == name).ok_or_else(|| format!("no function `{name}`"))?;

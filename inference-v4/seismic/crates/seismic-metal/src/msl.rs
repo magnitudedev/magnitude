@@ -1,56 +1,24 @@
 //! MSL printer for lowered functions.
 //!
-//! Realization on Metal, this version:
-//! - every top-level `parallel` block is one compute kernel; a work item is one simdgroup;
-//!   `sg_per_tg` simdgroups form a threadgroup;
-//! - a tile with at most 32 elements of capacity is *replicated*: every lane holds all of it
-//!   and computes it uniformly; a larger tile is *distributed*: element `e` lives in lane
-//!   `e % 32`, slot `e / 32`; a tile passed to simdgroup intrinsics lives in threadgroup memory;
-//! - a tile bound by a `load(..., over=axis)` loop is a *global view*: reads index device memory.
-//!   Over a dynamic extent the loop runs in pieces of a static capacity with a runtime extent;
-//! - a `load(view)` tile is materialized into its register realization;
-//! - dtype conversions are inserted exactly where the checker's types change.
+//! Storage legality is derived from IR by `storage`; explicit selections are
+//! validated against those domains. The diagnostic default still contains a
+//! placement policy and is not an optimized Tuned IR path.
+//! Load realization is explicit, with borrowing admitted by shared lifetime rules.
+//! Dtype conversions preserve the checked numerical publication boundaries.
 
 use seismic_lang::abi::ScalarParameter;
 use seismic_lang::ast::{AssignOp, BinaryOp, UnaryOp};
-use seismic_lang::hir::*;
-use seismic_lang::lower::Lowered;
+use seismic_lang::ir::*;
+use seismic_lang::lowered_ir::LoweredIr;
+use crate::storage::StorageDecision;
+use seismic_realization::memory::{AllocationId, Purpose, BarrierSite, BarrierPurpose, MemorySpace};
 use seismic_lang::repr;
 use seismic_lang::sym::{Atom, Sym};
 use seismic_lang::types::{DType, Elem, Ty};
 use seismic_realization::{BufferSpec, dispatch::{GroupDispatch, TileDeclaration, TilePlacement}};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-pub const SUBGROUP: i64 = 32;
-
-/// Realization choices the model will close; defaults for now.
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub sg_per_tg: i64,
-    /// Piece capacity for static streaming extents; `None` streams whole axes.
-    pub piece: Option<i64>,
-    /// How many consecutive values of the innermost `parallel` index one work item covers.
-    /// A free integer of the realization: kernels never name it.
-    pub per_item: i64,
-    /// How many simdgroups of one threadgroup share a splittable streamed range, each
-    /// taking a slice and merging through threadgroup memory. A free integer of the
-    /// realization: kernels never name it. 1 leaves the range whole.
-    pub split: i64,
-    /// Explicit independent pointwise tile extent per work item. Requires a
-    /// checked partition proof and runtime overlap validation; no implicit policy.
-    pub tile_piece: Option<i64>,
-    /// Device capacity facts, queried. The performance model will weigh
-    /// parallelism against reuse; it is carried so no part of the compiler invents it.
-    pub max_threads_per_threadgroup: i64,
-    pub max_threadgroup_bytes: i64,
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config { sg_per_tg: 4, piece: None, per_item: 1, split: 1, tile_piece: None, max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768 ,
-        }
-    }
-}
+use crate::execution::{self, Config, Execution, SUBGROUP};
 
 #[derive(Clone, Debug)]
 pub struct Emitted {
@@ -126,14 +94,19 @@ enum Realization {
     },
 }
 
+
+struct SplitTail {
+    phase: usize,
+    kernel: String,
+    carried: Vec<VarId>,
+    body: Vec<Stmt>,
+}
+
 struct Printer<'a> {
-    f: &'a Lowered,
-    cfg: Config,
+    f: &'a LoweredIr,
+    execution: &'a Execution,
+    cfg: &'a Config,
     out: String,
-    /// Tiles read at indices other than their own inside an `owned` loop, or outside any.
-    cross_read: std::collections::HashSet<VarId>,
-    /// Tiles written element-wise or by an intrinsic store.
-    written: std::collections::HashSet<VarId>,
     real: HashMap<VarId, Realization>,
     /// atom or emitted symbol -> C name
     names: HashMap<String, String>,
@@ -146,61 +119,55 @@ struct Printer<'a> {
     scalars: Vec<ScalarParameter>,
     shared_decls: Vec<(String, u64)>,
     tile_declarations: Vec<TileDeclaration>,
+    memory_launch: usize,
+    emitted_barriers: HashSet<BarrierSite>,
     /// Simdgroups per threadgroup for the kernel being emitted.
     simdgroups: i64,
-    /// The variable table, extended by rewrites that introduce variables.
-    extra_vars: Vec<Var>,
-    /// Byte sizes of compiler-allocated scratch buffers.
-    scratch: Vec<usize>,
 }
 
-pub fn emit(f: &Lowered) -> Result<Emitted, String> {
+pub fn emit(f: &LoweredIr) -> Result<Emitted, String> {
     emit_with(f, Config::default())
 }
 
-pub fn emit_with(f: &Lowered, cfg: Config) -> Result<Emitted, String> {
-    if cfg.sg_per_tg <= 0 || cfg.per_item <= 0 || cfg.split <= 0
-        || cfg.sg_per_tg.checked_mul(SUBGROUP).is_none_or(|n| n > cfg.max_threads_per_threadgroup)
-        || cfg.max_threadgroup_bytes < 0 {
-        return Err("invalid Metal candidate or device resource limits".into());
-    }
-    if cfg.per_item > 1 && cfg.split > 1 {
-        return Err("combined widening and splitting is not realized".into());
-    }
-    // A serial root is one logical work item. Its existence must not require
-    // authors to wrap natural sequential code in a synthetic parallel loop.
-    let serial_root;
-    let f = if !f.body.iter().any(|s| matches!(s.kind, StmtKind::Parallel { .. })) {
-        serial_root = Lowered { body: vec![Stmt { kind: StmtKind::Parallel {
-            vars: Vec::new(), extents: Vec::new(), body: f.body.clone(),
-        }, span: f.body.first().map(|s| s.span).unwrap_or_default() ,
-            }], ..f.clone() };
-        &serial_root
-    } else { f };
-    // An explicit candidate either realizes its declared choices or is rejected.
-    // Silently shrinking widening/splitting would invalidate accounting, cache
-    // identities and any comparison with the requested realization.
-    if let Some(piece) = cfg.tile_piece {
-        if cfg.per_item != 1 || cfg.split != 1 {
-            return Err("pointwise partition cannot combine with widening or reduction splitting".into());
-        }
-        let partitioned = seismic_lang::partition::pointwise(f,piece)?;
-        let mut emitted = emit_exact(&partitioned.function,cfg)?;
-        for (at,(a,ad)) in partitioned.parameters.iter().enumerate() {
-            for (b,bd) in &partitioned.parameters[at+1..] {
-                let find = |id:usize| emitted.buffers.iter().position(|slot|slot.parameter == f.vars[id].name && slot.plane.is_empty()).ok_or("partition parameter missing from ABI");
-                emitted.alias_pairs.push((find(*a)?,find(*b)?,ad==bd));
-            }
-        }
-        Ok(emitted)
-    } else { emit_exact(f, cfg) }
+pub fn emit_with(f: &LoweredIr, cfg: Config) -> Result<Emitted, String> {
+    emit_execution(&execution::prepare(f, cfg)?)
 }
 
-fn emit_exact(f: &Lowered, cfg: Config) -> Result<Emitted, String> {
-    let (cross_read, written) = analyze_usage(f);
-    let cfg_sg = cfg.sg_per_tg;
-    Printer { f, cfg, out: String::new(), cross_read, written, real: HashMap::new(), names: HashMap::new(), pieces: HashMap::new(), indent: 0, counter: 0, owned_ctx: Vec::new(), buffers: Vec::new(), scalars: Vec::new(), shared_decls: Vec::new(), tile_declarations: Vec::new(), simdgroups: cfg_sg, extra_vars: Vec::new(), scratch: Vec::new() ,
-    }.emit()
+/// Resolve storage before printing the selected execution.
+pub fn emit_storage_selected(
+    f: &LoweredIr, cfg: Config,
+    select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>,
+) -> Result<Emitted, String> {
+    emit_execution(&execution::prepare_storage_selected(f, cfg, select)?)
+}
+
+/// Print an already transformed execution with resolved materialized-value placements.
+/// Allocation lifetimes and intrinsic scheduling remain incomplete boundaries.
+pub fn emit_execution(execution: &Execution) -> Result<Emitted, String> {
+    let f = &execution.function;
+    let cfg = &execution.config;
+    let mut emitted = Printer { f, execution, cfg, out: String::new(),
+        real: HashMap::new(), names: HashMap::new(), pieces: HashMap::new(), indent: 0, counter: 0,
+        owned_ctx: Vec::new(), buffers: Vec::new(), scalars: Vec::new(), shared_decls: Vec::new(),
+        tile_declarations: Vec::new(), memory_launch: 0, emitted_barriers: HashSet::new(), simdgroups: cfg.sg_per_tg,
+    }.emit()?;
+    let planned = execution.memory.launches();
+    if emitted.launches.len() != planned.len() { return Err("emitted launch count disagrees with allocation plan".into()); }
+    for (launch, plan) in emitted.launches.iter().zip(planned) {
+        if launch.tiles.iter().ne(plan.arrays.iter().map(|a| &a.declaration))
+            || launch.declared_threadgroup_bytes != plan.shared_bytes_per_group {
+            let at = launch.tiles.iter().zip(&plan.arrays).position(|(a,b)| a != &b.declaration).unwrap_or(launch.tiles.len().min(plan.arrays.len()));
+            return Err(format!("{}: emitted tile arrays disagree with the allocation plan at {at}: emitted {:?}, planned {:?}; counts {} vs {}",launch.kernel,launch.tiles.get(at),plan.arrays.get(at).map(|a|&a.declaration),launch.tiles.len(),plan.arrays.len()));
+        }
+    }
+    for (at, (a, ad)) in execution.partition_parameters.iter().enumerate() {
+        for (b, bd) in &execution.partition_parameters[at + 1..] {
+            let find = |id: usize| emitted.buffers.iter().position(|slot| slot.parameter == f.vars[id].name && slot.plane.is_empty())
+                .ok_or("partition parameter missing from ABI");
+            emitted.alias_pairs.push((find(*a)?, find(*b)?, ad == bd));
+        }
+    }
+    Ok(emitted)
 }
 
 fn ctype(d: DType) -> &'static str {
@@ -221,7 +188,7 @@ fn scalar_dtype(t: &Ty) -> Option<DType> {
     }
 }
 
-impl<'a> Printer<'a> {
+impl Printer<'_> {
     fn line(&mut self, text: &str) {
         for _ in 0..self.indent {
             self.out.push_str("  ");
@@ -261,13 +228,9 @@ impl<'a> Printer<'a> {
         Ok(Dim { cap, ext })
     }
 
-    /// The variables in scope: the function's, plus any a rewrite introduced.
+    /// All value identities are established before printing.
     fn vars(&self) -> &[Var] {
-        if self.extra_vars.is_empty() {
-            &self.f.vars
-        } else {
-            &self.extra_vars
-        }
+        &self.f.vars
     }
 
     fn dims(&self, shape: &[Sym]) -> Result<Vec<Dim>, String> {
@@ -379,15 +342,10 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             }
         }
         // Scratch the split needs, declared on every kernel so one binding list serves all.
-        let scratch_count = if self.cfg.split > 1 {
-            seismic_lang::split::splittable(&self.f.body, &self.vars()).iter().map(|sp| sp.carried.len()).sum::<usize>()
-        } else {
-            0
-        };
-        for n in 0..scratch_count {
-            params_sig.push(format!("device float* split_{n} [[buffer({})]]", index + n));
+        for scratch in self.execution.memory.scratch() {
+            params_sig.push(format!("device {}* split_{} [[buffer({})]]", ctype(scratch.dtype), scratch.index, index + scratch.index));
         }
-        index += scratch_count;
+        index += self.execution.memory.scratch().len();
         if !self.scalars.is_empty() {
             header.push_str("struct Scalars {\n");
             for parameter in &self.scalars {
@@ -404,64 +362,24 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         let status_slot = index + usize::from(!self.scalars.is_empty());
         params_sig.push(format!("device atomic_uint* seismic_status [[buffer({status_slot})]]"));
         let mut launches = Vec::new();
-        let mut split_tails: Vec<(usize, String, Vec<seismic_lang::hir::VarId>, Vec<(String, usize, i64)>, i64, i64, Vec<Stmt>,
-        )> = Vec::new();
-        let mut body = self.f.body.clone();
-        // A streamed range that carries state is the only sequential work a `parallel` block
-        // has. When the model splits it, the simdgroups of one threadgroup each take a slice
-        // and merge afterwards, so the item count is unchanged and no scratch is needed.
-        // The parts of a split are the simdgroups of one threadgroup, so a Metal threadgroup's
-        // limit bounds it: at most 1024 threads, and every part must be a real simdgroup.
-        let splits = if self.cfg.split > 1 { seismic_lang::split::splittable(&body, &self.vars()) } else { Vec::new() };
-        if self.cfg.split > 1 && splits.is_empty() {
-            return Err("requested split has no legal streamed reduction".into());
-        }
-        let mut split_state: Vec<(usize, Vec<seismic_lang::hir::VarId>)> = Vec::new();
-        for sp in &splits {
-            let atom = Atom::Param(format!("part#{}", self.counter));
-            self.counter += 1;
-            let part = self.vars().len() + split_state.len();
-            {
-                let StmtKind::Parallel { body: block, .. } = &body[sp.stmt].kind else { unreachable!() };
-                let StmtKind::LoadLoop { body: loop_body, .. } = &block[sp.loop_at].kind else { unreachable!() };
-                let names = seismic_lang::rewrite::namer(&self.vars());
-                seismic_lang::rewrite::check_split(loop_body, &sp.carried, &names).map_err(|e| e.to_string())?;
-                
-            }
-            seismic_lang::split::narrow_range(sp, &mut body, part, &atom, self.cfg.split)?;
-            self.names.insert(match &atom { Atom::Param(p) => p.clone(), _ => unreachable!() ,
-                }, "part".to_string(),
-            );
-            split_state.push((sp.stmt, sp.carried.clone()));
-        }
+        let body = &self.f.body;
         for (k, stmt) in body.iter().enumerate() {
-            let StmtKind::Parallel { vars, extents, body ,
-            } = &stmt.kind else {
-                return Err("every top-level statement of a kernel must be a `parallel` block".into(),
-                );
-            };
-            let extents: Vec<i64> = extents.iter().map(|e| e.as_constant().ok_or("parallel extent is not concrete")).collect::<Result<_, _>>()?;
-            // One work item covers `per_item` consecutive values of the innermost index, so
-            // the weight rows it reads are contiguous and its activation reads are shared.
-            // The declared widening must divide the domain; tail widening is
-            // a different realization and cannot silently replace this choice.
-            let inner = *extents.last().unwrap_or(&1);
-            let splits_here = split_state.iter().any(|(at, _)| *at == k);
-            if inner % self.cfg.per_item != 0 {
-                return Err(format!("requested widening {} does not divide parallel extent {inner}",self.cfg.per_item));
+            let mut split_tails = Vec::new();
+            let phase = &self.execution.phases[k];
+            let StmtKind::Parallel { vars, body, .. } = &stmt.kind else { unreachable!() };
+            let split_here = phase.split.is_some();
+            let parts = phase.parts;
+            let items = phase.dispatch.work_items;
+            if let Some(split) = &phase.split {
+                let VarKind::Index(Atom::Param(atom)) = &self.f.vars[split.part].kind else { unreachable!() };
+                self.names.insert(atom.clone(), "part".into());
+                self.real.insert(split.part, Realization::Index { name: "part".into() });
             }
-            let per_item = self.cfg.per_item;
-            let base_items: i64 = extents.iter().product::<i64>() / per_item;
-            // A split gives every part its own work item, so the machine fills with
-            // threadgroups rather than with simdgroups of one threadgroup.
-            let split_here = splits_here;
-            let parts = if split_here { self.cfg.split } else { 1 };
-            let items: i64 = base_items * parts;
             let kernel = format!("{}_{k}", self.f.name);
             let mut kernel_out = String::new();
             std::mem::swap(&mut self.out, &mut kernel_out);
             self.indent = 1;
-            let sg_per_tg = self.cfg.sg_per_tg;
+            let sg_per_tg = phase.dispatch.items_per_group as i64;
             self.simdgroups = sg_per_tg;
             self.line(&format!("const uint slot = tg_pos.x * {sg_per_tg} + sg_id;"));
             self.line(&format!("if (slot >= {items}) return;"));
@@ -472,65 +390,20 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             } else {
                 self.line("const uint item = slot;");
             }
-            // Each index's own extent, with the innermost reduced by the run one item covers.
-            // The strides come from these reduced extents, so the two rewrites compose.
-            let last = vars.len().saturating_sub(1);
-            let reduced: Vec<i64> = extents.iter().enumerate().map(|(i, e)| if i == last { (e / per_item).max(1) } else { *e }).collect();
-            let mut stride: i64 = reduced.iter().product();
-            let mut inner_name = String::new();
-            for (i, (v, e)) in vars.iter().zip(&reduced).enumerate() {
-                let e = *e;
-                stride /= e.max(1);
-                let name = self.index_name(*v);
-                if i == last && per_item > 1 {
-                    // The innermost index becomes the base of this item's run.
-                    inner_name = name.clone();
-                    self.line(&format!("const int {name}_base = ((item / {stride}) % {e}) * {per_item};"));
-                } else {
-                    self.line(&format!("const int {name} = (item / {stride}) % {e};"));
-                }
-            }
-            if per_item > 1 {
-                // One item covers several values of the innermost index. The body is rewritten
-                // so the statements that depend on that index exist once per covered value,
-                // each with its own state, while everything else stays single. Work the covered
-                // values share, such as reading the activation row they all multiply against,
-                // is therefore done once instead of once per value.
-                let inner_atom = match &self.vars()[vars[last]].kind {
-                    VarKind::Index(a) => a.clone(),
-                    _ => unreachable!(),
-                };
-                let base = Expr {
-                    kind: ExprKind::Var(vars[last]),
-                    ty: Ty::Scalar(DType::I32),
-                    sym: Some(Sym::atom(inner_atom.clone())),
-                    span: stmt.span,
-                };
-                let mut vars_mut: Vec<Var> = self.vars().to_vec();
-                let widened = seismic_lang::widen::apply(body, vars[last], &inner_atom, per_item, &mut vars_mut, &base,
-                );
-                self.extra_vars = vars_mut;
-                self.line(&format!("const int {inner_name} = {inner_name}_base;"));
-                let mut terms: Vec<String> = Vec::new();
-                let mut place = 1i64;
-                for (v, e) in vars.iter().zip(&extents).rev() {
-                    let n = self.index_name(*v);
-                    terms.push(if place == 1 { format!("uint({n})") } else { format!("uint({n}) * {place}") });
-                    place *= e;
-                }
-                self.line(&format!("const uint tuple = {};", terms.join(" + ")));
-                self.block(&widened)?;
-            } else if split_here {
-                self.line("const uint tuple = item;");
+            self.bind_work_indices(vars, &phase.mapping)?;
+            if split_here {
                 // Each part streams its slice and publishes its carried state to scratch.
                 // A second launch folds the parts together with the loop body's own merge
                 // rule and runs the tail, so the kernel text never mentions either.
-                let at = split_state.iter().position(|(a, _)| *a == k).unwrap();
-                let carried = split_state[at].1.clone();
-                self.block(&body[..splits[at].loop_at + 1])?;
-                let handoff = self.publish_partials(&carried, base_items * per_item, parts, "tuple")?;
-                split_tails.push((k, kernel.clone(), carried, handoff, base_items, parts, body[splits[at].loop_at + 1..].to_vec(),
-                ));
+                let split = phase.split.as_ref().unwrap();
+                self.block(&body[..split.loop_at])?;
+                self.block(&split.validation_bindings)?;
+                for view in &split.original_views { self.view_of(view)?; }
+                let carried = split.carried.clone();
+                self.block(&body[split.loop_at..split.loop_at + 1])?;
+                self.publish_partials(k, &carried, "item")?;
+                split_tails.push(SplitTail { phase: k, kernel: kernel.clone(), carried,
+                    body: body[split.loop_at + 1..].to_vec() });
                 self.block(&[])?;
             } else {
                 self.block(body)?;
@@ -549,33 +422,26 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             }
             self.out.push_str(&kernel_out);
             self.out.push_str("}\n\n");
-            let after_barrier = !launches.is_empty();
-            launches.push(Launch { kernel, threadgroups: ((items + sg_per_tg - 1) / sg_per_tg) as u64, threads_per_threadgroup: (sg_per_tg * SUBGROUP) as u64, after_barrier,
-                dispatch: Some(GroupDispatch::new(items as u64,SUBGROUP as u64,sg_per_tg as u64)?),
-                tiles: std::mem::take(&mut self.tile_declarations),declared_threadgroup_bytes:shared_bytes,
+            let after_barrier = self.execution.memory.launches()[launches.len()].predecessor.is_some();
+            launches.push(Launch { kernel, threadgroups: phase.dispatch.groups, threads_per_threadgroup: phase.dispatch.threads_per_group, after_barrier,
+                dispatch: Some(phase.dispatch.clone()),
+                tiles: self.finish_memory()?,declared_threadgroup_bytes:shared_bytes,
             });
-        }
-        // A split reduction's second launch: fold the parts and run the tail.
-        for (k, first, carried, handoff, _items, parts, tail) in split_tails.clone() {
-            let StmtKind::Parallel { vars, extents, .. } = &body[k].kind else { unreachable!() };
-            let extents: Vec<i64> = extents.iter().map(|e| e.as_constant().unwrap()).collect();
-            // One item per index tuple: the merge does not itself use multiplicity.
-            let items: i64 = extents.iter().product();
+        // Complete this phase before a subsequent phase can observe its output.
+        for SplitTail { phase: k, kernel: first, carried, body: tail } in split_tails {
+            let StmtKind::Parallel { vars, .. } = &self.f.body[k].kind else { unreachable!() };
+            let dispatch = self.execution.phases[k].merge_dispatch.as_ref().unwrap();
+            let items = dispatch.work_items as i64;
             let kernel = format!("{first}_merge");
             let mut kernel_out = String::new();
             std::mem::swap(&mut self.out, &mut kernel_out);
             self.indent = 1;
-            let sg_per_tg = self.cfg.sg_per_tg;
+            let sg_per_tg = dispatch.items_per_group as i64;
             self.simdgroups = sg_per_tg;
             self.line(&format!("const uint item = tg_pos.x * {sg_per_tg} + sg_id;"));
             self.line(&format!("if (item >= {items}) return;"));
-            let mut stride = items;
-            for (v, e) in vars.iter().zip(&extents) {
-                stride /= e;
-                let name = self.index_name(*v);
-                self.line(&format!("const int {name} = (item / {stride}) % {e};"));
-            }
-            self.merge_partials(&carried, &handoff, parts)?;
+            self.bind_work_indices(vars, &self.execution.phases[k].mapping)?;
+            self.merge_partials(k, &carried, &self.execution.phases[k].split.as_ref().unwrap().merges, self.f.body[k].id.ok_or("merge phase has no operation identity")?)?;
             self.block(&tail)?;
             self.indent = 0;
             std::mem::swap(&mut self.out, &mut kernel_out);
@@ -587,13 +453,30 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             }
             self.out.push_str(&kernel_out);
             self.out.push_str("}\n\n");
-            launches.push(Launch { kernel, threadgroups: ((items + sg_per_tg - 1) / sg_per_tg) as u64, threads_per_threadgroup: (sg_per_tg * SUBGROUP) as u64, after_barrier: true,
-                dispatch: Some(GroupDispatch::new(items as u64,SUBGROUP as u64,sg_per_tg as u64)?),
-                tiles: std::mem::take(&mut self.tile_declarations),declared_threadgroup_bytes:shared_bytes,
+            let after_barrier = self.execution.memory.launches()[launches.len()].predecessor.is_some();
+            launches.push(Launch { kernel, threadgroups: dispatch.groups, threads_per_threadgroup: dispatch.threads_per_group, after_barrier,
+                dispatch: Some(dispatch.clone()),
+                tiles: self.finish_memory()?,declared_threadgroup_bytes:shared_bytes,
             });
         }
-        Ok(Emitted { source: header + &self.out, launches, buffers: self.buffers, scalars: self.scalars, scratch: self.scratch, status_slot: Some(status_slot), alias_pairs: Vec::new(),
+        }
+        Ok(Emitted { source: header + &self.out, launches, buffers: self.buffers, scalars: self.scalars, scratch: self.execution.memory.scratch().iter().map(|s| s.bytes).collect(), status_slot: Some(status_slot), alias_pairs: Vec::new(),
         })
+    }
+
+    fn bind_work_indices(&mut self, vars: &[VarId], mapping: &seismic_realization::dispatch::WorkMapping) -> Result<(), String> {
+        if vars.len() != mapping.axes().len() { return Err("parallel variables do not match the work mapping".into()); }
+        for (v, axis) in vars.iter().zip(mapping.axes()) {
+            let name = self.index_name(*v);
+            if mapping.work_items() == 0 {
+                // The launch has no work. Keep its source well-defined as well.
+                self.line(&format!("const int {name} = 0;"));
+            } else {
+                let (stride, extent, step) = (axis.stride, axis.extent, axis.step);
+                self.line(&format!("const int {name} = int(((item / {stride}u) % {extent}u) * {step}u);"));
+            }
+        }
+        Ok(())
     }
 
     fn index_name(&mut self, v: VarId) -> String {
@@ -617,9 +500,6 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         match &s.kind {
             StmtKind::Parallel { .. } => Err("nested `parallel` is not supported".into()),
             StmtKind::Range { var, lo, hi, body } => {
-                if matches!((lo.as_constant(),hi.as_constant()),(Some(lo),Some(hi)) if lo>=hi) {
-                    return Ok(());
-                }
                 let name = self.index_name(*var);
                 let lo = self.sym(lo)?;
                 let hi = self.sym(hi)?;
@@ -654,16 +534,18 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 self.line("}");
                 Ok(())
             }
-            StmtKind::LoadLoop { vars, views, axis, piece, capacity, body ,
+            StmtKind::LoadLoop { vars, views, axis, piece, capacity, modes, body ,
             } => {
+                let operation = s.id.ok_or("stream has no operation identity")?;
+                let modes = modes.as_ref().filter(|m| m.len() == vars.len()).ok_or("unresolved stream loads reached Metal emission")?;
                 let realized: Vec<Realization> = views.iter().map(|v| self.view_of(v)).collect::<Result<_, _>>()?;
                 match capacity {
                     None => {
                         if let Some(Realization::View { shape, .. }) = realized.first() {
                             if shape.get(*axis).and_then(Sym::as_constant) == Some(0) { return Ok(()); }
                         }
-                        for (v, r) in vars.iter().zip(realized) {
-                            self.bind_stream_load(*v, r, body)?;
+                        for ((v, r), mode) in vars.iter().zip(realized).zip(modes) {
+                            self.bind_stream_load(*v, r, *mode, operation)?;
                         }
                         self.block(body)
                     }
@@ -679,14 +561,14 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         self.line(&format!("for (int {chunk} = 0; {chunk} < ({ext} / {cap} + int({ext} % {cap} != 0)); ++{chunk}) {{"));
                         self.indent += 1;
                         self.line(&format!("const int {pe} = min({cap}, {ext} - {chunk} * {cap});"));
-                        for (v, r) in vars.iter().zip(realized) {
+                        for ((v, r), mode) in vars.iter().zip(realized).zip(modes) {
                             let Realization::View { param, elem, offset, strides, mut shape ,
                             } = r else { unreachable!() };
                             let offset = offset.add(&Sym::param(&chunk).mul(&Sym::constant(*cap)).mul(&strides[*axis]),
                             );
                             shape[*axis] = Sym::atom(piece.clone());
                             self.bind_stream_load(*v, Realization::View { param, elem, offset, strides, shape ,
-                                }, body,
+                                }, *mode, operation,
                             )?;
                         }
                         self.block(body)?;
@@ -720,7 +602,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         // Threadgroup memory: elements are spread over the lanes in the same
                         // order a distributed tile uses, then a barrier publishes them.
                         let n_cap: i64 = dims.iter().map(|d| d.cap).product();
-                        let slots = (n_cap + SUBGROUP - 1) / SUBGROUP;
+                        let slots = n_cap / SUBGROUP + i64::from(n_cap % SUBGROUP != 0);
                         let j = self.fresh("slot");
                         let e = self.fresh("e");
                         self.line(&format!("for (int {j} = 0; {j} < {slots}; ++{j}) {{"));
@@ -736,7 +618,6 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         self.line("}");
                         self.indent -= 1;
                         self.line("}");
-                        self.line("simdgroup_barrier(mem_flags::mem_threadgroup);");
                         Ok(())
                     }
                     Realization::Distributed { dims, slots, .. } => {
@@ -758,7 +639,8 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         Ok(())
                     }
                     other => Err(format!("owned() over {other:?} is not supported")),
-                }
+                }?;
+                self.barrier(BarrierSite { operation: s.id.ok_or("owned domain has no identity")?, variable: tv, purpose: BarrierPurpose::Owned })
             }
             StmtKind::If { cond, then, els } => {
                 let c = self.expr(cond)?;
@@ -777,12 +659,12 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 }
                 Ok(())
             }
-            StmtKind::Assign { target, op, value } => self.assign(target, *op, value),
+            StmtKind::Assign { target, op, value } => self.assign(target, *op, value, s.id.ok_or("emission requires normalized operation identities")?),
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::Builtin { name: Builtin::Store, args ,
                 } => self.store(&args[0], &args[1]),
                 ExprKind::Builtin { name: Builtin::Atomic, .. } => Err("atomic is not yet supported on Metal".into()),
-                ExprKind::Intrinsic { name, args } => self.intrinsic_stmt(name, args),
+                ExprKind::Intrinsic { op: name, args } => self.intrinsic_stmt(name, args, s.id.ok_or("intrinsic has no identity")?),
                 _ => {
                     let s = self.expr(e)?;
                     self.line(&format!("{s};"));
@@ -795,6 +677,10 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     /// Declares the index variables of a distributed element and returns the validity guard.
     fn distributed_guard(&mut self, e: &str, dims: &[Dim], names: &[String]) -> String {
         let n_cap: i64 = dims.iter().map(|d| d.cap).product();
+        if n_cap == 0 {
+            for name in names { self.line(&format!("const int {name} = 0;")); }
+            return "false".into();
+        }
         let mut stride = n_cap;
         let mut guards = vec![format!("{e} < {n_cap}")];
         for (nm, d) in names.iter().zip(dims) {
@@ -912,31 +798,80 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         Ok(Sym::param(&name))
     }
 
-    fn declare_tile(&mut self, v: VarId, shape: &[Sym], dtype: DType,
+    fn allocation(&mut self, id: AllocationId) -> Result<TileDeclaration, String> {
+        let launch = self.execution.memory.launches().get(self.memory_launch)
+            .ok_or("allocation launch is missing")?;
+        let allocation = launch.arrays.get(self.tile_declarations.len())
+            .ok_or("unplanned tile allocation reached emission")?;
+        if allocation.id != id {
+            return Err(format!("allocation site mismatch: requested {id:?}, planned {:?}", allocation.id));
+        }
+        let declaration = allocation.declaration.clone();
+        self.tile_declarations.push(declaration.clone());
+        Ok(declaration)
+    }
+
+    fn barrier(&mut self, site: BarrierSite) -> Result<(), String> {
+        let launch = self.execution.memory.launches().get(self.memory_launch)
+            .ok_or("memory launch is missing")?;
+        if let Some(barrier) = launch.barriers.get(&site) {
+            if !self.emitted_barriers.insert(site) { return Err("duplicate emitted memory barrier".into()); }
+            self.line(match barrier.memory {
+                MemorySpace::Threadgroup => "simdgroup_barrier(mem_flags::mem_threadgroup);",
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_memory(&mut self) -> Result<Vec<TileDeclaration>, String> {
+        let launch = self.execution.memory.launches().get(self.memory_launch)
+            .ok_or("allocation launch is missing")?;
+        if self.tile_declarations.len() != launch.arrays.len() {
+            return Err("emission omitted planned tile allocations".into());
+        }
+        if self.emitted_barriers.len() != launch.barriers.len() {
+            return Err("emission omitted planned memory barriers".into());
+        }
+        self.emitted_barriers.clear();
+        self.memory_launch += 1;
+        Ok(std::mem::take(&mut self.tile_declarations))
+    }
+
+    fn declare_tile(&mut self, v: VarId, shape: &[Sym], dtype: DType, operation: OperationId, purpose: Purpose,
     ) -> Result<Realization, String> {
         let dims = self.dims(shape)?;
-        let n_cap: i64 = dims.iter().map(|d| d.cap).product();
-        let name = format!("{}_{}", sanitize(&self.vars()[v].name), v);
-        let needs_shared = uses_intrinsic(&self.f.body, v) || (self.cross_read.contains(&v) && n_cap > SUBGROUP);
-        let r = if needs_shared {
+        self.declare_tile_dims(v, dims, dtype, operation, purpose)
+    }
+
+    fn declare_tile_dims(&mut self, v: VarId, dims: Vec<Dim>, dtype: DType, operation: OperationId, purpose: Purpose,
+    ) -> Result<Realization, String> {
+        let n_cap = dims.iter().try_fold(1i64, |capacity, dim| {
+            if dim.cap < 0 { return Err("negative tile extent"); }
+            capacity.checked_mul(dim.cap).ok_or("tile capacity overflow")
+        })?;
+        let name = self.fresh(&format!("{}_{}", sanitize(&self.vars()[v].name), v));
+        let declaration = self.allocation(AllocationId { operation, variable: v, purpose })?;
+        if declaration.capacity != n_cap as u64 || declaration.dtype != dtype {
+            return Err(format!("emitted tile {v} disagrees with its selected storage contract"));
+        }
+        let placement = declaration.placement.clone();
+        let dispatch = GroupDispatch::new(1, SUBGROUP as u64,
+            self.simdgroups.try_into().map_err(|_|"negative simdgroup count")?)?;
+        let layout = declaration.layout(&dispatch)?;
+        let r = if placement == TilePlacement::GroupShared {
             let sg = self.simdgroups;
-            let bytes = u64::try_from(n_cap.max(1)).map_err(|_|"negative tile capacity")?.checked_mul(dtype.bytes() as u64).and_then(|n|n.checked_mul(sg as u64)).ok_or("shared tile storage overflow")?;
-            self.shared_decls.push((format!("threadgroup {} {name}[{sg}][{}];", ctype(dtype), n_cap.max(1)),bytes));
+            self.shared_decls.push((format!("threadgroup {} {name}[{sg}][{}];", ctype(dtype), layout.shared_elements_per_item),layout.shared_bytes_per_group));
             Realization::Shared { name: format!("{name}[sg_id]"), dims, dtype ,
             }
-        } else if n_cap <= SUBGROUP {
-            self.line(&format!("{} {name}[{}];", ctype(dtype), n_cap.max(1)));
+        } else if placement == TilePlacement::Replicated {
+            self.line(&format!("{} {name}[{}];", ctype(dtype), layout.private_elements_per_lane));
             Realization::Replicated { name, dims, dtype }
         } else {
-            let slots = (n_cap + SUBGROUP - 1) / SUBGROUP;
+            let slots = i64::try_from(layout.private_elements_per_lane).map_err(|_|"private tile extent overflow")?;
             self.line(&format!("{} {name}[{slots}];", ctype(dtype)));
             Realization::Distributed { name, dims, dtype, slots ,
             }
         };
-        self.tile_declarations.push(TileDeclaration {
-            symbol: self.vars()[v].name.clone(), dtype, capacity:u64::try_from(n_cap).map_err(|_|"negative tile capacity")?,
-            placement:match &r {Realization::Replicated {..}=>TilePlacement::Replicated,Realization::Distributed {..}=>TilePlacement::Distributed,Realization::Shared {..}=>TilePlacement::GroupShared,_=>unreachable!()},
-        });
         self.real.insert(v, r.clone());
         Ok(r)
     }
@@ -948,24 +883,23 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         }
     }
 
-    fn assign(&mut self, target: &Expr, op: AssignOp, value: &Expr) -> Result<(), String> {
+    fn assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, operation: OperationId) -> Result<(), String> {
         match &target.kind {
             ExprKind::Var(v) => {
                 match &value.kind {
                     ExprKind::TileAlloc { shape, dtype } => {
                         let Elem::Dtype(dtype) = dtype else {return Err("unresolved or packed local tile dtype".into())};
-                        self.declare_tile(*v, shape, *dtype)?;
+                        self.declare_tile(*v, shape, *dtype, operation, Purpose::Value)?;
                         return Ok(());
                     }
-                    ExprKind::Intrinsic { name, args } if name == "simdgroup_matrix" => {
+                    ExprKind::Intrinsic { op: name, args } if *name == seismic_lang::intrinsics::Operation::Matrix => {
                         let Ty::Scalar(d) = args[0].ty else { unreachable!() };
                         self.frag_decl(*v, d);
                         return Ok(());
                     }
                     ExprKind::Builtin { name: Builtin::Reduce, args ,
-                    } => return self.reduce_into(*v, args),
-                    ExprKind::Builtin { name: Builtin::Load, args ,
-                    } => return self.load_into(*v, &args[0]),
+                    } => return self.reduce_into(*v, args, operation),
+                    ExprKind::Load { view, mode } => return self.load_into(*v, view, *mode, operation),
                     _ => {}
                 }
                 match &target.ty {
@@ -991,10 +925,10 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         let source = self.real.get(&src).cloned().ok_or("unrealized source tile")?;
                         if !self.real.contains_key(v) {
                             let dtype = shaped.elem.read_dtype().ok_or("unresolved tile assignment type")?;
-                            self.declare_tile(*v, &shaped.shape, dtype)?;
+                            self.declare_tile(*v, &shaped.shape, dtype, operation, Purpose::Value)?;
                         }
                         let destination = self.real.get(v).cloned().ok_or("unrealized destination tile")?;
-                        self.copy_tile(&destination, &source, op)
+                        self.copy_tile(&destination, &source, op, BarrierSite { operation, variable: *v, purpose: BarrierPurpose::Copy })
                     }
                     Ty::Tensor(_) => {
                         if self.real.contains_key(v) { return Err("tensor view rebinding needs explicit control-flow alias analysis".into(),
@@ -1013,14 +947,26 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 let Ty::Scalar(d) = target.ty else { unreachable!() };
                 let val = self.expr(value)?;
                 let val = self.coerce(val, &value.ty, d);
-                self.line(&format!("{lhs} {} {val};", assign_text(op)));
+                // Generic indexing retains its checked computation dtype, while
+                // publication uses the concrete tile storage dtype after binding.
+                let storage = base.ty.shaped().and_then(|s| match s.elem {
+                    Elem::Dtype(dtype) => Some(dtype), _ => None,
+                }).ok_or("element assignment requires concrete dense storage")?;
+                let result = match op {
+                    AssignOp::Assign => val,
+                    AssignOp::Add | AssignOp::Sub | AssignOp::Mul => {
+                        let operator = match op { AssignOp::Add => "+", AssignOp::Sub => "-", _ => "*" };
+                        format!("({}({lhs}) {operator} ({val}))", ctype(d))
+                    }
+                };
+                self.line(&format!("{lhs} = {}({result});", ctype(storage)));
                 Ok(())
             }
             _ => Err("unsupported assignment target".into()),
         }
     }
 
-    fn copy_tile(&mut self, destination: &Realization, source: &Realization, op: AssignOp,
+    fn copy_tile(&mut self, destination: &Realization, source: &Realization, op: AssignOp, site: BarrierSite,
     ) -> Result<(), String> {
         let (name, dims, dtype, distributed, shared) = match destination {
             Realization::Replicated { name, dims, dtype } => (name, dims, *dtype, false, false),
@@ -1057,8 +1003,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         self.line(&format!("{name}[{offset}] {} {value};", assign_text(op)));
         self.indent -= 1; self.line("}");
         self.indent -= 1; self.line("}");
-        if shared { self.line("simdgroup_barrier(mem_flags::mem_threadgroup);"); }
-        Ok(())
+        self.barrier(site)
     }
 
     fn tile_element(&mut self, tv: VarId, indices: &[Index]) -> Result<String, String> {
@@ -1176,30 +1121,34 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         }
     }
 
-    fn load_into(&mut self, v: VarId, view: &Expr) -> Result<(), String> {
+    fn load_into(&mut self, v: VarId, view: &Expr, mode: LoadMode, operation: OperationId) -> Result<(), String> {
         let realized = self.view_of(view)?;
-        let Realization::View { shape, .. } = &realized else { unreachable!() };
-        let n_cap: i64 = self.dims(&shape)?.iter().map(|d| d.cap).product();
-        if self.cross_read.contains(&v) && !self.written.contains(&v) && n_cap > SUBGROUP && seismic_lang::effects::load_can_borrow(&self.f.body, v, "metal") {
-            // Read-only tile with a store-free lifetime: its snapshot can borrow device memory.
+        if mode == LoadMode::Borrow {
+            if self.real.contains_key(&v) { return Err("borrowed load must define fresh tile storage".into()); }
             self.real.insert(v, realized);
             return Ok(());
         }
-        self.snapshot_into(v, realized)
+        let previous = self.real.remove(&v);
+        self.snapshot_into(v, realized, operation, Purpose::Value)?;
+        if let Some(destination) = previous {
+            let source = self.real.get(&v).cloned().ok_or("load snapshot is missing")?;
+            self.copy_tile(&destination, &source, AssignOp::Assign, BarrierSite { operation, variable: v, purpose: BarrierPurpose::Copy })?;
+            self.real.insert(v, destination);
+        }
+        Ok(())
     }
 
-    fn bind_stream_load(&mut self, v: VarId, realized: Realization, body: &[Stmt],
+    fn bind_stream_load(&mut self, v: VarId, realized: Realization, mode: LoadMode, operation: OperationId,
     ) -> Result<(), String> {
-        if body.iter().any(|s| {
-            seismic_lang::effects::tensor_effect(s, "metal") || seismic_lang::effects::tile_mutated(s, v, "metal")}) {
-            self.snapshot_into(v, realized)
+        if mode == LoadMode::Materialize {
+            self.snapshot_into(v, realized, operation, Purpose::Value)
         } else {
             self.real.insert(v, realized);
             Ok(())
         }
     }
 
-    fn snapshot_into(&mut self, v: VarId, realized: Realization) -> Result<(), String> {
+    fn snapshot_into(&mut self, v: VarId, realized: Realization, operation: OperationId, purpose: Purpose) -> Result<(), String> {
         let Realization::View { param, elem, offset, strides, shape ,
         } = realized else { return Err("snapshot load requires a tensor view".into()) ;
         };
@@ -1211,7 +1160,19 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             Elem::Dtype(d) => Ty::Scalar(*d),
             _ => Ty::Scalar(DType::F32),
         };
-        let r = self.declare_tile(v, &shape, dtype)?;
+        // View extents describe this invocation; the selected tile type carries
+        // allocation capacities. Split slices can have a dynamic extent even
+        // when the unsplit value has a static capacity.
+        let Ty::Tile(tile) = &self.vars()[v].ty else { return Err("snapshot destination is not a tile".into()); };
+        if tile.shape.len() != shape.len() { return Err("snapshot rank disagrees with selected tile".into()); }
+        let dims = tile.shape.iter().zip(&shape).map(|(bound, extent)| {
+            let cap = self.cap(bound)?;
+            if extent.as_constant().is_some_and(|n| n < 0 || n > cap) {
+                return Err("snapshot extent exceeds its selected capacity".to_string());
+            }
+            Ok(Dim { cap, ext: self.sym(extent)? })
+        }).collect::<Result<Vec<_>, String>>()?;
+        let r = self.declare_tile_dims(v, dims, dtype, operation, purpose)?;
         match r {
             r @ (Realization::Replicated { .. } | Realization::Shared { .. }) => {
                 let shared = matches!(r, Realization::Shared { .. });
@@ -1233,7 +1194,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 self.line("}");
                 self.indent -= 1;
                 self.line("}");
-                if shared { self.line("simdgroup_barrier(mem_flags::mem_threadgroup);"); }
+
             }
             Realization::Distributed { name, dims, slots, .. } => {
                 let j = self.fresh("slot");
@@ -1254,7 +1215,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             }
             _ => unreachable!(),
         }
-        Ok(())
+        self.barrier(BarrierSite { operation, variable: v, purpose: BarrierPurpose::Snapshot(purpose) })
     }
 
     /// Decompose a capacity-flat element counter into indices; returns the validity guard and
@@ -1262,6 +1223,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     fn unflatten(&mut self, flat: &str, dims: &[Dim], strides: &[Sym], offset: &Sym,
     ) -> (String, Sym) {
         let n_cap: i64 = dims.iter().map(|d| d.cap).product();
+        if n_cap == 0 { return ("false".into(), offset.clone()); }
         let mut stride_c = n_cap;
         let mut guards = vec![format!("{flat} < {n_cap}")];
         let mut off = offset.clone();
@@ -1326,16 +1288,16 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         Ok(())
     }
 
-    fn reduce_into(&mut self, v: VarId, args: &[Expr]) -> Result<(), String> {
+    fn reduce_into(&mut self, v: VarId, args: &[Expr], operation: OperationId) -> Result<(), String> {
         let previous = self.real.remove(&v);
-        self.reduce_new(v, args)?;
+        self.reduce_new(v, args, operation)?;
         if let Some(destination) = previous {
             let source = self.real.get(&v).cloned().ok_or("missing reduction result")?;
             match (&destination, &source) {
                 (Realization::Scalar { name: to }, Realization::Scalar { name: from }) => {
                     self.line(&format!("{to} = {from};"));
                 }
-                _ => self.copy_tile(&destination, &source, AssignOp::Assign)?,
+                _ => self.copy_tile(&destination, &source, AssignOp::Assign, BarrierSite { operation, variable: v, purpose: BarrierPurpose::Copy })?,
             }
             if let (VarKind::Index(Atom::Param(atom)), Realization::Scalar { name }) = (&self.vars()[v].kind, &destination) {
                 self.names.insert(atom.clone(), name.clone());
@@ -1345,38 +1307,44 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         Ok(())
     }
 
-    fn reduce_new(&mut self, v: VarId, args: &[Expr]) -> Result<(), String> {
+    fn reduce_new(&mut self, v: VarId, args: &[Expr], operation: OperationId) -> Result<(), String> {
         let ExprKind::Var(tv) = args[0].kind else { return Err("reduce of a non-variable tile".into()) ;
         };
         let ExprKind::Int(axis) = args[1].kind else { unreachable!() };
         let ExprKind::Int(op) = args[2].kind else { unreachable!() };
         let axis = axis as usize;
         if op == 3 {
-            return self.argmax_into(v, tv, axis);
+            return self.argmax_into(v, tv, axis, operation);
         }
-        let (opname, simd, init) = match op {
-            0 => ("+", "simd_sum", "0.0f"),
-            1 => ("max", "simd_max", "-INFINITY"),
-            2 => ("min", "simd_min", "INFINITY"),
+        let (opname, simd) = match op {
+            0 => ("+", "simd_sum"),
+            1 => ("max", "simd_max"),
+            2 => ("min", "simd_min"),
             _ => unreachable!(),
         };
+        let selected = self.execution.reductions.get(crate::reduction::Site { output: v, operation })?.clone();
         let mut src = self.real.get(&tv).cloned().ok_or("reduce of an unrealized tile")?;
-        if matches!(src, Realization::View { .. }) {
+        if selected.decision.input != tv || selected.decision.materialize_input != matches!(src, Realization::View { .. }) {
+            return Err("reduction input disagrees with its selected ownership".into());
+        }
+        if selected.decision.materialize_input {
             // A borrowed stream remains a tile value. Materialize it when this
             // reduction realization needs owned lane storage.
-            self.snapshot_into(tv, src)?;
+            self.snapshot_into(tv, src, operation, Purpose::ReductionInput)?;
             src = self.real.get(&tv).cloned().ok_or("reduction snapshot is missing")?;
         }
         let (dims, dtype) = match &src {
             Realization::Replicated { dims, dtype, .. } | Realization::Distributed { dims, dtype, .. } | Realization::Shared { dims, dtype, .. } => (dims.clone(), *dtype),
             other => return Err(format!("reduce of {other:?}")),
         };
-        let init = match (dtype,op) {
-            (DType::I32,1) => "(-2147483647 - 1)", (DType::I32,2) => "2147483647",
-            (DType::U32,1) => "0u", (DType::U32,2) => "0xffffffffu", _ => init,
-        };
-        let init=format!("{}({init})",ctype(dtype));
+        let contract = seismic_lang::reduction::Contract::new(ReduceOp::from_tag(op).ok_or("unknown reduction operation")?, dtype,
+            matches!(args.get(3).map(|e| &e.kind),Some(ExprKind::Bool(true))));
+        if contract != selected.decision.contract { return Err("fold numerical contract disagrees with selected execution".into()); }
+        let init = format!("{}({})", ctype(dtype), reduction_identity(contract.identity()));
         let combine=|acc:&str,x:&str| -> String {
+            if dtype == DType::Bool { return format!("({acc} {} {x})", if op == 2 { "&&" } else { "||" }); }
+            if dtype == DType::I32 && op == 0 { return format!("int(clamp(long({acc}) + long({x}), long(-2147483647) - 1L, 2147483647L))"); }
+            if dtype == DType::U32 && op == 0 { return format!("uint(min(ulong({acc}) + ulong({x}), 4294967295UL))"); }
             if matches!(dtype,DType::BF16|DType::F16) {
                 let inner=if opname=="+" {format!("float({acc}) + float({x})")}else{format!("{opname}(float({acc}), float({x}))")};
                 format!("{}({inner})",ctype(dtype))
@@ -1384,26 +1352,39 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         };
         // Narrow collective arithmetic is not admitted yet: ordered scalar
         // publication is a legal realization even when reassociation is allowed.
-        let ordered=matches!(args.get(3).map(|e|&e.kind),Some(ExprKind::Bool(true))) || matches!(dtype,DType::BF16|DType::F16);
+        let ordered = contract.ordered || matches!(dtype,DType::BF16|DType::F16) || contract.combination() == seismic_lang::reduction::Combination::SaturatingAdd;
         let mut out_dims = dims.clone();
         out_dims.remove(axis);
-        let out_cap: i64 = out_dims.iter().map(|d| d.cap).product::<i64>().max(1);
-        let scalar_result = out_dims.is_empty();
-        let name = self.fresh("reduced");
-        let inner_cap: i64 = dims[axis + 1..].iter().map(|d| d.cap).product();
-        let axis_cap = dims[axis].cap;
+        let placement = match src {
+            Realization::Replicated { .. } => TilePlacement::Replicated,
+            Realization::Shared { .. } => TilePlacement::GroupShared,
+            Realization::Distributed { .. } => TilePlacement::Distributed,
+            _ => unreachable!(),
+        };
+        if (selected.decision.contract.operation == ReduceOp::Argmax) || selected.decision.input_placement != Some(placement.clone()) {
+            return Err("fold input placement disagrees with its selected contract".into());
+        }
+        let reduction = crate::reduction::ReductionDomain::new(&dims.iter().map(|d| d.cap).collect::<Vec<_>>(), axis,
+            dtype, ordered, placement.clone(), SUBGROUP as u64)?;
+        use crate::reduction::Algorithm;
+        let out_cap = reduction.output_capacity() as i64;
+        let scalar_result = reduction.scalar_output();
+        let inner_cap = reduction.inner_capacity() as i64;
+        let axis_cap = reduction.axis_capacity() as i64;
         let axis_ext = dims[axis].ext.clone();
-        if !scalar_result && out_cap > SUBGROUP {
-            // Large result: only realizable when the reduced axis does not cross lanes, i.e. every
-            // source element of one output lives in that output's lane.
-            let Realization::Distributed { name: sn, .. } = &src else {
-                return Err("large reductions of replicated or shared tiles are not yet supported on Metal".into(),
-                );
-            };
-            if inner_cap % SUBGROUP != 0 {
-                return Err(format!("reduction over axis {axis} crosses lanes (inner extent {inner_cap} is not a multiple of {SUBGROUP}); not yet supported on Metal"));
-            }
-            let slots = (out_cap + SUBGROUP - 1) / SUBGROUP;
+        let algorithm = selected.algorithm;
+        if reduction != selected.decision.domain {
+            return Err("emitted reduction geometry disagrees with its selected domain".into());
+        }
+        if let Some(expected) = selected.output {
+            let declaration = self.allocation(AllocationId { operation, variable: v, purpose: Purpose::Value })?;
+            if declaration != expected { return Err("reduction output disagrees with allocation plan".into()); }
+        }
+        let output_slots = reduction.output_slots(algorithm)?;
+        let name = self.fresh("reduced");
+        if algorithm == Algorithm::LaneLocal {
+            let Realization::Distributed { name: sn, .. } = &src else { unreachable!() };
+            let slots = output_slots as i64;
             self.real.insert(v, Realization::Distributed { name: name.clone(), dims: out_dims.clone(), dtype, slots ,
                 },
             );
@@ -1434,8 +1415,9 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             self.real.insert(v, Realization::Replicated { name: name.clone(), dims: out_dims.clone(), dtype ,
                 },
             );
-            self.line(&format!("{} {name}[{out_cap}];", ctype(dtype)));
+            self.line(&format!("{} {name}[{output_slots}];", ctype(dtype)));
         }
+        if out_cap == 0 { return Ok(()); }
         let o = self.fresh("o");
         self.line(&format!("for (int {o} = 0; {o} < {out_cap}; ++{o}) {{"));
         self.indent += 1;
@@ -1453,15 +1435,15 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 self.indent -= 1;
                 self.line("}");
             }
-            Realization::Distributed { name:sn,.. } if ordered => {
+            Realization::Distributed { name:sn,.. } if algorithm == Algorithm::Ordered => {
                 let k=self.fresh("k");
                 self.line(&format!("for (int {k}=0; {k}<{axis_ext}; ++{k}) {{"));self.indent+=1;
                 self.line(&format!("const int e = (({o} / {inner_cap}) * {axis_cap} + {k}) * {inner_cap} + ({o} % {inner_cap});"));
-                let value=if matches!(dtype,DType::BF16|DType::F16) {format!("{}(simd_shuffle(float({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))",ctype(dtype))}else{format!("simd_shuffle({sn}[e / {SUBGROUP}], uint(e % {SUBGROUP}))")};
+                let value=if matches!(dtype,DType::BF16|DType::F16) {format!("{}(simd_shuffle(float({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))",ctype(dtype))}else if dtype == DType::Bool {format!("bool(simd_shuffle(uint({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))")}else{format!("simd_shuffle({sn}[e / {SUBGROUP}], uint(e % {SUBGROUP}))")};
                 self.line(&format!("{acc} = {};",combine(&acc,&value)));self.indent-=1;self.line("}");
             }
             Realization::Distributed { name: sn, slots, .. } => {
-                let n_cap: i64 = dims.iter().map(|d| d.cap).product();
+                let n_cap = reduction.input_capacity();
                 let j = self.fresh("slot");
                 self.line(&format!("for (int {j} = 0; {j} < {slots}; ++{j}) {{"));
                 self.indent += 1;
@@ -1485,7 +1467,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     }
 
     /// `argmax` along an axis: the index of the largest value, ties to the smaller index.
-    fn argmax_into(&mut self, v: VarId, tv: VarId, axis: usize) -> Result<(), String> {
+    fn argmax_into(&mut self, v: VarId, tv: VarId, axis: usize, operation: OperationId) -> Result<(), String> {
         let src = self.real.get(&tv).cloned().ok_or("reduce of an unrealized tile")?;
         let (dims, dtype) = match &src {
             Realization::Replicated { dims, dtype, .. } | Realization::Distributed { dims, dtype, .. } | Realization::Shared { dims, dtype, .. } => (dims.clone(), *dtype),
@@ -1495,14 +1477,30 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             }
             other => return Err(format!("argmax of {other:?}")),
         };
+        let selected = self.execution.reductions.get(crate::reduction::Site { output: v, operation })?.clone();
+        let placement = match &src {
+            Realization::Replicated { .. } => Some(TilePlacement::Replicated),
+            Realization::Distributed { .. } => Some(TilePlacement::Distributed),
+            Realization::Shared { .. } => Some(TilePlacement::GroupShared),
+            Realization::View { .. } => None,
+            _ => unreachable!(),
+        };
+        let domain = crate::reduction::ReductionDomain::argmax(&dims.iter().map(|d| d.cap).collect::<Vec<_>>(), axis,
+            dtype, placement.clone(), selected.decision.full_lanes, SUBGROUP as u64)?;
+        if selected.decision.contract.operation != ReduceOp::Argmax || selected.decision.contract.input != dtype || selected.decision.input != tv || selected.decision.input_placement != placement || selected.decision.domain != domain {
+            return Err("argmax disagrees with its selected input/domain".into());
+        }
+        let algorithm = selected.algorithm;
+        use crate::reduction::Algorithm;
         let mut out_dims = dims.clone();
         out_dims.remove(axis);
-        let out_cap: i64 = out_dims.iter().map(|d| d.cap).product::<i64>().max(1);
-        if out_cap > SUBGROUP {
-            return Err("argmax results larger than a subgroup are not yet supported on Metal".into(),
-            );
+        let out_cap = domain.output_capacity() as i64;
+        let slots = domain.output_slots(algorithm)?;
+        let scalar_result = domain.scalar_output();
+        if let Some(expected) = selected.output {
+            let declaration = self.allocation(AllocationId { operation, variable: v, purpose: Purpose::Value })?;
+            if declaration != expected { return Err("reduction output disagrees with allocation plan".into()); }
         }
-        let scalar_result = out_dims.is_empty();
         let name = self.fresh("argmax");
         if let VarKind::Index(Atom::Param(atom)) = &self.vars()[v].kind {
             self.names.insert(atom.clone(), name.clone());
@@ -1514,27 +1512,42 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             self.real.insert(v, Realization::Replicated { name: name.clone(), dims: out_dims.clone(), dtype: DType::I32 ,
                 },
             );
-            self.line(&format!("int {name}[{out_cap}];"));
+            self.line(&format!("int {name}[{slots}];"));
         }
-        let inner_cap: i64 = dims[axis + 1..].iter().map(|d| d.cap).product();
-        let axis_cap = dims[axis].cap;
+        if out_cap == 0 { return Ok(()); }
+        let inner_cap = domain.inner_capacity() as i64;
+        let axis_cap = domain.axis_capacity() as i64;
         let axis_ext = dims[axis].ext.clone();
-        if axis_cap < 1 || axis_cap > i64::from(i32::MAX) {return Err("Metal argmax axis exceeds its signed loop-index domain".into());}
-        let initial=match dtype {DType::I32=>"(-2147483647 - 1)",DType::U32=>"0u",_=>"-INFINITY",
-        };
+        let initial = reduction_identity(selected.decision.contract.identity());
         let o = self.fresh("o");
         let best = self.fresh("best");
         let at = self.fresh("at");
         self.line(&format!("for (int {o} = 0; {o} < {out_cap}; ++{o}) {{"));
         self.indent += 1;
         self.line(&format!("{} {best} = {}({initial}); int {at} = 0x7fffffff;", ctype(dtype), ctype(dtype)));
+        let tie_valid = if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) { format!("{at} != 0x7fffffff && ") } else { String::new() };
         match &src {
             Realization::Replicated { name: sn, .. } | Realization::Shared { name: sn, .. } => {
                 let k = self.fresh("k");
                 self.line(&format!("for (int {k} = 0; {k} < {axis_ext}; ++{k}) {{"));
                 self.indent += 1;
                 self.line(&format!("const int e = (({o} / {inner_cap}) * {axis_cap} + {k}) * {inner_cap} + ({o} % {inner_cap});"));
-                self.line(&format!("if ({sn}[e] > {best} || ({sn}[e] == {best} && {k} < {at})) {{ {best} = {sn}[e]; {at} = {k}; }}"));
+                self.line(&format!("if ({sn}[e] > {best} || ({sn}[e] == {best} && {tie_valid}{k} < {at})) {{ {best} = {sn}[e]; {at} = {k}; }}"));
+                self.indent -= 1;
+                self.line("}");
+            }
+            Realization::Distributed { name: sn, .. } if algorithm == Algorithm::Ordered => {
+                let k = self.fresh("k");
+                self.line(&format!("for (int {k} = 0; {k} < {axis_ext}; ++{k}) {{"));
+                self.indent += 1;
+                self.line(&format!("const int e = (({o} / {inner_cap}) * {axis_cap} + {k}) * {inner_cap} + ({o} % {inner_cap});"));
+                let read = if matches!(dtype, DType::F16 | DType::BF16) {
+                    format!("{}(simd_shuffle(float({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))", ctype(dtype))
+                } else if dtype == DType::Bool { format!("bool(simd_shuffle(uint({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))") }
+                else { format!("simd_shuffle({sn}[e / {SUBGROUP}], uint(e % {SUBGROUP}))") };
+                let x = self.fresh("x");
+                self.line(&format!("const {} {x} = {read};", ctype(dtype)));
+                self.line(&format!("if ({x} > {best} || ({x} == {best} && {tie_valid}{k} < {at})) {{ {best} = {x}; {at} = {k}; }}"));
                 self.indent -= 1;
                 self.line("}");
             }
@@ -1545,7 +1558,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 self.indent += 1;
                 self.line(&format!("const int e = int(lane) + {SUBGROUP} * {j};"));
                 self.line(&format!("const int k = (e / {inner_cap}) % {axis_cap};"));
-                self.line(&format!("if (e < {n_cap} && k < {axis_ext} && ((e / {inner_cap}) / {axis_cap}) * {inner_cap} + (e % {inner_cap}) == {o} && ({sn}[{j}] > {best} || ({sn}[{j}] == {best} && k < {at}))) {{ {best} = {sn}[{j}]; {at} = k; }}"));
+                self.line(&format!("if (e < {n_cap} && k < {axis_ext} && ((e / {inner_cap}) / {axis_cap}) * {inner_cap} + (e % {inner_cap}) == {o} && ({sn}[{j}] > {best} || ({sn}[{j}] == {best} && {tie_valid}k < {at}))) {{ {best} = {sn}[{j}]; {at} = k; }}"));
                 self.indent -= 1;
                 self.line("}");
                 self.line(&format!("{{ const {} m = simd_max({best}); {at} = simd_min({best} == m ? {at} : 0x7fffffff); }}", ctype(dtype)));
@@ -1568,14 +1581,15 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 }
                 let (ptr, off, elem) = self.view_element(tv, &points)?;
                 let val = self.read_elem(&ptr, &off, &elem)?;
-                self.line(&format!("for (int {k} = int(lane); {k} < {axis_ext}; {k} += {SUBGROUP}) {{"));
+                let (start, step) = if algorithm == Algorithm::Collective { ("int(lane)", SUBGROUP) } else { ("0", 1) };
+                self.line(&format!("for (int {k} = {start}; {k} < {axis_ext}; {k} += {step}) {{"));
                 self.indent += 1;
                 let x = self.fresh("x");
                 self.line(&format!("const {} {x} = {val};", ctype(dtype)));
-                self.line(&format!("if ({x} > {best} || ({x} == {best} && {k} < {at})) {{ {best} = {x}; {at} = {k}; }}"));
+                self.line(&format!("if ({x} > {best} || ({x} == {best} && {tie_valid}{k} < {at})) {{ {best} = {x}; {at} = {k}; }}"));
                 self.indent -= 1;
                 self.line("}");
-                self.line(&format!("{{ const {} m = simd_max({best}); {at} = simd_min({best} == m ? {at} : 0x7fffffff); }}", ctype(dtype)));
+                if algorithm == Algorithm::Collective { self.line(&format!("{{ const {} m = simd_max({best}); {at} = simd_min({best} == m ? {at} : 0x7fffffff); }}", ctype(dtype))); }
             }
             _ => unreachable!(),
         }
@@ -1593,12 +1607,12 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     }
 
     /// Write this part's carried state to compiler-allocated scratch, one region per
-    /// (item, part). Returns, per carried tile, its scratch buffer name, its index among the
-    /// scratch buffers, and its element count.
-    fn publish_partials(&mut self, carried: &[VarId], items: i64, parts: i64, row: &str,
-    ) -> Result<Vec<(String, usize, i64)>, String> {
-        let mut out = Vec::new();
-        for v in carried {
+    /// (item, part), using the memory plan's buffer identity and layout.
+    fn publish_partials(&mut self, phase: usize, carried: &[VarId], row: &str,
+    ) -> Result<(), String> {
+        let scratch: Vec<_> = self.execution.memory.scratch().iter().filter(|s| s.phase == phase).cloned().collect();
+        if scratch.len() != carried.len() { return Err("split scratch plan does not match carried values".into()); }
+        for (v, allocation) in carried.iter().zip(scratch) {
             let (name, cap) = match self.real.get(v) {
                 Some(Realization::Replicated { name, dims, .. }) | Some(Realization::Shared { name, dims, .. }) => (name.clone(), dims.iter().map(|d| d.cap).product::<i64>().max(1),
                 )
@@ -1611,73 +1625,57 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 other => {
                     return Err(format!("carried tile is {other:?}; splitting cannot publish it"))}
             };
-            let buf = format!("split_{}", self.scratch.len());
-            let index = self.scratch.len();
-            self.scratch.push((items * parts * cap * 4) as usize);
+            if allocation.variable != *v || allocation.elements_per_item != cap as u64 || allocation.dtype != DType::F32 {
+                return Err("published partial value disagrees with scratch plan".into());
+            }
+            let buf = format!("split_{}", allocation.index);
+            let parts = allocation.parts;
             let i = self.fresh("i");
-            self.line(&format!("for (int {i} = 0; {i} < {cap}; ++{i}) {buf}[(uint({row}) * {parts} + uint(part)) * {cap} + uint({i})] = {name}[{i}];"));
-            out.push((buf, index, cap));
+            self.line(&format!("if (lane == 0) for (int {i} = 0; {i} < {cap}; ++{i}) {buf}[(uint({row}) * {parts} + uint(part)) * {cap} + uint({i})] = {name}[{i}];"));
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Fold the parts of a split reduction, reading each part's published state and
     /// applying the streaming body's own merge rule, then leave the result in the carried
     /// tiles so the kernel's tail runs unchanged.
-    fn merge_partials(&mut self, carried: &[VarId], handoff: &[(String, usize, i64)], parts: i64,
+    fn merge_partials(&mut self, phase: usize, carried: &[VarId],
+        merges: &[execution::Merge], operation: OperationId,
     ) -> Result<(), String> {
-        if carried.len() != 3 || handoff.len() != 3 {
-            return Err(format!("splitting a streamed range needs three carried tiles (maximum, denominator, accumulator); this loop carries {}", carried.len()));
+        let scratch: Vec<_> = self.execution.memory.scratch().iter().filter(|s| s.phase == phase).cloned().collect();
+        if carried.len() != scratch.len() || carried.len() != merges.len() {
+            return Err("split handoff does not match its proven merge rules".into());
         }
-        // Re-declare the carried tiles in this kernel and seed them from part 0.
-        let mut names = Vec::new();
-        for (v, (buf, _, cap)) in carried.iter().zip(handoff) {
-            let Ty::Tile(shaped) = self.vars()[*v].ty.clone() else { return Err("carried state is not a tile".into()) ;
+        for ((v, allocation), merge) in carried.iter().zip(scratch).zip(merges) {
+            if allocation.variable != *v { return Err("merge value disagrees with scratch plan".into()); }
+            let buf = format!("split_{}", allocation.index);
+            let parts = allocation.parts;
+            let cap = allocation.elements_per_item;
+            let Ty::Tile(shaped) = self.vars()[*v].ty.clone() else { return Err("carried state is not a tile".into()); };
+            let r = self.declare_tile(*v, &shaped.shape, DType::F32, operation, Purpose::Merge)?;
+            let (name, shared) = match r {
+                Realization::Replicated { name, .. } | Realization::Distributed { name, .. } => (name, false),
+                Realization::Shared { name, .. } => (name, true),
+                _ => return Err("merge needs materialized state".into()),
             };
-            let dtype = shaped.elem.read_dtype().unwrap_or(DType::F32);
-            let r = self.declare_tile(*v, &shaped.shape, dtype)?;
-            let name = match &r {
-                Realization::Replicated { name, .. } | Realization::Shared { name, .. } | Realization::Distributed { name, .. } => name.clone(),
-                other => return Err(format!("merged tile is {other:?}")),
-            };
-            let i = self.fresh("i");
-            self.line(&format!("for (int {i} = 0; {i} < {cap}; ++{i}) {name}[{i}] = {buf}[(item * {parts}) * {cap} + uint({i})];"));
-            names.push((name, *cap, buf.clone()));
+            if cap != 1 { return Err("scalar merge state has non-scalar capacity".into()); }
+            if shared { self.line("if (lane == 0) {"); self.indent += 1; }
+            self.line(&format!("{name}[0] = {buf}[item * {parts}];"));
+            let p = self.fresh("part");
+            match merge {
+                execution::Merge::Sum => self.line(&format!("for (int {p} = 1; {p} < {parts}; ++{p}) {name}[0] += {buf}[item * {parts} + uint({p})];")),
+            }
+            if shared {
+                self.indent -= 1; self.line("}");
+            }
+            self.barrier(BarrierSite { operation, variable: *v, purpose: BarrierPurpose::Merge })?;
         }
-        let (m_name, m_cap, m_buf) = names[0].clone();
-        let (l_name, _, l_buf) = names[1].clone();
-        let (acc_name, acc_cap, acc_buf) = names[2].clone();
-        let width = acc_cap / m_cap.max(1);
-        let p = self.fresh("p");
-        let i = self.fresh("i");
-        let j = self.fresh("j");
-        self.line(&format!("for (int {p} = 1; {p} < {parts}; ++{p}) {{"));
-        self.indent += 1;
-        self.line(&format!("const uint base = (item * {parts} + uint({p}));"));
-        self.line(&format!("for (int {i} = 0; {i} < {m_cap}; ++{i}) {{"));
-        self.indent += 1;
-        self.line(&format!("const float om = {m_buf}[base * {m_cap} + uint({i})];"));
-        self.line(&format!("const float m2 = max({m_name}[{i}], om);"));
-        self.line(&format!("const float a = exp({m_name}[{i}] - m2);"));
-        self.line(&format!("const float b = exp(om - m2);"));
-        self.line(&format!("{l_name}[{i}] = {l_name}[{i}] * a + {l_buf}[base * {m_cap} + uint({i})] * b;"));
-        self.line(&format!("for (int {j} = 0; {j} < {width}; ++{j}) {{"));
-        self.indent += 1;
-        self.line(&format!("const int e = {i} * {width} + {j};"));
-        self.line(&format!("{acc_name}[e] = {acc_name}[e] * a + {acc_buf}[base * {acc_cap} + uint(e)] * b;"));
-        self.indent -= 1;
-        self.line("}");
-        self.line(&format!("{m_name}[{i}] = m2;"));
-        self.indent -= 1;
-        self.line("}");
-        self.indent -= 1;
-        self.line("}");
         Ok(())
     }
 
-    fn intrinsic_stmt(&mut self, name: &str, args: &[Expr]) -> Result<(), String> {
+    fn intrinsic_stmt(&mut self, name: &seismic_lang::intrinsics::Operation, args: &[Expr], operation: OperationId) -> Result<(), String> {
         match name {
-            "simdgroup_load" | "simdgroup_load_t" | "simdgroup_store" => {
+            seismic_lang::intrinsics::Operation::MatrixLoad | seismic_lang::intrinsics::Operation::MatrixLoadTranspose | seismic_lang::intrinsics::Operation::MatrixStore => {
                 let ExprKind::Var(fv) = args[0].kind else { return Err("fragment must be a variable".into()) ;
                 };
                 let Some(Realization::Frag { name: frag }) = self.real.get(&fv).cloned() else { return Err("unrealized fragment".into()) ;
@@ -1695,6 +1693,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         (name, row.mul(&ld).add(&col), ld, false)
                     }
                     Realization::View { param, elem, offset, strides, .. } => {
+                        if *name == seismic_lang::intrinsics::Operation::MatrixStore { return Err("fragment store requires owned shared tile storage".into()); }
                         if !matches!(elem, Elem::Dtype(_)) {
                             return Err("simdgroup atoms need a dense operand".into());
                         }
@@ -1713,21 +1712,22 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 };
                 let off_c = self.sym(&off)?;
                 let ld_c = self.sym(&ld)?;
-                let want_t = name == "simdgroup_load_t";
+                let want_t = *name == seismic_lang::intrinsics::Operation::MatrixLoadTranspose;
                 let transpose = want_t != col_major;
                 match name {
-                    "simdgroup_load" | "simdgroup_load_t" => self.line(&format!("simdgroup_load({frag}, {ptr} + ({off_c}), {ld_c}, ulong2(0, 0), {transpose});")),
+                    seismic_lang::intrinsics::Operation::MatrixLoad | seismic_lang::intrinsics::Operation::MatrixLoadTranspose => self.line(&format!("simdgroup_load({frag}, {ptr} + ({off_c}), {ld_c}, ulong2(0, 0), {transpose});")),
                     _ => {
                         if col_major {
                             return Err("simdgroup_store into a column-major view is not supported".into());
                         }
                         self.line(&format!("simdgroup_store({frag}, {ptr} + ({off_c}), {ld_c});"));
-                        self.line("simdgroup_barrier(mem_flags::mem_threadgroup);");
+                        let ExprKind::Var(destination) = args[1].kind else { return Err("fragment store has no tile binding".into()); };
+                        self.barrier(BarrierSite { operation, variable: destination, purpose: BarrierPurpose::IntrinsicStore })?;
                     }
                 }
                 Ok(())
             }
-            "simdgroup_multiply_accumulate" => {
+            seismic_lang::intrinsics::Operation::MatrixMultiplyAccumulate => {
                 let names: Vec<String> = args
                     .iter()
                     .map(|a| match a.kind {
@@ -1741,7 +1741,10 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 self.line(&format!("simdgroup_multiply_accumulate({}, {}, {}, {});", names[0], names[1], names[2], names[3]));
                 Ok(())
             }
-            other => Err(format!("intrinsic `{other}` is not a statement")),
+            other @ (seismic_lang::intrinsics::Operation::SimdSum
+                | seismic_lang::intrinsics::Operation::SimdMax
+                | seismic_lang::intrinsics::Operation::SimdMin
+                | seismic_lang::intrinsics::Operation::Matrix) => Err(format!("intrinsic `{other}` is not a statement")),
         }
     }
 
@@ -1770,6 +1773,8 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
 
     fn expr(&mut self, e: &Expr) -> Result<String, String> {
         match &e.kind {
+            ExprKind::Load { .. } => Err("selected load requires an explicit IR value binding".into()),
+
             ExprKind::Int(v) => Ok(match e.ty {
                 Ty::Scalar(d) if d.is_float() => format!("{}f", *v as f64),
                 _ => v.to_string(),
@@ -1823,27 +1828,18 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 Ok(self.read_publication(value, &e.ty))
             }
             ExprKind::Accessor { .. } => Err("a packet accessor must be indexed".into()),
-            ExprKind::Intrinsic { name, args } => match name.as_str() {
-                "simd_sum" | "simd_max" | "simd_min" => {
+            ExprKind::Intrinsic { op: name, args } => match name {
+                seismic_lang::intrinsics::Operation::SimdSum | seismic_lang::intrinsics::Operation::SimdMax | seismic_lang::intrinsics::Operation::SimdMin => {
                     let a = self.expr(&args[0])?;
                     Ok(format!("{name}({a})"))
                 }
-                "simdgroup_matrix" => Err("simdgroup_matrix must be assigned to a variable".into()),
-                other => Err(format!("intrinsic `{other}` in expression position")),
+                seismic_lang::intrinsics::Operation::Matrix => Err("simdgroup_matrix must be assigned to a variable".into()),
+                other @ (seismic_lang::intrinsics::Operation::MatrixLoad
+                    | seismic_lang::intrinsics::Operation::MatrixLoadTranspose
+                    | seismic_lang::intrinsics::Operation::MatrixStore
+                    | seismic_lang::intrinsics::Operation::MatrixMultiplyAccumulate) => Err(format!("intrinsic `{other}` in expression position")),
             },
-            ExprKind::Builtin { name: Builtin::Reduce, args ,
-            } => {
-                if !matches!(e.ty, Ty::Scalar(_)) { return Err("tile-valued reduction needs a value binding".into()); }
-                if self.extra_vars.is_empty() { self.extra_vars = self.f.vars.clone(); }
-                let id = self.extra_vars.len();
-                self.extra_vars.push(Var { name: "reduction_value".into(), ty: e.ty.clone(), span: e.span, kind: VarKind::Local ,
-                });
-                self.reduce_into(id, args)?;
-                match self.real.get(&id) {
-                    Some(Realization::Scalar { name }) => Ok(name.clone()),
-                    _ => Err("scalar reduction did not produce a scalar".into()),
-                }
-            }
+            ExprKind::Builtin { name: Builtin::Reduce, .. } => Err("reduction expression reached emission without an IR binding".into()),
             ExprKind::Builtin { name, args } => {
                 let result = scalar_dtype(&e.ty);
                 let mut a: Vec<String> = Vec::new();
@@ -2004,21 +2000,6 @@ fn flat_index(points: &[Sym], caps: &[i64]) -> Sym {
     flat
 }
 
-fn uses_intrinsic(stmts: &[Stmt], v: VarId) -> bool {
-    fn in_expr(e: &Expr, v: VarId) -> bool {
-        match &e.kind {
-            ExprKind::Intrinsic { args, .. } => args.iter().any(|a| matches!(a.kind, ExprKind::Var(x) if x == v)),
-            _ => false,
-        }
-    }
-    stmts.iter().any(|s| match &s.kind {
-        StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. } | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } => uses_intrinsic(body, v),
-        StmtKind::If { then, els, .. } => uses_intrinsic(then, v) || uses_intrinsic(els, v),
-        StmtKind::Expr(e) => in_expr(e, v),
-        StmtKind::Assign { value, .. } => in_expr(value, v),
-    })
-}
-
 /// Print a symbolic integer as a C expression; atoms map to their C names.
 pub fn sym_to_c(s: &Sym, names: &HashMap<String, String>) -> Result<String, String> {
     if let Some(c) = s.as_constant() {
@@ -2053,136 +2034,59 @@ pub fn sym_to_c(s: &Sym, names: &HashMap<String, String>) -> Result<String, Stri
     Ok(format!("({out})"))
 }
 
-/// Which tiles are read outside their owner, and which are written element-wise.
-fn analyze_usage(f: &Lowered,
-) -> (std::collections::HashSet<VarId>, std::collections::HashSet<VarId>,
-) {
-    use std::collections::HashSet;
-    let mut cross = HashSet::new();
-    let mut written = HashSet::new();
-    // Stack of enclosing owned loops: (tile var, index atoms).
-    fn atoms_of(vars: &[Var], ids: &[VarId]) -> Vec<String> {
-        ids.iter()
-            .map(|v| match &vars[*v].kind {
-                VarKind::Index(Atom::Param(p)) => p.clone(),
-                _ => String::new(),
-            })
-            .collect()
+fn reduction_identity(identity: seismic_lang::reduction::Identity) -> &'static str {
+    use seismic_lang::reduction::Identity;
+    match identity {
+        Identity::Zero => "0", Identity::One => "1",
+        Identity::NegativeInfinity => "-INFINITY", Identity::PositiveInfinity => "INFINITY",
+        Identity::MinI32 => "(-2147483647 - 1)", Identity::MaxI32 => "2147483647", Identity::MaxU32 => "0xffffffffu",
     }
-    fn same_shape(vars: &[Var], a: VarId, b: VarId) -> bool {
-        match (&vars[a].ty, &vars[b].ty) {
-            (Ty::Tile(x), Ty::Tile(y)) => x.shape == y.shape,
-            _ => false,
-        }
-    }
-    fn visit_expr(e: &Expr, vars: &[Var], owned: &[(VarId, Vec<String>)], cross: &mut HashSet<VarId>,
-    ) {
-        match &e.kind {
-            ExprKind::Accessor { base, .. } => {
-                // Packet coordinates differ from decoded element ownership.
-                // Preserve a proven read-only packed view when lowering uses them.
-                if let ExprKind::Var(v)=base.kind {cross.insert(v);}
-                visit_expr(base,vars,owned,cross);
-            }
-            ExprKind::Index { base, indices } => {
-                // Ownership is expressed in the underlying tile's coordinates.
-                // Analyze the same transposed read that emission will perform;
-                // otherwise materialization may incorrectly assign private lanes.
-                if let ExprKind::Transpose(inner) = &base.kind {
-                    if indices.len() == 2 {
-                        let mut read = e.clone();
-                        read.kind = ExprKind::Index { base: inner.clone(),
-                            indices: vec![indices[1].clone(), indices[0].clone()] };
-                        visit_expr(&read, vars, owned, cross);
-                        return;
-                    }
-                }
+}
 
-                if let ExprKind::Var(t) = base.kind {
-                    if matches!(vars[t].ty, Ty::Tile(_)) {
-                        let own = owned.last().map(|(ov, atoms)| {
-                            same_shape(vars, *ov, t)
-                                && indices.len() == atoms.len()
-                                && indices.iter().zip(atoms).all(|(i, a)| matches!(i, Index::Point(p) if p.sym.as_ref().map(|s| *s == Sym::param(a)).unwrap_or(false)))
-                        }).unwrap_or(false);
-                        if !own {
-                            cross.insert(t);
-                        }
-                    }
-                }
-                for i in indices {
-                    match i {
-                        Index::Point(p) => visit_expr(p, vars, owned, cross),
-                        Index::Slice { start, end } => {
-                            if let Some(x) = start { visit_expr(x, vars, owned, cross) }
-                            if let Some(x) = end { visit_expr(x, vars, owned, cross) }
-                        }
-                    }
-                }
-                visit_expr(base, vars, owned, cross);
-            }
-            ExprKind::Transpose(x) | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => visit_expr(x, vars, owned, cross),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                visit_expr(lhs, vars, owned, cross);
-                visit_expr(rhs, vars, owned, cross);
-            }
-            ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => {
-                for a in args {
-                    visit_expr(a, vars, owned, cross);
-                }
-            }
-            _ => {}
-        }
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_wrong_allocation_site_even_when_declarations_match() {
+        let program = seismic_lang::program::compile(&[seismic_lang::program::SourceFile {
+            path: "allocation_identity.seismic.portable".into(),
+            scope: seismic_lang::Scope::Portable,
+            text: "fn evaluate(x: tensor[6] f32, out: tensor[6] f32):\n  a = load(x)\n  a = load(x)\n  store(a,out)\n".into(),
+        }], &[]).unwrap();
+        let lowered = seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+        let mut execution = execution::prepare(&lowered, Config {
+            loads: seismic_realization::LoadStrategy::Materialize,
+            ..Default::default()
+        }).unwrap();
+        emit_execution(&execution).unwrap();
+        let arrays = &execution.memory.launches()[0].arrays;
+        assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays[0].declaration, arrays[1].declaration);
+        let first = arrays[0].id.operation;
+        let second = arrays[1].id.operation;
+        let StmtKind::Parallel { body, .. } = &mut execution.function.body[0].kind else { panic!() };
+        let statement = body.iter_mut().find(|statement| statement.id == Some(first)).unwrap();
+        statement.id = Some(second);
+        assert!(emit_execution(&execution).unwrap_err().contains("allocation site mismatch"));
     }
-    fn visit(stmts: &[Stmt], vars: &[Var], owned: &mut Vec<(VarId, Vec<String>)>, cross: &mut HashSet<VarId>, written: &mut HashSet<VarId>,
-    ) {
-        for s in stmts {
-            match &s.kind {
-                StmtKind::Owned { vars: ids, tile, body ,
-                } => {
-                    if let ExprKind::Var(t) = tile.kind {
-                        owned.push((t, atoms_of(vars, ids)));
-                        visit(body, vars, owned, cross, written);
-                        owned.pop();
-                    }
-                }
-                StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } => visit(body, vars, owned, cross, written),
-                StmtKind::If { cond, then, els } => {
-                    visit_expr(cond, vars, owned, cross);
-                    visit(then, vars, owned, cross, written);
-                    visit(els, vars, owned, cross, written);
-                }
-                StmtKind::Assign { target, value, .. } => {
-                    if let ExprKind::Index { base, indices } = &target.kind {
-                        if let ExprKind::Var(t) = base.kind {
-                            written.insert(t);
-                        }
-                        for i in indices {
-                            if let Index::Point(p) = i {
-                                visit_expr(p, vars, owned, cross);
-                            }
-                        }
-                    }
-                    if let ExprKind::Var(t) = target.kind {
-                        if matches!(vars[t].ty, Ty::Tile(_)) && !matches!(value.kind, ExprKind::TileAlloc { .. } | ExprKind::Builtin { .. }) {
-                            written.insert(t);
-                        }
-                    }
-                    visit_expr(value, vars, owned, cross);
-                }
-                StmtKind::Expr(e) => {
-                    if let ExprKind::Intrinsic { name, args } = &e.kind {
-                        if name == "simdgroup_store" {
-                            if let ExprKind::Var(t) = args[1].kind {
-                                written.insert(t);
-                            }
-                        }
-                    }
-                    visit_expr(e, vars, owned, cross);
-                }
-            }
-        }
+
+    #[test]
+    fn rejects_a_missing_publication_site() {
+        let program = seismic_lang::program::compile(&[seismic_lang::program::SourceFile {
+            path: "publication_identity.seismic.portable".into(),
+            scope: seismic_lang::Scope::Portable,
+            text: "fn evaluate(out: tensor[6] f32):\n  a = tile[6] f32\n  for i in owned(a): a[i] = 1.0\n  store(a,out)\n".into(),
+        }], &[]).unwrap();
+        let lowered = seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+        let mut execution = execution::prepare_storage_selected(&lowered, Config::default(),
+            &mut |_| Ok(TilePlacement::GroupShared)).unwrap();
+        assert_eq!(execution.memory.launches()[0].barriers.len(), 1);
+        emit_execution(&execution).unwrap();
+        let StmtKind::Parallel { body, .. } = &mut execution.function.body[0].kind else { panic!() };
+        let owned = body.iter_mut().find(|statement| matches!(statement.kind, StmtKind::Owned { .. })).unwrap();
+        owned.id = Some(OperationId(usize::MAX));
+        assert!(emit_execution(&execution).unwrap_err().contains("omitted planned memory barriers"));
     }
-    visit(&f.body, &f.vars, &mut Vec::new(), &mut cross, &mut written);
-    (cross, written)
+
 }

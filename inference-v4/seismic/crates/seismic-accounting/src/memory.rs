@@ -9,7 +9,7 @@ mod affine;
 use crate::region::Accesses;
 use seismic_lang::{
     ast::{BinaryOp, UnaryOp},
-    hir::*,
+    ir::*,
     program::Program,
     repr,
     sym::{Atom, Sym},
@@ -589,6 +589,10 @@ impl Walker<'_> {
                 self.calls.push(callee.clone());
                 self.block(&g.body, g, &mut inner)?;
                 self.calls.pop();
+            }
+            ExprKind::Load { view, .. } => {
+                self.expr(view, f, frame)?;
+                self.touch_expr(view, frame, Mode::Read)?;
             }
             ExprKind::Builtin { name, args } => {
                 for arg in args {

@@ -10,7 +10,7 @@
 //! This is what makes one item covering four output rows read the shared activation once
 //! rather than four times, which a statement-moving rewrite cannot express.
 
-use crate::hir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind};
+use crate::ir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind};
 use crate::sym::{Atom, Sym};
 use crate::types::{Shaped, Ty};
 use std::collections::HashSet;
@@ -153,12 +153,13 @@ fn descend(s: &Stmt, inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>
     let mut shallow = HashSet::new();
     shallow.insert(inner);
     let rewritten = match &s.kind {
-        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, body } => {
+        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, modes, body } => {
             // The loop itself is shared only when no view reads the index.
             if views.iter().any(|v| expr_depends_shallow(v, &shallow, atom)) {
                 return None;
             }
             StmtKind::LoadLoop {
+                modes: modes.clone(),
                 vars: lv.clone(),
                 views: views.clone(),
                 axis: *axis,
@@ -175,7 +176,7 @@ fn descend(s: &Stmt, inner: VarId, atom: &Atom, factor: i64, vars: &mut Vec<Var>
         }
         _ => return None,
     };
-    Some(Stmt { kind: rewritten, span: s.span })
+    Some(Stmt { id: None, kind: rewritten, span: s.span })
 }
 
 /// Whether an expression reads the index directly, without following variables.
@@ -206,7 +207,7 @@ fn expr_depends_shallow(e: &Expr, tainted: &HashSet<VarId>, atom: &Atom) -> bool
                     }
                 }
             }
-            ExprKind::Transpose(x2) | ExprKind::Accessor { base: x2, .. } | ExprKind::Lanes { base: x2, .. } | ExprKind::Unary { expr: x2, .. } | ExprKind::Cast { expr: x2, .. } => st.push(x2),
+            ExprKind::Load { view: x2, .. } | ExprKind::Transpose(x2) | ExprKind::Accessor { base: x2, .. } | ExprKind::Lanes { base: x2, .. } | ExprKind::Unary { expr: x2, .. } | ExprKind::Cast { expr: x2, .. } => st.push(x2),
             ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => st.extend(args.iter()),
             ExprKind::Binary { lhs, rhs, .. } => {
                 st.push(lhs);
@@ -315,7 +316,8 @@ fn map_stmt(s: &Stmt, inner: VarId, atom: &Atom, value: &Expr, copy: &std::colle
             width: *width,
             body: body.iter().map(|b| map_stmt(b, inner, atom, value, copy)).collect(),
         },
-        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, body } => StmtKind::LoadLoop {
+        StmtKind::LoadLoop { vars: lv, views, axis, piece, capacity, modes, body } => StmtKind::LoadLoop {
+            modes: modes.clone(),
             vars: lv.iter().map(|v| copy.get(v).copied().unwrap_or(*v)).collect(),
             views: views.iter().map(|v| map_expr(v, inner, atom, value, copy)).collect(),
             axis: *axis,
@@ -330,7 +332,7 @@ fn map_stmt(s: &Stmt, inner: VarId, atom: &Atom, value: &Expr, copy: &std::colle
         },
         StmtKind::Parallel { .. } => s.kind.clone(),
     };
-    Stmt { kind, span: s.span }
+    Stmt { id: None, kind, span: s.span }
 }
 
 fn map_sym(s: &Sym, atom: &Atom, value: &Expr) -> Sym {
@@ -360,11 +362,12 @@ fn map_expr(e: &Expr, inner: VarId, atom: &Atom, value: &Expr, copy: &std::colle
                 })
                 .collect(),
         },
+        ExprKind::Load { view, mode } => ExprKind::Load { view: Box::new(map_expr(view, inner, atom, value, copy)), mode: *mode },
         ExprKind::Transpose(x) => ExprKind::Transpose(Box::new(map_expr(x, inner, atom, value, copy))),
         ExprKind::Accessor { base, name } => ExprKind::Accessor { base: Box::new(map_expr(base, inner, atom, value, copy)), name: name.clone() },
         ExprKind::Lanes { base, extent } => ExprKind::Lanes { base: Box::new(map_expr(base, inner, atom, value, copy)), extent: map_sym(extent, atom, value) },
         ExprKind::Builtin { name, args } => ExprKind::Builtin { name: *name, args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect() },
-        ExprKind::Intrinsic { name, args } => ExprKind::Intrinsic { name: name.clone(), args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect() },
+        ExprKind::Intrinsic { op: name, args } => ExprKind::Intrinsic { op: *name, args: args.iter().map(|a| map_expr(a, inner, atom, value, copy)).collect() },
         ExprKind::Call { callee, shape_args, elem_args, args } => ExprKind::Call {
             callee: callee.clone(),
             shape_args: shape_args.iter().map(|s| map_sym(s, atom, value)).collect(),
@@ -429,7 +432,7 @@ pub fn reads(s: &Stmt, out: &mut HashSet<VarId>) {
                     }
                 }
             }
-            ExprKind::Transpose(x) | ExprKind::Accessor { base: x, .. } | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => expr(x, out),
+            ExprKind::Load { view: x, .. } | ExprKind::Transpose(x) | ExprKind::Accessor { base: x, .. } | ExprKind::Lanes { base: x, .. } | ExprKind::Unary { expr: x, .. } | ExprKind::Cast { expr: x, .. } => expr(x, out),
             ExprKind::Builtin { args, .. } | ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => {
                 for a in args {
                     expr(a, out);

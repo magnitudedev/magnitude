@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         #[cfg(target_os = "macos")]
         "metal" => {
-            let config = seismic_metal::msl::Config {
+            let config = seismic_metal::execution::Config {
                 sg_per_tg: i64::from(group),
                 ..Default::default()
             };

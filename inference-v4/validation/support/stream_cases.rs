@@ -1,12 +1,12 @@
 //! Runtime domains, tails and loop-carried state with independent integer-exact sums.
 use seismic_lang::{
-    lower::{Lowered, Options},
+    lowered_ir::LoweredIr, lower::Options,
     program::{compile, SourceFile},
     Scope,
 };
 use std::collections::HashMap;
 pub fn exercise(
-    mut run: impl FnMut(&Lowered, &mut [Vec<u8>]) -> Result<(), String>,
+    mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]) -> Result<(), String>,
     backend: &str,
 ) {
     let p = compile(&[SourceFile {

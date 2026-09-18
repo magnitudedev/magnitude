@@ -3,7 +3,7 @@
 //! invocations with concrete shapes, every tensor argument resolved to a contiguous view
 //! of a caller parameter, and every scalar argument to a literal or a caller scalar.
 
-use crate::hir::{Expr, ExprKind, Function, Index, Stmt, StmtKind, VarKind};
+use crate::ir::{Expr, ExprKind, Function, Index, Stmt, StmtKind, VarKind};
 use crate::program::Program;
 use crate::sym::{Atom, Sym};
 use crate::types::{Elem, Ty};
@@ -177,7 +177,7 @@ impl<'a> Planner<'a> {
     /// leading axes with the remaining axes whole.
     fn view(&self, e: &Expr) -> Result<(String, i64, Elem), String> {
         match &e.kind {
-            ExprKind::Builtin { name: crate::hir::Builtin::Reshape, args } => {
+            ExprKind::Builtin { name: crate::ir::Builtin::Reshape, args } => {
                 let binding = self.view(&args[0])?;
                 if matches!(binding.2, Elem::Repr(_)) { return Err("reshape currently requires dense storage".into()); }
                 let dims = |e: &Expr| e.ty.shaped().ok_or("reshape requires shaped views")?.shape.iter().map(|s| eval(s,&self.env)).collect::<Result<Vec<_>,_>>();

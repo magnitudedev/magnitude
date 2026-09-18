@@ -50,7 +50,6 @@ pub fn scalar(program: &ScalarProgram) -> ScalarAccount {
     let mut analysis = Analysis {
         program,
         constants: HashMap::new(),
-        roots: HashMap::new(),
         multiplicities: HashMap::new(),
     };
     let mut out = ScalarAccount {
@@ -61,65 +60,30 @@ pub fn scalar(program: &ScalarProgram) -> ScalarAccount {
         assumptions:vec!["all runtime validity guards pass; guard-failure executions are outside this account".into(),"counts describe scalar SSA before native optimization; memory bytes are requested accesses to named storage, not physical transactions".into()],
         unavailable:Vec::new(),
     };
-    for block in program.function.layout.blocks() {
-        let executions = program
-            .execution
-            .blocks
-            .get(&block)
+    let graph = seismic_realization::graph::Graph::scalar(program);
+    out.unavailable.extend(graph.unavailable.iter().cloned());
+    for block in &graph.blocks {
+        let executions = block.executions.as_ref()
             .map(|m| analysis.multiplicity(m))
-            .unwrap_or_else(|| Count::unknown(format!("missing execution domain for {block}")))
+            .unwrap_or_else(|| Count::unknown(format!("missing execution domain for {}", block.id)))
             .scale(program.work_items);
-        for inst in program.function.layout.block_insts(block) {
-            let f = &program.function;
-            let data = &f.dfg.insts[inst];
+        for &index in &block.instructions {
+            let instruction = &graph.instructions[index];
             out.instructions.push(InstructionTerm {
-                block: block.to_string(),
-                instruction: inst.to_string(),
-                opcode: data.opcode().to_string(),
-                primitive: if let D::Call { func_ref, .. } = data {
-                    program
-                        .imports
-                        .iter()
-                        .find(|(reference, _)| reference == func_ref)
-                        .map(|(_, operation)| *operation)
-                } else {
-                    None
-                },
-                operand_types: f
-                    .dfg
-                    .inst_args(inst)
-                    .iter()
-                    .map(|v| f.dfg.value_type(*v).to_string())
-                    .collect(),
-                result_types: f
-                    .dfg
-                    .inst_results(inst)
-                    .iter()
-                    .map(|v| f.dfg.value_type(*v).to_string())
-                    .collect(),
+                block: block.id.to_string(), instruction: instruction.id.to_string(),
+                opcode: instruction.opcode.to_string(), primitive: instruction.primitive,
+                operand_types: instruction.inputs.iter().map(|v|v.ty.to_string()).collect(),
+                result_types: instruction.outputs.iter().map(|(_,ty)|ty.to_string()).collect(),
                 count: executions.clone(),
             });
-            let access = match data {
-                D::Load { arg, .. } => Some((
-                    *arg,
-                    f.dfg.value_type(f.dfg.inst_results(inst)[0]).bytes(),
-                    false,
-                )),
-                D::Store { args, .. } => Some((args[1], f.dfg.value_type(args[0]).bytes(), true)),
-                _ => None,
-            };
-            if let Some((address, width, write)) = access {
-                if let Some(root) = analysis.root(address) {
-                    let traffic = out.traffic.entry(root).or_default();
-                    let count = executions.scale(u64::from(width));
-                    if write {
-                        traffic.writes = traffic.writes.add(&count)
-                    } else {
-                        traffic.reads = traffic.reads.add(&count)
-                    }
+            if let Some(access) = &instruction.memory {
+                if let Some(root) = &access.object {
+                    let traffic = out.traffic.entry(root.clone()).or_default();
+                    let count = executions.scale(u64::from(access.bytes));
+                    if access.write { traffic.writes = traffic.writes.add(&count); }
+                    else { traffic.reads = traffic.reads.add(&count); }
                 } else if executions != Count::Exact(0) {
-                    out.unavailable
-                        .push(format!("{inst}: memory object unresolved for {address}"));
+                    out.unavailable.push(format!("{}: memory object unresolved for {}", instruction.id, access.address));
                 }
             }
         }
@@ -133,33 +97,13 @@ pub fn scalar(program: &ScalarProgram) -> ScalarAccount {
 struct Analysis<'a> {
     program: &'a ScalarProgram,
     constants: HashMap<Value, Option<i64>>,
-    roots: HashMap<Value, Option<MemoryObject>>,
     multiplicities: HashMap<usize, Count>,
 }
 impl Analysis<'_> {
     fn multiplicity(&mut self, m: &std::sync::Arc<Multiplicity>) -> Count {
-        let key = std::sync::Arc::as_ptr(m) as usize;
-        if let Some(n) = self.multiplicities.get(&key) {
-            return n.clone();
-        }
-        let count = match &**m {
-            Multiplicity::Constant(n) => Count::Exact(*n),
-            Multiplicity::Product(a, b) => self.multiplicity(a).multiply(&self.multiplicity(b)),
-            Multiplicity::PlusOne(a) => self.multiplicity(a).add(&Count::Exact(1)),
-            Multiplicity::Iterations { lower, upper } => {
-                match (self.constant(*lower), self.constant(*upper)) {
-                    (Some(lo), Some(hi)) => {
-                        Count::Exact((i128::from(hi) - i128::from(lo)).max(0) as u64)
-                    }
-                    _ => Count::unknown(format!("runtime/dependent range {lower}..{upper}")),
-                }
-            }
-            Multiplicity::Predicate { value, expected } => match self.constant(*value) {
-                Some(n) => Count::Exact(u64::from((n != 0) == *expected)),
-                None => Count::interval(0, 1).unwrap(),
-            },
-        };
-        self.multiplicities.insert(key, count.clone());
+        let mut cache = std::mem::take(&mut self.multiplicities);
+        let count = crate::multiplicity::evaluate(m, &mut cache, &mut |value| self.constant(*value));
+        self.multiplicities = cache;
         count
     }
     fn constant(&mut self, value: Value) -> Option<i64> {
@@ -199,37 +143,7 @@ impl Analysis<'_> {
         self.constants.insert(value, result);
         result
     }
-    fn root(&mut self, value: Value) -> Option<MemoryObject> {
-        let value = self.program.function.dfg.resolve_aliases(value);
-        if let Some(root) = self.program.execution.memory_roots.get(&value) {
-            return Some(root.clone());
-        }
-        if let Some(root) = self.roots.get(&value) {
-            return root.clone();
-        }
-        self.roots.insert(value, None);
-        let f = &self.program.function;
-        let result = match f.dfg.value_def(value) {
-            ValueDef::Result(inst, _) => match f.dfg.insts[inst] {
-                D::BinaryImm64 {
-                    opcode: O::IaddImm,
-                    arg,
-                    ..
-                } => self.root(arg),
-                D::Binary {
-                    opcode: O::Iadd,
-                    args,
-                } => match (self.root(args[0]), self.root(args[1])) {
-                    (Some(r), None) | (None, Some(r)) => Some(r),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-        self.roots.insert(value, result.clone());
-        result
-    }
+
 }
 fn integer(op: O, a: i64, b: i64) -> Option<i64> {
     match op {

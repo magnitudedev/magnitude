@@ -1,11 +1,13 @@
 //! Derived resource accounting, with explicit units, provenance and uncertainty.
 
 pub mod memory;
+mod multiplicity;
 pub mod prediction;
 pub mod quantity;
 pub mod realization;
 pub mod region;
 pub mod resource;
+pub mod storage;
 pub mod work;
 
 /// Portable algorithm operations and accessed regions. Neither component alone
@@ -53,3 +55,7 @@ pub fn derive_specialized(
         )?,
     })
 }
+
+pub mod schedule;
+
+pub mod selection;

@@ -1,17 +1,18 @@
 use crate::{
     driver::{Allocation, Context, Driver, Event, Handle, Module},
     ptx,
+    execution::{Execution, Limits},
 };
 use cranelift_codegen::isa::CallConv;
 use seismic_lang::abi::ScalarParameter;
-use seismic_lang::lower::Lowered;
+use seismic_lang::lowered_ir::LoweredIr;
 use seismic_realization::{BufferSpec, Dispatch, ScalarProgram};
 use std::{
-    ffi::{c_void, CStr, CString},
+    ffi::{c_void, CStr},
     rc::Rc,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
     pub compute_capability: (i32, i32),
@@ -164,7 +165,7 @@ impl Device {
     /// candidate; this entry point does not pretend to perform automatic tuning.
     pub fn compile(
         &self,
-        lowered: &Lowered,
+        lowered: &LoweredIr,
         dispatch: Dispatch,
         threads_per_block: u32,
     ) -> Result<Kernel, String> {
@@ -179,7 +180,7 @@ impl Device {
     }
     pub fn compile_candidate(
         &self,
-        lowered: &Lowered,
+        lowered: &LoweredIr,
         options: seismic_realization::ScalarOptions,
         threads_per_block: u32,
     ) -> Result<Kernel, String> {
@@ -190,11 +191,11 @@ impl Device {
             return Err("CUDA block size exceeds device capability".into());
         }
         let program = seismic_compiler::scalar_candidate(lowered, CallConv::SystemV, options)?;
-        self.compile_program(program, threads_per_block)
+        self.compile_execution(Execution::new(program, threads_per_block, self.execution_limits())?)
     }
     pub fn compile_sequence(
         &self,
-        lowered: &Lowered,
+        lowered: &LoweredIr,
         options: seismic_realization::ScalarOptions,
         threads_per_block: u32,
     ) -> Result<Sequence, String> {
@@ -205,21 +206,69 @@ impl Device {
         let phases = sequence
             .phases
             .into_iter()
-            .map(|phase| self.compile_program(phase.program, threads_per_block))
+            .map(|phase| Execution::new(phase.program, threads_per_block, self.execution_limits()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.compile_executions(phases)
+    }
+    /// Consume the complete selected launch sequence, without re-preparing IR.
+    pub fn compile_executions(&self, executions: Vec<Execution>) -> Result<Sequence, String> {
+        if executions.is_empty() {
+            return Err("CUDA execution sequence must have at least one phase".into());
+        }
+        let first = executions[0].program();
+        for execution in &executions {
+            execution.validate_limits(self.execution_limits())?;
+            if execution.program().buffers != first.buffers
+                || execution.program().scalars != first.scalars {
+                return Err("CUDA phases must share the same invocation bindings".into());
+            }
+        }
+        let phases = executions.into_iter()
+            .map(|execution| self.compile_execution(execution))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Sequence { phases })
     }
-    fn compile_program(
+    /// Compile exactly the execution path's native code without invocation storage.
+    pub fn compile_artifacts(
         &self,
-        program: ScalarProgram,
+        lowered: &LoweredIr,
+        options: seismic_realization::ScalarOptions,
         threads_per_block: u32,
-    ) -> Result<Kernel, String> {
-        if threads_per_block == 0 || threads_per_block > self.info.max_threads_per_block {
-            return Err("CUDA block size exceeds device capability".into());
+    ) -> Result<Vec<NativeArtifact>, String> {
+        if lowered.backend != "cuda" {
+            return Err("CUDA requires a CUDA-lowered function".into());
         }
-        let source = ptx::emit(&program)?;
-        let image = CString::new(source.as_str()).map_err(|_| "PTX contains NUL")?;
+        let sequence = seismic_compiler::scalar_sequence(lowered, CallConv::SystemV, options)?;
+        sequence
+            .phases
+            .into_iter()
+            .map(|phase| Ok((phase.source_statement, Execution::new(phase.program, threads_per_block, self.execution_limits())?)))
+            .collect::<Result<Vec<_>,String>>()?
+            .into_iter()
+            .map(|(source_statement, execution)| {
+                let code = self.compile_code(&execution)?;
+                Ok(NativeArtifact {
+                    source_statement,
+                    work_items: execution.program().work_items,
+                    threads_per_block: execution.dispatch().threads_per_group as u32,
+                    blocks: execution.dispatch().groups as u32,
+                    native: code.native,
+                    image: code.image,
+                    ptx: code.source,
+                })
+            })
+            .collect()
+    }
+    fn execution_limits(&self) -> Limits {
+        Limits { max_threads_per_block: self.info.max_threads_per_block, max_grid_x: self.info.max_grid_x }
+    }
+    fn compile_code(&self, execution: &Execution) -> Result<CompiledCode, String> {
+        execution.validate_limits(self.execution_limits())?;
+        let threads_per_block = execution.dispatch().threads_per_group as u32;
+        let program = execution.program();
+        let source = ptx::emit(program)?;
         let context = &self.context;
+        let (image, compilation_log) = crate::driver::compile_image(context, &source)?;
         let _current = context.enter()?;
         let driver = &context.driver;
         let mut raw = std::ptr::null_mut();
@@ -235,7 +284,7 @@ impl Device {
                 values.as_mut_ptr(),
             )
         };
-        if let Err(error) = driver.check(status, "PTX compilation") {
+        if let Err(error) = driver.check(status, "native image loading") {
             let end = log.iter().position(|b| *b == 0).unwrap_or(log.len());
             return Err(format!("{error}\n{}", String::from_utf8_lossy(&log[..end])));
         }
@@ -286,92 +335,108 @@ impl Device {
         if threads_per_block > native.max_threads_per_block as u32 {
             return Err("CUDA block size exceeds compiled kernel capability".into());
         }
-        let blocks = program.work_items.div_ceil(u64::from(threads_per_block));
-        let blocks = u32::try_from(blocks)
-            .ok()
-            .filter(|n| *n <= self.info.max_grid_x)
-            .ok_or("CUDA domain exceeds one-dimensional grid capability")?;
-        let work_items = usize::try_from(program.work_items)
-            .map_err(|_| "CUDA work domain exceeds address range")?;
-        let scratch_bytes = program
-            .scratch_bytes
-            .checked_mul(work_items)
-            .ok_or("CUDA scratch size overflow")?;
-        // Compiled code owns no model tensor storage. Resident bindings are
-        // supplied by the caller; the host convenience path allocates lazily.
-        let table_bytes = program
-            .buffers
-            .len()
-            .checked_mul(8)
-            .ok_or("CUDA buffer table overflow")?;
-        let table = Allocation::new(context, table_bytes)?;
-        let scalar_bytes = program
-            .scalars
-            .len()
-            .checked_mul(8)
-            .ok_or("CUDA scalar table overflow")?;
-        let scalars = Allocation::new(context, scalar_bytes)?;
-        let scratch = Allocation::new(context, scratch_bytes)?;
-        let statuses = Allocation::new(
-            context,
-            work_items
-                .checked_mul(4)
-                .ok_or("CUDA status size overflow")?,
-        )?;
+        Ok(CompiledCode {
+            module,
+            function,
+            native,
+            source,
+            image: NativeImage {
+                cubin: image,
+                compilation_log,
+                driver_version: self.info.driver_version,
+                compute_capability: self.info.compute_capability,
+            },
+        })
+    }
+    /// Compile and allocate exactly the prevalidated selected execution.
+    pub fn compile_execution(&self, execution: Execution) -> Result<Kernel, String> {
+        let CompiledCode { module, function, native, source, image } = self.compile_code(&execution)?;
+        let context = &self.context;
+        let storage = execution.storage();
+        let table = Allocation::new(context, storage.buffer_table_bytes)?;
+        let scalars = Allocation::new(context, storage.scalar_bytes)?;
+        let scratch = Allocation::new(context, storage.scratch_bytes)?;
+        let statuses = Allocation::new(context, storage.status_bytes)?;
         Ok(Kernel {
             module,
             function,
-            program,
+            execution,
             tensors: Vec::new(),
             table,
             scalars,
             scratch,
             statuses,
-            threads_per_block,
-            blocks,
             native,
             ptx: source,
+            image,
             ready: false,
             timing: [Event::new(context)?, Event::new(context)?],
         })
     }
+}
+struct CompiledCode {
+    module: Module,
+    function: Handle,
+    native: NativeResources,
+    source: String,
+    image: NativeImage,
+}
+/// A native phase compiled without allocating any invocation buffers.
+pub struct NativeArtifact {
+    pub source_statement: usize,
+    pub work_items: u64,
+    pub threads_per_block: u32,
+    pub blocks: u32,
+    pub native: NativeResources,
+    pub image: NativeImage,
+    pub ptx: String,
 }
 /// Synchronous initial invocation owner. Launch returns only after completion;
 /// all submitted buffers, code and scratch therefore survive every device use.
 pub struct Kernel {
     module: Module,
     function: Handle,
-    program: ScalarProgram,
+    execution: Execution,
     tensors: Vec<Buffer>,
     table: Allocation,
     scalars: Allocation,
     scratch: Allocation,
     statuses: Allocation,
-    threads_per_block: u32,
-    blocks: u32,
     ready: bool,
     timing: [Event; 2],
     pub native: NativeResources,
     pub ptx: String,
+    image: NativeImage,
+}
+/// The exact linked image loaded by this kernel. Developer inspection can use
+/// CUDA tooling, but compilation/execution depend only on the installed driver.
+pub struct NativeImage {
+    pub cubin: Vec<u8>,
+    pub compilation_log: String,
+    pub driver_version: i32,
+    pub compute_capability: (i32, i32),
 }
 impl Kernel {
+    pub fn native_image(&self) -> &NativeImage {
+        &self.image
+    }
     pub fn buffers(&self) -> &[BufferSpec] {
-        &self.program.buffers
+        &self.execution.program().buffers
     }
     pub fn scalars(&self) -> &[ScalarParameter] {
-        &self.program.scalars
+        &self.execution.program().scalars
     }
     pub fn scratch_bytes(&self) -> usize {
         self.scratch.bytes
     }
     pub fn work_items(&self) -> u64 {
-        self.program.work_items
+        self.execution.program().work_items
     }
     fn validate(&self, buffers: &[&mut [u8]]) -> Result<(), String> {
-        if buffers.len() != self.program.buffers.len() {
+        if buffers.len() != self.execution.program().buffers.len() {
             return Err("CUDA buffer binding count mismatch".into());
         }
-        for (buffer, spec) in buffers.iter().zip(&self.program.buffers) {
+        for (buffer, spec) in buffers.iter().zip(&self.execution.program().buffers) {
             if buffer.len() < spec.bytes {
                 return Err(format!(
                     "CUDA buffer {}.{} has {} bytes; needs {}",
@@ -388,10 +453,10 @@ impl Kernel {
     /// the pointer/scalar tables; ownership remains retained through every launch.
     pub fn bind(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
         self.ready = false;
-        if buffers.len() != self.program.buffers.len() {
+        if buffers.len() != self.execution.program().buffers.len() {
             return Err("CUDA resident binding count mismatch".into());
         }
-        for (buffer, spec) in buffers.iter().zip(&self.program.buffers) {
+        for (buffer, spec) in buffers.iter().zip(&self.execution.program().buffers) {
             if !Rc::ptr_eq(&buffer.allocation.context, &self.module.context) {
                 return Err("CUDA buffer belongs to a different context".into());
             }
@@ -405,7 +470,7 @@ impl Kernel {
                 return Err("CUDA resident view violates typed storage alignment".into());
             }
         }
-        let words = seismic_realization::encode_scalars(&self.program.scalars, scalars)?;
+        let words = seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
         let bytes = words
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -425,9 +490,8 @@ impl Kernel {
         self.validate(buffers)?;
         // The first host invocation supplies storage. Subsequent uploads refresh
         // the current resident bindings rather than allocating per invocation.
-        if self.tensors.is_empty() && !self.program.buffers.is_empty() {
-            self.tensors = self
-                .program
+        if self.tensors.is_empty() && !self.execution.program().buffers.is_empty() {
+            self.tensors = self.execution.program()
                 .buffers
                 .iter()
                 .map(|spec| {
@@ -441,8 +505,8 @@ impl Kernel {
         }
         let resident = self.tensors.clone();
         // Validate scalar values before modifying caller-owned resident contents.
-        seismic_realization::encode_scalars(&self.program.scalars, scalars)?;
-        for ((tensor, buffer), spec) in resident.iter().zip(buffers).zip(&self.program.buffers) {
+        seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
+        for ((tensor, buffer), spec) in resident.iter().zip(buffers).zip(&self.execution.program().buffers) {
             tensor.write(&buffer[..spec.bytes])?;
         }
         self.bind(&resident, scalars)
@@ -465,7 +529,7 @@ impl Kernel {
         if !self.ready {
             return Err("CUDA kernel must have validated inputs uploaded before launch".into());
         }
-        if self.blocks == 0 {
+        if self.execution.dispatch().groups as u32 == 0 {
             return Ok(0.0);
         }
         self.ready = false;
@@ -492,10 +556,10 @@ impl Kernel {
             }
             let launch = (driver.launch)(
                 self.function,
-                self.blocks,
+                self.execution.dispatch().groups as u32,
                 1,
                 1,
-                self.threads_per_block,
+                self.execution.dispatch().threads_per_group as u32,
                 1,
                 1,
                 0,
@@ -545,10 +609,10 @@ impl Kernel {
     }
     pub fn download(&self, buffers: &mut [&mut [u8]]) -> Result<(), String> {
         self.validate(buffers)?;
-        if self.tensors.len() != self.program.buffers.len() {
+        if self.tensors.len() != self.execution.program().buffers.len() {
             return Err("CUDA tensors have not been bound".into());
         }
-        for ((tensor, buffer), spec) in self.tensors.iter().zip(buffers).zip(&self.program.buffers)
+        for ((tensor, buffer), spec) in self.tensors.iter().zip(buffers).zip(&self.execution.program().buffers)
         {
             tensor.read(&mut buffer[..spec.bytes])?;
         }
@@ -583,7 +647,7 @@ impl Sequence {
     pub fn realizations(&self) -> impl Iterator<Item = (&ScalarProgram, &NativeResources)> {
         self.phases
             .iter()
-            .map(|kernel| (&kernel.program, &kernel.native))
+            .map(|kernel| (kernel.execution.program(), &kernel.native))
     }
     /// Device timing is the sum of per-kernel event intervals, excluding host gaps.
     pub fn execute(

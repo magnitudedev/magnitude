@@ -3,21 +3,21 @@
 //! scalar expressions, and no reductions, cross-element reads or control effects.
 use crate::{
     ast::AssignOp,
-    hir::*,
-    lower::Lowered,
+    ir::*,
+    lowered_ir::LoweredIr,
     sym::{Atom, Sym},
     types::{DType, Elem, Ty},
 };
 use std::collections::HashSet;
 
 pub struct Partitioned {
-    pub function: Lowered,
+    pub function: LoweredIr,
     /// Runtime must reject overlapping parameter storage unless these parameters
     /// have identical base addresses and identical dense element types.
     pub parameters: Vec<(usize, DType)>,
 }
 
-pub fn pointwise(function: &Lowered, piece: i64) -> Result<Partitioned, String> {
+pub fn pointwise(function: &LoweredIr, piece: i64) -> Result<Partitioned, String> {
     if piece <= 0 {
         return Err("pointwise partition must be positive".into());
     }

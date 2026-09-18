@@ -2,13 +2,13 @@
 use seismic_lang::Scope;
 use seismic_lang::{
     interp::TensorData,
-    lower::{Lowered, Options},
+    lowered_ir::LoweredIr, lower::Options,
     program::{compile, SourceFile},
     types::DType,
 };
 use std::collections::HashMap;
 pub fn exercise(
-    mut run: impl FnMut(&Lowered, &mut [Vec<u8>], &[f64]) -> Result<(), String>,
+    mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]) -> Result<(), String>,
     backend: &str,
 ) {
     let portable = [

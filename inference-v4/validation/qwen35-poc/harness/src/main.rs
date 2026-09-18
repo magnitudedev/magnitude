@@ -9,7 +9,7 @@ use bindings::{Packed, Qwen35Decode, Qwen35DecodeShapes};
 use json::Json;
 use safetensors::SafeTensors;
 use seismic_lang::program::{collect_files, compile};
-use seismic_metal::msl::Config;
+use seismic_metal::execution::Config;
 use seismic_metal::plan_exec::compile_plan;
 use seismic_metal::runtime::{Buffer, Device};
 use std::collections::HashMap;
@@ -198,7 +198,7 @@ fn run() -> Result<(), String> {
     let device = Device::open()?;
     eprintln!("device: {}", device.info().name);
     let t1 = Instant::now();
-    let compiled = compile_plan(&device, &program, &plan, Config { sg_per_tg: a.sg_per_tg, piece: a.piece, per_item: a.rows_per_item, split: a.split, max_threads_per_threadgroup: device.info().max_threads_per_threadgroup as i64, max_threadgroup_bytes: device.info().max_threadgroup_bytes as i64 })?;
+    let compiled = compile_plan(&device, &program, &plan, Config { tile_piece: None, sg_per_tg: a.sg_per_tg, piece: a.piece, per_item: a.rows_per_item, split: a.split, max_threads_per_threadgroup: device.info().max_threads_per_threadgroup as i64, max_threadgroup_bytes: device.info().max_threadgroup_bytes as i64, ..Default::default() })?;
     eprintln!("plan: {} steps, {} pipelines, compiled in {:.2} s", plan.steps.len(), compiled.pipelines.len(), t1.elapsed().as_secs_f64());
 
     // Weights.

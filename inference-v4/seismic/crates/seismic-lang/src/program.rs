@@ -7,7 +7,7 @@
 
 use crate::ast;
 use crate::check::{self, Checked, Env, Signature};
-use crate::hir::{Function, Lowering};
+use crate::ir::{Function, Lowering};
 use crate::span::Diagnostic;
 use crate::{parse, scope_of_path, Scope};
 use std::collections::{BTreeMap, HashMap};
@@ -185,7 +185,7 @@ pub fn compile(files: &[SourceFile], backends: &[String]) -> Result<Program, Vec
 }
 
 /// Shared entry binding contract for kernel and composition specialization.
-pub fn validate_element_bindings(f: &crate::hir::Function, elements: &HashMap<String, crate::types::Elem>) -> Result<(), String> {
+pub fn validate_element_bindings(f: &crate::ir::Function, elements: &HashMap<String, crate::types::Elem>) -> Result<(), String> {
     let name = &f.name;
     for parameter in &f.elem_params {
         match elements.get(parameter) {

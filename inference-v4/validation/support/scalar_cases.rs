@@ -1,11 +1,11 @@
 //! Independent small semantic cases shared by backend qualification tests.
 use seismic_lang::{
-    lower::Lowered,
+    lowered_ir::LoweredIr,
     program::{compile, SourceFile},
     Scope,
 };
 use std::collections::HashMap;
-pub fn exercise(mut run: impl FnMut(&Lowered, &mut [Vec<u8>], &[f64]), backend: &str) {
+pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend: &str) {
     let program = compile(
         &[SourceFile {
             path: "scalar-semantics.seismic.portable".into(),

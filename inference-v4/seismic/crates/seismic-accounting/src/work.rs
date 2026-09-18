@@ -4,7 +4,7 @@
 
 use crate::quantity::Count;
 use seismic_lang::ast::{AssignOp, BinaryOp};
-use seismic_lang::hir::*;
+use seismic_lang::ir::*;
 use seismic_lang::program::Program;
 use seismic_lang::sym::{Atom, Sym};
 use seismic_lang::types::{DType, Elem, Ty};
@@ -31,10 +31,8 @@ pub enum WorkKind {
     /// One reduction per output element, with the input extent retained. Backend
     /// rules decide its comparisons/additions/communication under precision rules.
     Reduction {
-        operation: ReduceOp,
-        ordered: bool,
+        contract: seismic_lang::reduction::Contract,
         extent: Count,
-        dtype: DType,
     },
     Decode {
         representation: String,
@@ -309,7 +307,9 @@ impl Walker<'_> {
                 StmtKind::Assign { target, op, value } => {
                     self.expr(value, f, b, mult);
                     let publication_dtype = match &target.kind {
-                        ExprKind::Index { base, .. } if matches!(target.ty, Ty::Scalar(_)) => dtype(&base.ty, b),
+                        ExprKind::Index { base, .. } if matches!(target.ty, Ty::Scalar(_)) => {
+                            dtype(&base.ty, b)
+                        }
                         _ => dtype(&target.ty, b),
                     };
                     if matches!(target.ty, Ty::Scalar(_) | Ty::Tile(_)) {
@@ -326,7 +326,13 @@ impl Walker<'_> {
                         self.indices(indices, f, b, mult);
                     }
                     if *op != AssignOp::Assign {
-                        self.conversion(publication_dtype, dtype(&target.ty,b), mult.clone(),f,target);
+                        self.conversion(
+                            publication_dtype,
+                            dtype(&target.ty, b),
+                            mult.clone(),
+                            f,
+                            target,
+                        );
                         if let Some(d) = dtype(&target.ty, b) {
                             let operator = match op {
                                 AssignOp::Add => "+",
@@ -427,13 +433,7 @@ impl Walker<'_> {
                             .and_then(Sym::as_constant)
                             .and_then(|v| usize::try_from(v).ok());
                         let op = if let ExprKind::Int(op) = args[2].kind {
-                            match op {
-                                0 => Some(ReduceOp::Sum),
-                                1 => Some(ReduceOp::Max),
-                                2 => Some(ReduceOp::Min),
-                                3 => Some(ReduceOp::Argmax),
-                                _ => None,
-                            }
+                            ReduceOp::from_tag(op)
                         } else {
                             None
                         };
@@ -443,13 +443,15 @@ impl Walker<'_> {
                             if let Some(extent) = sh.shape.get(axis) {
                                 self.term(
                                     WorkKind::Reduction {
-                                        operation: op,
-                                        ordered: matches!(
-                                            args.get(3).map(|e| &e.kind),
-                                            Some(ExprKind::Bool(true))
+                                        contract: seismic_lang::reduction::Contract::new(
+                                            op,
+                                            d,
+                                            matches!(
+                                                args.get(3).map(|e| &e.kind),
+                                                Some(ExprKind::Bool(true))
+                                            ),
                                         ),
                                         extent: count(extent, b),
-                                        dtype: d,
                                     },
                                     product(mult, &elements(&e.ty, b)),
                                     f,
@@ -574,9 +576,9 @@ impl Walker<'_> {
                     }
                 }
             }
-            ExprKind::Transpose(base) | ExprKind::Accessor { base, .. } => {
-                self.expr(base, f, b, mult)
-            }
+            ExprKind::Load { view: base, .. }
+            | ExprKind::Transpose(base)
+            | ExprKind::Accessor { base, .. } => self.expr(base, f, b, mult),
             ExprKind::Tuple(items) => {
                 for item in items {
                     self.expr(item, f, b, mult);

@@ -47,7 +47,7 @@ pub struct Invocation<'a> {
     pub scalars: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
     pub unified_memory: bool,

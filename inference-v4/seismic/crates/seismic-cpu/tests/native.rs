@@ -125,7 +125,7 @@ fn compare_candidate(
                     a.is_finite() && b.is_finite() && (a - b).abs() <= 0.002 + 0.005 * b.abs(),
                     "{name} {}[{i}] expected {b}, got {a}\n{}",
                     slot.parameter,
-                    kernel.ir
+                    kernel.native_artifact().ir
                 );
             }
         }
@@ -241,7 +241,7 @@ fn repeated_native_invocation_reinitializes_logical_tiles() {
 
 #[test]
 fn altered_loop_domain_cannot_escape_native_buffer_bounds() {
-    use seismic_lang::{hir::StmtKind, program::SourceFile, sym::Sym, Scope};
+    use seismic_lang::{ir::StmtKind, program::SourceFile, sym::Sym, Scope};
     let p = compile(&[SourceFile {
         path: "copy.seismic.portable".into(), scope: Scope::Portable,
         text: "fn copy[N](x: tensor[N] f32, out: tensor[N] f32):\n  for i in parallel:\n    t = load(x[i:i+1])\n    store(t, out[i:i+1])\n".into(),

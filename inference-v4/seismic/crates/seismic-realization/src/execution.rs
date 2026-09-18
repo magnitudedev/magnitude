@@ -4,21 +4,24 @@ use cranelift_codegen::ir::{Block, Value};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug)]
-pub enum Multiplicity {
+pub enum Multiplicity<V = Value> {
     Constant(u64),
+    Unknown {
+        reason: String,
+    },
     Product(Arc<Self>, Arc<Self>),
     PlusOne(Arc<Self>),
-    /// Half-open unit-stride range. Values refer to the generated SSA itself.
+    /// Half-open unit-stride range. References belong to the representation carrying this evidence.
     Iterations {
-        lower: Value,
-        upper: Value,
+        lower: V,
+        upper: V,
     },
     Predicate {
-        value: Value,
+        value: V,
         expected: bool,
     },
 }
-impl Multiplicity {
+impl<V> Multiplicity<V> {
     pub fn product(a: Arc<Self>, b: Arc<Self>) -> Arc<Self> {
         Arc::new(Self::Product(a, b))
     }

@@ -1,4 +1,6 @@
-//! Typed, resolved IR produced by the checker.
+//! Shared typed nodes for portable computation and backend implementations.
+//! Stage representations reuse these expressions, statements, types and identities;
+//! applying Seismic lowering definitions does not duplicate the node hierarchy.
 
 use crate::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::span::Span;
@@ -49,8 +51,14 @@ pub struct Lowering {
     pub residual: Vec<Sym>,
 }
 
+/// Identity within one normalized execution artifact, never a source offset or
+/// scheduling position. Transformations producing a new artifact reassign IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OperationId(pub usize);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stmt {
+    pub id: Option<OperationId>,
     pub kind: StmtKind,
     pub span: Span,
 }
@@ -61,7 +69,8 @@ pub enum StmtKind {
     /// `for vars in load(views, over=axis)`; `piece` is the lowering-chosen extent along `axis`.
     /// After lowering, `capacity` is the static piece size when the axis extent is dynamic
     /// (the piece atom then stays symbolic and denotes the runtime extent of each piece).
-    LoadLoop { vars: Vec<VarId>, views: Vec<Expr>, axis: usize, piece: Atom, capacity: Option<i64>, body: Vec<Stmt> },
+    /// `modes` is unresolved before selection; afterward it contains one load mode per binding.
+    LoadLoop { modes: Option<Vec<LoadMode>>, vars: Vec<VarId>, views: Vec<Expr>, axis: usize, piece: Atom, capacity: Option<i64>, body: Vec<Stmt> },
     Owned { vars: Vec<VarId>, tile: Expr, body: Vec<Stmt> },
     Range { var: VarId, lo: Sym, hi: Sym, body: Vec<Stmt> },
     /// Lowering scope: iterate `extent` across the subgroup's lanes, `width` consecutive per lane.
@@ -80,6 +89,11 @@ pub struct Expr {
     pub span: Span,
 }
 
+/// Selected realization of a value-semantic load. Borrowing requires a lifetime
+/// proof; it does not change the program's observable snapshot semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadMode { Materialize, Borrow }
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
     Int(i64),
@@ -89,6 +103,8 @@ pub enum ExprKind {
     Bool(bool),
     Var(VarId),
     TileAlloc { shape: Vec<Sym>, dtype: Elem },
+    /// Execution-stage load with its storage decision resolved.
+    Load { view: Box<Expr>, mode: LoadMode },
     /// Indexing of a tensor or tile: a view, or an element when every axis is a point.
     Index { base: Box<Expr>, indices: Vec<Index> },
     Transpose(Box<Expr>),
@@ -99,7 +115,7 @@ pub enum ExprKind {
     Builtin { name: Builtin, args: Vec<Expr> },
     /// Call of a function or construct with inferred shape and element arguments.
     Call { callee: String, shape_args: Vec<Sym>, elem_args: Vec<Elem>, args: Vec<Expr> },
-    Intrinsic { name: String, args: Vec<Expr> },
+    Intrinsic { op: crate::intrinsics::Operation, args: Vec<Expr> },
     Unary { op: UnaryOp, expr: Box<Expr> },
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Cast { dtype: DType, expr: Box<Expr> },
@@ -167,6 +183,10 @@ pub enum ReduceOp {
 }
 
 impl ReduceOp {
+    pub fn from_tag(tag: i64) -> Option<Self> {
+        Some(match tag { 0 => Self::Sum, 1 => Self::Max, 2 => Self::Min, 3 => Self::Argmax, _ => return None })
+    }
+
     pub fn from_name(name: &str) -> Option<ReduceOp> {
         Some(match name {
             "sum" => ReduceOp::Sum,

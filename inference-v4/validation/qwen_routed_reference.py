@@ -2,9 +2,10 @@
 """Routed Qwen suffix and routing edge cases from V3 primitive references."""
 import argparse, hashlib, json, sys
 from pathlib import Path
+from reference_source import activate
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
-a=p.parse_args();source=a.source.resolve(strict=True);sys.path.insert(0,str(source/'src'))
+a=p.parse_args();source=a.source.resolve(strict=True);activate(source)
 import numpy as np
 from ops.tensor import ops
 from ops.tensor.primitive import round_reference

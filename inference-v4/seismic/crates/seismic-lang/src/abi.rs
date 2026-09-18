@@ -20,7 +20,7 @@ impl ScalarParameter {
         }
     }
     pub fn from_lowered(
-        lowered: &crate::lower::Lowered,
+        lowered: &crate::lowered_ir::LoweredIr,
         name: &str,
         dtype: DType,
     ) -> Result<Self, String> {

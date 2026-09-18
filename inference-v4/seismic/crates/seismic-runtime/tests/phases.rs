@@ -22,7 +22,12 @@ fn exercise(device: Device, candidate: Candidate) {
         &HashMap::from([("N".into(), 67)]),
     )
     .unwrap();
-    let mut kernel = device.compile(&lowered, candidate).unwrap();
+    let execution = seismic_runtime::execution::Execution::prepare(
+        &lowered, candidate, &device.facts(),
+    ).unwrap();
+    // Account and compile exactly the same prepared execution across backends.
+    let _account = execution.account().unwrap();
+    let mut kernel = device.compile_execution(execution).unwrap();
     assert_eq!(
         kernel.phase_count(),
         if device.backend() == "cpu" { 1 } else { 2 }

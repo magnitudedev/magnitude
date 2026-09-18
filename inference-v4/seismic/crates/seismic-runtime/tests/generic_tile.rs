@@ -1,10 +1,13 @@
 use seismic_lang::{
-    Scope,
     interp::{Arg, Interpreter, TensorData},
-    lower::{Options, lower_specialized},
+    lower::{
+        alternatives::{Space, Specialization},
+        lower_specialized, Options,
+    },
     numeric::{bf16_round, f16_bits, f16_round},
-    program::{SourceFile, compile},
+    program::{compile, SourceFile},
     types::{DType, Elem},
+    Scope,
 };
 use seismic_runtime::{Candidate, Device};
 use std::collections::HashMap;
@@ -43,34 +46,45 @@ fn exercise(device: Device, candidate: Candidate) {
                 assert_eq!(interpreter.tensors[o].get(i) as f32, *e);
             }
         }
-        let lowered = lower_specialized(
-            &program,
-            "local",
-            device.backend(),
-            &shapes,
-            &HashMap::from([("ACTIVATION".into(), Elem::Dtype(dtype))]),
-            &Options::default(),
-        )
-        .unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
-        let inputbytes = input
-            .iter()
-            .flat_map(|v| {
-                if dtype == DType::BF16 {
-                    ((v.to_bits() >> 16) as u16).to_le_bytes()
-                } else {
-                    f16_bits(*v).to_le_bytes()
-                }
-            })
-            .collect::<Vec<_>>();
-        let x = device.buffer_from(&inputbytes).unwrap();
-        let out = device.buffer(16).unwrap();
-        kernel.execute(&[x, out.clone()], &[]).unwrap();
-        let mut bytes = [0; 16];
-        out.read(&mut bytes).unwrap();
-        for (b, e) in bytes.chunks_exact(4).zip(expected) {
-            assert_eq!(f32::from_le_bytes(b.try_into().unwrap()), e);
+        let elements = HashMap::from([("ACTIVATION".into(), Elem::Dtype(dtype))]);
+        let options = Options::default();
+        let mut space = Space::new(Specialization {
+            program: &program,
+            entry: "local",
+            backend: device.backend(),
+            shapes: &shapes,
+            elements: &elements,
+            options: &options,
+        });
+        let mut candidate_count = 0;
+        for attempt in space.by_ref() {
+            let lowered = attempt.result.unwrap();
+            candidate_count += 1;
+            let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+            let inputbytes = input
+                .iter()
+                .flat_map(|v| {
+                    if dtype == DType::BF16 {
+                        ((v.to_bits() >> 16) as u16).to_le_bytes()
+                    } else {
+                        f16_bits(*v).to_le_bytes()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let x = device.buffer_from(&inputbytes).unwrap();
+            let out = device.buffer(16).unwrap();
+            kernel.execute(&[x, out.clone()], &[]).unwrap();
+            let mut bytes = [0; 16];
+            out.read(&mut bytes).unwrap();
+            for (b, e) in bytes.chunks_exact(4).zip(expected) {
+                assert_eq!(f32::from_le_bytes(b.try_into().unwrap()), e);
+            }
         }
+        assert!(space.exhausted());
+        assert_eq!(
+            candidate_count, 2,
+            "materialized and recomputed compact publication"
+        );
     }
     let invalid = lower_specialized(
         &program,
@@ -107,7 +121,7 @@ fn cuda_generic_tile() {
         Device::cuda(0).unwrap(),
         Candidate::Cuda {
             options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
+                dispatch: seismic_realization::Dispatch::Sequential,
                 loads: seismic_realization::LoadStrategy::Materialize,
             },
             threads_per_block: 32,

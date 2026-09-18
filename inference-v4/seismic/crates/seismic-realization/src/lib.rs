@@ -3,10 +3,11 @@
 use seismic_lang::abi::ScalarParameter;
 pub mod execution;
 pub mod storage;
+pub mod memory;
 use cranelift_codegen::ir;
 pub use cranelift_codegen::isa::CallConv;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferSpec {
     pub parameter: String,
     pub plane: String,
@@ -88,3 +89,5 @@ pub struct ScalarPhase {
 }
 
 pub mod dispatch;
+
+pub mod graph;

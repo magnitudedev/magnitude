@@ -7,11 +7,14 @@ fn value_semantics_and_precision_boundaries() {
     use seismic_metal::{msl, runtime::Device};
     let device = Device::open().unwrap();
     let info = device.info();
+    for loads in [seismic_realization::LoadStrategy::Materialize,
+        seismic_realization::LoadStrategy::BorrowProvenReadOnly] {
     scalar_cases::exercise(
         |lowered, values, scalars| {
             let emitted = msl::emit_with(
                 lowered,
-                msl::Config {
+                seismic_metal::execution::Config {
+                    loads,
                     max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
                     max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
                     ..Default::default()
@@ -33,6 +36,7 @@ fn value_semantics_and_precision_boundaries() {
         },
         "metal",
     );
+    }
 }
 
 #[test]
@@ -77,7 +81,7 @@ fn standard_streaming_attention_matches_independent_reference() {
         |lowered, values, scalars| {
             let emitted = msl::emit_with(
                 lowered,
-                msl::Config {
+                seismic_metal::execution::Config {
                     max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
                     max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
                     ..Default::default()
@@ -111,7 +115,7 @@ fn runtime_stream_domains_and_piece_tails() {
         |lowered, values| {
             let emitted = msl::emit_with(
                 lowered,
-                msl::Config {
+                seismic_metal::execution::Config {
                     max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
                     max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
                     ..Default::default()
@@ -140,7 +144,6 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
         Scope,
     };
     use seismic_metal::{
-        msl,
         plan_exec::{compile_plan, Bindings},
         runtime::{Buffer, Device},
     };
@@ -170,7 +173,7 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
     .unwrap();
     let plan = seismic_lang::plan::plan(&p, "composition", &HashMap::new()).unwrap();
     let device = Device::open().unwrap();
-    let compiled = compile_plan(&device, &p, &plan, msl::Config::default()).unwrap();
+    let compiled = compile_plan(&device, &p, &plan, seismic_metal::execution::Config::default()).unwrap();
     let inputs = Inputs(HashMap::from([
         (
             "x".into(),
@@ -218,7 +221,7 @@ fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
 #[ignore = "requires a Metal device"]
 fn altered_domain_is_rejected_without_touching_backing_canaries() {
     use seismic_lang::{
-        hir::StmtKind,
+        ir::StmtKind,
         program::{compile, SourceFile},
         sym::Sym,
         Scope,

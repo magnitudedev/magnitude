@@ -2,8 +2,9 @@
 """V3 primitive-reference composition for a small four-block dense decoder."""
 import argparse,hashlib,json,sys
 from pathlib import Path
+from reference_source import activate
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--source',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--routed',action='store_true');a=p.parse_args()
-source=a.source.resolve(strict=True);sys.path.insert(0,str(source/'src'))
+source=a.source.resolve(strict=True);activate(source)
 import numpy as np
 from ops.tensor import ops
 from ops.tensor.primitive import round_reference

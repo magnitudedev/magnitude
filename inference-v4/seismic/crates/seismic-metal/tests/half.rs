@@ -11,7 +11,7 @@ fn all_half_values_and_rounding_boundaries() {
         |lowered, values| {
             let emitted = msl::emit_with(
                 lowered,
-                msl::Config {
+                seismic_metal::execution::Config {
                     max_threads_per_threadgroup: info.max_threads_per_threadgroup as i64,
                     max_threadgroup_bytes: info.max_threadgroup_bytes as i64,
                     ..Default::default()

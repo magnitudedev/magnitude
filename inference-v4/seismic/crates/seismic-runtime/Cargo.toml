@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 seismic-lang.workspace = true
+seismic-compiler.workspace = true
+seismic-accounting.workspace = true
 seismic-realization.workspace = true
 seismic-cpu.workspace = true
 seismic-cuda.workspace = true
@@ -14,6 +16,5 @@ seismic-cuda.workspace = true
 seismic-metal.workspace = true
 
 [dev-dependencies]
-seismic-accounting.workspace = true
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"

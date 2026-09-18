@@ -2,7 +2,7 @@
 //! its midpoint and the immediately neighboring f32 values. This does not repeat
 //! the compiler's bit-conversion algorithm.
 use seismic_lang::{
-    lower::Lowered,
+    lowered_ir::LoweredIr,
     program::{compile, SourceFile},
     Scope,
 };
@@ -23,7 +23,7 @@ fn half_value(bits: u16) -> f32 {
         sign * (1.0 + f32::from(fraction) / 1024.0) * 2.0f32.powi(i32::from(exp) - 15)
     }
 }
-pub fn exercise(mut run: impl FnMut(&Lowered, &mut [Vec<u8>]), backend: &str) {
+pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) {
     let text="fn encode[N](x: tensor[N] f32, out: tensor[N] f16):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n\nfn decode[N](x: tensor[N] f16, out: tensor[N] f32):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n";
     let program = compile(
         &[SourceFile {

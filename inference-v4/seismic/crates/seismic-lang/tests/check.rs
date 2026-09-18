@@ -187,3 +187,22 @@ fn output_proof_does_not_initialize_partial_or_aliased_inputs() {
     let partial="fn fill[N](out: tile[N] f32):\n  for i in owned(out): out[i] = 1.0\n\nfn entry(out: tensor[4] f32):\n  t = tile[4] f32\n  fill(t[0:2])\n  store(t,out)\n";
     assert_error(&[file("partial.seismic.portable", partial)], "read before");
 }
+
+#[test]
+fn fragment_store_initializes_only_a_complete_definite_tile() {
+    let probe = |extent: usize, write: &str| format!(
+        "fn probe(x: tile[8,8] f32, enabled: bool):\n  tmp = tile[{extent},8] f32\n  a = simdgroup_matrix(f32)\n  simdgroup_load(a,x,0,0)\n{write}\n  b = simdgroup_matrix(f32)\n  simdgroup_load(b,tmp,0,0)\n"
+    );
+    let full = probe(8, "  simdgroup_store(a,tmp,0,0)");
+    let es = errors(&[file("write.seismic.metal", &full)], &["metal"]);
+    assert!(es.is_empty(), "{es:?}");
+    let partial = probe(16, "  simdgroup_store(a,tmp,0,0)");
+    assert_error(&[file("partial.seismic.metal", &partial)], "read before");
+    let conditional = probe(8, "  if enabled:\n    simdgroup_store(a,tmp,0,0)");
+    assert_error(&[file("conditional.seismic.metal", &conditional)], "read before");
+    let both = probe(8, "  if enabled:\n    simdgroup_store(a,tmp,0,0)\n  else:\n    simdgroup_store(a,tmp,0,0)");
+    let es = errors(&[file("both.seismic.metal", &both)], &["metal"]);
+    assert!(es.is_empty(), "{es:?}");
+    let invalid = probe(8, "  simdgroup_store(a,tmp,1,0)");
+    assert_error(&[file("bounds.seismic.metal", &invalid)], "block may exceed");
+}

@@ -1,7 +1,10 @@
 //! Native resource ownership and invocation. Numerical work stays in compiled
 //! Seismic. Candidates are explicit until accounting can justify selection.
 pub mod plan;
-use seismic_lang::{abi::ScalarParameter, lower::Lowered};
+pub mod execution;
+pub mod tuner;
+pub mod choices;
+use seismic_lang::{abi::ScalarParameter, lowered_ir::LoweredIr};
 use seismic_realization::{BufferSpec, LoadStrategy, ScalarOptions};
 use std::rc::Rc;
 
@@ -12,7 +15,7 @@ enum BackendDevice {
     Metal(Rc<seismic_metal::runtime::Device>),
 }
 pub struct Device(BackendDevice);
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceFacts {
     Cpu {
         architecture: &'static str,
@@ -45,7 +48,7 @@ pub enum Candidate {
         threads_per_block: u32,
     },
     #[cfg(target_os = "macos")]
-    Metal(seismic_metal::msl::Config),
+    Metal(seismic_metal::execution::Config),
 }
 enum Executable {
     Cpu(Box<seismic_cpu::Kernel>),
@@ -129,51 +132,44 @@ impl Device {
         buffer.write(bytes)?;
         Ok(buffer)
     }
-    pub fn compile(&self, lowered: &Lowered, candidate: Candidate) -> Result<Kernel, String> {
-        if lowered.backend != self.backend() {
-            return Err("lowered program and execution backend differ".into());
+    pub fn compile_tuned(&self, tuned: tuner::TunedIr) -> Result<Kernel, String> {
+        if &self.facts() != tuned.hardware() {
+            return Err("tuned execution targets different hardware facts".into());
         }
-        let (executable, buffers, scalars) = match (&self.0, candidate) {
-            (BackendDevice::Cpu, Candidate::Cpu { loads }) => {
-                let kernel = seismic_cpu::compile_candidate(lowered, loads)?;
+        self.compile_execution(tuned.into_execution())
+    }
+    pub fn compile(&self, lowered: &LoweredIr, candidate: Candidate) -> Result<Kernel, String> {
+        let execution = execution::Execution::prepare(lowered, candidate, &self.facts())?;
+        self.compile_execution(execution)
+    }
+    /// Native compilation consumes a prepared execution. It cannot select or
+    /// replace a candidate by re-running lowering or preparation.
+    pub fn compile_execution(&self, execution: execution::Execution) -> Result<Kernel, String> {
+        use execution::Execution;
+        let (executable, buffers, scalars) = match (&self.0, execution) {
+            (BackendDevice::Cpu, Execution::Cpu(program)) => {
+                let kernel = seismic_cpu::compile_execution(program)?;
                 let buffers = kernel.buffers().to_vec();
                 let scalars = kernel.scalars().to_vec();
                 (Executable::Cpu(Box::new(kernel)), buffers, scalars)
             }
-            (
-                BackendDevice::Cuda(device),
-                Candidate::Cuda {
-                    options,
-                    threads_per_block,
-                },
-            ) => {
-                let kernel = device.compile_sequence(lowered, options, threads_per_block)?;
+            (BackendDevice::Cuda(device), Execution::Cuda(phases)) => {
+                let kernel = device.compile_executions(phases)?;
                 let buffers = kernel.buffers().to_vec();
                 let scalars = kernel.scalars().to_vec();
                 (Executable::Cuda(Box::new(kernel)), buffers, scalars)
             }
             #[cfg(target_os = "macos")]
-            (BackendDevice::Metal(device), Candidate::Metal(config)) => {
-                let emitted = seismic_metal::msl::emit_with(lowered, config)?;
+            (BackendDevice::Metal(device), Execution::Metal(execution)) => {
+                let emitted = seismic_metal::msl::emit_execution(&execution)?;
                 let buffers = emitted.buffers.clone();
                 let scalars = emitted.scalars.clone();
                 let pipeline = device.compile(emitted)?;
-                (
-                    Executable::Metal {
-                        device: device.clone(),
-                        pipeline: Box::new(pipeline),
-                    },
-                    buffers,
-                    scalars,
-                )
+                (Executable::Metal { device: device.clone(), pipeline: Box::new(pipeline) }, buffers, scalars)
             }
-            _ => return Err("realization candidate and device backend differ".into()),
+            _ => return Err("selected execution and device backend differ".into()),
         };
-        Ok(Kernel {
-            executable,
-            buffers,
-            scalars,
-        })
+        Ok(Kernel { executable, buffers, scalars })
     }
 }
 impl Buffer {

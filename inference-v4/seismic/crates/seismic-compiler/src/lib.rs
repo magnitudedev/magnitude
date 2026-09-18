@@ -3,14 +3,14 @@
 mod scalar;
 use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use seismic_lang::lower::Lowered;
+use seismic_lang::lowered_ir::LoweredIr;
 use seismic_realization::{CallConv, Dispatch, LoadStrategy, ScalarOptions, ScalarProgram};
 
-pub fn scalar(lowered: &Lowered, call_conv: CallConv) -> Result<ScalarProgram, String> {
+pub fn scalar(lowered: &LoweredIr, call_conv: CallConv) -> Result<ScalarProgram, String> {
     scalar_with(lowered, call_conv, Dispatch::Sequential)
 }
 pub fn scalar_with(
-    lowered: &Lowered,
+    lowered: &LoweredIr,
     call_conv: CallConv,
     dispatch: Dispatch,
 ) -> Result<ScalarProgram, String> {
@@ -24,11 +24,19 @@ pub fn scalar_with(
     )
 }
 pub fn scalar_candidate(
-    lowered: &Lowered,
+    lowered: &LoweredIr,
     call_conv: CallConv,
     options: ScalarOptions,
 ) -> Result<ScalarProgram, String> {
     let ScalarOptions { dispatch, loads } = options;
+    let mut normalized = lowered.clone();
+    if dispatch == Dispatch::ParallelRoot {
+        seismic_lang::normalize::work_domain(&mut normalized.body);
+    }
+    seismic_lang::normalize::bind_values(&mut normalized.body, &mut normalized.vars);
+    seismic_lang::normalize::select_loads(&mut normalized.body, loads == LoadStrategy::BorrowProvenReadOnly);
+    seismic_lang::normalize::identify(&mut normalized.body, &mut 0);
+    let lowered = &normalized;
     let mut function = ir::Function::new();
     function.signature.call_conv = call_conv;
     for _ in 0..3 {
@@ -44,7 +52,7 @@ pub fn scalar_candidate(
     builder.switch_to_block(entry);
     builder.append_block_params_for_function_params(entry);
     let args = builder.block_params(entry).to_vec();
-    let mut emitter = scalar::Emitter::new(lowered, builder, args[0], args[1], args[2], loads)?;
+    let mut emitter = scalar::Emitter::new(lowered, builder, args[0], args[1], args[2])?;
     let work_items = match dispatch {
         Dispatch::Sequential => {
             emitter.body(&lowered.body)?;
@@ -88,7 +96,7 @@ pub fn scalar_candidate(
 /// Local storage crossing domains requires a different realization and is rejected
 /// by each phase's ordinary binding validation; no kernel-source rewrite is needed.
 pub fn scalar_sequence(
-    lowered: &Lowered,
+    lowered: &LoweredIr,
     call_conv: CallConv,
     options: ScalarOptions,
 ) -> Result<seismic_realization::ScalarSequence, String> {
@@ -102,12 +110,12 @@ pub fn scalar_sequence(
             }],
         });
     }
-    if lowered.body.is_empty() {
-        return Err("parallel sequence has no domains".into());
-    }
+    let mut normalized = lowered.clone();
+    seismic_lang::normalize::work_domain(&mut normalized.body);
+    let lowered = &normalized;
     let mut phases = Vec::new();
     for (source_statement, statement) in lowered.body.iter().enumerate() {
-        if !matches!(statement.kind, seismic_lang::hir::StmtKind::Parallel { .. }) {
+        if !matches!(statement.kind, seismic_lang::ir::StmtKind::Parallel { .. }) {
             return Err(format!("{}: statement {source_statement} needs cross-phase storage/control lowering; expected an outer parallel domain",lowered.name));
         }
         let mut phase = lowered.clone();

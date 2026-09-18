@@ -5,6 +5,26 @@ Goal created 2026-09-17 09:57:51 UTC. Requested minimum work interval ends
 requires the master specification's gates. Work autonomously across sessions.
 Local commits are authorized infrequently at verified milestones. Never push.
 
+## Current governing direction — compiler closure
+
+The active replacement goal is Appendix A of the master specification: qualify the
+complete program-to-tuned-executable compiler boundary before resuming model-kernel
+performance tuning. Historical engine work below is evidence, not the current work
+order. Manual kernel/candidate performance experiments are frozen.
+
+The user prohibits further commits. Keep all further work local and uncommitted;
+no staging, commits or pushes. Earlier permissions below are historical and revoked.
+The 24 implementation commits after `wip kernel tooling` were squashed at the user's
+request into a single commit named `wip compiler engine`; no content was discarded.
+
+Initial boundary audit confirms that the shared realization currently describes
+Cranelift scalar programs, while Metal emits from a separate representation. Intrinsic
+contracts contain signatures and limited write effects but lack execution-resource,
+participation and synchronization contracts; CPU/CUDA intrinsic tables are empty.
+The prediction API accepts separately supplied service mappings and free-text evidence,
+not an emission-derived execution model or independently verified proof. These are
+foundational integration gaps, not requests to tune model kernels.
+
 ## Starting point
 
 - Repository reference: `d3c11098` (`wip kernel tooling`); initial working tree clean.
@@ -642,3 +662,17 @@ foundation milestone or describe it as full completion.
   ~61ms host/~58ms GPU. Evidence: decoder-35b-gguf-integration.json. Pinned V3
   dense-BF16-history comparison is running separately (session37771); do not claim
   numerical/performance parity before its results are analyzed.
+
+## Mechanically checked lower-bound specification
+
+- Added [the lower-bound specification](../../specs/26-09-17/seismic-sound-lower-bounds.md).
+  Necessary demand and capacity claims must enter proofs through checked rules and
+  explicit hardware contracts; explanation strings cannot establish authority.
+- The sequence is checker/trust boundary, required-transfer derivation, alternatives
+  and composition, real-hardware applicability, then certified pruning/selection.
+  The spec covers aliases, residency, packed representations, exact arithmetic,
+  conditional claims, proof replay and independent adversarial validation.
+- This checkpoint is documentation only. It implements no bound derivation and
+  closes no numerical, hardware-model or optimizer qualification gate. Local links,
+  Markdown fences/whitespace and design applicability were checked; no new runtime
+  test results are claimed.

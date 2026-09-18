@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from reference_source import activate
 import sys
 
 parser=argparse.ArgumentParser(description=__doc__)
@@ -11,7 +12,7 @@ parser.add_argument('--source',type=Path,required=True)
 parser.add_argument('--output',type=Path,required=True)
 args=parser.parse_args()
 source=args.source.resolve(strict=True)
-sys.path.insert(0,str(source/'src'))
+activate(source)
 import numpy as np
 from ops.tensor import ops
 from ops.tensor.primitive import round_reference

@@ -2,40 +2,13 @@
 //! construct call by the selected `lower` block (or the construct's portable body)
 //! until only primitives and intrinsics remain.
 
-use crate::hir::*;
+use crate::ir::*;
+use crate::lowered_ir::*;
 use crate::program::Program;
 use crate::sym::{Atom, Sym};
 use crate::types::{Elem, Shaped, Ty};
 use std::collections::HashMap;
-
-/// A function after inlining for one backend and one shape binding.
-#[derive(Clone, Debug)]
-pub struct Lowered {
-    pub name: String,
-    pub backend: String,
-    pub params: Vec<(String, Ty)>,
-    pub index_params: Vec<(String, Sym)>,
-    pub vars: Vec<Var>,
-    pub body: Vec<Stmt>,
-    /// Shape parameters and their concrete values.
-    pub shapes: HashMap<String, i64>,
-    /// Which lowering block was chosen for each call site, for inspection and the tuning cache.
-    pub selections: Vec<Selection>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Selection {
-    pub construct: String,
-    pub shape_args: Vec<i64>,
-    pub choice: Choice,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Choice {
-    /// Index into the construct's blocks for this backend, in file order.
-    Block(usize),
-    Portable,
-}
+pub mod alternatives;
 
 /// Sizes the model will close; explicit for now.
 #[derive(Clone, Debug, Default)]
@@ -45,21 +18,46 @@ pub struct Options {
     pub piece: Option<i64>,
 }
 
-pub fn lower(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>) -> Result<Lowered, String> {
+pub fn lower(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>) -> Result<LoweredIr, String> {
     lower_with(program, name, backend, shapes, &Options::default())
 }
 
-pub fn lower_with(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>, opts: &Options) -> Result<Lowered, String> {
+pub fn lower_with(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>, opts: &Options) -> Result<LoweredIr, String> {
     lower_specialized(program, name, backend, shapes, &HashMap::new(), opts)
 }
 
 /// Bind entry element parameters as well as shapes before choosing lowerings.
-pub fn lower_specialized(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>, opts: &Options) -> Result<Lowered, String> {
+pub fn lower_specialized(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>, opts: &Options) -> Result<LoweredIr, String> {
+    lower_selected(program, name, backend, shapes, elements, opts, &mut |decision| {
+        // Deterministic diagnostic baseline only. It makes no optimality claim.
+        decision.alternatives.first().cloned().ok_or_else(||
+            format!("empty decision domain on `{backend}`: {:?}", decision.kind))
+    })
+}
+
+/// Expand only choices made by the caller, after checking their applicability.
+/// Every construct decision is exposed, including singleton domains and portable
+/// alternatives. An invalid choice fails; there is no silent preferred fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_selected(
+    program: &Program, name: &str, backend: &str,
+    shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>, opts: &Options,
+    select: &mut dyn FnMut(&Decision) -> Result<Alternative, String>,
+) -> Result<LoweredIr, String> {
     if opts.piece.is_some_and(|capacity| capacity <= 0) {
         return Err("stream piece capacity must be positive".into());
     }
     let f = program.functions.iter().find(|f| f.name == name).ok_or_else(|| format!("no function `{name}`"))?;
-    let mut ctx = Inliner { program, backend, selections: Vec::new(), counter: 0, opts: opts.clone(), piece_values: HashMap::new(), elements: elements.clone() };
+    let mut decisions = Vec::new();
+    let mut recording = |domain: &Decision| {
+        let selected = select(domain)?;
+        if !domain.alternatives.contains(&selected) {
+            return Err(format!("selected alternative {selected:?} is not applicable to {:?}", domain.kind));
+        }
+        decisions.push(DecisionRecord { domain: domain.clone(), selected: selected.clone() });
+        Ok(selected)
+    };
+    let mut ctx = Inliner { program, backend, select: &mut recording, selections: Vec::new(), counter: 0, opts: opts.clone(), piece_values: HashMap::new(), elements: elements.clone() };
     let env: HashMap<String, Sym> = shapes.iter().map(|(k, v)| (k.clone(), Sym::constant(*v))).collect();
     for p in &f.shape_params {
         if !shapes.contains_key(p) {
@@ -68,10 +66,11 @@ pub fn lower_specialized(program: &Program, name: &str, backend: &str, shapes: &
     }
     crate::program::validate_element_bindings(f, elements)?;
     let mut vars: Vec<Var> = f.vars.iter().map(|v| Var { ty: subst_elem_ty(&subst_ty(&v.ty, &env), elements), ..v.clone() }).collect();
-    let body = ctx.inline_block(&f.body, &env, &HashMap::new(), &mut vars, &mut HashMap::new(), 0)?;
+    let mut body = ctx.inline_block(&f.body, &env, &HashMap::new(), &mut vars, &mut HashMap::new(), 0)?;
+    select_producers(&mut body, &vars, ctx.select)?;
     let params = f.params.iter().map(|(n, t)| (n.clone(), subst_elem_ty(&subst_ty(t, &env), elements))).collect();
     let index_params = f.index_params.iter().map(|(name,bound)| (name.clone(), subst_sym(bound,&env,&HashMap::new()))).collect();
-    Ok(Lowered { name: name.to_string(), backend: backend.to_string(), params, index_params, vars, body, shapes: shapes.clone(), selections: ctx.selections })
+    Ok(LoweredIr { name: name.to_string(), backend: backend.to_string(), params, index_params, vars, body, shapes: shapes.clone(), selections: ctx.selections, decisions })
 }
 
 /// A slice cannot exceed its parent axis. Follow that structural bound rather
@@ -101,6 +100,7 @@ fn view_axis_capacity(view: &Expr, axis: usize) -> Result<i64, String> {
 struct Inliner<'a> {
     program: &'a Program,
     backend: &'a str,
+    select: &'a mut dyn FnMut(&Decision) -> Result<Alternative, String>,
     selections: Vec<Selection>,
     counter: usize,
     opts: Options,
@@ -123,7 +123,6 @@ impl<'a> Inliner<'a> {
         for s in stmts {
             out.extend(self.inline_stmt(s, env, vmap, vars, atom_map, depth)?);
         }
-        inline_elementwise_producers(&mut out, vars);
         Ok(out)
     }
 
@@ -177,6 +176,7 @@ impl<'a> Inliner<'a> {
                     vars[*v].ty = subst_ty(&vars[*v].ty, &inner_env);
                 }
                 StmtKind::LoadLoop {
+                    modes: None,
                     vars: new_vars,
                     views,
                     axis: *axis,
@@ -220,7 +220,7 @@ impl<'a> Inliner<'a> {
                 StmtKind::Expr(self.inline_expr(e, env, vmap, vars, atom_map)?)
             }
         };
-        Ok(vec![Stmt { kind, span }])
+        Ok(vec![Stmt { id: None, kind, span }])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -274,24 +274,37 @@ impl<'a> Inliner<'a> {
                 });
                 elems_ok && residual_ok
             };
-            // Specialized blocks first, then general bodies, then portable.
-            let mut chosen: Option<(usize, &Lowering)> = None;
-            for (i, l) in blocks.iter().enumerate() {
-                if l.body.is_empty() && l.residual.is_empty() && l.elem_bindings.is_empty() {
-                    continue; // portable line
-                }
-                if applicable(l) && (chosen.is_none() || (!l.elem_bindings.is_empty() && chosen.unwrap().1.elem_bindings.is_empty())) {
-                    chosen = Some((i, l));
+            let mut alternatives = Vec::new();
+            let mut portable = false;
+            for (i, block) in blocks.iter().enumerate() {
+                if block.body.is_empty() && block.residual.is_empty() && block.elem_bindings.is_empty() {
+                    portable = true;
+                } else if applicable(block) {
+                    alternatives.push(Alternative::Body(Choice::Block(i)));
                 }
             }
-            match chosen {
-                Some((i, l)) => (l.body.clone(), l.vars.clone(), Choice::Block(i)),
-                None => {
-                    if !blocks.iter().any(|l| l.body.is_empty()) {
-                        return Err(format!("no lowering of `{callee}` on `{}` applies to shapes {:?} and elements {:?}", self.backend, concrete, elem_args));
-                    }
-                    (f.body.clone(), f.vars.clone(), Choice::Portable)
-                }
+            if portable {
+                alternatives.push(Alternative::Body(Choice::Portable));
+            }
+            let decision = Decision {
+                kind: DecisionKind::Construct {
+                    name: callee.to_string(),
+                    shape_args: f.shape_params.iter().map(|p| inner_env[p].clone()).collect(),
+                    element_args: elem_args.to_vec(),
+                },
+                alternatives,
+            };
+            if decision.alternatives.is_empty() {
+                return Err(format!("no lowering of `{callee}` on `{}` applies to shapes {:?} and elements {:?}", self.backend, concrete, elem_args));
+            }
+            let choice = (self.select)(&decision)?;
+            if !decision.alternatives.contains(&choice) {
+                return Err(format!("selected lowering {choice:?} is not applicable to `{callee}`; legal alternatives: {:?}", decision.alternatives));
+            }
+            match choice {
+                Alternative::Body(Choice::Block(i)) => (blocks[i].body.clone(), blocks[i].vars.clone(), Choice::Block(i)),
+                Alternative::Body(Choice::Portable) => (f.body.clone(), f.vars.clone(), Choice::Portable),
+                _ => unreachable!("validated construct domain"),
             }
         } else {
             (f.body.clone(), f.vars.clone(), Choice::Portable)
@@ -343,6 +356,7 @@ impl<'a> Inliner<'a> {
         let span = e.span;
         let mut sub = |x: &Expr, this: &mut Self| this.inline_expr(x, env, vmap, vars, atom_map);
         let kind = match &e.kind {
+            ExprKind::Load { .. } => return Err("selected execution loads cannot appear in lowering definitions".into()),
             ExprKind::Var(id) => {
                 if let Some(bound) = vmap.get(id) {
                     let mut b = bound.clone();
@@ -406,7 +420,7 @@ impl<'a> Inliner<'a> {
                 ExprKind::Builtin{name:*name,args}
             },
             ExprKind::Call { .. } => return Err("a call in expression position cannot be inlined; calls are statements".into()),
-            ExprKind::Intrinsic { name, args } => ExprKind::Intrinsic { name: name.clone(), args: args.iter().map(|a| self.inline_expr(a, env, vmap, vars, atom_map)).collect::<Result<_, _>>()? },
+            ExprKind::Intrinsic { op: name, args } => ExprKind::Intrinsic { op: *name, args: args.iter().map(|a| self.inline_expr(a, env, vmap, vars, atom_map)).collect::<Result<_, _>>()? },
             ExprKind::Unary { op, expr } => ExprKind::Unary { op: *op, expr: Box::new(sub(expr, self)?) },
             ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary { op: *op, lhs: Box::new(sub(lhs, self)?), rhs: Box::new(sub(rhs, self)?) },
             ExprKind::Cast { dtype, expr } => ExprKind::Cast { dtype: *dtype, expr: Box::new(sub(expr, self)?) },
@@ -519,10 +533,24 @@ fn subst_elem_ty(t: &Ty, elems: &HashMap<String, Elem>) -> Ty {
     }
 }
 
-/// Canonicalization: a tile defined by one elementwise `owned` loop and consumed only through
-/// element reads is not materialized; its expression is recomputed at every read. This is
-/// how elementwise work folds into the construct that consumes it.
-fn inline_elementwise_producers(block: &mut Vec<Stmt>, vars: &[Var]) {
+/// Select legal producer materialization after expansion is complete. A producer
+/// is offered once; nested expansion cannot override a previous retention decision.
+fn select_producers(
+    block: &mut Vec<Stmt>, vars: &[Var],
+    select: &mut dyn FnMut(&Decision) -> Result<Alternative, String>,
+) -> Result<(), String> {
+    for statement in block.iter_mut() {
+        match &mut statement.kind {
+            StmtKind::Parallel { body, .. } | StmtKind::Range { body, .. }
+            | StmtKind::Owned { body, .. } | StmtKind::Lanes { body, .. }
+            | StmtKind::LoadLoop { body, .. } => select_producers(body, vars, select)?,
+            StmtKind::If { then: then_body, els: else_body, .. } => {
+                select_producers(then_body, vars, select)?;
+                select_producers(else_body, vars, select)?;
+            }
+            _ => {}
+        }
+    }
     // Only a tile allocated in this block can be removed here. A write to a
     // loop-carried or enclosing tile escapes this block even without a local read.
     let allocated: std::collections::HashSet<VarId> = block.iter().filter_map(|s| match &s.kind {
@@ -560,7 +588,7 @@ fn inline_elementwise_producers(block: &mut Vec<Stmt>, vars: &[Var]) {
         }
     }
     if producers.is_empty() {
-        return;
+        return Ok(());
     }
     // Keep only producers whose every other use is an element read.
     let mut other_uses: HashMap<VarId, usize> = HashMap::new();
@@ -569,7 +597,24 @@ fn inline_elementwise_producers(block: &mut Vec<Stmt>, vars: &[Var]) {
     }
     producers.retain(|a, _| other_uses.get(a).copied().unwrap_or(0) == 0);
     if producers.is_empty() {
-        return;
+        return Ok(());
+    }
+    // Sort by the source variable identity; HashMap iteration must never affect
+    // replay, candidate identity, or coverage of independent decisions.
+    let mut candidates: Vec<_> = producers.keys().copied().collect();
+    candidates.sort_unstable();
+    for variable in candidates {
+        let decision = Decision {
+            kind: DecisionKind::Producer {
+                variable, name: vars[variable].name.clone(), ty: vars[variable].ty.clone(),
+            },
+            alternatives: vec![Alternative::Materialize, Alternative::Recompute],
+        };
+        match select(&decision)? {
+            Alternative::Materialize => { producers.remove(&variable); }
+            Alternative::Recompute => {}
+            other => return Err(format!("invalid producer alternative {other:?}")),
+        }
     }
     // Drop their definitions and rewrite the reads.
     block.retain(|s| match &s.kind {
@@ -580,6 +625,7 @@ fn inline_elementwise_producers(block: &mut Vec<Stmt>, vars: &[Var]) {
     for s in block.iter_mut() {
         rewrite_reads_stmt(s, &producers, vars);
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -886,7 +932,7 @@ fn subst_vars(e: &Expr, map: &HashMap<VarId, Expr>, atoms: &HashMap<String, Opti
         ExprKind::Accessor { base, name } => ExprKind::Accessor { base: Box::new(sub(base)), name: name.clone() },
         ExprKind::Lanes { base, extent } => ExprKind::Lanes { base: Box::new(sub(base)), extent: extent.clone() },
         ExprKind::Builtin { name, args } => ExprKind::Builtin { name: *name, args: args.iter().map(sub).collect() },
-        ExprKind::Intrinsic { name, args } => ExprKind::Intrinsic { name: name.clone(), args: args.iter().map(sub).collect() },
+        ExprKind::Intrinsic { op: name, args } => ExprKind::Intrinsic { op: *name, args: args.iter().map(sub).collect() },
         ExprKind::Call { callee, shape_args, elem_args, args } => ExprKind::Call { callee: callee.clone(), shape_args: shape_args.clone(), elem_args: elem_args.clone(), args: args.iter().map(sub).collect() },
         ExprKind::Tuple(items) => ExprKind::Tuple(items.iter().map(sub).collect()),
         ExprKind::Unary { op, expr } => ExprKind::Unary { op: *op, expr: Box::new(sub(expr)) },

@@ -3,7 +3,7 @@ use seismic_accounting::{
     work::{self, WorkKind},
 };
 use seismic_lang::{
-    hir::Builtin,
+    ir::Builtin,
     program::{collect_files, compile, SourceFile},
     types::DType,
     Scope,
@@ -158,7 +158,7 @@ fn reduction_account_retains_order_permission() {
             .find(|t| matches!(t.kind, WorkKind::Reduction { .. }))
             .unwrap();
         assert!(
-            matches!(term.kind,WorkKind::Reduction{ordered:permission,extent:Count::Exact(65),..} if permission==ordered)
+            matches!(term.kind,WorkKind::Reduction{contract,extent:Count::Exact(65),..} if contract.ordered==ordered)
         );
     }
 }
@@ -166,9 +166,92 @@ fn reduction_account_retains_order_permission() {
 #[test]
 fn generic_local_publication_counts_rounding_and_widening() {
     let program = compile(&[SourceFile {path:"local.seismic.portable".into(),scope:Scope::Portable,text:"fn local[N](x: tensor[N] ACTIVATION, out: tensor[N] f32):\n  a = load(x)\n  compact = tile[N] ACTIVATION\n  for i in owned(compact): compact[i] = f32(a[i]) * 1.003\n  y = tile[N] f32\n  for i in owned(y): y[i] = f32(compact[i]) * 1031.0\n  store(y,out)\n".into()}],&[]).unwrap();
-    let account = work::derive_specialized(&program,"local",&HashMap::from([("N".into(),4)]),&HashMap::from([("ACTIVATION".into(),seismic_lang::types::Elem::Dtype(DType::BF16))])).unwrap();
+    let account = work::derive_specialized(
+        &program,
+        "local",
+        &HashMap::from([("N".into(), 4)]),
+        &HashMap::from([(
+            "ACTIVATION".into(),
+            seismic_lang::types::Elem::Dtype(DType::BF16),
+        )]),
+    )
+    .unwrap();
     assert!(account.is_exact());
-    let count=|from,to|account.terms.iter().filter(|t|t.kind==WorkKind::Conversion{from,to}).fold(Count::Exact(0),|n,t|n.add(&t.count));
-    assert_eq!(count(DType::F32,DType::BF16),Count::Exact(4));
-    assert_eq!(count(DType::BF16,DType::F32),Count::Exact(8));
+    let count = |from, to| {
+        account
+            .terms
+            .iter()
+            .filter(|t| t.kind == WorkKind::Conversion { from, to })
+            .fold(Count::Exact(0), |n, t| n.add(&t.count))
+    };
+    assert_eq!(count(DType::F32, DType::BF16), Count::Exact(4));
+    assert_eq!(count(DType::BF16, DType::F32), Count::Exact(8));
+}
+
+#[test]
+fn reduction_accounts_retain_numerical_publication_and_output_type() {
+    use seismic_lang::reduction::{Combination, Identity};
+    for (dtype, operation, combination, identity, output) in [
+        (
+            "i32",
+            "sum",
+            Combination::SaturatingAdd,
+            Identity::Zero,
+            DType::I32,
+        ),
+        (
+            "u32",
+            "min",
+            Combination::Minimum,
+            Identity::MaxU32,
+            DType::U32,
+        ),
+        (
+            "bool",
+            "max",
+            Combination::LogicalOr,
+            Identity::Zero,
+            DType::Bool,
+        ),
+        (
+            "bool",
+            "min",
+            Combination::LogicalAnd,
+            Identity::One,
+            DType::Bool,
+        ),
+        (
+            "bf16",
+            "sum",
+            Combination::FloatingAdd,
+            Identity::Zero,
+            DType::BF16,
+        ),
+        (
+            "f32",
+            "argmax",
+            Combination::FirstMaximum,
+            Identity::NegativeInfinity,
+            DType::I32,
+        ),
+    ] {
+        let program = compile(&[SourceFile {
+            path: "contract.seismic.portable".into(), scope: Scope::Portable,
+            text: format!("fn evaluate(x: tensor[65] {dtype}):\n  a = load(x)\n  value = reduce(a,0,{operation})\n"),
+        }], &[]).unwrap();
+        let account = work::derive(&program, "evaluate", &HashMap::new()).unwrap();
+        let term = account
+            .terms
+            .iter()
+            .find(|t| matches!(t.kind, WorkKind::Reduction { .. }))
+            .unwrap();
+        let WorkKind::Reduction { contract, extent } = &term.kind else {
+            unreachable!()
+        };
+        assert_eq!(*extent, Count::Exact(65));
+        assert_eq!(contract.combination(), combination);
+        assert_eq!(contract.identity(), identity);
+        assert_eq!(contract.output(), output);
+        assert_eq!(contract.allows_empty_axis(), operation != "argmax");
+    }
 }

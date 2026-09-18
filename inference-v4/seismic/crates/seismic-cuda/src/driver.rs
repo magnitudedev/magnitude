@@ -51,6 +51,10 @@ driver! {
     download: unsafe extern "system" fn(*mut c_void,u64,usize)->ResultCode => "cuMemcpyDtoH_v2",
     memset: unsafe extern "system" fn(u64,u8,usize)->ResultCode => "cuMemsetD8_v2",
     module_load: unsafe extern "system" fn(*mut Handle,*const c_void,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuModuleLoadDataEx",
+    link_create: unsafe extern "system" fn(c_uint,*mut c_int,*mut *mut c_void,*mut Handle)->ResultCode => "cuLinkCreate_v2",
+    link_add_data: unsafe extern "system" fn(Handle,c_int,*mut c_void,usize,*const c_char,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuLinkAddData_v2",
+    link_complete: unsafe extern "system" fn(Handle,*mut *mut c_void,*mut usize)->ResultCode => "cuLinkComplete",
+    link_destroy: unsafe extern "system" fn(Handle)->ResultCode => "cuLinkDestroy",
     module_unload: unsafe extern "system" fn(Handle)->ResultCode => "cuModuleUnload",
     module_function: unsafe extern "system" fn(*mut Handle,Handle,*const c_char)->ResultCode => "cuModuleGetFunction",
     function_attribute: unsafe extern "system" fn(*mut c_int,c_int,Handle)->ResultCode => "cuFuncGetAttribute",
@@ -270,4 +274,108 @@ impl Drop for Event {
             }
         }
     }
+}
+
+/// Retains JIT log buffers until the link state is destroyed. The driver owns the
+/// completed cubin until destruction; callers receive an owned byte-for-byte copy.
+struct Linker {
+    raw: Handle,
+    context: Rc<Context>,
+    info: Vec<u8>,
+    error: Vec<u8>,
+}
+impl Drop for Linker {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            unsafe {
+                (self.context.driver.link_destroy)(self.raw);
+            }
+        }
+    }
+}
+
+pub(crate) fn compile_image(
+    context: &Rc<Context>,
+    source: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let _current = context.enter()?;
+    let driver = &context.driver;
+    let mut info = vec![0u8; 16384];
+    let mut error = vec![0u8; 16384];
+    // CUDA driver ABI: INFO_LOG_BUFFER/SIZE, ERROR_LOG_BUFFER/SIZE,
+    // TARGET_FROM_CUCONTEXT and LOG_VERBOSE. No resource cap or fallback policy.
+    let mut options = [3, 4, 5, 6, 8, 12];
+    let mut values = [
+        info.as_mut_ptr().cast(),
+        info.len() as *mut c_void,
+        error.as_mut_ptr().cast(),
+        error.len() as *mut c_void,
+        std::ptr::null_mut(),
+        std::ptr::without_provenance_mut::<c_void>(1),
+    ];
+    let mut raw = std::ptr::null_mut();
+    unsafe {
+        driver.check(
+            (driver.link_create)(
+                options.len() as u32,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+                &mut raw,
+            ),
+            "JIT link creation",
+        )?;
+    }
+    let linker = Linker {
+        raw,
+        context: context.clone(),
+        info,
+        error,
+    };
+    let mut input = std::ffi::CString::new(source)
+        .map_err(|_| "PTX contains NUL")?
+        .into_bytes_with_nul();
+    let status = unsafe {
+        (driver.link_add_data)(
+            linker.raw,
+            1,
+            input.as_mut_ptr().cast(),
+            input.len(),
+            c"seismic.ptx".as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    let check = |status, operation| {
+        driver.check(status, operation).map_err(|error| {
+            let end = linker
+                .error
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(linker.error.len());
+            format!("{error}\n{}", String::from_utf8_lossy(&linker.error[..end]))
+        })
+    };
+    check(status, "PTX compilation")?;
+    let mut image = std::ptr::null_mut();
+    let mut size = 0;
+    check(
+        unsafe { (driver.link_complete)(linker.raw, &mut image, &mut size) },
+        "native image linking",
+    )?;
+    if image.is_null() || size == 0 || size > isize::MAX as usize {
+        return Err("driver returned an invalid native image".into());
+    }
+    // cuLinkComplete's image remains valid until cuLinkDestroy. Copy before the
+    // RAII state releases it; loaded modules never borrow this driver's pointer.
+    let cubin = unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec();
+    let end = linker
+        .info
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(linker.info.len());
+    Ok((
+        cubin,
+        String::from_utf8_lossy(&linker.info[..end]).into_owned(),
+    ))
 }

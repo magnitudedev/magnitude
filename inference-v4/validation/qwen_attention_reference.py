@@ -2,8 +2,9 @@
 """Generate V3 dense-history attention decode fixtures; validation only."""
 import argparse,hashlib,json,sys
 from pathlib import Path
+from reference_source import activate
 parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--source',type=Path,required=True);parser.add_argument('--output',type=Path,required=True)
-args=parser.parse_args();source=args.source.resolve(strict=True);sys.path.insert(0,str(source/'src'))
+args=parser.parse_args();source=args.source.resolve(strict=True);activate(source)
 import numpy as np
 from ops.tensor import ops
 from ops.tensor.primitive import round_reference

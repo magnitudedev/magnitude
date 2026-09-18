@@ -3,11 +3,13 @@
 pub mod abi;
 pub mod effects;
 pub mod numeric;
+pub mod reduction;
 pub mod ast;
 pub mod check;
-pub mod hir;
+pub mod ir;
 pub mod interp;
 pub mod lower;
+pub mod lowered_ir;
 pub mod intrinsics;
 pub mod lexer;
 pub mod layout;
@@ -46,3 +48,4 @@ pub fn scope_of_path(path: &str) -> Option<Scope> {
 }
 
 pub mod partition;
+pub mod normalize;
