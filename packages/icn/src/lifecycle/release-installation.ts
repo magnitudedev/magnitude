@@ -52,6 +52,9 @@ const executableName = () =>
 
 const MAXIMUM_COMMAND_OUTPUT = 64 * 1024
 
+export const finalOutputRecord = (output: string): string =>
+  output.trimEnd().split(/\r?\n/).at(-1) ?? ""
+
 const outputTail = (stream: Stream.Stream<Uint8Array, unknown>): Effect.Effect<string, unknown> =>
   stream.pipe(
     Stream.decodeText(),
@@ -276,7 +279,7 @@ const selectBackend = (
     )
     const report = yield* Schema.decodeUnknown(
       Schema.parseJson(BackendEligibilityReport),
-    )(output).pipe(
+    )(finalOutputRecord(output)).pipe(
       Effect.mapError(() =>
         installationError(
           "probe",
