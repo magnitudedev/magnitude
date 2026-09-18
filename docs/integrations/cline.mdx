@@ -8,20 +8,20 @@ description: "Connect Cline to your downloaded Magnitude models."
 1. [Install Cline](https://docs.cline.bot/getting-started/installing-cline) if needed.
 2. Download a compatible model in Magnitude.
 3. Open **Connections → Cline** and click **Connect**.
-4. Open or restart Cline and choose your Magnitude model.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
 
 This connector detects the `cline` executable and manages its provider configuration. Having only an editor extension installed does not necessarily make this CLI integration available. Magnitude configures the OpenAI-compatible provider.
 
-## Select a model from the terminal
+## Run Cline
 
-To configure the connection and select a specific downloaded model, first find its exact ID:
+After connecting in Magnitude, start Cline with:
 
 ```sh
-magnitude models status
-magnitude connections add cline --set-model "MODEL_ID"
+cline --tui --provider openai-compatible --model MODEL_ID
 ```
 
-Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
 
 ## Configuration
 
@@ -37,12 +37,5 @@ Supported location overrides: `CLINE_DATA_DIR`, `CLINE_PROVIDER_SETTINGS_PATH`. 
 ## Repair or disconnect
 
 If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-Terminal equivalents:
-
-```sh
-magnitude connections sync cline
-magnitude connections remove cline
-```
 
 See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.

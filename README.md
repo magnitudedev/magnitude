@@ -21,6 +21,8 @@ Magnitude is an open source inference engine optimized for consumer hardware. It
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
+https://github.com/user-attachments/assets/8317d05b-8a6e-40e0-b45d-81011ecbc329
+
 ## Get started
 
 **[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
@@ -46,11 +48,15 @@ The desktop app includes the `magnitude` CLI. No separate installation is needed
 
 ### What is Magnitude?
 
-An open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
+An open source inference engine optimized for consumer hardware. The desktop app profiles your machine, recommends the best models for it, then downloads, tunes, and runs them. One click connects the agent you already use.
 
 ### How does it know what my machine can run?
 
-Magnitude profiles your chip, memory, and bandwidth, then estimates fit and tok/s for every model in the catalog. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
+Magnitude profiles your hardware and estimates tok/s for every model in the catalog before you download anything. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
+
+### How is this different from Ollama or LM Studio?
+
+They run whatever model you pick. Magnitude helps you pick. It estimates how every model and quant will perform on your machine before you download, then tunes the one you choose for your exact hardware, from context size to speculative decoding.
 
 ### What hardware do I need?
 
@@ -58,15 +64,15 @@ There's no fixed minimum. Magnitude profiles your machine and recommends what ru
 
 ### What systems does Magnitude support?
 
-macOS, Windows, and Linux. See the [download page](https://magnitude.dev/download) for available installers and system requirements.
+The desktop app is native on macOS, Linux, and Windows. It runs on Apple Silicon, NVIDIA and AMD GPUs, and CPU-only machines, including unified-memory boxes like DGX Spark and Strix Halo.
 
 ### Which harnesses work with it?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Use Connections in the desktop app to configure your harness without launching it.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Pick a model and connect your harness in one click.
 
 ### Do I need to manage it after setup?
 
-No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight. Your agent can install or switch models through the CLI anytime.
+No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight.
 
 ### Is it private?
 

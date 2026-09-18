@@ -3,55 +3,34 @@ title: "FAQ"
 description: "Common questions about running Magnitude."
 ---
 
-## Is Magnitude free and open source?
+## What is Magnitude?
 
-Yes. Magnitude is Apache 2.0 licensed. Local inference does not require a paid API key. Individual model licenses still apply, and optional hosted providers may charge for their services.
+An open source inference engine optimized for consumer hardware. The desktop app profiles your machine, recommends the best models for it, then downloads, tunes, and runs them. One click connects the agent you already use.
 
-## Does Magnitude work offline?
+## How does it know what my machine can run?
 
-Local inference can run offline once the required model and runtime files are downloaded. Downloading models or runtime components, fetching uncached catalog information, and checking for updates need internet access. Hosted models also require connectivity.
+Magnitude profiles your hardware and estimates tok/s for every model in the catalog before you download anything. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
 
-## What stays on my machine?
+## How is this different from Ollama or LM Studio?
 
-Local model inference runs on your computer. The Usage page stores local usage measurements, not prompt or response content. If you choose a hosted provider, those requests go to that provider.
+They run whatever model you pick. Magnitude helps you pick. It estimates how every model and quant will perform on your machine before you download, then tunes the one you choose for your exact hardware, from context size to speculative decoding.
 
-Update checks send application/platform information and a pseudonymous installation identifier to Magnitude. Download endpoints also record download-request metadata. This is separate from your local token-usage history.
+## What hardware do I need?
 
-## How do updates work?
+There's no fixed minimum. Magnitude profiles your machine and recommends what runs well on it. More memory lets you run larger models.
 
-Magnitude checks for application updates shortly after startup and approximately hourly while running. In **Settings → Application updates**, you can turn **Auto-download updates** on or off; turning it off does not disable checks.
+## What systems does Magnitude support?
 
-Use **Download update** when an update is available, then **Restart to update** when it is ready. Prepared updates can also be applied on a subsequent startup. Installation stops the current model and service; Linux may ask for package-manager authorization.
+The desktop app is native on macOS, Linux, and Windows. It runs on Apple Silicon, NVIDIA and AMD GPUs, and CPU-only machines, including unified-memory boxes like DGX Spark and Strix Halo.
 
-Application updates include the bundled CLI and service. Downloading a new model is a separate operation.
+## Which harnesses work with it?
 
-## Does closing the window stop inference?
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Pick a model and connect your harness in one click.
 
-No. Closing the window leaves Magnitude running in the background. **Quit Magnitude** stops the app, service, and local inference. **Stop model** only unloads the active model; a later request can load it again.
+## Do I need to manage it after setup?
 
-## Can Magnitude start when I sign in?
+No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight.
 
-Enable **Launch at login** in Settings. Magnitude starts in the background without opening its window. On Linux this requires a desktop login session; it isn't a system-wide boot service.
+## Is it private?
 
-## Where are models and settings stored?
-
-Magnitude uses `.magnitude` in your home directory: `~/.magnitude` on macOS/Linux, or `%USERPROFILE%\.magnitude` on Windows.
-
-- `models/`: downloaded Magnitude models.
-- `config.json`: user configuration.
-- `cache/`: cached and derived data.
-- `harness-connections.json`: connection management records.
-
-Do not delete the whole directory to troubleshoot a single issue. Removing the app and removing your model data are different actions.
-
-## Do I need npm or a separate CLI?
-
-No. The desktop includes the CLI. See [CLI reference](/reference) for commands and [troubleshooting](/troubleshooting#magnitude-command-not-found) if your terminal cannot find it.
-
-## Can I use a machine without a GPU?
-
-Yes. CPU inference is supported, including Intel Macs and the current Windows build. Smaller models are generally more practical. See [Hardware](/hardware) for supported configurations and trade-offs.
-
-## How do I change the theme?
-
-Open Settings and select **Light**, **Dark**, or **System** appearance.
+Yes. Prompts, files, and models stay on your machine. Once a model is downloaded, no internet connection is needed.
