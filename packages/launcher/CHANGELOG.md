@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.1.3
+
+### Patch Changes
+
+- [#113](https://github.com/magnitudedev/magnitude/pull/113) [`8440631`](https://github.com/magnitudedev/magnitude/commit/84406317e6df9a62ad54e0e0dc117e7898ca034f) Thanks [@lepsistemas](https://github.com/lepsistemas)! - Handle native driver output preceding the backend eligibility JSON record.
+
 ## 0.1.2
 
 ### Patch Changes
