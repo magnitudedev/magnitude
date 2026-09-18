@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.1.1
+
+### Patch Changes
+
+- [`e216361`](https://github.com/magnitudedev/magnitude/commit/e216361bffd4b0d53459299b1caa7f61e571cdb5) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Smoothly upgrade previous standalone macOS and Linux installations while preserving downloaded models. Fix macOS window dragging and automatically register fresh installed macOS apps for launch at login while preserving later opt-outs. Simplify connection refresh controls and keep recommendation names on one line with quantization visible.
+
 ## 0.1.0
 
 ### Minor Changes
