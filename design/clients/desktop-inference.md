@@ -189,7 +189,13 @@ collection lengths and installation states remain unknown until observed.
 
 Settings observes OS registration rather than a saved boolean. Failed host actions preserve their
 actionable message across the preload boundary without displaying internal Effect stacks. macOS registers the main application
-through SMAppService and detects login launch before deciding window visibility. Windows registers
+through SMAppService and detects login launch before deciding window visibility. On first startup
+of a production copy in Applications, the owner records an automatic-registration attempt before
+registering a previously unseen (`not-found`) main app. Existing OS registration states are preserved.
+The attempt marker survives upgrades and later opt-outs; it stores no preference. Development,
+isolated profiles, and copies outside Applications never register automatically. Registration failure
+is nonfatal and logged; Settings permits explicit retry. Reads never register. Successful enablement
+requires OS confirmation or an explicit approval-required state. Windows registers
 the installed executable with `--background` and observes startup approval for its stable application
 identity. Command matching and approval must refer to that same per-user entry; a different entry
 for the executable cannot substitute for it. Executable paths containing spaces remain intact. Linux uses one user XDG

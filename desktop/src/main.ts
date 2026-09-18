@@ -6,7 +6,7 @@ import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu } from "./tray-menu"
-import { makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
+import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate } from "./application-update"
 import { macUpdateSource } from "./mac-update-source"
 import { makeLinuxUpdateSource } from "./linux-update-source"
@@ -108,6 +108,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* Effect.addFinalizer(() => Effect.sync(() => powerMonitor.removeListener("shutdown", shutdown)))
   }
   const loginStartup = yield* makeLoginStartup(isolatedProfile)
+  yield* initializeLoginStartup(loginStartup, stateDir, isolatedProfile).pipe(Effect.provide(NodeContext.layer), Effect.catchAll(error => Effect.logWarning(error.message)))
   const rendererRecovery = yield* makeRendererRecovery
   const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
   const quit = yield* Queue.sliding<"Quit" | "RestartUpdate">(1)
