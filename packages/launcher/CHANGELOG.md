@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.1.2
+
+### Patch Changes
+
+- [`5bcb95b`](https://github.com/magnitudedev/magnitude/commit/5bcb95b2b6449ca5e74b3d28b6b22cb2a52549a3) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add model-specific copyable agent commands with compact model selectors, guide downloaded Discover recommendations to Connections, and improve dropdown and copy feedback.
+
 ## 0.1.1
 
 ### Patch Changes
