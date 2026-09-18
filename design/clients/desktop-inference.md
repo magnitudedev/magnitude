@@ -159,7 +159,8 @@ The initializer installs the canonical client-common palette variables; importin
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls
 in the application surface, with its menu accessible through Alt. Linux retains desktop-native
-window decorations. Integrated controls have reserved space and a draggable top region; interactive
+window decorations. Integrated controls have reserved space and a draggable top region spanning
+both the sidebar and main content, including when the sidebar is collapsed; interactive
 content never overlaps window controls or becomes part of the drag region.
 
 Use the existing slate surfaces and blue actions/selections, Inter UI text, Martian Mono headings,
