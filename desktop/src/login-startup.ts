@@ -1,4 +1,6 @@
 import { Context, Effect } from "effect"
+import { FileSystem } from "@effect/platform"
+import { join } from "node:path"
 import { app } from "electron"
 import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { LoginStartupFailed, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
@@ -24,7 +26,6 @@ export const makeLoginStartup = (isolatedProfile: boolean) => Effect.gen(functio
     const settings = app.getLoginItemSettings(options)
     if (process.platform === "darwin") {
       if (settings.status === "requires-approval") return { _tag: "RequiresApproval" }
-      if (settings.status === "not-found") return { _tag: "Unavailable", message: "The installed application could not be found by macOS." }
       return { _tag: settings.status === "enabled" ? "Enabled" : "Disabled" }
     }
     // openAtLogin compares the complete registered command, including --background.
@@ -40,3 +41,19 @@ export const makeLoginStartup = (isolatedProfile: boolean) => Effect.gen(functio
     ? Effect.fail(new LoginStartupFailed({ message: "The operating system did not apply the login-startup change. Check your system startup settings." }))
     : Effect.succeed(state)))) })
 })
+
+/** First-run policy, separate from observational Settings reads. The marker records an
+ * attempt, never the user's preference; macOS remains authoritative after that attempt. */
+export const initializeLoginStartup = (service: LoginStartup, stateDirectory: string, isolatedProfile: boolean) => Effect.gen(function* () {
+  if (isolatedProfile || !app.isPackaged || process.platform !== "darwin" || !app.isInApplicationsFolder()) return
+  const fs = yield* FileSystem.FileSystem
+  const marker = join(stateDirectory, "login-startup-attempted")
+  if (yield* fs.exists(marker)) return
+  const settings = yield* Effect.try({
+    try: () => app.getLoginItemSettings({ type: "mainAppService" }),
+    catch: error => new LoginStartupFailed({ message: `Could not inspect initial login startup: ${String(error)}` }),
+  })
+  // Claim before registering: a crash or later opt-out must never cause re-enablement.
+  yield* fs.writeFileString(marker, "", { flag: "wx", mode: 0o600 })
+  if (settings.status === "not-found") yield* service.set(true)
+}).pipe(Effect.mapError(error => error instanceof LoginStartupFailed ? error : new LoginStartupFailed({ message: `Could not initialize login startup: ${String(error)}` })))
