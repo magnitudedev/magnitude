@@ -83,7 +83,8 @@
           "integrations/codex",
           "integrations/claude-code",
           "integrations/oh-my-pi",
-          "integrations/cline"
+          "integrations/cline",
+          "integrations/custom-apps"
         ]
       },
       {

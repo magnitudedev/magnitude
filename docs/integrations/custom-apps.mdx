@@ -1,0 +1,85 @@
+---
+title: "Custom apps"
+description: "Connect your app to Magnitude's local inference API."
+---
+
+Connect your own app to Magnitude to run inference with downloaded models. Apps that support a custom OpenAI-compatible base URL can connect without a Magnitude-specific integration.
+
+## Before you start
+
+1. Install and open Magnitude.
+2. Download a model in **Discover**.
+3. Keep Magnitude running while your app uses it.
+
+Magnitude loads the requested model on demand. The first response can take longer while it loads. To load it ahead of time, click **Load model** in **My Models**.
+
+## Configure an OpenAI-compatible app
+
+| Setting | Value |
+| --- | --- |
+| Provider | OpenAI-compatible |
+| Base URL | `http://127.0.0.1:10100/inference/v1` |
+| API key | `magnitude-local` if your app requires a value |
+| Model | An exact model ID returned by the models endpoint below |
+
+Local inference does not require an API key. `magnitude-local` is a placeholder for clients that require a nonempty key.
+
+Use the base URL above when your app appends `/chat/completions` or `/responses` itself. If it asks for a complete endpoint URL, use the corresponding full path from the endpoint table below.
+
+## Find a model ID
+
+List the models available for inference:
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/models
+```
+
+The response is an OpenAI-compatible model list with a `data` array. Copy the `id` of the model you want to use. Pass that exact value as `model` in requests, rather than the model's display name.
+
+## Send a request
+
+Replace `MODEL_ID` with an ID from the models response:
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MODEL_ID",
+    "messages": [
+      {"role": "user", "content": "Explain prompt caching in one paragraph."}
+    ],
+    "max_tokens": 256
+  }'
+```
+
+Read the generated text from `choices[0].message.content`. To stream the response, add `"stream": true` to the request body and use `curl -N` to display events as they arrive. Streaming responses use server-sent events (SSE).
+
+These shell examples use macOS/Linux quoting. On Windows, use `curl.exe` with quoting appropriate for your shell, or send the same JSON body from your application.
+
+## HTTP endpoints
+
+All paths below are relative to `http://127.0.0.1:10100`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Check whether the service is ready; returns `200` when ready. |
+| `GET` | `/inference/v1/models` | List models available for inference. |
+| `POST` | `/inference/v1/chat/completions` | OpenAI-compatible Chat Completions, with JSON or streaming output. |
+| `POST` | `/inference/v1/responses` | OpenAI-compatible Responses, with JSON or streaming output. |
+| `POST` | `/inference/anthropic/v1/messages` | Anthropic-compatible Messages. |
+| `POST` | `/inference/anthropic/v1/messages/count_tokens` | Count input tokens for an Anthropic-format request. |
+
+For an Anthropic-compatible client that appends `/v1/messages`, use `http://127.0.0.1:10100/inference/anthropic` as its base URL. Messages requests require `max_tokens`.
+
+Supported inputs and features depend on the selected model. These endpoints provide local model inference; your application handles conversation history and executes any tools requested by the model.
+
+## Local access and troubleshooting
+
+The API listens on the same machine as Magnitude. `127.0.0.1` in a container or on another machine refers to that environment, not the machine running Magnitude. Direct LAN or internet access is not provided. Browser access is restricted to local origins; a page hosted on an external website cannot call the API directly through ordinary cross-origin requests.
+
+- **Connection refused:** open Magnitude, or run `magnitude service start` using the bundled CLI.
+- **`/health` works but inference returns `404`:** check the URL prefix. Use `/inference/v1/chat/completions`, not `/v1/chat/completions` at the server root.
+- **Model unavailable:** download a model and copy its exact ID from `/inference/v1/models`.
+- **Slow first response:** allow time for model loading, or load the model ahead of time in **My Models**.
+
+See [Inference](/inference) for loading, memory, and performance behavior, and the [CLI reference](/reference) for model and service management.
