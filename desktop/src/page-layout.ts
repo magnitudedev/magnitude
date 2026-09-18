@@ -2,11 +2,11 @@
 export const pageLayout = {
   hardwarePhoto: "min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900",
   hardwareGrid: "grid-cols-[140px_minmax(0,1fr)] min-[1000px]:grid-cols-[220px_minmax(0,1fr)]",
-  recommendationRow: "flex min-h-16 w-full items-center gap-3 rounded-xl border px-3 py-4 text-left",
+  recommendationRow: "flex min-h-16 min-w-0 w-full items-center gap-3 rounded-xl border px-3 py-4 text-left",
   modelCard: "rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850",
   modelRow: "grid items-center gap-4 lg:grid-cols-[minmax(0,1fr)_auto]",
   recommendations: "grid overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]",
-  recommendationList: "space-y-2 p-3",
+  recommendationList: "min-w-0 space-y-2 p-3",
   recommendationPane: "min-w-0 border-t border-slate-200 p-5 dark:border-slate-750 lg:border-l lg:border-t-0",
   recommendationToolbar: "mb-4 flex flex-wrap items-center justify-between gap-3",
   modelRadar: "mx-auto my-3 aspect-[360/270] w-full max-w-sm",
