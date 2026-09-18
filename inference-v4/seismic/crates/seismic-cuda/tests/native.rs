@@ -6,6 +6,30 @@ use seismic_lang::{
 };
 use seismic_realization::Dispatch;
 use std::{collections::HashMap, path::PathBuf};
+
+#[path = "support/remainder.rs"]
+mod remainder;
+
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn signed_remainder_matches_scalar_ssa_for_all_integer_widths() {
+    use cranelift_codegen::ir::types;
+    let device = seismic_cuda::Device::open(0).unwrap();
+    for ty in [types::I8, types::I16, types::I32, types::I64] {
+        let pairs = remainder::operands(ty);
+        let execution = seismic_cuda::execution::Execution::new(
+            remainder::program(ty, pairs.len()), 32,
+            seismic_cuda::execution::Limits { max_threads_per_block: 1024, max_grid_x: u32::MAX },
+        ).unwrap();
+        let mut kernel = device.compile_execution(execution).unwrap();
+        let mut a = remainder::bytes(pairs.iter().map(|p| p.0), ty);
+        let mut b = remainder::bytes(pairs.iter().map(|p| p.1), ty);
+        let mut out = vec![0xA5; a.len()];
+        kernel.run(&mut [&mut a, &mut b, &mut out], &[]).unwrap();
+        let expected = remainder::bytes(pairs.iter().map(|&(a,b)| (i128::from(a) % i128::from(b)) as i64), ty);
+        assert_eq!(out, expected, "scalar SSA {ty} signed remainder");
+    }
+}
 fn standard() -> Program {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../seismic-std/lib");
     compile(

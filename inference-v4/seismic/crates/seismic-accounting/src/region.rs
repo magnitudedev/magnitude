@@ -59,7 +59,8 @@ impl Regions {
     }
 }
 
-/// Logical interface obligations, before a memory path or residency is chosen.
+/// Logical read/write access unions. These do not retain reaching value versions,
+/// prove that every touched byte is necessary, or establish physical movement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Access {
     pub reads: Regions,

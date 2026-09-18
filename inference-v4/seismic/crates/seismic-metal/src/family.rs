@@ -4,6 +4,23 @@
 //! remain fixed. Constructing and selecting this family never emits target code.
 use crate::execution::Execution;
 use seismic_realization::dispatch::GroupDispatch;
+use seismic_accounting::selection::Choices;
+
+/// Legal groupings derived for one actual launch, including padding constraints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupingChoices {
+    pub launch: usize,
+    alternatives: Vec<u64>,
+}
+impl GroupingChoices {
+    pub fn values(&self) -> &[u64] { &self.alternatives }
+    pub fn index(&self, value: u64) -> Option<usize> { self.alternatives.binary_search(&value).ok() }
+}
+impl Choices for GroupingChoices {
+    type Alternative = u64;
+    fn len(&self) -> usize { self.alternatives.len() }
+    fn get(&self, index: usize) -> Option<u64> { self.alternatives.get(index).copied() }
+}
 
 #[derive(Clone, Debug)]
 pub struct Constraint {
@@ -25,6 +42,7 @@ pub struct GroupFamily {
     shared_bytes_per_item: Vec<u64>,
     pub constraints: Vec<Constraint>,
     maximum_items: u64,
+    maximum_by_launch: Vec<u64>,
 }
 impl GroupFamily {
     /// Keep the selected operations/ownership fixed and solve their exact linear
@@ -43,11 +61,13 @@ impl GroupFamily {
         let mut constraints = Vec::new();
         let mut maximum_items = u64::MAX;
         let mut shared_bytes_per_item = Vec::new();
+        let mut maximum_by_launch = Vec::new();
         for (index, (dispatch, memory)) in launches
             .iter()
             .zip(execution.memory().launches())
             .enumerate()
         {
+            let mut launch_maximum = u64::MAX;
             let unit = GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, 1)?;
             let shared = memory.arrays.iter().try_fold(0u64, |sum, array| {
                 sum.checked_add(array.declaration.layout(&unit)?.shared_bytes_per_group)
@@ -71,6 +91,7 @@ impl GroupFamily {
                 }
                 let maximum = capacity / units_per_item;
                 maximum_items = maximum_items.min(maximum);
+                launch_maximum = launch_maximum.min(maximum);
                 constraints.push(Constraint {
                     launch: index,
                     resource,
@@ -79,6 +100,7 @@ impl GroupFamily {
                     maximum_items: maximum,
                 });
             }
+            maximum_by_launch.push(launch_maximum);
         }
         if maximum_items == u64::MAX || maximum_items == 0 {
             return Err("group family has no bounded nonempty legal domain".into());
@@ -89,6 +111,7 @@ impl GroupFamily {
             shared_bytes_per_item,
             constraints,
             maximum_items,
+            maximum_by_launch,
         })
     }
     fn grouping(&self, items_per_group: u64) -> Result<Grouping, String> {
@@ -132,9 +155,38 @@ impl GroupFamily {
     /// using the resulting launch geometry before allowing emission.
     pub fn select(&self, items_per_group: u64) -> Result<Execution, String> {
         let grouping = self.grouping(items_per_group)?;
+        self.select_grouping(grouping)
+    }
+
+    /// Each launch has its own resource domain. Neither an earlier launch's
+    /// shared arrays nor a common convenience grouping restricts this choice.
+    pub fn grouping_choices(&self, launch: usize) -> Result<GroupingChoices, String> {
+        let maximum = *self.maximum_by_launch.get(launch).ok_or("unknown grouping launch")?;
+        let domain = &self.launches[launch];
+        let alternatives = (1..=maximum).filter(|&items| {
+            // Padding is a typed index-width constraint, not a failed compiler
+            // attempt used as a proxy for legality.
+            u128::from(domain.work_items).div_ceil(u128::from(items)) * u128::from(items) <= u128::from(u32::MAX)
+        }).collect();
+        Ok(GroupingChoices { launch, alternatives })
+    }
+
+    pub fn select_launches(&self, items: &[u64]) -> Result<Execution, String> {
+        if items.len() != self.launches.len() { return Err("one grouping is required for every launch".into()); }
+        let mut launches = Vec::new();
+        let mut shared_bytes_per_group = Vec::new();
+        for (index, (&items, domain)) in items.iter().zip(&self.launches).enumerate() {
+            if self.grouping_choices(index)?.index(items).is_none() { return Err(format!("grouping is outside launch {index}'s resource domain")); }
+            launches.push(GroupDispatch::new(domain.work_items, domain.lanes_per_item, items)?);
+            shared_bytes_per_group.push(self.shared_bytes_per_item[index].checked_mul(items).ok_or("grouping storage overflow")?);
+        }
+        self.select_grouping(Grouping { items_per_group: items.first().copied().ok_or("empty launch domain")?, launches, shared_bytes_per_group })
+    }
+
+    fn select_grouping(&self, grouping: Grouping) -> Result<Execution, String> {
         let mut execution = self.execution.clone();
         execution.config.sg_per_tg =
-            i64::try_from(items_per_group).map_err(|_| "group count overflow")?;
+            i64::try_from(grouping.items_per_group).map_err(|_| "group count overflow")?;
         let mut launches = grouping.launches.into_iter();
         for phase in &mut execution.phases {
             phase.dispatch = launches.next().ok_or("main dispatch missing")?;

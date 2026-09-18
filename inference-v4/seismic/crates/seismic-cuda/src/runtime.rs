@@ -265,8 +265,7 @@ impl Device {
     fn compile_code(&self, execution: &Execution) -> Result<CompiledCode, String> {
         execution.validate_limits(self.execution_limits())?;
         let threads_per_block = execution.dispatch().threads_per_group as u32;
-        let program = execution.program();
-        let source = ptx::emit(program)?;
+        let source = ptx::print(execution.target_plan());
         let context = &self.context;
         let (image, compilation_log) = crate::driver::compile_image(context, &source)?;
         let _current = context.enter()?;

@@ -52,7 +52,10 @@ pub fn explore(args: &[String]) -> Result<(), String> {
         attempted += 1;
         let decisions = attempt.steps.iter().map(|s| json!({
             "site": format!("{:?}", s.domain.kind),
-            "domain": s.domain.alternatives.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
+            "domain": match s.domain.alternatives.capacity_interval() {
+                Some((first,last)) => json!({"stream_capacity_interval": {"first":first,"last":last}}),
+                None => json!(s.domain.alternatives.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>()),
+            },
             "selected": format!("{:?}", s.selected),
         })).collect::<Vec<_>>();
         let realization = attempt.result.and_then(|lowered| {

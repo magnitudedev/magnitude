@@ -44,7 +44,7 @@ pub fn inspect(args: &[String]) -> Result<(), String> {
     let scratch = family.execution().memory().scratch().iter().map(|s| json!({"buffer":s.index,"phase":s.phase,"variable":s.variable,"dtype":s.dtype.name(),"elements_per_item":s.elements_per_item,"work_items":s.work_items,"parts":s.parts,"bytes":s.bytes,"producer":s.producer,"consumer":s.consumer})).collect::<Vec<_>>();
     let launch_dependencies = family.execution().memory().launches().iter().enumerate().map(|(index,l)| json!({"launch":index,"predecessor":l.predecessor})).collect::<Vec<_>>();
     let dispatches = family.execution().phases().iter().flat_map(|p| std::iter::once(p.dispatch.clone()).chain(p.merge_dispatch.clone())).collect::<Vec<_>>();
-    let storage_account = seismic_accounting::storage::derive(family.execution().memory(), &dispatches)?;
+    let storage_account = seismic_metal::model::derive(family.execution().memory(), &dispatches)?;
     let count_json = |count: &seismic_accounting::quantity::Count| match count.bounds() {
         Some((lo,hi)) => json!({"lower":lo,"upper":hi}),
         None => json!({"unknown":format!("{count:?}")}),
@@ -53,8 +53,9 @@ pub fn inspect(args: &[String]) -> Result<(), String> {
         "peak_required_scratch_bytes_for_serial_launches":count_json(&storage_account.peak_required_scratch_bytes_for_serial_launches),
         "launches":storage_account.launches.iter().map(|l| json!({"declared_private_array_bytes_per_lane":count_json(&l.declared_private_array_bytes_per_lane),
             "declared_shared_array_bytes_per_group":count_json(&l.declared_shared_array_bytes_per_group),"static_barrier_sites":count_json(&l.static_barrier_sites),
-            "barrier_executions":count_json(&l.barrier_executions),"native_private_bytes_per_lane":count_json(&l.native_private_bytes_per_lane),
-            "unmodeled_fragment_operations":l.unmodeled_fragment_operations.iter().map(|id| id.0).collect::<Vec<_>>()})).collect::<Vec<_>>()});
+            "barrier_executions":count_json(&l.barrier_executions),"prologue_guard_executions":count_json(&l.prologue_guard_executions),"prologue":l.prologue.iter().map(|operation|json!({"operation":format!("{:?}",operation.operation),"executions":count_json(&operation.executions)})).collect::<Vec<_>>(),"native_private_bytes_per_lane":count_json(&l.native_private_bytes_per_lane),
+            "declared_fragment_payload_bytes_per_subgroup":count_json(&l.declared_fragment_payload_bytes_per_subgroup),
+            "collectives":l.collectives.iter().map(|c|json!({"operation":c.site.operation.0,"ordinal":c.site.ordinal,"implementation":format!("{:?}",c.implementation),"executions":count_json(&c.executions),"requested_read_bytes":count_json(&c.requested_read_bytes),"requested_write_bytes":count_json(&c.requested_write_bytes),"scalar_multiply_accumulates":count_json(&c.scalar_multiply_accumulates)})).collect::<Vec<_>>()})).collect::<Vec<_>>()});
     let analysis_seconds = start.elapsed().as_secs_f64();
     let compile_start = std::time::Instant::now();
     let selected = u64::try_from(options.sg_per_tg)

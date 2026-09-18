@@ -1,12 +1,31 @@
 //! Backend-owned execution choices. These are domains of currently implemented
 //! forms, not hardware performance scores. All expansion is IR-only.
 use crate::{execution::Execution, DeviceFacts};
+use seismic_accounting::selection::{Choices, IntegerRange};
 use seismic_lang::lowered_ir::LoweredIr;
-use seismic_realization::{CallConv, Dispatch, LoadStrategy, ScalarOptions};
+use seismic_realization::{CallConv, Dispatch, LoadStrategy};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    CudaBlock { phase: usize },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchChoice;
+impl Choices for DispatchChoice {
+    type Alternative = Dispatch;
+    fn len(&self) -> usize {
+        2
+    }
+    fn get(&self, index: usize) -> Option<Dispatch> {
+        [Dispatch::Sequential, Dispatch::ParallelRoot]
+            .get(index)
+            .copied()
+    }
+}
 
 pub struct Domain {
     pub name: String,
-    pub alternatives: Vec<String>,
+    pub alternatives: seismic_accounting::selection::Domain,
 }
 pub enum Expansion {
     Choice(Domain),
@@ -16,6 +35,7 @@ pub enum Expansion {
 /// Decomposition parameters are fixed inputs here. Metal storage, reduction and
 /// grouping choices remain dependent domains. Extending decomposition coverage
 /// belongs to the compiler, not to a caller-supplied list of performance guesses.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Form {
     CpuScalar,
     CudaScalar,
@@ -70,46 +90,50 @@ impl<'a> Space<'a> {
         self.hardware
     }
     pub fn expand(&self, prefix: &[usize]) -> Result<Expansion, String> {
-        let Some(&load_index) = prefix.first() else {
-            return Ok(Expansion::Choice(Domain {
-                name: "load realization".into(),
-                alternatives: vec!["materialize".into(), "proven read-only borrow".into()],
-            }));
+        let (function, consumed, _metal_loads) = match &self.form {
+            Form::CpuScalar | Form::CudaScalar => {
+                match seismic_lang::normalize::loads::expand(self.lowered, prefix)? {
+                    seismic_lang::normalize::loads::Expansion::Choice(choice) => {
+                        return Ok(Expansion::Choice(Domain {
+                            name: format!(
+                                "load site {} (variable {})",
+                                choice.site, choice.variable
+                            ),
+                            alternatives: seismic_accounting::selection::Domain::new(choice)?,
+                        }));
+                    }
+                    seismic_lang::normalize::loads::Expansion::Selected { function, consumed } => {
+                        (function, consumed, LoadStrategy::Materialize)
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Form::Metal { .. } => (self.lowered.clone(), 0, LoadStrategy::Materialize),
         };
-        let loads = match load_index {
-            0 => LoadStrategy::Materialize,
-            1 => LoadStrategy::BorrowProvenReadOnly,
-            _ => return Err("load choice is outside its domain".into()),
-        };
+        let prefix = &prefix[consumed..];
         match (&self.form, self.hardware) {
             (Form::CpuScalar, DeviceFacts::Cpu { .. }) => {
-                if prefix.len() != 1 {
+                if !prefix.is_empty() {
                     return Err("unused CPU execution decisions".into());
                 }
-                Ok(Expansion::Execution(Execution::Cpu(seismic_cpu::prepare(
-                    self.lowered,
-                    loads,
-                )?)))
+                Ok(Expansion::Execution(Execution::Cpu(
+                    seismic_cpu::prepare_resolved(&function)?,
+                )))
             }
             (Form::CudaScalar, DeviceFacts::Cuda(facts)) => {
-                let Some(&dispatch_index) = prefix.get(1) else {
+                let Some(&dispatch_index) = prefix.first() else {
                     return Ok(Expansion::Choice(Domain {
                         name: "work dispatch".into(),
-                        alternatives: vec![
-                            "sequential invocation".into(),
-                            "parallel root domains".into(),
-                        ],
+                        alternatives: seismic_accounting::selection::Domain::new(DispatchChoice)?,
                     }));
                 };
-                let dispatch = match dispatch_index {
-                    0 => Dispatch::Sequential,
-                    1 => Dispatch::ParallelRoot,
-                    _ => return Err("CUDA dispatch choice is outside its domain".into()),
-                };
-                let sequence = seismic_compiler::scalar_sequence(
-                    self.lowered,
+                let dispatch = DispatchChoice
+                    .get(dispatch_index)
+                    .ok_or("CUDA dispatch choice is outside its domain")?;
+                let sequence = seismic_compiler::scalar_sequence_resolved(
+                    &function,
                     CallConv::SystemV,
-                    ScalarOptions { dispatch, loads },
+                    dispatch,
                 )?;
                 if sequence.phases.is_empty() {
                     return Err("CUDA form requires a nonempty phase sequence".into());
@@ -140,15 +164,16 @@ impl<'a> Space<'a> {
                             },
                         ));
                     }
-                    let Some(&index) = prefix.get(phase + 2) else {
+                    let domain =
+                        IntegerRange::new(Decision::CudaBlock { phase }, minimum, maximum)?;
+                    let Some(&index) = prefix.get(phase + 1) else {
                         return Ok(Expansion::Choice(Domain {
                             name: format!("CUDA phase {phase} threads per block"),
-                            alternatives: (minimum..=maximum).map(|n| n.to_string()).collect(),
+                            alternatives: seismic_accounting::selection::Domain::new(domain)?,
                         }));
                     };
-                    let threads = minimum
-                        .checked_add(index as u64)
-                        .filter(|n| *n <= maximum)
+                    let threads = domain
+                        .get(index)
                         .ok_or("CUDA block choice is outside its domain")?;
                     selected.push(seismic_cuda::execution::Execution::new(
                         program.program,
@@ -156,7 +181,7 @@ impl<'a> Space<'a> {
                         limits,
                     )?);
                 }
-                if prefix.len() != selected.len() + 2 {
+                if prefix.len() != selected.len() + 1 {
                     return Err("unused CUDA execution decisions".into());
                 }
                 Ok(Expansion::Execution(Execution::Cuda(selected)))
@@ -172,7 +197,7 @@ impl<'a> Space<'a> {
                 DeviceFacts::Metal(facts),
             ) => {
                 let config = seismic_metal::execution::Config {
-                    loads,
+                    loads: _metal_loads,
                     sg_per_tg: 1,
                     piece: *piece,
                     per_item: *per_item,
@@ -187,7 +212,7 @@ impl<'a> Space<'a> {
                         .try_into()
                         .map_err(|_| "Metal storage capacity exceeds integer range")?,
                 };
-                match seismic_metal::choices::expand(self.lowered, config, &prefix[1..])? {
+                match seismic_metal::choices::expand(self.lowered, config, prefix)? {
                     seismic_metal::choices::Expansion::Infeasible {
                         launch,
                         required,
@@ -202,37 +227,39 @@ impl<'a> Space<'a> {
                     seismic_metal::choices::Expansion::Choice(domain) => {
                         Ok(Expansion::Choice(Domain {
                             name: format!("Metal {:?}", domain.decision),
-                            alternatives: domain
-                                .alternatives
-                                .iter()
-                                .map(|a| format!("{a:?}"))
-                                .collect(),
+                            alternatives: seismic_accounting::selection::Domain::new(domain)?,
                         }))
                     }
                     seismic_metal::choices::Expansion::Execution {
                         execution,
                         consumed,
                     } => {
-                        let end = consumed + 1;
+                        let end = consumed;
                         let family = seismic_metal::family::GroupFamily::derive(execution)?;
-                        let groupings = family.groupings().collect::<Vec<_>>();
-                        let Some(&index) = prefix.get(end) else {
-                            return Ok(Expansion::Choice(Domain {
-                                name: "Metal work items per threadgroup".into(),
-                                alternatives: groupings
-                                    .iter()
-                                    .map(|g| g.items_per_group.to_string())
-                                    .collect(),
-                            }));
-                        };
-                        if prefix.len() != end + 1 {
+                        let mut groups = Vec::new();
+                        for launch in 0..family.execution().memory().launches().len() {
+                            let domain = family.grouping_choices(launch)?;
+                            let Some(&index) = prefix.get(end + launch) else {
+                                return Ok(Expansion::Choice(Domain {
+                                    name: format!(
+                                        "Metal launch {launch} work items per threadgroup"
+                                    ),
+                                    alternatives: seismic_accounting::selection::Domain::new(
+                                        domain,
+                                    )?,
+                                }));
+                            };
+                            groups.push(
+                                domain
+                                    .get(index)
+                                    .ok_or("Metal grouping choice is outside its domain")?,
+                            );
+                        }
+                        if prefix.len() != end + groups.len() {
                             return Err("unused Metal execution decisions".into());
                         }
-                        let grouping = groupings
-                            .get(index)
-                            .ok_or("Metal grouping choice is outside its domain")?;
                         Ok(Expansion::Execution(Execution::Metal(
-                            family.select(grouping.items_per_group)?,
+                            family.select_launches(&groups)?,
                         )))
                     }
                 }

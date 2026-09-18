@@ -2,6 +2,7 @@
 //! Bindings stay in their original control-flow and iteration scope. This pass
 //! does not select a reduction algorithm, move work between iterations, or emit code.
 use crate::{ast::AssignOp, ir::*};
+pub mod loads;
 
 /// Bind load and reduction expressions and return each original statement's new position
 /// after its own prerequisite bindings. This preserves references to split loops.
@@ -56,70 +57,10 @@ pub fn bind_expression_values(expr: &mut Expr, vars: &mut Vec<Var>) -> Vec<Stmt>
 /// Resolve ordinary and streamed load realization in the operations themselves.
 /// The input must have explicit value bindings.
 pub fn select_loads(body: &mut [Stmt], borrow_read_only: bool) {
-    let original = body.to_vec();
-    fn select(body: &mut [Stmt], original: &[Stmt], borrow: bool) {
-        for statement in body {
-            match &mut statement.kind {
-                StmtKind::Assign {
-                    target,
-                    op: AssignOp::Assign,
-                    value,
-                } => {
-                    if let ExprKind::Var(var) = &target.kind {
-                        let view = match &value.kind {
-                            ExprKind::Builtin {
-                                name: Builtin::Load,
-                                args,
-                            } => Some(args[0].clone()),
-                            ExprKind::Load { view, .. } => Some((**view).clone()),
-                            _ => None,
-                        };
-                        if let Some(view) = view {
-                            let mode = if borrow
-                                && crate::effects::load_can_borrow(original, *var)
-                            {
-                                LoadMode::Borrow
-                            } else {
-                                LoadMode::Materialize
-                            };
-                            value.kind = ExprKind::Load {
-                                view: Box::new(view),
-                                mode,
-                            };
-                        }
-                    }
-                }
-                StmtKind::LoadLoop {
-                    vars, modes, body, ..
-                } => {
-                    *modes = Some(
-                        vars.iter()
-                            .map(|var| {
-                                if borrow
-                                    && crate::effects::stream_load_can_borrow(body, *var)
-                                {
-                                    LoadMode::Borrow
-                                } else {
-                                    LoadMode::Materialize
-                                }
-                            })
-                            .collect(),
-                    );
-                    select(body, original, borrow);
-                }
-                StmtKind::Parallel { body, .. }
-                | StmtKind::Owned { body, .. }
-                | StmtKind::Range { body, .. }
-                | StmtKind::Lanes { body, .. } => select(body, original, borrow),
-                StmtKind::If { then, els, .. } => {
-                    select(then, original, borrow);
-                    select(els, original, borrow);
-                }
-                _ => {}
-            }
-        }
-    }
-    select(body, &original, borrow_read_only);
+    let modes = loads::sites(body).iter().map(|site| {
+        if borrow_read_only && site.can_borrow { LoadMode::Borrow } else { LoadMode::Materialize }
+    }).collect::<Vec<_>>();
+    loads::resolve(body, &modes).expect("modes are selected from the checked domain");
 }
 
 fn bind_expr(expr: &mut Expr, vars: &mut Vec<Var>, bindings: &mut Vec<Stmt>, already_bound: bool) {

@@ -188,7 +188,7 @@ pub struct Site {
     pub output: seismic_lang::ir::VarId,
     pub operation: seismic_lang::ir::OperationId,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub site: Site,
     pub input: seismic_lang::ir::VarId,
@@ -197,6 +197,20 @@ pub struct Decision {
     pub contract: seismic_lang::reduction::Contract,
     pub full_lanes: bool,
     pub domain: ReductionDomain,
+}
+impl Decision {
+    /// Existing explicit diagnostic policy; the legal domain remains authoritative.
+    pub fn diagnostic(&self) -> Algorithm {
+        if self.domain.output_capacity() > crate::execution::SUBGROUP as u64
+            && self.domain.algorithms().contains(&Algorithm::LaneLocal)
+        {
+            Algorithm::LaneLocal
+        } else if self.domain.algorithms().contains(&Algorithm::Collective) {
+            Algorithm::Collective
+        } else {
+            Algorithm::Ordered
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Selected {

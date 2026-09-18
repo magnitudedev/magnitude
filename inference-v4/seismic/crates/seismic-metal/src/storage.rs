@@ -7,7 +7,7 @@ use seismic_lang::{
 };
 use seismic_realization::dispatch::{TileDeclaration, TilePlacement};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageDecision {
     pub variable: VarId,
     pub name: String,
@@ -21,6 +21,19 @@ pub struct StorageDecision {
 }
 
 impl StorageDecision {
+    /// Existing explicit diagnostic policy; this does not rank performance.
+    pub fn diagnostic(&self) -> TilePlacement {
+        if self.intrinsic_operand
+            || (self.cross_lane_read && self.capacity > crate::execution::SUBGROUP)
+        {
+            TilePlacement::GroupShared
+        } else if self.capacity <= crate::execution::SUBGROUP {
+            TilePlacement::Replicated
+        } else {
+            TilePlacement::Distributed
+        }
+    }
+
     /// Resolve this ownership domain into the declaration consumed by emission
     /// and accounting. Selection does not print or compile a candidate.
     pub fn select(&self, placement: TilePlacement) -> Result<TileDeclaration, String> {

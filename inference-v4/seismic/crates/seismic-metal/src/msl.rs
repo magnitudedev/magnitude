@@ -11,8 +11,9 @@ use seismic_lang::ast::{AssignOp, BinaryOp, UnaryOp};
 use seismic_lang::ir::*;
 use seismic_lang::lowered_ir::LoweredIr;
 use crate::storage::StorageDecision;
-use seismic_realization::memory::{AllocationId, Purpose, BarrierSite, BarrierPurpose, MemorySpace};
+use crate::memory::{AllocationId, Purpose, BarrierSite, BarrierPurpose, MemorySpace};
 use seismic_lang::repr;
+use crate::collective::{Implementation as CollectiveImplementation, Site as CollectiveSite, StorageSpace};
 use seismic_lang::sym::{Atom, Sym};
 use seismic_lang::types::{DType, Elem, Ty};
 use seismic_realization::{BufferSpec, dispatch::{GroupDispatch, TileDeclaration, TilePlacement}};
@@ -121,6 +122,9 @@ struct Printer<'a> {
     tile_declarations: Vec<TileDeclaration>,
     memory_launch: usize,
     emitted_barriers: HashSet<BarrierSite>,
+    emitted_collectives: HashSet<CollectiveSite>,
+    current_operation: Option<OperationId>,
+    collective_ordinal: usize,
     /// Simdgroups per threadgroup for the kernel being emitted.
     simdgroups: i64,
 }
@@ -149,7 +153,7 @@ pub fn emit_execution(execution: &Execution) -> Result<Emitted, String> {
     let mut emitted = Printer { f, execution, cfg, out: String::new(),
         real: HashMap::new(), names: HashMap::new(), pieces: HashMap::new(), indent: 0, counter: 0,
         owned_ctx: Vec::new(), buffers: Vec::new(), scalars: Vec::new(), shared_decls: Vec::new(),
-        tile_declarations: Vec::new(), memory_launch: 0, emitted_barriers: HashSet::new(), simdgroups: cfg.sg_per_tg,
+        tile_declarations: Vec::new(), memory_launch: 0, emitted_barriers: HashSet::new(), emitted_collectives: HashSet::new(), current_operation: None, collective_ordinal: 0, simdgroups: cfg.sg_per_tg,
     }.emit()?;
     let planned = execution.memory.launches();
     if emitted.launches.len() != planned.len() { return Err("emitted launch count disagrees with allocation plan".into()); }
@@ -240,47 +244,7 @@ impl Printer<'_> {
     fn emit(mut self) -> Result<Emitted, String> {
         let mut header = String::new();
         header.push_str("#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\n#pragma clang fp contract(off)\nusing namespace metal;\n\n");
-        header.push_str(r#"
-inline uint seismic_shift(uint a, long b, bool left, device atomic_uint* status) {
-    if (b < 0 || b >= 32) { atomic_store_explicit(status, 1u, memory_order_relaxed); return 0; }
-    return left ? a << uint(b) : a >> uint(b);
-}
-inline int seismic_shift(int a, long b, bool left, device atomic_uint* status) {
-    if (b < 0 || b >= 32) { atomic_store_explicit(status, 1u, memory_order_relaxed); return 0; }
-    return left ? as_type<int>(as_type<uint>(a) << uint(b)) : a >> uint(b);
-}
-inline int seismic_integer_division(int a, int b, bool remainder, device atomic_uint* status) {
-    if (b == 0 || (a == (-2147483647 - 1) && b == -1)) { atomic_store_explicit(status, 1u, memory_order_relaxed); return 0; }
-    long q = long(a) / long(b), r = long(a) % long(b);
-    if (r < 0) { q += b < 0 ? 1 : -1; r += b < 0 ? -long(b) : long(b); }
-    return int(remainder ? r : q);
-}
-inline uint seismic_integer_division(uint a, uint b, bool remainder, device atomic_uint* status) {
-    if (b == 0) { atomic_store_explicit(status, 1u, memory_order_relaxed); return 0; }
-    return remainder ? a % b : a / b;
-}
-inline long seismic_index(long index, long extent, device atomic_uint* status) {
-    if (index < 0 || index >= extent) {
-        atomic_store_explicit(status, 1u, memory_order_relaxed);
-        return 0;
-    }
-    return index;
-}
-template<typename T> inline T seismic_read(device const T* pointer, long index, ulong count, device atomic_uint* status) {
-    if (index < 0 || ulong(index) >= count) {
-        atomic_store_explicit(status, 1u, memory_order_relaxed);
-        return T(0);
-    }
-    return pointer[index];
-}
-template<typename T> inline void seismic_write(device T* pointer, long index, ulong count, T value, device atomic_uint* status) {
-    if (index < 0 || ulong(index) >= count) {
-        atomic_store_explicit(status, 1u, memory_order_relaxed);
-        return;
-    }
-    pointer[index] = value;
-}
-"#);
+        header.push_str(&crate::support::render(self.execution.support()));
         let mut index = 0usize;
         let mut params_sig: Vec<String> = Vec::new();
         for (i, (name, ty)) in self.f.params.iter().enumerate() {
@@ -368,8 +332,6 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             let phase = &self.execution.phases[k];
             let StmtKind::Parallel { vars, body, .. } = &stmt.kind else { unreachable!() };
             let split_here = phase.split.is_some();
-            let parts = phase.parts;
-            let items = phase.dispatch.work_items;
             if let Some(split) = &phase.split {
                 let VarKind::Index(Atom::Param(atom)) = &self.f.vars[split.part].kind else { unreachable!() };
                 self.names.insert(atom.clone(), "part".into());
@@ -381,16 +343,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             self.indent = 1;
             let sg_per_tg = phase.dispatch.items_per_group as i64;
             self.simdgroups = sg_per_tg;
-            self.line(&format!("const uint slot = tg_pos.x * {sg_per_tg} + sg_id;"));
-            self.line(&format!("if (slot >= {items}) return;"));
-            if split_here {
-                // The part varies fastest so neighbouring items read neighbouring slices.
-                self.line(&format!("const int part = int(slot % {parts});"));
-                self.line(&format!("const uint item = slot / {parts};"));
-            } else {
-                self.line("const uint item = slot;");
-            }
-            self.bind_work_indices(vars, &phase.mapping)?;
+            self.emit_prologue(vars, &phase.dispatch)?;
             if split_here {
                 // Each part streams its slice and publishes its carried state to scratch.
                 // A second launch folds the parts together with the loop body's own merge
@@ -431,16 +384,13 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         for SplitTail { phase: k, kernel: first, carried, body: tail } in split_tails {
             let StmtKind::Parallel { vars, .. } = &self.f.body[k].kind else { unreachable!() };
             let dispatch = self.execution.phases[k].merge_dispatch.as_ref().unwrap();
-            let items = dispatch.work_items as i64;
             let kernel = format!("{first}_merge");
             let mut kernel_out = String::new();
             std::mem::swap(&mut self.out, &mut kernel_out);
             self.indent = 1;
             let sg_per_tg = dispatch.items_per_group as i64;
             self.simdgroups = sg_per_tg;
-            self.line(&format!("const uint item = tg_pos.x * {sg_per_tg} + sg_id;"));
-            self.line(&format!("if (item >= {items}) return;"));
-            self.bind_work_indices(vars, &self.execution.phases[k].mapping)?;
+            self.emit_prologue(vars, dispatch)?;
             self.merge_partials(k, &carried, &self.execution.phases[k].split.as_ref().unwrap().merges, self.f.body[k].id.ok_or("merge phase has no operation identity")?)?;
             self.block(&tail)?;
             self.indent = 0;
@@ -464,17 +414,31 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         })
     }
 
-    fn bind_work_indices(&mut self, vars: &[VarId], mapping: &seismic_realization::dispatch::WorkMapping) -> Result<(), String> {
-        if vars.len() != mapping.axes().len() { return Err("parallel variables do not match the work mapping".into()); }
-        for (v, axis) in vars.iter().zip(mapping.axes()) {
-            let name = self.index_name(*v);
-            if mapping.work_items() == 0 {
-                // The launch has no work. Keep its source well-defined as well.
-                self.line(&format!("const int {name} = 0;"));
-            } else {
-                let (stride, extent, step) = (axis.stride, axis.extent, axis.step);
-                self.line(&format!("const int {name} = int(((item / {stride}u) % {extent}u) * {step}u);"));
-            }
+    fn emit_prologue(&mut self, vars: &[VarId], dispatch: &GroupDispatch) -> Result<(), String> {
+        use crate::support::{LaunchOperation as O, LaunchValue as V, Helper};
+        let program=self.execution.memory.launches()[self.memory_launch].prologue.instantiate(dispatch)?;
+        if vars.len()!=program.coordinates.len(){return Err("parallel variables do not match launch coordinates".into());}
+        let value=|v: V| match v {
+            V::Group=>"tg_pos.x".to_string(), V::Subgroup=>"sg_id".to_string(),
+            V::Constant(n)=>format!("{n}u"), V::Result(n)=>format!("seismic_entry_{n}"),
+        };
+        for (n,step) in program.steps.iter().enumerate(){
+            let (ty,expression)=match step.operation {
+                O::Add(a,b)=>("uint",format!("{} + {}",value(a),value(b))),
+                O::Multiply(a,b)=>("uint",format!("{} * {}",value(a),value(b))),
+                O::Divide(a,b)=>("uint",format!("{} / {}",value(a),value(b))),
+                O::Remainder(a,b)=>("uint",format!("{} % {}",value(a),value(b))),
+                O::SignedIndex(a)=>("int",format!("int({})",value(a))),
+                O::Live(a,b)=>("bool",format!("{}({}, {})",self.execution.support().get(Helper::WorkItemLive).name,value(a),value(b))),
+            };
+            self.line(&format!("const {ty} seismic_entry_{n} = {expression};"));
+            if n==program.guard {self.line(&format!("if (!seismic_entry_{n}) return;"));}
+        }
+        self.line(&format!("const uint item = {};",value(program.item)));
+        if let Some(part)=program.part {self.line(&format!("const int part = {};",value(part)));}
+        for (&v, coordinate) in vars.iter().zip(program.coordinates) {
+            let name=self.index_name(v);
+            self.line(&format!("const int {name} = int({});",value(coordinate)));
         }
         Ok(())
     }
@@ -497,6 +461,13 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        let previous=(self.current_operation,self.collective_ordinal);
+        self.current_operation=s.id;self.collective_ordinal=0;
+        let result=self.stmt_inner(s);
+        (self.current_operation,self.collective_ordinal)=previous;
+        result
+    }
+    fn stmt_inner(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
             StmtKind::Parallel { .. } => Err("nested `parallel` is not supported".into()),
             StmtKind::Range { var, lo, hi, body } => {
@@ -747,10 +718,9 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                                 let en_c = self.sym(&en)?;
                                 let ext_c = self.sym(ext)?;
                                 let valid = self.fresh("slice_valid");
-                                self.line(&format!("const bool {valid} = long({s_c}) >= 0 && long({s_c}) <= long({en_c}) && long({en_c}) <= long({ext_c});"));
-                                self.line(&format!("if (!{valid}) atomic_store_explicit(seismic_status, 1u, memory_order_relaxed);"));
+                                self.line(&format!("const bool {valid} = seismic_slice_valid(long({s_c}), long({en_c}), long({ext_c}));"));
                                 let safe = self.fresh("slice_start");
-                                self.line(&format!("const long {safe} = {valid} ? long({s_c}) : 0;"));
+                                self.line(&format!("const long {safe} = seismic_slice_start({valid}, long({s_c}), seismic_status);"));
                                 self.names.insert(safe.clone(), safe.clone());
                                 let result_ext = result.shape[out_axis].clone();
                                 if result_ext.as_constant().is_none() && !result_ext.atoms().iter().all(|a| matches!(a, Atom::Param(p) if self.names.contains_key(p))) {
@@ -758,7 +728,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                                     let [Atom::Param(dyn_atom)] = atoms.as_slice() else { return Err("unexpected slice extent form".into()) };
                                     let dyn_atom = dyn_atom.clone();
                                     let name = self.fresh("dyn");
-                                    self.line(&format!("const int {name} = {valid} ? int(long({en_c}) - long({s_c})) : 0;"));
+                                    self.line(&format!("const int {name} = seismic_slice_extent({valid}, long({s_c}), long({en_c}));"));
                                     self.names.insert(dyn_atom, name);
                                 }
                                 off = off.add(&Sym::param(&safe).mul(&strides[axis]));
@@ -823,6 +793,15 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         Ok(())
     }
 
+    fn collective(&mut self, operation: seismic_lang::intrinsics::Operation) -> Result<CollectiveImplementation,String> {
+        let site=CollectiveSite{operation:self.current_operation.ok_or("collective emission has no operation identity")?,ordinal:self.collective_ordinal};
+        self.collective_ordinal+=1;
+        let instruction=self.execution.memory.launches().get(self.memory_launch)
+            .and_then(|launch|launch.collectives.get(&site)).ok_or("unplanned collective reached emission")?;
+        if instruction.implementation.operation()!=operation {return Err("collective operation differs from the prepared implementation".into());}
+        if !self.emitted_collectives.insert(site) {return Err("duplicate collective emission".into());}
+        Ok(instruction.implementation.clone())
+    }
     fn finish_memory(&mut self) -> Result<Vec<TileDeclaration>, String> {
         let launch = self.execution.memory.launches().get(self.memory_launch)
             .ok_or("allocation launch is missing")?;
@@ -832,6 +811,8 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         if self.emitted_barriers.len() != launch.barriers.len() {
             return Err("emission omitted planned memory barriers".into());
         }
+        if self.emitted_collectives.len()!=launch.collectives.len() {return Err("emission omitted prepared collective implementations".into());}
+        self.emitted_collectives.clear();
         self.emitted_barriers.clear();
         self.memory_launch += 1;
         Ok(std::mem::take(&mut self.tile_declarations))
@@ -892,9 +873,10 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         self.declare_tile(*v, shape, *dtype, operation, Purpose::Value)?;
                         return Ok(());
                     }
-                    ExprKind::Intrinsic { op: name, args } if *name == seismic_lang::intrinsics::Operation::Matrix => {
-                        let Ty::Scalar(d) = args[0].ty else { unreachable!() };
-                        self.frag_decl(*v, d);
+                    ExprKind::Intrinsic { op: name, .. } if *name == seismic_lang::intrinsics::Operation::Matrix => {
+                        let CollectiveImplementation::Declare{fragment,layout}=self.collective(*name)? else {return Err("matrix declaration implementation mismatch".into());};
+                        if fragment!=*v {return Err("matrix declaration binding differs from prepared storage".into());}
+                        self.frag_decl(*v, layout)?;
                         return Ok(());
                     }
                     ExprKind::Builtin { name: Builtin::Reduce, args ,
@@ -1255,7 +1237,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         if dims.len() != shape.len() { return Err("store rank mismatch".into()); }
         let valid = dims.iter().zip(&shape).map(|(dim,extent)| Ok(format!("long({}) == long({})", dim.ext, self.sym(extent)?))).collect::<Result<Vec<_>,String>>()?.join(" && ");
         let valid = if valid.is_empty() { "true".into() } else { valid };
-        self.line(&format!("if (!({valid})) atomic_store_explicit(seismic_status, 1u, memory_order_relaxed);"));
+        self.line(&format!("{}({valid}, seismic_status);", self.execution.support().get(crate::support::Helper::Validate).name));
         match real {
             Realization::Replicated { name, dims, dtype } | Realization::Shared { name, dims, dtype } => {
                 let n_cap: i64 = dims.iter().map(|d| d.cap).product();
@@ -1674,25 +1656,34 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
     }
 
     fn intrinsic_stmt(&mut self, name: &seismic_lang::intrinsics::Operation, args: &[Expr], operation: OperationId) -> Result<(), String> {
+        let implementation=self.collective(*name)?;
         match name {
             seismic_lang::intrinsics::Operation::MatrixLoad | seismic_lang::intrinsics::Operation::MatrixLoadTranspose | seismic_lang::intrinsics::Operation::MatrixStore => {
                 let ExprKind::Var(fv) = args[0].kind else { return Err("fragment must be a variable".into()) ;
                 };
                 let Some(Realization::Frag { name: frag }) = self.real.get(&fv).cloned() else { return Err("unrealized fragment".into()) ;
                 };
-                let row = self.int_value(&args[2])?;
-                let col = self.int_value(&args[3])?;
+                let (planned_fragment,memory,want_t)=match &implementation {
+                    CollectiveImplementation::Load{fragment,memory,transpose,..}=>(*fragment,memory,*transpose),
+                    CollectiveImplementation::Store{fragment,memory,..}=>(*fragment,memory,false),
+                    _=>return Err("matrix transfer implementation mismatch".into()),
+                };
+                if planned_fragment!=fv || memory.operand!=args[1] || memory.row!=args[2] || memory.column!=args[3] {return Err("matrix transfer operands differ from prepared execution".into());}
+                let row = self.int_value(&memory.row)?;
+                let col = self.int_value(&memory.column)?;
                 let operand = match args[1].kind {
                     ExprKind::Var(tv) => self.real.get(&tv).cloned().ok_or("unrealized intrinsic operand")?,
                     _ => self.view_of(&args[1])?,
                 };
                 // (pointer, offset of the block origin, leading dimension, memory holds the transpose)
                 let (ptr, off, ld, col_major) = match operand {
-                    Realization::Shared { name, dims, .. } => {
+                    Realization::Shared { name, dims, dtype } => {
+                        if memory.space!=StorageSpace::Threadgroup || memory.dtype!=dtype {return Err("matrix shared operand disagrees with selected memory contract".into());}
                         let ld = Sym::constant(dims[1].cap);
                         (name, row.mul(&ld).add(&col), ld, false)
                     }
                     Realization::View { param, elem, offset, strides, .. } => {
+                        if memory.space!=StorageSpace::Device || elem!=Elem::Dtype(memory.dtype) {return Err("matrix device operand disagrees with selected memory contract".into());}
                         if *name == seismic_lang::intrinsics::Operation::MatrixStore { return Err("fragment store requires owned shared tile storage".into()); }
                         if !matches!(elem, Elem::Dtype(_)) {
                             return Err("simdgroup atoms need a dense operand".into());
@@ -1712,15 +1703,15 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 };
                 let off_c = self.sym(&off)?;
                 let ld_c = self.sym(&ld)?;
-                let want_t = *name == seismic_lang::intrinsics::Operation::MatrixLoadTranspose;
                 let transpose = want_t != col_major;
+                let builtin=implementation.metal_builtin().ok_or("matrix transfer has no selected builtin")?;
                 match name {
-                    seismic_lang::intrinsics::Operation::MatrixLoad | seismic_lang::intrinsics::Operation::MatrixLoadTranspose => self.line(&format!("simdgroup_load({frag}, {ptr} + ({off_c}), {ld_c}, ulong2(0, 0), {transpose});")),
+                    seismic_lang::intrinsics::Operation::MatrixLoad | seismic_lang::intrinsics::Operation::MatrixLoadTranspose => self.line(&format!("{builtin}({frag}, {ptr} + ({off_c}), {ld_c}, ulong2(0, 0), {transpose});")),
                     _ => {
                         if col_major {
                             return Err("simdgroup_store into a column-major view is not supported".into());
                         }
-                        self.line(&format!("simdgroup_store({frag}, {ptr} + ({off_c}), {ld_c});"));
+                        self.line(&format!("{builtin}({frag}, {ptr} + ({off_c}), {ld_c});"));
                         let ExprKind::Var(destination) = args[1].kind else { return Err("fragment store has no tile binding".into()); };
                         self.barrier(BarrierSite { operation, variable: destination, purpose: BarrierPurpose::IntrinsicStore })?;
                     }
@@ -1728,6 +1719,9 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                 Ok(())
             }
             seismic_lang::intrinsics::Operation::MatrixMultiplyAccumulate => {
+                let CollectiveImplementation::MultiplyAccumulate{fragments,..}=&implementation else {return Err("matrix multiply implementation mismatch".into());};
+                if args.iter().zip(fragments).any(|(arg,id)|!matches!(arg.kind,ExprKind::Var(v) if v==*id)) {return Err("matrix multiply operands differ from prepared execution".into());}
+                let builtin=implementation.metal_builtin().ok_or("matrix multiply has no selected builtin")?;
                 let names: Vec<String> = args
                     .iter()
                     .map(|a| match a.kind {
@@ -1738,7 +1732,7 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
                         _ => Err("fragment must be a variable".to_string()),
                     })
                     .collect::<Result<_, _>>()?;
-                self.line(&format!("simdgroup_multiply_accumulate({}, {}, {}, {});", names[0], names[1], names[2], names[3]));
+                self.line(&format!("{builtin}({}, {}, {}, {});", names[0], names[1], names[2], names[3]));
                 Ok(())
             }
             other @ (seismic_lang::intrinsics::Operation::SimdSum
@@ -1748,17 +1742,13 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
         }
     }
 
-    fn frag_decl(&mut self, v: VarId, dtype: DType) -> String {
+    fn frag_decl(&mut self, v: VarId, layout: crate::collective::FragmentLayout) -> Result<(),String> {
         let name = format!("{}_{}", sanitize(&self.vars()[v].name), v);
-        let elem = match dtype {
-            DType::BF16 => "bfloat",
-            DType::F16 => "half",
-            DType::F32 => "float",
-            other => panic!("no simdgroup matrix of {}", other.name()),
-        };
-        self.line(&format!("simdgroup_{elem}8x8 {name};"));
-        self.real.insert(v, Realization::Frag { name: name.clone() });
-        name
+        let allocation=self.execution.memory.launches()[self.memory_launch].fragments.iter().find(|a|a.variable==v).ok_or("unplanned fragment storage")?;
+        if allocation.layout!=layout {return Err("fragment storage differs from selected layout".into());}
+        self.line(&format!("{} {name};",layout.metal_type()?));
+        self.real.insert(v, Realization::Frag { name });
+        Ok(())
     }
 
     // Generic reads are checked as F32 even when specialization binds a narrow
@@ -1831,7 +1821,9 @@ template<typename T> inline void seismic_write(device T* pointer, long index, ul
             ExprKind::Intrinsic { op: name, args } => match name {
                 seismic_lang::intrinsics::Operation::SimdSum | seismic_lang::intrinsics::Operation::SimdMax | seismic_lang::intrinsics::Operation::SimdMin => {
                     let a = self.expr(&args[0])?;
-                    Ok(format!("{name}({a})"))
+                    let implementation=self.collective(*name)?;
+                    let builtin=implementation.metal_builtin().ok_or("scalar collective has no builtin")?;
+                    Ok(format!("{builtin}({a})"))
                 }
                 seismic_lang::intrinsics::Operation::Matrix => Err("simdgroup_matrix must be assigned to a variable".into()),
                 other @ (seismic_lang::intrinsics::Operation::MatrixLoad

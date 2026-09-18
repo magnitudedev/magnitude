@@ -15,6 +15,12 @@ pub struct Bounds {
 }
 
 impl Count {
+    /// Cardinality of a half-open unit-stride signed domain. Its full range fits
+    /// u64 even when subtracting the endpoints would overflow i64.
+    pub fn iterations(lower: i64, upper: i64) -> Self {
+        Self::Exact((i128::from(upper) - i128::from(lower)).max(0) as u64)
+    }
+
     pub fn interval(lower: u64, upper: u64) -> Result<Self, String> {
         if lower > upper {
             return Err("count lower bound exceeds upper bound".into());
@@ -107,5 +113,13 @@ mod tests {
             Count::interval(12, 30).unwrap()
         );
         assert!(Count::interval(9, 8).is_err());
+    }
+
+    #[test]
+    fn half_open_domains_cover_the_signed_endpoint_range() {
+        assert_eq!(Count::iterations(i64::MIN, i64::MAX), Count::Exact(u64::MAX));
+        assert_eq!(Count::iterations(-3, 4), Count::Exact(7));
+        assert_eq!(Count::iterations(4, -3), Count::Exact(0));
+        assert_eq!(Count::iterations(4, 4), Count::Exact(0));
     }
 }

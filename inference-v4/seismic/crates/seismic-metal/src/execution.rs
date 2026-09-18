@@ -191,14 +191,16 @@ pub struct Execution {
     pub(crate) function: LoweredIr,
     pub(crate) config: Config,
     pub(crate) phases: Vec<Phase>,
-    pub(crate) memory: seismic_realization::memory::MemoryPlan,
+    pub(crate) memory: crate::memory::MemoryPlan,
+    pub(crate) support: crate::support::Plan,
     pub(crate) reductions: crate::reduction::ReductionPlan,
     pub(crate) storage: crate::storage::StoragePlan,
     pub(crate) partition_parameters: Vec<(usize, DType)>,
 }
 
 impl Execution {
-    pub fn memory(&self) -> &seismic_realization::memory::MemoryPlan {
+    pub fn support(&self) -> &crate::support::Plan {&self.support}
+    pub fn memory(&self) -> &crate::memory::MemoryPlan {
         &self.memory
     }
     pub fn reductions(&self) -> &crate::reduction::ReductionPlan {
@@ -217,20 +219,8 @@ impl Execution {
 
 /// Apply a caller's choices exactly, without generating source or querying a device.
 pub fn prepare(function: &LoweredIr, config: Config) -> Result<Execution, String> {
-    use seismic_realization::dispatch::TilePlacement;
     prepare_storage_selected(function, config, &mut |decision| {
-        // Diagnostic policy, pending model-driven selection; never an optimality claim.
-        Ok(
-            if decision.intrinsic_operand
-                || (decision.cross_lane_read && decision.capacity > SUBGROUP)
-            {
-                TilePlacement::GroupShared
-            } else if decision.capacity <= SUBGROUP {
-                TilePlacement::Replicated
-            } else {
-                TilePlacement::Distributed
-            },
-        )
+        Ok(decision.diagnostic())
     })
 }
 
@@ -242,20 +232,7 @@ pub fn prepare_storage_selected(
     ) -> Result<seismic_realization::dispatch::TilePlacement, String>,
 ) -> Result<Execution, String> {
     prepare_selected(function, config, select, &mut |decision| {
-        use crate::reduction::Algorithm;
-        let domain = &decision.domain;
-        // Diagnostic selection until the qualified resource model closes this decision.
-        Ok(
-            if domain.output_capacity() > SUBGROUP as u64
-                && domain.algorithms().contains(&Algorithm::LaneLocal)
-            {
-                Algorithm::LaneLocal
-            } else if domain.algorithms().contains(&Algorithm::Collective) {
-                Algorithm::Collective
-            } else {
-                Algorithm::Ordered
-            },
-        )
+        Ok(decision.diagnostic())
     })
 }
 
@@ -268,6 +245,21 @@ pub fn prepare_selected(
     select_reduction: &mut dyn FnMut(
         &crate::reduction::Decision,
     ) -> Result<crate::reduction::Algorithm, String>,
+) -> Result<Execution, String> {
+    let borrow = config.loads == seismic_realization::LoadStrategy::BorrowProvenReadOnly;
+    prepare_with_choices(function, config, &mut |_, site| {
+        Ok(if borrow && site.can_borrow { LoadMode::Borrow } else { LoadMode::Materialize })
+    }, select, select_reduction)
+}
+
+/// Prepare all site choices after decomposition, so widening and splitting
+/// cannot silently create loads outside the selected domain.
+pub fn prepare_with_choices(
+    function: &LoweredIr,
+    config: Config,
+    select_load: &mut dyn FnMut(usize, &seismic_lang::normalize::loads::Site) -> Result<LoadMode, String>,
+    select: &mut dyn FnMut(&crate::storage::StorageDecision) -> Result<seismic_realization::dispatch::TilePlacement, String>,
+    select_reduction: &mut dyn FnMut(&crate::reduction::Decision) -> Result<crate::reduction::Algorithm, String>,
 ) -> Result<Execution, String> {
     if function.backend != "metal" {
         return Err("Metal execution requires Metal Lowered IR".into());
@@ -464,10 +456,10 @@ pub fn prepare_selected(
             split.loop_at = positions[split.loop_at];
         }
     }
-    seismic_lang::normalize::select_loads(
-        &mut function.body,
-        config.loads == seismic_realization::LoadStrategy::BorrowProvenReadOnly,
-    );
+    let load_modes = seismic_lang::normalize::loads::sites(&function.body).iter()
+        .enumerate().map(|(index, site)| select_load(index, site))
+        .collect::<Result<Vec<_>, _>>()?;
+    seismic_lang::normalize::loads::resolve(&mut function.body, &load_modes)?;
     for phase in &mut phases {
         if let Some(split) = &mut phase.split {
             // Validation bindings are consumed by separately represented views.
@@ -503,6 +495,7 @@ pub fn prepare_selected(
         config.max_threadgroup_bytes as u64,
     )?;
     Ok(Execution {
+        support: crate::support::Plan::new(),
         memory,
         reductions,
         storage,

@@ -3,10 +3,13 @@
 Rust inference on Seismic. This workspace is under implementation; it is not yet a
 replacement for V3 or a qualified release.
 
-The implementation contract is the [master specification](/Users/anerli/notes/specs/26-09-17/inference-v4-master.md),
-with [Seismic Accounting](/Users/anerli/notes/specs/26-09-17/seismic-accounting.md)
-defining resource accounting and model-driven selection. V3 defines preserved engine
-behavior and numerical contracts.
+Start with the [architecture overview](docs/overview.md), then the
+[engine](docs/engine/overview.md) and [Seismic](docs/seismic/overview.md) contracts.
+These local docs define intended architecture. The [master implementation spec](/Users/anerli/notes/specs/26-09-17/inference-v4-master.md)
+and [accounting research/spec](/Users/anerli/notes/specs/26-09-17/seismic-accounting.md)
+provide implementation context; older conflicting mechanisms are superseded by the
+local architectural contracts. V3's active behavior and numerical contracts remain
+the preservation reference.
 
 Current packages are the audited foundation: language/checker/interpreter, Metal
 emission/runtime, a shared scalar realization with native CPU/CUDA execution, derived

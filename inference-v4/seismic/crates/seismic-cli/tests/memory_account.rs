@@ -1,6 +1,7 @@
 //! Cross-crate checks of structured IR -> selected memory plan -> accounting.
 //! No emitted source, native compilation, or device is needed for these counts.
-use seismic_accounting::{quantity::Count, storage};
+use seismic_accounting::quantity::Count;
+use seismic_metal::model as storage;
 use seismic_lang::{
     lower::{lower_with, Options},
     program::{compile, SourceFile},

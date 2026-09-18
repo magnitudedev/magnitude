@@ -206,3 +206,49 @@ fn ordered_phases_keep_domains_and_completion_edges() {
             .add(&account.phases[1].account.scratch_bytes_per_dispatch)
     );
 }
+
+#[test]
+fn scalar_predicate_counts_follow_narrow_integer_wrap() {
+    use cranelift_codegen::ir::{self, InstBuilder, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use seismic_realization::{ScalarProgram, execution::{ExecutionEvidence, Multiplicity}};
+    use std::sync::Arc;
+
+    for (input, taken) in [(127, 1), (128, 0)] {
+        let mut function = ir::Function::new();
+        let mut context = FunctionBuilderContext::new();
+        let (entry, yes, no, predicate) = {
+            let mut builder = FunctionBuilder::new(&mut function, &mut context);
+            let entry = builder.create_block();
+            let yes = builder.create_block();
+            let no = builder.create_block();
+            builder.switch_to_block(entry);
+            let value = builder.ins().iconst(types::I8, input);
+            let predicate = builder.ins().iadd(value, value);
+            builder.ins().brif(predicate, yes, &[], no, &[]);
+            builder.switch_to_block(yes);
+            builder.ins().return_(&[]);
+            builder.switch_to_block(no);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            builder.finalize();
+            (entry, yes, no, predicate)
+        };
+        let mut execution = ExecutionEvidence::default();
+        execution.blocks.insert(entry, Arc::new(Multiplicity::Constant(1)));
+        execution.blocks.insert(yes, Arc::new(Multiplicity::Predicate { value: predicate, expected: true }));
+        execution.blocks.insert(no, Arc::new(Multiplicity::Predicate { value: predicate, expected: false }));
+        let program = ScalarProgram {
+            function, buffers: Vec::new(), scalars: Vec::new(), scratch_bytes: 0,
+            imports: Vec::new(), work_items: 1, dispatch: Dispatch::Sequential,
+            loads: Vec::new(), execution,
+        };
+        cranelift_codegen::verify_function(&program.function, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder())).unwrap();
+        let account = scalar(&program);
+        for (block, count) in [(yes, taken), (no, 1 - taken)] {
+            let instructions = account.instructions.iter().filter(|i| i.block == block.to_string()).collect::<Vec<_>>();
+            assert!(!instructions.is_empty());
+            assert!(instructions.iter().all(|i| i.count == Count::Exact(count)));
+        }
+    }
+}

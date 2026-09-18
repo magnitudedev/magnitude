@@ -663,16 +663,18 @@ foundation milestone or describe it as full completion.
   dense-BF16-history comparison is running separately (session37771); do not claim
   numerical/performance parity before its results are analyzed.
 
-## Mechanically checked lower-bound specification
+## Unified lower-bound specification (revised 2026-09-17)
 
-- Added [the lower-bound specification](../../specs/26-09-17/seismic-sound-lower-bounds.md).
-  Necessary demand and capacity claims must enter proofs through checked rules and
-  explicit hardware contracts; explanation strings cannot establish authority.
-- The sequence is checker/trust boundary, required-transfer derivation, alternatives
-  and composition, real-hardware applicability, then certified pruning/selection.
-  The spec covers aliases, residency, packed representations, exact arithmetic,
-  conditional claims, proof replay and independent adversarial validation.
-- This checkpoint is documentation only. It implements no bound derivation and
-  closes no numerical, hardware-model or optimizer qualification gate. Local links,
-  Markdown fences/whitespace and design applicability were checked; no new runtime
-  test results are claimed.
+- Revised the existing [lower-bound specification](../../specs/26-09-17/seismic-sound-lower-bounds.md)
+  and all six V4 architecture docs to require one execution/resource/optimization
+  path. The previous proof-DAG, independent-checker, and certificate-lifecycle
+  direction is superseded and must not guide further implementation.
+- Bounds derive from sound relaxations of the same execution constraints used by
+  selection. Typed decisions, shared implementation definitions, exact arithmetic,
+  aliases/versions, residency, and explicit hardware conditions remain required.
+  The spec directs removal of the parallel bounds computation graph and competing
+  prediction pipeline, with their necessary analysis moved to the existing owners.
+- This checkpoint changes documentation only. It does not claim that the code is
+  consolidated or close any numerical, hardware-model, or optimizer qualification
+  gate. Implementation must follow the revised spec's consolidation and acceptance
+  requirements.

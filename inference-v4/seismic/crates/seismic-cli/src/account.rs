@@ -67,7 +67,7 @@ pub fn print_work(
     }
     let memory = derived.memory;
     println!(
-        "accessed backing regions: {} ({} analysis steps; budget {})",
+        "diagnostic access regions: {} ({} analysis steps; budget {})",
         if memory.is_exact() {
             "exact union"
         } else {
@@ -76,6 +76,7 @@ pub fn print_work(
         memory.analysis_steps,
         analysis_steps
     );
+    println!("  alias assumption: unbound parameters/planes use separate named backings; this is not an invocation binding or necessary-traffic proof");
     for (backing, access) in memory.accesses.iter() {
         println!(
             "  {backing}: {} bytes read, {} bytes written",

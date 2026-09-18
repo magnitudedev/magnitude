@@ -136,20 +136,12 @@ fn count(s: &Sym, b: &Bindings) -> Count {
     }
 }
 
-fn product(a: &Count, b: &Count) -> Count {
-    match (a, b) {
-        (Count::Exact(n), _) => b.scale(*n),
-        (_, Count::Exact(n)) => a.scale(*n),
-        _ => Count::unknown(format!("unresolved multiplicity: {a:?} * {b:?}")),
-    }
-}
-
 fn elements(ty: &Ty, b: &Bindings) -> Count {
     ty.shaped()
         .map(|t| {
             t.shape
                 .iter()
-                .fold(Count::Exact(1), |a, s| product(&a, &count(s, b)))
+                .fold(Count::Exact(1), |a, s| Count::multiply(&a, &count(s, b)))
         })
         .unwrap_or(Count::Exact(1))
 }
@@ -226,24 +218,21 @@ impl Walker<'_> {
                 StmtKind::Parallel { extents, body, .. } => {
                     let n = extents
                         .iter()
-                        .fold(mult.clone(), |a, d| product(&a, &count(d, b)));
+                        .fold(mult.clone(), |a, d| Count::multiply(&a, &count(d, b)));
                     self.block(body, f, b, &n);
                 }
                 StmtKind::Owned { tile, body, .. } => {
-                    self.block(body, f, b, &product(mult, &elements(&tile.ty, b)))
+                    self.block(body, f, b, &Count::multiply(mult, &elements(&tile.ty, b)))
                 }
                 StmtKind::Range { lo, hi, body, .. } => {
                     let n = match (
                         lo.eval(&|p| b.shapes.get(p).copied()),
                         hi.eval(&|p| b.shapes.get(p).copied()),
                     ) {
-                        (Some(lo), Some(hi)) => match hi.checked_sub(lo) {
-                            Some(n) => Count::Exact(n.max(0) as u64),
-                            None => Count::unknown("range length overflow"),
-                        },
+                        (Some(lo), Some(hi)) => Count::iterations(lo, hi),
                         _ => Count::unknown(format!("dependent range `{lo}..{hi}`")),
                     };
-                    self.block(body, f, b, &product(mult, &n));
+                    self.block(body, f, b, &Count::multiply(mult, &n));
                 }
                 StmtKind::LoadLoop {
                     views,
@@ -316,7 +305,7 @@ impl Walker<'_> {
                         self.conversion(
                             dtype(&value.ty, b),
                             publication_dtype,
-                            product(mult, &elements(&target.ty, b)),
+                            Count::multiply(mult, &elements(&target.ty, b)),
                             f,
                             target,
                         );
@@ -345,7 +334,7 @@ impl Walker<'_> {
                                     operator: operator.into(),
                                     dtype: d,
                                 },
-                                product(mult, &elements(&target.ty, b)),
+                                Count::multiply(mult, &elements(&target.ty, b)),
                                 f,
                                 target,
                             );
@@ -418,7 +407,7 @@ impl Walker<'_> {
                     Builtin::Store => self.conversion(
                         dtype(&args[0].ty, b),
                         dtype(&args[1].ty, b),
-                        product(mult, &elements(&args[1].ty, b)),
+                        Count::multiply(mult, &elements(&args[1].ty, b)),
                         f,
                         e,
                     ),
@@ -453,7 +442,7 @@ impl Walker<'_> {
                                         ),
                                         extent: count(extent, b),
                                     },
-                                    product(mult, &elements(&e.ty, b)),
+                                    Count::multiply(mult, &elements(&e.ty, b)),
                                     f,
                                     e,
                                 );
@@ -470,7 +459,7 @@ impl Walker<'_> {
                                 self.conversion(
                                     dtype(&a.ty, b),
                                     Some(d),
-                                    product(mult, &elements(&a.ty, b)),
+                                    Count::multiply(mult, &elements(&a.ty, b)),
                                     f,
                                     a,
                                 );
@@ -480,7 +469,7 @@ impl Walker<'_> {
                                     operation: *name,
                                     dtype: d,
                                 },
-                                product(mult, &elements(&e.ty, b)),
+                                Count::multiply(mult, &elements(&e.ty, b)),
                                 f,
                                 e,
                             );
@@ -502,14 +491,14 @@ impl Walker<'_> {
                     self.conversion(
                         dtype(&lhs.ty, b),
                         Some(d),
-                        product(mult, &elements(&lhs.ty, b)),
+                        Count::multiply(mult, &elements(&lhs.ty, b)),
                         f,
                         lhs,
                     );
                     self.conversion(
                         dtype(&rhs.ty, b),
                         Some(d),
-                        product(mult, &elements(&rhs.ty, b)),
+                        Count::multiply(mult, &elements(&rhs.ty, b)),
                         f,
                         rhs,
                     );
@@ -518,7 +507,7 @@ impl Walker<'_> {
                             operator: op.text().into(),
                             dtype: d,
                         },
-                        product(mult, &elements(&e.ty, b)),
+                        Count::multiply(mult, &elements(&e.ty, b)),
                         f,
                         e,
                     );
@@ -541,7 +530,7 @@ impl Walker<'_> {
                             operator: format!("{op:?}"),
                             dtype: d,
                         },
-                        product(mult, &elements(&e.ty, b)),
+                        Count::multiply(mult, &elements(&e.ty, b)),
                         f,
                         e,
                     );
@@ -553,7 +542,7 @@ impl Walker<'_> {
                     if from != *to {
                         self.term(
                             WorkKind::Conversion { from, to: *to },
-                            product(mult, &elements(&e.ty, b)),
+                            Count::multiply(mult, &elements(&e.ty, b)),
                             f,
                             e,
                         );

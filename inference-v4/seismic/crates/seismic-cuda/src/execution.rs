@@ -1,7 +1,7 @@
 //! Selected scalar CUDA execution, resolved without a driver or native compilation.
 //! This baseline assigns one work item to each CUDA thread. It does not model
 //! native registers/occupancy or select a performance-optimal block size.
-use seismic_realization::{dispatch::GroupDispatch, ScalarProgram};
+use seismic_realization::{ScalarProgram, dispatch::GroupDispatch};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -17,6 +17,7 @@ pub struct InvocationStorage {
 }
 pub struct Execution {
     program: ScalarProgram,
+    target: crate::ptx::TargetPlan,
     dispatch: GroupDispatch,
     storage: InvocationStorage,
 }
@@ -54,14 +55,20 @@ impl Execution {
                 .checked_mul(4)
                 .ok_or("CUDA status size overflow")?,
         };
+        let target = crate::ptx::prepare(&program)?;
         Ok(Self {
             program,
+            target,
             dispatch,
             storage,
         })
     }
     pub fn program(&self) -> &ScalarProgram {
         &self.program
+    }
+    /// The exact terminal implementation retained before printing/native compilation.
+    pub fn target_plan(&self) -> &crate::ptx::TargetPlan {
+        &self.target
     }
     pub fn dispatch(&self) -> &GroupDispatch {
         &self.dispatch

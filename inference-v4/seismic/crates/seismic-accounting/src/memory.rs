@@ -24,7 +24,9 @@ pub struct Backing {
 }
 
 /// Parameter/plane -> backing. Dense tensors use the empty plane name. Packed
-/// tensors use `words`, `scale`, `bias`. Omitted bindings get distinct identities.
+/// tensors use `words`, `scale`, `bias`. Omitted bindings get distinct diagnostic
+/// parameter/plane identities. This assumption is not an alias proof or an actual
+/// invocation binding and must never supply necessary physical-demand evidence.
 pub type Bindings = HashMap<(String, String), Backing>;
 
 #[derive(Clone, Debug, Default)]

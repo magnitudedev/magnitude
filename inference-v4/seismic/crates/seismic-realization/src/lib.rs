@@ -3,7 +3,6 @@
 use seismic_lang::abi::ScalarParameter;
 pub mod execution;
 pub mod storage;
-pub mod memory;
 use cranelift_codegen::ir;
 pub use cranelift_codegen::isa::CallConv;
 
@@ -35,6 +34,7 @@ impl MathFunction {
 }
 /// Concrete storage and instruction program, not a cost estimate. Math imports
 /// retain semantic identities; the target must supply an admitted implementation.
+#[derive(Clone)]
 pub struct ScalarProgram {
     pub function: ir::Function,
     pub buffers: Vec<BufferSpec>,
@@ -43,7 +43,7 @@ pub struct ScalarProgram {
     pub imports: Vec<(ir::FuncRef, MathFunction)>,
     pub work_items: u64,
     pub dispatch: Dispatch,
-    pub loads: LoadStrategy,
+    pub loads: Vec<seismic_lang::normalize::loads::Decision>,
     pub execution: execution::ExecutionEvidence,
 }
 
@@ -91,3 +91,7 @@ pub struct ScalarPhase {
 pub mod dispatch;
 
 pub mod graph;
+pub mod integer;
+pub mod scheduling;
+
+pub mod liveness;

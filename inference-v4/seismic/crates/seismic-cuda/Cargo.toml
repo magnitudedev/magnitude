@@ -11,3 +11,4 @@ cranelift-codegen = "=0.125.4"
 libloading = "0.8.9"
 
 seismic-realization.workspace = true
+seismic-accounting.workspace = true

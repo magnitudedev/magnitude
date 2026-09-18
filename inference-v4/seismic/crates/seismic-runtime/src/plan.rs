@@ -178,6 +178,7 @@ impl Submission {
                 .try_borrow()
                 .map_err(|_| "shared kernel is already executing")?;
             let kind = std::mem::discriminant(&kernel.executable);
+            kernel.validate_tuning(&invocation.buffers, &invocation.scalars)?;
             if backend.is_some_and(|previous| previous != kind) {
                 return Err("mixed backends in submission".into());
             }

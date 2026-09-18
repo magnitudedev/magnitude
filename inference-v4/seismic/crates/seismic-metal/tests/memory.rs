@@ -3,11 +3,11 @@ use seismic_lang::{
     program::{compile, SourceFile},
     Scope,
 };
+use seismic_metal::memory::{BarrierPurpose, MemorySpace, Purpose};
 use seismic_metal::{
     execution::{prepare_storage_selected, Config},
     msl::emit_execution,
 };
-use seismic_realization::memory::{BarrierPurpose, MemorySpace, Purpose};
 use seismic_realization::{dispatch::TilePlacement, LoadStrategy};
 
 fn prepare(text: &str, placement: TilePlacement) -> seismic_metal::execution::Execution {
@@ -106,7 +106,7 @@ fn fragment_execution() -> seismic_metal::execution::Execution {
 fn fragment_publication_orders_owned_shared_storage() {
     let execution = fragment_execution();
     let launch = &execution.memory().launches()[0];
-    assert_eq!(launch.unmodeled_fragments.len(), 2);
+    assert_eq!(launch.fragments.len(), 2);
     let stores: Vec<_> = launch
         .barriers
         .iter()
@@ -290,4 +290,102 @@ fn native_shared_snapshot_in_replicated_owned_domain_preserves_sum() {
     let out = device.buffer(4).unwrap();
     device.run(&kernel, &[&x, &out], &[], 1).unwrap();
     assert_eq!(out.read(4), input.iter().sum::<f32>().to_le_bytes());
+}
+
+fn selected_backend_body(body: &str) -> Result<seismic_metal::execution::Execution, String> {
+    let portable = "construct transfer(x: tile[32] f32, out: tile[1] f32):\n  out[0] = x[0]\nfn evaluate(x: tensor[32] f32, out: tensor[1] f32):\n  a = load(x)\n  b = tile[1] f32\n  for i in owned(b): b[i] = 0.0\n  transfer(a,b)\n  store(b,out)\n";
+    let backend = format!("lower transfer(x: tile[32] f32, out: tile[1] f32):\n{body}");
+    let program = compile(
+        &[
+            SourceFile {
+                path: "collective.seismic.portable".into(),
+                scope: Scope::Portable,
+                text: portable.into(),
+            },
+            SourceFile {
+                path: "collective.seismic.metal".into(),
+                scope: Scope::Backend("metal".into()),
+                text: backend,
+            },
+        ],
+        &[],
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let lowered =
+        lower(&program, "evaluate", "metal", &Default::default()).map_err(|e| format!("{e:?}"))?;
+    seismic_metal::execution::prepare(&lowered, Config::default())
+}
+
+#[test]
+fn collective_implementations_are_admitted_and_consumed_before_native_compilation() {
+    let execution = selected_backend_body("  out[0] = simd_sum(simd_max(0.0))\n").unwrap();
+    let launch = &execution.memory().launches()[0];
+    assert_eq!(launch.collectives.len(), 2);
+    let names: Vec<_> = launch
+        .collectives
+        .values()
+        .map(|c| c.implementation.metal_builtin().unwrap())
+        .collect();
+    assert_eq!(names, ["simd_max", "simd_sum"]);
+    emit_execution(&execution).unwrap();
+    let invalid = selected_backend_body(
+        "  fragment = simdgroup_matrix(i32)\n  for i in owned(out): out[i] = 0.0\n",
+    )
+    .err()
+    .unwrap();
+    assert!(invalid.contains("matrices do not support i32"), "{invalid}");
+}
+
+#[test]
+fn lane_dependent_collective_control_is_rejected_during_preparation() {
+    let invalid = selected_backend_body(
+        "  for k in lanes(32,1):\n    if k == 0:\n      out[0] = simd_sum(x[k])\n",
+    )
+    .err()
+    .unwrap();
+    assert!(invalid.contains("full-lane participation"), "{invalid}");
+}
+
+fn tensor_control(body: &str) -> Result<seismic_metal::execution::Execution, String> {
+    let portable = "construct transfer(x: tensor[32] f32, out: tile[1] f32):\n  out[0] = x[0]\nfn evaluate(x: tensor[32] f32, out: tensor[1] f32):\n  b = tile[1] f32\n  for i in owned(b): b[i] = 0.0\n  transfer(x,b)\n  store(b,out)\n";
+    let backend = format!("lower transfer(x: tensor[32] f32, out: tile[1] f32):\n{body}");
+    let program = compile(
+        &[
+            SourceFile {
+                path: "tensor-control.seismic.portable".into(),
+                scope: Scope::Portable,
+                text: portable.into(),
+            },
+            SourceFile {
+                path: "tensor-control.seismic.metal".into(),
+                scope: Scope::Backend("metal".into()),
+                text: backend,
+            },
+        ],
+        &[],
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let lowered =
+        lower(&program, "evaluate", "metal", &Default::default()).map_err(|e| format!("{e:?}"))?;
+    seismic_metal::execution::prepare(&lowered, Config::default())
+}
+
+#[test]
+fn common_tensor_addresses_prove_uniform_control_without_assuming_private_values_agree() {
+    let execution = tensor_control("  if x[0] > 0.0:\n    out[0] = simd_sum(1.0)\n")
+        .expect("the same stable tensor read agrees in every lane");
+    assert_eq!(execution.memory().launches()[0].collectives.len(), 1);
+    emit_execution(&execution).unwrap();
+
+    for body in [
+        "  for k in lanes(32,1):\n    if x[k] > 0.0:\n      out[0] = simd_sum(1.0)\n",
+        "  partial = tile[1] f32\n  for i in owned(partial): partial[i] = 0.0\n  for k in lanes(32,1): partial[0] = f32(k)\n  if partial[0] > 0.0:\n    out[0] = simd_sum(1.0)\n",
+        "  store(out,x[0:1])\n  if x[0] > 0.0:\n    out[0] = simd_sum(1.0)\n",
+        "  for step in range(2):\n    if x[0] > 0.0:\n      out[0] = simd_sum(1.0)\n    store(out,x[0:1])\n",
+    ] {
+        let error = tensor_control(body)
+            .err()
+            .expect("varying or potentially unpublished memory cannot prove collective control");
+        assert!(error.contains("full-lane participation"), "{body}\n{error}");
+    }
 }

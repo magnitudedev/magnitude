@@ -5,7 +5,7 @@ use seismic_realization::execution::Multiplicity;
 use std::{collections::HashMap, sync::Arc};
 
 /// The caller keeps all nodes alive for the lifetime of this pointer-keyed cache.
-pub(crate) fn evaluate<V>(
+pub fn evaluate<V>(
     node: &Arc<Multiplicity<V>>,
     cache: &mut HashMap<usize, Count>,
     constant: &mut impl FnMut(&V) -> Option<i64>,
@@ -22,7 +22,7 @@ pub(crate) fn evaluate<V>(
         }
         Multiplicity::PlusOne(a) => evaluate(a, cache, constant).add(&Count::Exact(1)),
         Multiplicity::Iterations { lower, upper } => match (constant(lower), constant(upper)) {
-            (Some(lo), Some(hi)) => Count::Exact((i128::from(hi) - i128::from(lo)).max(0) as u64),
+            (Some(lo), Some(hi)) => Count::iterations(lo, hi),
             _ => Count::unknown("runtime or dependent execution extent"),
         },
         Multiplicity::Predicate { value, expected } => match constant(value) {

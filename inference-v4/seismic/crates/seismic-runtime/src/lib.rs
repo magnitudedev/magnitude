@@ -33,7 +33,7 @@ enum Storage {
     Metal(seismic_metal::runtime::Buffer),
 }
 #[derive(Clone)]
-pub struct Buffer(Storage, Rc<Allocation>);
+pub struct Buffer(Storage, Rc<Allocation>, usize);
 struct Allocation {
     bytes: usize,
 }
@@ -81,6 +81,7 @@ pub struct Kernel {
     executable: Executable,
     buffers: Vec<BufferSpec>,
     scalars: Vec<ScalarParameter>,
+    tuning: Option<tuner::Artifact>,
 }
 impl Device {
     pub fn facts(&self) -> DeviceFacts {
@@ -125,6 +126,7 @@ impl Device {
                 BackendDevice::Metal(device) => Storage::Metal(device.buffer(bytes)?),
             },
             Rc::new(Allocation { bytes }),
+            0,
         ))
     }
     pub fn buffer_from(&self, bytes: &[u8]) -> Result<Buffer, String> {
@@ -133,10 +135,12 @@ impl Device {
         Ok(buffer)
     }
     pub fn compile_tuned(&self, tuned: tuner::TunedIr) -> Result<Kernel, String> {
-        if &self.facts() != tuned.hardware() {
-            return Err("tuned execution targets different hardware facts".into());
-        }
-        self.compile_execution(tuned.into_execution())
+        if !matches!(self.0,BackendDevice::Cpu) { return Err("CPU tuned execution requires a CPU device".into()); }
+        let (program, artifact) = tuned.into_parts();
+        let kernel = seismic_cpu::compile_execution_with(program,&artifact.conditions().codegen)?;
+        let buffers=kernel.buffers().to_vec();
+        let scalars=kernel.scalars().to_vec();
+        Ok(Kernel { executable:Executable::Cpu(Box::new(kernel)),buffers,scalars,tuning:Some(artifact) })
     }
     pub fn compile(&self, lowered: &LoweredIr, candidate: Candidate) -> Result<Kernel, String> {
         let execution = execution::Execution::prepare(lowered, candidate, &self.facts())?;
@@ -169,10 +173,18 @@ impl Device {
             }
             _ => return Err("selected execution and device backend differ".into()),
         };
-        Ok(Kernel { executable, buffers, scalars })
+        Ok(Kernel { executable, buffers, scalars, tuning: None })
     }
 }
 impl Buffer {
+    fn model_alignment(&self) -> Result<u64, String> {
+        match &self.0 {
+            // The owner allocates Vec<u64>; this is a stable guaranteed minimum,
+            // independent of allocator luck or the offset of this view.
+            Storage::Cpu(_) => Ok(std::mem::align_of::<u64>() as u64),
+            _ => Err("GPU buffer model admission requires its backend contract".into()),
+        }
+    }
     /// Allocation identity survives cloning and byte views. It is distinct from
     /// logical view size and is never inferred from an exposed device address.
     pub fn shares_allocation(&self, other: &Self) -> bool {
@@ -219,7 +231,12 @@ impl Buffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Offset relative to the retained allocation, including nested views.
+    pub fn allocation_offset(&self) -> usize {
+        self.2
+    }
     pub fn view(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
+        let offset = self.2.checked_add(range.start).ok_or("buffer view offset overflow")?;
         Ok(Self(
             match &self.0 {
                 Storage::Cpu(b) => Storage::Cpu(b.view(range)?),
@@ -228,6 +245,7 @@ impl Buffer {
                 Storage::Metal(b) => Storage::Metal(b.view(range)?),
             },
             self.1.clone(),
+            offset,
         ))
     }
     pub fn write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -260,6 +278,13 @@ impl Buffer {
     }
 }
 impl Kernel {
+    pub fn tuning(&self) -> Option<&tuner::Artifact> { self.tuning.as_ref() }
+    fn validate_tuning(&self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
+        if let Some(artifact) = &self.tuning {
+            tuner::validate_bindings(artifact.workload(), buffers, &self.scalars, scalars)?;
+        }
+        Ok(())
+    }
     #[cfg(target_os = "macos")]
     pub fn metal_pipeline_facts(&self) -> Option<&[seismic_metal::runtime::PipelineFacts]> {
         match &self.executable { Executable::Metal {pipeline,..}=>Some(&pipeline.facts), _=>None }
@@ -307,6 +332,7 @@ impl Kernel {
         scalars: &[f64],
         timed: bool,
     ) -> Result<Option<f64>, String> {
+        self.validate_tuning(buffers, scalars)?;
         match &mut self.executable {
             Executable::Cpu(kernel) => {
                 let buffers = buffers

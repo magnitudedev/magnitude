@@ -127,6 +127,54 @@ fn selected_loads_preserve_snapshots_and_can_be_reselected() {
 }
 
 #[test]
+fn load_space_covers_mixed_modes_and_forces_mutated_snapshots() {
+    use seismic_lang::{
+        ir::LoadMode::{Borrow, Materialize},
+        normalize::loads::{self, Expansion},
+    };
+    let p = program("fn evaluate(x: tensor[4] f32, y: tensor[4] f32, out: tensor[1] f32):\n  a = load(x)\n  sa = reduce(a,0,sum)\n  b = load(y)\n  sb = reduce(b,0,sum)\n  c = load(x)\n  for i in owned(c): c[i] = 0.0\n  sc = reduce(c,0,sum)\n  z = tile[1] f32\n  for i in owned(z): z[i] = sa + sb + sc\n  store(z,out)\n");
+    let lowered = seismic_lang::lower::lower(&p, "evaluate", "cpu", &Default::default()).unwrap();
+    assert!(matches!(
+        loads::expand(&lowered, &[]).unwrap(),
+        Expansion::Choice(loads::Choice { site: 0, .. })
+    ));
+    let mut observed = Vec::new();
+    for a in 0..2 {
+        for b in 0..2 {
+            let Expansion::Selected {
+                mut function,
+                consumed,
+            } = loads::expand(&lowered, &[a, b]).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(consumed, 2);
+            let modes = loads::selected(&function.body)
+                .unwrap()
+                .into_iter()
+                .map(|d| d.mode)
+                .collect::<Vec<_>>();
+            assert_eq!(modes[2], Materialize);
+            observed.push(modes.clone());
+            let before = function.body.clone();
+            let mut invalid = modes;
+            invalid[2] = Borrow;
+            assert!(loads::resolve(&mut function.body, &invalid).is_err());
+            assert_eq!(function.body, before);
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![
+            vec![Materialize, Materialize, Materialize],
+            vec![Materialize, Borrow, Materialize],
+            vec![Borrow, Materialize, Materialize],
+            vec![Borrow, Borrow, Materialize]
+        ]
+    );
+}
+
+#[test]
 fn selected_loads_keep_reference_interpreter_semantics() {
     let mut p = program(SCOPED);
     let f = &mut p.functions[0];

@@ -10,5 +10,3 @@ cranelift-codegen = "=0.125.4"
 
 seismic-realization.workspace = true
 
-[dev-dependencies]
-seismic-compiler.workspace = true

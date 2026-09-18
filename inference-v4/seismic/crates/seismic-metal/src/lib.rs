@@ -12,3 +12,9 @@ pub mod plan_exec;
 pub mod runtime;
 
 pub mod choices;
+
+pub mod collective;
+
+pub mod support;
+
+pub mod model;

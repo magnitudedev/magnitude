@@ -1008,7 +1008,6 @@ name = "seismic-accounting"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
- "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
 ]
@@ -1034,6 +1033,7 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
+ "seismic-accounting",
  "seismic-lang",
  "seismic-realization",
 ]
@@ -1046,6 +1046,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
@@ -1057,6 +1058,7 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "libloading",
+ "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
@@ -1087,6 +1089,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "seismic-accounting",
  "seismic-lang",
  "seismic-realization",
 ]

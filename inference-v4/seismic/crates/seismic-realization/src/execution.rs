@@ -3,7 +3,7 @@
 use cranelift_codegen::ir::{Block, Value};
 use std::{collections::HashMap, sync::Arc};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Multiplicity<V = Value> {
     Constant(u64),
     Unknown {
@@ -33,7 +33,7 @@ pub enum MemoryObject {
     ScalarArguments,
     PrivateScratch,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionEvidence {
     /// Executions per invocation, conditional on all runtime validity guards passing.
     pub blocks: HashMap<Block, Arc<Multiplicity>>,

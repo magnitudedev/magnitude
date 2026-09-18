@@ -2,10 +2,10 @@
 //! optimization: instruction instances and requested bytes, not issued machine
 //! instructions, cache transactions, or DRAM traffic.
 use crate::quantity::Count;
-use cranelift_codegen::ir::{self, InstructionData as D, Opcode as O, Value, ValueDef};
+use cranelift_codegen::ir::{self, Value, ValueDef};
 use seismic_realization::{
-    execution::{MemoryObject, Multiplicity},
     ScalarProgram,
+    execution::{MemoryObject, Multiplicity},
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,27 +63,45 @@ pub fn scalar(program: &ScalarProgram) -> ScalarAccount {
     let graph = seismic_realization::graph::Graph::scalar(program);
     out.unavailable.extend(graph.unavailable.iter().cloned());
     for block in &graph.blocks {
-        let executions = block.executions.as_ref()
+        let executions = block
+            .executions
+            .as_ref()
             .map(|m| analysis.multiplicity(m))
             .unwrap_or_else(|| Count::unknown(format!("missing execution domain for {}", block.id)))
             .scale(program.work_items);
         for &index in &block.instructions {
             let instruction = &graph.instructions[index];
             out.instructions.push(InstructionTerm {
-                block: block.id.to_string(), instruction: instruction.id.to_string(),
-                opcode: instruction.opcode.to_string(), primitive: instruction.primitive,
-                operand_types: instruction.inputs.iter().map(|v|v.ty.to_string()).collect(),
-                result_types: instruction.outputs.iter().map(|(_,ty)|ty.to_string()).collect(),
+                block: block.id.to_string(),
+                instruction: instruction.id.to_string(),
+                opcode: instruction.opcode.to_string(),
+                primitive: instruction.primitive,
+                operand_types: instruction
+                    .inputs
+                    .iter()
+                    .map(|v| v.ty.to_string())
+                    .collect(),
+                result_types: instruction
+                    .outputs
+                    .iter()
+                    .map(|(_, ty)| ty.to_string())
+                    .collect(),
                 count: executions.clone(),
             });
             if let Some(access) = &instruction.memory {
                 if let Some(root) = &access.object {
                     let traffic = out.traffic.entry(root.clone()).or_default();
                     let count = executions.scale(u64::from(access.bytes));
-                    if access.write { traffic.writes = traffic.writes.add(&count); }
-                    else { traffic.reads = traffic.reads.add(&count); }
+                    if access.write {
+                        traffic.writes = traffic.writes.add(&count);
+                    } else {
+                        traffic.reads = traffic.reads.add(&count);
+                    }
                 } else if executions != Count::Exact(0) {
-                    out.unavailable.push(format!("{}: memory object unresolved for {}", instruction.id, access.address));
+                    out.unavailable.push(format!(
+                        "{}: memory object unresolved for {}",
+                        instruction.id, access.address
+                    ));
                 }
             }
         }
@@ -102,7 +120,8 @@ struct Analysis<'a> {
 impl Analysis<'_> {
     fn multiplicity(&mut self, m: &std::sync::Arc<Multiplicity>) -> Count {
         let mut cache = std::mem::take(&mut self.multiplicities);
-        let count = crate::multiplicity::evaluate(m, &mut cache, &mut |value| self.constant(*value));
+        let count =
+            crate::multiplicity::evaluate(m, &mut cache, &mut |value| self.constant(*value));
         self.multiplicities = cache;
         count
     }
@@ -113,51 +132,36 @@ impl Analysis<'_> {
         }
         self.constants.insert(value, None);
         let f = &self.program.function;
-        let result = match f.dfg.value_def(value) {
-            ValueDef::Result(inst, _) => match f.dfg.insts[inst] {
-                D::UnaryImm {
-                    opcode: O::Iconst,
-                    imm,
-                } => Some(imm.bits()),
-                D::Binary { opcode, args } => {
-                    let a = self.constant(args[0]);
-                    let b = self.constant(args[1]);
-                    a.zip(b).and_then(|(a, b)| integer(opcode, a, b))
+        let ty = f.dfg.value_type(value);
+        // Count reports remain partial: unsupported widths, runtime operands and
+        // traps are unavailable facts, never invented execution counts.
+        let result = if matches!(ty, ir::types::I64 | ir::types::I8) {
+            match f.dfg.value_def(value) {
+                ValueDef::Result(inst, _) => {
+                    let data = &f.dfg.insts[inst];
+                    let args = f.dfg.inst_args(inst);
+                    match seismic_realization::integer::evaluate(data, ty, |index| {
+                        let argument = *args.get(index)?;
+                        Some((
+                            f.dfg.value_type(argument),
+                            self.constant(argument).map(|n| n as u64),
+                        ))
+                    }) {
+                        seismic_realization::integer::Evaluation::Exact(bits) => {
+                            seismic_realization::integer::signed(bits, ty)
+                        }
+                        _ => None,
+                    }
                 }
-                D::BinaryImm64 { opcode, arg, imm } => self
-                    .constant(arg)
-                    .and_then(|a| integer(opcode, a, imm.bits())),
                 _ => None,
-            },
-            _ => None,
-        };
-        // Counts currently use signed i64 address/domain arithmetic. Do not
-        // extrapolate narrow integer wrap semantics as an i64 constant.
-        let result = if f.dfg.value_type(value) == ir::types::I64
-            || f.dfg.value_type(value) == ir::types::I8
-        {
-            result
+            }
         } else {
             None
         };
         self.constants.insert(value, result);
         result
     }
-
 }
-fn integer(op: O, a: i64, b: i64) -> Option<i64> {
-    match op {
-        O::Iadd | O::IaddImm => a.checked_add(b),
-        O::Isub => a.checked_sub(b),
-        O::Imul | O::ImulImm => a.checked_mul(b),
-        O::Sdiv => a.checked_div(b),
-        O::Srem => a.checked_rem(b),
-        O::Udiv | O::UdivImm if a >= 0 && b > 0 => Some(a / b),
-        O::Urem | O::UremImm if a >= 0 && b > 0 => Some(a % b),
-        _ => None,
-    }
-}
-
 /// Source-ordered scalar phases. Shared tensor identities remain the same across
 /// phase accounts; callers must not sum their interface regions as new obligations.
 #[derive(Clone, Debug)]

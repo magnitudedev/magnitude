@@ -39,7 +39,7 @@ fn repeated_definitions_have_distinct_allocation_sites() {
     assert_ne!(launch.arrays[0].id, launch.arrays[1].id);
     assert_eq!(launch.declared_private_bytes_per_lane, 48);
     assert_eq!(launch.shared_bytes_per_group, 0);
-    assert!(launch.unmodeled_fragments.is_empty());
+    assert!(launch.fragments.is_empty());
     emit_execution(&execution).unwrap();
 }
 #[test]

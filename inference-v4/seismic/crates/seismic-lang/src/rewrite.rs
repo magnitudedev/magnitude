@@ -254,7 +254,9 @@ fn is_local_temp(loop_body: &[Stmt], v: VarId) -> bool {
 /// Variables a statement assigns, directly or through an element write.
 pub fn writes(s: &Stmt, out: &mut HashSet<VarId>) {
     match &s.kind {
-        StmtKind::Assign { target, .. } => {
+        StmtKind::Assign { target, value, .. } => {
+            expression_writes(value, out);
+            expression_writes(target, out);
             let mut node = target;
             loop {
                 match &node.kind {
@@ -285,7 +287,45 @@ pub fn writes(s: &Stmt, out: &mut HashSet<VarId>) {
                 writes(b, out);
             }
         }
-        StmtKind::Expr(_) => {}
+        StmtKind::Expr(expr) => expression_writes(expr, out),
+    }
+}
+
+/// Intrinsics mutate value storage through typed operand effects even when
+/// written as expression statements. They participate in the same dependency
+/// closure as ordinary tile assignments.
+fn expression_writes(expr: &Expr, out: &mut HashSet<VarId>) {
+    fn root(expr: &Expr) -> Option<VarId> {
+        match &expr.kind {
+            ExprKind::Var(v) => Some(*v),
+            ExprKind::Index { base, .. } | ExprKind::Transpose(base) => root(base),
+            _ => None,
+        }
+    }
+    match &expr.kind {
+        ExprKind::Intrinsic { op, args } => {
+            for &index in op.writes_arguments() {
+                if let Some(v) = args.get(index).and_then(root) { out.insert(v); }
+            }
+            for argument in args { expression_writes(argument, out); }
+        }
+        ExprKind::Builtin { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => {
+            for argument in args { expression_writes(argument, out); }
+        }
+        ExprKind::Index { base, indices } => {
+            expression_writes(base, out);
+            for index in indices {
+                match index {
+                    Index::Point(expr) => expression_writes(expr, out),
+                    Index::Slice { start, end } => for expr in start.iter().chain(end) { expression_writes(expr, out); },
+                }
+            }
+        }
+        ExprKind::Load { view: expr, .. } | ExprKind::Transpose(expr)
+        | ExprKind::Accessor { base: expr, .. } | ExprKind::Lanes { base: expr, .. }
+        | ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => expression_writes(expr, out),
+        ExprKind::Binary { lhs, rhs, .. } => { expression_writes(lhs, out); expression_writes(rhs, out); }
+        _ => {}
     }
 }
 

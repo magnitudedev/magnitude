@@ -28,13 +28,25 @@ pub fn scalar_candidate(
     call_conv: CallConv,
     options: ScalarOptions,
 ) -> Result<ScalarProgram, String> {
-    let ScalarOptions { dispatch, loads } = options;
+    let mut normalized = lowered.clone();
+    seismic_lang::normalize::bind_values(&mut normalized.body, &mut normalized.vars);
+    seismic_lang::normalize::select_loads(&mut normalized.body, options.loads == LoadStrategy::BorrowProvenReadOnly);
+    scalar_resolved(&normalized, call_conv, options.dispatch)
+}
+
+/// Compile the selected load operations directly. This boundary validates their
+/// legality and introduces no load/storage preferences.
+pub fn scalar_resolved(
+    lowered: &LoweredIr,
+    call_conv: CallConv,
+    dispatch: Dispatch,
+) -> Result<ScalarProgram, String> {
     let mut normalized = lowered.clone();
     if dispatch == Dispatch::ParallelRoot {
         seismic_lang::normalize::work_domain(&mut normalized.body);
     }
     seismic_lang::normalize::bind_values(&mut normalized.body, &mut normalized.vars);
-    seismic_lang::normalize::select_loads(&mut normalized.body, loads == LoadStrategy::BorrowProvenReadOnly);
+    let loads = seismic_lang::normalize::loads::selected(&normalized.body)?;
     seismic_lang::normalize::identify(&mut normalized.body, &mut 0);
     let lowered = &normalized;
     let mut function = ir::Function::new();
@@ -100,13 +112,24 @@ pub fn scalar_sequence(
     call_conv: CallConv,
     options: ScalarOptions,
 ) -> Result<seismic_realization::ScalarSequence, String> {
+    let mut normalized = lowered.clone();
+    seismic_lang::normalize::bind_values(&mut normalized.body, &mut normalized.vars);
+    seismic_lang::normalize::select_loads(&mut normalized.body, options.loads == LoadStrategy::BorrowProvenReadOnly);
+    scalar_sequence_resolved(&normalized, call_conv, options.dispatch)
+}
+
+pub fn scalar_sequence_resolved(
+    lowered: &LoweredIr,
+    call_conv: CallConv,
+    dispatch: Dispatch,
+) -> Result<seismic_realization::ScalarSequence, String> {
     use seismic_realization::{ScalarPhase, ScalarSequence};
-    if options.dispatch == Dispatch::Sequential {
+    if dispatch == Dispatch::Sequential {
         return Ok(ScalarSequence {
             name: lowered.name.clone(),
             phases: vec![ScalarPhase {
                 source_statement: 0,
-                program: scalar_candidate(lowered, call_conv, options)?,
+                program: scalar_resolved(lowered, call_conv, dispatch)?,
             }],
         });
     }
@@ -120,7 +143,7 @@ pub fn scalar_sequence(
         }
         let mut phase = lowered.clone();
         phase.body = vec![statement.clone()];
-        let program = scalar_candidate(&phase, call_conv, options)
+        let program = scalar_resolved(&phase, call_conv, dispatch)
             .map_err(|error| format!("{} phase {source_statement}: {error}", lowered.name))?;
         phases.push(ScalarPhase {
             source_statement,
@@ -132,3 +155,5 @@ pub fn scalar_sequence(
         phases,
     })
 }
+
+pub mod tuner;

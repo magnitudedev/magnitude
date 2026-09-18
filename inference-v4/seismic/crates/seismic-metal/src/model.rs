@@ -1,14 +1,19 @@
 //! Declared storage accounting from the same selected memory plan used by emission.
 //! Byte quantities here are allocation sizes, not load/store traffic. Lexical
 //! declarations and barrier sites are not native registers or dynamic instances.
-use crate::quantity::Count;
-use seismic_realization::{dispatch::GroupDispatch, memory::MemoryPlan};
-use seismic_realization::{execution::Multiplicity, memory::ControlValue};
+use crate::memory::ControlValue;
+use crate::memory::MemoryPlan;
+use seismic_accounting::quantity::Count;
+use seismic_realization::dispatch::GroupDispatch;
+use seismic_realization::execution::Multiplicity;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct LaunchStorage {
     pub dispatch: GroupDispatch,
+    pub prologue: Vec<LaunchOperationAccount>,
+    /// Scalar lane executions of the padding guard, including padding lanes.
+    pub prologue_guard_executions: Count,
     /// Sum of all private array declarations, including disjoint lexical scopes.
     pub declared_private_array_bytes_per_lane: Count,
     pub declared_shared_array_bytes_per_group: Count,
@@ -17,7 +22,28 @@ pub struct LaunchStorage {
     /// cycles. Unresolved loop/branch facts remain unknown or bounded.
     pub barrier_executions: Count,
     pub native_private_bytes_per_lane: Count,
-    pub unmodeled_fragment_operations: Vec<seismic_lang::ir::OperationId>,
+    /// Logical matrix payload declared per SIMD group, including disjoint scopes.
+    /// The native element-to-lane/register mapping is a separate target contract.
+    pub declared_fragment_payload_bytes_per_subgroup: Count,
+    pub collectives: Vec<CollectiveAccount>,
+}
+#[derive(Clone, Debug)]
+pub struct LaunchOperationAccount {
+    pub operation: crate::support::LaunchOperation,
+    /// Executions of this typed source operation. Native instruction mapping is
+    /// separate, including strength reduction of division by known constants.
+    pub executions: Count,
+}
+#[derive(Clone, Debug)]
+pub struct CollectiveAccount {
+    pub site: crate::collective::Site,
+    pub implementation: crate::collective::Implementation,
+    pub executions: Count,
+    /// Logical requested bytes at the implementation's named memory space,
+    /// never cache transactions or device-memory traffic.
+    pub requested_read_bytes: Count,
+    pub requested_write_bytes: Count,
+    pub scalar_multiply_accumulates: Count,
 }
 #[derive(Clone, Debug)]
 pub struct StorageAccount {
@@ -70,6 +96,21 @@ pub fn derive(plan: &MemoryPlan, dispatches: &[GroupDispatch]) -> Result<Storage
             }
             Ok(LaunchStorage {
                 dispatch: dispatch.clone(),
+                prologue: launch
+                    .prologue
+                    .instantiate(dispatch)?
+                    .steps
+                    .into_iter()
+                    .map(|step| LaunchOperationAccount {
+                        operation: step.operation,
+                        executions: Count::Exact(if step.participating_only {
+                            dispatch.participating_lanes()
+                        } else {
+                            dispatch.dispatched_lanes()
+                        }),
+                    })
+                    .collect(),
+                prologue_guard_executions: Count::Exact(dispatch.dispatched_lanes()),
                 declared_private_array_bytes_per_lane: count(private),
                 declared_shared_array_bytes_per_group: count(shared),
                 static_barrier_sites: count(launch.barriers.len() as u128),
@@ -83,7 +124,35 @@ pub fn derive(plan: &MemoryPlan, dispatches: &[GroupDispatch]) -> Result<Storage
                 native_private_bytes_per_lane: Count::unknown(
                     "native register allocation, scalar temporaries and spills are unmodeled",
                 ),
-                unmodeled_fragment_operations: launch.unmodeled_fragments.clone(),
+                declared_fragment_payload_bytes_per_subgroup: count(
+                    launch
+                        .fragments
+                        .iter()
+                        .map(|f| u128::from(f.layout.payload_bytes()))
+                        .sum(),
+                ),
+                collectives: launch
+                    .collectives
+                    .values()
+                    .map(|c| {
+                        let executions = structured_count(&c.executions, &mut multiplicities)
+                            .scale(dispatch.work_items);
+                        let (read, write) = match c.implementation.requested_memory() {
+                            Some((_, false, bytes)) => (executions.scale(bytes), Count::Exact(0)),
+                            Some((_, true, bytes)) => (Count::Exact(0), executions.scale(bytes)),
+                            None => (Count::Exact(0), Count::Exact(0)),
+                        };
+                        CollectiveAccount {
+                            site: c.site,
+                            implementation: c.implementation.clone(),
+                            requested_read_bytes: read,
+                            requested_write_bytes: write,
+                            scalar_multiply_accumulates: executions
+                                .scale(c.implementation.scalar_multiply_accumulates()),
+                            executions,
+                        }
+                    })
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -122,7 +191,7 @@ fn structured_count(
     node: &Arc<Multiplicity<ControlValue>>,
     cache: &mut HashMap<usize, Count>,
 ) -> Count {
-    crate::multiplicity::evaluate(node, cache, &mut |value| match value {
+    seismic_accounting::multiplicity::evaluate(node, cache, &mut |value| match value {
         ControlValue::Integer(s) => s.as_constant(),
         ControlValue::Predicate(e) => match e.kind {
             seismic_lang::ir::ExprKind::Bool(b) => Some(i64::from(b)),
@@ -134,21 +203,25 @@ fn structured_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::*;
     use seismic_lang::{ir::OperationId, types::DType};
-    use seismic_realization::{
-        dispatch::{TileDeclaration, TilePlacement},
-        memory::*,
-    };
+    use seismic_realization::dispatch::{TileDeclaration, TilePlacement};
     use std::collections::BTreeMap;
 
     fn launch(index: usize) -> LaunchMemory {
         LaunchMemory {
+            prologue: crate::support::LaunchRecipe::new(
+                seismic_realization::dispatch::WorkMapping::new(&[2], &[1]).unwrap(),
+                1,
+            )
+            .unwrap(),
             predecessor: index.checked_sub(1),
             arrays: Vec::new(),
             barriers: BTreeMap::new(),
             declared_private_bytes_per_lane: 0,
             shared_bytes_per_group: 0,
-            unmodeled_fragments: Vec::new(),
+            fragments: Vec::new(),
+            collectives: BTreeMap::new(),
         }
     }
     fn scratch(index: usize, producer: usize, consumer: usize) -> ScratchAllocation {
@@ -168,6 +241,11 @@ mod tests {
     #[test]
     fn allocation_units_are_separate_from_native_storage_and_execution_counts() {
         let mut selected = launch(0);
+        selected.prologue = crate::support::LaunchRecipe::new(
+            seismic_realization::dispatch::WorkMapping::new(&[5], &[1]).unwrap(),
+            1,
+        )
+        .unwrap();
         for (id, capacity, placement) in [
             (0, 10, TilePlacement::GroupShared),
             (1, 65, TilePlacement::Distributed),
@@ -204,7 +282,14 @@ mod tests {
                 }),
             },
         );
-        selected.unmodeled_fragments.push(OperationId(9));
+        selected
+            .fragments
+            .push(crate::collective::FragmentAllocation {
+                operation: OperationId(9),
+                variable: 9,
+                layout: crate::collective::FragmentLayout::metal(DType::F32).unwrap(),
+                scope: vec![Scope::Body(OperationId(99))],
+            });
         let plan = MemoryPlan::new(vec![selected], vec![]).unwrap();
         let account = derive(&plan, &[GroupDispatch::new(5, 32, 2).unwrap()]).unwrap();
         let launch = &account.launches[0];
@@ -219,10 +304,48 @@ mod tests {
         assert_eq!(launch.static_barrier_sites, Count::Exact(1));
         assert!(launch.barrier_executions.bounds().is_none());
         assert!(launch.native_private_bytes_per_lane.bounds().is_none());
-        assert_eq!(launch.unmodeled_fragment_operations, [OperationId(9)]);
-        let empty = derive(&plan, &[GroupDispatch::new(0, 32, 2).unwrap()]).unwrap();
-        assert_eq!(empty.launches[0].barrier_executions, Count::Exact(0));
+        assert_eq!(
+            launch.declared_fragment_payload_bytes_per_subgroup,
+            Count::Exact(256)
+        );
+        assert!(derive(&plan, &[GroupDispatch::new(0, 32, 2).unwrap()]).is_err());
         assert!(derive(&plan, &[GroupDispatch::new(5, 32, 4).unwrap()]).is_err());
+    }
+    #[test]
+    fn subgroup_work_and_scalar_launch_work_have_distinct_multiplicities() {
+        use crate::collective::{Collective, FragmentLayout, Implementation, Site};
+        let mut selected = launch(0);
+        let site = Site {
+            operation: OperationId(10),
+            ordinal: 0,
+        };
+        selected.collectives.insert(
+            site,
+            Collective {
+                site,
+                implementation: Implementation::MultiplyAccumulate {
+                    fragments: [0, 1, 2, 3],
+                    layouts: [FragmentLayout::metal(DType::F32).unwrap(); 4],
+                },
+                scope: vec![],
+                executions: Arc::new(Multiplicity::Constant(3)),
+            },
+        );
+        let plan = MemoryPlan::new(vec![selected], vec![]).unwrap();
+        let account = derive(&plan, &[GroupDispatch::new(2, 32, 4).unwrap()]).unwrap();
+        let launch = &account.launches[0];
+        assert_eq!(launch.collectives[0].executions, Count::Exact(6));
+        assert_eq!(
+            launch.collectives[0].scalar_multiply_accumulates,
+            Count::Exact(3072)
+        );
+        assert_eq!(launch.prologue_guard_executions, Count::Exact(128));
+        assert!(launch.prologue[..3]
+            .iter()
+            .all(|s| s.executions == Count::Exact(128)));
+        assert!(launch.prologue[3..]
+            .iter()
+            .all(|s| s.executions == Count::Exact(64)));
     }
     #[test]
     fn scratch_retention_is_not_confused_with_required_lifetime_overlap() {

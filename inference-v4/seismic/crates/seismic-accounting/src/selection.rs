@@ -1,13 +1,11 @@
-//! Exact selection over a structurally defined execution space. The space owns
-//! legality and derives each leaf's execution and objective together. Traversal
-//! order has no performance meaning, and every legal leaf participates.
+//! Selection over the implementation's own choices and derived constraints.
 //!
-//! This module proves selection under that contract. It does not prove that a
-//! backend's execution space or hardware model faithfully describes its target.
-use std::collections::BTreeSet;
+//! Search state is private. Bounds, coverage and schedule feasibility are checked
+//! where they are computed, without a second proof graph or certificate language.
+use crate::schedule::{self, Model, SearchOutcome, Solution};
+mod domain;
+pub use domain::{Choices, Domain, IntegerRange, Region};
 
-/// All alternatives use the same workload, target, execution form and objective.
-/// Identities must describe immutable inputs, rather than device display names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     pub program: String,
@@ -16,7 +14,6 @@ pub struct Context {
     pub contracts: String,
     pub execution_form: String,
     pub objective: String,
-    /// Exact common time unit for the latency objective.
     pub seconds_numerator: u64,
     pub seconds_denominator: u64,
 }
@@ -39,43 +36,36 @@ impl Context {
         }
         Ok(())
     }
+    fn check_model(&self, model: &Model) -> Result<(), String> {
+        if u128::from(model.timebase.seconds_numerator) * u128::from(self.seconds_denominator)
+            != u128::from(self.seconds_numerator) * u128::from(model.timebase.seconds_denominator)
+        {
+            return Err("execution analysis has a different objective time unit".into());
+        }
+        model.relationship.require_feasible_upper()
+    }
 }
 
-/// A model-derived interval in the context's exact integer time units. Bounds
-/// describe the same execution/workload conditions across every alternative.
+/// An interval for this analysis's optimum, never an independently supplied cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cost {
     lower: u64,
     upper: u64,
 }
 impl Cost {
-    pub fn exact(ticks: u64) -> Self {
-        Self {
-            lower: ticks,
-            upper: ticks,
-        }
-    }
-    pub fn bounded(lower: u64, upper: u64) -> Result<Self, String> {
-        if lower > upper {
-            return Err("reversed execution cost bounds".into());
-        }
-        Ok(Self { lower, upper })
-    }
     pub fn lower(self) -> u64 {
         self.lower
     }
     pub fn upper(self) -> u64 {
         self.upper
     }
+    pub fn is_exact(self) -> bool {
+        self.lower == self.upper
+    }
 }
 
-/// A leaf cannot contain an execution without its derived modeled cost.
-pub struct Realization<E> {
-    pub execution: E,
-    pub cost: Cost,
-}
-/// A violated physical capacity in the declared execution form. Verification
-/// rederives this constraint from the original program and hardware inputs.
+/// A violated capacity derived by the implementation's own construction rules.
+/// This is not a hardware fact or a separately supplied proof of infeasibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapacityViolation {
     pub resource: String,
@@ -85,218 +75,311 @@ pub struct CapacityViolation {
 impl CapacityViolation {
     fn validate(&self) -> Result<(), String> {
         if self.resource.is_empty() || self.required <= self.available {
-            return Err("infeasible branch does not contain a violated capacity".into());
+            return Err("infeasible branch has no violated implementation capacity".into());
         }
         Ok(())
     }
 }
 pub enum Node<E> {
-    /// Complete legal alternatives at this point, including dependent choices.
-    Choice {
-        name: String,
-        alternatives: Vec<String>,
-    },
-    Realization(Realization<E>),
+    Choice { name: String, alternatives: Domain },
+    Realization(E),
     Infeasible(CapacityViolation),
 }
-/// Expand a decision prefix using IR and hardware contracts only. Each child is
-/// addressed by its index in the freshly derived parent domain. Compiler failures
-/// are errors, never evidence that an otherwise legal alternative can be omitted.
 pub trait Space {
     type Execution;
     fn context(&self) -> &Context;
     fn expand(&self, prefix: &[usize]) -> Result<Node<Self::Execution>, String>;
+    /// Derive constraints from this exact execution and bound hardware facts.
+    fn analyze(&self, execution: &Self::Execution) -> Result<Model, String>;
+    /// Resolve the selected schedule in the emitted execution and validate that
+    /// transformation against the source before returning it.
+    fn materialize(
+        &self,
+        execution: &Self::Execution,
+        objective: &Objective,
+    ) -> Result<Self::Execution, String>;
 }
 
+/// Read-only projection of a scheduling analysis tied to its exact constraints.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Evidence {
-    Choice {
-        name: String,
-        alternatives: Vec<String>,
-    },
-    Realization(Cost),
-    Infeasible(CapacityViolation),
+pub struct Objective {
+    solution: Solution,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Record {
-    pub path: Vec<usize>,
-    pub evidence: Evidence,
+impl Objective {
+    pub fn model(&self) -> &Model {
+        self.solution.model()
+    }
+    pub fn schedule(&self) -> &schedule::Schedule {
+        self.solution.schedule()
+    }
+    pub fn cost(&self) -> Cost {
+        Cost {
+            lower: self.solution.lower_bound(),
+            upper: self.schedule().completion,
+        }
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Certificate {
-    pub context: Context,
-    /// Complete preorder tree. Verification regenerates each domain and cost.
-    pub records: Vec<Record>,
-    pub selected: Vec<usize>,
-}
-/// The selected execution itself is retained, not reconstructed from settings at
-/// native compilation. Construction is private to successful complete selection.
 pub struct Selected<E> {
     execution: E,
-    certificate: Certificate,
-    cost: Cost,
+    path: Vec<usize>,
+    objective: Objective,
 }
 impl<E> Selected<E> {
     pub fn execution(&self) -> &E {
         &self.execution
     }
-    pub fn certificate(&self) -> &Certificate {
-        &self.certificate
+    pub fn selected_path(&self) -> &[usize] {
+        &self.path
     }
     pub fn cost(&self) -> Cost {
-        self.cost
+        let upper = self.objective.cost().upper();
+        Cost {
+            lower: upper,
+            upper,
+        }
+    }
+    pub fn objective(&self) -> &Objective {
+        &self.objective
     }
     pub fn into_execution(self) -> E {
         self.execution
     }
 }
 
-fn validate_choice(name: &str, alternatives: &[String]) -> Result<(), String> {
-    let distinct: BTreeSet<_> = alternatives.iter().collect();
-    if name.is_empty()
-        || alternatives.is_empty()
-        || distinct.len() != alternatives.len()
-        || alternatives.iter().any(String::is_empty)
-    {
-        return Err(
-            "execution choice requires a name and distinct nonempty legal alternatives".into(),
-        );
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    /// New choice/execution nodes per call; this never truncates a legal domain.
+    pub nodes: usize,
+    /// Proposed start assignments per leaf; resumption increases this allowance.
+    pub schedule_assignments: u64,
+}
+#[derive(Clone, Debug, PartialEq)]
+enum Analysis {
+    Choice(Domain),
+    Execution {
+        model: Model,
+        outcome: SearchOutcome,
+        allowance: u64,
+    },
+    Infeasible(CapacityViolation),
+}
+struct Record {
+    path: Vec<usize>,
+    analysis: Analysis,
+}
+struct Incumbent<E> {
+    record: usize,
+    execution: E,
+    upper: u64,
+}
+/// Coverage is maintained by the search itself. Cached analyses are rederived
+/// from their exact executions on resumption before they can justify exclusions.
+pub struct Progress<E> {
+    context: Context,
+    pending: Vec<Region>,
+    records: Vec<Record>,
+    incumbent: Option<Incumbent<E>>,
+}
+impl<E> Progress<E> {
+    pub fn nodes_visited(&self) -> usize {
+        self.records.len()
     }
-    Ok(())
+    pub fn frontier(&self) -> &[Region] {
+        &self.pending
+    }
+    pub fn incumbent(&self) -> Option<&E> {
+        self.incumbent.as_ref().map(|i| &i.execution)
+    }
+    pub fn feasible_upper(&self) -> Option<u64> {
+        self.incumbent.as_ref().map(|i| i.upper)
+    }
+    pub fn lower_bound(&self) -> Result<u64, String> {
+        // One selected implementation cannot establish a region-wide bound.
+        if !self.pending.is_empty() {
+            return Ok(0);
+        }
+        self.records
+            .iter()
+            .filter_map(|record| match &record.analysis {
+                Analysis::Execution { outcome, .. } => schedule_lower(outcome),
+                _ => None,
+            })
+            .min()
+            .ok_or_else(|| "execution domain has no feasible member".into())
+    }
+}
+pub enum Outcome<E> {
+    Optimal(Selected<E>),
+    Incomplete(Progress<E>),
+    Infeasible,
 }
 
-/// A traversal budget interrupts work; it never redefines the legal domain or
-/// produces a partially covered result. No target code or native feedback enters.
-pub fn select<S: Space>(space: &S, node_budget: usize) -> Result<Selected<S::Execution>, String> {
+pub fn select<S: Space>(space: &S, budget: Budget) -> Result<Outcome<S::Execution>, String> {
     space.context().validate()?;
-    let mut pending = vec![Vec::new()];
-    let mut records = Vec::new();
-    let mut best: Option<(Vec<usize>, Realization<S::Execution>)> = None;
-    while let Some(path) = pending.pop() {
-        if records.len() == node_budget {
-            return Err(
-                "selection budget exhausted before complete execution-space coverage".into(),
-            );
-        }
-        match space.expand(&path)? {
-            Node::Choice { name, alternatives } => {
-                validate_choice(&name, &alternatives)?;
-                for i in (0..alternatives.len()).rev() {
-                    let mut child = path.clone();
-                    child.push(i);
-                    pending.push(child);
+    resume(
+        space,
+        Progress {
+            context: space.context().clone(),
+            pending: vec![Region::Branch { path: Vec::new() }],
+            records: Vec::new(),
+            incumbent: None,
+        },
+        budget,
+    )
+}
+
+pub fn resume<S: Space>(
+    space: &S,
+    mut progress: Progress<S::Execution>,
+    budget: Budget,
+) -> Result<Outcome<S::Execution>, String> {
+    space.context().validate()?;
+    if space.context() != &progress.context {
+        return Err("selection inputs changed".into());
+    }
+    // These are cache consistency checks in the existing analysis path, not a
+    // second interpretation of the computation or independent proof replay.
+    for index in 0..progress.records.len() {
+        let record = &mut progress.records[index];
+        match (&mut record.analysis, space.expand(&record.path)?) {
+            (
+                Analysis::Choice(alternatives),
+                Node::Choice {
+                    alternatives: domain,
+                    ..
+                },
+            ) if *alternatives == domain => {}
+            (Analysis::Infeasible(saved), Node::Infeasible(actual)) if *saved == actual => {}
+            (
+                Analysis::Execution {
+                    model: saved,
+                    outcome,
+                    allowance,
+                },
+                Node::Realization(execution),
+            ) => {
+                let model = space.analyze(&execution)?;
+                progress.context.check_model(&model)?;
+                if model != *saved {
+                    return Err("execution analysis changed during resumption".into());
                 }
-                records.push(Record {
-                    path,
-                    evidence: Evidence::Choice { name, alternatives },
+                let excluded = matches!(outcome, SearchOutcome::Infeasible)
+                    || progress.incumbent.as_ref().is_some_and(|i| {
+                        schedule_lower(outcome).is_some_and(|lower| lower >= i.upper)
+                    });
+                if !excluded {
+                    *allowance = allowance
+                        .checked_add(budget.schedule_assignments)
+                        .ok_or("schedule budget overflow")?;
+                    *outcome = model.search(*allowance)?;
+                }
+                if let SearchOutcome::Feasible(solution) = outcome {
+                    let upper = solution.schedule().completion;
+                    // Reuse the derived analysis, but materialize the owner's
+                    // current execution even when its resource costs are equal.
+                    if progress
+                        .incumbent
+                        .as_ref()
+                        .is_none_or(|i| i.record == index || upper < i.upper)
+                    {
+                        progress.incumbent = Some(Incumbent {
+                            record: index,
+                            execution,
+                            upper,
+                        });
+                    }
+                }
+            }
+            _ => return Err("implementation choices changed during resumption".into()),
+        }
+    }
+    for _ in 0..budget.nodes {
+        let Some(path) = domain::pop(&mut progress.pending) else {
+            break;
+        };
+        let analysis = match space.expand(&path)? {
+            Node::Choice { alternatives, .. } => {
+                alternatives.validate()?;
+                progress.pending.push(Region::Children {
+                    parent: path.clone(),
+                    indices: 0..alternatives.len(),
                 });
+                Analysis::Choice(alternatives)
             }
             Node::Infeasible(violation) => {
                 violation.validate()?;
-                records.push(Record {
-                    path,
-                    evidence: Evidence::Infeasible(violation),
-                });
+                Analysis::Infeasible(violation)
             }
-            Node::Realization(realization) => {
-                records.push(Record {
-                    path: path.clone(),
-                    evidence: Evidence::Realization(realization.cost),
-                });
-                if best.as_ref().is_none_or(|(_, old)| {
-                    (realization.cost.upper, realization.cost.lower)
-                        < (old.cost.upper, old.cost.lower)
-                }) {
-                    best = Some((path, realization));
+            Node::Realization(execution) => {
+                let model = space.analyze(&execution)?;
+                progress.context.check_model(&model)?;
+                let outcome = model.search(budget.schedule_assignments)?;
+                if let SearchOutcome::Feasible(solution) = &outcome {
+                    let upper = solution.schedule().completion;
+                    if progress.incumbent.as_ref().is_none_or(|i| upper < i.upper) {
+                        progress.incumbent = Some(Incumbent {
+                            record: progress.records.len(),
+                            execution,
+                            upper,
+                        });
+                    }
+                }
+                Analysis::Execution {
+                    model,
+                    outcome,
+                    allowance: budget.schedule_assignments,
                 }
             }
-        }
+        };
+        progress.records.push(Record { path, analysis });
     }
-    let (path, realization) = best.ok_or("execution space has no realization")?;
-    for record in &records {
-        if let Evidence::Realization(cost) = record.evidence {
-            if record.path != path && realization.cost.upper > cost.lower {
-                return Err("modeled intervals do not establish an optimal realization".into());
-            }
-        }
+    if !progress.pending.is_empty() {
+        return Ok(Outcome::Incomplete(progress));
     }
-    Ok(Selected {
-        execution: realization.execution,
-        cost: realization.cost,
-        certificate: Certificate {
-            context: space.context().clone(),
-            records,
-            selected: path,
-        },
-    })
+    let Some(best) = &progress.incumbent else {
+        let unresolved = progress.records.iter().any(|record| {
+            matches!(
+                record.analysis,
+                Analysis::Execution {
+                    outcome: SearchOutcome::Incomplete { .. },
+                    ..
+                }
+            )
+        });
+        return Ok(if unresolved {
+            Outcome::Incomplete(progress)
+        } else {
+            Outcome::Infeasible
+        });
+    };
+    if progress.lower_bound()? < best.upper {
+        return Ok(Outcome::Incomplete(progress));
+    }
+    let best = progress.incumbent.take().unwrap();
+    let record = progress.records.swap_remove(best.record);
+    let Analysis::Execution {
+        outcome: SearchOutcome::Feasible(solution),
+        ..
+    } = record.analysis
+    else {
+        unreachable!("incumbent owns a feasible scheduling result")
+    };
+    let objective = Objective { solution };
+    objective
+        .model()
+        .check_execution_upper(objective.schedule())?;
+    let execution = space.materialize(&best.execution, &objective)?;
+    Ok(Outcome::Optimal(Selected {
+        execution,
+        path: record.path,
+        objective,
+    }))
 }
 
-/// Independent certificate replay: a stack of expected children establishes
-/// coverage; neither claimed leaf count nor the optimizer's preferred order is
-/// accepted as evidence. Costs are rederived from the original space.
-pub fn verify<S: Space>(
-    space: &S,
-    certificate: &Certificate,
-    node_budget: usize,
-) -> Result<Cost, String> {
-    space.context().validate()?;
-    if space.context() != &certificate.context {
-        return Err("selection assumptions changed".into());
+fn schedule_lower(outcome: &SearchOutcome) -> Option<u64> {
+    match outcome {
+        SearchOutcome::Feasible(solution) => Some(solution.lower_bound()),
+        SearchOutcome::Incomplete { lower_bound } => Some(*lower_bound),
+        SearchOutcome::Infeasible => None,
     }
-    let mut expected = vec![Vec::new()];
-    let mut selected = None;
-    let mut competitor_floor = u64::MAX;
-    for (visited, record) in certificate.records.iter().enumerate() {
-        if visited == node_budget {
-            return Err("verification budget exhausted".into());
-        }
-        let path = expected.pop().ok_or("certificate contains extra nodes")?;
-        if path != record.path {
-            return Err("certificate omitted or reordered a legal branch".into());
-        }
-        match (space.expand(&path)?, &record.evidence) {
-            (
-                Node::Choice { name, alternatives },
-                Evidence::Choice {
-                    name: saved_name,
-                    alternatives: saved,
-                },
-            ) => {
-                validate_choice(&name, &alternatives)?;
-                if name != *saved_name || alternatives != *saved {
-                    return Err("legal choice domain changed".into());
-                }
-                for i in (0..alternatives.len()).rev() {
-                    let mut child = path.clone();
-                    child.push(i);
-                    expected.push(child);
-                }
-            }
-            (Node::Infeasible(violation), Evidence::Infeasible(saved)) => {
-                violation.validate()?;
-                if violation != *saved {
-                    return Err("derived capacity violation changed".into());
-                }
-            }
-            (Node::Realization(realization), Evidence::Realization(saved)) => {
-                if realization.cost != *saved {
-                    return Err("derived execution cost changed".into());
-                }
-                if path == certificate.selected {
-                    selected = Some(realization.cost);
-                } else {
-                    competitor_floor = competitor_floor.min(realization.cost.lower);
-                }
-            }
-            _ => return Err("certificate node does not match the execution space".into()),
-        }
-    }
-    if !expected.is_empty() {
-        return Err("certificate has incomplete coverage".into());
-    }
-    let cost = selected.ok_or("selected path is not a realization")?;
-    if cost.upper > competitor_floor {
-        return Err("certificate does not exclude a better realization".into());
-    }
-    Ok(cost)
 }

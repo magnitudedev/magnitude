@@ -4,13 +4,13 @@
 
 use cranelift_codegen::{
     ir::{self, types},
-    settings::{self, Configurable},
 };
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 use seismic_lang::abi::ScalarParameter;
 use seismic_lang::lowered_ir::LoweredIr;
 
+pub mod codegen;
 mod buffer;
 pub use buffer::Buffer;
 pub use seismic_realization::BufferSpec;
@@ -30,6 +30,9 @@ pub struct Kernel {
 /// Linked bytes contain process-local relocations and are inspection evidence,
 /// not a portable executable or a cache key.
 pub struct NativeArtifact {
+    pub codegen: codegen::Policy,
+    pub import_bindings: Vec<codegen::Import>,
+    pub input_liveness: seismic_realization::liveness::Liveness,
     pub ir: String,
     pub optimized_ir: String,
     pub machine_code: Vec<u8>,
@@ -226,6 +229,13 @@ fn host_call_conv() -> Result<seismic_realization::CallConv, String> {
     Ok(seismic_realization::CallConv::triple_default(target.triple()))
 }
 
+pub fn prepare_resolved(lowered: &LoweredIr) -> Result<seismic_realization::ScalarProgram, String> {
+    if lowered.backend != "cpu" {
+        return Err("CPU preparation requires a CPU-lowered function".into());
+    }
+    seismic_compiler::scalar_resolved(lowered, host_call_conv()?, seismic_realization::Dispatch::Sequential)
+}
+
 pub fn compile(lowered: &LoweredIr) -> Result<Kernel, String> {
     compile_candidate(lowered, seismic_realization::LoadStrategy::Materialize)
 }
@@ -237,13 +247,16 @@ pub fn compile_candidate(
 }
 /// Compile an already selected scalar program; no source preparation occurs here.
 pub fn compile_execution(program: seismic_realization::ScalarProgram) -> Result<Kernel, String> {
+    compile_execution_with(program, &codegen::Policy::host()?)
+}
+pub fn compile_execution_with(program: seismic_realization::ScalarProgram, policy: &codegen::Policy) -> Result<Kernel, String> {
     let CompiledCode {
         memory,
         entry,
         buffers,
         scalars,
         artifact,
-    } = compile_code(program)?;
+    } = compile_code(program, policy)?;
     let mut scratch = Vec::new();
     scratch
         .try_reserve_exact(artifact.scratch_bytes)
@@ -263,9 +276,9 @@ pub fn compile_artifact(
     lowered: &LoweredIr,
     loads: seismic_realization::LoadStrategy,
 ) -> Result<NativeArtifact, String> {
-    Ok(compile_code(prepare(lowered, loads)?)?.artifact)
+    Ok(compile_code(prepare(lowered, loads)?, &codegen::Policy::host()?)?.artifact)
 }
-fn compile_code(program: seismic_realization::ScalarProgram) -> Result<CompiledCode, String> {
+fn compile_code(program: seismic_realization::ScalarProgram, policy: &codegen::Policy) -> Result<CompiledCode, String> {
     if program.dispatch != seismic_realization::Dispatch::Sequential
         || program.function.signature.call_conv != host_call_conv()?
         || program.function.signature.params.len() != 3
@@ -275,19 +288,9 @@ fn compile_code(program: seismic_realization::ScalarProgram) -> Result<CompiledC
     {
         return Err("selected CPU execution has an incompatible invocation ABI".into());
     }
-    let mut flags = settings::builder();
-    flags
-        .set("use_colocated_libcalls", "false")
-        .map_err(|e| e.to_string())?;
-    flags.set("is_pic", "false").map_err(|e| e.to_string())?;
-    flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
-    flags
-        .set("machine_code_cfg_info", "true")
-        .map_err(|e| e.to_string())?;
-    let isa = cranelift_native::builder()
-        .map_err(str::to_owned)?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| e.to_string())?;
+    let import_bindings = codegen::imports(&program)?;
+    let input_liveness = seismic_realization::liveness::scalar(&program)?;
+    let isa = policy.target()?.isa;
     let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
     for (name, address) in [
         ("seismic_exp", exp as *const u8),
@@ -362,6 +365,9 @@ fn compile_code(program: seismic_realization::ScalarProgram) -> Result<CompiledC
         unsafe { std::slice::from_raw_parts(module.get_finalized_function(id), code.len()) }
             .to_vec();
     let artifact = NativeArtifact {
+        codegen: policy.clone(),
+        import_bindings,
+        input_liveness,
         ir,
         optimized_ir: context.func.display().to_string(),
         machine_code,
@@ -403,3 +409,5 @@ fn compile_code(program: seismic_realization::ScalarProgram) -> Result<CompiledC
         artifact,
     })
 }
+
+pub mod tuning;

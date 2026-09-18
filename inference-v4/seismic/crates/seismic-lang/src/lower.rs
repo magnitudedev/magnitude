@@ -10,11 +10,11 @@ use crate::types::{Elem, Shaped, Ty};
 use std::collections::HashMap;
 pub mod alternatives;
 
-/// Sizes the model will close; explicit for now.
-#[derive(Clone, Debug, Default)]
+/// Explicit restrictions on the lowering space.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
-    /// Explicit legal piece capacity. `None` uses the whole axis, bounded by its
-    /// backing view for runtime extents. This is a baseline, not a performance choice.
+    /// Restrict every stream to this capacity. `None` exposes every capacity up
+    /// to its proven backing extent. Diagnostic lowering chooses the whole axis.
     pub piece: Option<i64>,
 }
 
@@ -30,7 +30,7 @@ pub fn lower_with(program: &Program, name: &str, backend: &str, shapes: &HashMap
 pub fn lower_specialized(program: &Program, name: &str, backend: &str, shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>, opts: &Options) -> Result<LoweredIr, String> {
     lower_selected(program, name, backend, shapes, elements, opts, &mut |decision| {
         // Deterministic diagnostic baseline only. It makes no optimality claim.
-        decision.alternatives.first().cloned().ok_or_else(||
+        decision.alternatives.get(0).ok_or_else(||
             format!("empty decision domain on `{backend}`: {:?}", decision.kind))
     })
 }
@@ -136,7 +136,6 @@ impl<'a> Inliner<'a> {
             },
             StmtKind::LoadLoop { vars: vs, views, axis, piece, body, .. } => {
                 let views: Vec<Expr> = views.iter().map(|v| self.inline_expr(v, env, vmap, vars, atom_map)).collect::<Result<_, _>>()?;
-                // This version streams the whole axis as one piece; the piece extent is the axis extent.
                 let extent = match &views[0].ty {
                     Ty::Tensor(s) => s.shape[*axis].clone(),
                     Ty::Tuple(items) => match &items[0] {
@@ -147,7 +146,24 @@ impl<'a> Inliner<'a> {
                 };
                 let Atom::Param(pname) = piece else { unreachable!() };
                 let mut inner_env = env.clone();
-                let capacity = match (extent.as_constant(), self.opts.piece) {
+                let maximum = match extent.as_constant() {
+                    Some(n) if n >= 0 => n.max(1),
+                    Some(_) => return Err("negative stream extent".into()),
+                    None => views.iter().map(|view| view_axis_capacity(view, *axis))
+                        .collect::<Result<Vec<_>, _>>()?.into_iter().min()
+                        .ok_or("stream requires a view")?.max(1),
+                };
+                let domain = Decision {
+                    kind: DecisionKind::Stream { piece: remap_atom(piece, atom_map), extent: extent.clone(), maximum },
+                    alternatives: match self.opts.piece {
+                        Some(n) => vec![Alternative::StreamCapacity(n)].into(),
+                        None => Alternatives::stream_capacities(maximum)?,
+                    },
+                };
+                let Alternative::StreamCapacity(selected) = (self.select)(&domain)? else {
+                    return Err("stream decision requires a capacity".into());
+                };
+                let capacity = match (extent.as_constant(), Some(selected)) {
                     (Some(e), Some(c)) if e > c => {
                         // Static extent chunked: pieces of `c` and a tail of `e % c`.
                         let mut values = vec![c];
@@ -292,7 +308,7 @@ impl<'a> Inliner<'a> {
                     shape_args: f.shape_params.iter().map(|p| inner_env[p].clone()).collect(),
                     element_args: elem_args.to_vec(),
                 },
-                alternatives,
+                alternatives: alternatives.into(),
             };
             if decision.alternatives.is_empty() {
                 return Err(format!("no lowering of `{callee}` on `{}` applies to shapes {:?} and elements {:?}", self.backend, concrete, elem_args));
@@ -608,7 +624,7 @@ fn select_producers(
             kind: DecisionKind::Producer {
                 variable, name: vars[variable].name.clone(), ty: vars[variable].ty.clone(),
             },
-            alternatives: vec![Alternative::Materialize, Alternative::Recompute],
+            alternatives: vec![Alternative::Materialize, Alternative::Recompute].into(),
         };
         match select(&decision)? {
             Alternative::Materialize => { producers.remove(&variable); }

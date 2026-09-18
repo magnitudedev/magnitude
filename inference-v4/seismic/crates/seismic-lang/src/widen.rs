@@ -61,7 +61,7 @@ pub fn plan_at(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64) -> Widenin
             if dependent[i] {
                 continue;
             }
-            if crate::rewrite::depends(s, &tainted, atom) {
+            if crate::rewrite::depends(s, &tainted, atom) || crate::effects::tensor_effect(s) {
                 dependent[i] = true;
                 for v in &writes_of[i] {
                     tainted.insert(*v);
@@ -113,7 +113,7 @@ fn rewrite_block(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &m
     loop {
         let mut changed = false;
         for s in body {
-            if crate::rewrite::depends(s, &tainted, atom) {
+            if crate::rewrite::depends(s, &tainted, atom) || crate::effects::tensor_effect(s) {
                 let mut w = HashSet::new();
                 crate::rewrite::writes(s, &mut w);
                 for v in w {
@@ -129,7 +129,7 @@ fn rewrite_block(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64, vars: &m
     }
     let mut out = Vec::new();
     for s in body {
-        if !crate::rewrite::depends(s, &tainted, atom) {
+        if !crate::rewrite::depends(s, &tainted, atom) && !crate::effects::tensor_effect(s) {
             out.push(s.clone());
             continue;
         }
@@ -386,13 +386,6 @@ fn map_expr(e: &Expr, inner: VarId, atom: &Atom, value: &Expr, copy: &std::colle
         other => other.clone(),
     };
     Expr { kind, ty: e.ty.clone(), sym, span: e.span }
-}
-
-/// Whether the widening is worth applying: it must share something. A body where every
-/// statement depends on the index has nothing to share, so covering several values with one
-/// item would only cost parallelism.
-pub fn worthwhile(w: &Widening) -> bool {
-    !w.shared.is_empty()
 }
 
 /// Widen a tile's type: it holds `factor` of what it held, along a new leading axis.

@@ -59,6 +59,33 @@ fn nonpositive_piece_capacity_is_rejected_before_arithmetic() {
 }
 
 #[test]
+fn stream_piece_domains_are_independent_and_symbolic() {
+    use seismic_lang::{lower::alternatives::{expand, Expansion, Specialization}, lowered_ir::{Alternative, DecisionKind}};
+    let program = compile(&[SourceFile {
+        path: "pieces.seismic.portable".into(), scope: Scope::Portable,
+        text: "fn pieces[N](x: tensor[N] f32, y: tensor[3] f32):\n  for a in load(x,over=0):\n    for i in owned(a): a[i] = a[i] + 1.0\n  for b in load(y,over=0):\n    for i in owned(b): b[i] = b[i] + 1.0\n".into(),
+    }], &[]).unwrap();
+    let shapes = HashMap::from([("N".into(), 1_000_000_000)]);
+    let elements = HashMap::new();
+    let options = Options::default();
+    let request = || Specialization { program: &program, entry: "pieces", backend: "cpu", shapes: &shapes, elements: &elements, options: &options };
+    let Expansion::Choice(first) = expand(request(), &[]).unwrap() else { panic!() };
+    assert!(matches!(first.kind, DecisionKind::Stream { maximum: 1_000_000_000, .. }));
+    assert_eq!(first.alternatives.capacity_interval(), Some((1_000_000_000, 1)));
+    assert_eq!(first.alternatives.get(999_999_999), Some(Alternative::StreamCapacity(1)));
+    let Expansion::Choice(second) = expand(request(), &[999_999_999]).unwrap() else { panic!() };
+    assert!(matches!(second.kind, DecisionKind::Stream { maximum: 3, .. }));
+    let Expansion::Lowered { function, consumed } = expand(request(), &[999_999_999, 1]).unwrap() else { panic!() };
+    assert_eq!(consumed, 2);
+    let capacities = function.body.iter().filter_map(|s| match &s.kind { StmtKind::LoadLoop { capacity, .. } => *capacity, _ => None }).collect::<Vec<_>>();
+    assert_eq!(capacities, vec![1,2]);
+    let mut space = seismic_lang::lower::alternatives::Space::new(request());
+    assert!(space.next().unwrap().result.is_ok());
+    assert!(space.next().unwrap().result.is_ok());
+    assert!(!space.exhausted());
+}
+
+#[test]
 fn reference_empty_stream_has_no_body_effects() {
     use seismic_lang::{
         interp::{Arg, Interpreter, TensorData},
@@ -118,7 +145,7 @@ fn all_applicable_bodies_are_visible_and_replayed_without_fallback() {
             Ok(Alternative::Body(Choice::Portable))
         }).unwrap();
     assert_eq!(visited.iter().map(|d| match &d.kind { DecisionKind::Construct { name, .. } => name.as_str(), _ => panic!("unexpected producer") }).collect::<Vec<_>>(), ["outer", "leaf"]);
-    assert!(visited.iter().all(|d| d.alternatives == [Alternative::Body(Choice::Block(1)), Alternative::Body(Choice::Portable)]));
+    assert!(visited.iter().all(|d| d.alternatives == vec![Alternative::Body(Choice::Block(1)), Alternative::Body(Choice::Portable)].into()));
     assert!(lowered.selections.iter().all(|s| s.choice == Choice::Portable));
     let mut visited = Vec::new();
     lower_selected(&program, "entry", "cpu",
@@ -166,7 +193,7 @@ fn expansion_space_covers_branches_with_different_nested_decisions() {
         extra.push(extra[0].clone());
         assert!(replay(&extra).unwrap_err().contains("unused"));
         let mut corrupted = attempt.steps.clone();
-        corrupted[0].domain.alternatives.clear();
+        corrupted[0].domain.alternatives = Vec::new().into();
         assert!(replay(&corrupted).unwrap_err().contains("domain changed"));
         paths.push(attempt.steps.into_iter().map(|s| s.selected).collect::<Vec<_>>());
     }
