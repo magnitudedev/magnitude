@@ -8,20 +8,28 @@ description: "Connect OpenClaw to your downloaded Magnitude models."
 1. [Install OpenClaw](https://docs.openclaw.ai/install) if needed.
 2. Download a compatible model in Magnitude.
 3. Open **Connections → OpenClaw** and click **Connect**.
-4. Open or restart OpenClaw and choose your Magnitude model.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
 
 Restart your running OpenClaw instance after changing its connection, then select a Magnitude model. The configuration is persistent; connecting does not start OpenClaw for you.
 
-## Select a model from the terminal
+## Run OpenClaw
 
-To configure the connection and select a specific downloaded model, first find its exact ID:
+After connecting in Magnitude, start OpenClaw with:
 
 ```sh
-magnitude models status
-magnitude connections add openclaw --set-model "MODEL_ID"
+openclaw tui
 ```
 
-Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+Then select your model inside the OpenClaw TUI:
+
+```text
+/model magnitude/MODEL_ID
+```
+
+Connections shows both commands for your selected model. Run the `/model` command inside OpenClaw, not in your shell.
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
 
 ## Configuration
 
@@ -36,12 +44,5 @@ Supported location overrides: `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`. The 
 ## Repair or disconnect
 
 If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-Terminal equivalents:
-
-```sh
-magnitude connections sync openclaw
-magnitude connections remove openclaw
-```
 
 See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.

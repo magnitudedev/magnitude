@@ -89,8 +89,15 @@ Use `--help` after any command to see its options. `magnitude --version` prints 
 
 ## Environment variables
 
-For integration configuration overrides, see your [agent guide](/integrations/overview). For model storage and cached downloads, see the [FAQ](/faq#where-are-models-and-settings-stored).
+For integration configuration overrides, see your [agent guide](/integrations/overview). For model storage and cached downloads, see the [files and directories](#files-and-directories).
 
 ## Files and directories
 
-See [storage locations](/faq#where-are-models-and-settings-stored).
+Magnitude uses `.magnitude` in your home directory: `~/.magnitude` on macOS/Linux, or `%USERPROFILE%\.magnitude` on Windows.
+
+- `models/`: downloaded Magnitude models.
+- `config.json`: user configuration.
+- `cache/`: cached and derived data.
+- `harness-connections.json`: connection management records.
+
+Do not delete the whole directory to troubleshoot a single issue. Removing the app and removing your model data are different actions.

@@ -8,20 +8,20 @@ description: "Connect Hermes to your downloaded Magnitude models."
 1. [Install Hermes](https://hermes-agent.nousresearch.com/docs/getting-started/installation/) if needed.
 2. Download a compatible model in Magnitude.
 3. Open **Connections → Hermes** and click **Connect**.
-4. Open or restart Hermes and choose your Magnitude model.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
 
-Magnitude adds a custom provider named `magnitude`. You can select a model explicitly with the CLI example below before restarting Hermes.
+Magnitude adds a custom provider named `magnitude`. The command below starts Hermes with a model from that provider.
 
-## Select a model from the terminal
+## Run Hermes
 
-To configure the connection and select a specific downloaded model, first find its exact ID:
+After connecting in Magnitude, start Hermes with:
 
 ```sh
-magnitude models status
-magnitude connections add hermes --set-model "MODEL_ID"
+hermes --provider custom:magnitude --model MODEL_ID
 ```
 
-Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
 
 ## Configuration
 
@@ -36,12 +36,5 @@ Supported location overrides: `HERMES_HOME`. The paths displayed in Connections 
 ## Repair or disconnect
 
 If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-Terminal equivalents:
-
-```sh
-magnitude connections sync hermes
-magnitude connections remove hermes
-```
 
 See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
