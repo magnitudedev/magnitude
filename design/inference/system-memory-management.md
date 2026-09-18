@@ -8,12 +8,9 @@ applies_to:
   - packages/acn/src/model-slot-**
   - packages/agent/src/errors/model-start.ts
   - packages/acn-protocol/src/**
-  - packages/client-common/src/utils/model-memory.ts
+  - packages/client-common/src/utils/hardware-memory.ts
   - packages/client-common/src/utils/model-slots.ts
   - packages/client-common/src/hooks/**
-  - cli/src/features/local-inference/**
-  - cli/src/features/model-*/**
-  - cli/src/features/agent-status/**
   - web/src/components/model-center.tsx
 ---
 

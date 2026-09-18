@@ -9,7 +9,7 @@ applies_to:
   - packages/acn/src/inference-gateway.ts
   - packages/acn/src/server.ts
   - packages/sdk/src/inference-client.ts
-  - cli/src/harness-connections/**
+  - packages/harness-connections/src/**
   - integrations/pi/extensions/observing-fetch.ts
   - integrations/pi/extensions/protocol.ts
 ---

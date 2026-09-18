@@ -1,7 +1,6 @@
 ---
 applies_to:
   - packages/storage/src/**
-  - packages/icn/src/catalog/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
   - inference/crates/icn-hardware/**
@@ -10,7 +9,7 @@ applies_to:
   - inference/catalog/**
   - packages/icn/src/lifecycle/**
   - packages/acn/src/icn/layer.ts
-  - cli/src/harness-connections/service.ts
+  - packages/harness-connections/src/service.ts
 ---
 
 # File-based cache, index, and durable-state recovery

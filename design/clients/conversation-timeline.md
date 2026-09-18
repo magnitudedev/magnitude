@@ -4,8 +4,6 @@ applies_to:
   - packages/agent/src/display/**
   - packages/agent/src/display-view/**
   - packages/client-common/src/utils/root-detail.ts
-  - cli/src/features/chat-timeline/**
-  - cli/src/features/agent-status/**
   - web/src/components/chat-timeline.tsx
   - web/src/components/messages/**
   - web/src/components/inline-work-activity.tsx

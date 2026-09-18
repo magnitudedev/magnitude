@@ -660,6 +660,5 @@ For every domain:
 - [ACN service lifecycle](../acn/lifecycle/service-lifecycle.md)
 - [Session runtime lifecycle](../acn/lifecycle/session-runtime.md)
 - [ACN subscriptions](../acn/subscriptions.md)
-- [Root work activity](../agent/work-activity.md)
 - [ICN process lifecycle](../icn/lifecycle.md)
 - [Model instance lifecycle](../model-management/instance-lifecycle.md)

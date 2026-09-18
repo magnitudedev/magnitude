@@ -4,7 +4,6 @@ applies_to:
   - packages/acn/src/attachments/**
   - packages/acn/src/session-*.ts
   - packages/client-common/src/**
-  - cli/src/features/composer/**
   - web/src/components/composer.tsx
   - web/src/lib/message-uploads.ts
   - web/src/app.tsx

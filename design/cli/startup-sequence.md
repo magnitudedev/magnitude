@@ -5,7 +5,6 @@ applies_to:
   - cli/src/server/**
   - cli/src/runtime/**
   - cli/src/startup/**
-  - cli/src/update/**
   - packages/sdk/src/client.ts
   - packages/daemon-management/src/desktop-native/application-client.ts
   - packages/daemon-management/src/desktop-native/application-host.ts

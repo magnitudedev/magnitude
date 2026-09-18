@@ -6,7 +6,7 @@ applies_to:
   - cli/src/index.ts
   - cli/src/commands/update.ts
   - cli/src/commands/update-runtime.ts
-  - cli/src/update/**
+  - cli/src/startup/*update*
   - cli/src/runtime/**
 ---
 
@@ -17,7 +17,7 @@ Release discovery uses the Magnitude-hosted signed protocol. npm dist-tags and a
 manager are not application update authorities. Neither the CLI nor the Pi extension is published
 to npm. Normal Pi connections configure its models and skill without installing the extension.
 
-Desktop installation exposes its bundled CLI directly: /usr/local/bin/magnitude points into the
+Desktop installation exposes its bundled CLI directly: `~/.magnitude/bin/magnitude` points into the
 Mac application, Windows adds the installed resources directory to the user's PATH, and Linux
 retains its package-owned /usr/bin/magnitude link. Replacing the desktop at the same location
 updates the command's executable without a second package update. On macOS the CLI resolves

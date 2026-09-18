@@ -3,8 +3,8 @@
 Tests use [vitest](https://vitest.dev/) with [@effect/vitest](https://effect.website/docs/testing) for Effect-native lifecycle management.
 
 ```bash
-bunx vitest run          # run all tests
-bunx vitest              # watch mode
+bunx --bun vitest run          # run all tests
+bunx --bun vitest              # watch mode
 ```
 
 ## Structure

@@ -11,7 +11,6 @@ applies_to:
   - packages/acn/src/shared-client.ts
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - cli/src/features/model-menus/**
 ---
 
 # Custom endpoints

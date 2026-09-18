@@ -6,12 +6,10 @@ applies_to:
   - packages/acn/src/model-slot-**
   - packages/acn/src/local-model-**
   - packages/acn/src/boundary/**
-  - packages/sdk/src/inference.ts
   - packages/icn-protocol/src/generated/**
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
   - packages/client-common/src/**/local-model*
-  - web/src/components/local-model-onboarding.tsx
   - web/src/components/model-center.tsx
 ---
 

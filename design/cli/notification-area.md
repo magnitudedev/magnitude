@@ -2,13 +2,6 @@
 applies_to:
   - packages/client-common/src/state/notification-area-state.ts
   - packages/client-common/src/state/service-recovery.ts
-  - cli/src/app.tsx
-  - cli/src/runtime/interactive.tsx
-  - cli/src/platform/effect-logger.ts
-  - cli/src/features/notification-area/**
-  - cli/src/features/composer/**
-  - cli/src/features/model-menus/**
-  - cli/src/features/local-inference/footer-status.tsx
 ---
 
 # CLI notification area

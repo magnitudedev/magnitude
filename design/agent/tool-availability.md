@@ -7,7 +7,7 @@ applies_to:
   - packages/acn/src/shared-client.ts
   - packages/acn/src/agent-factory.ts
   - packages/acn/src/provider-credentials.ts
-  - packages/sdk/src/provider-client.ts
+  - packages/providers/src/provider-client.ts
   - packages/providers/src/exa/**
   - packages/providers/src/magnitude/provider.ts
   - packages/providers/src/web-search-error.ts

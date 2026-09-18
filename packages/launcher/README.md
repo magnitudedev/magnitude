@@ -3,12 +3,13 @@
 Install the Magnitude desktop app from [magnitude.dev](https://magnitude.dev) first.
 The app includes the headless CLI and manages its updates.
 
-You can optionally make that CLI available through npm:
+Open the app once, then open a new terminal:
 
 ```sh
-npm install -g @magnitudedev/cli
 magnitude --help
 ```
+
+The desktop installer provides the command. This launcher package is private and is not published to npm.
 
 This package runs the CLI bundled with your installed desktop app. It does not
 install a separate engine, download another CLI, or manage app updates. If the

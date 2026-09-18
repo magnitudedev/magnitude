@@ -2,8 +2,8 @@
 
 Provider system spans three packages:
 - `packages/ai` — provider-agnostic contract (`Provider`, `ModelCatalog`, `BoundModel`, `BaseCallOptions`).
-- `packages/providers` — concrete implementations + registry/aggregation.
-- `packages/sdk` — `ProviderClient`: sole consumer boundary. Consumers never import from `ai` or `providers` directly.
+- `packages/providers` — concrete implementations, registry/aggregation, and `ProviderClient` construction.
+- `packages/sdk` — client-facing RPC boundary. Clients access providers through ACN and the SDK, never by importing `ai` or `providers` directly.
 
 ## Provider Contract
 
@@ -40,6 +40,6 @@ Hosted providers generally use files under `packages/providers/src/<name>/`: `co
 4. `errors.ts` — `classifyRejectedResponse` maps provider errors to `ProviderRejection` variants.
 5. `provider.ts` — construct a `Provider<TModel>` (plus status/extensions where applicable). Export `PROVIDER_ID`. A local provider's bound stream must hold its acquired runtime lease until the response event stream terminates.
 6. Register in `registry.ts`, export from `index.ts`.
-7. Wire into `createProviderClient()` in `packages/sdk/src/provider-client.ts`.
+7. Wire into `createProviderClient()` in `packages/providers/src/provider-client.ts`.
 
 Non-OpenAI-compatible providers: custom protocol namespace + `Model.define` directly.

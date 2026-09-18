@@ -7,17 +7,15 @@ It profiles your machine, recommends the models that fit, then downloads, tunes,
 
 ## Get started
 
-Install the extension:
+Install the Magnitude desktop app. Download a model in Discover, then connect Pi from Connections.
+Restart Pi and choose a Magnitude model with `/model`. Normal connections configure models and
+install the Magnitude skill; they do not install or require this extension.
 
-```sh
-pi install npm:@magnitudedev/pi-extension
-```
+## Local extension development
 
-Install the Magnitude desktop app and its CLI. Open Pi and accept the offer to open Magnitude.
-Discover and download a model in the desktop app, then connect Pi from Connections. Return to Pi
-and run `/reload` to use the new configuration.
-
-You can also start setup anytime with `/magnitude-setup`.
+This directory contains the optional Pi extension source. The package is private and is not
+published to npm. From a configured Magnitude development checkout, run `bun dev:pi` to develop
+the extension. The extension features and slash commands below apply to that development setup.
 
 Requires Pi 0.83.0 or newer. Use a supported Magnitude desktop installation in the same graphical user session as Pi.
 An internet connection is needed for installation and model downloads; after that, you can work offline.

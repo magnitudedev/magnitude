@@ -11,7 +11,7 @@ Magnitude assesses your machine and recommends models that fit. Start with those
 | --- | --- |
 | Apple Silicon Mac | Metal GPU acceleration |
 | Intel Mac | CPU |
-| Windows x64 | CPU |
+| Windows x64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 | Linux x64 or ARM64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 
 See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers.
@@ -26,7 +26,7 @@ Metal support is supplied by macOS; you do not need a separate GPU toolkit.
 
 ## NVIDIA GPUs
 
-On Linux, Magnitude can use its CUDA backend with a compatible NVIDIA GPU and driver. The current CUDA builds target Ampere-class and newer GPUs; older CUDA-capable cards are not automatically supported.
+On Linux and Windows, Magnitude can use its CUDA backend with a compatible NVIDIA GPU and driver. The current CUDA builds target Ampere-class and newer GPUs; older CUDA-capable cards are not automatically supported.
 
 Install your GPU's supported NVIDIA driver. You can check that the driver sees it with:
 
@@ -38,13 +38,13 @@ Magnitude acquires compatible runtime components; you do not need the CUDA devel
 
 ## AMD and other Vulkan GPUs
 
-Linux GPU support uses Vulkan for compatible devices. Magnitude does **not** currently ship a ROCm backend. Windows GPU backends are also not included in the current release configuration.
+Linux and Windows GPU support uses Vulkan for compatible devices. Magnitude does **not** currently ship a ROCm backend.
 
-Use your distribution's supported graphics driver and Vulkan runtime. The backend requires Vulkan 1.1 or later, but the version alone does not guarantee that a particular GPU supports every model. Check the model's compatibility in Catalog.
+Use your operating system's supported graphics driver and Vulkan runtime. The backend requires Vulkan 1.1 or later, but the version alone does not guarantee that a particular GPU supports every model. Check the model's compatibility in Catalog.
 
 ## CPU-only machines
 
-Magnitude can run models without a supported GPU, including on Intel Macs and the current Windows build. Smaller models and lower-bit quantizations are usually more practical when response speed matters.
+Magnitude can run models without a supported GPU, including on Intel Macs and Windows machines without a compatible GPU. Smaller models and lower-bit quantizations are usually more practical when response speed matters.
 
 CPU inference uses system RAM. Having enough memory to fit a large model does not mean it will generate quickly; use the speed estimates when choosing.
 

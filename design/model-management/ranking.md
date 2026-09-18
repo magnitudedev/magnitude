@@ -3,7 +3,6 @@ applies_to:
   - packages/acn/src/local-model-rank*.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/options.ts
-  - packages/client-common/src/local-models/setup*.ts
   - cli/src/commands/inference-runtime.ts
   - packages/client-common/src/desktop/service.ts
   - desktop/src/renderer.tsx
