@@ -2,6 +2,7 @@
 //! This baseline assigns one work item to each CUDA thread. It does not model
 //! native registers/occupancy or select a performance-optimal block size.
 use seismic_realization::{ScalarProgram, dispatch::GroupDispatch};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -17,8 +18,8 @@ pub struct InvocationStorage {
 }
 #[derive(Clone)]
 pub struct Execution {
-    program: ScalarProgram,
-    target: crate::ptx::TargetPlan,
+    program: Arc<ScalarProgram>,
+    target: Arc<crate::ptx::TargetPlan>,
     dispatch: GroupDispatch,
     storage: InvocationStorage,
 }
@@ -29,12 +30,17 @@ impl Execution {
         limits: Limits,
     ) -> Result<Self, String> {
         let target = crate::ptx::prepare(&program)?;
-        Self::from_plan(program, target, threads_per_block, limits)
+        Self::from_plan(
+            Arc::new(program),
+            Arc::new(target),
+            threads_per_block,
+            limits,
+        )
     }
     /// Resolve launch geometry without replacing the already selected target IR.
     pub(crate) fn from_plan(
-        program: ScalarProgram,
-        target: crate::ptx::TargetPlan,
+        program: Arc<ScalarProgram>,
+        target: Arc<crate::ptx::TargetPlan>,
         threads_per_block: u32,
         limits: Limits,
     ) -> Result<Self, String> {
@@ -42,8 +48,14 @@ impl Execution {
             return Err("CUDA block size exceeds device capability".into());
         }
         let lanes = u64::from(program.participation.lanes());
-        if lanes == 0 || !u64::from(threads_per_block).is_multiple_of(lanes) { return Err("CUDA block must contain whole logical participant groups".into()); }
-        let dispatch = GroupDispatch::new(program.work_items, lanes, u64::from(threads_per_block)/lanes)?;
+        if lanes == 0 || !u64::from(threads_per_block).is_multiple_of(lanes) {
+            return Err("CUDA block must contain whole logical participant groups".into());
+        }
+        let dispatch = GroupDispatch::new(
+            program.work_items,
+            lanes,
+            u64::from(threads_per_block) / lanes,
+        )?;
         if dispatch.groups > u64::from(limits.max_grid_x) {
             return Err("CUDA domain exceeds one-dimensional grid capability".into());
         }
@@ -94,6 +106,7 @@ impl Execution {
             && self.storage == other.storage
             && self.program.buffers == other.program.buffers
             && self.program.scalars == other.program.scalars
+            && self.program.conditions == other.program.conditions
     }
     pub(crate) fn validate_limits(&self, limits: Limits) -> Result<(), String> {
         if self.dispatch.threads_per_group > u64::from(limits.max_threads_per_block)

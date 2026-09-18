@@ -151,10 +151,13 @@ fn statements(body: &[Stmt], data: &mut HashSet<VarId>) {
             } => {
                 expression(&domain.view, false, data);
                 for (variable, view) in vars.iter().zip(views) {
-                    // Stream bindings still have an explicit selected transfer
-                    // realization. The domain alone can remain geometry-only.
-                    data.insert(*variable);
-                    expression(view, true, data);
+                    // A piece retains its geometry even when none of its elements
+                    // are read. The fixed point propagates any body data use back
+                    // through the transfer; unsupported geometry stays materialized.
+                    if !has_geometry(view) {
+                        data.insert(*variable);
+                    }
+                    expression(view, data.contains(variable), data);
                 }
                 statements(body, data);
             }

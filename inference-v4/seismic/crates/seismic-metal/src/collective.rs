@@ -64,7 +64,7 @@ impl FragmentLayout {
         })
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FragmentAllocation {
     pub operation: OperationId,
     pub variable: VarId,
@@ -219,7 +219,7 @@ pub struct Site {
     pub operation: OperationId,
     pub ordinal: usize,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Collective {
     pub site: Site,
     pub implementation: Implementation,

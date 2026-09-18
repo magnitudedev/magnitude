@@ -93,7 +93,7 @@ pub struct Definition {
     pub generic_element: bool,
     pub body: Vec<Statement>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     definitions: Vec<Definition>,
 }

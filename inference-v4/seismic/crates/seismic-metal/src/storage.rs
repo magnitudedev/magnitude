@@ -472,7 +472,7 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
 
 /// Selected placement contracts for materialized IR values. These are not an
 /// allocation/lifetime account: repeated definitions may allocate multiple arrays.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StoragePlan {
     declarations: std::collections::BTreeMap<VarId, TileDeclaration>,
     data_variables: std::collections::HashSet<VarId>,

@@ -1,23 +1,62 @@
 //! Metal grouping choices derived from selected IR, memory plans, and device limits.
 //! This is legality, not a throughput preference or native occupancy estimate.
-//! The family varies a common grouping across launches; other execution choices
+//! The family varies independent launch groupings; other execution choices
 //! remain fixed. Constructing and selecting this family never emits target code.
 use crate::execution::Execution;
 use seismic_accounting::selection::Choices;
+use seismic_compiler::tuner::Preparation;
 use seismic_realization::dispatch::GroupDispatch;
+use std::sync::Arc;
 
 /// Legal groupings derived for one actual launch, including padding constraints.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct GroupingChoices {
     pub launch: usize,
     alternatives: Vec<u64>,
+    family: Arc<GroupFamily>,
+    selected: Vec<u64>,
+}
+impl std::fmt::Debug for GroupingChoices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupingChoices")
+            .field("launch", &self.launch)
+            .field("alternatives", &self.alternatives)
+            .field("selected", &self.selected)
+            .field("function", &self.family.execution.function().name)
+            .finish()
+    }
+}
+impl PartialEq for GroupingChoices {
+    fn eq(&self, other: &Self) -> bool {
+        self.launch == other.launch
+            && self.alternatives == other.alternatives
+            && self.selected == other.selected
+            && (Arc::ptr_eq(&self.family, &other.family)
+                || self.family.execution.same_implementation(&other.family.execution))
+    }
 }
 impl GroupingChoices {
+    pub fn family(&self) -> &GroupFamily {
+        &self.family
+    }
+    pub fn selected(&self) -> &[u64] {
+        &self.selected
+    }
     pub fn values(&self) -> &[u64] {
         &self.alternatives
     }
     pub fn index(&self, value: u64) -> Option<usize> {
         self.alternatives.binary_search(&value).ok()
+    }
+    /// Apply one original-domain ordinal to this immutable prepared family.
+    pub fn refine(&self, index: usize) -> Result<Preparation<Execution>, String> {
+        if self.launch != self.selected.len() {
+            return Err("Metal grouping choice does not identify the unresolved launch".into());
+        }
+        let value = self.get(index).ok_or("Metal grouping choice is outside its domain")?;
+        let mut selected = self.selected.clone();
+        selected.push(value);
+        self.family.next(selected)
     }
 }
 impl Choices for GroupingChoices {
@@ -168,7 +207,7 @@ impl GroupFamily {
 
     /// Each launch has its own resource domain. Neither an earlier launch's
     /// shared arrays nor a common convenience grouping restricts this choice.
-    pub fn grouping_choices(&self, launch: usize) -> Result<GroupingChoices, String> {
+    fn grouping_values(&self, launch: usize) -> Result<Vec<u64>, String> {
         let maximum = *self
             .maximum_by_launch
             .get(launch)
@@ -182,9 +221,33 @@ impl GroupFamily {
                     <= u128::from(u32::MAX)
             })
             .collect();
-        Ok(GroupingChoices {
+        Ok(alternatives)
+    }
+
+    /// Continue resolving launch geometry while retaining all prior execution
+    /// choices. Main and merge launches remain independent legal domains.
+    pub fn next(self: &Arc<Self>, selected: Vec<u64>) -> Result<Preparation<Execution>, String> {
+        if selected.len() > self.launches.len() {
+            return Err("unused Metal grouping decisions".into());
+        }
+        for (launch, value) in selected.iter().enumerate() {
+            if self.grouping_values(launch)?.binary_search(value).is_err() {
+                return Err(format!("grouping is outside launch {launch}'s resource domain"));
+            }
+        }
+        if selected.len() == self.launches.len() {
+            return Ok(Preparation::Execution(self.select_launches(&selected)?));
+        }
+        let launch = selected.len();
+        let alternatives = GroupingChoices {
             launch,
-            alternatives,
+            alternatives: self.grouping_values(launch)?,
+            family: Arc::clone(self),
+            selected,
+        };
+        Ok(Preparation::Choice {
+            name: format!("Metal launch {launch} work items per threadgroup"),
+            alternatives: seismic_accounting::selection::Domain::new(alternatives)?,
         })
     }
 
@@ -195,7 +258,7 @@ impl GroupFamily {
         let mut launches = Vec::new();
         let mut shared_bytes_per_group = Vec::new();
         for (index, (&items, domain)) in items.iter().zip(&self.launches).enumerate() {
-            if self.grouping_choices(index)?.index(items).is_none() {
+            if self.grouping_values(index)?.binary_search(&items).is_err() {
                 return Err(format!(
                     "grouping is outside launch {index}'s resource domain"
                 ));

@@ -212,13 +212,13 @@ impl Decision {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Selected {
     pub decision: Decision,
     pub algorithm: Algorithm,
     pub output: Option<TileDeclaration>,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReductionPlan {
     selections: std::collections::HashMap<Site, Selected>,
 }
@@ -266,7 +266,7 @@ pub fn plan(
                         for (var, mode) in vars.iter().zip(modes) {
                             self.bindings.insert(
                                 *var,
-                                if *mode == LoadMode::Borrow {
+                                if !self.storage.requires_data(*var) || *mode == LoadMode::Borrow {
                                     None
                                 } else {
                                     Some(self.storage.declaration(*var)?.placement.clone())

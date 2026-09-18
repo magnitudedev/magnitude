@@ -929,13 +929,24 @@ impl Printer<'_> {
                     .get(domain.axis)
                     .ok_or("stream domain axis exceeds rank")?
                     .clone();
-                let realized: Vec<Realization> = views
-                    .iter()
-                    .map(|v| self.view_of(v))
+                // Evaluate sources in order before checking equality or entering
+                // the loop, even if no piece or element transfer will execute.
+                let realized: Vec<Realization> = vars.iter().zip(views)
+                    .map(|(variable, view)| {
+                        if self.execution.storage.requires_data(*variable) {
+                            self.view_of(view)
+                        } else {
+                            let (shape, _) = self.geometry_of(view)?;
+                            self.geometry_snapshot(&shape, &view.ty.shaped()
+                                .ok_or("stream source has no geometry")?.shape)
+                        }
+                    })
                     .collect::<Result<_, _>>()?;
                 for (view, &axis) in realized.iter().zip(axes) {
-                    let Realization::View { shape, .. } = view else {
-                        unreachable!()
+                    let shape = match view {
+                        Realization::View { shape, .. } => shape.clone(),
+                        Realization::Geometry { dims, .. } => self.realized_shape(dims),
+                        _ => return Err("stream transfer requires view geometry".into()),
                     };
                     let extent = shape.get(axis).ok_or("stream transfer axis exceeds rank")?;
                     if extent != &domain_extent {
@@ -1039,36 +1050,29 @@ impl Printer<'_> {
                         });
                         for (((v, r), mode), axis) in vars.iter().zip(realized).zip(modes).zip(axes)
                         {
-                            let Realization::View {
-                                space,
-                                param,
-                                elem,
-                                offset,
-                                strides,
-                                mut shape,
-                            } = r
-                            else {
-                                unreachable!()
-                            };
-                            let offset = offset.add(
-                                &Sym::param(&chunk)
-                                    .mul(&Sym::constant(*cap))
-                                    .mul(&strides[*axis]),
-                            );
-                            shape[*axis] = Sym::atom(piece.clone());
-                            self.bind_stream_load(
-                                *v,
+                            let realized = match r {
+                                Realization::Geometry { mut dims, .. } => {
+                                    dims[*axis] = self.dim(&Sym::atom(piece.clone()))?;
+                                    let strides = row_major_syms(
+                                        &dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+                                    Realization::Geometry { dims, strides }
+                                }
                                 Realization::View {
-                                    space,
-                                    param,
-                                    elem,
-                                    offset,
-                                    strides,
-                                    shape,
-                                },
-                                *mode,
-                                operation,
-                            )?;
+                                    space, param, elem, offset, strides, mut shape,
+                                } => {
+                                    let offset = offset.add(
+                                        &Sym::param(&chunk)
+                                            .mul(&Sym::constant(*cap))
+                                            .mul(&strides[*axis]),
+                                    );
+                                    shape[*axis] = Sym::atom(piece.clone());
+                                    Realization::View {
+                                        space, param, elem, offset, strides, shape,
+                                    }
+                                }
+                                _ => return Err("stream transfer requires view geometry".into()),
+                            };
+                            self.bind_stream_load(*v, realized, *mode, operation)?;
                         }
                         self.block(body)?;
                         self.indent -= 1;
@@ -1313,6 +1317,7 @@ impl Printer<'_> {
                 else {
                     return Err("reshape requires a view".into());
                 };
+                self.reshape_dimensions(args)?;
                 let target =
                     e.ty.shaped()
                         .ok_or("reshape requires shaped result")?
@@ -1486,6 +1491,32 @@ impl Printer<'_> {
         self.geometry_of(view).map(|(shape, _)| shape)
     }
 
+    /// A logical tile's captured geometry owns contiguous snapshot layout.
+    fn geometry_snapshot(&self, shape: &[Sym], checked: &[Sym]) -> Result<Realization, String> {
+        if shape.len() != checked.len() {
+            return Err("geometry snapshot rank mismatch".into());
+        }
+        let dims = shape.iter().zip(checked)
+            .map(|(actual, checked)| Ok(Dim {
+                cap: self.cap(checked)?,
+                ext: self.sym(actual)?,
+                value: self.target_sym(actual)?,
+            }))
+            .collect::<Result<Vec<_>, String>>()?;
+        let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+        Ok(Realization::Geometry { dims, strides })
+    }
+
+    // Call after realizing the source view, preserving source argument order.
+    // Stored view realizations already captured these evaluations and reach no
+    // reshape expression when their later metadata or elements are queried.
+    fn reshape_dimensions(&mut self, args: &[Expr]) -> Result<(), String> {
+        for dimension in args.iter().skip(1) {
+            self.int_value(dimension)?;
+        }
+        Ok(())
+    }
+
     fn reshape_geometry(
         shape: &[Sym],
         strides: &[Sym],
@@ -1572,6 +1603,7 @@ impl Printer<'_> {
                 args,
             } => {
                 let (shape, strides) = self.geometry_of(&args[0])?;
+                self.reshape_dimensions(args)?;
                 let target = &view.ty.shaped().ok_or("reshape has no shape")?.shape;
                 let strides = Self::reshape_geometry(&shape, &strides, target)?;
                 Ok((target.clone(), strides))
@@ -1778,6 +1810,29 @@ impl Printer<'_> {
         }
     }
     fn indexed_value(&mut self, base: &Expr, indices: &[Index]) -> Result<TE, String> {
+        if matches!(base.ty, Ty::Tensor(_)) {
+            // Addressable tensor views evaluate their complete geometry before
+            // point indices. Reuse it directly so reshape/slice guards are not
+            // dropped or evaluated again by logical tile-coordinate mapping.
+            let Realization::View { space, param, elem, mut offset, strides, shape } =
+                self.view_of(base)? else {
+                    return Err("tensor element read requires a realized view".into());
+                };
+            if indices.len() != shape.len() {
+                return Err("tensor element coordinate rank differs".into());
+            }
+            for ((index, stride), extent) in indices.iter().zip(&strides).zip(&shape) {
+                let Index::Point(point) = index else {
+                    return Err("scalar tensor read contains a slice".into());
+                };
+                let point = self.int_value(point)?;
+                let point = self.checked_index(&point, extent)?;
+                offset = offset.add(&point.mul(stride));
+            }
+            // Dense and packed tensor reads keep their existing typed decoder;
+            // accessor expressions are handled by target_expr before this path.
+            return self.target_view_read(space, &param, &offset, &elem);
+        }
         let points = indices
             .iter()
             .map(|index| match index {
@@ -2128,17 +2183,8 @@ impl Printer<'_> {
                         .shaped()
                         .ok_or("geometry binding has no shape")?
                         .shape;
-                    let dims = shape
-                        .iter()
-                        .zip(checked)
-                        .map(|(actual, checked)| {
-                            Ok(Dim {
-                                cap: self.cap(checked)?,
-                                ext: self.sym(actual)?,
-                                value: self.target_sym(actual)?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
+                    let snapshot = self.geometry_snapshot(&shape, checked)?;
+                    let Realization::Geometry { dims, .. } = &snapshot else { unreachable!() };
                     if let Some(Realization::Geometry { dims: previous, .. }) =
                         self.real.get(v).cloned()
                     {
@@ -2160,10 +2206,7 @@ impl Printer<'_> {
                             }
                         }
                     } else {
-                        let strides =
-                            row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
-                        self.real
-                            .insert(*v, Realization::Geometry { dims, strides });
+                        self.real.insert(*v, snapshot);
                     }
                     return Ok(());
                 }
@@ -3066,11 +3109,11 @@ impl Printer<'_> {
         mode: LoadMode,
         operation: OperationId,
     ) -> Result<(), String> {
-        if mode == LoadMode::Materialize {
-            self.snapshot_into(v, realized, operation, Purpose::Value)
-        } else {
+        if matches!(realized, Realization::Geometry { .. }) || mode == LoadMode::Borrow {
             self.real.insert(v, realized);
             Ok(())
+        } else {
+            self.snapshot_into(v, realized, operation, Purpose::Value)
         }
     }
 

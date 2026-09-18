@@ -179,8 +179,10 @@ impl Region {
         })
     }
     pub(super) fn first_path(&self) -> Vec<usize> {
-        let mut path=self.parent.clone();
-        if let Some((_,indices))=&self.children {path.push(indices.start);}
+        let mut path = self.parent.clone();
+        if let Some((_, indices)) = &self.children {
+            path.push(indices.start);
+        }
         path
     }
     pub fn alternatives(&self) -> Option<(&Domain, std::ops::Range<usize>)> {
@@ -194,15 +196,18 @@ impl Region {
     }
     /// Disjoint, exhaustive bisection of this owner's indexed alternatives.
     /// No implementation is constructed and no candidate is silently discarded.
-    pub(super) fn split(self) -> Result<(Self,Self),Self> {
-        let Some((domain,indices))=&self.children else {return Err(self)};
-        if indices.len()<2 {return Err(self);}
-        let middle=indices.start+indices.len()/2;
-        let mut left=self.clone();
-        left.children=Some((domain.clone(),indices.start..middle));
-        let mut right=self.clone();
-        right.children=Some((domain.clone(),middle..indices.end));
-        Ok((left,right))
+    pub(super) fn split(self) -> Result<(Self, Self), Self> {
+        let Some((domain, indices)) = &self.children else {
+            return Err(self);
+        };
+        if indices.len() < 2 {
+            return Err(self);
+        }
+        let middle = indices.start + indices.len() / 2;
+        let mut left = self.clone();
+        left.children = Some((domain.clone(), indices.start..middle));
+        let mut right = self.clone();
+        right.children = Some((domain.clone(), middle..indices.end));
+        Ok((left, right))
     }
 }
-

@@ -31,7 +31,10 @@ Geometry can remain live after a value's element data becomes dead. Its definiti
 still captures endpoints, clamps dynamic windows, checks points, and validates
 reshape layout at the original evaluation site. An owning tile snapshot has its
 own contiguous layout even when no element allocation is necessary. Endpoint and
-axis expressions can themselves read data and retain those dependencies.
+axis expressions can themselves read data and retain those dependencies. Reshape
+target dimensions likewise evaluate after the source view, in argument order,
+even when their symbolic values are known. A captured view retains that evaluation
+rather than repeating its original expressions when later consumed.
 
 Geometry-only realization is explicit and cannot service an element access. The
 compiler may omit element production only after proving that no data consumer,
@@ -42,6 +45,12 @@ retains conversions and guards, and allocates only its demanded result. A dynami
 window that may cover the entire input still has that full capacity unless a
 separate bounded consumer or streaming realization establishes a smaller demand.
 
+The same captured rectangle can restrict an admitted pure producer region with
+multiple updates. Its original statements retain update order, logical coordinates
+and intermediate precision. Bounds are evaluated before the rectangle is used;
+its lengths refer to the extents established by those checks. Projection may not
+remove a failure in an unrequested part of the original producer.
+
 Ordered reductions over computed tile windows can use the same bounded iteration
 as tensor-backed domains. Capacity follows structural view provenance; the loop
 reads the already captured value's geometry rather than reevaluating its original
@@ -49,6 +58,14 @@ endpoints. A later temporary with the same shape does not replace that snapshot.
 Inputs that overlap mutable reduction state are captured once before decomposition,
 so each piece consumes the original input while carrying the preceding state.
 An empty logical domain executes no pieces and leaves the initial state intact.
+
+A streamed value used only for geometry requires no element transfer or storage.
+Its source still evaluates before the loop, including endpoint reads, layout and
+point checks, and agreement with the iteration domain, even for an empty domain.
+Each piece retains the owning contiguous layout and captured shape of its logical
+load. Data demand propagates through the body; unsupported geometry forms retain
+their data realization. Storage, reduction planning and emission use that same
+demand result.
 
 ## Operation and implementation contracts
 

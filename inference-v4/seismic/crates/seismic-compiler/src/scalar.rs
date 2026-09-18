@@ -1115,9 +1115,16 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 if vars.len()!=views.len() || axes.len()!=views.len() {return Err("stream transfer binding geometry mismatch".into());}
                 let geometry=self.geometry(&domain.view)?;
                 let dimension=*geometry.shape.get(domain.axis).ok_or("invalid stream domain axis")?;
-                let sources = views
-                    .iter()
-                    .map(|expr| self.expr(expr)?.view())
+                // Evaluate every source once, before the loop and before the
+                // zero-trip check. Metadata retains endpoint reads and failures.
+                let sources = vars.iter().zip(views)
+                    .map(|(variable, expr)| {
+                        if self.data_variables.contains(variable) {
+                            self.expr(expr)?.view()
+                        } else {
+                            self.geometry(expr)
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 for (view,&axis) in sources.iter().zip(axes) {
                     self.equal_shape(
@@ -1147,6 +1154,13 @@ impl<'a, 'b> Emitter<'a, 'b> {
                         for (((var, source), mode), &axis) in vars.iter().zip(&sources).zip(modes).zip(axes) {
                             let mut view = source.clone();
                             view.shape[axis] = dim;
+                            if !s.data_variables.contains(var) {
+                                // A logical load owns a contiguous value snapshot,
+                                // including when its selected transfer may borrow.
+                                let tile = s.geometry_snapshot(view.shape)?;
+                                s.bind_tile(*var, tile);
+                                continue;
+                            }
                             let delta = s.builder.ins().imul_imm(start, view.strides[axis]);
                             view.offset = s.builder.ins().iadd(view.offset, delta);
                             let tile = if *mode == seismic_lang::ir::LoadMode::Borrow { view } else { s.materialize(view)? };
@@ -1477,6 +1491,16 @@ impl<'a, 'b> Emitter<'a, 'b> {
         }
     }
     fn reshape_geometry(&mut self, e: &Expr, mut view: View) -> Result<View, String> {
+        let ExprKind::Builtin { name: Builtin::Reshape, args } = &e.kind else {
+            return Err("reshape geometry requires a reshape expression".into());
+        };
+        // The source view was evaluated first. A proven target shape does not
+        // erase effects in the expressions that supplied its dimensions.
+        for dimension in args.iter().skip(1) {
+            if !seismic_lang::effects::can_substitute_symbolic_value(dimension) {
+                self.expr(dimension)?.scalar()?;
+            }
+        }
         let target = self.shape(&e.ty.shaped().ok_or("reshape requires shaped result")?.shape)?;
         if view.shape.iter().chain(&target).any(|d| d.extent.is_some()) {
             return Err("reshape requires statically resolved extents".into());

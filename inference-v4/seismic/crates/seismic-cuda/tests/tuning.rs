@@ -6,9 +6,10 @@ use seismic_lang::{
     lowered_ir::LoweredIr,
     program::{SourceFile, compile},
 };
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 const COPY: &str = "fn kernel(x: tensor[2] f32, out: tensor[2] f32):\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = x[i] + 1.0\n    store(y,out[i:i+1])\n";
+const TWO_PHASES: &str = "fn kernel(x: tensor[1] f32, middle: tensor[1] f32, out: tensor[1] f32):\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = x[i] + 1.0\n    store(y,middle[i:i+1])\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = middle[i] * 2.0\n    store(y,out[i:i+1])\n";
 const LIMITS: workload::DerivationLimits = workload::DerivationLimits {
     instructions: 100_000,
     operations: 100_000,
@@ -198,6 +199,301 @@ fn select() -> tuner::TunedIr<Vec<Execution>, tuning::Conditions> {
 #[test]
 fn compiler_selects_the_complete_cuda_form_and_retains_target_ir() {
     select();
+}
+
+#[test]
+fn retained_block_family_refines_complete_phase_domains_without_repreparing_plans() {
+    let function = lowered(TWO_PHASES);
+    let device = device();
+    let leaves = executions(&function, &device);
+    assert_eq!(leaves.len(), 6); // one sequential phase or two parallel phases
+    let all = leaves
+        .iter()
+        .flat_map(|(_, e)| e.clone())
+        .collect::<Vec<_>>();
+    let backend = tuning::Backend::new(&device, &profile(&all, &device)).unwrap();
+    let dispatch = 1;
+    let Preparation::Choice { alternatives, .. } =
+        tuning::prepare(&function, &device, &[dispatch]).unwrap()
+    else {
+        panic!("expected the retained first-phase block domain")
+    };
+    let owner = alternatives
+        .owner::<selection::IntegerRange<tuning::BlockChoice>>()
+        .unwrap();
+    assert_eq!((owner.first(), owner.last()), (1, 2));
+    assert_eq!(owner.decision.family().phase_count(), 2);
+    assert!(owner.decision.family().selected_blocks().is_empty());
+    let mut refined = Vec::<Vec<Execution>>::new();
+    for first in 0..alternatives.len() {
+        let Some(Preparation::Choice {
+            alternatives: second,
+            ..
+        }) = backend.refine(&alternatives, first).unwrap()
+        else {
+            panic!("expected the retained second-phase block domain")
+        };
+        let next = second
+            .owner::<selection::IntegerRange<tuning::BlockChoice>>()
+            .unwrap();
+        assert_eq!(next.decision.phase, 1);
+        assert_eq!((next.first(), next.last()), (1, 2));
+        assert_eq!(
+            next.decision.family().selected_blocks(),
+            &[first as u32 + 1]
+        );
+        for phase in 0..2 {
+            assert!(std::ptr::eq(
+                owner.decision.family().target(phase).unwrap(),
+                next.decision.family().target(phase).unwrap()
+            ));
+        }
+        for index in 0..second.len() {
+            let Some(Preparation::Execution(execution)) = backend.refine(&second, index).unwrap()
+            else {
+                panic!("all phase dimensions are resolved")
+            };
+            let (_, expected) = leaves
+                .iter()
+                .find(|(path, _)| path == &[dispatch, first, index])
+                .unwrap();
+            for (phase, (actual, expected)) in execution.iter().zip(expected).enumerate() {
+                assert_eq!(actual.target_plan(), expected.target_plan());
+                assert_eq!(actual.dispatch(), expected.dispatch());
+                assert_eq!(actual.storage(), expected.storage());
+                assert_eq!(actual.program().conditions, expected.program().conditions);
+                assert!(std::ptr::eq(
+                    owner.decision.family().target(phase).unwrap(),
+                    actual.target_plan()
+                ));
+                if let Some(sibling) = refined.first() {
+                    assert!(std::ptr::eq(actual.program(), sibling[phase].program()));
+                }
+            }
+            refined.push(execution);
+        }
+    }
+    assert_eq!(refined.len(), 4);
+    assert!(backend.refine(&alternatives, alternatives.len()).is_err());
+    let shortened =
+        selection::Domain::new(selection::IntegerRange::new(owner.decision.clone(), 1, 1).unwrap())
+            .unwrap();
+    assert!(backend.refine(&shortened, 0).is_err());
+    let mut wrong_phase = owner.clone();
+    wrong_phase.decision.phase = 1;
+    assert!(
+        backend
+            .refine(&selection::Domain::new(wrong_phase).unwrap(), 0)
+            .is_err()
+    );
+}
+
+/// Fixes parallel dispatch, then fails if search reconstructs the captured
+/// two-phase family through the source path instead of refining its owner.
+struct RetainedBackend {
+    inner: tuning::Backend,
+    prepared: RefCell<Vec<Vec<usize>>>,
+    families: RefCell<Vec<selection::Domain>>,
+    refined: RefCell<usize>,
+}
+impl tuner::Backend for RetainedBackend {
+    type Execution = Vec<Execution>;
+    type Conditions = tuning::Conditions;
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn conditions(&self) -> Self::Conditions {
+        self.inner.conditions()
+    }
+    fn description(&self) -> tuner::Description {
+        self.inner.description()
+    }
+    fn prepare(
+        &self,
+        function: &LoweredIr,
+        path: &[usize],
+    ) -> Result<Preparation<Self::Execution>, String> {
+        assert!(
+            path.is_empty(),
+            "repeated source/scalar/PTX preparation for {path:?}"
+        );
+        self.prepared.borrow_mut().push(path.to_vec());
+        let result = self.inner.prepare(function, &[1])?;
+        if let Preparation::Choice { alternatives, .. } = &result {
+            if alternatives
+                .owner::<selection::IntegerRange<tuning::BlockChoice>>()
+                .is_some()
+            {
+                self.families.borrow_mut().push(alternatives.clone());
+            }
+        }
+        Ok(result)
+    }
+    fn refine(
+        &self,
+        alternatives: &selection::Domain,
+        index: usize,
+    ) -> Result<Option<Preparation<Self::Execution>>, String> {
+        let result = self.inner.refine(alternatives, index)?;
+        if result.is_some() {
+            *self.refined.borrow_mut() += 1;
+        }
+        Ok(result)
+    }
+    fn relax(
+        &self,
+        alternatives: &selection::Domain,
+        indices: std::ops::Range<usize>,
+        workload: &workload::ScalarWorkload,
+    ) -> Result<Option<schedule::Demand>, String> {
+        self.inner.relax(alternatives, indices, workload)
+    }
+    fn analyze(
+        &self,
+        execution: &Self::Execution,
+        workload: &workload::ScalarWorkload,
+        limits: workload::DerivationLimits,
+    ) -> Result<schedule::Model, workload::DerivationError> {
+        let mut model = self.inner.analyze(execution, workload, limits)?;
+        // A synthetic fully blocking warp: each instruction completes before
+        // the next issues. Keep the derived operations/resources intact while
+        // making this launch-choice oracle independent of schedule branching.
+        for operation in &mut model.operations {
+            for &predecessor in &operation.start_predecessors {
+                if !operation.predecessors.contains(&predecessor) {
+                    operation.predecessors.push(predecessor);
+                }
+            }
+        }
+        model.identity.push_str(":blocking-warp-test");
+        Ok(model)
+    }
+    fn materialize(
+        &self,
+        execution: &Self::Execution,
+        objective: &selection::Objective,
+    ) -> Result<Self::Execution, String> {
+        self.inner.materialize(execution, objective)
+    }
+    fn check_materialization(
+        &self,
+        source: &Self::Execution,
+        selected: &Self::Execution,
+        objective: &selection::Objective,
+    ) -> Result<(), String> {
+        for (source, selected) in source.iter().zip(selected) {
+            assert!(std::ptr::eq(source.program(), selected.program()));
+            assert!(std::ptr::eq(source.target_plan(), selected.target_plan()));
+        }
+        self.inner
+            .check_materialization(source, selected, objective)
+    }
+}
+
+#[test]
+fn interrupted_two_phase_search_reuses_retained_families_and_finds_exact_optimum() {
+    let function = lowered(TWO_PHASES);
+    let device = device();
+    let leaves = executions(&function, &device)
+        .into_iter()
+        .filter(|(path, _)| path[0] == 1)
+        .map(|(path, execution)| (path[1..].to_vec(), execution))
+        .collect::<Vec<_>>();
+    assert_eq!(leaves.len(), 4);
+    let all = leaves
+        .iter()
+        .flat_map(|(_, e)| e.clone())
+        .collect::<Vec<_>>();
+    let mut hardware = profile(&all, &device);
+    hardware.per_unit_residency[0].capacity = 1;
+    let backend = RetainedBackend {
+        inner: tuning::Backend::new(&device, &hardware).unwrap(),
+        prepared: RefCell::default(),
+        families: RefCell::default(),
+        refined: RefCell::default(),
+    };
+    let invocation = workload(&all[0]);
+    let expected = leaves
+        .iter()
+        .map(|(_, execution)| {
+            let solution = backend
+                .analyze(execution, &invocation, LIMITS)
+                .unwrap()
+                .solve(100_000)
+                .unwrap();
+            assert!(solution.is_optimal());
+            solution.schedule().completion
+        })
+        .min()
+        .unwrap();
+    let request = tuner::Request {
+        input: tuner::Input::Lowered(&function),
+        backend: &backend,
+        workload: &invocation,
+        derivation_limits: LIMITS,
+    };
+    let tuner::Outcome::Incomplete(progress) = tuner::tune(
+        &request,
+        selection::Budget {
+            nodes: 1,
+            schedule_assignments: 0,
+        },
+    )
+    .unwrap() else {
+        panic!("expected pending block regions")
+    };
+    assert!(!progress.frontier().is_empty());
+    assert_eq!(backend.families.borrow().len(), 1);
+    let tuner::Outcome::Incomplete(progress) = tuner::resume(
+        &request,
+        progress,
+        selection::Budget {
+            nodes: 1,
+            schedule_assignments: 0,
+        },
+    )
+    .unwrap() else {
+        panic!("expected the pending second-phase domain")
+    };
+    assert!(!progress.frontier().is_empty());
+    assert!(progress.feasible_upper().is_none());
+    assert_eq!(backend.families.borrow().len(), 1);
+    assert_eq!(backend.prepared.borrow().len(), 1);
+    let refinements = *backend.refined.borrow();
+    let tuner::Outcome::Optimal(selected) = tuner::resume(
+        &request,
+        progress,
+        selection::Budget {
+            nodes: 100,
+            schedule_assignments: 100_000,
+        },
+    )
+    .unwrap() else {
+        panic!("complete CUDA family did not resolve")
+    };
+    assert_eq!(backend.prepared.borrow().len(), 1);
+    assert!(
+        *backend.refined.borrow() > refinements,
+        "resumed search must continue refining the retained owner"
+    );
+    assert_eq!(selected.modeled_cost().upper(), expected);
+    let (_, expected) = leaves
+        .iter()
+        .find(|(path, _)| path == selected.selected_path())
+        .unwrap();
+    for (phase, (actual, expected)) in selected.execution().iter().zip(expected).enumerate() {
+        assert_eq!(actual.target_plan(), expected.target_plan());
+        assert_eq!(actual.dispatch(), expected.dispatch());
+        assert!(backend.families.borrow().iter().any(|domain| {
+            domain
+                .owner::<selection::IntegerRange<tuning::BlockChoice>>()
+                .unwrap()
+                .decision
+                .family()
+                .target(phase)
+                .is_some_and(|target| std::ptr::eq(target, actual.target_plan()))
+        }));
+    }
 }
 
 #[test]

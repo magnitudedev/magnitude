@@ -95,6 +95,27 @@ separate complete tree for every candidate. Bounds and constraints specialize as
 resolve. Reuse of subproblems or derived analyses is valid only under compatible
 identities and conditions.
 
+Typed source identity compares floating literal representations, including the
+sign of zero and NaN payload bits. Numeric floating equality cannot identify an
+unchanged program or validate a retained selection against new input.
+
+A retained choice owner may construct its selected member directly when it owns
+the necessary execution context. This refinement must produce the same execution
+or dependent domain as full-path construction under the bound request identity.
+Unrecognized owners use full-path construction; construction failures remain
+errors. Immutable execution plans may be shared across siblings, while each
+assignment retains its own resolved decisions. Resumption retains the owner and
+ordinal needed to recover an execution whose improved schedule becomes the
+incumbent. This reuse changes construction work, not legal domains, objective
+bounds, or the accounting required for a selected execution.
+
+Metal launch grouping retains the prepared execution while resolving each launch's
+own legal domain, including padding exclusions. Selecting the complete assignment
+replans storage quantities for those dispatches without changing allocation
+identities. Prepared implementation identity includes source conditions, ownership,
+storage and synchronization plans; a lazily populated emission cache is derived
+state and does not change that identity.
+
 Retain structured iteration, predicates and symbolic resource relationships where
 possible; full scalar expansion of each candidate is not the production scaling
 strategy. Search decomposition requires independence or a frontier retaining the

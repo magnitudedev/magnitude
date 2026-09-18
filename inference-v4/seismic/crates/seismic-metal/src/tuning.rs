@@ -107,26 +107,18 @@ pub fn expand(
             execution,
             consumed,
         } => {
-            let family = crate::family::GroupFamily::derive(execution)?;
-            let mut groups = Vec::new();
-            for launch in 0..family.execution().memory().launches().len() {
-                let domain = family.grouping_choices(launch)?;
-                let Some(&index) = path.get(consumed + launch) else {
-                    return Ok(Preparation::Choice {
-                        name: format!("Metal launch {launch} work items per threadgroup"),
-                        alternatives: Domain::new(domain)?,
-                    });
+            let family = std::sync::Arc::new(crate::family::GroupFamily::derive(execution)?);
+            let mut prepared = family.next(Vec::new())?;
+            for &index in &path[consumed..] {
+                let Preparation::Choice { alternatives, .. } = &prepared else {
+                    return Err("unused Metal execution decisions".into());
                 };
-                groups.push(
-                    domain
-                        .get(index)
-                        .ok_or("Metal grouping choice is outside its domain")?,
-                );
+                prepared = alternatives
+                    .owner::<crate::family::GroupingChoices>()
+                    .expect("remaining Metal choices are retained launch groupings")
+                    .refine(index)?;
             }
-            if path.len() != consumed + groups.len() {
-                return Err("unused Metal execution decisions".into());
-            }
-            Ok(Preparation::Execution(family.select_launches(&groups)?))
+            Ok(prepared)
         }
     }
 }
@@ -193,6 +185,24 @@ impl compiler::Backend for Backend {
             path,
         )
     }
+    fn refine(
+        &self,
+        alternatives: &Domain,
+        index: usize,
+    ) -> Result<Option<Preparation<Execution>>, String> {
+        let Some(choice) = alternatives.owner::<crate::family::GroupingChoices>() else {
+            return Ok(None);
+        };
+        let config = &choice.family().execution().config;
+        if u64::try_from(config.max_threads_per_threadgroup).ok()
+            != Some(self.conditions.capacities.max_threads_per_threadgroup)
+            || u64::try_from(config.max_threadgroup_bytes).ok()
+                != Some(self.conditions.capacities.max_threadgroup_bytes)
+        {
+            return Err("retained Metal group family has different device capacities".into());
+        }
+        choice.refine(index).map(Some)
+    }
     fn analyze(
         &self,
         execution: &Execution,
@@ -212,9 +222,7 @@ impl compiler::Backend for Backend {
         selected: &Execution,
         _: &Objective,
     ) -> Result<(), String> {
-        if source.function() != selected.function()
-            || crate::msl::prepare_execution(source)? != crate::msl::prepare_execution(selected)?
-        {
+        if !source.same_implementation(selected) {
             return Err("Metal materialization changed the selected implementation".into());
         }
         Ok(())

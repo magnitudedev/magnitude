@@ -219,6 +219,9 @@ impl Analysis<'_> {
                 self.combine(&[expr], coords)
             }
             ExprKind::Binary { lhs, rhs, .. } => self.combine(&[lhs, rhs], coords),
+            ExprKind::Builtin { name: Builtin::Extent, args } => self
+                .parameter_extent(args, coords)
+                .unwrap_or_else(|| self.combine(&args.iter().collect::<Vec<_>>(), coords)),
             ExprKind::Builtin { name, args }
                 if !matches!(
                     name,
@@ -230,6 +233,29 @@ impl Analysis<'_> {
             _ => Value::Unknown,
         }
     }
+    /// A direct parameter query reads geometry, not an element at the current
+    /// reduction coordinate. Only the partitioned axis changes across pieces.
+    /// Derived views retain the existing conservative coordinate proof: their
+    /// endpoint evaluation and guards may change when an input is partitioned.
+    fn parameter_extent(&self, args: &[Expr], coords: &[Sym]) -> Option<Value> {
+        let [view, axis] = args else { return None; };
+        let ExprKind::Var(variable) = view.kind else { return None; };
+        let VarKind::Param(parameter) = self.vars.get(variable)?.kind else { return None; };
+        let queried = usize::try_from(axis.sym.as_ref()?.as_constant()?).ok()?;
+        let extent = view.ty.shaped()?.shape.get(queried)?;
+        let partitioned = self.axes.get(parameter)?;
+        // A constant-valued axis can still evaluate a guarded expression.
+        // Keep its dependency facts rather than substituting the constant.
+        let (accesses, sensitive, folded) = self.read(axis, coords).facts();
+        Some(Value::Other {
+            accesses,
+            sensitive: sensitive
+                || *partitioned == Some(queried)
+                || extent.params().contains(&self.dimension.to_string()),
+            folded,
+        })
+    }
+
     fn combine(&self, args: &[&Expr], coords: &[Sym]) -> Value {
         let mut accesses = Vec::new();
         let (mut sensitive, mut folded) = (false, false);
@@ -903,4 +929,49 @@ pub(super) fn slice_input(
         },
         target,
     ))
+}
+
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::{program::{compile, SourceFile}, Scope};
+
+    fn partitions(query: &str) -> bool {
+        let source = format!(r#"
+fn merge[M](left:tile[M] i32,right:tile[M] i32,out:tile[M] i32):
+  for j in owned(out): out[j] = left[j] + right[j]
+construct fold[K,M](a:tile[K,1] i32,shape_only:tile[K,M] i32,index:i32,state:tile[1] i32):
+  values = tile[K,1] i32
+  for k,j in owned(values): values[k,j] = a[k,j] + {query}
+  reduce((values,),0,merge,into=(state,),ordered=true)
+"#);
+        let program = compile(&[SourceFile {
+            path: "metadata_domain.seismic.portable".into(),
+            scope: Scope::Portable,
+            text: source,
+        }], &[]).unwrap();
+        let function = program.functions.iter().find(|f| f.name == "fold").unwrap();
+        let (vars, body) = crate::lower::portable_body(&program, function).unwrap();
+        domains(function, &vars, &body).iter().any(|domain| domain.parameter == "K")
+    }
+
+    #[test]
+    fn extent_depends_on_the_queried_axis_not_on_parameter_elements() {
+        assert!(partitions("extent(shape_only,1)"));
+        assert!(partitions("extent(shape_only,1+0)"));
+        assert!(!partitions("extent(shape_only,0)"));
+        // Preserve the existing conservative dependency closure even when
+        // symbolic arithmetic cancels two queries of the changing dimension.
+        assert!(!partitions("extent(shape_only,0)-K"));
+    }
+
+    #[test]
+    fn parameter_extent_preserves_axis_expression_and_view_guard_dependencies() {
+        // The outer query selects unchanged axis 1, but evaluating that axis
+        // first checks a point against the partitioned input's axis 0.
+        assert!(!partitions("extent(shape_only,extent(a[index,:],0))"));
+        // The result is still M, but its view checks a point against K.
+        assert!(!partitions("extent(shape_only[index,:],0)"));
+    }
 }

@@ -34,7 +34,7 @@ impl seismic_accounting::selection::Choices for FoldChoice {
 }
 
 /// Realization choices the model will close; defaults for now.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Explicit load realization; borrowing requires the shared lifetime proof.
     pub loads: seismic_realization::LoadStrategy,
@@ -72,7 +72,7 @@ impl Default for Config {
 }
 
 /// A selected parallel mapping and the explicit split handoff, if present.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Phase {
     pub mapping: WorkMapping,
     pub parts: i64,
@@ -81,7 +81,7 @@ pub struct Phase {
     pub split: Option<Split>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Split {
     pub loop_at: usize,
     pub carried: Vec<VarId>,
@@ -93,7 +93,7 @@ pub struct Split {
     pub validation_bindings: Vec<Stmt>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Merge {
     Sum,
 }
@@ -293,6 +293,19 @@ pub struct Execution {
 }
 
 impl Execution {
+    /// Compare the actual prepared implementation independently of whether its
+    /// lazy target emission has already been requested.
+    pub(crate) fn same_implementation(&self, other: &Self) -> bool {
+        self.function == other.function
+            && self.source == other.source
+            && self.config == other.config
+            && self.phases == other.phases
+            && self.memory == other.memory
+            && self.support == other.support
+            && self.reductions == other.reductions
+            && self.storage == other.storage
+            && self.partition_parameters == other.partition_parameters
+    }
     pub fn source(&self) -> &LoweredIr {
         &self.source
     }

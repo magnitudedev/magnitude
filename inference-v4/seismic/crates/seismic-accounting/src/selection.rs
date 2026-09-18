@@ -98,6 +98,17 @@ pub trait Space {
     fn identity(&self) -> Self::Identity;
     fn context(&self) -> &Context;
     fn expand(&self, prefix: &[usize]) -> Result<Node<Self::Execution>, String>;
+    /// Construct a selected member directly from its retained choice owner.
+    /// This changes construction cost only: the result must equal expansion of
+    /// the corresponding full path under the same immutable space identity.
+    /// Owners without retained construction context return None.
+    fn refine(
+        &self,
+        _alternatives: &Domain,
+        _index: usize,
+    ) -> Result<Option<Node<Self::Execution>>, String> {
+        Ok(None)
+    }
     /// Necessary resource demand of the partial implementation in the domain,
     /// relaxed over every indexed alternative. No arbitrary scalar score.
     fn relax(
@@ -186,6 +197,9 @@ enum Analysis {
 }
 struct Record<E> {
     path: Vec<usize>,
+    /// Retain the actual owning domain for leaf recovery after schedule resume.
+    /// Its ordinal still belongs to the same full decision path.
+    refinement: Option<(Domain, usize)>,
     analysis: Analysis,
     /// Keep the already constructed execution while its model needs a larger
     /// derivation budget. Completed models remain in their scheduling search.
@@ -304,6 +318,22 @@ pub enum Outcome<E, I> {
     Infeasible,
 }
 
+fn construct<S: Space>(
+    space: &S,
+    path: &[usize],
+    refinement: Option<&(Domain, usize)>,
+) -> Result<Node<S::Execution>, String> {
+    if let Some((domain, index)) = refinement {
+        if *index >= domain.len() {
+            return Err("refinement ordinal is outside its retained domain".into());
+        }
+        if let Some(node) = space.refine(domain, *index)? {
+            return Ok(node);
+        }
+    }
+    space.expand(path)
+}
+
 pub fn select<S: Space>(
     space: &S,
     budget: Budget,
@@ -372,7 +402,9 @@ pub fn resume<S: Space>(
                     let execution = match record.deferred_execution.take() {
                         Some(execution) => execution,
                         None => {
-                            let Node::Realization(execution) = space.expand(&record.path)? else {
+                            let Node::Realization(execution) =
+                                construct(space, &record.path, record.refinement.as_ref())?
+                            else {
                                 return Err(
                                     "bound implementation changed under identical inputs".into()
                                 );
@@ -435,14 +467,20 @@ pub fn resume<S: Space>(
                         progress.pending.push(region);
                     }
                 }
-                Err(region) => break Some((region.first_path(), region.lower_bound())),
+                Err(region) => break Some(region),
             }
         };
-        let Some((path, lower_bound)) = next else {
+        let Some(region) = next else {
             break;
         };
+        let path = region.first_path();
+        let lower_bound = region.lower_bound();
+        let refinement = region.alternatives().map(|(domain, indices)| {
+            debug_assert_eq!(indices.len(), 1);
+            (domain.clone(), indices.start)
+        });
         let mut deferred_execution = None;
-        let analysis = match space.expand(&path)? {
+        let analysis = match construct(space, &path, refinement.as_ref())? {
             Node::Choice { alternatives, .. } => {
                 alternatives.validate()?;
                 let mut region = Region::children(path.clone(), alternatives.clone(), lower_bound);
@@ -481,6 +519,7 @@ pub fn resume<S: Space>(
         };
         progress.records.push(Record {
             path,
+            refinement,
             analysis,
             deferred_execution,
         });

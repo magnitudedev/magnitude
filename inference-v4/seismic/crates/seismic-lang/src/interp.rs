@@ -783,6 +783,13 @@ impl<'a> Interpreter<'a> {
             Builtin::Reshape => {
                 let Value::View(mut view) = self.expr(&args[0], frame)? else { return Err("reshape requires a tensor view".into()); };
                 if matches!(self.tensors[view.tensor], TensorData::Packed { .. }) { return Err("reshape currently requires dense storage".into()); }
+                // Evaluate dimensions after the source, even when checking has
+                // proved their symbolic values. Nested extent queries can fail.
+                for dimension in args.iter().skip(1) {
+                    if !crate::effects::can_substitute_symbolic_value(dimension) {
+                        self.scalar(dimension, frame)?;
+                    }
+                }
                 let target = args[1..].iter().map(|e| e.sym.as_ref().map(|s| self.eval_sym(s,frame)).ok_or("reshape dimension is not symbolic")).collect::<Result<Vec<_>,_>>()?;
                 let dims = view.shape.iter().map(|n| i64::try_from(*n).map_err(|_| "reshape extent overflow".to_string())).collect::<Result<Vec<_>,_>>()?;
                 let strides = view.strides.iter().map(|n| i64::try_from(*n).map_err(|_| "reshape stride overflow".to_string())).collect::<Result<Vec<_>,_>>()?;

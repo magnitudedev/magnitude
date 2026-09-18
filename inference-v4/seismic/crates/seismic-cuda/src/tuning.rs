@@ -64,20 +64,50 @@ impl BlockChoice {
     pub fn family(&self) -> &BlockFamily {
         &self.family
     }
+    fn refine(
+        domain: &IntegerRange<Self>,
+        index: usize,
+    ) -> Result<Preparation<Vec<Execution>>, String> {
+        let choice = &domain.decision;
+        if choice.phase != choice.family.selected.len() {
+            return Err("CUDA block choice does not identify the unresolved phase".into());
+        }
+        let interval = choice
+            .family
+            .block_interval(choice.phase)
+            .ok_or("invalid CUDA block phase")?;
+        if domain.first() != *interval.start() || domain.last() != *interval.end() {
+            return Err("CUDA block choice differs from its retained complete domain".into());
+        }
+        let items = domain
+            .get(index)
+            .ok_or("CUDA block choice is outside its domain")?;
+        let lanes = choice
+            .family
+            .lanes_per_item(choice.phase)
+            .ok_or("invalid CUDA block phase")?;
+        let threads = items
+            .checked_mul(u64::from(lanes))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or("CUDA block dimension overflow")?;
+        let mut family = (*choice.family).clone();
+        family.selected.push(threads);
+        family.next()
+    }
 }
 
 /// Actual selected PTX and unresolved launch dimensions. Resolved earlier phases
 /// and the remaining legal intervals stay with the same implementation owner.
 #[derive(Clone)]
 pub struct BlockFamily {
-    phases: Vec<Phase>,
+    phases: Arc<[Phase]>,
     selected: Vec<u32>,
     limits: Limits,
 }
 #[derive(Clone)]
 struct Phase {
-    program: ScalarProgram,
-    target: crate::ptx::TargetPlan,
+    program: Arc<ScalarProgram>,
+    target: Arc<crate::ptx::TargetPlan>,
 }
 impl std::fmt::Debug for BlockFamily {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,10 +123,11 @@ impl PartialEq for BlockFamily {
         self.selected == other.selected
             && self.limits == other.limits
             && self.phases.len() == other.phases.len()
-            && self.phases.iter().zip(&other.phases).all(|(a, b)| {
+            && self.phases.iter().zip(other.phases.iter()).all(|(a, b)| {
                 a.target == b.target
                     && a.program.buffers == b.program.buffers
                     && a.program.scalars == b.program.scalars
+                    && a.program.conditions == b.program.conditions
             })
     }
 }
@@ -106,7 +137,7 @@ impl BlockFamily {
         self.phases.len()
     }
     pub fn target(&self, phase: usize) -> Option<&crate::ptx::TargetPlan> {
-        self.phases.get(phase).map(|p| &p.target)
+        self.phases.get(phase).map(|p| p.target.as_ref())
     }
     pub fn selected_blocks(&self) -> &[u32] {
         &self.selected
@@ -131,15 +162,40 @@ impl BlockFamily {
                 ..=u64::from(self.limits.max_threads_per_block / program.participation.lanes()),
         )
     }
+    fn next(self) -> Result<Preparation<Vec<Execution>>, String> {
+        let phase = self.selected.len();
+        if phase == self.phases.len() {
+            return Ok(Preparation::Execution(self.finish()?));
+        }
+        let interval = self.block_interval(phase).ok_or("invalid CUDA phase")?;
+        let domain = IntegerRange::new(
+            BlockChoice {
+                phase,
+                family: Arc::new(self),
+            },
+            *interval.start(),
+            *interval.end(),
+        )?;
+        Ok(Preparation::Choice {
+            name: format!("CUDA phase {phase} work items per block"),
+            alternatives: selection::Domain::new(domain)?,
+        })
+    }
+
     fn finish(self) -> Result<Vec<Execution>, String> {
         if self.selected.len() != self.phases.len() {
             return Err("unresolved CUDA block dimensions".into());
         }
         self.phases
-            .into_iter()
+            .iter()
             .zip(self.selected)
             .map(|(phase, threads)| {
-                Execution::from_plan(phase.program, phase.target, threads, self.limits)
+                Execution::from_plan(
+                    phase.program.clone(),
+                    phase.target.clone(),
+                    threads,
+                    self.limits,
+                )
             })
             .collect()
     }
@@ -266,11 +322,7 @@ pub fn prepare(
         max_threads_per_block: device.max_threads_per_block,
         max_grid_x: device.max_grid_x,
     };
-    let mut family = BlockFamily {
-        phases: Vec::new(),
-        selected: Vec::new(),
-        limits,
-    };
+    let mut phases = Vec::new();
     for (phase, program) in sequence.phases.into_iter().enumerate() {
         let minimum = program
             .program
@@ -287,40 +339,27 @@ pub fn prepare(
             }));
         }
         let target = crate::ptx::prepare(&program.program)?;
-        family.phases.push(Phase {
-            program: program.program,
-            target,
+        phases.push(Phase {
+            program: Arc::new(program.program),
+            target: Arc::new(target),
         });
     }
-    for phase in 0..family.phases.len() {
-        let interval = family.block_interval(phase).expect("known CUDA phase");
-        let minimum = *interval.start();
-        let maximum = *interval.end();
-        let Some(&index) = path.get(phase + 1) else {
-            let domain = IntegerRange::new(
-                BlockChoice {
-                    phase,
-                    family: Arc::new(family),
-                },
-                minimum,
-                maximum,
-            )?;
-            return Ok(Preparation::Choice {
-                name: format!("CUDA phase {phase} work items per block"),
-                alternatives: selection::Domain::new(domain)?,
-            });
+    let mut prepared = BlockFamily {
+        phases: phases.into(),
+        selected: Vec::new(),
+        limits,
+    }
+    .next()?;
+    for &index in &path[1..] {
+        let Preparation::Choice { alternatives, .. } = &prepared else {
+            return Err("unused CUDA execution decisions".into());
         };
-        let threads = IntegerRange::new(phase, minimum, maximum)?
-            .get(index)
-            .ok_or("CUDA block choice is outside its domain")?;
-        family
-            .selected
-            .push((threads * u64::from(family.lanes_per_item(phase).unwrap())) as u32);
+        let domain = alternatives
+            .owner::<IntegerRange<BlockChoice>>()
+            .expect("remaining CUDA choices are retained block dimensions");
+        prepared = BlockChoice::refine(domain, index)?;
     }
-    if path.len() != family.selected.len() + 1 {
-        return Err("unused CUDA execution decisions".into());
-    }
-    Ok(Preparation::Execution(family.finish()?))
+    Ok(prepared)
 }
 
 impl compiler::Backend for Backend {
@@ -348,6 +387,25 @@ impl compiler::Backend for Backend {
         path: &[usize],
     ) -> Result<Preparation<Vec<Execution>>, String> {
         prepare(function, &self.conditions.device, path)
+    }
+    fn refine(
+        &self,
+        alternatives: &selection::Domain,
+        index: usize,
+    ) -> Result<Option<Preparation<Vec<Execution>>>, String> {
+        let Some(domain) = alternatives.owner::<IntegerRange<BlockChoice>>() else {
+            return Ok(None);
+        };
+        let device = &self.conditions.device;
+        if domain.decision.family.limits
+            != (Limits {
+                max_threads_per_block: device.max_threads_per_block,
+                max_grid_x: device.max_grid_x,
+            })
+        {
+            return Err("retained CUDA block family has different device limits".into());
+        }
+        Ok(Some(BlockChoice::refine(domain, index)?))
     }
     fn analyze(
         &self,
@@ -410,8 +468,9 @@ pub fn prepare_fixed(
     threads: u32,
 ) -> Result<Vec<Execution>, String> {
     let mut path = Vec::new();
+    let mut prepared = prepare(function, device, &path)?;
     loop {
-        match prepare(function, device, &path)? {
+        match prepared {
             Preparation::Execution(executions) => return Ok(executions),
             Preparation::Infeasible(reason) => {
                 return Err(format!(
@@ -452,7 +511,84 @@ pub fn prepare_fixed(
                     return Err("unknown CUDA execution decision".into());
                 };
                 path.push(index);
+                prepared = match alternatives.owner::<IntegerRange<BlockChoice>>() {
+                    Some(domain) => BlockChoice::refine(domain, index)?,
+                    None => prepare(function, device, &path)?,
+                };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invocation_conditions_distinguish_equal_target_implementations() {
+        let program = seismic_lang::program::compile(
+            &[seismic_lang::program::SourceFile {
+                path: "identity.seismic.portable".into(),
+                scope: seismic_lang::Scope::Portable,
+                text: "fn kernel(x: tensor[1] f32, out: tensor[1] f32):\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = x[i] + 1.0\n    store(y,out[i:i+1])\n".into(),
+            }],
+            &[],
+        ).unwrap();
+        let mut function =
+            seismic_lang::lower::lower(&program, "kernel", "cuda", &Default::default()).unwrap();
+        function.alias_requirements.clear();
+        let device = DeviceInfo {
+            name: "identity test".into(),
+            compute_capability: (8, 0),
+            driver_version: 0,
+            max_threads_per_block: 1,
+            max_grid_x: 1,
+            warp_size: 1,
+            multiprocessors: 1,
+            global_memory_bytes: 4096,
+            l2_cache_bytes: 0,
+            max_threads_per_multiprocessor: 1,
+            registers_32bit_per_multiprocessor: 1024,
+            shared_bytes_per_multiprocessor: 1024,
+        };
+        let Preparation::Choice {
+            alternatives: ordinary,
+            ..
+        } = prepare(&function, &device, &[1]).unwrap()
+        else {
+            panic!("expected block choice")
+        };
+        function
+            .alias_requirements
+            .push(seismic_lang::lowered_ir::AliasRequirement {
+                left: 0,
+                right: 1,
+                exact_allowed: false,
+            });
+        let Preparation::Choice {
+            alternatives: restricted,
+            ..
+        } = prepare(&function, &device, &[1]).unwrap()
+        else {
+            panic!("expected block choice")
+        };
+        let ordinary_owner = ordinary.owner::<IntegerRange<BlockChoice>>().unwrap();
+        let restricted_owner = restricted.owner::<IntegerRange<BlockChoice>>().unwrap();
+        assert_eq!(
+            ordinary_owner.decision.family.target(0),
+            restricted_owner.decision.family.target(0)
+        );
+        assert_ne!(ordinary, restricted);
+        let Preparation::Execution(ordinary) = BlockChoice::refine(ordinary_owner, 0).unwrap()
+        else {
+            panic!("expected terminal execution")
+        };
+        let Preparation::Execution(restricted) = BlockChoice::refine(restricted_owner, 0).unwrap()
+        else {
+            panic!("expected terminal execution")
+        };
+        assert_eq!(ordinary[0].target_plan(), restricted[0].target_plan());
+        assert_eq!(ordinary[0].dispatch(), restricted[0].dispatch());
+        assert!(!ordinary[0].same_implementation(&restricted[0]));
     }
 }

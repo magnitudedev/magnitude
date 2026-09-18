@@ -219,6 +219,165 @@ fn incomplete_schedule_search_is_retained_and_resumed() {
         3
     );
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Refinement {
+    All,
+    NestedOnly,
+    Fail,
+}
+struct RetainedTree {
+    tree: Tree,
+    mode: Refinement,
+    expanded: std::cell::RefCell<Vec<Vec<usize>>>,
+    refined: std::cell::RefCell<Vec<(u8, usize)>>,
+}
+impl RetainedTree {
+    fn new(mode: Refinement) -> Self {
+        Self {
+            tree: tree(),
+            mode,
+            expanded: Default::default(),
+            refined: Default::default(),
+        }
+    }
+}
+impl Space for RetainedTree {
+    type Execution = usize;
+    type Identity = (<Tree as Space>::Identity, Refinement);
+    fn identity(&self) -> Self::Identity {
+        (self.tree.identity(), self.mode)
+    }
+    fn context(&self) -> &Context {
+        self.tree.context()
+    }
+    fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> {
+        self.expanded.borrow_mut().push(path.to_vec());
+        self.tree.expand(path)
+    }
+    fn refine(&self, domain: &Domain, index: usize) -> Result<Option<Node<usize>>, String> {
+        let Some(owner) = domain.owner::<FixtureChoice>() else {
+            return Ok(None);
+        };
+        if self.mode == Refinement::NestedOnly && owner.site == 0 {
+            return Ok(None);
+        }
+        if self.mode == Refinement::Fail {
+            return Err("retained construction failed".into());
+        }
+        self.refined.borrow_mut().push((owner.site, index));
+        Ok(Some(match (owner.site, index) {
+            (0, 0) => Node::Choice {
+                name: "layout".into(),
+                alternatives: Domain::new(FixtureChoice { site: 1 })?,
+            },
+            (0, 1) => Node::Realization(2),
+            (1, 0) => Node::Realization(0),
+            (1, 1) => Node::Realization(1),
+            _ => return Err("invalid retained choice".into()),
+        }))
+    }
+    fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
+        self.tree.analyze(execution)
+    }
+    fn materialize(&self, execution: &usize, objective: &Objective) -> Result<usize, String> {
+        self.tree.materialize(execution, objective)
+    }
+}
+#[test]
+fn retained_dependent_owners_preserve_optimum_and_interrupted_coverage() {
+    let expected = optimal(select(&tree(), budget(5)).unwrap());
+    let space = RetainedTree::new(Refinement::All);
+    let Outcome::Incomplete(progress) = select(&space, budget(3)).unwrap() else {
+        panic!("expected retained frontier");
+    };
+    assert_eq!(
+        progress
+            .frontier()
+            .iter()
+            .flat_map(Region::paths)
+            .collect::<Vec<_>>(),
+        vec![vec![1], vec![0, 1]]
+    );
+    assert_eq!(progress.incumbent(), Some(&0));
+    let actual = optimal(resume(&space, progress, budget(2)).unwrap());
+    assert_eq!(actual.execution(), expected.execution());
+    assert_eq!(actual.selected_path(), expected.selected_path());
+    assert_eq!(actual.objective(), expected.objective());
+    assert_eq!(&*space.expanded.borrow(), &[Vec::<usize>::new()]);
+    assert_eq!(&*space.refined.borrow(), &[(0, 0), (1, 0), (1, 1), (0, 1)]);
+}
+#[test]
+fn improved_schedule_recovers_nonincumbent_through_its_retained_owner() {
+    let mut space = RetainedTree::new(Refinement::All);
+    let mut parallel = model(3);
+    parallel.resources.push(Resource {
+        name: "independent issue".into(),
+        capacity: 1,
+        unit: CapacityUnit::Slots,
+    });
+    let mut second = parallel.operations[0].clone();
+    second.name = "independent operation".into();
+    second.reservations[0].resource = 1;
+    parallel.operations.push(second);
+    space.tree.models = [model(5), parallel, model(7)];
+    let Outcome::Incomplete(progress) = select(
+        &space,
+        Budget {
+            nodes: 5,
+            schedule_assignments: 0,
+        },
+    )
+    .unwrap() else {
+        panic!("parallel schedule needs further search");
+    };
+    assert!(progress.frontier().is_empty());
+    assert_eq!(progress.incumbent(), Some(&0));
+    assert_eq!(progress.feasible_upper(), Some(5));
+    assert_eq!(progress.lower_bound().unwrap(), 3);
+    let selected = optimal(resume(&space, progress, budget(0)).unwrap());
+    assert_eq!(selected.execution(), &1);
+    assert_eq!(selected.selected_path(), &[0, 1]);
+    assert_eq!(selected.cost().upper(), 3);
+    assert_eq!(&*space.expanded.borrow(), &[Vec::<usize>::new()]);
+    assert_eq!(space.refined.borrow().last(), Some(&(1, 1)));
+    assert_eq!(
+        space
+            .refined
+            .borrow()
+            .iter()
+            .filter(|&&v| v == (1, 1))
+            .count(),
+        2
+    );
+}
+#[test]
+fn unhandled_owner_uses_full_path_but_construction_errors_propagate() {
+    let space = RetainedTree::new(Refinement::NestedOnly);
+    let selected = optimal(select(&space, budget(5)).unwrap());
+    assert_eq!(selected.execution(), &1);
+    assert_eq!(&*space.expanded.borrow(), &[vec![], vec![0], vec![1]]);
+    assert_eq!(&*space.refined.borrow(), &[(1, 0), (1, 1)]);
+    let space = RetainedTree::new(Refinement::Fail);
+    assert!(
+        matches!(select(&space, budget(5)), Err(error) if error == "retained construction failed")
+    );
+    assert_eq!(&*space.expanded.borrow(), &[Vec::<usize>::new()]);
+}
+#[test]
+fn changed_inputs_reject_retained_frontier_before_refinement() {
+    let mut space = RetainedTree::new(Refinement::All);
+    let Outcome::Incomplete(progress) = select(&space, budget(2)).unwrap() else {
+        panic!("expected nested retained domain");
+    };
+    let refinements = space.refined.borrow().clone();
+    space.tree.models[1].operations[0].latency = 4;
+    assert!(
+        matches!(resume(&space, progress, budget(3)), Err(error) if error.contains("inputs changed"))
+    );
+    assert_eq!(*space.refined.borrow(), refinements);
+    assert_eq!(&*space.expanded.borrow(), &[Vec::<usize>::new()]);
+}
 #[test]
 fn large_domains_retain_exact_frontier_without_expanding_each_alternative() {
     struct Wide(Tree);

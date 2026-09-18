@@ -146,9 +146,19 @@ impl Execution {
             })
         };
         let mut prefix = Vec::new();
+        let mut prepared = prepare(&prefix)?;
         loop {
-            match prepare(&prefix)? {
-                Preparation::Choice { alternatives, .. } => prefix.push(select(&alternatives)?),
+            match prepared {
+                Preparation::Choice { alternatives, .. } => {
+                    let index = select(&alternatives)?;
+                    prefix.push(index);
+                    #[cfg(target_os = "macos")]
+                    if let Some(choice) = alternatives.owner::<seismic_metal::family::GroupingChoices>() {
+                        prepared = crate::tuner::map_preparation(choice.refine(index)?, Execution::Metal);
+                        continue;
+                    }
+                    prepared = prepare(&prefix)?;
+                }
                 Preparation::Execution(execution) => return Ok(execution),
                 Preparation::Infeasible(violation) => {
                     return Err(format!(

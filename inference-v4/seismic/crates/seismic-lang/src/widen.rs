@@ -50,6 +50,19 @@ pub fn plan_at(body: &[Stmt], inner: VarId, atom: &Atom, factor: i64) -> Widenin
             w
         })
         .collect();
+    plan_with_writes(body, inner, atom, factor, &writes_of)
+}
+
+/// Reuse the same dependency closure when a caller has checked write effects
+/// for retained operations that have not yet expanded into assignments.
+pub(crate) fn plan_with_writes(
+    body: &[Stmt],
+    inner: VarId,
+    atom: &Atom,
+    factor: i64,
+    writes_of: &[HashSet<VarId>],
+) -> Widening {
+    assert_eq!(body.len(), writes_of.len());
     // Grow the dependent set to a fixpoint: a statement is dependent if it reads the index or
     // any value a dependent statement produced.
     let mut dependent = vec![false; body.len()];

@@ -64,6 +64,89 @@ fn budget() -> Budget {
     }
 }
 
+fn floating_literal_resume_identity(initial: u64, changed: u64) {
+    use seismic_lang::ir::{ExprKind, StmtKind};
+    let mut program = compile(&[SourceFile {
+        path: "literal-identity.seismic.portable".into(),
+        scope: LanguageScope::Portable,
+        text: "fn write(out:tensor[1] f32):\n  value = 0.0\n  y = tile[1] f32\n  for i in owned(y):\n    y[i] = value\n  store(y,out)\n".into(),
+    }], &[]).unwrap();
+    let set_literal = |program: &mut seismic_lang::program::Program, bits| {
+        let StmtKind::Assign { value, .. } = &mut program.functions[0].body[0].kind else {
+            panic!("fixture literal assignment");
+        };
+        let ExprKind::Float(number) = &mut value.kind else {
+            panic!("fixture floating literal");
+        };
+        *number = f64::from_bits(bits);
+    };
+    let shapes = HashMap::new();
+    let elements = HashMap::new();
+    let options = seismic_lang::lower::Options::default();
+    let baseline = seismic_lang::lower::lower(&program, "write", "cpu", &shapes).unwrap();
+    let hardware = Hardware::Cpu(contract(&baseline));
+    // Keep every other source fact, including spans, identical. These are typed
+    // IR literals: identity must compare their representation, not IEEE equality.
+    set_literal(&mut program, initial);
+    let mut altered = program.clone();
+    set_literal(&mut altered, changed);
+    let lowered = seismic_lang::lower::lower(&program, "write", "cpu", &shapes).unwrap();
+    let altered_lowered = seismic_lang::lower::lower(&altered, "write", "cpu", &shapes).unwrap();
+    let device = Device::cpu();
+    let facts = device.facts();
+    let workload =
+        tuner::workload("literal identity", &[device.buffer(4).unwrap()], &[], &[]).unwrap();
+    let portable = |program| Input::Portable {
+        program,
+        entry: "write",
+        shapes: &shapes,
+        elements: &elements,
+        options: &options,
+    };
+    for (input, changed_input) in [
+        (portable(&program), portable(&altered)),
+        (Input::Lowered(&lowered), Input::Lowered(&altered_lowered)),
+    ] {
+        let mut request = Request {
+            input,
+            device: &facts,
+            form: Form::CpuScalar,
+            hardware: &hardware,
+            workload: &workload,
+            derivation_limits: DerivationLimits {
+                instructions: 100,
+                operations: 100,
+            },
+        };
+        let limited = Budget {
+            nodes: 0,
+            schedule_assignments: 0,
+        };
+        let Outcome::Incomplete(progress) = tuner::tune(&request, limited).unwrap() else {
+            panic!("zero-node budget retains source without selecting an execution");
+        };
+        let Outcome::Incomplete(progress) = tuner::resume(&request, progress, limited).unwrap()
+        else {
+            panic!("identical floating literal must permit resumption");
+        };
+        request.input = changed_input;
+        assert!(
+            matches!(tuner::resume(&request, progress, limited), Err(error) if error.contains("inputs changed")),
+            "changed literal bits must invalidate retained choices"
+        );
+    }
+}
+
+#[test]
+fn source_identity_distinguishes_signed_zero_literals() {
+    floating_literal_resume_identity(0.0_f64.to_bits(), (-0.0_f64).to_bits());
+}
+
+#[test]
+fn source_identity_retains_identical_nan_and_distinguishes_payloads() {
+    floating_literal_resume_identity(0x7ff8_0000_0000_0001, 0x7ff8_0000_0000_0002);
+}
+
 #[test]
 fn model_construction_limits_are_resumable_without_changing_execution_identity() {
     let program = compile(&[SourceFile {

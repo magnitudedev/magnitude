@@ -224,6 +224,24 @@ impl compiler::Backend for Composition {
             }
         })
     }
+    fn refine(
+        &self,
+        alternatives: &selection::Domain,
+        index: usize,
+    ) -> Result<Option<Preparation<Execution>>, String> {
+        match &self.implementation {
+            Implementation::Cpu(b) => Ok(b
+                .refine(alternatives, index)?
+                .map(|p| map_preparation(p, Execution::Cpu))),
+            Implementation::Cuda(b) => Ok(b
+                .refine(alternatives, index)?
+                .map(|p| map_preparation(p, Execution::Cuda))),
+            #[cfg(target_os = "macos")]
+            Implementation::Metal(b) => Ok(b
+                .refine(alternatives, index)?
+                .map(|p| map_preparation(p, Execution::Metal))),
+        }
+    }
     fn analyze(
         &self,
         execution: &Execution,

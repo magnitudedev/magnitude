@@ -37,7 +37,7 @@ pub enum Scope {
     Then(OperationId),
     Else(OperationId),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArrayAllocation {
     pub id: AllocationId,
     pub declaration: TileDeclaration,
@@ -86,19 +86,19 @@ pub struct BarrierSite {
     pub purpose: BarrierPurpose,
 }
 /// References to structured IR, before scalar SSA or native emission.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ControlValue {
     Integer(seismic_lang::sym::Sym),
     Predicate(Box<seismic_lang::ir::Expr>),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Barrier {
     pub memory: MemorySpace,
     pub scope: Vec<Scope>,
     /// Per-work-item executions, conditional on valid collective participation.
     pub executions: Arc<Multiplicity<ControlValue>>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LaunchMemory {
     pub prologue: crate::support::LaunchRecipe,
     /// This launch must observe completion of its predecessor before it starts.
@@ -131,7 +131,7 @@ pub struct ScratchAllocation {
     pub producer: usize,
     pub consumer: usize,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryPlan {
     launches: Vec<LaunchMemory>,
     scratch: Vec<ScratchAllocation>,
@@ -758,6 +758,10 @@ pub fn plan_selected(
                             self.scope.push(Scope::Body(operation));
                         }
                         for ((var, mode), view) in vars.iter().zip(modes).zip(views) {
+                            if !self.storage.requires_data(*var) {
+                                self.bound.insert(*var, None);
+                                continue;
+                            }
                             if *mode == LoadMode::Materialize {
                                 self.snapshot(operation, *var, Purpose::Value)?;
                             }

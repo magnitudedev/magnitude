@@ -198,6 +198,22 @@ fn capture_view(
                     kind: StmtKind::Expr(extent(&partial, 0)),
                 });
             }
+            // The metadata evaluations above established each checked extent.
+            // Use that same shape identity in the returned rectangle instead
+            // of asking later projection to rediscover end - start equality.
+            // Captured bounds satisfy 0 <= start <= end <= parent <= i32::MAX,
+            // so start + extent equals the clamped end without overflow.
+            let mut visible = 0;
+            for index in &mut normalized {
+                if let Index::Slice { start, end } = index {
+                    let start = start.as_ref().map_or_else(
+                        || Some(Sym::constant(0)),
+                        |start| start.sym.clone(),
+                    )?;
+                    *end = Some(symbol(start.add(&view.ty.shaped()?.shape[visible]), view.span));
+                    visible += 1;
+                }
+            }
             captured.kind = ExprKind::Index {
                 base: Box::new(base),
                 indices: normalized,

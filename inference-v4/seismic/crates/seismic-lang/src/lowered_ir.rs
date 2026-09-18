@@ -125,9 +125,18 @@ impl Alternatives {
     }
 }
 
+/// One retained call whose independent output dimension participates in a
+/// common source-coordinate group. Position distinguishes repeated calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputGroupCall {
+    pub position: usize,
+    pub construct: String,
+    pub parameter: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecisionKind {
-    OutputGroup { coordinate: VarId, extent: i64, construct: String, parameter: String },
+    OutputGroup { coordinate: VarId, extent: i64, calls: Vec<OutputGroupCall> },
     Representation { variable: VarId },
     ReductionSegments {extent:i64},
     Intermediate { variable: VarId, publication: usize },

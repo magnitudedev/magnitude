@@ -92,13 +92,25 @@ pub struct IterationDomain {
     pub axis: usize,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Expr {
     pub kind: ExprKind,
     pub ty: Ty,
     /// Symbolic value for integer-typed expressions built from parameters, indices and literals.
     pub sym: Option<Sym>,
     pub span: Span,
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        // Typed expression identity is structural, not a floating-point
+        // comparison: signed zero and NaN payloads are part of the source.
+        let same_kind = match (&self.kind, &other.kind) {
+            (ExprKind::Float(a), ExprKind::Float(b)) => a.to_bits() == b.to_bits(),
+            (a, b) => a == b,
+        };
+        same_kind && self.ty == other.ty && self.sym == other.sym && self.span == other.span
+    }
 }
 
 /// Selected realization of a value-semantic load. Borrowing requires a lifetime

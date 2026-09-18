@@ -727,10 +727,6 @@ fn project(
     // Follow only the reaching, still-stable snapshot definitions already owned
     // by this environment. Preserve each ordinary view operation and its shape.
     let value = expand_views(value, available, 0);
-    if let Some(Producer::Region { output, body }) = root(&value).and_then(|v| available.get(&v)) {
-        return super::regions::project(body, *output, &value, target, vars, project_call)
-            .map(|body| body.map(|body| Projection { body, view: value }));
-    }
     if let Some(view) = tensor(&value, available, 0) {
         return Ok(Some(Projection { view: value, body: vec![Stmt {
             id: None,
@@ -754,6 +750,13 @@ fn project(
         let Some(captured) = geometry::capture(&value, vars) else { return Ok(None); };
         captured
     } else { (value, Vec::new()) };
+    if let Some(Producer::Region { output, body: region }) = root(&value).and_then(|v| available.get(&v)) {
+        let Some(projected) = super::regions::project(region, *output, &value, target, vars, project_call)? else {
+            return Ok(None);
+        };
+        body.extend(projected);
+        return Ok(Some(Projection { body, view: value }));
+    }
     let shape = &target
         .ty
         .shaped()

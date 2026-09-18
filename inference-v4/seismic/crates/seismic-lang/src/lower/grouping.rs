@@ -1,4 +1,4 @@
-//! Rectangular independent outputs become one retained construct invocation.
+//! Rectangular independent outputs widen an ordered sequence of retained calls.
 //! Geometry and independence come from the same checked maps used by projection;
 //! ordinary tile copies preserve each source seed and publication conversion.
 use super::*;
@@ -15,12 +15,17 @@ struct Axis {
     output_axis: usize,
     parameter: String,
 }
-struct Region<'a> {
+struct CallRegion<'a> {
     function: &'a Function,
     call: usize,
     output: usize,
     axes: Vec<Axis>,
     loads: Vec<Option<Expr>>,
+    versions: Vec<Option<usize>>,
+}
+struct Region<'a> {
+    calls: Vec<CallRegion<'a>>,
+    axes: Vec<Axis>,
     removable: HashSet<usize>,
     aliases: Vec<AliasRequirement>,
 }
@@ -65,13 +70,21 @@ pub(super) fn select(
                     let widths = region
                         .axes
                         .iter()
-                        .map(|axis| {
+                        .enumerate()
+                        .map(|(dimension, axis)| {
                             let domain = Decision {
                                 kind: DecisionKind::OutputGroup {
                                     coordinate: axis.coordinate,
                                     extent: axis.extent,
-                                    construct: region.function.name.clone(),
-                                    parameter: axis.parameter.clone(),
+                                    calls: region
+                                        .calls
+                                        .iter()
+                                        .map(|call| OutputGroupCall {
+                                            position: call.call,
+                                            construct: call.function.name.clone(),
+                                            parameter: call.axes[dimension].parameter.clone(),
+                                        })
+                                        .collect(),
                                 },
                                 alternatives: Alternatives::output_widths(axis.extent)?,
                             };
@@ -135,71 +148,27 @@ fn region<'a>(
     let calls = body
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| match &s.kind {
+        .filter_map(|(position, statement)| match &statement.kind {
             StmtKind::Expr(
-                e @ Expr {
+                call @ Expr {
                     kind: ExprKind::Call { .. },
                     ..
                 },
-            ) => Some((i, e)),
+            ) => Some((position, call)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let [(call_index, call)] = calls.as_slice() else {
+    let Some((last_call, _)) = calls.last() else {
         return Ok(None);
     };
-    let ExprKind::Call { callee, args, .. } = &call.kind else {
-        unreachable!()
-    };
-    let Some(function) = program
-        .functions
+    let positions = calls
         .iter()
-        .find(|f| f.is_construct && f.name == *callee)
-    else {
-        return Ok(None);
-    };
-    let Some(facts) = projection::output_axes(program, function)? else {
-        return Ok(None);
-    };
-    let Some(output) = args.get(facts.output) else {
-        return Ok(None);
-    };
-    if args.iter().any(|a| {
-        matches!(a.ty, Ty::Tensor(_))
-            || a.ty.shaped().is_some_and(|s| {
-                s.shape
-                    .iter()
-                    .any(|n| n.as_constant().is_none_or(|n| n <= 0))
-            })
-    }) {
-        return Ok(None);
-    }
-    let ExprKind::Var(output_id) = output.kind else {
-        return Ok(None);
-    };
-    let Ty::Tile(output_shape) = &output.ty else {
-        return Ok(None);
-    };
-    if output_shape
-        .shape
-        .iter()
-        .any(|n| n.as_constant().is_none_or(|n| n <= 0))
-    {
-        return Ok(None);
-    }
-    if args
-        .iter()
-        .enumerate()
-        .any(|(i, e)| i != facts.output && mentions(e, output_id))
-    {
-        return Ok(None);
-    }
-    // Local state must be recreated inside each source work item. This excludes
-    // escaping state, mutable tensors, and unknown effects around the call.
+        .map(|(position, _)| *position)
+        .collect::<HashSet<_>>();
     let mut local = HashSet::new();
     fn bindings(body: &[Stmt], local: &mut HashSet<VarId>) {
-        for s in body {
-            match &s.kind {
+        for statement in body {
+            match &statement.kind {
                 StmtKind::Assign {
                     target:
                         Expr {
@@ -216,31 +185,24 @@ fn region<'a>(
         }
     }
     bindings(body, &mut local);
-    if !local.is_disjoint(enclosing) {
-        return Ok(None);
-    }
-    if local.iter().any(|v| {
-        !matches!(vars[*v].kind, VarKind::Local)
-            || vars[*v]
-                .ty
-                .shaped()
-                .is_some_and(|s| s.shape.iter().any(|n| n.as_constant().is_none()))
-    }) {
-        return Ok(None);
-    }
-    if !local.contains(&output_id)
-        || body[..*call_index]
-            .iter()
-            .any(|s| !local_statement(s, &local, false))
-        || body[*call_index + 1..]
-            .iter()
-            .any(|s| !local_statement(s, &local, true))
+    if !local.is_disjoint(enclosing)
+        || local.iter().any(|v| {
+            !matches!(vars[*v].kind, VarKind::Local)
+                || vars[*v]
+                    .ty
+                    .shaped()
+                    .is_some_and(|s| s.shape.iter().any(|n| n.as_constant().is_none()))
+        })
+        || body.iter().enumerate().any(|(position, statement)| {
+            !positions.contains(&position)
+                && !local_statement(statement, &local, position > *last_call)
+        })
     {
         return Ok(None);
     }
-    let publications = body[*call_index + 1..]
+    let publications = body[*last_call + 1..]
         .iter()
-        .filter_map(|s| match &s.kind {
+        .filter_map(|statement| match &statement.kind {
             StmtKind::Expr(Expr {
                 kind:
                     ExprKind::Builtin {
@@ -255,31 +217,53 @@ fn region<'a>(
     let [(value, destination)] = publications.as_slice() else {
         return Ok(None);
     };
-    if value
-        .ty
-        .shaped()
-        .is_none_or(|s| s.shape != output_shape.shape)
-    {
-        return Ok(None);
-    }
     let Some(publication) = View::of(destination) else {
         return Ok(None);
     };
-    if publication.visible.len() != output_shape.shape.len() {
-        return Ok(None);
+
+    // Retained calls have checked write effects. The ordinary syntactic write
+    // collector cannot see their output until their bodies have been resolved.
+    let mut writes = Vec::new();
+    for statement in body {
+        let mut written = HashSet::new();
+        crate::rewrite::writes(statement, &mut written);
+        if let StmtKind::Expr(
+            call @ Expr {
+                kind: ExprKind::Call { .. },
+                ..
+            },
+        ) = &statement.kind
+        {
+            let Some((call_writes, external)) = call_effects(program, call) else {
+                return Ok(None);
+            };
+            if external || !call_writes.is_subset(&local) {
+                return Ok(None);
+            }
+            written.extend(call_writes);
+        }
+        writes.push(written);
     }
     let mut source = body
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i != *call_index)
-        .map(|(_, s)| s.clone())
+        .filter(|(position, _)| !positions.contains(position))
+        .map(|(_, statement)| statement.clone())
         .collect::<Vec<_>>();
-    for argument in args.iter().filter(|a| a.ty.shaped().is_none()) {
-        source.push(Stmt {
-            id: None,
-            span: argument.span,
-            kind: StmtKind::Expr(argument.clone()),
-        });
+    for (_, call) in &calls {
+        let ExprKind::Call { args, .. } = &call.kind else {
+            unreachable!()
+        };
+        for argument in args
+            .iter()
+            .filter(|argument| argument.ty.shaped().is_none())
+        {
+            source.push(Stmt {
+                id: None,
+                span: argument.span,
+                kind: StmtKind::Expr(argument.clone()),
+            });
+        }
     }
     let accesses = crate::composition::Accesses::of(&source);
     if accesses.unknown
@@ -325,140 +309,242 @@ fn region<'a>(
             }
         }
     }
-    let mut axes = Vec::new();
-    for (&coordinate, extent) in coordinates.iter().zip(extents) {
-        let (VarKind::Index(atom), Some(extent)) = (&vars[coordinate].kind, extent.as_constant())
+
+    let mut regions = Vec::new();
+    for (call_index, call) in &calls {
+        let ExprKind::Call { callee, args, .. } = &call.kind else {
+            unreachable!()
+        };
+        let Some(function) = program
+            .functions
+            .iter()
+            .find(|f| f.is_construct && f.name == *callee)
         else {
             return Ok(None);
         };
-        if extent <= 0 {
-            return Ok(None);
-        }
-        let mapped = facts
-            .dimensions
-            .iter()
-            .filter(|(axis, _)| {
-                let (start, count) = &publication.axes[publication.visible[*axis]];
-                *count == output_shape.shape[*axis]
-                    && start
-                        .linear_in(atom)
-                        .is_some_and(|(step, _)| Some(step) == count.as_constant())
-            })
-            .collect::<Vec<_>>();
-        let [(output_axis, parameter)] = mapped.as_slice() else {
+        let Some(facts) = projection::output_axes(program, function)? else {
             return Ok(None);
         };
-        if axes.iter().any(|a: &Axis| a.parameter == *parameter) {
+        let Some(output) = args.get(facts.output) else {
             return Ok(None);
-        }
-        // A rectangular coordinate changes exactly one physical publication axis.
-        if publication
-            .axes
-            .iter()
-            .enumerate()
-            .any(|(i, (start, count))| {
-                count.atoms().contains(atom)
-                    || (i != publication.visible[*output_axis] && start.atoms().contains(atom))
+        };
+        let ExprKind::Var(output_id) = output.kind else {
+            return Ok(None);
+        };
+        let Ty::Tile(output_shape) = &output.ty else {
+            return Ok(None);
+        };
+        if !local.contains(&output_id)
+            || writes[*call_index] != HashSet::from([output_id])
+            || args.iter().any(|argument| {
+                matches!(argument.ty, Ty::Tensor(_))
+                    || !crate::effects::expression_can_be_omitted(argument)
+                    || argument.ty.shaped().is_some_and(|s| {
+                        s.shape
+                            .iter()
+                            .any(|n| n.as_constant().is_none_or(|n| n <= 0))
+                    })
             })
+            || args.iter().enumerate().any(|(position, argument)| {
+                position != facts.output && mentions(argument, output_id)
+            })
+            || value
+                .ty
+                .shaped()
+                .is_none_or(|s| s.shape != output_shape.shape)
+            || publication.visible.len() != output_shape.shape.len()
         {
             return Ok(None);
         }
-        axes.push(Axis {
-            coordinate,
-            atom: atom.clone(),
-            extent,
-            output_axis: *output_axis,
-            parameter: parameter.clone(),
-        });
-    }
-    let mut loads = Vec::new();
-    let mut removable = HashSet::new();
-    for (position, actual) in args.iter().enumerate() {
-        if position == facts.output {
-            loads.push(None);
-            continue;
-        }
-        for axis in &axes {
-            let formal_varies = function.params[position]
-                .1
-                .shaped()
-                .is_some_and(|s| s.shape.iter().any(|n| *n == Sym::param(&axis.parameter)));
-            let dependencies =
-                crate::widen::plan(&body[..*call_index], axis.coordinate, &axis.atom, 2).wide_vars;
-            if !formal_varies && depends(actual, &dependencies, axis.coordinate, &axis.atom) {
+        let mut axes = Vec::new();
+        for (&coordinate, extent) in coordinates.iter().zip(extents) {
+            let (VarKind::Index(atom), Some(extent)) =
+                (&vars[coordinate].kind, extent.as_constant())
+            else {
+                return Ok(None);
+            };
+            if extent <= 0 {
                 return Ok(None);
             }
-        }
-        let definition = match actual.kind {
-            ExprKind::Var(v) => body[..*call_index]
+            let mapped = facts
+                .dimensions
+                .iter()
+                .filter(|(axis, _)| {
+                    let (start, count) = &publication.axes[publication.visible[*axis]];
+                    *count == output_shape.shape[*axis]
+                        && start
+                            .linear_in(atom)
+                            .is_some_and(|(step, _)| Some(step) == count.as_constant())
+                })
+                .collect::<Vec<_>>();
+            let [(output_axis, parameter)] = mapped.as_slice() else {
+                return Ok(None);
+            };
+            if axes.iter().any(|a: &Axis| a.parameter == *parameter) {
+                return Ok(None);
+            }
+            // A rectangular coordinate changes exactly one physical publication axis.
+            if publication
+                .axes
                 .iter()
                 .enumerate()
-                .find_map(|(i, s)| match &s.kind {
-                    StmtKind::Assign {
-                        target:
-                            Expr {
-                                kind: ExprKind::Var(t),
-                                ..
-                            },
-                        value,
-                        ..
-                    } if *t == v => match &value.kind {
+                .any(|(i, (start, count))| {
+                    count.atoms().contains(atom)
+                        || (i != publication.visible[*output_axis] && start.atoms().contains(atom))
+                })
+            {
+                return Ok(None);
+            }
+            axes.push(Axis {
+                coordinate,
+                atom: atom.clone(),
+                extent,
+                output_axis: *output_axis,
+                parameter: parameter.clone(),
+            });
+        }
+
+        // Each source slot initializes one rectangular block. Repeating a
+        // grouped parameter on multiple formal axes would expose cross-slot
+        // blocks that the gather never initialized, including output seeds.
+        if function.params.iter().any(|(_, ty)| {
+            ty.shaped().is_some_and(|shape| {
+                axes.iter().any(|axis| {
+                    shape
+                        .shape
+                        .iter()
+                        .filter(|n| **n == Sym::param(&axis.parameter))
+                        .count()
+                        > 1
+                })
+            })
+        }) {
+            return Ok(None);
+        }
+
+        let mut loads = Vec::new();
+        let mut versions = Vec::new();
+        for (position, actual) in args.iter().enumerate() {
+            let version = root(actual).and_then(|variable| {
+                writes[..*call_index]
+                    .iter()
+                    .rposition(|written| written.contains(&variable))
+            });
+            versions.push(version);
+            if position == facts.output {
+                loads.push(None);
+                continue;
+            }
+            for axis in &axes {
+                let formal_varies = function.params[position]
+                    .1
+                    .shaped()
+                    .is_some_and(|s| s.shape.iter().any(|n| *n == Sym::param(&axis.parameter)));
+                let dependencies = crate::widen::plan_with_writes(
+                    &body[..*call_index],
+                    axis.coordinate,
+                    &axis.atom,
+                    2,
+                    &writes[..*call_index],
+                )
+                .wide_vars;
+                if !formal_varies && depends(actual, &dependencies, axis.coordinate, &axis.atom) {
+                    return Ok(None);
+                }
+            }
+            let load = version
+                .and_then(|definition| match (&actual.kind, &body[definition].kind) {
+                    (
+                        ExprKind::Var(v),
+                        StmtKind::Assign {
+                            target:
+                                Expr {
+                                    kind: ExprKind::Var(t),
+                                    ..
+                                },
+                            value,
+                            op: AssignOp::Assign,
+                        },
+                    ) if v == t => match &value.kind {
                         ExprKind::Builtin {
                             name: Builtin::Load,
                             args,
-                        } if args.len() == 1 => Some((i, args[0].clone())),
-                        ExprKind::Load { view, .. } => Some((i, (**view).clone())),
+                        } if args.len() == 1 => Some(args[0].clone()),
+                        ExprKind::Load { view, .. } => Some((**view).clone()),
                         _ => None,
                     },
                     _ => None,
-                }),
-            _ => None,
-        };
-        let union = definition.as_ref().and_then(|(definition, view)| {
-            let ExprKind::Var(id) = actual.kind else {
-                return None;
-            };
-            if body[*definition + 1..*call_index]
-                .iter()
-                .any(|s| crate::effects::tile_mutated(s, id))
+                })
+                .filter(|view| {
+                    union_view(view, &function.params[position].1, &axes).is_some_and(|geometry| {
+                        matches!(vars[geometry.root].kind, VarKind::Param(_))
+                    })
+                });
+            if actual
+                .ty
+                .shaped()
+                .is_some_and(|s| matches!(s.elem, Elem::Repr(_)))
+                && load.is_none()
             {
-                return None;
+                return Ok(None);
             }
-            let geometry = union_view(view, &function.params[position].1, &axes)?;
-            // A local view alias must first be resolved in its lexical snapshot
-            // environment. Until then keep its dense value through a tile copy.
-            if !matches!(vars[geometry.root].kind, VarKind::Param(_)) {
-                return None;
-            }
-            Some(view.clone())
-        });
-        if actual
-            .ty
-            .shaped()
-            .is_some_and(|s| matches!(s.elem, Elem::Repr(_)))
-            && union.is_none()
-        {
-            return Ok(None);
+            loads.push(load);
         }
-        if let (Some(_), Some((definition, _)), ExprKind::Var(v)) =
-            (&union, &definition, &actual.kind)
-        {
-            if !body
-                .iter()
-                .enumerate()
-                .any(|(i, s)| i != *definition && i != *call_index && statement_mentions(s, *v))
-            {
+        regions.push(CallRegion {
+            function,
+            call: *call_index,
+            output: facts.output,
+            axes,
+            loads,
+            versions,
+        });
+    }
+    // Remove a direct snapshot only when every use is supplied by its proven
+    // widened load. A later seed, local computation or publication keeps it.
+    let mut removable = HashSet::new();
+    for call in &regions {
+        let ExprKind::Call { args, .. } = &calls
+            .iter()
+            .find(|(position, _)| *position == call.call)
+            .unwrap()
+            .1
+            .kind
+        else {
+            unreachable!()
+        };
+        for (argument, (load, version)) in args.iter().zip(call.loads.iter().zip(&call.versions)) {
+            let (ExprKind::Var(variable), Some(_), Some(definition)) =
+                (&argument.kind, load, version)
+            else {
+                continue;
+            };
+            if body.iter().enumerate().all(|(position, statement)| {
+                if position == *definition {
+                    return true;
+                }
+                if let Some(call) = regions.iter().find(|call| call.call == position) {
+                    let StmtKind::Expr(Expr {
+                        kind: ExprKind::Call { args, .. },
+                        ..
+                    }) = &statement.kind
+                    else {
+                        unreachable!()
+                    };
+                    return args.iter().zip(&call.loads).all(|(argument, load)| {
+                        !mentions(argument, *variable)
+                            || matches!(argument.kind, ExprKind::Var(v) if v == *variable)
+                                && load.is_some()
+                    });
+                }
+                !statement_mentions(statement, *variable)
+            }) {
                 removable.insert(*definition);
             }
         }
-        loads.push(union);
     }
     Ok(Some(Region {
-        function,
-        call: *call_index,
-        output: facts.output,
-        axes,
-        loads,
+        axes: regions[0].axes.clone(),
+        calls: regions,
         removable,
         aliases,
     }))
@@ -623,28 +709,15 @@ fn rectangle_body(
     vars: &mut Vec<Var>,
     span: crate::span::Span,
 ) -> Result<Vec<Stmt>, String> {
-    let ExprKind::Call {
-        callee,
-        shape_args,
-        elem_args,
-        args,
-    } = &match &body[region.call].kind {
-        StmtKind::Expr(e) => e,
-        _ => unreachable!(),
-    }
-    .kind
-    else {
-        unreachable!()
-    };
     let mut slots = vec![Vec::<i64>::new()];
     for &factor in factors {
         slots = slots
             .into_iter()
-            .flat_map(|p| {
-                (0..factor).map(move |n| {
-                    let mut q = p.clone();
-                    q.push(n);
-                    q
+            .flat_map(|prefix| {
+                (0..factor).map(move |offset| {
+                    let mut slot = prefix.clone();
+                    slot.push(offset);
+                    slot
                 })
             })
             .collect();
@@ -652,13 +725,12 @@ fn rectangle_body(
     let filtered = body
         .iter()
         .enumerate()
-        .filter(|(i, _)| !region.removable.contains(i))
-        .map(|(_, s)| s.clone())
+        .filter(|(position, _)| !region.removable.contains(position))
+        .map(|(_, statement)| statement.clone())
         .collect::<Vec<_>>();
-    let at = region.call - region.removable.len();
-    let mut prefixes = Vec::new();
-    let mut suffixes = Vec::new();
-    let mut arguments = Vec::new();
+    // Each slot has one persistent local environment across all call stages.
+    // Scattering immediately after a call exposes its writes to the next stage.
+    let mut copies = Vec::new();
     for slot in &slots {
         let (mut copy, _) = crate::widen::copy_bindings(&filtered, vars);
         for ((axis, base), offset) in region.axes.iter().zip(bases).zip(slot) {
@@ -669,166 +741,214 @@ fn rectangle_body(
                 &symbol(base.add(&Sym::constant(*offset)), span),
             );
         }
+        copies.push(copy);
+    }
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    // Reuse only an identical reaching snapshot with identical group axes.
+    // Checked call writes participate in the version recorded at each use.
+    let mut shared = Vec::<(VarId, Option<usize>, Vec<Option<usize>>, Expr)>::new();
+    for call in &region.calls {
         let StmtKind::Expr(Expr {
-            kind: ExprKind::Call { args, .. },
+            kind:
+                ExprKind::Call {
+                    callee,
+                    shape_args,
+                    elem_args,
+                    args,
+                },
             ..
-        }) = &copy[at].kind
+        }) = &body[call.call].kind
         else {
-            return Err("group call lost during binding copy".into());
+            unreachable!()
         };
-        arguments.push(args.clone());
-        prefixes.extend(copy[..at].iter().cloned());
-        suffixes.push(copy[at + 1..].to_vec());
-    }
-    let mut combined = Vec::new();
-    let mut seed = Vec::new();
-    for (position, actual) in args.iter().enumerate() {
-        let Some(formal) = region.function.params[position].1.shaped() else {
-            combined.push(arguments[0][position].clone());
-            continue;
-        };
-        let mapping = formal
-            .shape
-            .iter()
-            .map(|n| {
-                region
-                    .axes
-                    .iter()
-                    .position(|a| *n == Sym::param(&a.parameter))
-            })
-            .collect::<Vec<_>>();
-        let mut shape = actual
-            .ty
-            .shaped()
-            .ok_or("group operand lost shape")?
-            .clone();
-        for (n, a) in shape.shape.iter_mut().zip(&mapping) {
-            if let Some(a) = a {
-                *n = n.scale(factors[*a]);
-            }
-        }
-        let ty = Ty::Tile(shape.clone());
-        let target = local_var("group_operand", ty.clone(), vars, span);
-        if let Some(source) = &region.loads[position] {
-            let mut v = union_view(source, &region.function.params[position].1, &region.axes)
-                .ok_or("group operand geometry changed")?;
-            for (start, count) in &mut v.axes {
-                for (axis, base) in region.axes.iter().zip(bases) {
-                    *start = start.subst(&axis.atom, base);
-                    *count = count.subst(&axis.atom, base);
-                }
-            }
-            for (axis, mapped) in mapping.iter().enumerate() {
-                if let Some(group) = mapped {
-                    let root = v.visible[axis];
-                    v.axes[root].1 = v.axes[root].1.scale(factors[*group]);
-                }
-            }
-            let view = geometry(&v, &source.ty, vars, span)?;
-            seed.push(assign(
-                target.clone(),
-                Expr {
-                    kind: ExprKind::Builtin {
-                        name: Builtin::Load,
-                        args: vec![view],
-                    },
-                    ty,
-                    sym: None,
-                    span,
-                },
-                span,
-            ));
-        } else {
-            seed.push(assign(
-                target.clone(),
-                Expr {
-                    kind: ExprKind::TileAlloc {
-                        shape: shape.shape.clone(),
-                        dtype: shape.elem.clone(),
-                    },
-                    ty,
-                    sym: None,
-                    span,
-                },
-                span,
-            ));
-            let mut copied = HashSet::new();
-            for (slot, arguments) in slots.iter().zip(&arguments) {
-                let offset = mapping
-                    .iter()
-                    .enumerate()
-                    .map(|(axis, g)| {
-                        g.map_or(0, |g| {
-                            slot[g]
-                                * actual.ty.shaped().unwrap().shape[axis]
-                                    .as_constant()
-                                    .unwrap()
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if copied.insert(offset.clone()) {
-                    seed.push(copy_tile(
-                        &arguments[position],
-                        &target,
-                        &offset,
-                        false,
-                        vars,
-                        span,
-                    )?);
-                }
-            }
-        }
-        combined.push(target);
-    }
-    prefixes.extend(seed);
-    let shapes = region
-        .function
-        .shape_params
-        .iter()
-        .zip(shape_args)
-        .map(|(p, n)| {
-            region
-                .axes
+        let at = call.call
+            - region
+                .removable
                 .iter()
-                .position(|a| a.parameter == *p)
-                .map_or_else(|| n.clone(), |a| n.scale(factors[a]))
-        })
-        .collect();
-    prefixes.push(Stmt {
-        id: None,
-        span,
-        kind: StmtKind::Expr(Expr {
-            kind: ExprKind::Call {
-                callee: callee.clone(),
-                shape_args: shapes,
-                elem_args: elem_args.clone(),
-                args: combined.clone(),
-            },
-            ty: Ty::Void,
-            sym: None,
-            span,
-        }),
-    });
-    for ((slot, arguments), suffix) in slots.iter().zip(&arguments).zip(suffixes) {
-        let output = &arguments[region.output];
-        let mut offset = vec![0; output.ty.shaped().unwrap().shape.len()];
-        for (axis, index) in region.axes.iter().zip(slot) {
-            offset[axis.output_axis] = index
-                * output.ty.shaped().unwrap().shape[axis.output_axis]
-                    .as_constant()
-                    .unwrap();
+                .filter(|position| **position < call.call)
+                .count();
+        let mut arguments = Vec::new();
+        for copy in &copies {
+            result.extend(copy[cursor..at].iter().cloned());
+            let StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) = &copy[at].kind
+            else {
+                return Err("group call lost during binding copy".into());
+            };
+            arguments.push(args.clone());
         }
-        prefixes.push(copy_tile(
-            output,
-            &combined[region.output],
-            &offset,
-            true,
-            vars,
+        let mut combined = Vec::new();
+        let mut seed = Vec::new();
+        for (position, actual) in args.iter().enumerate() {
+            let Some(formal) = call.function.params[position].1.shaped() else {
+                combined.push(arguments[0][position].clone());
+                continue;
+            };
+            let mapping = formal
+                .shape
+                .iter()
+                .map(|n| {
+                    call.axes
+                        .iter()
+                        .position(|a| *n == Sym::param(&a.parameter))
+                })
+                .collect::<Vec<_>>();
+            let key = match actual.kind {
+                ExprKind::Var(variable) if position != call.output => {
+                    Some((variable, call.versions[position], mapping.clone()))
+                }
+                _ => None,
+            };
+            if let Some((variable, version, mapping)) = &key {
+                if let Some((_, _, _, value)) = shared.iter().find(|(v, epoch, axes, _)| {
+                    v == variable && epoch == version && axes == mapping
+                }) {
+                    combined.push(value.clone());
+                    continue;
+                }
+            }
+            let mut shape = actual
+                .ty
+                .shaped()
+                .ok_or("group operand lost shape")?
+                .clone();
+            for (n, a) in shape.shape.iter_mut().zip(&mapping) {
+                if let Some(a) = a {
+                    *n = n.scale(factors[*a]);
+                }
+            }
+            let ty = Ty::Tile(shape.clone());
+            let target = local_var("group_operand", ty.clone(), vars, span);
+            if let Some(source) = &call.loads[position] {
+                let mut v = union_view(source, &call.function.params[position].1, &call.axes)
+                    .ok_or("group operand geometry changed")?;
+                for (start, count) in &mut v.axes {
+                    for (axis, base) in region.axes.iter().zip(bases) {
+                        *start = start.subst(&axis.atom, base);
+                        *count = count.subst(&axis.atom, base);
+                    }
+                }
+                for (axis, mapped) in mapping.iter().enumerate() {
+                    if let Some(group) = mapped {
+                        let root = v.visible[axis];
+                        v.axes[root].1 = v.axes[root].1.scale(factors[*group]);
+                    }
+                }
+                let view = geometry(&v, &source.ty, vars, span)?;
+                seed.push(assign(
+                    target.clone(),
+                    Expr {
+                        kind: ExprKind::Builtin {
+                            name: Builtin::Load,
+                            args: vec![view],
+                        },
+                        ty,
+                        sym: None,
+                        span,
+                    },
+                    span,
+                ));
+            } else {
+                seed.push(assign(
+                    target.clone(),
+                    Expr {
+                        kind: ExprKind::TileAlloc {
+                            shape: shape.shape.clone(),
+                            dtype: shape.elem.clone(),
+                        },
+                        ty,
+                        sym: None,
+                        span,
+                    },
+                    span,
+                ));
+                let mut copied = HashSet::new();
+                for (slot, arguments) in slots.iter().zip(&arguments) {
+                    let offset = mapping
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, g)| {
+                            g.map_or(0, |g| {
+                                slot[g]
+                                    * actual.ty.shaped().unwrap().shape[axis]
+                                        .as_constant()
+                                        .unwrap()
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if copied.insert(offset.clone()) {
+                        seed.push(copy_tile(
+                            &arguments[position],
+                            &target,
+                            &offset,
+                            false,
+                            vars,
+                            span,
+                        )?);
+                    }
+                }
+            }
+            if let Some((variable, version, mapping)) = key {
+                shared.push((variable, version, mapping, target.clone()));
+            }
+            combined.push(target);
+        }
+
+        result.extend(seed);
+        let shapes = call
+            .function
+            .shape_params
+            .iter()
+            .zip(shape_args)
+            .map(|(parameter, extent)| {
+                call.axes
+                    .iter()
+                    .position(|axis| axis.parameter == *parameter)
+                    .map_or_else(|| extent.clone(), |axis| extent.scale(factors[axis]))
+            })
+            .collect();
+        result.push(Stmt {
+            id: None,
             span,
-        )?);
-        prefixes.extend(suffix);
+            kind: StmtKind::Expr(Expr {
+                kind: ExprKind::Call {
+                    callee: callee.clone(),
+                    shape_args: shapes,
+                    elem_args: elem_args.clone(),
+                    args: combined.clone(),
+                },
+                ty: Ty::Void,
+                sym: None,
+                span,
+            }),
+        });
+        for (slot, arguments) in slots.iter().zip(&arguments) {
+            let output = &arguments[call.output];
+            let mut offset = vec![0; output.ty.shaped().unwrap().shape.len()];
+            for (axis, index) in call.axes.iter().zip(slot) {
+                offset[axis.output_axis] = index
+                    * output.ty.shaped().unwrap().shape[axis.output_axis]
+                        .as_constant()
+                        .unwrap();
+            }
+            result.push(copy_tile(
+                output,
+                &combined[call.output],
+                &offset,
+                true,
+                vars,
+                span,
+            )?);
+        }
+        cursor = at + 1;
     }
-    Ok(prefixes)
+    for copy in copies {
+        result.extend(copy[cursor..].iter().cloned());
+    }
+    Ok(result)
 }
 fn geometry(
     view: &View,

@@ -21,6 +21,16 @@ pub trait Backend {
         function: &LoweredIr,
         path: &[usize],
     ) -> Result<Preparation<Self::Execution>, String>;
+    /// Refine the actual retained owner without repeating frontend preparation.
+    /// The owner must come from this backend under the same request identity;
+    /// unsupported owner types continue through ordinary path construction.
+    fn refine(
+        &self,
+        _alternatives: &selection::Domain,
+        _index: usize,
+    ) -> Result<Option<Preparation<Self::Execution>>, String> {
+        Ok(None)
+    }
     /// Relax resource constraints of the partial implementation retained by the
     /// typed domain. Counts must hold for every alternative in this interval.
     /// No numeric bound, independent execution graph or candidate sample enters.
@@ -64,6 +74,15 @@ pub enum Preparation<E> {
     },
     Execution(E),
     Infeasible(selection::CapacityViolation),
+}
+fn preparation_node<E>(preparation: Preparation<E>) -> selection::Node<E> {
+    match preparation {
+        Preparation::Choice { name, alternatives } => {
+            selection::Node::Choice { name, alternatives }
+        }
+        Preparation::Execution(execution) => selection::Node::Realization(execution),
+        Preparation::Infeasible(violation) => selection::Node::Infeasible(violation),
+    }
 }
 #[derive(Clone, Copy)]
 pub enum Input<'a> {
@@ -188,13 +207,9 @@ impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
                 }
             }
         }
-        match self.request.backend.prepare(function, path)? {
-            Preparation::Choice { name, alternatives } => {
-                Ok(selection::Node::Choice { name, alternatives })
-            }
-            Preparation::Infeasible(v) => Ok(selection::Node::Infeasible(v)),
-            Preparation::Execution(execution) => Ok(selection::Node::Realization(execution)),
-        }
+        Ok(preparation_node(
+            self.request.backend.prepare(function, path)?,
+        ))
     }
 }
 impl<B: Backend> selection::Space for Space<'_, '_, B> {
@@ -202,6 +217,16 @@ impl<B: Backend> selection::Space for Space<'_, '_, B> {
     type Identity = Inputs<B::Conditions>;
     fn identity(&self) -> Self::Identity {
         self.request.inputs()
+    }
+    fn refine(
+        &self,
+        alternatives: &selection::Domain,
+        index: usize,
+    ) -> Result<Option<selection::Node<B::Execution>>, String> {
+        self.request
+            .backend
+            .refine(alternatives, index)
+            .map(|preparation| preparation.map(preparation_node))
     }
     fn relax(
         &self,

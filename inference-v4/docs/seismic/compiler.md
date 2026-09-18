@@ -31,6 +31,11 @@ execution reachable. Whole-domain loads and logical intermediates must admit bou
 streaming, shared producers, and state retention within the supported execution form.
 Merely joining already-authored streams does not fulfill this requirement.
 
+Geometry dependencies are distinct from element accesses. A direct parameter
+extent query on an unchanged axis can survive contraction partitioning; it does
+not require an element at the reduction coordinate. Queries observing a changed
+axis or carrying unproved view/index dependencies cannot authorize that rewrite.
+
 Retain operation meaning until applicable instruction/implementation covers can
 be selected; premature scalar expansion must not remove supported alternatives.
 
@@ -39,8 +44,12 @@ contraction partitioning and backend body selection. Every admitted static outpu
 axis exposes widths 1..N with exact full and remainder rectangles. Grouped calls
 retain each output's seed, scalar calculations and conversions while sharing
 invariant operands; subsequent contraction choices remain dependent alternatives.
-The current constructor admits straight-line regions with one retained call,
-provable operand maps and rectangular publication. Dynamic operand shapes,
+For an ordered sequence of calls, each call's writes become visible to the next
+local computation before its operands are grouped. Operand sharing requires the
+same reaching snapshot and axis mapping; checked call effects participate in
+both dependency analysis and snapshot invalidation.
+The current constructor admits straight-line regions with retained calls,
+provable operand maps and a common rectangular publication. Dynamic operand shapes,
 unknown effects and unsupported maps remain outside this constructor's coverage.
 Its applicability cannot be inferred from a model or construct name.
 

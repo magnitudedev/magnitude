@@ -493,7 +493,7 @@ impl fmt::Display for Sym {
 }
 
 /// Known bounds on atoms, and equalities that hold.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
     /// atom -> inclusive upper bound
     upper: BTreeMap<Atom, Sym>,

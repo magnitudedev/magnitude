@@ -47,10 +47,10 @@ fn lower(
         },
         &mut |d| {
             Ok(match &d.kind {
-                DecisionKind::OutputGroup { parameter, .. } => Alternative::OutputWidth(
+                DecisionKind::OutputGroup { calls, .. } => Alternative::OutputWidth(
                     widths
                         .iter()
-                        .find(|(p, _)| *p == parameter)
+                        .find(|(p, _)| calls.iter().any(|call| *p == call.parameter))
                         .map_or(1, |(_, n)| *n),
                 ),
                 _ => d.alternatives.get(0).unwrap(),

@@ -52,8 +52,12 @@ pub(super) fn derive(
                 operations: usize::MAX,
             },
         )?;
-        let lanes=u64::from(target.domain().lanes_per_item);
-        let work_items = target.domain().work_items.checked_mul(lanes).ok_or("CUDA participant count overflow")?;
+        let lanes = u64::from(target.domain().lanes_per_item);
+        let work_items = target
+            .domain()
+            .work_items
+            .checked_mul(lanes)
+            .ok_or("CUDA participant count overflow")?;
         if work_items == 0 {
             continue;
         }
@@ -65,8 +69,12 @@ pub(super) fn derive(
         } else {
             (*interval.start(), *interval.end())
         };
-        let minimum_block=minimum_block.checked_mul(lanes).ok_or("CUDA block extent overflow")?;
-        let maximum_block=maximum_block.checked_mul(lanes).ok_or("CUDA block extent overflow")?;
+        let minimum_block = minimum_block
+            .checked_mul(lanes)
+            .ok_or("CUDA block extent overflow")?;
+        let maximum_block = maximum_block
+            .checked_mul(lanes)
+            .ok_or("CUDA block extent overflow")?;
         // A warp contains at most min(warp width, block size) active work items.
         // Blocks, tails, and divergent exits can only increase the issue count.
         let minimum_warps = work_items.div_ceil(u64::from(hardware.warp_width).min(maximum_block));
