@@ -1,8 +1,9 @@
 import { pageLayout } from "./page-layout"
 import type { DesktopHarnessConnection, HarnessId } from "@magnitudedev/client-common"
 import { Brand } from "effect"
-import { ArrowUpRightIcon } from "@phosphor-icons/react"
+import { ArrowClockwiseIcon, ArrowUpRightIcon } from "@phosphor-icons/react"
 import { Button } from "../../web/src/components/ui/button"
+import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { HarnessLogo } from "./harness-logo"
 
 const installationDocs: Record<Brand.Brand.Unbranded<HarnessId>, string> = {
@@ -25,7 +26,7 @@ type Props = {
 }
 
 export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect }: Props) {
-  return <div className="mt-7 space-y-8">{[true, false].map(installed => {
+  return <TooltipProvider><div className="mt-7 space-y-8">{[true, false].map(installed => {
     const rows = connections.filter(row => row.installed === installed)
       .sort((a, b) => Number(b.inspection._tag === "Connected") - Number(a.inspection._tag === "Connected"))
     if (rows.length === 0) return null
@@ -48,7 +49,9 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
             {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
-            {installed ? <><Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : row.inspection._tag === "Connected" ? "Reconnect" : "Connect"}</Button>{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
+            {installed ? <>{row.inspection._tag === "Connected"
+              ? <ActionTooltip label="Refresh connection" trigger={<Button variant="ghost" size="icon-sm" aria-label="Refresh connection" disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
+              : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : "Connect"}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
               : <a href={installationDocs[Brand.unbranded(row.id)]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
           </div>
         </div>
@@ -56,5 +59,5 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
 
       </article>})}</div>
     </section>
-  })}</div>
+  })}</div></TooltipProvider>
 }
