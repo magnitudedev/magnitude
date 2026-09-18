@@ -2,7 +2,7 @@
 //! Native calls are synchronous today: an advance becomes committable only after
 //! its execution closure returns successful physical completion.
 use seismic_lang::types::DType;
-use seismic_runtime::{Buffer, Device};
+use seismic_runtime::{Buffer, Device, Error};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -103,7 +103,7 @@ impl StateStore {
     pub fn component_specs(&self) -> &[ComponentSpec] {
         &self.component_specs
     }
-    pub fn history(&self) -> Result<Vec<Buffer>, String> {
+    pub fn history(&self) -> Result<Vec<Buffer>, Error> {
         if self.history.borrow().is_none() {
             let buffers = self
                 .history_row_bytes
@@ -146,7 +146,7 @@ impl StateStore {
             .take()
             .map_or(Ok(0), |v| Buffer::reclaimable_bytes(v.iter()))
     }
-    fn allocate_values(&self, zero: bool) -> Result<Vec<Buffer>, String> {
+    fn allocate_values(&self, zero: bool) -> Result<Vec<Buffer>, Error> {
         self.component_specs
             .iter()
             .map(|spec| {
@@ -159,7 +159,7 @@ impl StateStore {
             })
             .collect()
     }
-    pub fn create(self: &Rc<Self>) -> Result<SequenceState, String> {
+    pub fn create(self: &Rc<Self>) -> Result<SequenceState, Error> {
         let values = self.allocate_values(true)?;
         self.owners.set(self.owners.get() + 1);
         Ok(SequenceState {
@@ -276,7 +276,7 @@ impl SequenceState {
     }
     /// The mutable borrow prevents a second advance, trimming or checkpointing
     /// while a proposal is unresolved. Dropping the advance aborts it.
-    pub fn begin(&mut self, count: usize) -> Result<StateAdvance<'_>, String> {
+    pub fn begin(&mut self, count: usize) -> Result<StateAdvance<'_>, Error> {
         if count == 0 || count > self.store.context_capacity - self.position {
             return Err("advance exceeds context capacity".into());
         }
@@ -333,6 +333,7 @@ impl StateCheckpoint {
         }
     }
 }
+#[derive(Clone, Copy)]
 pub struct AdvanceBindings<'a> {
     pub previous: &'a [Buffer],
     pub following: &'a [Buffer],
@@ -366,21 +367,41 @@ impl StateAdvance<'_> {
     /// This API must not accept mere asynchronous submission as completion.
     pub fn execute(
         &mut self,
-        run: impl FnOnce(AdvanceBindings<'_>) -> Result<(), String>,
-    ) -> Result<(), String> {
-        if self.attempted {
-            return Err("advance has already been executed".into());
+        run: impl FnOnce(AdvanceBindings<'_>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        Self::execute_batch(std::slice::from_mut(self), |bindings| run(bindings[0]))
+    }
+    /// One synchronous completion covers every row's constituent work. No row
+    /// can become committable if the shared execution fails or unwinds.
+    pub fn execute_batch(
+        advances: &mut [Self],
+        run: impl FnOnce(&[AdvanceBindings<'_>]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if advances.is_empty() || advances.iter().any(|advance| advance.attempted) {
+            return Err("batch is empty or an advance has already been executed".into());
         }
-        self.attempted = true;
-        let history = self.state.store.history()?;
-        let destinations = self.destinations();
-        run(AdvanceBindings {
-            previous: &self.state.values,
-            following: &self.following,
-            history: &history,
-            destinations: &destinations,
-        })?;
-        self.completed = true;
+        for advance in advances.iter_mut() {
+            advance.attempted = true;
+        }
+        let history = advances
+            .iter()
+            .map(|advance| advance.state.store.history())
+            .collect::<Result<Vec<_>, _>>()?;
+        let destinations = advances.iter().map(Self::destinations).collect::<Vec<_>>();
+        let bindings = advances
+            .iter()
+            .enumerate()
+            .map(|(i, advance)| AdvanceBindings {
+                previous: &advance.state.values,
+                following: &advance.following,
+                history: &history[i],
+                destinations: &destinations[i],
+            })
+            .collect::<Vec<_>>();
+        run(&bindings)?;
+        for advance in advances {
+            advance.completed = true;
+        }
         Ok(())
     }
     pub fn commit(mut self) -> Result<(), String> {

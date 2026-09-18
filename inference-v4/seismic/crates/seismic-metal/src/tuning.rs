@@ -10,6 +10,8 @@ use seismic_accounting::{
 };
 use seismic_compiler::tuner::{self as compiler, Preparation};
 use seismic_lang::lowered_ir::LoweredIr;
+use std::sync::Arc;
+mod bounds;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decomposition {
@@ -71,9 +73,31 @@ pub fn expand(
     capacities: &Capacities,
     path: &[usize],
 ) -> Result<Preparation<Execution>, String> {
-    let (decomposition, mappings, consumed) = match decomposition(function, form, path)? {
-        DecompositionExpansion::Choice { name, alternatives } => {
-            return Ok(Preparation::Choice { name, alternatives });
+    expand_retained(Arc::new(function.clone()), form, capacities, path)
+}
+
+fn expand_retained(
+    function: Arc<LoweredIr>,
+    form: &Form,
+    capacities: &Capacities,
+    path: &[usize],
+) -> Result<Preparation<Execution>, String> {
+    if let seismic_realization::phases::Applicability::Unresolved { reason } =
+        seismic_realization::phases::assess(&function)?
+    {
+        return Ok(Preparation::Unresolved(format!("Metal phase realization: {reason}")));
+    }
+    let (decomposition, mappings, consumed) = match decomposition(&function, form, path)? {
+        DecompositionExpansion::Choice { name, alternatives, dispatch } => {
+            return Ok(Preparation::Choice {
+                name,
+                alternatives: Domain::new(DecompositionChoice {
+                    publications: bounds::Publications::derive(&function),
+                    dispatch,
+                    function, form: form.clone(), capacities: capacities.clone(),
+                    prefix: path.to_vec(), alternatives,
+                })?,
+            });
         }
         DecompositionExpansion::Selected {
             value,
@@ -83,13 +107,13 @@ pub fn expand(
     };
     let path = &path[consumed..];
     match crate::choices::expand_with_mappings(
-        function,
+        &function,
         capacities.config(&decomposition)?,
         mappings.as_deref(),
         path,
     )? {
         crate::choices::Expansion::Choice(domain) => Ok(Preparation::Choice {
-            name: format!("Metal {:?}", domain.decision),
+            name: format!("Metal {:?}", domain.decision()),
             alternatives: Domain::new(domain)?,
         }),
         crate::choices::Expansion::Infeasible {
@@ -190,6 +214,41 @@ impl compiler::Backend for Backend {
         alternatives: &Domain,
         index: usize,
     ) -> Result<Option<Preparation<Execution>>, String> {
+        if let Some(choice) = alternatives.owner::<DecompositionChoice>() {
+            if choice.form != self.conditions.form || choice.capacities != self.conditions.capacities {
+                return Err("retained Metal decomposition has different execution conditions".into());
+            }
+            return choice.refine(index).map(Some);
+        }
+        if let Some(choice) = alternatives.owner::<crate::choices::ExecutionChoice>() {
+            let config = choice.config();
+            if u64::try_from(config.max_threads_per_threadgroup).ok()
+                != Some(self.conditions.capacities.max_threads_per_threadgroup)
+                || u64::try_from(config.max_threadgroup_bytes).ok()
+                    != Some(self.conditions.capacities.max_threadgroup_bytes)
+            {
+                return Err("retained Metal preparation has different device capacities".into());
+            }
+            return Ok(Some(match choice.refine(index)? {
+                crate::choices::Expansion::Choice(choice) => Preparation::Choice {
+                    name: format!("Metal {:?}", choice.decision()),
+                    alternatives: Domain::new(choice)?,
+                },
+                crate::choices::Expansion::Infeasible {
+                    launch,
+                    required,
+                    available,
+                } => Preparation::Infeasible(seismic_accounting::selection::CapacityViolation {
+                    resource: format!("Metal launch {launch} shared bytes per group"),
+                    required,
+                    available,
+                }),
+                crate::choices::Expansion::Execution { execution, .. } => {
+                    std::sync::Arc::new(crate::family::GroupFamily::derive(execution)?)
+                        .next(Vec::new())?
+                }
+            }));
+        }
         let Some(choice) = alternatives.owner::<crate::family::GroupingChoices>() else {
             return Ok(None);
         };
@@ -203,13 +262,57 @@ impl compiler::Backend for Backend {
         }
         choice.refine(index).map(Some)
     }
+    fn relax(
+        &self,
+        alternatives: &Domain,
+        indices: std::ops::Range<usize>,
+        workload: &ScalarWorkload,
+        limits: DerivationLimits,
+    ) -> Result<Option<schedule::Demand>, String> {
+        if indices.is_empty() || indices.end > alternatives.len() {
+            return Err("Metal relaxation needs a nonempty subdomain".into());
+        }
+        if let Some(choice) = alternatives.owner::<seismic_lang::lower::alternatives::LoweringChoice>() {
+            let mut demand = schedule::Demand::new(self.conditions.hardware.timebase.clone(), self.conditions.hardware.resources.clone())?;
+            bounds::Publications::derive(choice.prepared()).include(&mut demand, &self.conditions.hardware)?;
+            return Ok(Some(demand));
+        }
+        if let Some(choice) = alternatives.owner::<DecompositionChoice>() {
+            let mut demand = match choice.dispatch.demand(&choice.alternatives, indices,
+                self.conditions.capacities.max_threads_per_threadgroup, &self.conditions.hardware)? {
+                Some(demand) => demand,
+                None => schedule::Demand::new(self.conditions.hardware.timebase.clone(), self.conditions.hardware.resources.clone())?,
+            };
+            choice.publications.include(&mut demand, &self.conditions.hardware)?;
+            return Ok(Some(demand));
+        }
+        if let Some(choice) = alternatives.owner::<crate::family::GroupingChoices>() {
+            return choice.relax(indices, &self.conditions.hardware, workload, limits);
+        }
+        if let Some(choice) = alternatives.owner::<crate::choices::ExecutionChoice>() {
+            return choice.relax(&self.conditions.hardware, workload, limits);
+        }
+        Ok(None)
+    }
     fn analyze(
         &self,
         execution: &Execution,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, DerivationError> {
-        model::execution(execution, &self.conditions.hardware, workload, limits)
+    ) -> Result<schedule::evaluation::Model, DerivationError> {
+        Ok(schedule::evaluation::Model::Structured {
+            model: model::structured_execution(execution, &self.conditions.hardware, workload, limits)?,
+            expansion_limit: limits.operations as u64,
+        })
+    }
+    fn relax_execution(
+        &self,
+        execution: &Execution,
+        workload: &ScalarWorkload,
+        limits: DerivationLimits,
+    ) -> Result<Option<schedule::Demand>, String> {
+        let account = execution.relaxation(workload, limits)?;
+        Ok(Some(model::relaxed_demand(&account, &self.conditions.hardware)?))
     }
     fn materialize(&self, execution: &Execution, _: &Objective) -> Result<Execution, String> {
         // Target statement order is fixed in this form. The solver only schedules
@@ -226,6 +329,45 @@ impl compiler::Backend for Backend {
             return Err("Metal materialization changed the selected implementation".into());
         }
         Ok(())
+    }
+}
+
+/// Decomposition still owns the complete lowered computation. Refining a
+/// mapping or split must not replay portable lowering and its earlier choices.
+/// Its typed numeric domain remains the exact legal domain, with no preferred
+/// widths or implicit completion of unresolved decisions.
+#[derive(Clone, PartialEq)]
+pub struct DecompositionChoice {
+    function: Arc<LoweredIr>,
+    form: Form,
+    capacities: Capacities,
+    prefix: Vec<usize>,
+    alternatives: Domain,
+    publications: bounds::Publications,
+    dispatch: bounds::Dispatch,
+}
+impl std::fmt::Debug for DecompositionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecompositionChoice")
+            .field("entry", &self.function.name)
+            .field("prefix", &self.prefix)
+            .field("alternatives", &self.alternatives)
+            .finish()
+    }
+}
+impl Choices for DecompositionChoice {
+    type Alternative = String;
+    fn len(&self) -> usize { self.alternatives.len() }
+    fn get(&self, index: usize) -> Option<String> { self.alternatives.label(index) }
+}
+impl DecompositionChoice {
+    pub fn alternatives(&self) -> &Domain { &self.alternatives }
+    pub fn prepared(&self) -> &LoweredIr { &self.function }
+    pub fn refine(&self, index: usize) -> Result<Preparation<Execution>, String> {
+        if index >= self.alternatives.len() { return Err("Metal decomposition choice is outside its domain".into()); }
+        let mut prefix = self.prefix.clone();
+        prefix.push(index);
+        expand_retained(self.function.clone(), &self.form, &self.capacities, &prefix)
     }
 }
 
@@ -261,6 +403,7 @@ enum DecompositionExpansion {
     Choice {
         name: String,
         alternatives: Domain,
+        dispatch: bounds::Dispatch,
     },
     Selected {
         value: Decomposition,
@@ -280,8 +423,7 @@ fn decomposition(
             consumed: 0,
         });
     }
-    let mut normalized = function.clone();
-    seismic_lang::normalize::work_domain(&mut normalized.body);
+    let mut normalized = seismic_realization::phases::work_domains(function)?;
     let mut consumed = 0;
     let mut value = Decomposition::default();
     if seismic_lang::partition::pointwise(&normalized, 1).is_ok() {
@@ -309,6 +451,7 @@ fn decomposition(
             return Ok(DecompositionExpansion::Choice {
                 name: "Metal independent tile partition".into(),
                 alternatives: Domain::new(domain)?,
+                dispatch: bounds::Dispatch::derive(&normalized, &[], &[], bounds::Remaining::Partition)?,
             });
         };
         consumed += 1;
@@ -342,6 +485,8 @@ fn decomposition(
                 return Ok(DecompositionExpansion::Choice {
                     name: format!("Metal phase {phase} axis {axis} coordinates per work item"),
                     alternatives: Domain::new(domain)?,
+                    dispatch: bounds::Dispatch::derive(&normalized, &mappings, &steps,
+                        bounds::Remaining::Mapping { phase, extent })?,
                 });
             };
             consumed += 1;
@@ -362,6 +507,9 @@ fn decomposition(
                 return Ok(DecompositionExpansion::Choice {
                     name: "Metal reduction partitions".into(),
                     alternatives: Domain::new(domain)?,
+                    dispatch: bounds::Dispatch::derive(&normalized, &mappings, &[],
+                        bounds::Remaining::Split { phases: seismic_lang::split::split_candidates(&normalized.body, &normalized.vars)
+                            .iter().map(|candidate| candidate.stmt).collect() })?,
                 });
             };
             consumed += 1;

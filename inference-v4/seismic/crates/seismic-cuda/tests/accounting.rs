@@ -81,7 +81,7 @@ fn hardware(execution: &execution::Execution) -> model::CudaHardware {
 }
 
 fn workload(execution: &execution::Execution) -> workload::ScalarWorkload {
-    workload::ScalarWorkload {
+    workload::ScalarWorkload { integer_domains: Vec::new(),
         identity: "four unknown f32 inputs".into(),
         allocations: execution
             .program()
@@ -187,7 +187,7 @@ fn opaque_helper_cannot_be_replaced_with_an_authored_cost() {
 }
 
 #[test]
-fn missing_hardware_service_is_an_analysis_error() {
+fn missing_hardware_service_is_an_explicitly_unsupported_analysis() {
     let execution = execution("x[i] + 1.0");
     let mut hardware = hardware(&execution);
     hardware.timings.pop().unwrap();
@@ -202,10 +202,8 @@ fn missing_hardware_service_is_an_analysis_error() {
         Ok(_) => panic!("missing primitive timing silently disappeared"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("missing CUDA hardware timing"),
-        "{error}"
-    );
+    assert!(matches!(error, workload::DerivationError::Unsupported(ref reason)
+        if reason.contains("missing CUDA hardware timing")), "{error}");
 }
 
 #[test]

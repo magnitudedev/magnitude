@@ -212,3 +212,163 @@ fn explicit_mixer_flags_and_speculative_blocks_keep_main_layer_order() {
     );
     assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
 }
+
+#[test]
+fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
+    use seismic_engine::{
+        chat::{ChatRequest, PreparedChat, TemplateSelection},
+        inputs::ByteBpeTokenizer,
+        models::qwen35::loading::Model,
+    };
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn kind(value: &Scalar) -> u32 {
+        match value {
+            Scalar::String(_) => 8,
+            Scalar::Bool(_) => 7,
+            Scalar::Unsigned(_) => 10,
+            Scalar::Signed(_) => 11,
+            Scalar::Float(_) => 12,
+        }
+    }
+    fn scalar(out: &mut Vec<u8>, value: &Scalar) {
+        match value {
+            Scalar::String(s) => string(out, s),
+            Scalar::Bool(b) => out.push(u8::from(*b)),
+            Scalar::Unsigned(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Scalar::Signed(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Scalar::Float(n) => out.extend_from_slice(&n.to_le_bytes()),
+        }
+    }
+    let mut d = directory(false);
+    let mut alphabet: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
+    let mut codes: Vec<u32> = alphabet.iter().map(|&b| u32::from(b)).collect();
+    let mut next = 256;
+    for b in 0..=255 {
+        if !alphabet.contains(&b) {
+            alphabet.push(b);
+            codes.push(next);
+            next += 1;
+        }
+    }
+    let mut pieces = vec![Scalar::String(String::new()); 256];
+    for (b, code) in alphabet.into_iter().zip(codes) {
+        pieces[b as usize] = Scalar::String(char::from_u32(code).unwrap().to_string());
+    }
+    pieces.push(Scalar::String("<eos>".into()));
+    for (name, value) in [
+        (
+            "tokenizer.ggml.model",
+            Value::Scalar(Scalar::String("gpt2".into())),
+        ),
+        (
+            "tokenizer.ggml.pre",
+            Value::Scalar(Scalar::String("qwen35".into())),
+        ),
+        ("tokenizer.ggml.tokens", Value::Array(pieces)),
+        (
+            "tokenizer.ggml.token_type",
+            Value::Array(
+                (0..257)
+                    .map(|i| Scalar::Unsigned(if i == 256 { 3 } else { 1 }))
+                    .collect(),
+            ),
+        ),
+        ("tokenizer.ggml.merges", Value::Array(vec![])),
+        (
+            "tokenizer.ggml.eos_token_id",
+            Value::Scalar(Scalar::Unsigned(256)),
+        ),
+        (
+            "tokenizer.chat_template",
+            Value::Scalar(Scalar::String("{{ messages[0].content }}".into())),
+        ),
+    ] {
+        d.metadata.push(Metadata {
+            name: name.into(),
+            value,
+        });
+    }
+    let embedding = d
+        .tensors
+        .iter_mut()
+        .find(|t| t.name == "token_embd.weight")
+        .unwrap();
+    embedding.shape[0] = 257;
+    embedding.nbytes = 257 * 8 * 4;
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&(d.tensors.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&(d.metadata.len() as u64).to_le_bytes());
+    for item in &d.metadata {
+        string(&mut bytes, &item.name);
+        match &item.value {
+            Value::Scalar(value) => {
+                bytes.extend_from_slice(&kind(value).to_le_bytes());
+                scalar(&mut bytes, value);
+            }
+            Value::Array(values) => {
+                bytes.extend_from_slice(&9u32.to_le_bytes());
+                bytes.extend_from_slice(&values.first().map_or(8, kind).to_le_bytes());
+                bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for value in values {
+                    scalar(&mut bytes, value);
+                }
+            }
+        }
+    }
+    let mut offset = 0u64;
+    for tensor in &d.tensors {
+        string(&mut bytes, &tensor.name);
+        bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
+        for dimension in tensor.shape.iter().rev() {
+            bytes.extend_from_slice(&dimension.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(tensor.encoding as u32).to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        offset = (offset + tensor.nbytes).div_ceil(32) * 32;
+    }
+    bytes.resize(bytes.len().div_ceil(32) * 32 + offset as usize, 0);
+    let path = std::env::temp_dir().join(format!(
+        "seismic-qwen-loading-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let temp = Temp(path);
+    std::fs::write(&temp.0, bytes).unwrap();
+    let model = Model::open(&temp.0).unwrap();
+    assert_eq!(model.description().geometry.vocabulary, 257);
+    assert_eq!(model.description().output, model.description().embedding);
+    let identity = model.description().artifact_identity.to_string();
+    // GGUF interpretation is retained; later pathname replacement cannot alter
+    // its tokenizer/template metadata or the open weight source.
+    let replacement = temp.0.with_extension("replacement");
+    std::fs::write(&replacement, b"invalid replacement").unwrap();
+    std::fs::rename(&replacement, &temp.0).unwrap();
+    let tokenizer = ByteBpeTokenizer::new(model.tokenizer_config().unwrap()).unwrap();
+    assert_eq!(tokenizer.artifact_identity(), identity);
+    let prepared = PreparedChat::prepare(
+        &model.templates().unwrap(),
+        &tokenizer,
+        &ChatRequest::new(
+            vec![serde_json::json!({"role":"user","content":"hello"})],
+            0,
+        ),
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    assert_eq!(prepared.prompt(), "hello");
+    assert_eq!(prepared.prompt_tokens(), 5);
+    assert!(Model::open(&temp.0).is_err());
+}

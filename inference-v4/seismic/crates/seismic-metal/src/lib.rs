@@ -7,7 +7,7 @@ pub mod storage;
 pub mod reduction;
 pub mod family;
 #[cfg(target_os = "macos")]
-pub mod plan_exec;
+
 #[cfg(target_os = "macos")]
 pub mod runtime;
 

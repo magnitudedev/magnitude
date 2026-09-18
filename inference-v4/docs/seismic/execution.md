@@ -160,6 +160,28 @@ multiplicity and order; every intrinsic's requirements hold. Necessary communica
 is explicit. Search specializes this structure rather than treating arbitrary
 rewrite-pass histories as distinct candidates.
 
+Source-order phase construction groups consecutive serial statements into one
+rank-zero work domain and retains each outer parallel domain. Serial setup runs
+once before dependent parallel regions. Every launch completes before its
+successor, including tensor writes and invocation-owned value publications.
+Scalars and dense tiles crossing boundaries receive internal typed storage;
+publication and reload are ordinary operations in the same accounted program.
+Later serial updates publish a new version before subsequent consumers. These
+allocations are owned by the compiled invocation and do not extend its public ABI.
+
+A retained tensor view keeps its backing identity and captures each dynamic
+coordinate at the original evaluation site. Consumers reconstruct geometry from
+those retained scalar coordinates; they do not reread coordinate tensors or copy
+the view's referent. Runtime-sized dense snapshots retain their actual lengths
+separately from the capacity derived from their source views. Publication and
+reload use those lengths, preserving empty and clamped windows.
+
+Each launch is checked independently for typed bindings, scope, and participant
+indices. Iteration-local values cannot escape their domain, and mutation of a
+broadcast value requires an ownership or merge proof. Unsupported storage or
+domain construction stays explicitly unresolved; it cannot silently eliminate
+an alternative. Malformed IR and inconsistent construction metadata remain errors.
+
 Decision identity and alternatives remain typed through lowering, accounting, and
 selection. Display labels do not replace those identities. Resolving a decision
 specializes the same execution structure and its derived constraints; neither the tuner
@@ -260,3 +282,92 @@ its admitted merge semantics, including masked, empty and exceptional-value case
 Numerical and effect preservation is independent of optimizer cost improvement.
 Transforms must handle aliases and snapshots, exceptional floating-point values,
 partial or empty domains, and collective participation according to their semantics.
+
+Participant-owned segmented folds retain the selected source merge tree, including
+its seed leaf exactly once. Leaves map cyclically onto subgroup lanes and private
+slots, so the number of segments may exceed subgroup width. Partial state remains
+proportional to leaves per participant. Exchange reads a uniform source slot across
+all participants before shuffling from the selected lane; receiver-dependent slot
+reads cannot implement a remote private-memory lookup. Pairwise and explicit
+contiguous trees retain their original child order and arithmetic. Extra lanes or
+slots initialize private identity values but do not introduce padded merge leaves.
+
+Seed placement is an explicit participant-ownership choice. One mapping leaves the
+seed at logical leaf zero while computing each segment in its final lane/slot.
+The other computes segment `j` at cyclic coordinate `j`, then shifts the retained
+partial states to coordinate `j + 1` and inserts the original seed at zero. This
+can avoid an extra serial segment on one lane when the segment count is a multiple
+of subgroup width. Slots shift in descending order; all shuffle source slots are
+uniform. Both mappings enter the identical merge tree with identical leaves.
+The transfer instructions, temporary state, and ownership are ordinary execution
+IR, so their costs participate in the same derivation as the segment arithmetic.
+
+### Terminal loop traversal
+
+After allocation and storage are fixed, Metal retains contiguous device-to-private
+snapshot copies and adjacent device-read bundles as typed transfer choices. Scalar accesses and supported packed
+vectors of two, three, or four elements belong to the same domain. Pure local
+coordinate bindings are resolved using the terminal owner's lexical integer
+analysis. A vector alternative requires contiguous source addresses without
+integer wrapping; it preserves per-element conversions and destination writes.
+Guards must hold for every component, otherwise that chunk executes its original
+scalar copies. The remaining tail stays scalar. Packed vectors retain scalar
+alignment and exact payload size; they introduce no stronger binding condition.
+The selected vector read is a terminal operation used by emission, known-value
+propagation, request geometry, and hardware service derivation. It is not a claim
+that the native compiler emits one instruction. Transfer choices are retained
+before traversal choices, so unrolling sees the selected copy loops. Read bundles
+resolve immutable scalar aliases through the same integer analysis, require
+consecutive addresses in one backing, and cross only total scalar definitions.
+They preserve scalar bindings, conversions, and incomplete tails. Writes,
+control boundaries, unresolved checked reads, and other effects end the bundle;
+no source name or packed representation is part of recognition.
+
+Metal then retains each finite constant loop
+as a typed traversal domain. Widths `1..iteration_count` preserve the original
+ordered iteration sequence; nondivisor widths emit complete chunks and exact
+remaining iterations. Full unrolling exposes constant private-array indices.
+Selection never infers native registers or chooses widths from benchmark feedback.
+
+The selected loop transformation operates on the same terminal statements used
+by emission and accounting. Lexical scopes retain local declarations between
+copies; bounds failures, casts, and FMA order remain in their original occurrence.
+Loops containing unknown textual implementations, mutated induction variables,
+or an unproved final integer increment have no unrolled alternative. The owning
+terminal preparation is retained across refinement, and numeric width domains do
+not allocate a vector of all alternatives.
+
+Pairwise participant folds additionally admit completion by leaf waves. Each
+subgroup-sized contiguous set of leaves executes the same lower tree levels
+before the next set is generated. Its root is retained across participants, so
+live leaf storage becomes one root per completed wave rather than every leaf.
+The upper levels combine these roots in the unchanged pairwise order. Both seed
+placements remain available; deferred seed insertion carries the preceding
+wave's final segment into the next wave without recomputing it. The final partial
+wave contributes only its real leaves. Explicit trees keep the existing complete
+leaf realization unless their independent subtree schedule is established.
+
+Metal storage domains retain the participant relationship between an owned loop and every tile element it writes. Replicated publication requires the loop's full per-lane traversal; cooperative publication uses the distributed traversal. These replication classes propagate jointly through writes and borrowed storage aliases, including constraints imposed by matrix operands. A distributed read also constrains its owning loop to cooperative traversal. Selecting an earlier tile can therefore narrow later storage domains. Shared writes receive an owned-region publication barrier even when the region's named iteration tile uses distributed private storage. The memory plan owns that barrier and emission and accounting consume it together.
+
+An owned iteration domain need not have a data allocation. Borrowed device views
+and geometry-only tiles use the same publication ownership relationships as
+materialized tiles: when they fill cooperative storage, their coordinates are
+partitioned cooperatively; when they fill replicated storage, every lane traverses
+the domain. Device aliases do not force separate logical iteration domains into
+one replication class. The selected ownership is stored in the storage plan and
+consumed by both convergence/publication analysis and terminal construction.
+
+Terminal synchronization refinement can defer a publication barrier to the next
+barrier in the same control region when the intervening shared accesses do not
+conflict. Read/write, write/read and write/write hazards use backing-slot pointer
+aliases, including matrix transfers; unknown effects and control exits stop the
+analysis. The first and last barriers of a region remain, and nested regions with
+barriers are opaque to their parent. This coalescing runs before terminal transfer
+and traversal choices, so their retained mandatory-work bounds see the same fixed
+barrier set. Emission and accounting consume the coalesced typed program.
+The synchronization analysis additionally tracks known low byte-address bits.
+This can prove that different columns of a strided allocation are disjoint even
+when their bounding intervals overlap. Integer-width wrapping, pointer offsets,
+and every byte of each scalar access participate in that calculation. Matrix
+transfers conservatively touch their entire backing allocation; unresolved address
+bits never establish disjointness.

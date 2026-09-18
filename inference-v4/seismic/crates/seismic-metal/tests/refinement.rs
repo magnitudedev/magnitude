@@ -16,6 +16,13 @@ use seismic_metal::{
 use seismic_realization::{LoadStrategy, dispatch::TilePlacement};
 use std::{cell::Cell, sync::Arc};
 
+fn oracle_model(model: schedule::evaluation::Model) -> schedule::Model {
+    match model {
+        schedule::evaluation::Model::Flat(model) => model,
+        schedule::evaluation::Model::Structured { model, expansion_limit } => model.expand(expansion_limit).unwrap(),
+    }
+}
+
 const TWO: &str = "fn evaluate(x: tensor[5,64] f32, middle: tensor[5,64] f32, out: tensor[5] f32):\n  for row in parallel:\n    a = load(x[row])\n    y = tile[64] f32\n    for i in owned(y): y[i] = a[(i+1)%64]\n    store(y,middle[row])\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = middle[row,0]\n    store(y,out[row:row+1])\n";
 const SPLIT: &str = "fn evaluate(x: tensor[2,65] f32, middle: tensor[2] f32, out: tensor[2] f32):\n  for row in parallel:\n    acc = tile[1] f32\n    for i in owned(acc): acc[i] = 0.0\n    chunk = load(x[row,0:65])\n    acc[0] += reduce(chunk,0,sum)\n    store(acc,middle[row:row+1])\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = middle[row] * 2.0 + 1.0\n    store(y,out[row:row+1])\n";
 
@@ -298,13 +305,22 @@ impl tuner::Backend for RetainedBackend {
     ) -> Result<Option<Preparation<Execution>>, String> {
         self.inner.refine(alternatives, index)
     }
+    fn relax(
+        &self,
+        alternatives: &selection::Domain,
+        indices: std::ops::Range<usize>,
+        invocation: &workload::ScalarWorkload,
+        limits: workload::DerivationLimits,
+    ) -> Result<Option<schedule::Demand>, String> {
+        self.inner.relax(alternatives, indices, invocation, limits)
+    }
     fn analyze(
         &self,
         execution: &Execution,
         invocation: &workload::ScalarWorkload,
         limits: workload::DerivationLimits,
-    ) -> Result<schedule::Model, workload::DerivationError> {
-        let mut model = self.inner.analyze(execution, invocation, limits)?;
+    ) -> Result<schedule::evaluation::Model, workload::DerivationError> {
+        let mut model = oracle_model(self.inner.analyze(execution, invocation, limits)?);
         for operation in &mut model.operations {
             for &predecessor in &operation.start_predecessors {
                 if !operation.predecessors.contains(&predecessor) {
@@ -313,7 +329,15 @@ impl tuner::Backend for RetainedBackend {
             }
         }
         model.identity.push_str(":blocking-test");
-        Ok(model)
+        Ok(model.into())
+    }
+    fn relax_execution(
+        &self,
+        execution: &Execution,
+        invocation: &workload::ScalarWorkload,
+        limits: workload::DerivationLimits,
+    ) -> Result<Option<schedule::Demand>, String> {
+        self.inner.relax_execution(execution, invocation, limits)
     }
     fn materialize(
         &self,
@@ -349,8 +373,10 @@ fn two_launch_optimum_and_resume_reuse_the_same_preparation() {
         if domain.owner::<GroupingChoices>().is_some() {
             break domain;
         }
-        let owner = domain.owner::<seismic_metal::choices::Domain>().unwrap();
-        let selected = match &owner.decision {
+        let owner = domain
+            .owner::<seismic_metal::choices::ExecutionChoice>()
+            .unwrap();
+        let selected = match owner.decision() {
             seismic_metal::choices::Decision::Storage(_) => {
                 seismic_metal::choices::Alternative::Storage(TilePlacement::GroupShared)
             }
@@ -426,7 +452,7 @@ fn two_launch_optimum_and_resume_reuse_the_same_preparation() {
         prefix,
         preparations: Cell::new(0),
     };
-    let invocation = workload::ScalarWorkload {
+    let invocation = workload::ScalarWorkload { integer_domains: Vec::new(),
         identity: "disjoint two-phase buffers".into(),
         allocations: (0..2)
             .map(|id| workload::Allocation {
@@ -452,9 +478,9 @@ fn two_launch_optimum_and_resume_reuse_the_same_preparation() {
     let expected = executions
         .iter()
         .map(|(_, execution)| {
-            let solution = backend
+            let solution = oracle_model(backend
                 .analyze(execution, &invocation, limits)
-                .unwrap()
+                .unwrap())
                 .solve(100_000)
                 .unwrap();
             assert!(solution.is_optimal());
@@ -530,5 +556,205 @@ fn two_launch_optimum_and_resume_reuse_the_same_preparation() {
         assert!(
             matches!(tuner::resume(&changed, progress, selection::Budget { nodes: 100, schedule_assignments: 100_000 }), Err(message) if message == "selection inputs changed")
         );
+    }
+}
+
+#[test]
+fn execution_refinement_reuses_completed_stages_and_matches_full_path() {
+    use seismic_metal::choices::{self, Decision, Expansion};
+    let function = lowered(&TWO.replace("    store(y,middle[row])", "    store(y,middle[row])\n    z = tile[64] f32\n    for i in owned(z): z[i] = middle[row,i] * 2.0\n    store(z,middle[row])"));
+    let config = config();
+    let mut prefix = Vec::new();
+    let mut next = choices::expand(&function, config.clone(), &[]).unwrap();
+    let mut reused = 0;
+    let mut saw_load = false;
+    let mut saw_storage = false;
+    let mut saw_allocation = false;
+    loop {
+        match next {
+            Expansion::Choice(owner) => {
+                let Expansion::Choice(rebuilt) =
+                    choices::expand(&function, config.clone(), &prefix).unwrap()
+                else {
+                    panic!("full path must reach the same choice");
+                };
+                assert_eq!(owner, rebuilt);
+                saw_load |= matches!(owner.decision(), Decision::Load(_));
+                saw_storage |= matches!(owner.decision(), Decision::Storage(_));
+                saw_allocation |= matches!(owner.decision(), Decision::Allocation(_));
+                let selected = match owner.decision() {
+                    Decision::Storage(_) => {
+                        choices::Alternative::Storage(TilePlacement::GroupShared)
+                    }
+                    _ => owner.diagnostic(LoadStrategy::Materialize),
+                };
+                let index = owner.index(&selected).unwrap();
+                next = owner.refine(index).unwrap();
+                if let Expansion::Choice(ref next) = next {
+                    if matches!(
+                        (owner.decision(), next.decision()),
+                        (Decision::Storage(_), Decision::Storage(_))
+                            | (Decision::Allocation(_), Decision::Allocation(_))
+                    ) {
+                        assert!(std::ptr::eq(owner.prepared(), next.prepared()));
+                        reused += 1;
+                    }
+                }
+                prefix.push(index);
+            }
+            Expansion::Execution {
+                execution,
+                consumed,
+            } => {
+                assert_eq!(consumed, prefix.len());
+                let Expansion::Execution {
+                    execution: rebuilt,
+                    consumed: full,
+                } = choices::expand(&function, config.clone(), &prefix).unwrap()
+                else {
+                    panic!("full path must complete");
+                };
+                assert_eq!(consumed, full);
+                assert_eq!(execution.function(), rebuilt.function());
+                assert_eq!(execution.phases(), rebuilt.phases());
+                assert_eq!(execution.memory(), rebuilt.memory());
+                assert_eq!(
+                    msl::emit_execution(&execution).unwrap().source,
+                    msl::emit_execution(&rebuilt).unwrap().source
+                );
+                break;
+            }
+            Expansion::Infeasible { .. } => panic!("small prepared example must fit"),
+        }
+    }
+    assert!(
+        saw_load && saw_storage && saw_allocation && reused > 0,
+        "load={saw_load} storage={saw_storage} allocation={saw_allocation} reused={reused}"
+    );
+}
+
+#[test]
+fn grouping_region_demand_bounds_every_remaining_launch_assignment() {
+    use seismic_accounting::selection::Choices;
+    use seismic_metal::terminal::Primitive;
+    let function = lowered(
+        "fn evaluate(middle:tensor[5] f32,out:tensor[5] f32):\n  for row in parallel:\n    value = tile[1] f32\n    for i in owned(value): value[i] = 3.0\n    store(value,middle[row:row+1])\n  for row in parallel:\n    value = tile[1] f32\n    for i in owned(value): value[i] = middle[row] * 2.0\n    store(value,out[row:row+1])\n",
+    );
+    let family = family(&function, config());
+    let domain = choice(family.next(vec![]).unwrap());
+    let owner = domain.owner::<GroupingChoices>().unwrap();
+    let mut primitives = Vec::new();
+    for grouping in family.groupings() {
+        let execution = family.select(grouping.items_per_group).unwrap();
+        for primitive in model::requirements(&execution).unwrap().primitives {
+            if !primitives.contains(&primitive) { primitives.push(primitive); }
+        }
+    }
+    let hardware = model::Hardware {
+        identity: "synthetic dispatch-service fixture".into(),
+        timebase: schedule::Timebase {
+            seconds_numerator: 1,
+            seconds_denominator: 1,
+        },
+        resources: vec![schedule::Resource {
+            name: "submission".into(),
+            capacity: 1,
+            unit: schedule::CapacityUnit::Slots,
+        }],
+        resident_groups: 1,
+        resident_shared_bytes: 1024,
+        timings: primitives.into_iter()
+            .map(|primitive| {
+                let latency = match primitive {
+                    Primitive::Launch => 3,
+                    Primitive::Group => 10,
+                    Primitive::Write { space: seismic_metal::terminal::Space::Device, .. } => 7,
+                    _ => 0,
+                };
+                model::Timing {
+                    primitive,
+                    latency,
+                    services: if latency == 0 {
+                        vec![]
+                    } else {
+                        vec![model::Service {
+                            resource: 0,
+                            offset: 0,
+                            duration: latency,
+                            units: model::Units::PerSubgroup(1),
+                        }]
+                    },
+                }
+            })
+            .collect(),
+    };
+    let backend = tuning::Backend::with_conditions(tuning::Conditions {
+        target: "fixture".into(),
+        capacities: tuning::Capacities {
+            max_threads_per_threadgroup: 96,
+            max_threadgroup_bytes: 1024,
+        },
+        form: tuning::Form::Fixed(Default::default()),
+        hardware,
+    })
+    .unwrap();
+    let invocation = workload::ScalarWorkload { integer_domains: Vec::new(),
+        identity: "two outputs".into(),
+        allocations: (0..2)
+            .map(|id| workload::Allocation {
+                id,
+                bytes: 20,
+                alignment: 4,
+                known_bytes: Default::default(),
+            })
+            .collect(),
+        buffers: (0..2)
+            .map(|allocation| workload::BufferBinding {
+                allocation,
+                offset: 0,
+                bytes: 20,
+            })
+            .collect(),
+        scalars: vec![],
+    };
+    let bound = |domain: &selection::Domain, range| {
+        backend
+            .relax(domain, range, &invocation, workload::DerivationLimits { instructions: 100_000, operations: 100_000 })
+            .unwrap()
+            .unwrap()
+            .lower_bound()
+            .unwrap()
+    };
+    let broad = bound(&domain, 0..owner.len());
+    let narrow = bound(&domain, 0..1);
+    assert!(broad > 46 && narrow > broad, "the bound must include mandatory publications beyond the two launches and minimum groups");
+    let cached = backend.relax(&domain, 0..owner.len(), &invocation, workload::DerivationLimits { instructions: 0, operations: 0 }).unwrap().unwrap().lower_bound().unwrap();
+    assert_eq!(cached, broad, "completed body counts survive a smaller budget");
+    for first in 0..owner.len() {
+        let next = choice(owner.refine(first).unwrap());
+        let second = next.owner::<GroupingChoices>().unwrap();
+        let region = bound(&next, 0..second.len());
+        assert!(region >= broad);
+        for last in 0..second.len() {
+            let Preparation::Execution(execution) = second.refine(last).unwrap() else {
+                panic!()
+            };
+            let model = oracle_model(backend
+                .analyze(
+                    &execution,
+                    &invocation,
+                    workload::DerivationLimits {
+                        instructions: 100_000,
+                        operations: 100_000,
+                    },
+                )
+                .unwrap());
+            assert!(model.unmapped.is_empty(), "{:?}", model.unmapped);
+            let floor = model.lower_bound().unwrap();
+            assert!(broad <= floor && region <= floor);
+            if first == 0 {
+                assert!(narrow <= floor);
+            }
+        }
     }
 }

@@ -3,6 +3,7 @@
 use seismic_lang::abi::ScalarParameter;
 pub mod execution;
 pub mod storage;
+pub mod phases;
 use cranelift_codegen::ir;
 pub use cranelift_codegen::isa::CallConv;
 
@@ -17,6 +18,7 @@ pub struct BufferSpec {
 /// Derived source invocation requirements retained through preparation/emission.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InvocationConditions {
+    read_only_buffers: Vec<usize>,
     independent_buffers: Vec<usize>,
     alias_pairs: Vec<(usize, usize, bool)>,
 }
@@ -57,7 +59,13 @@ impl InvocationConditions {
                 }
             }
         }
+        let read_only_buffers = parameters.iter().enumerate().filter_map(|(slot, buffer)| {
+            let parameter = function.params.iter().position(|(name, _)| name == &buffer.parameter)?;
+            let (id, _) = function.vars.iter().enumerate().find(|(_, var)| matches!(var.kind, seismic_lang::ir::VarKind::Param(p) if p == parameter))?;
+            seismic_lang::effects::tensor_parameter_read_only(&function.body, id).then_some(slot)
+        }).collect();
         Ok(Self {
+            read_only_buffers,
             alias_pairs,
             independent_buffers: parameters
                 .iter()
@@ -72,6 +80,8 @@ impl InvocationConditions {
                 .collect(),
         })
     }
+    /// Parameters proven unmodified by the admitted computation, including aliases.
+    pub fn read_only_buffers(&self) -> &[usize] { &self.read_only_buffers }
     pub fn independent_buffers(&self) -> &[usize] {
         &self.independent_buffers
     }
@@ -142,6 +152,9 @@ pub struct ScalarProgram {
     pub conditions: InvocationConditions,
     pub function: ir::Function,
     pub buffers: Vec<BufferSpec>,
+    /// Source-visible prefix of `buffers`. Remaining planes are invocation-owned
+    /// phase storage and are never supplied by the caller.
+    pub public_buffer_count: usize,
     pub scalars: Vec<ScalarParameter>,
     pub scratch_bytes: usize,
     pub imports: Vec<(ir::FuncRef, MathFunction)>,
@@ -183,11 +196,13 @@ pub fn encode_scalars(schema: &[ScalarParameter], scalars: &[f64]) -> Result<Vec
         .collect())
 }
 
-/// Source-ordered phases with physical completion between them. Tensor parameters
-/// retain their backing identity; phase-local values cannot escape their phase.
+/// Source-ordered phases with physical completion between them. Appended storage
+/// retains values across launches for the lifetime of this invocation.
 pub struct ScalarSequence {
     pub name: String,
     pub phases: Vec<ScalarPhase>,
+    pub public_buffer_count: usize,
+    pub retained: Vec<phases::RetainedValue>,
 }
 pub struct ScalarPhase {
     pub source_statement: usize,

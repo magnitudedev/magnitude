@@ -154,26 +154,37 @@ fn bind_expr(expr: &mut Expr, vars: &mut Vec<Var>, bindings: &mut Vec<Stmt>, alr
     }
 }
 
-/// Represent a serial root as one rank-zero work item for parallel dispatch.
-/// Existing outer parallel domains retain their phase boundaries.
+/// Represent each consecutive serial region as one rank-zero work item.
+/// Existing outer parallel domains retain their phase boundaries and source
+/// order. Values spanning these domains need the realization phase handoff.
 pub fn work_domain(body: &mut Vec<Stmt>) {
-    if body
-        .iter()
-        .any(|s| matches!(s.kind, StmtKind::Parallel { .. }))
-    {
-        return;
+    fn flush(serial: &mut Vec<Stmt>, phases: &mut Vec<Stmt>) {
+        if serial.is_empty() { return; }
+        phases.push(Stmt {
+            id: None,
+            span: serial[0].span,
+            kind: StmtKind::Parallel {
+                vars: Vec::new(), extents: Vec::new(), body: std::mem::take(serial),
+            },
+        });
     }
-    let span = body.first().map(|s| s.span).unwrap_or_default();
-    let inner = std::mem::take(body);
-    body.push(Stmt {
-        id: None,
-        kind: StmtKind::Parallel {
-            vars: Vec::new(),
-            extents: Vec::new(),
-            body: inner,
-        },
-        span,
-    });
+    let mut phases = Vec::new();
+    let mut serial = Vec::new();
+    for statement in std::mem::take(body) {
+        if matches!(statement.kind, StmtKind::Parallel { .. }) {
+            flush(&mut serial, &mut phases);
+            phases.push(statement);
+        } else {
+            serial.push(statement);
+        }
+    }
+    flush(&mut serial, &mut phases);
+    if phases.is_empty() {
+        phases.push(Stmt { id: None, span: Default::default(), kind: StmtKind::Parallel {
+            vars: Vec::new(), extents: Vec::new(), body: Vec::new(),
+        }});
+    }
+    *body = phases;
 }
 
 /// Lift pure, loop-invariant reductions out of nonempty owned domains. This
@@ -364,6 +375,12 @@ pub fn value_identity(expr: &Expr) -> Expr {
             ExprKind::Binary{lhs,rhs,..}=>{visit(lhs);visit(rhs);},
             ExprKind::Call{args,..}|ExprKind::Builtin{args,..}|ExprKind::Intrinsic{args,..}|ExprKind::Tuple(args)=>for e in args {visit(e)},
             _=>{}
+        }
+        // A scalar temporary records its precision as a cast. Casting a value
+        // already at that same precision is idempotent; narrower intermediate
+        // casts remain part of identity and cannot unlock sharing accidentally.
+        if let ExprKind::Cast { dtype, expr } = &e.kind {
+            if expr.ty == crate::types::Ty::Scalar(*dtype) { *e = (**expr).clone(); }
         }
         if let Some(sym)=&e.sym {
             // Equal checked symbolic coordinates have one structural identity,

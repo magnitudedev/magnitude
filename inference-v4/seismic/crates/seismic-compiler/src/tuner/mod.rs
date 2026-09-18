@@ -6,7 +6,7 @@ use seismic_accounting::{
     workload::{DerivationError, DerivationLimits, ScalarWorkload},
 };
 use seismic_lang::{ir, lower, lowered_ir::LoweredIr, program::Program, types::Elem};
-use std::collections::{BTreeMap, HashMap};
+use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 /// Backend-owned implementation boundary. Implementations prepare IR and derive
 /// models from it; native compilation and timing feedback are forbidden here.
@@ -39,6 +39,16 @@ pub trait Backend {
         _alternatives: &selection::Domain,
         _indices: std::ops::Range<usize>,
         _workload: &ScalarWorkload,
+        _limits: DerivationLimits,
+    ) -> Result<Option<schedule::Demand>, String> {
+        Ok(None)
+    }
+    /// Demand of a completed execution without constructing its full schedule.
+    fn relax_execution(
+        &self,
+        _execution: &Self::Execution,
+        _workload: &ScalarWorkload,
+        _limits: DerivationLimits,
     ) -> Result<Option<schedule::Demand>, String> {
         Ok(None)
     }
@@ -47,7 +57,7 @@ pub trait Backend {
         execution: &Self::Execution,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, DerivationError>;
+    ) -> Result<schedule::evaluation::Model, DerivationError>;
     fn materialize(
         &self,
         execution: &Self::Execution,
@@ -74,6 +84,7 @@ pub enum Preparation<E> {
     },
     Execution(E),
     Infeasible(selection::CapacityViolation),
+    Unresolved(String),
 }
 fn preparation_node<E>(preparation: Preparation<E>) -> selection::Node<E> {
     match preparation {
@@ -82,6 +93,7 @@ fn preparation_node<E>(preparation: Preparation<E>) -> selection::Node<E> {
         }
         Preparation::Execution(execution) => selection::Node::Realization(execution),
         Preparation::Infeasible(violation) => selection::Node::Infeasible(violation),
+        Preparation::Unresolved(reason) => selection::Node::Unresolved(reason),
     }
 }
 #[derive(Clone, Copy)]
@@ -150,6 +162,7 @@ impl<B: Backend> Request<'_, B> {
 struct Space<'a, 'b, B: Backend> {
     request: &'a Request<'b, B>,
     context: selection::Context,
+    inputs: Arc<Inputs<B::Conditions>>,
 }
 impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
     fn new(request: &'a Request<'b, B>) -> Self {
@@ -160,6 +173,7 @@ impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
         let d = request.backend.description();
         Self {
             request,
+            inputs: Arc::new(request.inputs()),
             context: selection::Context {
                 program: name.to_string(),
                 workload: request.workload.identity.clone(),
@@ -214,15 +228,25 @@ impl<'a, 'b, B: Backend> Space<'a, 'b, B> {
 }
 impl<B: Backend> selection::Space for Space<'_, '_, B> {
     type Execution = B::Execution;
-    type Identity = Inputs<B::Conditions>;
+    type Identity = Arc<Inputs<B::Conditions>>;
     fn identity(&self) -> Self::Identity {
-        self.request.inputs()
+        self.inputs.clone()
     }
     fn refine(
         &self,
         alternatives: &selection::Domain,
         index: usize,
     ) -> Result<Option<selection::Node<B::Execution>>, String> {
+        if let Some(owner) = alternatives.owner::<lower::alternatives::LoweringChoice>() {
+            return Ok(Some(match owner.refine(index)? {
+                lower::alternatives::Expansion::RetainedChoice(choice) => selection::Node::Choice {
+                    name: format!("{:?}", choice.decision().kind),
+                    alternatives: selection::Domain::new(choice)?,
+                },
+                lower::alternatives::Expansion::Lowered { function, .. } => self.backend_node(&function, &[])?,
+                lower::alternatives::Expansion::Choice(_) => return Err("retained refinement returned an earlier lowering stage".into()),
+            }));
+        }
         self.request
             .backend
             .refine(alternatives, index)
@@ -235,17 +259,20 @@ impl<B: Backend> selection::Space for Space<'_, '_, B> {
     ) -> Result<Option<schedule::Demand>, String> {
         self.request
             .backend
-            .relax(alternatives, indices, self.request.workload)
+            .relax(alternatives, indices, self.request.workload, self.request.derivation_limits)
     }
     fn context(&self) -> &selection::Context {
         &self.context
     }
-    fn analyze(&self, execution: &B::Execution) -> Result<schedule::Model, DerivationError> {
+    fn analyze(&self, execution: &B::Execution) -> Result<schedule::evaluation::Model, DerivationError> {
         self.request.backend.analyze(
             execution,
             self.request.workload,
             self.request.derivation_limits,
         )
+    }
+    fn relax_execution(&self, execution: &B::Execution) -> Result<Option<schedule::Demand>, String> {
+        self.request.backend.relax_execution(execution, self.request.workload, self.request.derivation_limits)
     }
     fn materialize(
         &self,
@@ -283,6 +310,10 @@ impl<B: Backend> selection::Space for Space<'_, '_, B> {
                         name: format!("{:?}", d.kind),
                         alternatives: selection::Domain::new(d)?,
                     }),
+                    lower::alternatives::Expansion::RetainedChoice(choice) => Ok(selection::Node::Choice {
+                        name: format!("{:?}", choice.decision().kind),
+                        alternatives: selection::Domain::new(choice)?,
+                    }),
                     lower::alternatives::Expansion::Lowered { function, consumed } => {
                         self.backend_node(&function, &path[consumed..])
                     }
@@ -293,7 +324,7 @@ impl<B: Backend> selection::Space for Space<'_, '_, B> {
 }
 pub struct TunedIr<E, C> {
     selected: Selected<E>,
-    inputs: Inputs<C>,
+    inputs: Arc<Inputs<C>>,
 }
 impl<E, C> TunedIr<E, C> {
     pub fn execution(&self) -> &E {
@@ -305,12 +336,7 @@ impl<E, C> TunedIr<E, C> {
     pub fn modeled_cost(&self) -> Cost {
         self.selected.cost()
     }
-    pub fn model(&self) -> &schedule::Model {
-        self.selected.objective().model()
-    }
-    pub fn schedule(&self) -> &schedule::Schedule {
-        self.selected.objective().schedule()
-    }
+    pub fn objective(&self) -> &Objective { self.selected.objective() }
     pub fn conditions(&self) -> &C {
         &self.inputs.conditions
     }
@@ -334,7 +360,7 @@ impl<E, C> TunedIr<E, C> {
 pub struct Artifact<C> {
     selected_path: Vec<usize>,
     objective: Objective,
-    inputs: Inputs<C>,
+    inputs: Arc<Inputs<C>>,
 }
 impl<C> Artifact<C> {
     pub fn selected_path(&self) -> &[usize] {
@@ -343,12 +369,7 @@ impl<C> Artifact<C> {
     pub fn modeled_cost(&self) -> Cost {
         self.objective.cost()
     }
-    pub fn model(&self) -> &schedule::Model {
-        self.objective.model()
-    }
-    pub fn schedule(&self) -> &schedule::Schedule {
-        self.objective.schedule()
-    }
+    pub fn objective(&self) -> &Objective { &self.objective }
     pub fn conditions(&self) -> &C {
         &self.inputs.conditions
     }
@@ -357,9 +378,15 @@ impl<C> Artifact<C> {
     }
 }
 pub struct Progress<E, C> {
-    search: selection::Progress<E, Inputs<C>>,
+    search: selection::Progress<E, Arc<Inputs<C>>>,
 }
 impl<E, C> Progress<E, C> {
+    pub fn nodes_visited(&self) -> usize {
+        self.search.nodes_visited()
+    }
+    pub fn missing_mappings(&self) -> impl Iterator<Item = (&[usize], &[String])> {
+        self.search.missing_mappings()
+    }
     pub fn frontier(&self) -> &[selection::Region] {
         self.search.frontier()
     }
@@ -372,6 +399,9 @@ impl<E, C> Progress<E, C> {
     pub fn unresolved(&self) -> selection::Unresolved {
         self.search.unresolved()
     }
+    pub fn unsupported_analyses(&self) -> impl Iterator<Item = (&[usize], &str)> {
+        self.search.unsupported_analyses()
+    }
     pub fn exhausted_derivations(
         &self,
     ) -> impl Iterator<Item = (&[usize], seismic_accounting::workload::DerivationLimit)> {
@@ -383,7 +413,7 @@ pub enum Outcome<E, C> {
     Incomplete(Progress<E, C>),
     Infeasible,
 }
-fn finish<E, C>(outcome: selection::Outcome<E, Inputs<C>>, inputs: Inputs<C>) -> Outcome<E, C> {
+fn finish<E, C>(outcome: selection::Outcome<E, Arc<Inputs<C>>>, inputs: Arc<Inputs<C>>) -> Outcome<E, C> {
     match outcome {
         selection::Outcome::Optimal(selected) => Outcome::Optimal(TunedIr { selected, inputs }),
         selection::Outcome::Incomplete(search) => Outcome::Incomplete(Progress { search }),
@@ -394,18 +424,14 @@ pub fn tune<B: Backend>(
     request: &Request<'_, B>,
     budget: selection::Budget,
 ) -> Result<Outcome<B::Execution, B::Conditions>, String> {
-    Ok(finish(
-        selection::select(&Space::new(request), budget)?,
-        request.inputs(),
-    ))
+    let space = Space::new(request);
+    Ok(finish(selection::select(&space, budget)?, space.inputs))
 }
 pub fn resume<B: Backend>(
     request: &Request<'_, B>,
     progress: Progress<B::Execution, B::Conditions>,
     budget: selection::Budget,
 ) -> Result<Outcome<B::Execution, B::Conditions>, String> {
-    Ok(finish(
-        selection::resume(&Space::new(request), progress.search, budget)?,
-        request.inputs(),
-    ))
+    let space = Space::new(request);
+    Ok(finish(selection::resume(&space, progress.search, budget)?, space.inputs))
 }

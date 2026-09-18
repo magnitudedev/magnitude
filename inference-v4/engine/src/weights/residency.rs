@@ -5,12 +5,11 @@ use super::{
     Error,
 };
 use seismic_lang::{
-    lower::{lower_specialized, Options},
     program::{compile, Program, SourceFile},
     types::{DType, Elem},
     Scope,
 };
-use seismic_runtime::{Buffer, Candidate, Device, Kernel};
+use seismic_runtime::{Buffer, Device, plan::{CompiledPlan, PlanCompiler, Settings}};
 use std::{
     collections::{BTreeMap, HashMap},
     rc::Rc,
@@ -25,6 +24,9 @@ pub struct ResidentWeight {
     planes: BTreeMap<String, Buffer>,
 }
 impl ResidentWeight {
+    pub(crate) fn belongs_to(&self, device: &Device) -> bool {
+        self.planes.values().all(|buffer| buffer.belongs_to(device))
+    }
     pub fn descriptor(&self) -> &WeightDescriptor {
         &self.descriptor
     }
@@ -37,13 +39,13 @@ impl ResidentWeight {
 }
 pub struct Importer {
     device: Rc<Device>,
-    candidate: Candidate,
+    settings: Settings,
     program: Program,
-    kernels: HashMap<(DType, DType, usize), Kernel>,
-    block_kernels: HashMap<(super::gguf::Encoding, usize), Kernel>,
+    kernels: HashMap<(DType, DType, usize), CompiledPlan>,
+    block_kernels: HashMap<(super::gguf::Encoding, usize), CompiledPlan>,
 }
 impl Importer {
-    pub fn new(device: Rc<Device>, candidate: Candidate) -> Result<Self, Error> {
+    pub fn new(device: Rc<Device>, settings: Settings) -> Result<Self, Error> {
         let program = compile(
             &[
                 SourceFile {
@@ -68,7 +70,7 @@ impl Importer {
         .map_err(|e| invalid(format!("weight import program: {e:?}")))?;
         Ok(Self {
             device,
-            candidate,
+            settings,
             program,
             kernels: HashMap::new(),
             block_kernels: HashMap::new(),
@@ -142,25 +144,18 @@ impl Importer {
                 let input = self.device.buffer_from(&bytes).map_err(invalid)?;
                 let key = (*encoding, blocks);
                 if !self.block_kernels.contains_key(&key) {
-                    let lowered = lower_specialized(
-                        &self.program,
+                    let plan = PlanCompiler::new(&self.device, &self.program, self.settings.clone()).compile_entry(
                         entry,
-                        self.device.backend(),
                         &HashMap::from([(
                             "B".into(),
                             i64::try_from(blocks)
                                 .map_err(|_| invalid("block count exceeds index range"))?,
                         )]),
                         &HashMap::new(),
-                        &Options::default(),
+                        &Default::default(),
                     )
                     .map_err(invalid)?;
-                    self.block_kernels.insert(
-                        key,
-                        self.device
-                            .compile(&lowered, self.candidate.clone())
-                            .map_err(invalid)?,
-                    );
+                    self.block_kernels.insert(key, plan);
                 }
                 let mut buffers = vec![input.clone(), input];
                 let mut planes = BTreeMap::new();
@@ -173,7 +168,7 @@ impl Importer {
                 self.block_kernels
                     .get_mut(&key)
                     .unwrap()
-                    .execute(&buffers, &[])
+                    .execute_buffers(&buffers, &[])
                     .map_err(invalid)?;
                 (Elem::Repr(representation.into()), planes)
             }
@@ -192,10 +187,8 @@ impl Importer {
                         let key = (tensor.dtype, target, count);
                         if !self.kernels.contains_key(&key) {
                             let entry = "import_weight";
-                            let lowered = lower_specialized(
-                                &self.program,
+                            let plan = PlanCompiler::new(&self.device, &self.program, self.settings.clone()).compile_entry(
                                 entry,
-                                self.device.backend(),
                                 &HashMap::from([(
                                     "N".into(),
                                     i64::try_from(count)
@@ -205,15 +198,10 @@ impl Importer {
                                     ("T".into(), Elem::Dtype(tensor.dtype)),
                                     ("U".into(), Elem::Dtype(target)),
                                 ]),
-                                &Options::default(),
+                                &Default::default(),
                             )
                             .map_err(invalid)?;
-                            self.kernels.insert(
-                                key,
-                                self.device
-                                    .compile(&lowered, self.candidate.clone())
-                                    .map_err(invalid)?,
-                            );
+                            self.kernels.insert(key, plan);
                         }
                         let bytes = count
                             .checked_mul(target.bytes() as usize)
@@ -222,7 +210,7 @@ impl Importer {
                         self.kernels
                             .get_mut(&key)
                             .unwrap()
-                            .execute(
+                            .execute_buffers(
                                 &[input, output.clone()],
                                 &[f64::from(descriptor.transform == Transform::NegativeExp)],
                             )

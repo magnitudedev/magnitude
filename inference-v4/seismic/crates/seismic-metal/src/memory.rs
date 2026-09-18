@@ -121,6 +121,9 @@ pub struct LaunchMemory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScratchAllocation {
     pub index: usize,
+    /// Internal tensor parameter for an ordinary cross-phase retained value.
+    /// Split-reduction scratch has no parameter binding.
+    pub parameter: Option<usize>,
     pub phase: usize,
     pub variable: VarId,
     pub dtype: seismic_lang::types::DType,
@@ -199,7 +202,7 @@ impl MemoryPlan {
         let mut bindings = HashSet::new();
         for (index, allocation) in scratch.iter().enumerate() {
             if allocation.index != index
-                || !bindings.insert((allocation.phase, allocation.variable))
+                || !bindings.insert((allocation.phase, allocation.variable, allocation.parameter))
             {
                 return Err("scratch allocation identity is ambiguous".into());
             }
@@ -233,6 +236,31 @@ impl MemoryPlan {
     }
     pub fn scratch(&self) -> &[ScratchAllocation] {
         &self.scratch
+    }
+    pub(crate) fn with_retained(
+        self,
+        retained: &[seismic_realization::phases::RetainedValue],
+        phases: &[crate::execution::Phase],
+    ) -> Result<Self, String> {
+        let mut ends = Vec::with_capacity(phases.len());
+        let mut launches = 0usize;
+        for phase in phases {
+            launches += 1 + usize::from(phase.split.is_some());
+            ends.push(launches - 1);
+        }
+        if launches != self.launches.len() { return Err("retained phase/launch count differs".into()); }
+        let mut scratch = self.scratch;
+        for value in retained {
+            let consumer = *value.consumers.last().ok_or("retained value has no consumer")?;
+            scratch.push(ScratchAllocation {
+                index: scratch.len(), parameter: Some(value.parameter), phase: value.producer,
+                variable: value.variable, dtype: value.dtype, elements_per_item: value.elements,
+                work_items: 1, parts: 1, bytes: value.bytes,
+                producer: *ends.get(value.producer).ok_or("invalid retained producer")?,
+                consumer: *ends.get(consumer).ok_or("invalid retained consumer")?,
+            });
+        }
+        Self::new(self.launches, scratch)
     }
     pub fn launches(&self) -> &[LaunchMemory] {
         &self.launches
@@ -919,7 +947,7 @@ pub fn plan_selected(
                             .cloned()
                             .ok_or("owned memory domain has no placement")?;
                         let outer_partial = self.partial_owned;
-                        self.partial_owned |= placement != Some(TilePlacement::Replicated)
+                        self.partial_owned |= self.storage.owned_cooperative(var)
                             || !tile
                                 .ty
                                 .shaped()
@@ -933,7 +961,22 @@ pub fn plan_selected(
                         }
                         self.nested(body, Scope::Body(operation), Multiplicity::Unknown { reason: "owned-domain lane participation and runtime tile extents are unresolved".into() })?;
                         self.partial_owned = outer_partial;
-                        self.publish(operation, var, BarrierPurpose::Owned, placement)?;
+                        // The iteration domain need not be its only publication.
+                        // A distributed owner can also write a shared tile whose
+                        // next consumer uses different lane coordinates.
+                        fn shared_writes(body: &[Stmt], bound: &std::collections::HashMap<VarId, Option<TilePlacement>>) -> bool {
+                            body.iter().any(|s| match &s.kind {
+                                StmtKind::Assign { target, .. } if matches!(target.kind, ExprKind::Index { .. }) =>
+                                    crate::storage::tile_root(target).is_some_and(|v| bound.get(&v) == Some(&Some(TilePlacement::GroupShared))),
+                                StmtKind::If { then, els, .. } => shared_writes(then, bound) || shared_writes(els, bound),
+                                StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
+                                | StmtKind::Parallel { body, .. } | StmtKind::Lanes { body, .. }
+                                | StmtKind::LoadLoop { body, .. } => shared_writes(body, bound),
+                                _ => false,
+                            })
+                        }
+                        let publication = if shared_writes(body, &self.bound) { Some(TilePlacement::GroupShared) } else { placement };
+                        self.publish(operation, var, BarrierPurpose::Owned, publication)?;
                     }
                     StmtKind::Expr(Expr {
                         kind: ExprKind::Intrinsic { op: name, args },
@@ -1204,6 +1247,12 @@ pub fn plan_selected(
     let mut launches = Vec::new();
     let mut scratch = Vec::new();
     for (phase_index, (root, phase)) in body.iter().zip(phases).enumerate() {
+        // Launch-local allocations and uniformity facts have no physical
+        // existence in the next launch. Retained values are explicit reloads.
+        planner.bound.retain(|variable, _| matches!(vars[*variable].kind, VarKind::Param(_)));
+        planner.uniform.retain(|variable| matches!(vars[*variable].kind, VarKind::Param(_)));
+        planner.uniform_views.retain(|variable| matches!(vars[*variable].kind, VarKind::Param(_)));
+        planner.uniform_atoms.clear();
         planner.split_launch = phase.split.is_some();
         // Ordered launches publish predecessor tensor writes before this phase.
         planner.uniform_tensor_reads = true;
@@ -1248,6 +1297,7 @@ pub fn plan_selected(
                 let producer = launches.len();
                 scratch.push(ScratchAllocation {
                     index: scratch.len(),
+                    parameter: None,
                     phase: phase_index,
                     variable,
                     dtype,

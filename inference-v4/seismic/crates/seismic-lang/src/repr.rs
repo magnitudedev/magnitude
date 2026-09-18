@@ -16,6 +16,12 @@ pub struct Repr {
     pub code: CodeInterpretation,
 }
 
+/// Equivalent source-IR covers for a bounded packet decode owner. Specialized
+/// decoding retains fixed code ranges and word reuse; indexed decoding uses a
+/// bounded element loop with runtime word/bit coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PacketDecoder { Specialized, Indexed }
+
 /// Private packet rows large enough to retain any logical prefix within a
 /// representation group. The same physical plane geometry owns native storage
 /// declarations and raw snapshot copies on every backend.

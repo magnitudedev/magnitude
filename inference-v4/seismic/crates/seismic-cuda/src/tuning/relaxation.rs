@@ -43,7 +43,7 @@ pub(super) fn derive(
     for (phase, implementation) in family.phases.iter().enumerate() {
         let target = &implementation.target;
         // A relaxation must not hide a missing primitive/helper implementation.
-        model::validate_target(
+        match model::validate_target(
             target,
             hardware,
             &model::target_requirements(target),
@@ -51,7 +51,13 @@ pub(super) fn derive(
                 instructions: u64::MAX,
                 operations: usize::MAX,
             },
-        )?;
+        ) {
+            Ok(()) => {}
+            // An unavailable service supplies no bound. Its explicit reason
+            // remains with the terminal analysis when this region is refined.
+            Err(DerivationError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
         let lanes = u64::from(target.domain().lanes_per_item);
         let work_items = target
             .domain()
@@ -159,7 +165,7 @@ fn include(
     }
     .checked_mul(minimum_active)
     .ok_or("CUDA region access size overflow")?;
-    let (mut latency, service) = model::primitive_service(timing, |quantity| {
+    let (mut latency, service) = model::primitive_service::<String>(timing, |quantity| {
         Ok(match quantity {
             Quantity::One | Quantity::IssuedLanes => 1,
             Quantity::ActiveLanes => minimum_active,

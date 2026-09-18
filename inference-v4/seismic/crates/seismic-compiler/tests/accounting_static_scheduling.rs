@@ -72,7 +72,7 @@ fn fixture(program: &ScalarProgram) -> (ScalarHardware, ScalarWorkload) {
                 })
                 .collect(),
         },
-        ScalarWorkload {
+        ScalarWorkload { integer_domains: Vec::new(),
             identity: "two integer scalar operands".into(),
             allocations: vec![Allocation {
                 id: 0,

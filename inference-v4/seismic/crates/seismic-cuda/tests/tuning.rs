@@ -68,6 +68,7 @@ fn executions(
             }
             Preparation::Execution(execution) => out.push((path.clone(), execution)),
             Preparation::Infeasible(_) => {}
+            Preparation::Unresolved(reason) => panic!("fixture needs supported realization: {reason}"),
         }
     }
     let mut out = Vec::new();
@@ -124,7 +125,7 @@ fn profile(executions: &[Execution], device: &seismic_cuda::DeviceInfo) -> model
     }
 }
 fn workload(execution: &Execution) -> workload::ScalarWorkload {
-    workload::ScalarWorkload {
+    workload::ScalarWorkload { integer_domains: Vec::new(),
         identity: "fixed independent bindings".into(),
         allocations: execution
             .program()
@@ -168,7 +169,7 @@ fn select() -> tuner::TunedIr<Vec<Execution>, tuning::Conditions> {
     let expected = executions
         .iter()
         .map(|(_, e)| {
-            let model = backend.analyze(e, &workload, LIMITS).unwrap();
+            let model = backend.analyze(e, &workload, LIMITS).unwrap().into_flat().unwrap();
             let solution = model.solve(100_000).unwrap();
             assert!(solution.is_optimal());
             solution.schedule().completion
@@ -345,16 +346,17 @@ impl tuner::Backend for RetainedBackend {
         alternatives: &selection::Domain,
         indices: std::ops::Range<usize>,
         workload: &workload::ScalarWorkload,
+        limits: workload::DerivationLimits,
     ) -> Result<Option<schedule::Demand>, String> {
-        self.inner.relax(alternatives, indices, workload)
+        self.inner.relax(alternatives, indices, workload, limits)
     }
     fn analyze(
         &self,
         execution: &Self::Execution,
         workload: &workload::ScalarWorkload,
         limits: workload::DerivationLimits,
-    ) -> Result<schedule::Model, workload::DerivationError> {
-        let mut model = self.inner.analyze(execution, workload, limits)?;
+    ) -> Result<schedule::evaluation::Model, workload::DerivationError> {
+        let schedule::evaluation::Model::Flat(mut model) = self.inner.analyze(execution, workload, limits)? else { return Err("flat oracle expected".into()); };
         // A synthetic fully blocking warp: each instruction completes before
         // the next issues. Keep the derived operations/resources intact while
         // making this launch-choice oracle independent of schedule branching.
@@ -366,7 +368,7 @@ impl tuner::Backend for RetainedBackend {
             }
         }
         model.identity.push_str(":blocking-warp-test");
-        Ok(model)
+        Ok(model.into())
     }
     fn materialize(
         &self,
@@ -419,6 +421,7 @@ fn interrupted_two_phase_search_reuses_retained_families_and_finds_exact_optimum
             let solution = backend
                 .analyze(execution, &invocation, LIMITS)
                 .unwrap()
+                .into_flat().unwrap()
                 .solve(100_000)
                 .unwrap();
             assert!(solution.is_optimal());
@@ -521,7 +524,7 @@ fn every_block_interval_relaxes_all_of_its_members() {
     for start in 0..alternatives.len() {
         for end in start + 1..=alternatives.len() {
             let lower = backend
-                .relax(&alternatives, start..end, &invocation)
+                .relax(&alternatives, start..end, &invocation, workload::DerivationLimits { instructions: 100_000, operations: 100_000 })
                 .unwrap()
                 .unwrap()
                 .lower_bound()
@@ -536,6 +539,7 @@ fn every_block_interval_relaxes_all_of_its_members() {
                 let solution = backend
                     .analyze(selected, &invocation, LIMITS)
                     .unwrap()
+                    .into_flat().unwrap()
                     .solve(100_000)
                     .unwrap();
                 assert!(
@@ -553,7 +557,7 @@ fn every_block_interval_relaxes_all_of_its_members() {
     };
     assert_eq!(
         backend
-            .relax(&alternatives, 0..alternatives.len(), &invocation)
+            .relax(&alternatives, 0..alternatives.len(), &invocation, workload::DerivationLimits { instructions: 100_000, operations: 100_000 })
             .unwrap()
             .unwrap()
             .lower_bound()
@@ -563,7 +567,7 @@ fn every_block_interval_relaxes_all_of_its_members() {
 }
 
 #[test]
-fn unsupported_service_aborts_analysis_and_cannot_exclude_a_branch() {
+fn unsupported_service_retains_analysis_and_cannot_exclude_a_branch() {
     let function = lowered(COPY);
     let device = device();
     let executions = executions(&function, &device);
@@ -581,11 +585,12 @@ fn unsupported_service_aborts_analysis_and_cannot_exclude_a_branch() {
         workload: &workload,
         derivation_limits: LIMITS,
     };
-    let error = match tuner::tune(&request, BUDGET) {
-        Err(e) => e,
-        _ => panic!("missing service became a search result"),
+    let tuner::Outcome::Incomplete(progress) = tuner::tune(&request, BUDGET).unwrap() else {
+        panic!("missing service must retain every unproved region");
     };
-    assert!(error.contains("missing CUDA hardware timing"), "{error}");
+    assert!(progress.feasible_upper().is_none());
+    assert_eq!(progress.unresolved().unsupported, executions.len());
+    assert!(progress.unsupported_analyses().all(|(_, reason)| reason.contains("missing CUDA hardware timing")));
 }
 
 #[test]
@@ -694,4 +699,79 @@ fn selected_cuda_execution_runs_without_repreparing_its_ir() {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect::<Vec<_>>();
     assert_eq!(actual, vec![2.0, 3.0]);
+}
+
+#[test]
+fn varying_integer_inputs_preserve_numerical_work_and_retain_unknown_control() {
+    let source = "fn kernel(input: tensor[2] i32, out: tensor[2] f32, position: i32):\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = f32(input[i]) + f32(position)\n    store(y,out[i:i+1])\n";
+    let function = lowered(source);
+    let device = device();
+    let cases = executions(&function, &device);
+    let all = cases.iter().flat_map(|(_, phases)| phases.clone()).collect::<Vec<_>>();
+    let hardware = profile(&all, &device);
+    let mut inputs = workload(&all[0]);
+    inputs.scalars = vec![0; 8];
+    let range = workload::IntegerRange { min: 0, max: 100, stride: 1 };
+    inputs.integer_domains = vec![workload::IntegerDomain {
+        input: workload::IntegerInput::Scalar { slot: 0 }, bytes: 4, signed: true, range,
+    }];
+    for offset in [0, 4] {
+        inputs.integer_domains.push(workload::IntegerDomain {
+            input: workload::IntegerInput::Allocation { allocation: inputs.buffers[0].allocation, offset },
+            bytes: 4, signed: true, range,
+        });
+    }
+    let backend = tuning::Backend::new(&device, &hardware).unwrap();
+    let request = tuner::Request { input: tuner::Input::Lowered(&function), backend: &backend, workload: &inputs, derivation_limits: LIMITS };
+    let tuner::Outcome::Optimal(selected) = tuner::tune(&request, BUDGET).unwrap() else { panic!("integer numerical values do not change PTX work") };
+    assert!(selected.modeled_cost().is_exact());
+
+    let function = lowered("fn kernel(out: tensor[1] i32, position: i32):\n  y = tile[1] i32\n  for i in owned(y):\n    if position == 0: y[i] = 1\n    else: y[i] = 3\n  store(y,out)\n");
+    let cases = executions(&function, &device);
+    let all = cases.iter().flat_map(|(_, phases)| phases.clone()).collect::<Vec<_>>();
+    let hardware = profile(&all, &device);
+    let backend = tuning::Backend::new(&device, &hardware).unwrap();
+    let mut inputs = workload(&all[0]);
+    inputs.scalars = vec![0; 8];
+    inputs.integer_domains = vec![workload::IntegerDomain { input: workload::IntegerInput::Scalar { slot: 0 }, bytes: 4, signed: true, range }];
+    let request = tuner::Request { input: tuner::Input::Lowered(&function), backend: &backend, workload: &inputs, derivation_limits: LIMITS };
+    let tuner::Outcome::Incomplete(progress) = tuner::tune(&request, BUDGET).unwrap() else { panic!("varying predicate cannot use its canonical minimum") };
+    assert!(progress.unresolved().unsupported > 0);
+    assert!(progress.feasible_upper().is_none());
+}
+
+#[test]
+fn ordered_scalar_and_tile_publications_keep_private_invocation_storage() {
+    let source = "fn kernel(out: tensor[2] f32):\n  bias = 3.0\n  saved = tile[2] f32\n  for i in owned(saved): saved[i] = f32(i) + 1.0\n  for i in parallel:\n    y = tile[1] f32\n    for j in owned(y): y[j] = saved[i] + bias\n    store(y,out[i:i+1])\n";
+    let function = lowered(source);
+    let device = device();
+    let cases = executions(&function, &device);
+    let all = cases.iter().flat_map(|(_, phases)| phases.clone()).collect::<Vec<_>>();
+    let hardware = profile(&all, &device);
+    let public = cases.iter().find(|(_, phases)| phases.len() == 1).unwrap().1[0].clone();
+    let mut inputs = workload(&public);
+    // User allocation identities span all u64 values; private identities must
+    // occupy unused space without assuming the public IDs leave an upper tail.
+    inputs.allocations[0].id = u64::MAX;
+    inputs.buffers[0].allocation = u64::MAX;
+    model::derive_sequence(&[public], &hardware, &inputs, LIMITS).unwrap();
+    let parallel = cases.iter().filter(|(_, phases)| phases.len() > 1).collect::<Vec<_>>();
+    assert!(!parallel.is_empty());
+    for (_, phases) in parallel {
+        assert_eq!(phases[0].program().public_buffer_count, 1);
+        assert_eq!(phases[0].program().buffers.len(), 3);
+        assert!(phases.iter().all(|phase| phase.program().buffers == phases[0].program().buffers));
+        let model = model::derive_sequence(phases, &hardware, &inputs, LIMITS).unwrap();
+        assert!(model.unmapped.is_empty());
+        assert!(model.operations.iter().any(|op| op.name.starts_with("phase1:")));
+    }
+}
+
+#[test]
+fn malformed_ir_does_not_become_an_unresolved_cuda_alternative() {
+    let mut function = lowered(COPY);
+    if let seismic_lang::ir::StmtKind::Parallel { vars, .. } = &mut function.body[0].kind {
+        vars.push(usize::MAX);
+    } else { panic!("parallel fixture root") }
+    assert!(tuning::prepare(&function, &device(), &[1]).is_err());
 }

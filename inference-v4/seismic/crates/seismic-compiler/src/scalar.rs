@@ -282,7 +282,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         });
         Ok(ptr)
     }
-    fn shape(&self, shape: &[Sym]) -> Result<Vec<Dimension>, String> {
+    fn shape(&mut self, shape: &[Sym]) -> Result<Vec<Dimension>, String> {
         shape
             .iter()
             .map(|s| {
@@ -292,10 +292,17 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 {
                     return Ok(Dimension::fixed(n));
                 }
-                self.dimensions
+                if let Some(dimension) = self.dimensions
                     .iter()
                     .find_map(|(name, dimension)| (*s == Sym::param(name)).then_some(*dimension))
-                    .ok_or_else(|| format!("runtime tile extent `{s}` has no proven capacity"))
+                { return Ok(dimension); }
+                let (minimum, capacity) = s.eval_interval(&|name| {
+                    self.constants.get(name).map(|&n| (n,n)).or_else(||
+                        self.dimensions.get(name).map(|d| (0,d.capacity)))
+                }).filter(|(minimum, _)| *minimum >= 0)
+                    .ok_or_else(|| format!("runtime tile extent `{s}` has no proven capacity"))?;
+                if minimum == capacity { return Ok(Dimension::fixed(capacity)); }
+                Ok(Dimension { capacity, extent: Some(self.sym(s)?) })
             })
             .collect()
     }

@@ -68,7 +68,7 @@ fn fixture(program: &ScalarProgram) -> (ScalarHardware, ScalarWorkload) {
             })
             .collect(),
     };
-    let workload = ScalarWorkload {
+    let workload = ScalarWorkload { integer_domains: Vec::new(),
         identity: "exact allocation topology; unconstrained external contents".into(),
         allocations: program
             .buffers

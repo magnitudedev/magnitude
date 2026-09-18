@@ -8,7 +8,13 @@ use seismic_realization::dispatch::GroupDispatch;
 use seismic_realization::execution::Multiplicity;
 use std::{collections::HashMap, sync::Arc};
 mod execution;
-pub use execution::{execution, requirements, Hardware, Requirements, Service, Timing, Units};
+mod access;
+mod memory;
+pub use access::AccessPattern;
+pub(crate) use execution::dispatch_demand;
+pub use execution::{execution, structured_execution, requirements, Hardware, Requirements, Service, Timing, Units};
+pub use execution::{invocation_account, invocation_relaxation, InvocationAccount, OperationCount};
+pub(crate) use execution::{include_preserved_demand, relaxed_demand};
 
 #[derive(Clone, Debug)]
 pub struct LaunchStorage {
@@ -230,6 +236,7 @@ mod tests {
     fn scratch(index: usize, producer: usize, consumer: usize) -> ScratchAllocation {
         ScratchAllocation {
             index,
+            parameter: None,
             phase: index,
             variable: index,
             dtype: DType::F32,

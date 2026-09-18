@@ -80,7 +80,7 @@ fn check(
     for tree in if ordered {
         vec![Tree::Ordered]
     } else {
-        vec![Tree::Ordered, Tree::Pairwise, Tree::Explicit]
+        vec![Tree::Ordered, Tree::Pairwise, Tree::Explicit, Tree::SeedThenPairwise]
     } {
         let lowered = lower_selected(
             &p,

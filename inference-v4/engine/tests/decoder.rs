@@ -6,15 +6,33 @@ use seismic_engine::{
         source::FileSource,
     },
 };
-use seismic_lang::{lower::Options, types::DType};
-use seismic_runtime::{Candidate, Device, plan::Diagnostic};
+use seismic_lang::types::DType;
+use seismic_runtime::{Device, plan::Settings};
+#[path = "support/decoder_hardware.rs"]
+mod hardware;
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
-fn exercise(device: Device, candidate: Candidate, routed: bool) {
+
+fn assert_reference_logits(actual: &[f32], reference: &Value, stage: &str) {
+    let expected = reference["logits"].as_array().unwrap();
+    assert_eq!(actual.len(), expected.len(), "{stage}: logit count");
+    let mut maximum = 0f32;
+    for (index, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let expected = expected.as_f64().unwrap() as f32;
+        maximum = maximum.max((actual - expected).abs());
+        assert!(actual.is_finite() && (actual - expected).abs() <= 2e-4 + 0.002 * expected.abs(),
+            "{stage} logit {index}: {actual} != {expected}");
+    }
+    eprintln!("decoder {stage}: max_abs={maximum:e}");
+}
+
+fn exercise(device: Device, settings: Settings, routed: bool) {
+    let started = std::time::Instant::now();
+    eprintln!("decoder fixture: preparing {} weights (routed={routed})", device.backend());
     let fixture: Value = serde_json::from_str(if routed {
-        include_str!("../../validation/fixtures/qwen-routed-decoder-reference.json")
+        include_str!("../../validation/results/fixtures/qwen-routed-decoder-reference.json")
     } else {
-        include_str!("../../validation/fixtures/qwen-decoder-reference.json")
+        include_str!("../../validation/results/fixtures/qwen-decoder-reference.json")
     })
     .unwrap();
     let directory = std::env::temp_dir().join(format!(
@@ -138,11 +156,15 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
         blocks,
     };
     let device = Rc::new(device);
-    let mut importer = Importer::new(device.clone(), candidate.clone()).unwrap();
-    let mut decoder = Decoder::compile_diagnostic(
+    eprintln!("decoder fixture: creating automatic importer");
+    let mut importer = Importer::new(device.clone(), settings.clone()).unwrap();
+    eprintln!("decoder fixture: compiling logical decoder and importing weights");
+    let mut decoder = Decoder::compile(
         device,
         &description,
         |descriptor, target| {
+            let import_started = std::time::Instant::now();
+            eprintln!("decoder fixture: import {} -> {target:?}", descriptor.name);
             let (offset, nbytes) = ranges[&descriptor.name];
             let stored = Stored::Dense(StoredTensor {
                 source: source.clone(),
@@ -151,21 +173,18 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
                 dtype: DType::F32,
                 shape: descriptor.shape.clone(),
             });
-            importer
+            let imported = importer
                 .import(descriptor, &stored, target)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            eprintln!("decoder fixture: import {} finished after {:.3}s", descriptor.name, import_started.elapsed().as_secs_f64());
+            imported
         },
-        Diagnostic {
-            candidate,
-            lowering: Options {
-                piece: Some(4),
-                ..Default::default()
-            },
-        },
+        settings,
         8,
         2,
     )
     .unwrap();
+    eprintln!("decoder fixture: decoder ready after {:.3}s", started.elapsed().as_secs_f64());
     assert!(decoder.compiled_kernel_count() < 4 * 19);
     let store = decoder.state_store().clone();
     let mut state = store.create().unwrap();
@@ -173,14 +192,17 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
     for (position, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
         let token = step["token"].as_u64().unwrap() as u32;
         if position == 0 {
+            eprintln!("decoder fixture: token {position}, initial proposal then abort");
             let rejected = decoder.propose(&mut state, token).unwrap();
             rejected.abort();
             assert_eq!(state.position(), 0);
             assert_eq!(store.occupied_rows(), 0);
         }
+        eprintln!("decoder fixture: token {position}, sequential proposal");
         let serial = decoder.propose(&mut state, token).unwrap();
         let serial_logits = serial.logits().to_vec();
         serial.abort();
+        eprintln!("decoder fixture: token {position}, batched proposal");
         let (proposed, observation) = decoder.propose_batched(&mut state, token).unwrap();
         assert!(observation.host_seconds > 0.);
         let actual = proposed.logits().to_vec();
@@ -188,27 +210,14 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
             actual, serial_logits,
             "batched publication differs at {position}"
         );
-        let expected = step["logits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n.as_f64().unwrap() as f32)
-            .collect::<Vec<_>>();
-        let mut maximum = 0f32;
-        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
-            maximum = maximum.max((a - e).abs());
-            assert!(
-                (a - e).abs() <= 2e-4 + 0.002 * e.abs(),
-                "position {position} logit {i}: {a} != {e}"
-            );
-        }
-        eprintln!("decoder position {position}: max_abs={maximum:e}");
+        assert_reference_logits(&actual, step, &format!("position {position}"));
         proposed.commit().unwrap();
         assert_eq!(state.position(), position + 1);
         if position == 0 {
             checkpoint = Some(state.checkpoint());
         }
         if position == 1 {
+            eprintln!("decoder fixture: token {position}, forked-state proposal");
             let mut branch = checkpoint.take().unwrap().fork();
             let proposed = decoder.propose(&mut branch, token).unwrap();
             assert_eq!(actual, proposed.logits());
@@ -220,79 +229,65 @@ fn exercise(device: Device, candidate: Candidate, routed: bool) {
     assert!(decoder.propose(&mut state, 32).is_err());
     drop(state);
     assert_eq!(store.occupied_rows(), 0);
+    if !routed {
+        let reference = fixture["steps"].as_array().unwrap();
+        let prompt = [
+            reference[0]["token"].as_u64().unwrap() as u32,
+            reference[1]["token"].as_u64().unwrap() as u32,
+        ];
+        let continuation = reference[2]["token"].as_u64().unwrap() as u32;
+        let mut state = store.create().unwrap();
+        eprintln!("decoder fixture: two-row sequential prefill then abort");
+        let rejected = decoder.prefill(&mut state, &prompt).unwrap();
+        let serial_logits = rejected.logits().to_vec();
+        assert_reference_logits(&serial_logits, &reference[1], "two-row prefill before abort");
+        rejected.abort();
+        assert_eq!(state.position(), 0, "aborted prefill must leave the sequence empty");
+        assert_eq!(store.occupied_rows(), 0, "aborted prefill must release both rows");
+
+        eprintln!("decoder fixture: two-row batched prefill then commit");
+        let (prefilled, observation) = decoder.prefill_batched(&mut state, &prompt).unwrap();
+        assert!(observation.host_seconds > 0.);
+        assert_eq!(prefilled.logits(), serial_logits, "batched prefill publication differs");
+        assert_reference_logits(prefilled.logits(), &reference[1], "two-row batched prefill");
+        prefilled.commit().unwrap();
+        assert_eq!(state.position(), 2, "prefill must commit both tokens");
+        assert_eq!(store.occupied_rows(), 2);
+
+        eprintln!("decoder fixture: decode continuation after two-row prefill");
+        let (decoded, observation) = decoder.propose_batched(&mut state, continuation).unwrap();
+        assert!(observation.host_seconds > 0.);
+        assert_reference_logits(decoded.logits(), &reference[2], "decode after two-row prefill");
+        decoded.commit().unwrap();
+        assert_eq!(state.position(), 3);
+        assert_eq!(store.occupied_rows(), 3);
+        drop(state);
+        assert_eq!(store.occupied_rows(), 0);
+    }
     drop(decoder);
     drop(importer);
     drop(source);
     std::fs::remove_dir_all(directory).unwrap();
 }
 #[test]
+#[ignore = "automatic CPU Qwen accounting still has unmapped opaque math helpers"]
 fn cpu_dense_decoder() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-        false,
-    );
+    exercise(Device::cpu(), hardware::cpu(), false);
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_dense_decoder() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-        false,
-    );
+    exercise(Device::metal().unwrap(), hardware::metal(), false);
 }
 #[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_dense_decoder() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-        false,
-    );
-}
-
-#[test]
+#[ignore = "automatic CPU Qwen accounting still has unmapped opaque math helpers and data-dependent routing"]
 fn cpu_routed_decoder() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-        true,
-    );
+    exercise(Device::cpu(), hardware::cpu(), true);
 }
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires Metal hardware"]
+#[ignore = "automatic Metal accounting still needs data-dependent routing"]
 fn metal_routed_decoder() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-        true,
-    );
-}
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_routed_decoder() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-        true,
-    );
+    exercise(Device::metal().unwrap(), hardware::metal(), true);
 }

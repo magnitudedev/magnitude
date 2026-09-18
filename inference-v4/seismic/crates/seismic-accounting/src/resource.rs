@@ -11,6 +11,7 @@ use seismic_lang::types::DType;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     Add,
     Multiply,
@@ -31,6 +32,7 @@ pub enum Operation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Unit {
     Bytes,
     Operations { operation: Operation, dtype: DType },

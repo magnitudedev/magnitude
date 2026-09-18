@@ -43,7 +43,7 @@ fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
 }
 fn exercise(device: Device, candidate: Candidate) {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../validation/fixtures/qwen-routed-reference.json"
+        "../../validation/results/fixtures/qwen-routed-reference.json"
     ))
     .unwrap();
     let program = program().unwrap();

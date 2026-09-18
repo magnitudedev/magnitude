@@ -1,9 +1,10 @@
 //! Lazy traversal of the expansion and producer-materialization space for one specialization.
 //! This is coverage of lowering bodies, not of placement, fusion or native schedules.
-use super::{lower_selected, Options};
+use super::{Options, lower_selected};
 use crate::lowered_ir::{Decision, DecisionRecord, LoweredIr};
 use crate::{program::Program, types::Elem};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct Specialization<'a> {
     pub program: &'a Program,
@@ -19,16 +20,114 @@ pub struct Specialization<'a> {
 /// can compose its backend execution domains in the same decision tree.
 pub enum Expansion {
     Choice(Decision),
+    RetainedChoice(LoweringChoice),
     Lowered {
         function: LoweredIr,
         consumed: usize,
     },
 }
 
+/// The existing lowering stage owns the prepared computation and unresolved
+/// suffix. Refinement replays only that stage, never a second lowering pipeline.
+#[derive(Clone)]
+struct PreparedStage {
+    function: LoweredIr,
+    program: Arc<Program>,
+    phase: super::LoweringStage,
+}
+impl PartialEq for PreparedStage {
+    fn eq(&self, other: &Self) -> bool {
+        self.phase == other.phase
+            && self.function == other.function
+            && self.program.functions == other.program.functions
+            && self.program.lowerings == other.program.lowerings
+            && self.program.signatures == other.program.signatures
+    }
+}
+#[derive(Clone)]
+pub struct LoweringChoice {
+    stage: Arc<PreparedStage>,
+    prefix: Vec<usize>,
+    decision: Decision,
+}
+impl PartialEq for LoweringChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix
+            && self.decision == other.decision
+            && (Arc::ptr_eq(&self.stage, &other.stage) || self.stage == other.stage)
+    }
+}
+impl std::fmt::Debug for LoweringChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoweringChoice")
+            .field("entry", &self.stage.function.name)
+            .field("prefix", &self.prefix)
+            .field("decision", &self.decision)
+            .finish()
+    }
+}
+impl LoweringChoice {
+    pub fn decision(&self) -> &Decision {
+        &self.decision
+    }
+    pub fn prepared(&self) -> &LoweredIr {
+        &self.stage.function
+    }
+    pub fn refine(&self, index: usize) -> Result<Expansion, String> {
+        if self.decision.alternatives.get(index).is_none() {
+            return Err("lowering choice is outside its derived domain".into());
+        }
+        let mut prefix = self.prefix.clone();
+        prefix.push(index);
+        finish(self.stage.clone(), &prefix)
+    }
+}
+
+fn finish(stage: Arc<PreparedStage>, prefix: &[usize]) -> Result<Expansion, String> {
+    let mut function = stage.function.clone();
+    let base = function.decisions.len();
+    let mut consumed = 0;
+    let mut pending = None;
+    let result = super::finish_stage(&mut function, &stage.program, &stage.phase, &mut |domain| {
+        let Some(&index) = prefix.get(consumed) else {
+            pending = Some(domain.clone());
+            return Err("lowering decision is unresolved".into());
+        };
+        let alternative = domain
+            .alternatives
+            .get(index)
+            .ok_or("lowering choice is outside its derived domain")?;
+        consumed += 1;
+        Ok(alternative)
+    });
+    if let Some(decision) = pending {
+        return Ok(Expansion::RetainedChoice(LoweringChoice {
+            stage,
+            prefix: prefix[..consumed].to_vec(),
+            decision,
+        }));
+    }
+    result?;
+    if let Some(phase) = stage.phase.next() {
+        return finish(
+            Arc::new(PreparedStage {
+                function,
+                program: stage.program.clone(),
+                phase,
+            }),
+            &prefix[consumed..],
+        );
+    }
+    Ok(Expansion::Lowered {
+        function,
+        consumed: base + consumed,
+    })
+}
+
 pub fn expand(request: Specialization<'_>, prefix: &[usize]) -> Result<Expansion, String> {
     let mut consumed = 0;
     let mut pending = None;
-    let result = lower_selected(
+    let result = super::prepare_selected(
         request.program,
         request.entry,
         request.backend,
@@ -51,10 +150,15 @@ pub fn expand(request: Specialization<'_>, prefix: &[usize]) -> Result<Expansion
     if let Some(domain) = pending {
         return Ok(Expansion::Choice(domain));
     }
-    Ok(Expansion::Lowered {
-        function: result?,
-        consumed,
-    })
+    let (function, bodies) = result?;
+    finish(
+        Arc::new(PreparedStage {
+            function,
+            program: Arc::new(request.program.clone()),
+            phase: super::LoweringStage::Bodies(bodies),
+        }),
+        &prefix[consumed..],
+    )
 }
 
 #[derive(Debug)]
@@ -102,7 +206,9 @@ impl Iterator for Space<'_> {
             request.options,
             &mut |domain| {
                 let index = prefix.get(steps.len()).copied().unwrap_or(0);
-                let selected = domain.alternatives.get(index)
+                let selected = domain
+                    .alternatives
+                    .get(index)
                     .ok_or("lowering replay index is outside its derived domain")?;
                 steps.push(DecisionRecord {
                     domain: domain.clone(),
@@ -119,7 +225,9 @@ impl Iterator for Space<'_> {
         for depth in (0..steps.len()).rev() {
             let index = prefix.get(depth).copied().unwrap_or(0);
             if index + 1 < steps[depth].domain.alternatives.len() {
-                let mut next = (0..=depth).map(|i| prefix.get(i).copied().unwrap_or(0)).collect::<Vec<_>>();
+                let mut next = (0..=depth)
+                    .map(|i| prefix.get(i).copied().unwrap_or(0))
+                    .collect::<Vec<_>>();
                 next[depth] = index + 1;
                 self.pending = Some(next);
                 break;

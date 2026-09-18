@@ -746,3 +746,115 @@ fn evaluate(x:tensor[5] f32,out:tensor[4] f32):
         );
     }
 }
+
+fn concatenated_remainders(device: Device, candidate: Candidate) {
+    let p = program(r#"
+construct transform[M,N](x:tile[M,N] f32,y:tile[M,N] f32):
+  for i,j in owned(y): y[i,j] = x[i,j] * 2.0 + y[i,j]
+fn evaluate(x:tensor[5,7] f32,out:tensor[5,7] f32):
+  for row,col in parallel:
+    a = load(x[row:row+1,col:col+1])
+    y = tile[1,1] f32
+    bias = f32(row * 7 + col)
+    for i,j in owned(y): y[i,j] = bias
+    transform(a,y)
+    for i,j in owned(y): y[i,j] = y[i,j] + bias * 0.25
+    store(y,out[row:row+1,col:col+1])
+"#, device.backend(), "lower transform: portable\n");
+    let input = (0..35).map(|i| i as f32 * 0.25).collect::<Vec<_>>();
+    let expected = input.iter().enumerate().map(|(i, x)| x * 2.0 + i as f32 * 1.25).collect::<Vec<_>>();
+    let mut aliases = None;
+    for concatenate in [false, true] {
+        let mut domains = None;
+        let ir = lower::lower_selected(&p, "evaluate", device.backend(), &HashMap::new(), &HashMap::new(), &Options::default(), &mut |d| {
+            Ok(match &d.kind {
+                DecisionKind::OutputGroup { calls, .. } => Alternative::OutputWidth(if calls[0].parameter == "M" { 2 } else { 3 }),
+                DecisionKind::OutputRemainders { domains: rectangles } => {
+                    domains = Some(rectangles.clone());
+                    if concatenate { Alternative::Concatenate } else { Alternative::Separate }
+                }
+                _ => d.alternatives.get(0).unwrap(),
+            })
+        }).unwrap();
+        assert_eq!(domains.unwrap().len(), 4);
+        assert_eq!(ir.body.len(), if concatenate { 1 } else { 4 });
+        if let Some(aliases) = &aliases { assert_eq!(&ir.alias_requirements, aliases); }
+        else { aliases = Some(ir.alias_requirements.clone()); }
+        assert_eq!(execute_on(&device, candidate.clone(), &ir, &input, 35), expected);
+        if concatenate {
+            // The source permits exact in-place bindings. Concatenation must
+            // preserve that contract, not invent a blanket no-alias restriction.
+            let mut kernel = device.compile(&ir, candidate.clone()).unwrap();
+            let buffer = device.buffer_from(&input.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+            kernel.execute(&[buffer.clone(), buffer.clone()], &[]).unwrap();
+            let mut bytes = vec![0; 140];
+            buffer.read(&mut bytes).unwrap();
+            let actual = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+#[test]
+fn cpu_concatenated_remainders_preserve_rectangles_and_alias_admission() {
+    concatenated_remainders(Device::cpu(), Candidate::Cpu { loads: LoadStrategy::BorrowProvenReadOnly });
+}
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires Metal hardware"]
+fn metal_concatenated_remainders_preserve_rectangles_and_alias_admission() {
+    concatenated_remainders(Device::metal().unwrap(), Candidate::Metal(Default::default()));
+}
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_concatenated_remainders_preserve_rectangles_and_alias_admission() {
+    concatenated_remainders(Device::cuda(0).unwrap(), Candidate::Cuda {
+        options: seismic_realization::ScalarOptions { dispatch: seismic_realization::Dispatch::ParallelRoot, loads: LoadStrategy::BorrowProvenReadOnly },
+        threads_per_block: 64,
+    });
+}
+
+fn compact_rectangle_epilogues(device: Device, candidate: Candidate) {
+    let p = program(r#"
+construct transform[M,N](x:tile[M,N] f32,y:tile[M,N] f32):
+  for i,j in owned(y): y[i,j] = x[i,j] * 2.0 + y[i,j]
+fn evaluate(x:tensor[5,7] f32,out:tensor[5,7] f32):
+  for row,col in parallel:
+    a = load(x[row:row+1,col:col+1])
+    y = tile[1,1] f32
+    for i,j in owned(y): y[i,j] = f32(row * 7 + col)
+    transform(a,y)
+    for i,j in owned(y): y[i,j] = f32(f16(y[i,j])) + f32(row * 7 + col) * 0.25
+    store(y,out[row:row+1,col:col+1])
+"#, device.backend(), "lower transform: portable\n");
+    let input = (0..35).map(|i| i as f32 * 0.173).collect::<Vec<_>>();
+    let expected = input.iter().enumerate().map(|(i,x)| seismic_lang::numeric::f16_round(x * 2.0 + i as f32) + i as f32 * 0.25).collect::<Vec<_>>();
+    let mut count = 0;
+    let ir = lower::lower_selected(&p, "evaluate", device.backend(), &HashMap::new(), &HashMap::new(), &Options::default(), &mut |d| Ok(match &d.kind {
+        DecisionKind::OutputGroup { calls, .. } => Alternative::OutputWidth(if calls[0].parameter == "M" { 2 } else { 3 }),
+        DecisionKind::GroupEpilogue { .. } => { count += 1; Alternative::GroupEpilogue(seismic_lang::lowered_ir::GroupEpilogue::Serial) },
+        DecisionKind::OutputRemainders { domains } => { assert_eq!(domains.len(), 4); Alternative::Concatenate },
+        _ => d.alternatives.get(0).unwrap(),
+    })).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(execute_on(&device, candidate.clone(), &ir, &input, 35), expected);
+    let mut kernel = device.compile(&ir, candidate).unwrap();
+    let buffer = device.buffer_from(&input.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    kernel.execute(&[buffer.clone(),buffer.clone()], &[]).unwrap();
+    let mut bytes = vec![0;140]; buffer.read(&mut bytes).unwrap();
+    assert_eq!(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), expected);
+}
+#[test]
+fn cpu_compact_rectangle_epilogues_keep_two_axis_tails_and_in_place_publications() {
+    compact_rectangle_epilogues(Device::cpu(), Candidate::Cpu { loads: LoadStrategy::BorrowProvenReadOnly });
+}
+#[test]
+#[cfg(target_os="macos")]
+#[ignore="requires Metal hardware"]
+fn metal_compact_rectangle_epilogues_keep_two_axis_tails_and_in_place_publications() {
+    compact_rectangle_epilogues(Device::metal().unwrap(), Candidate::Metal(Default::default()));
+}
+#[test]
+#[ignore="requires CUDA hardware"]
+fn cuda_compact_rectangle_epilogues_keep_two_axis_tails_and_in_place_publications() {
+    compact_rectangle_epilogues(Device::cuda(0).unwrap(), Candidate::Cuda { options: seismic_realization::ScalarOptions { dispatch: seismic_realization::Dispatch::ParallelRoot, loads: LoadStrategy::BorrowProvenReadOnly }, threads_per_block: 64 });
+}

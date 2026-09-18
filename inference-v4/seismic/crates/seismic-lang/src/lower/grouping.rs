@@ -2,6 +2,7 @@
 //! Geometry and independence come from the same checked maps used by projection;
 //! ordinary tile copies preserve each source seed and publication conversion.
 use super::*;
+mod suffix;
 use crate::ast::AssignOp;
 use crate::composition::View;
 use crate::types::DType;
@@ -101,7 +102,38 @@ pub(super) fn select(
                         })
                         .collect::<Result<Vec<_>, String>>()?;
                     if widths.iter().any(|w| *w > 1) {
-                        result.extend(materialize(&region, body, &widths, vars, s.span)?);
+                        let compact = if let Some(outputs) = suffix::outputs(&region, body) {
+                            let decision = Decision {
+                                kind: DecisionKind::GroupEpilogue { outputs },
+                                alternatives: vec![Alternative::GroupEpilogue(crate::lowered_ir::GroupEpilogue::Unrolled), Alternative::GroupEpilogue(crate::lowered_ir::GroupEpilogue::Serial)].into(),
+                            };
+                            let selected = choose(&decision)?;
+                            if !decision.alternatives.contains(&selected) { return Err("invalid grouped epilogue construction".into()); }
+                            selected == Alternative::GroupEpilogue(crate::lowered_ir::GroupEpilogue::Serial)
+                        } else { false };
+                        let mut grouped = materialize(&region, body, &widths, compact, vars, s.span)?;
+                        if grouped.len() > 1 && concatenated_extent(&grouped).is_some() {
+                            let domains = grouped
+                                .iter()
+                                .map(|s| match &s.kind {
+                                    StmtKind::Parallel { extents, .. } => extents.clone(),
+                                    _ => unreachable!(),
+                                })
+                                .collect();
+                            let decision = Decision {
+                                kind: DecisionKind::OutputRemainders { domains },
+                                alternatives: vec![Alternative::Separate, Alternative::Concatenate]
+                                    .into(),
+                            };
+                            match choose(&decision)? {
+                                Alternative::Separate => {}
+                                Alternative::Concatenate => {
+                                    grouped = vec![concatenate(grouped, vars, s.span)?]
+                                }
+                                _ => return Err("invalid grouped remainder mapping".into()),
+                            }
+                        }
+                        result.extend(grouped);
                         visible.extend(written);
                         continue;
                     }
@@ -649,6 +681,7 @@ fn materialize(
     region: &Region<'_>,
     body: &[Stmt],
     widths: &[i64],
+    compact: bool,
     vars: &mut Vec<Var>,
     span: crate::span::Span,
 ) -> Result<Vec<Stmt>, String> {
@@ -687,7 +720,7 @@ fn materialize(
             group_extents.push(Sym::constant(*count));
             bases.push(Sym::atom(atom).scale(*width).add(&Sym::constant(*offset)));
         }
-        let grouped = rectangle_body(region, body, &factors, &bases, vars, span)?;
+        let grouped = rectangle_body(region, body, &factors, &bases, compact, vars, span)?;
         result.push(Stmt {
             id: None,
             span,
@@ -701,11 +734,109 @@ fn materialize(
     Ok(result)
 }
 
+/// All rectangles come from one already-proved independent source parallel
+/// region. Concatenation changes only their work-item numbering; it does not
+/// establish a new memory independence or alias assumption between source ops.
+fn concatenated_extent(rectangles: &[Stmt]) -> Option<i64> {
+    let total = rectangles.iter().try_fold(0i64, |sum, s| {
+        let StmtKind::Parallel { extents, .. } = &s.kind else {
+            return None;
+        };
+        let count = extents.iter().try_fold(1i64, |product, n| {
+            let n = n.as_constant().filter(|&n| n > 0)?;
+            product.checked_mul(n)
+        })?;
+        sum.checked_add(count)
+    })?;
+    (total <= i64::from(i32::MAX)).then_some(total)
+}
+fn concatenate(
+    rectangles: Vec<Stmt>,
+    vars: &mut Vec<Var>,
+    span: crate::span::Span,
+) -> Result<Stmt, String> {
+    let total = concatenated_extent(&rectangles)
+        .ok_or("grouped remainder domain exceeds index capacity")?;
+    let id = vars.len();
+    let atom = Atom::Param(format!("output_region#{id}"));
+    vars.push(Var {
+        name: format!("output_region_{id}"),
+        ty: Ty::Scalar(DType::I32),
+        span,
+        kind: VarKind::Index(atom.clone()),
+    });
+    let ordinal = Sym::atom(atom);
+    let mut branches = Vec::new();
+    let mut offset = 0;
+    for rectangle in rectangles {
+        let StmtKind::Parallel {
+            vars: coordinates,
+            extents,
+            mut body,
+        } = rectangle.kind
+        else {
+            unreachable!()
+        };
+        let local = ordinal.sub(&Sym::constant(offset));
+        let mut stride = 1i64;
+        for (&coordinate, extent) in coordinates.iter().zip(&extents).rev() {
+            let extent = extent
+                .as_constant()
+                .ok_or("nonconstant grouped rectangle")?;
+            let value = local
+                .quot(&Sym::constant(stride))
+                .rem(&Sym::constant(extent));
+            let VarKind::Index(atom) = &vars[coordinate].kind else {
+                return Err("grouped rectangle has no coordinate identity".into());
+            };
+            crate::widen::replace_index(&mut body, coordinate, atom, &symbol(value, span));
+            stride = stride
+                .checked_mul(extent)
+                .ok_or("grouped rectangle extent overflow")?;
+        }
+        offset = offset
+            .checked_add(stride)
+            .ok_or("grouped remainder extent overflow")?;
+        branches.push((offset, body));
+    }
+    let (_, mut body) = branches.pop().ok_or("empty grouped remainder mapping")?;
+    for (end, then) in branches.into_iter().rev() {
+        body = vec![Stmt {
+            id: None,
+            span,
+            kind: StmtKind::If {
+                cond: Expr {
+                    kind: ExprKind::Binary {
+                        op: crate::ast::BinaryOp::Lt,
+                        lhs: Box::new(variable(id, vars)),
+                        rhs: Box::new(symbol(Sym::constant(end), span)),
+                    },
+                    ty: Ty::Scalar(DType::Bool),
+                    sym: None,
+                    span,
+                },
+                then,
+                els: body,
+            },
+        }];
+    }
+    Ok(Stmt {
+        id: None,
+        span,
+        kind: StmtKind::Parallel {
+            vars: vec![id],
+            extents: vec![Sym::constant(total)],
+            body,
+        },
+    })
+}
+
 fn rectangle_body(
     region: &Region<'_>,
     body: &[Stmt],
     factors: &[i64],
     bases: &[Sym],
+    compact: bool,
     vars: &mut Vec<Var>,
     span: crate::span::Span,
 ) -> Result<Vec<Stmt>, String> {
@@ -722,7 +853,8 @@ fn rectangle_body(
             })
             .collect();
     }
-    let filtered = body
+    let end = if compact { region.calls.last().unwrap().call + 1 } else { body.len() };
+    let filtered = body[..end]
         .iter()
         .enumerate()
         .filter(|(position, _)| !region.removable.contains(position))
@@ -748,6 +880,7 @@ fn rectangle_body(
     // Reuse only an identical reaching snapshot with identical group axes.
     // Checked call writes participate in the version recorded at each use.
     let mut shared = Vec::<(VarId, Option<usize>, Vec<Option<usize>>, Expr)>::new();
+    let mut outputs = Vec::new();
     for call in &region.calls {
         let StmtKind::Expr(Expr {
             kind:
@@ -925,7 +1058,8 @@ fn rectangle_body(
                 span,
             }),
         });
-        for (slot, arguments) in slots.iter().zip(&arguments) {
+        if compact { outputs.push(combined[call.output].clone()); }
+        for (slot, arguments) in slots.iter().zip(&arguments).filter(|_| !compact) {
             let output = &arguments[call.output];
             let mut offset = vec![0; output.ty.shaped().unwrap().shape.len()];
             for (axis, index) in call.axes.iter().zip(slot) {
@@ -945,8 +1079,10 @@ fn rectangle_body(
         }
         cursor = at + 1;
     }
-    for copy in copies {
-        result.extend(copy[cursor..].iter().cloned());
+    if compact {
+        result.extend(suffix::materialize(region, body, &outputs, factors, bases, vars, span)?);
+    } else {
+        for copy in copies { result.extend(copy[cursor..].iter().cloned()); }
     }
     Ok(result)
 }

@@ -6,6 +6,10 @@ use seismic_lang::{
 };
 pub fn sources() -> Vec<SourceFile> {
     let embedded: &[(&str, &str, Scope)] = &[
+        ("lib/kernels/gelu.seismic.portable", include_str!("../lib/kernels/gelu.seismic.portable"), Scope::Portable),
+        ("lib/kernels/layer_norm.seismic.portable", include_str!("../lib/kernels/layer_norm.seismic.portable"), Scope::Portable),
+        ("lib/kernels/linear_bias.seismic.portable", include_str!("../lib/kernels/linear_bias.seismic.portable"), Scope::Portable),
+        ("lib/kernels/sampling.seismic.portable", include_str!("../lib/kernels/sampling.seismic.portable"), Scope::Portable),
         ("lib/kernels/gguf_import.seismic.portable",include_str!("../lib/kernels/gguf_import.seismic.portable"),Scope::Portable),
         (
             "lib/kernels/embedding_row.seismic.portable",

@@ -89,6 +89,28 @@ pub fn lower_selected(
     opts: &Options,
     select: &mut dyn FnMut(&Decision) -> Result<Alternative, String>,
 ) -> Result<LoweredIr, String> {
+    let (mut lowered, bodies) = prepare_selected(program, name, backend, shapes, elements, opts, select)?;
+    let mut stage = LoweringStage::Bodies(bodies);
+    loop {
+        finish_stage(&mut lowered, program, &stage, select)?;
+        let Some(next) = stage.next() else { break; };
+        stage = next;
+    }
+    Ok(lowered)
+}
+
+/// Retained boundary after decomposition, partitioning and producer projection.
+/// Backend bodies and composition refine these same calls and captured facts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_selected(
+    program: &Program,
+    name: &str,
+    backend: &str,
+    shapes: &HashMap<String, i64>,
+    elements: &HashMap<String, Elem>,
+    opts: &Options,
+    select: &mut dyn FnMut(&Decision) -> Result<Alternative, String>,
+) -> Result<(LoweredIr, BodyResolution), String> {
     if opts.piece.is_some_and(|capacity| capacity <= 0) {
         return Err("stream piece capacity must be positive".into());
     }
@@ -162,7 +184,7 @@ pub fn lower_selected(
         .iter()
         .map(|(name, bound)| (name.clone(), subst_sym(bound, &env, &HashMap::new())))
         .collect();
-    let mut selections = std::mem::take(&mut ctx.selections);
+    let selections = std::mem::take(&mut ctx.selections);
     let mut counter = ctx.counter;
     let mut piece_values = std::mem::take(&mut ctx.piece_values);
     let mut domains = std::mem::take(&mut ctx.domains);
@@ -219,37 +241,108 @@ pub fn lower_selected(
             projection::call(program, call, output, view, target, vars)
         },
     )?;
-    let context = Vec::new();
-    let mut ctx = Inliner {
-        program,
-        backend,
-        select: &mut recording,
-        selections: Vec::new(),
+    lowered.selections = selections;
+    drop(recording);
+    lowered.decisions = decisions;
+    crate::verify::lowered(&lowered, crate::verify::Stage::Decomposed)?;
+    Ok((lowered, BodyResolution {
         counter,
-        opts: opts.clone(),
-        piece_values,
+        options: opts.clone(),
         elements: elements.clone(),
-        calls: CallStage::Resolve,
-        partitioning: std::collections::HashSet::new(),
+        piece_values,
         domains,
         view_domains,
+    }))
+}
+
+/// Lexical lowering facts travel with the retained calls. They are the original
+/// inliner's state, not a separately reconstructed interpretation of the source.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BodyResolution {
+    counter: usize,
+    options: Options,
+    elements: HashMap<String, Elem>,
+    piece_values: HashMap<String, Vec<i64>>,
+    domains: HashMap<String, Vec<decomposition::Domain>>,
+    view_domains: HashMap<Sym, (i64, IterationDomain)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LoweringStage {
+    Bodies(BodyResolution),
+    Values,
+    Representations,
+}
+impl LoweringStage {
+    pub(crate) fn next(&self) -> Option<Self> {
+        match self {
+            Self::Bodies(_) => Some(Self::Values),
+            Self::Values => Some(Self::Representations),
+            Self::Representations => None,
+        }
+    }
+}
+
+pub(crate) fn finish_stage(
+    lowered: &mut LoweredIr,
+    program: &Program,
+    stage: &LoweringStage,
+    select: &mut dyn FnMut(&Decision) -> Result<Alternative, String>,
+) -> Result<(), String> {
+    let mut decisions = std::mem::take(&mut lowered.decisions);
+    let mut recording = |domain: &Decision| {
+        let selected = select(domain)?;
+        if !domain.alternatives.contains(&selected) {
+            return Err(format!(
+                "selected alternative {selected:?} is not applicable to {:?}",
+                domain.kind
+            ));
+        }
+        decisions.push(DecisionRecord {
+            domain: domain.clone(),
+            selected: selected.clone(),
+        });
+        Ok(selected)
     };
-    ctx.resolve_calls(&mut lowered.body, &mut lowered.vars, &context)?;
-    selections.extend(std::mem::take(&mut ctx.selections));
-    drop(ctx);
-    lowered.selections = selections;
-    crate::composition::select(
-        &mut lowered,
-        program,
-        &opts.ownership,
-        &mut recording,
-        &mut |call, output, view, target, vars| {
-            projection::call(program, call, output, view, target, vars)
-        },
-    )?;
-    select_producers(&mut lowered.body, &lowered.vars, &mut recording)?;
+    match stage {
+        LoweringStage::Bodies(state) => {
+            let mut ctx = Inliner {
+                program,
+                backend: &lowered.backend,
+                select: &mut recording,
+                selections: Vec::new(),
+                counter: state.counter,
+                opts: state.options.clone(),
+                piece_values: state.piece_values.clone(),
+                elements: state.elements.clone(),
+                calls: CallStage::Resolve,
+                partitioning: std::collections::HashSet::new(),
+                domains: state.domains.clone(),
+                view_domains: state.view_domains.clone(),
+            };
+            ctx.resolve_calls(&mut lowered.body, &mut lowered.vars, &[])?;
+            lowered.selections.extend(ctx.selections);
+        }
+        LoweringStage::Values => {
+            let ownership = lowered.ownership.clone();
+            crate::composition::select(
+                lowered,
+                program,
+                &ownership,
+                &mut recording,
+                &mut |call, output, view, target, vars| {
+                    projection::call(program, call, output, view, target, vars)
+                },
+            )?;
+        }
+        LoweringStage::Representations => {
+            crate::composition::select_representations(lowered, &mut recording)?;
+            select_producers(&mut lowered.body, &lowered.vars, &mut recording)?;
+        }
+    }
     lowered.decisions = decisions;
-    Ok(lowered)
+    crate::verify::lowered(lowered, crate::verify::Stage::Expanded)?;
+    Ok(())
 }
 
 /// A slice cannot exceed its parent axis. Follow that structural bound rather
@@ -502,7 +595,7 @@ impl<'a> Inliner<'a> {
                         shape_args,
                         elem_args,
                         ..
-                    } = &mut reduction.merge.kind
+                    } = &mut reduction.merge.source_mut().unwrap().kind
                     {
                         *shape_args = shape_args
                             .iter()
@@ -536,7 +629,7 @@ impl<'a> Inliner<'a> {
                         shape_args,
                         elem_args,
                         ..
-                    } = &reduction.merge.kind
+                    } = &reduction.merge.source_mut().unwrap().kind
                     else {
                         unreachable!()
                     };
@@ -563,7 +656,7 @@ impl<'a> Inliner<'a> {
                             shape_args,
                             elem_args,
                             ..
-                        } = &mut step.call.kind
+                        } = &mut step.call.source_mut().unwrap().kind
                         {
                             *shape_args = shape_args
                                 .iter()
@@ -614,7 +707,7 @@ impl<'a> Inliner<'a> {
                             shape_args,
                             elem_args,
                             ..
-                        } = &mut step.call.kind
+                        } = &mut step.call.source_mut().unwrap().kind
                         else {
                             unreachable!()
                         };
@@ -1894,72 +1987,66 @@ struct Writes {
     unknown: bool,
 }
 
-/// Extract a value computation, independent of pure scalar temporary spelling.
-/// Only loop-local scalar definitions and one complete output assignment can be
-/// removed together. Any escaping scalar, effect, or other write retains storage.
+/// Extract a straight-line value from the same pure producer normalization
+/// used by sharing. Conditional producers keep their original lazy control;
+/// consumers requiring a single expression do not admit those definitions.
 pub(crate) fn producer_value(
-    body: &[Stmt],
-    output: VarId,
-    vars: &[Var],
-    before: &[Stmt],
-    after: &[Stmt],
+    body: &[Stmt], output: VarId, vars: &[Var], before: &[Stmt], after: &[Stmt],
 ) -> Option<(Expr, Expr)> {
-    let mut scalars = HashMap::new();
-    let mut result = None;
-    for statement in body {
-        let StmtKind::Assign {
-            target,
-            op: crate::ast::AssignOp::Assign,
-            value,
-        } = &statement.kind
-        else {
-            return None;
-        };
-        let value = subst_vars(value, &scalars, &HashMap::new());
-        let substituted_target = subst_vars(target, &scalars, &HashMap::new());
-        if !crate::effects::expression_can_be_omitted(&value)
-            || !crate::effects::expression_can_be_omitted(&substituted_target)
-        {
-            return None;
-        }
-        match &target.kind {
-            ExprKind::Var(v)
-                if matches!(target.ty, Ty::Scalar(_))
-                    && matches!(vars[*v].kind, VarKind::Local) =>
-            {
-                if before
-                    .iter()
-                    .chain(after)
-                    .any(|s| crate::effects::uses(s, *v))
-                {
-                    return None;
+    let (target, definition) = producer_definition(body, output, vars, before, after)?;
+    let [Stmt { kind: StmtKind::Assign { value, .. }, .. }] = definition.as_slice() else { return None; };
+    Some((target, value.clone()))
+}
+
+/// A complete pure point producer, represented by its existing statements.
+/// Scalar temporaries retain their conversions; every conditional path must
+/// assign the same element exactly once. No select expression eagerly evaluates
+/// an unchosen read, and no new semantic graph is introduced.
+pub(crate) fn producer_definition(
+    body: &[Stmt], output: VarId, vars: &[Var], before: &[Stmt], after: &[Stmt],
+) -> Option<(Expr, Vec<Stmt>)> {
+    fn normalize(body: &[Stmt], output: VarId, vars: &[Var], before: &[Stmt], after: &[Stmt], inherited: &HashMap<VarId, Expr>) -> Option<(Expr, Vec<Stmt>)> {
+        let mut scalars = inherited.clone();
+        let mut target_value = None;
+        let mut definition = Vec::new();
+        let canonical = |kind| Stmt { id: None, span: crate::span::Span::default(), kind };
+        for (position, statement) in body.iter().enumerate() {
+            match &statement.kind {
+                StmtKind::Assign { target, op: crate::ast::AssignOp::Assign, value } => {
+                    let value = subst_vars(value, &scalars, &HashMap::new());
+                    let substituted_target = subst_vars(target, &scalars, &HashMap::new());
+                    if !crate::effects::expression_can_be_omitted(&value)
+                        || !crate::effects::expression_can_be_omitted(&substituted_target) { return None; }
+                    match &target.kind {
+                        ExprKind::Var(v) if matches!(target.ty, Ty::Scalar(_)) && matches!(vars[*v].kind, VarKind::Local) => {
+                            if before.iter().chain(after).any(|s| crate::effects::uses(s, *v)) { return None; }
+                            let Ty::Scalar(dtype) = target.ty else { unreachable!() };
+                            scalars.insert(*v, Expr { kind: ExprKind::Cast { dtype, expr: Box::new(value) }, ty: target.ty.clone(), sym: None, span: target.span });
+                        }
+                        ExprKind::Index { base, .. } if matches!(base.kind, ExprKind::Var(v) if v == output) => {
+                            if target_value.is_some() { return None; }
+                            let target = substituted_target;
+                            target_value = Some(target.clone());
+                            definition.push(canonical(StmtKind::Assign { target, op: crate::ast::AssignOp::Assign, value }));
+                        }
+                        _ => return None,
+                    }
                 }
-                let Ty::Scalar(dtype) = target.ty else {
-                    unreachable!()
-                };
-                scalars.insert(
-                    *v,
-                    Expr {
-                        kind: ExprKind::Cast {
-                            dtype,
-                            expr: Box::new(value),
-                        },
-                        ty: target.ty.clone(),
-                        sym: None,
-                        span: target.span,
-                    },
-                );
-            }
-            ExprKind::Index { base, .. } if matches!(base.kind,ExprKind::Var(v) if v==output) => {
-                if result.is_some() {
-                    return None;
+                StmtKind::If { cond, then, els } if target_value.is_none() && position + 1 == body.len() => {
+                    let condition = subst_vars(cond, &scalars, &HashMap::new());
+                    if !crate::effects::expression_can_be_omitted(&condition) { return None; }
+                    let (then_target, then) = normalize(then, output, vars, before, after, &scalars)?;
+                    let (else_target, els) = normalize(els, output, vars, before, after, &scalars)?;
+                    if crate::normalize::value_identity(&then_target) != crate::normalize::value_identity(&else_target) { return None; }
+                    target_value = Some(then_target);
+                    definition.push(canonical(StmtKind::If { cond: condition, then, els }));
                 }
-                result = Some((target.clone(), value));
+                _ => return None,
             }
-            _ => return None,
         }
+        Some((target_value?, definition))
     }
-    result
+    normalize(body, output, vars, before, after, &HashMap::new())
 }
 /// Syntactic effects across nested control flow. Materialized tile values cannot
 /// alias tensor storage, while tensor reads require an alias proof to cross stores.

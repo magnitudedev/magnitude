@@ -219,15 +219,19 @@ impl Device {
         let first = executions[0].program();
         for execution in &executions {
             execution.validate_limits(self.execution_limits())?;
-            if execution.program().buffers != first.buffers
+            if execution.program().public_buffer_count != first.public_buffer_count
+                || execution.program().buffers != first.buffers
                 || execution.program().scalars != first.scalars {
                 return Err("CUDA phases must share the same invocation bindings".into());
             }
         }
+        let public_buffers = first.buffers[..first.public_buffer_count].to_vec();
+        let internal = first.buffers[first.public_buffer_count..].iter()
+            .map(|spec| self.buffer(spec.bytes)).collect::<Result<Vec<_>, _>>()?;
         let phases = executions.into_iter()
             .map(|execution| self.compile_execution(execution))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Sequence { phases })
+        Ok(Sequence { phases, public_buffers, internal })
     }
     /// Compile exactly the execution path's native code without invocation storage.
     pub fn compile_artifacts(
@@ -626,10 +630,14 @@ impl Kernel {
 /// after physical completion. Successful earlier writes may remain after failure.
 pub struct Sequence {
     phases: Vec<Kernel>,
+    public_buffers: Vec<BufferSpec>,
+    /// One invocation-owned publication allocation per retained cross-phase
+    /// value. Every phase receives the same suffix of the pointer table.
+    internal: Vec<Buffer>,
 }
 impl Sequence {
     pub fn buffers(&self) -> &[BufferSpec] {
-        self.phases[0].buffers()
+        &self.public_buffers
     }
     pub fn scalars(&self) -> &[ScalarParameter] {
         self.phases[0].scalars()
@@ -652,9 +660,13 @@ impl Sequence {
         scalars: &[f64],
         timed: bool,
     ) -> Result<Option<f64>, String> {
+        if buffers.len() != self.public_buffers.len() {
+            return Err("CUDA sequence public binding count mismatch".into());
+        }
+        let bindings = buffers.iter().chain(&self.internal).cloned().collect::<Vec<_>>();
         let result = (|| {
             for kernel in &mut self.phases {
-                kernel.bind(buffers, scalars)?;
+                kernel.bind(&bindings, scalars)?;
             }
             let mut seconds = 0.0;
             for (index, kernel) in self.phases.iter_mut().enumerate() {

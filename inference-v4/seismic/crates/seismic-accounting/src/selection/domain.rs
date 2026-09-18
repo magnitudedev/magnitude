@@ -1,6 +1,6 @@
 //! Indexed access to the actual choices owned by lowering and execution.
 //! The optimizer retains the typed owner intact; strings are only display.
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{any::Any, fmt::Debug, sync::{Arc, Weak}};
 
 /// Implemented by the existing choice owner, not by a second decision registry.
 /// Legal alternatives are derived there; search only partitions their indices.
@@ -31,12 +31,19 @@ impl<T: Choices> Erased for T {
 }
 #[derive(Clone, Debug)]
 pub struct Domain(Arc<dyn Erased>);
+/// Historical decisions must not keep an otherwise retired prepared IR alive.
+#[derive(Clone, Debug)]
+pub(super) struct WeakDomain(Weak<dyn Erased>);
+impl WeakDomain {
+    pub(super) fn upgrade(&self) -> Option<Domain> { self.0.upgrade().map(Domain) }
+}
 impl PartialEq for Domain {
     fn eq(&self, other: &Self) -> bool {
         self.0.same(other.0.as_ref())
     }
 }
 impl Domain {
+    pub(super) fn downgrade(&self) -> WeakDomain { WeakDomain(Arc::downgrade(&self.0)) }
     pub fn new<T: Choices>(owner: T) -> Result<Self, String> {
         let domain = Self(Arc::new(owner));
         domain.validate()?;
@@ -123,6 +130,16 @@ impl Choices for seismic_lang::lowered_ir::Decision {
         self.alternatives.get(index)
     }
 }
+
+impl Choices for seismic_lang::lower::alternatives::LoweringChoice {
+    type Alternative = seismic_lang::lowered_ir::Alternative;
+    fn len(&self) -> usize {
+        self.decision().alternatives.len()
+    }
+    fn get(&self, index: usize) -> Option<Self::Alternative> {
+        self.decision().alternatives.get(index)
+    }
+}
 impl Choices for seismic_lang::normalize::loads::Choice {
     type Alternative = seismic_lang::ir::LoadMode;
     fn len(&self) -> usize {
@@ -142,7 +159,34 @@ pub struct Region {
     children: Option<(Domain, std::ops::Range<usize>)>,
     lower_bound: u64,
 }
+/// A completed exclusion keeps indexed coverage and its derived bound. Its
+/// execution owner has no remaining construction or relaxation responsibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExcludedRegion {
+    parent: Vec<usize>,
+    indices: Option<std::ops::Range<usize>>,
+    lower_bound: u64,
+}
+impl ExcludedRegion {
+    pub fn len(&self) -> usize { self.indices.as_ref().map_or(1, |indices| indices.len()) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn lower_bound(&self) -> u64 { self.lower_bound }
+    pub fn paths(&self) -> impl Iterator<Item = Vec<usize>> + '_ {
+        (0..self.len()).map(move |offset| {
+            let mut path = self.parent.clone();
+            if let Some(indices) = &self.indices { path.push(indices.start + offset); }
+            path
+        })
+    }
+}
 impl Region {
+    pub(super) fn exclude(self) -> ExcludedRegion {
+        ExcludedRegion {
+            parent: self.parent,
+            indices: self.children.map(|(_, indices)| indices),
+            lower_bound: self.lower_bound,
+        }
+    }
     pub(super) fn root() -> Self {
         Self {
             parent: Vec::new(),

@@ -15,10 +15,13 @@ Device discovery supplies facts with the meaning guaranteed by its API. It does 
 promote architecture names, thread limits, or storage capacities into a complete
 throughput profile. Hardware/model admission follows [Accounting](accounting.md).
 
-Explicit candidate and diagnostic requests use the same execution construction, resource
-derivation, and validation path as optimized compilation. They can restrict choices
-explicitly but cannot supply an alternative cost model or claim optimality without
-completing selection over the declared form.
+Executable compilation requires completed automatic selection. The public runtime
+accepts only compiler-produced `TunedIr`; it has no candidate, prepared-execution,
+or diagnostic compilation entry point. Every native kernel retains its selection
+artifact and validates the artifact's workload conditions before execution.
+Model compositions and numerical weight imports use the same automatic path.
+Incomplete search returns an error and retained progress; it never yields an
+executable incumbent or a default implementation.
 
 The runtime composition root supplies concrete backend implementations to the compiler
 through shared interfaces. Candidate construction, model derivation, and selection have
@@ -37,9 +40,8 @@ flowchart LR
     X --> D[Completion and status]
 ```
 
-The diagram describes the qualified execution path. Diagnostic compilation may produce
-explicitly unqualified artifacts, but cannot promote them into the qualified path by
-relabeling them.
+This is the only supported executable lifecycle. Internal backend construction and
+compiler analysis are not alternative runtime compilation interfaces.
 
 | Artifact | Retained information |
 | --- | --- |
@@ -93,6 +95,17 @@ Invocation scratch follows the selected allocation and lifetime plan. Aliasing, 
 views, asynchronous work, and cross-launch handoffs prevent premature reuse or
 deallocation.
 
+A device and its cloned handles share one resource domain. An operator may bound
+the domain's charged storage bytes; every retained allocation is charged once,
+and views and completion pins keep that charge live until the final owner releases
+it. Failed allocation and failed preparation unwind tentative charges. Budget
+denial reports typed required and available bytes at the failed allocation, which
+must survive propagation to engine admission. A native allocator failure remains
+a failure unless its API supplies reliable capacity facts. Charged storage bytes
+exclude driver/allocator overhead and are not a measurement of system-wide free
+memory. Engine compositions require weights, scratch, and invocation buffers from
+their owning resource domain.
+
 Submission preserves the selected launch and dependency graph. Fusion, batching, command
 grouping, or overlap introduced by the runtime must either be represented in that
 graph/model or be proven irrelevant to the declared objective and semantics. Runtime
@@ -125,6 +138,47 @@ A hardware, mapping, or analysis update invalidates affected cached results. Reu
 different conditions requires establishing compatibility through the owning analysis.
 Native-code compatibility alone does not establish that cached resource constraints or a
 previous selection remain applicable.
+
+Within a fixed enclosing compilation identity, a completed artifact may serve an
+invocation that establishes all of its workload facts. Additional captured bytes
+and stronger power-of-two alignment do not invalidate an artifact compiled under
+weaker facts. Exact scalar fields, allocation/view geometry and alias relationships
+must still match, and every originally captured byte must be established unchanged.
+The artifact retains its original workload and objective; lookup does not relabel
+it as a newly specialized optimum. Submission continues to validate the original
+conditions. Unfinished search resumption still requires exact input identity.
+
+Bindings may declare finite integer domains for scalar inputs and fields of
+immutable control buffers. Each domain gives a storage width, signedness, inclusive
+range, and stride. Preparation checks the current input and canonically retains
+the domain; it does not retain that invocation's value as a specialization. The
+terminal derivation must establish the same execution model across every admitted
+value, including its bounds checks and transaction geometry. Varying branch
+outcomes, loop counts, or unsupported symbolic accesses remain unresolved.
+Completed selection may then serve any invocation or narrower domain establishing
+the original conditions, without changing its objective or selected artifact.
+Native submission rechecks range and residue, and batched execution rejects writes
+to any allocation whose integer fields condition another invocation. Backends
+without domain analysis reject these requests rather than using canonical minimum
+values as exact data. Domains do not automatically generalize changing sequence
+lengths or claim optimality under a different amount of work.
+CUDA retains affine integer values and allocation-relative addresses over checked
+input domains. Bounds, alignment, branch outcomes and memory dependencies must be
+uniform across the domain. Varying addresses are supported for hardware services
+that do not require sector coverage; sector-dependent services remain unresolved
+until their uniform coverage is established. Unrepresentable address arithmetic,
+varying predicates and varying alias conflicts retain explicit unsupported-analysis
+regions. Canonical domain bytes are never treated as exact inputs. Missing realization or hardware analyses
+likewise retain their choice paths and sound inherited lower bounds, so they can
+only disappear after a bound proves they cannot improve the incumbent.
+
+Ordered GPU phases publish cross-phase scalars and dense tiles into invocation
+storage. These allocations are hidden from the source binding ABI, shared by all
+phases of that invocation, and carry writes through physical phase completion.
+Host compositions query the selected form's domain-analysis capability. A host
+may retain checked exact control bytes on other backends, while still enforcing
+the same input range. This changes analysis precision; it does not execute an
+unfinished selection or attach domain-wide optimality to an exact specialization.
 
 ## Failures and result classification
 

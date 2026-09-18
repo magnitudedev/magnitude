@@ -55,6 +55,32 @@ barriers, scratch handoffs, and ABI support are part of the implementation when
 executed. An opaque library call is not assigned zero cost or treated as a single
 hardware instruction. Its contract must cover its implementation and conditions.
 
+Metal realizes every executable operation, including argmax and invocation scratch
+handoffs, in its typed terminal representation before rendering and accounting.
+Completed programs reject opaque text and verify lexical control and scalar types;
+incomplete hardware analysis remains a separate unresolved accounting result.
+BF16 arithmetic explicitly widens operands to F32 and
+rounds each result back to BF16, including nested arithmetic and math builtins;
+MSL's implicit float result must not erase a source rounding boundary. Integer
+validity helpers become direct operations only when the operand expressions prove
+their checks cannot fail. This local simplification preserves integer wrapping,
+invalid shifts, bounds failures and signed division overflow, and never uses
+native compiler feedback. Lexical loop bounds, dominated branch comparisons and immutable scalar definitions
+can establish those checks; scalar writes are excluded before analyzing any
+iteration, and scope exit discards local facts. Unknown textual implementations
+do not receive this scope analysis. Signed Euclidean division keeps its helper
+unless its operands also prove equivalence to native truncating division. Both
+emitted source and resource derivation consume the same realized expressions.
+Device reads and writes whose addresses are proved inside their binding capacity
+retain their memory operation while shedding only the impossible bounds-failure
+path. Unknown addresses retain the ordinary checked helper.
+These facts do not specialize control predicates using their enclosing context.
+The selected region guards remain in the terminal program: removing them together
+with slice checks produced incorrect native private-packet partial sums during
+qualification, despite the predicates being redundant in the typed computation.
+The underlying native cause remains unresolved; this is a mapping limitation, not
+permission to weaken source bounds or select candidates using native feedback.
+
 ## Backend mechanisms
 
 | Backend | Required execution mechanisms and resource relationships |
@@ -121,6 +147,15 @@ mapping assumptions participate in artifact and qualification identities.
 
 ## Qualification outside selection
 
+Metal's optional native stage observation uses timestamp counters around one
+compute encoder per dispatch. It reports dispatch identity, a capture-relative
+calibrated GPU interval, and the separate command-buffer interval. The diagnostic
+CLI enables it with `run --target metal --profile-kernels`. Instrumented stage
+times are distinct from ordinary submission timing; unavailable counters and
+incomplete captures are errors, never substituted measurements. Binding checks,
+dispatch dependencies, completion and failure status still follow the runtime's
+submission path. Neither selection nor accounting consumes these observations.
+
 Qualification establishes and challenges the implementation mappings and hardware models
 using independently checked semantics, native inspection, architecture contracts, and
 correctly conditioned measurements.
@@ -153,3 +188,10 @@ Tooling must connect suspicious performance or invalid behavior to the originati
 operation, decision, mapping, and resource constraint. It should expose selected
 layouts, communication, checks, launches, and native evidence where available. Users
 must not reverse-engineer hidden emitter policies to write natural kernels.
+
+Metal terminal realization removes typed integer identities and replaces unsigned
+or proven nonnegative division/remainder by literal powers of two with shifts or
+masks. An identity that discards an operand requires the same bounds analysis to
+establish pure, nonfailing evaluation. Floating identities and negative signed
+division are excluded. The realized operations feed both rendering and accounting;
+these are explicit terminal rewrites, not assumptions about a native optimizer.

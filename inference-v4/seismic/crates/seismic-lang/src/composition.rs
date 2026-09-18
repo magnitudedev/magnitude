@@ -1,7 +1,12 @@
 //! Composition from common-IR iteration domains, typed access maps and effects.
 mod producers;
 mod regions;
+mod ranges;
+mod panels;
+mod reductions;
+pub(crate) use reductions::read_only as parameter_read_only;
 mod representations;
+pub(crate) use representations::{select as select_representations, decode_packet_segment, prepare_packet_coefficients, prepare_packet_words};
 use crate::{
     ast::AssignOp,
     ir::*,
@@ -155,8 +160,11 @@ pub(crate) fn select(
         remove_dead_publications(&mut f.body, &private.difference(&reads).copied().collect());
     }
     select_streams(&mut f.body, &mut f.vars, select)?;
+    ranges::select(&mut f.body, &mut f.vars, select)?;
     share_loads(&mut f.body, select)?;
-    representations::select(f, select)?;
+    reductions::select(&mut f.body, &f.vars, select)?;
+    producers::share(f, select)?;
+    panels::select(&mut f.body, &mut f.vars, select)?;
     Ok(())
 }
 fn join_parallel(
@@ -1305,11 +1313,11 @@ fn map_expr(e: &mut Expr, rename: &HashMap<VarId, VarId>, atoms: &[(Atom, Sym)])
     }
     children_mut(e, &mut |e| map_expr(e, rename, atoms));
 }
-fn remap(s: &mut Stmt, rename: &HashMap<VarId, VarId>, atoms: &[(Atom, Sym)]) {
+pub(crate) fn remap(s: &mut Stmt, rename: &HashMap<VarId, VarId>, atoms: &[(Atom, Sym)]) {
     if let StmtKind::Reduction(r) = &mut s.kind {
-        map_expr(&mut r.merge, rename, atoms);
+        if let Some(call) = r.merge.source_mut() { map_expr(call, rename, atoms); }
         if let Some(step) = &mut r.step {
-            map_expr(&mut step.call, rename, atoms);
+            if let Some(call) = step.call.source_mut() { map_expr(call, rename, atoms); }
         }
         for m in r.implementations_mut() {
             for e in m.left.iter_mut().chain(&mut m.right).chain(&mut m.output) {
@@ -1498,5 +1506,21 @@ fn nested_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Vec<Stmt>)) {
             f(els)
         }
         _ => {}
+    }
+}
+
+/// Substitute immutable local values through the existing typed expression and
+/// statement walkers. The replacement contains no binder identities to rename.
+pub(crate) fn substitute_values(body: &mut [Stmt], values: &HashMap<VarId, Expr>) {
+    if values.is_empty() { return; }
+    for statement in body {
+        direct_exprs_mut(statement, &mut |e| *e = crate::lower::subst_vars(e, values, &HashMap::new()));
+        if let StmtKind::Reduction(r) = &mut statement.kind {
+            if let Some(call) = r.merge.source_mut() { *call = crate::lower::subst_vars(call, values, &HashMap::new()); }
+            if let Some(step) = &mut r.step {
+                if let Some(call) = step.call.source_mut() { *call = crate::lower::subst_vars(call, values, &HashMap::new()); }
+            }
+        }
+        nested_mut(statement, &mut |body| substitute_values(body, values));
     }
 }

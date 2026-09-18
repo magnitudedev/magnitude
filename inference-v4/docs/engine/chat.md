@@ -36,6 +36,14 @@ GGML. Token constraints use llguidance with equivalent grammar conversion semant
 Template/parser family support does not imply numerical model-family support.
 Exact prompt counting uses the same preparation path without executing model weights.
 
+The wire boundary rejects unknown fields and unsupported generation policies before
+native preparation. It accepts one completion with temperature zero or one and
+unmodified logits; token-limit aliases must agree. Stop strings are bounded by
+Unicode character count. Named/required tools and JSON response formats are checked
+against effective offered tools. Model identity and rendered context limits come
+from host configuration, not request-controlled capacity fields. Media content must
+reach a supported media preparation path; it cannot silently become text-only input.
+
 ## Streaming
 
 ```text
@@ -50,8 +58,35 @@ published tokens → incremental text → bounded stop filter
 - Stop matching retains bounded lookbehind across chunks.
 - Disconnect releases the receiver and cancels generation without abandoning
   already-submitted work or late preparation results.
+- Native parsers remain host-local. A unique request receiver awaits publication
+  notifications; cancelling an active receive releases its request.
+- Accepted output drains before terminal failure is reported, including after
+  execution-owner teardown. String stops end parsing within the current publication
+  and release remaining output. User stops take precedence over identical template
+  stops; template stops preserve natural completion.
+- SSE frames encode semantic events as JSON with stable tool indices and bounded
+  total bytes. Natural completed tool calls, truncation, cancellation, and failure
+  retain distinct terminal meanings. Usage comes from authoritative engine counts.
+- Completion usage counts accepted generated tokens, including EOS and tokens
+  hidden by string stops. It is not inferred from decoded bytes or emitted text.
+  A host string stop awaits execution-owner acknowledgement before reporting final
+  usage; pending native work stays owned and cannot accept later output. Terminal
+  snapshots retain their counts after owner teardown and output draining.
+- Nonstream assembly consumes the same semantic publications and terminal rules
+  as SSE. It bounds retained content and final encoded bytes, preserves reasoning
+  and append-only tool arguments, and publishes only a terminal response with
+  authoritative usage. Failure and cancellation do not become partial successes.
 
 ## Host boundary and caches
+
+HTTP connections own their pending handler and response stream, including the
+chat session; a detached producer must not outlive a disconnected receiver.
+Connection count, request bytes, body/header wait time, and response bytes are
+bounded by host configuration. Invalid wire data and unsupported policies remain
+distinct client errors; worker unavailability remains a service error. Health
+reports actual execution-owner availability and configured model metadata.
+Shutdown releases connections before joining the execution owner, which retains
+submitted native work until completion.
 
 Immutable tokens, prepared media, options, and symbolic constraint plans cross into
 the execution owner. Tokens and snapshots cross out. Live parsers, processors,

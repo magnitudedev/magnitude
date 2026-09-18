@@ -1,5 +1,5 @@
-//! MSL operations retained by the emitter. Typed nodes render themselves; legacy
-//! text is explicitly unmapped, never reinterpreted as native instructions.
+//! MSL operations shared by emission and accounting. Completed backend programs
+//! contain only typed nodes; opaque diagnostic nodes never enter execution.
 use crate::support::Helper;
 use seismic_lang::{
     ast::{BinaryOp, UnaryOp},
@@ -7,8 +7,16 @@ use seismic_lang::{
     types::DType,
 };
 use std::fmt;
+mod simplify;
+pub(crate) mod synchronize;
+pub(crate) mod helper;
+mod rewrite;
+mod validate;
+pub mod traversal;
+pub mod transfer;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Bool,
     I32,
@@ -68,14 +76,16 @@ impl From<DType> for Type {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Space {
     Private,
     Threadgroup,
     Device,
     Constant,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Primitive {
     Binary {
         operation: BinaryOp,
@@ -93,6 +103,7 @@ pub enum Primitive {
         space: Space,
         ty: Type,
     },
+    VectorRead { space: Space, ty: Type, components: u8 },
     Write {
         space: Space,
         ty: Type,
@@ -131,11 +142,12 @@ pub enum Primitive {
         layouts: [crate::collective::FragmentLayout; 4],
     },
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expression {
     Integer(i64, Type),
     Float(u64, Type),
     Variable(String, Type),
+    VectorElement { name: String, component: u8, ty: Type },
     Parameter {
         name: String,
         ty: Type,
@@ -158,7 +170,7 @@ pub enum Expression {
         space: Space,
         ty: Type,
     },
-    /// Emission remains available, but no model can treat the missing mapping as zero.
+    /// An incomplete diagnostic node, rejected at the completed-program boundary.
     Unmapped(String, Type),
 }
 impl Expression {
@@ -173,7 +185,7 @@ impl Expression {
             | Self::Builtin(_, _, t)
             | Self::Helper(_, _, t)
             | Self::Unmapped(_, t) => *t,
-            Self::Read { ty, .. } | Self::Parameter { ty, .. } => *ty,
+            Self::Read { ty, .. } | Self::Parameter { ty, .. } | Self::VectorElement { ty, .. } => *ty,
             Self::Select(_, a, _) => a.ty(),
             Self::ShortCircuit { .. } => Type::Bool,
             Self::Bitcast(t, _) => *t,
@@ -241,6 +253,7 @@ impl Expression {
                 )
             }
             Self::Variable(n, _) | Self::Unmapped(n, _) => n.clone(),
+            Self::VectorElement { name, component, .. } => format!("{name}[{component}]"),
             Self::Parameter { name, .. } => name.clone(),
             Self::Binary(op, a, b, _) => match op {
                 BinaryOp::And => format!("bool(({a}) & ({b}))"),
@@ -308,6 +321,7 @@ pub enum Statement {
         space: Space,
         ty: Type,
     },
+    VectorRead { name: String, base: String, index: Expression, ty: Type, components: u8 },
     Write {
         name: String,
         index: Expression,
@@ -324,6 +338,7 @@ pub enum Statement {
     },
     If(Expression),
     Else,
+    Scope,
     End,
     ReturnIf(Expression),
     Return(Option<Expression>),
@@ -357,6 +372,9 @@ pub enum Statement {
     Unmapped(String),
 }
 impl Statement {
+    pub(crate) fn realized(self) -> Self {
+        simplify::statement(self)
+    }
     pub fn render(&self) -> String {
         match self {
             Self::Let { name, ty, value } => format!("{} {name} = {value};", ty.metal()),
@@ -378,6 +396,7 @@ impl Statement {
                 ty.metal()
             ),
             Self::Array { name, ty, elements } => format!("{} {name}[{elements}];", ty.metal()),
+            Self::VectorRead { name, base, index, ty, components } => format!("packed_{}{components} {name} = *reinterpret_cast<const device packed_{}{components}*>({base} + ({index}));", ty.metal(), ty.metal()),
             Self::Write {
                 name, index, value, ..
             } => format!("{name}[{index}] = {value};"),
@@ -389,6 +408,7 @@ impl Statement {
                 step,
             } => format!("for (int {name} = {start}; {name} < {end}; {name} += {step}) {{"),
             Self::If(e) => format!("if ({e}) {{"),
+            Self::Scope => "{".into(),
             Self::Else => "} else {".into(),
             Self::End => "}".into(),
             Self::ReturnIf(e) => format!("if ({e}) return;"),
@@ -441,6 +461,14 @@ pub struct Program {
     pub(crate) launches: Vec<Vec<Site>>,
 }
 impl Program {
+    /// A completed backend program must describe every executable operation.
+    /// Missing hardware analysis is a separate accounting result, never opaque text.
+    pub fn validate_typed(&self) -> Result<(), String> {
+        validate::program(self)
+    }
+    pub(crate) fn realize_launch(&mut self, index: usize) {
+        simplify::launch(&mut self.launches[index]);
+    }
     pub fn launches(&self) -> &[Vec<Site>] {
         &self.launches
     }

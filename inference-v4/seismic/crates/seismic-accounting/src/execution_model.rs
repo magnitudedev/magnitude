@@ -488,6 +488,10 @@ struct Memory {
 }
 impl Memory {
     fn new(program: &ScalarProgram, workload: &ScalarWorkload) -> Result<Self, String> {
+        workload.validate()?;
+        if !workload.integer_domains.is_empty() {
+            return Err("scalar accounting does not yet support varying integer input domains".into());
+        }
         if workload.identity.is_empty() {
             return Err("scalar workload requires an identity".into());
         }

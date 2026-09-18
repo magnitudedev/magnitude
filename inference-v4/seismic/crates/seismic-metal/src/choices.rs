@@ -1,6 +1,6 @@
 //! Dependent storage/reduction domains for a fixed execution decomposition.
-//! Preparation suspends at the first unresolved decision. No default policy,
-//! emitted source or native compilation participates in this traversal.
+//! Preparation suspends at the first unresolved decision. No default performance policy,
+//! target-text inspection or native compilation participates in this traversal.
 use crate::{
     execution::{Config, Execution},
     reduction::Algorithm,
@@ -12,6 +12,8 @@ use std::cell::RefCell;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
+    Transfer(crate::terminal::transfer::Choice),
+    Traversal(crate::terminal::traversal::Choice),
     Fold(crate::execution::FoldChoice),
     Load(loads::Choice),
     Storage(crate::storage::StorageDecision),
@@ -20,6 +22,8 @@ pub enum Decision {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alternative {
+    Transfer(u8),
+    Traversal(usize),
     Fold(crate::execution::FoldOwnership),
     Load(LoadMode),
     Storage(TilePlacement),
@@ -34,6 +38,8 @@ impl Choices for Domain {
     type Alternative = Alternative;
     fn len(&self) -> usize {
         match &self.decision {
+            Decision::Transfer(choice) => choice.len(),
+            Decision::Traversal(choice) => choice.len(),
             Decision::Fold(choice) => choice.len(),
             Decision::Load(choice) => choice.modes().len(),
             Decision::Storage(choice) => choice.alternatives.len(),
@@ -43,6 +49,8 @@ impl Choices for Domain {
     }
     fn get(&self, index: usize) -> Option<Alternative> {
         match &self.decision {
+            Decision::Transfer(choice) => choice.get(index).map(Alternative::Transfer),
+            Decision::Traversal(choice) => choice.get(index).map(Alternative::Traversal),
             Decision::Fold(choice) => choice.get(index).map(Alternative::Fold),
             Decision::Load(choice) => choice.modes().get(index).copied().map(Alternative::Load),
             Decision::Storage(choice) => choice
@@ -63,6 +71,8 @@ impl Choices for Domain {
 impl Domain {
     pub fn diagnostic(&self, loads: seismic_realization::LoadStrategy) -> Alternative {
         match &self.decision {
+            Decision::Transfer(_) => Alternative::Transfer(1),
+            Decision::Traversal(_) => Alternative::Traversal(1),
             Decision::Fold(_) => Alternative::Fold(crate::execution::FoldOwnership::Serial),
             Decision::Load(_) => Alternative::Load(match loads {
                 seismic_realization::LoadStrategy::Materialize => LoadMode::Materialize,
@@ -74,11 +84,14 @@ impl Domain {
         }
     }
     pub fn index(&self, alternative: &Alternative) -> Option<usize> {
+        if let (Decision::Traversal(choice), Alternative::Traversal(width)) = (&self.decision, alternative) {
+            return width.checked_sub(1).filter(|&index| index < choice.len());
+        }
         (0..self.len()).find(|&index| self.get(index).as_ref() == Some(alternative))
     }
 }
 pub enum Expansion {
-    Choice(Domain),
+    Choice(ExecutionChoice),
     Execution {
         execution: Execution,
         consumed: usize,
@@ -101,6 +114,106 @@ pub fn expand_with_mappings(
     mappings: Option<&[seismic_realization::dispatch::WorkMapping]>,
     prefix: &[usize],
 ) -> Result<Expansion, String> {
+    if config.max_threadgroup_bytes < 0 {
+        return Err("negative shared-memory capacity".into());
+    }
+    let mut unbounded = config.clone();
+    unbounded.max_threadgroup_bytes = i64::MAX;
+    let stage = crate::execution::prepare_initial(function, unbounded, mappings)?;
+    finish(std::sync::Arc::new(stage), config, 0, prefix)
+}
+
+/// The retained owning stage and only that stage's resolved decision prefix.
+#[derive(Clone)]
+pub struct ExecutionChoice {
+    stage: std::sync::Arc<crate::execution::Stage>,
+    config: Config,
+    base: usize,
+    prefix: Vec<usize>,
+    domain: Domain,
+}
+impl PartialEq for ExecutionChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.base == other.base
+            && self.prefix == other.prefix
+            && self.domain == other.domain
+            && (std::sync::Arc::ptr_eq(&self.stage, &other.stage) || self.stage == other.stage)
+    }
+}
+impl std::fmt::Debug for ExecutionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionChoice")
+            .field("decision", &self.domain.decision)
+            .field("base", &self.base)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+impl Choices for ExecutionChoice {
+    type Alternative = Alternative;
+    fn len(&self) -> usize {
+        self.domain.len()
+    }
+    fn get(&self, index: usize) -> Option<Alternative> {
+        self.domain.get(index)
+    }
+}
+impl ExecutionChoice {
+    pub fn diagnostic(&self, loads: seismic_realization::LoadStrategy) -> Alternative {
+        self.domain.diagnostic(loads)
+    }
+    pub fn index(&self, alternative: &Alternative) -> Option<usize> {
+        self.domain.index(alternative)
+    }
+    pub fn decision(&self) -> &Decision {
+        &self.domain.decision
+    }
+    pub fn prepared(&self) -> &LoweredIr {
+        self.stage.function()
+    }
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+    pub(crate) fn relax(
+        &self,
+        hardware: &crate::model::Hardware,
+        workload: &seismic_accounting::workload::ScalarWorkload,
+        limits: seismic_accounting::workload::DerivationLimits,
+    ) -> Result<Option<seismic_accounting::schedule::Demand>, String> {
+        let maximum = u64::try_from(self.config.max_threads_per_threadgroup)
+            .map_err(|_| "negative Metal thread capacity")?;
+        let launches = self
+            .stage
+            .phases()
+            .iter()
+            .flat_map(|phase| std::iter::once(&phase.dispatch).chain(phase.merge_dispatch.as_ref()))
+            .map(|dispatch| (dispatch.work_items, maximum / dispatch.lanes_per_item));
+        let dispatch = crate::model::dispatch_demand(hardware, launches)?;
+        let Some(account) = self.stage.refinement_account(workload, limits)? else { return Ok(dispatch); };
+        let mut demand = match dispatch {
+            Some(demand) => demand,
+            None => seismic_accounting::schedule::Demand::new(hardware.timebase.clone(), hardware.resources.clone())?,
+        };
+        crate::model::include_preserved_demand(&mut demand, &account, hardware, |primitive| self.stage.preserves(primitive))?;
+        Ok(Some(demand))
+    }
+    pub fn refine(&self, index: usize) -> Result<Expansion, String> {
+        if self.get(index).is_none() {
+            return Err("Metal execution choice is outside its derived domain".into());
+        }
+        let mut prefix = self.prefix.clone();
+        prefix.push(index);
+        finish(self.stage.clone(), self.config.clone(), self.base, &prefix)
+    }
+}
+
+fn finish(
+    mut stage: std::sync::Arc<crate::execution::Stage>,
+    config: Config,
+    mut base: usize,
+    mut prefix: &[usize],
+) -> Result<Expansion, String> {
     struct Replay<'a> {
         prefix: &'a [usize],
         consumed: usize,
@@ -114,6 +227,11 @@ pub fn expand_with_mappings(
                     domain.decision
                 ));
             }
+            // A forced implementation is not a search branch. Its owning plan
+            // still validates and records the only legal implementation.
+            if domain.len() == 1 {
+                return Ok(domain.get(0).unwrap());
+            }
             let Some(index) = self.prefix.get(self.consumed) else {
                 self.pending = Some(domain);
                 return Err("execution preparation suspended at an unresolved decision".into());
@@ -125,82 +243,99 @@ pub fn expand_with_mappings(
             Ok(selected)
         }
     }
-    let replay = RefCell::new(Replay {
-        prefix,
-        consumed: 0,
-        pending: None,
-    });
-    let available = u64::try_from(config.max_threadgroup_bytes)
-        .map_err(|_| "negative shared-memory capacity")?;
-    let mut unbounded_storage = config.clone();
-    // Derive actual arrays first. Capacity exclusion below is explicit evidence,
-    // rather than turning a compiler error string into permission to prune.
-    unbounded_storage.max_threadgroup_bytes = i64::MAX;
-    let result = crate::execution::prepare_with_participants(
-        function,
-        unbounded_storage,
-        mappings,
-        &mut |decision| match replay.borrow_mut().select(Domain {
-            decision: Decision::Fold(decision.clone()),
-        })? {
-            Alternative::Fold(ownership) => Ok(ownership),
-            _ => unreachable!("fold domain contains only ownerships"),
-        },
-        &mut |site, load| {
-            if !load.can_borrow {
-                return Ok(LoadMode::Materialize);
-            }
-            match replay.borrow_mut().select(Domain {
-                decision: Decision::Load(loads::Choice {
-                    site,
-                    variable: load.variable,
-                }),
+    loop {
+        let replay = RefCell::new(Replay {
+            prefix,
+            consumed: 0,
+            pending: None,
+        });
+        let result = crate::execution::advance(
+            &stage,
+            &mut |decision| match replay.borrow_mut().select(Domain {
+                decision: Decision::Fold(decision.clone()),
             })? {
-                Alternative::Load(mode) => Ok(mode),
-                _ => unreachable!("load domain contains only modes"),
-            }
-        },
-        &mut |decision| match replay.borrow_mut().select(Domain {
-            decision: Decision::Storage(decision.clone()),
-        })? {
-            Alternative::Storage(placement) => Ok(placement),
-            _ => unreachable!("storage domain contains only placements"),
-        },
-        &mut |decision| match replay.borrow_mut().select(Domain {
-            decision: Decision::Reduction(decision.clone()),
-        })? {
-            Alternative::Reduction(algorithm) => Ok(algorithm),
-            _ => unreachable!("reduction domain contains only algorithms"),
-        },
-        &mut |decision| {
-            if decision.len() == 1 {
-                return Ok(decision.new_slot);
-            }
-            match replay.borrow_mut().select(Domain {
-                decision: Decision::Allocation(decision.clone()),
+                Alternative::Fold(value) => Ok(value),
+                _ => unreachable!(),
+            },
+            &mut |site, load| {
+                if !load.can_borrow {
+                    return Ok(LoadMode::Materialize);
+                }
+                match replay.borrow_mut().select(Domain {
+                    decision: Decision::Load(loads::Choice {
+                        site,
+                        variable: load.variable,
+                    }),
+                })? {
+                    Alternative::Load(value) => Ok(value),
+                    _ => unreachable!(),
+                }
+            },
+            &mut |decision| match replay.borrow_mut().select(Domain {
+                decision: Decision::Storage(decision.clone()),
             })? {
-                Alternative::Allocation(slot) => Ok(slot),
-                _ => unreachable!("allocation domain contains only backing slots"),
+                Alternative::Storage(value) => Ok(value),
+                _ => unreachable!(),
+            },
+            &mut |decision| match replay.borrow_mut().select(Domain {
+                decision: Decision::Reduction(decision.clone()),
+            })? {
+                Alternative::Reduction(value) => Ok(value),
+                _ => unreachable!(),
+            },
+            &mut |decision| {
+                if decision.len() == 1 {
+                    return Ok(decision.new_slot);
+                }
+                match replay.borrow_mut().select(Domain {
+                    decision: Decision::Allocation(decision.clone()),
+                })? {
+                    Alternative::Allocation(value) => Ok(value),
+                    _ => unreachable!(),
+                }
+            },
+            &mut |choice| match replay.borrow_mut().select(Domain { decision: Decision::Transfer(choice.clone()) })? {
+                Alternative::Transfer(width) => Ok(width), _ => unreachable!(),
+            },
+            &mut |choice| match replay.borrow_mut().select(Domain {
+                decision: Decision::Traversal(choice.clone()),
+            })? {
+                Alternative::Traversal(width) => Ok(width),
+                _ => unreachable!(),
+            },
+        );
+        let replay = replay.into_inner();
+        if let Some(domain) = replay.pending {
+            return Ok(Expansion::Choice(ExecutionChoice {
+                stage,
+                config,
+                base,
+                prefix: prefix[..replay.consumed].to_vec(),
+                domain,
+            }));
+        }
+        base += replay.consumed;
+        prefix = &prefix[replay.consumed..];
+        match result? {
+            crate::execution::Advance::Stage(next) => stage = std::sync::Arc::new(next),
+            crate::execution::Advance::Execution(mut execution) => {
+                let available = u64::try_from(config.max_threadgroup_bytes)
+                    .map_err(|_| "negative shared-memory capacity")?;
+                execution.config = config;
+                for (launch, memory) in execution.memory().launches().iter().enumerate() {
+                    if memory.shared_bytes_per_group > available {
+                        return Ok(Expansion::Infeasible {
+                            launch,
+                            required: memory.shared_bytes_per_group,
+                            available,
+                        });
+                    }
+                }
+                return Ok(Expansion::Execution {
+                    execution,
+                    consumed: base,
+                });
             }
-        },
-    );
-    let replay = replay.into_inner();
-    if let Some(domain) = replay.pending {
-        return Ok(Expansion::Choice(domain));
-    }
-    let mut execution = result?;
-    execution.config = config;
-    for (launch, memory) in execution.memory().launches().iter().enumerate() {
-        if memory.shared_bytes_per_group > available {
-            return Ok(Expansion::Infeasible {
-                launch,
-                required: memory.shared_bytes_per_group,
-                available,
-            });
         }
     }
-    Ok(Expansion::Execution {
-        execution,
-        consumed: replay.consumed,
-    })
 }

@@ -48,6 +48,28 @@ impl GroupingChoices {
     pub fn index(&self, value: u64) -> Option<usize> {
         self.alternatives.binary_search(&value).ok()
     }
+    pub(crate) fn relax(&self, indices: std::ops::Range<usize>, hardware: &crate::model::Hardware, workload: &seismic_accounting::workload::ScalarWorkload, limits: seismic_accounting::workload::DerivationLimits) -> Result<Option<seismic_accounting::schedule::Demand>, String> {
+        if indices.is_empty() || indices.end > self.alternatives.len() { return Err("Metal grouping relaxation needs a nonempty subdomain".into()); }
+        let mut launches = Vec::new();
+        for (launch, dispatch) in self.family.launches.iter().enumerate() {
+            let maximum = if let Some(&selected) = self.selected.get(launch) { selected }
+            else if launch == self.launch { *self.alternatives[indices.clone()].iter().max().unwrap() }
+            else { *self.family.grouping_values(launch)?.last().ok_or("empty Metal grouping domain")? };
+            launches.push((dispatch.work_items, maximum));
+        }
+        let dispatch = crate::model::dispatch_demand(hardware, launches)?;
+        let mut demand = match dispatch {
+            Some(demand) => demand,
+            None => seismic_accounting::schedule::Demand::new(hardware.timebase.clone(), hardware.resources.clone())?,
+        };
+        let account = self.family.execution.relaxation(workload, limits)?;
+        // Regrouping changes launch geometry and shared-array base addresses,
+        // but each logical subgroup still performs the same selected body.
+        // Ignore integer/address/control work and keep the same conservative
+        // mandatory-work predicate used by terminal traversal refinement.
+        crate::model::include_preserved_demand(&mut demand, &account, hardware, crate::terminal::traversal::preserves)?;
+        Ok(Some(demand))
+    }
     /// Apply one original-domain ordinal to this immutable prepared family.
     pub fn refine(&self, index: usize) -> Result<Preparation<Execution>, String> {
         if self.launch != self.selected.len() {
@@ -282,8 +304,15 @@ impl GroupFamily {
     }
 
     fn select_grouping(&self, grouping: Grouping) -> Result<Execution, String> {
+        if self.launches == grouping.launches
+            && u64::try_from(self.execution.config.sg_per_tg).ok() == Some(grouping.items_per_group)
+        {
+            // The validated resource family includes its original geometry.
+            // Selecting it changes no allocation or terminal operation.
+            return Ok(self.execution.clone());
+        }
         let mut execution = self.execution.clone();
-        execution.emission = Default::default();
+        execution.invalidate_terminal();
         execution.config.sg_per_tg =
             i64::try_from(grouping.items_per_group).map_err(|_| "group count overflow")?;
         let mut launches = grouping.launches.into_iter();
@@ -312,7 +341,7 @@ impl GroupFamily {
                     .copied()
                     .ok_or_else(|| "grouping changed an allocation identity".into())
             },
-        )?;
+        )?.with_retained(&execution.retained, &execution.phases)?;
         if execution
             .memory
             .launches()
@@ -326,5 +355,41 @@ impl GroupFamily {
     }
     pub fn execution(&self) -> &Execution {
         &self.execution
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use seismic_accounting::workload::{Allocation, BufferBinding, DerivationLimits, ScalarWorkload};
+    use seismic_lang::{Scope, program::{SourceFile, compile}};
+
+    #[test]
+    fn identity_grouping_shares_emission_and_account_but_changed_geometry_does_not() {
+        let program = compile(&[SourceFile {
+            path: "group-cache.seismic.portable".into(), scope: Scope::Portable,
+            text: "fn evaluate(out: tensor[2] f32):\n  y = tile[2] f32\n  for i in owned(y): y[i] = 3.0\n  store(y,out)\n".into(),
+        }], &[]).unwrap();
+        let function = seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+        let execution = crate::execution::prepare(&function, crate::execution::Config { sg_per_tg: 1, ..Default::default() }).unwrap();
+        let workload = ScalarWorkload {
+            identity: "group-cache".into(), integer_domains: Vec::new(), scalars: Vec::new(),
+            allocations: vec![Allocation { id: 1, bytes: 8, alignment: 4, known_bytes: Default::default() }],
+            buffers: vec![BufferBinding { allocation: 1, offset: 0, bytes: 8 }],
+        };
+        let limits = DerivationLimits { instructions: 100_000, operations: 100_000 };
+        let account = execution.relaxation(&workload, limits).unwrap();
+        assert!(account.is_complete());
+        let family = GroupFamily::derive(execution.clone()).unwrap();
+        let unchanged = family.select(1).unwrap();
+        assert!(Arc::ptr_eq(&execution.terminal, &unchanged.terminal));
+        assert!(std::ptr::eq(crate::msl::prepare_execution(&execution).unwrap(), crate::msl::prepare_execution(&unchanged).unwrap()));
+        assert!(Arc::ptr_eq(&account, &unchanged.relaxation(&workload, limits).unwrap()));
+        let regrouped = family.select(2).unwrap();
+        assert!(!Arc::ptr_eq(&execution.terminal, &regrouped.terminal));
+        assert!(!Arc::ptr_eq(&account, &regrouped.relaxation(&workload, limits).unwrap()));
+        let mut other_workload = workload.clone();
+        other_workload.identity.push_str("-different");
+        assert!(!Arc::ptr_eq(&account, &unchanged.relaxation(&other_workload, limits).unwrap()));
     }
 }

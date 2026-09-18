@@ -37,6 +37,30 @@ impl Demand {
         &self.timebase
     }
 
+    /// Compose mandatory work whose ordering belongs to the execution graph.
+    /// These operations are private to scheduling derivation, not caller scores.
+    pub(super) fn append(&mut self, other: &Self, serial: bool) -> Result<(), String> {
+        if self.timebase != other.timebase || self.resources != other.resources {
+            return Err("incompatible structured demands".into());
+        }
+        let (left, right) = (self.lower_bound()?, other.lower_bound()?);
+        for (destination, source) in self.occupancy.iter_mut().zip(&other.occupancy) {
+            *destination = destination.checked_add(*source).ok_or("structured demand overflow")?;
+        }
+        self.latency = if serial { left.checked_add(right).ok_or("structured dependency overflow")? } else { left.max(right) };
+        Ok(())
+    }
+    pub(super) fn repeat(&mut self, count: u64, serial: bool) -> Result<(), String> {
+        let lower = self.lower_bound()?;
+        for occupancy in &mut self.occupancy {
+            *occupancy = occupancy.checked_mul(u128::from(count)).ok_or("structured demand overflow")?;
+        }
+        self.latency = if serial { lower.checked_mul(count).ok_or("structured dependency overflow")? }
+            else if count == 0 { 0 } else { lower };
+        Ok(())
+    }
+    pub(super) fn require_duration(&mut self, duration: u64) { self.latency = self.latency.max(duration); }
+
     /// The caller derives a necessary instance count from the retained execution
     /// domain. Dropping ordering and unlisted operations weakens the bound. This
     /// cannot be used as a feasible upper or as a claim about native mappings.

@@ -104,6 +104,7 @@ impl Execution {
         self.target == other.target
             && self.dispatch == other.dispatch
             && self.storage == other.storage
+            && self.program.public_buffer_count == other.program.public_buffer_count
             && self.program.buffers == other.program.buffers
             && self.program.scalars == other.program.scalars
             && self.program.conditions == other.program.conditions

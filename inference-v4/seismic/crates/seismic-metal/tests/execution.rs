@@ -120,6 +120,10 @@ fn split_indices_and_phase_dependencies_exist_before_emission() {
     assert_eq!(execution.phases()[1].dispatch.work_items, 2);
     assert!(execution.phases()[1].split.is_none());
     let emitted = emit_execution(&execution).unwrap();
+    emitted.terminal.validate_typed().unwrap();
+    let requirements = seismic_metal::model::requirements(&execution).unwrap();
+    assert!(requirements.unmapped.is_empty(), "{:?}", requirements.unmapped);
+    assert!(requirements.primitives.iter().any(|p| matches!(p, seismic_metal::terminal::Primitive::Write { space: seismic_metal::terminal::Space::Device, .. })));
     assert_eq!(
         emitted
             .launches

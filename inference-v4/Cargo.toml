@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "engine",
+  "templates",
   "seismic-std",
   "seismic/crates/seismic-lang",
   "seismic/crates/seismic-accounting",
@@ -12,7 +13,6 @@ members = [
   "seismic/crates/seismic-realization",
   "seismic/crates/seismic-cuda",
   "seismic/crates/seismic-runtime",
-  "validation/qwen35-poc/harness",
 ]
 
 [workspace.package]
@@ -21,6 +21,7 @@ edition = "2021"
 license = "UNLICENSED"
 
 [workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
 seismic-std = { path = "seismic-std" }
 seismic-lang = { path = "seismic/crates/seismic-lang" }
 seismic-metal = { path = "seismic/crates/seismic-metal" }

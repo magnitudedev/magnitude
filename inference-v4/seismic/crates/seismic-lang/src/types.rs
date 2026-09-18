@@ -4,6 +4,7 @@ use crate::sym::Sym;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum DType {
     F32,
     BF16,

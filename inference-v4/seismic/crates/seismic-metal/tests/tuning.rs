@@ -16,7 +16,7 @@ fn source() -> seismic_lang::lowered_ir::LoweredIr {
     seismic_lang::lower::lower(&p, "evaluate", "metal", &Default::default()).unwrap()
 }
 fn workload() -> ScalarWorkload {
-    ScalarWorkload {
+    ScalarWorkload { integer_domains: Vec::new(),
         identity: "two outputs".into(),
         allocations: vec![Allocation {
             id: 1,
@@ -59,6 +59,102 @@ fn synthetic(keys: Vec<Primitive>) -> Hardware {
                 }],
             })
             .collect(),
+    }
+}
+
+#[test]
+fn structured_launch_derivation_matches_flat_exact_oracle() {
+    let execution = execution::prepare(&source(), Config::default()).unwrap();
+    let mut hardware = synthetic(model::requirements(&execution).unwrap().primitives);
+    hardware.resources[0].capacity = 1;
+    for timing in &mut hardware.timings { for service in &mut timing.services { service.units = Units::PerSubgroup(1); } }
+    let limits = DerivationLimits { instructions: 100_000, operations: 100_000 };
+    let flat = model::execution(&execution, &hardware, &workload(), limits).unwrap();
+    let structured = model::structured_execution(&execution, &hardware, &workload(), limits).unwrap();
+    assert!(structured.unmapped.is_empty(), "{:?}", structured.unmapped);
+    let reference = flat.solve(100_000).unwrap();
+    assert!(reference.is_optimal());
+    let witness = structured.compact_witness().unwrap().unwrap();
+    assert!(witness.is_optimal());
+    assert_eq!(witness.completion(), reference.schedule().completion);
+    let expanded = structured.expand(100_000).unwrap().solve(100_000).unwrap();
+    assert!(expanded.is_optimal());
+    assert_eq!(expanded.schedule().completion, witness.completion());
+}
+#[test]
+fn invariant_dispatch_groups_are_derived_without_enumeration() {
+    for count in [3, 8, 11, 1_000_000_003] {
+        let program = compile(&[SourceFile { path: "groups.seismic.portable".into(), scope: Scope::Portable,
+            text: "fn write[N](out: tensor[N] f32):\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = 3.0\n    store(y, out[row:row+1])\n".into() }], &[]).unwrap();
+        let lowered = seismic_lang::lower::lower(&program, "write", "metal", &std::collections::HashMap::from([("N".into(), count)])).unwrap();
+        let execution = execution::prepare(&lowered, Config::default()).unwrap();
+        let hardware = synthetic(model::requirements(&execution).unwrap().primitives);
+        let mut workload = workload();
+        workload.allocations[0].bytes = count as u64 * 4;
+        workload.buffers[0].bytes = count as u64 * 4;
+        let limits = DerivationLimits { instructions: 1000, operations: 1000 };
+        let structured = model::structured_execution(&execution, &hardware, &workload, limits).unwrap();
+        assert!(structured.unmapped.is_empty(), "{:?}", structured.unmapped);
+        let relaxed = model::invocation_relaxation(&execution, &workload, limits).unwrap();
+        assert!(relaxed.is_complete(), "symbolic dispatch count: {:?}", relaxed.unmapped);
+        assert!(relaxed.visits < 1000);
+        assert_eq!(relaxed.operations.iter().filter(|term| matches!(term.primitive, Primitive::Launch))
+            .map(|term| term.instances).sum::<u64>(), 1);
+        assert_eq!(relaxed.operations.iter().filter(|term| matches!(term.primitive, Primitive::Group))
+            .map(|term| term.instances).sum::<u64>(), execution.phases()[0].dispatch.groups);
+        assert_eq!(relaxed.operations.iter().filter(|term| matches!(term.primitive, Primitive::Write { space: seismic_metal::terminal::Space::Device, .. }))
+            .map(|term| term.instances * term.lanes).sum::<u64>(), count as u64);
+        let grouped = seismic_metal::family::GroupFamily::derive(execution.clone()).unwrap().select(3).unwrap();
+        let grouped_count = model::invocation_relaxation(&grouped, &workload, limits).unwrap();
+        assert!(grouped_count.is_complete(), "partial group count: {:?}", grouped_count.unmapped);
+        assert_eq!(grouped_count.operations.iter().filter(|term| matches!(term.primitive, Primitive::Group))
+            .map(|term| term.instances).sum::<u64>(), (count as u64).div_ceil(3));
+        assert_eq!(grouped_count.operations.iter().filter(|term| matches!(term.primitive, Primitive::Write { space: seismic_metal::terminal::Space::Device, .. }))
+            .map(|term| term.instances * term.lanes).sum::<u64>(), count as u64);
+        if count < 100 {
+            let flat = model::execution(&execution, &hardware, &workload, DerivationLimits { instructions: 1000, operations: 1000 }).unwrap();
+            let expanded = structured.expand(1000).unwrap();
+            let counts = |model: &seismic_accounting::schedule::Model| {
+                let mut counts = std::collections::BTreeMap::new();
+                for op in model.operations.iter().filter(|op| op.latency > 0) {
+                    *counts.entry(format!("{}:{:?}", op.latency, op.reservations)).or_insert(0) += 1;
+                }
+                counts
+            };
+            assert_eq!(counts(&expanded), counts(&flat));
+            assert_eq!(expanded.lower_bound().unwrap(), flat.lower_bound().unwrap());
+            structured.compact_witness().unwrap().unwrap().expand(1000).unwrap();
+            // Both symbolic geometry and any necessary concrete refinement
+            // must preserve the transaction model.
+            let mut transactions = hardware.clone();
+            for timing in &mut transactions.timings {
+                if matches!(timing.primitive, Primitive::Write { space: seismic_metal::terminal::Space::Device, .. }) {
+                    for service in &mut timing.services { service.units = Units::PerTransaction { bytes: 16, units: 1 }; }
+                }
+            }
+            workload.allocations[0].alignment = 16;
+            let concrete = model::execution(&execution, &transactions, &workload, limits).unwrap();
+            let retry = model::structured_execution(&execution, &transactions, &workload, limits).unwrap();
+            assert!(retry.unmapped.is_empty(), "count {count}: {:?}; flat {:?}", retry.unmapped, concrete.unmapped);
+            assert_eq!(counts(&retry.expand(1000).unwrap()), counts(&concrete));
+            if count == 3 {
+                let reference = flat.solve(100_000).unwrap();
+                let candidate = expanded.solve(100_000).unwrap();
+                assert!(reference.is_optimal() && candidate.is_optimal());
+                assert_eq!(candidate.schedule().completion, reference.schedule().completion);
+            }
+        } else {
+            let mut transactions = hardware.clone();
+            for timing in &mut transactions.timings {
+                if matches!(timing.primitive, Primitive::Write { space: seismic_metal::terminal::Space::Device, .. }) {
+                    for service in &mut timing.services { service.units = Units::PerTransaction { bytes: 4, units: 1 }; }
+                }
+            }
+            workload.allocations[0].alignment = 16;
+            let compact = model::structured_execution(&execution, &transactions, &workload, limits).unwrap();
+            assert!(compact.unmapped.is_empty(), "symbolic transactions: {:?}", compact.unmapped);
+            assert!(matches!(model::execution(&execution, &hardware, &workload, limits), Err(seismic_accounting::workload::DerivationError::Exhausted(_))));
+        }
     }
 }
 #[test]
@@ -107,18 +203,18 @@ fn selected_storage_implementations_have_terminal_resource_mappings() {
 }
 #[test]
 fn automatic_choices_cover_typed_decomposition_and_storage_without_source_cost_callbacks() {
-    use seismic_compiler::tuner::Preparation;
+    use seismic_compiler::tuner::{Backend as _, Preparation};
     use seismic_metal::tuning::{self, Capacities, Form};
     let source = source();
     let capacities = Capacities {
         max_threads_per_threadgroup: 64,
         max_threadgroup_bytes: 4096,
     };
-    let mut pending = vec![vec![]];
+    let mut pending = vec![(vec![], Vec::new())];
     let mut executions = Vec::new();
     let mut keys = Vec::new();
     let mut visits = 0;
-    while let Some(path) = pending.pop() {
+    while let Some((path, ancestors)) = pending.pop() {
         visits += 1;
         assert!(visits < 200);
         match tuning::expand(&source, &Form::Automatic, &capacities, &path).unwrap() {
@@ -126,7 +222,27 @@ fn automatic_choices_cover_typed_decomposition_and_storage_without_source_cost_c
                 for i in 0..alternatives.len() {
                     let mut p = path.clone();
                     p.push(i);
-                    pending.push(p);
+                    if let Some(owner) = alternatives.owner::<tuning::DecompositionChoice>() {
+                        assert_eq!(owner.prepared(), &source);
+                        let retained = owner.refine(i).unwrap();
+                        let replayed = tuning::expand(&source, &Form::Automatic, &capacities, &p).unwrap();
+                        match (retained, replayed) {
+                            (Preparation::Choice { name: a, alternatives: x }, Preparation::Choice { name: b, alternatives: y }) => {
+                                assert_eq!(a, b);
+                                assert_eq!(x, y);
+                            }
+                            (Preparation::Execution(a), Preparation::Execution(b)) => {
+                                assert_eq!(a.function(), b.function());
+                                assert_eq!(seismic_metal::msl::emit_execution(&a).unwrap().source,
+                                    seismic_metal::msl::emit_execution(&b).unwrap().source);
+                            }
+                            (Preparation::Infeasible(a), Preparation::Infeasible(b)) => assert_eq!(a, b),
+                            _ => panic!("retained decomposition changed its dependent domain"),
+                        }
+                    }
+                    let mut inherited = ancestors.clone();
+                    inherited.push((alternatives.clone(), i));
+                    pending.push((p, inherited));
                 }
             }
             Preparation::Execution(e) => {
@@ -137,14 +253,20 @@ fn automatic_choices_cover_typed_decomposition_and_storage_without_source_cost_c
                         keys.push(p);
                     }
                 }
-                executions.push(e);
+                executions.push((e, ancestors));
             }
             Preparation::Infeasible(_) => {}
+            Preparation::Unresolved(reason) => panic!("fixture needs supported realization: {reason}"),
         }
     }
     assert!(executions.len() >= 12, "{}", executions.len());
-    let h = synthetic(keys);
-    for e in executions {
+    let mut h = synthetic(keys);
+    h.resources[0].capacity = 1;
+    let backend = tuning::Backend::with_conditions(tuning::Conditions {
+        target: "conditional decomposition fixture".into(), capacities,
+        form: Form::Automatic, hardware: h.clone(),
+    }).unwrap();
+    for (e, ancestors) in executions {
         let m = model::execution(
             &e,
             &h,
@@ -156,6 +278,13 @@ fn automatic_choices_cover_typed_decomposition_and_storage_without_source_cost_c
         )
         .unwrap();
         assert!(m.unmapped.is_empty(), "{:?}", m.unmapped);
+        for (domain, index) in ancestors {
+            if let Some(demand) = backend.relax(&domain, index..index + 1, &workload(),
+                DerivationLimits { instructions: 100000, operations: 100000 }).unwrap() {
+                assert!(demand.lower_bound().unwrap() <= m.lower_bound().unwrap(),
+                    "retained family bound exceeds member's complete resource floor: {domain:?}");
+            }
+        }
     }
 }
 
@@ -617,6 +746,16 @@ fn native_integer_wrapping_and_partial_lane_rounds() {
 #[test]
 #[ignore = "requires Metal hardware"]
 fn native_selected_fold_participants_preserve_fma_segments_and_bound_storage() {
+    participant_fold_correspondence(false);
+}
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Metal hardware"]
+fn native_seed_root_fold_preserves_selected_tree_and_bound_storage() {
+    participant_fold_correspondence(true);
+}
+#[cfg(target_os = "macos")]
+fn participant_fold_correspondence(root_seed: bool) {
     use seismic_lang::{
         lowered_ir::{Alternative, DecisionKind},
         reduction::structured::Tree,
@@ -637,6 +776,8 @@ fn evaluate(a:tensor[67,3] f32,b:tensor[67,3] f32,out:tensor[3] f32):
   reduce((ta,tb),0,merge,into=(state,),step=accumulate,identity=(zero,),ordered=false)
   store(state,out)
 "#;
+    let n = if root_seed { 64 } else { 67 };
+    let text = text.replace("67", &n.to_string());
     let p = compile(
         &[SourceFile {
             path: "participant_fold.seismic.portable".into(),
@@ -647,133 +788,190 @@ fn evaluate(a:tensor[67,3] f32,b:tensor[67,3] f32,out:tensor[3] f32):
     )
     .unwrap();
     let device = seismic_metal::runtime::Device::open().unwrap();
+    let values = (0..n * 3)
+        .map(|i| match (i / 3) % 4 {
+            0 => 1.0e20_f32,
+            1 => [1.0, 0.25, 3.0][i % 3],
+            2 => -1.0e20_f32,
+            _ => [-0.5, 4.0, 0.125][i % 3],
+        })
+        .collect::<Vec<_>>();
     let a = device
         .buffer_from(
-            &(0..201)
-                .flat_map(|i| (i as f32).to_le_bytes())
+            &values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         )
         .unwrap();
     let b = device
         .buffer_from(
-            &[2.0f32; 201]
+            &vec![2.0f32; n * 3]
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-    for tree in [Tree::Pairwise, Tree::Explicit] {
-        for segment in [3, 7, 17, 67] {
-            let f = seismic_lang::lower::lower_selected(
-                &p,
-                "evaluate",
-                "metal",
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-                &mut |d| {
-                    Ok(match d.kind {
-                        DecisionKind::Reduction { .. } => Alternative::ReductionTree(tree),
-                        DecisionKind::ReductionSegments { .. } => {
-                            Alternative::ReductionSegment(segment)
-                        }
-                        _ => d.alternatives.get(0).unwrap(),
-                    })
-                },
-            )
-            .unwrap();
-            let first = seismic_metal::choices::expand(&f, Config::default(), &[]).unwrap();
-            assert!(matches!(
-                first,
-                seismic_metal::choices::Expansion::Choice(seismic_metal::choices::Domain {
-                    decision: seismic_metal::choices::Decision::Fold(_)
-                })
-            ));
-            let selected = prepare_with_participants(
-                &f,
-                Config::default(),
-                None,
-                &mut |_| Ok(FoldOwnership::Participants),
-                &mut |_, site| {
-                    Ok(if site.can_borrow {
-                        seismic_lang::ir::LoadMode::Borrow
-                    } else {
-                        seismic_lang::ir::LoadMode::Materialize
-                    })
-                },
-                &mut |s| Ok(s.diagnostic()),
-                &mut |r| Ok(r.diagnostic()),
-                &mut |a| Ok(a.alternatives[0]),
-            )
-            .unwrap();
-            let requirements = model::requirements(&selected).unwrap();
-            assert!(
-                requirements.unmapped.is_empty(),
-                "{tree:?}/{segment}: {:?}",
-                requirements.unmapped
-            );
-            assert!(
-                selected.memory().launches()[0]
-                    .arrays
-                    .iter()
-                    .all(|a| a.declaration.capacity <= 3),
-                "logical input/leaves must stay unmaterialized"
-            );
-            let emitted = seismic_metal::msl::emit_execution(&selected).unwrap();
-            assert!(emitted.source.contains("simd_shuffle"));
-            let hardware = synthetic(requirements.primitives);
-            let workload = ScalarWorkload {
-                identity: "participant fold".into(),
-                allocations: [(1, 804), (2, 804), (3, 12)]
-                    .into_iter()
-                    .map(|(id, bytes)| Allocation {
-                        id,
-                        bytes,
-                        alignment: 4,
-                        known_bytes: Default::default(),
-                    })
-                    .collect(),
-                buffers: [(1, 804), (2, 804), (3, 12)]
-                    .into_iter()
-                    .map(|(allocation, bytes)| BufferBinding {
-                        allocation,
-                        offset: 0,
-                        bytes,
-                    })
-                    .collect(),
-                scalars: vec![],
-            };
-            let modeled = model::execution(
-                &selected,
-                &hardware,
-                &workload,
-                DerivationLimits {
-                    instructions: 2_000_000,
-                    operations: 2_000_000,
-                },
-            )
-            .unwrap();
-            assert!(
-                modeled.unmapped.is_empty(),
-                "{tree:?}/{segment}: {:?}",
-                modeled.unmapped
-            );
-            let kernel = device.compile(emitted).unwrap();
-            let out = device.buffer(12).unwrap();
-            device.run(&kernel, &[&a, &b, &out], &[], 1).unwrap();
-            let actual = out
-                .read(12)
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            let expected = (0..3)
-                .map(|column| {
-                    10.0 + (0..67)
-                        .map(|row| 2.0 * ((row * 3 + column) as f32))
-                        .sum::<f32>()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(actual, expected, "{tree:?}/{segment}");
+    let ownerships = if root_seed {
+        vec![FoldOwnership::ParticipantsRootSeed, FoldOwnership::ParticipantsWavefrontRootSeed]
+    } else {
+        vec![FoldOwnership::Participants, FoldOwnership::ParticipantsInsertSeed,
+            FoldOwnership::ParticipantsWavefront, FoldOwnership::ParticipantsWavefrontInsertSeed]
+    };
+    let trees = if root_seed { vec![Tree::SeedThenPairwise] } else { vec![Tree::Pairwise, Tree::Explicit] };
+    for ownership in ownerships {
+        for &tree in &trees {
+            if tree == Tree::Explicit && matches!(ownership, FoldOwnership::ParticipantsWavefront | FoldOwnership::ParticipantsWavefrontInsertSeed) { continue; }
+            for segment in [1, 2, 3, 7, 17, n as i64] {
+                let f = seismic_lang::lower::lower_selected(
+                    &p,
+                    "evaluate",
+                    "metal",
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                    &mut |d| {
+                        Ok(match d.kind {
+                            DecisionKind::Reduction { .. } => Alternative::ReductionTree(tree),
+                            DecisionKind::ReductionSegments { .. } => {
+                                Alternative::ReductionSegment(segment)
+                            }
+                            _ => d.alternatives.get(0).unwrap(),
+                        })
+                    },
+                )
+                .unwrap();
+                let first = seismic_metal::choices::expand(&f, Config::default(), &[]).unwrap();
+                assert!(matches!(
+                    first,
+                    seismic_metal::choices::Expansion::Choice(choice) if matches!(choice.decision(), seismic_metal::choices::Decision::Fold(_))
+                ));
+                let selected = prepare_with_participants(
+                    &f,
+                    Config::default(),
+                    None,
+                    &mut |_| Ok(ownership),
+                    &mut |_, site| {
+                        Ok(if site.can_borrow {
+                            seismic_lang::ir::LoadMode::Borrow
+                        } else {
+                            seismic_lang::ir::LoadMode::Materialize
+                        })
+                    },
+                    &mut |s| Ok(s.diagnostic()),
+                    &mut |r| Ok(r.diagnostic()),
+                    &mut |a| Ok(a.alternatives[0]),
+                )
+                .unwrap();
+                let requirements = model::requirements(&selected).unwrap();
+                assert!(
+                    requirements.unmapped.is_empty(),
+                    "{tree:?}/{segment}: {:?}",
+                    requirements.unmapped
+                );
+                assert!(
+                    selected.memory().launches()[0]
+                        .arrays
+                        .iter()
+                        .all(|a| a.declaration.capacity
+                            <= 3 * (((n as u64).div_ceil(segment as u64) + u64::from(!root_seed)).div_ceil(32))),
+                    "private state must scale with leaves per lane, not total leaves"
+                );
+                let emitted = seismic_metal::msl::emit_execution(&selected).unwrap();
+                assert!(emitted.source.contains("simd_shuffle"));
+                let hardware = synthetic(requirements.primitives);
+                let workload = ScalarWorkload { integer_domains: Vec::new(),
+                    identity: "participant fold".into(),
+                    allocations: [(1, (n * 12) as u64), (2, (n * 12) as u64), (3, 12)]
+                        .into_iter()
+                        .map(|(id, bytes)| Allocation {
+                            id,
+                            bytes,
+                            alignment: 4,
+                            known_bytes: Default::default(),
+                        })
+                        .collect(),
+                    buffers: [(1, (n * 12) as u64), (2, (n * 12) as u64), (3, 12)]
+                        .into_iter()
+                        .map(|(allocation, bytes)| BufferBinding {
+                            allocation,
+                            offset: 0,
+                            bytes,
+                        })
+                        .collect(),
+                    scalars: vec![],
+                };
+                let modeled = model::execution(
+                    &selected,
+                    &hardware,
+                    &workload,
+                    DerivationLimits {
+                        instructions: 2_000_000,
+                        operations: 2_000_000,
+                    },
+                )
+                .unwrap();
+                assert!(
+                    modeled.unmapped.is_empty(),
+                    "{tree:?}/{segment}: {:?}",
+                    modeled.unmapped
+                );
+                let kernel = device.compile(emitted).unwrap();
+                let out = device.buffer(12).unwrap();
+                device.run(&kernel, &[&a, &b, &out], &[], 1).unwrap();
+                let actual = out
+                    .read(12)
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                // Evaluate the same selected tree independently. Cancellation makes
+                // changing a child order or adding padded identity leaves observable.
+                let reference = seismic_lang::program::Program {
+                    functions: vec![seismic_lang::ir::Function {
+                        name: f.name.clone(),
+                        is_construct: false,
+                        shape_params: vec![],
+                        elem_params: vec![],
+                        params: f.params.clone(),
+                        index_params: f.index_params.clone(),
+                        vars: f.vars.clone(),
+                        body: f.body.clone(),
+                    }],
+                    lowerings: vec![],
+                    signatures: Default::default(),
+                };
+                let mut interpreter = seismic_lang::interp::Interpreter::new(&reference);
+                let x = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![n, 3],
+                    values.iter().map(|&v| f64::from(v)).collect(),
+                ));
+                let y = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![n, 3],
+                    vec![2.0; n * 3],
+                ));
+                let z = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![3],
+                    vec![0.0; 3],
+                ));
+                interpreter
+                    .run(
+                        "evaluate",
+                        &[
+                            seismic_lang::interp::Arg::Tensor(x),
+                            seismic_lang::interp::Arg::Tensor(y),
+                            seismic_lang::interp::Arg::Tensor(z),
+                        ],
+                        &Default::default(),
+                    )
+                    .unwrap();
+                let expected = (0..3)
+                    .map(|i| interpreter.tensors[z].get(i) as f32)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{ownership:?}/{tree:?}/{segment}");
+            }
         }
     }
 }
@@ -848,7 +1046,7 @@ lower product(a:tile[8,8] f32,b:tile[8,8] f32,c:tile[8,8] f32):
                 .iter()
                 .any(|p| matches!(p, Primitive::MatrixMultiplyAccumulate { .. }))
         );
-        let workload = ScalarWorkload {
+        let workload = ScalarWorkload { integer_domains: Vec::new(),
             identity: "8x8 source matrix operation".into(),
             allocations: (1..=3)
                 .map(|id| Allocation {
@@ -937,4 +1135,83 @@ fn construction_limits_are_typed_separately_from_analysis_errors() {
         };
         assert_eq!(error, DerivationError::Exhausted(expected));
     }
+}
+
+#[test]
+fn compact_terminal_counts_match_schedule_operations_and_preserve_incompleteness() {
+    let f = source();
+    for placement in [
+        seismic_realization::dispatch::TilePlacement::Replicated,
+        seismic_realization::dispatch::TilePlacement::Distributed,
+        seismic_realization::dispatch::TilePlacement::GroupShared,
+    ] {
+        let e = execution::prepare_storage_selected(&f, Config::default(), &mut |_| Ok(placement.clone())).unwrap();
+        let mut h = synthetic(model::requirements(&e).unwrap().primitives);
+        h.resources.push(Resource { name: "subgroup issue".into(), capacity: 4, unit: CapacityUnit::Slots });
+        for timing in &mut h.timings {
+            timing.services.push(Service { resource: 1, offset: 0, duration: 1, units: Units::PerSubgroup(1) });
+        }
+        let limits = DerivationLimits { instructions: 100_000, operations: 100_000 };
+        let schedule = model::execution(&e, &h, &workload(), limits).unwrap();
+        let counts = model::invocation_account(&e, &workload(), limits).unwrap();
+        assert!(counts.is_complete(), "{:?}", counts.unmapped);
+        let instances: u64 = counts.operations.iter().map(|t| t.instances).sum();
+        let lanes: u64 = counts.operations.iter().map(|t| t.instances * t.lanes).sum();
+        let service = |resource| schedule.operations.iter().flat_map(|op| &op.reservations)
+            .filter(|r| r.resource == resource).map(|r| r.units * r.duration).sum::<u64>();
+        assert_eq!(instances, service(1));
+        assert_eq!(lanes, service(0));
+        assert_eq!(counts.visits, instances);
+        assert!(counts.operations.len() < schedule.operations.len());
+        let demand = counts.demand(&h).unwrap().unwrap();
+        assert_eq!(demand.lower_bound().unwrap(), lanes.div_ceil(1024).max(instances.div_ceil(4)).max(1));
+        assert!(demand.lower_bound().unwrap() <= schedule.lower_bound().unwrap());
+        let partial = model::invocation_account(&e, &workload(), DerivationLimits { instructions: 2, operations: 100_000 }).unwrap();
+        assert_eq!(partial.exhausted, Some(seismic_accounting::workload::DerivationLimit::Instructions(2)));
+        assert!(!partial.is_complete());
+        assert!(partial.demand(&h).unwrap().is_none());
+        let bounded = model::invocation_account(&e, &workload(), DerivationLimits { instructions: 100_000, operations: 1 }).unwrap();
+        assert_eq!(bounded.exhausted, Some(seismic_accounting::workload::DerivationLimit::Operations(1)));
+        assert_eq!(bounded.operations.len(), 1);
+        h.timings.clear();
+        assert!(counts.demand(&h).unwrap().is_none());
+    }
+}
+
+#[test]
+fn indirect_gather_domains_preserve_guard_and_transaction_geometry() {
+    use seismic_accounting::workload::{IntegerDomain, IntegerInput, IntegerRange};
+    let program = compile(&[SourceFile { path: "indirect-domain.seismic.portable".into(), scope: Scope::Portable,
+        text: "fn gather(table: tensor[16, 8] f32, token: tensor[1] i32, out: tensor[8] f32):\n  x = load(table[token[0]])\n  store(x, out)\n".into() }], &[]).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "gather", "metal", &Default::default()).unwrap();
+    let execution = execution::prepare(&lowered, Config::default()).unwrap();
+    let mut hardware = synthetic(model::requirements(&execution).unwrap().primitives);
+    for timing in &mut hardware.timings {
+        if matches!(timing.primitive, Primitive::Read { space: seismic_metal::terminal::Space::Device, .. } | Primitive::Write { space: seismic_metal::terminal::Space::Device, .. }) {
+            for service in &mut timing.services { service.units = Units::PerTransaction { bytes: 4, units: 1 }; }
+        }
+    }
+    let sizes = [512, 4, 32];
+    let workload = ScalarWorkload { identity: "varying indirect row".into(),
+        allocations: sizes.iter().enumerate().map(|(id, &bytes)| Allocation { id: id as u64, bytes, alignment: 256, known_bytes: Default::default() }).collect(),
+        buffers: sizes.iter().enumerate().map(|(id, &bytes)| BufferBinding { allocation: id as u64, offset: 0, bytes }).collect(),
+        scalars: vec![], integer_domains: vec![IntegerDomain { input: IntegerInput::Allocation { allocation: 1, offset: 0 }, bytes: 4, signed: true,
+            range: IntegerRange { min: 0, max: 15, stride: 1 } }] };
+    let limits = DerivationLimits { instructions: 100_000, operations: 10_000 };
+    let domain = model::structured_execution(&execution, &hardware, &workload, limits).unwrap();
+    assert!(domain.unmapped.is_empty(), "{:?}", domain.unmapped);
+    let normalized = |model: &seismic_accounting::schedule::Model| {
+        model.operations.iter().filter(|op| op.latency > 0).map(|op| (op.latency, op.reservations.clone())).collect::<Vec<_>>()
+    };
+    for token in [0i32, 3, 15] {
+        let mut exact = workload.clone();
+        exact.integer_domains.clear();
+        exact.allocations[1].known_bytes = token.to_le_bytes().into_iter().enumerate().map(|(i, byte)| (i as u64, byte)).collect();
+        let exact = model::structured_execution(&execution, &hardware, &exact, limits).unwrap();
+        assert!(exact.unmapped.is_empty(), "{:?}", exact.unmapped);
+        assert_eq!(normalized(&domain.expand(10_000).unwrap()), normalized(&exact.expand(10_000).unwrap()));
+    }
+    let mut invalid = workload;
+    invalid.integer_domains[0].range.max = 16;
+    assert!(!model::structured_execution(&execution, &hardware, &invalid, limits).unwrap().unmapped.is_empty());
 }

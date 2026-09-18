@@ -2,7 +2,7 @@ use seismic_accounting::selection::{Choices, IntegerRange};
 use seismic_compiler::tuner::Preparation;
 use seismic_cuda::{
     DeviceInfo,
-    tuning::{self, BlockChoice, DispatchChoice, FoldChoice},
+    tuning::{self, BlockChoice, DispatchChoice, FoldChoice, FoldImplementation},
 };
 use seismic_lang::{
     Scope,
@@ -75,19 +75,27 @@ fn device() -> DeviceInfo {
     }
 }
 fn prepare(f: &LoweredIr, device: &DeviceInfo) -> Vec<seismic_cuda::execution::Execution> {
+    prepare_ownership(f, device, FoldImplementation::Subgroup)
+}
+fn prepare_ownership(
+    f: &LoweredIr,
+    device: &DeviceInfo,
+    ownership: FoldImplementation,
+) -> Vec<seismic_cuda::execution::Execution> {
     let mut path = vec![];
     loop {
         match tuning::prepare(f, device, &path).unwrap() {
             Preparation::Execution(e) => return e,
             Preparation::Infeasible(e) => panic!("{e:?}"),
+            Preparation::Unresolved(e) => panic!("{e}"),
             Preparation::Choice { alternatives, .. } => {
                 let i = if let Some(c) = alternatives.owner::<loads::Choice>() {
                     c.modes()
                         .iter()
                         .position(|&m| m == seismic_lang::ir::LoadMode::Borrow)
                         .unwrap()
-                } else if alternatives.owner::<FoldChoice>().is_some() {
-                    1
+                } else if let Some(c) = alternatives.owner::<FoldChoice>() {
+                    (0..c.len()).find(|&i| c.get(i) == Some(ownership)).unwrap()
                 } else if let Some(c) = alternatives.owner::<DispatchChoice>() {
                     (0..c.len())
                         .find(|&i| c.get(i) == Some(Dispatch::ParallelRoot))
@@ -122,79 +130,108 @@ fn selected_fold_uses_adjacent_exchange_and_bounded_private_state() {
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn native_selected_fold_preserves_seed_segments_tree_and_tail() {
+    participant_fold_correspondence(false);
+}
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn native_seed_root_fold_preserves_seed_segments_tree_and_tail() {
+    participant_fold_correspondence(true);
+}
+fn participant_fold_correspondence(root_seed: bool) {
     let device = seismic_cuda::Device::open(0).unwrap();
-    for (n, segment) in [(1, 1), (13, 1), (35, 2), (67, 4), (93, 3)] {
-        for tree in [Tree::Pairwise, Tree::Explicit] {
-            let f = lowered(n, segment, tree);
-            let execution = prepare(&f, &device.info);
-            let a = (0..3 * n * 2)
-                .map(|i| ((i % 19) as f32 - 9.0) / 8.0)
-                .collect::<Vec<_>>();
-            let b = (0..3 * n * 2)
-                .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
-                .collect::<Vec<_>>();
-            // Evaluate the exact selected lowered source, including its seed/tree, with
-            // independent interpreter arithmetic rather than another warp algorithm.
-            let reference = seismic_lang::program::Program {
-                functions: vec![seismic_lang::ir::Function {
-                    name: f.name.clone(),
-                    is_construct: false,
-                    shape_params: vec![],
-                    elem_params: vec![],
-                    params: f.params.clone(),
-                    index_params: f.index_params.clone(),
-                    vars: f.vars.clone(),
-                    body: f.body.clone(),
-                }],
-                lowerings: vec![],
-                signatures: HashMap::new(),
-            };
-            let mut interpreter = seismic_lang::interp::Interpreter::new(&reference);
-            let x = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
-                seismic_lang::types::DType::F32,
-                vec![3, n as usize, 2],
-                a.iter().map(|&x| x as f64).collect(),
-            ));
-            let y = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
-                seismic_lang::types::DType::F32,
-                vec![3, n as usize, 2],
-                b.iter().map(|&x| x as f64).collect(),
-            ));
-            let z = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
-                seismic_lang::types::DType::F32,
-                vec![3, 2],
-                vec![0.0; 6],
-            ));
-            interpreter
-                .run(
-                    "fold",
-                    &[
-                        seismic_lang::interp::Arg::Tensor(x),
-                        seismic_lang::interp::Arg::Tensor(y),
-                        seismic_lang::interp::Arg::Tensor(z),
-                    ],
-                    &HashMap::new(),
-                )
-                .unwrap();
-            let mut kernel = device.compile_executions(execution).unwrap();
-            let x = device
-                .buffer_from(&a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
-                .unwrap();
-            let y = device
-                .buffer_from(&b.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
-                .unwrap();
-            let z_native = device.buffer(24).unwrap();
-            kernel
-                .execute(&[x, y, z_native.clone()], &[], false)
-                .unwrap();
-            let mut bytes = vec![0; 24];
-            z_native.read(&mut bytes).unwrap();
-            for (i, bytes) in bytes.chunks_exact(4).enumerate() {
-                assert_eq!(
-                    f32::from_le_bytes(bytes.try_into().unwrap()),
-                    interpreter.tensors[z].get(i) as f32,
-                    "n{n},segment{segment},{tree:?},i{i}"
-                );
+    let ownerships = if root_seed {
+        vec![FoldImplementation::SubgroupRootSeed, FoldImplementation::SubgroupWavefrontRootSeed]
+    } else {
+        vec![FoldImplementation::Subgroup, FoldImplementation::SubgroupInsertSeed,
+            FoldImplementation::SubgroupWavefront, FoldImplementation::SubgroupWavefrontInsertSeed]
+    };
+    let trees = if root_seed { vec![Tree::SeedThenPairwise] } else { vec![Tree::Pairwise, Tree::Explicit] };
+    for ownership in ownerships {
+        for (n, segment) in [
+            (1, 1),
+            (13, 1),
+            (35, 2),
+            (67, 4),
+            (93, 3),
+            (67, 1),
+            (512, 16),
+            (64, 1),
+            (1057, 1),
+        ] {
+            for &tree in &trees {
+                let wavefront = matches!(ownership, FoldImplementation::SubgroupWavefront | FoldImplementation::SubgroupWavefrontInsertSeed | FoldImplementation::SubgroupWavefrontRootSeed);
+                if (tree == Tree::Explicit && wavefront) || (n == 1057 && !wavefront) { continue; }
+                let f = lowered(n, segment, tree);
+                let execution = prepare_ownership(&f, &device.info, ownership);
+                let a = (0..3 * n * 2)
+                    .map(|i| ((i % 19) as f32 - 9.0) / 8.0)
+                    .collect::<Vec<_>>();
+                let b = (0..3 * n * 2)
+                    .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
+                    .collect::<Vec<_>>();
+                // Evaluate the exact selected lowered source, including its seed/tree, with
+                // independent interpreter arithmetic rather than another warp algorithm.
+                let reference = seismic_lang::program::Program {
+                    functions: vec![seismic_lang::ir::Function {
+                        name: f.name.clone(),
+                        is_construct: false,
+                        shape_params: vec![],
+                        elem_params: vec![],
+                        params: f.params.clone(),
+                        index_params: f.index_params.clone(),
+                        vars: f.vars.clone(),
+                        body: f.body.clone(),
+                    }],
+                    lowerings: vec![],
+                    signatures: HashMap::new(),
+                };
+                let mut interpreter = seismic_lang::interp::Interpreter::new(&reference);
+                let x = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![3, n as usize, 2],
+                    a.iter().map(|&x| x as f64).collect(),
+                ));
+                let y = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![3, n as usize, 2],
+                    b.iter().map(|&x| x as f64).collect(),
+                ));
+                let z = interpreter.add_tensor(seismic_lang::interp::TensorData::dense(
+                    seismic_lang::types::DType::F32,
+                    vec![3, 2],
+                    vec![0.0; 6],
+                ));
+                interpreter
+                    .run(
+                        "fold",
+                        &[
+                            seismic_lang::interp::Arg::Tensor(x),
+                            seismic_lang::interp::Arg::Tensor(y),
+                            seismic_lang::interp::Arg::Tensor(z),
+                        ],
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                let mut kernel = device.compile_executions(execution).unwrap();
+                let x = device
+                    .buffer_from(&a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+                    .unwrap();
+                let y = device
+                    .buffer_from(&b.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+                    .unwrap();
+                let z_native = device.buffer(24).unwrap();
+                kernel
+                    .execute(&[x, y, z_native.clone()], &[], false)
+                    .unwrap();
+                let mut bytes = vec![0; 24];
+                z_native.read(&mut bytes).unwrap();
+                for (i, bytes) in bytes.chunks_exact(4).enumerate() {
+                    assert_eq!(
+                        f32::from_le_bytes(bytes.try_into().unwrap()),
+                        interpreter.tensors[z].get(i) as f32,
+                        "{ownership:?},n{n},segment{segment},{tree:?},i{i}"
+                    );
+                }
             }
         }
     }
@@ -369,7 +406,7 @@ fn resource_analysis_tracks_dynamic_exchange_from_retained_operations() {
             units_per_block: model::Amount::fixed(1),
         }],
     };
-    let workload = workload::ScalarWorkload {
+    let workload = workload::ScalarWorkload { integer_domains: Vec::new(),
         identity: "disjoint unknown float inputs".into(),
         allocations: e
             .program()

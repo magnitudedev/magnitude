@@ -33,6 +33,7 @@ pub fn program(ty: Type, elements: usize) -> seismic_realization::ScalarProgram 
     seismic_realization::ScalarProgram {
             conditions: Default::default(),
         function,
+        public_buffer_count: 3,
         buffers: ["a", "b", "out"]
             .into_iter()
             .map(|parameter| seismic_realization::BufferSpec {

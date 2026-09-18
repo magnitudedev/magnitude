@@ -44,6 +44,183 @@ results over these constraints, not inputs from a separate proof pipeline. Accou
 accepts the execution and its hardware/workload context; a caller cannot pair an
 execution with an independently authored cost model.
 
+Metal's terminal execution walker supplies both scheduling constraints and a
+compact invocation account. Both follow the same typed expressions, helper
+bodies and parameter conversions, active-lane masks, launches, and workload
+bindings. The compact account groups matching primitives, participant counts,
+and access patterns instead of retaining every dynamic scheduling node. An
+instruction budget bounds traversal; the operation budget bounds retained
+account groups or scheduling nodes, according to the consumer.
+
+### Symbolic execution and workload domains
+
+The walk retains per-lane integer intervals and affine relationships over
+independent dispatch, loop, and runtime-input coordinates. Arithmetic, supported
+quotient/remainder operations, helper arguments and returns, and derived pointers
+preserve those relationships when the target's integer widths exclude wrapping.
+Shifts require counts valid for the operand width. Selected integer values retain
+the chosen lane facts; subgroup shuffles require a known participating source.
+Integer min/max and subgroup extrema retain interval bounds, and retain an affine
+operand when its ordering is established over the entire domain. Floating
+arithmetic does not acquire host-evaluation semantics to resolve device control.
+
+A workload may constrain integer scalar slots or allocation locations to finite
+progressions with an explicit width and signedness. Each domain covers all its
+admitted runtime values; its canonical scalar bytes are not a representative
+execution. Exact known bytes and variable domains cannot overlap. A completed
+execution model must establish the same operations, participants, and resource
+constraints throughout the admitted domain. Changing control or transaction
+geometry that cannot be represented remains unresolved; it is not replaced by
+an average or an arbitrary domain member.
+
+Uniform loop traces retain their visit count and independent induction
+coordinates, including nested loops, without enumerating iterations. Admission
+requires a finite common trip count, an invariant endpoint that does not read the
+loop's own induction variable, and a body whose retained walk establishes the
+required control and accesses throughout the coordinate domain. Assigned values,
+loop-carried pointer bindings, and mutable local byte state are forgotten before
+the retained visit; final induction values are computed separately. This never
+substitutes the first visit's values for the loop's final state. Expression facts
+are scoped to the current evaluation and statement; helper frames and lexical
+restoration cannot retain facts from a shadowed binding. Unsupported recurrences,
+varying predicates, and lost address facts require bounded concrete refinement
+or remain unresolved.
+
+Complete dispatch groups can likewise share one abstract walk over their entire
+group-coordinate interval. Structured derivation retains the result as a parallel
+repetition and visits a partial final group concretely. When a region loses
+control or transaction facts, it rolls back that region's derived constraints
+and subdivides its group interval. Every resulting region still covers its full
+coordinate domain, and subdivision does not narrow any runtime-input domain.
+Discarded attempts consume the traversal budget. If necessary, derivation retries
+concrete groups while retaining loop compression before dropping loop abstraction.
+An absent primitive service or resident-capacity mapping cannot be repaired by
+coordinate refinement: it remains an explicit gap and suppresses futile retries.
+No refinement changes the selected implementation or turns exhaustion into
+infeasibility.
+
+Pruning uses the same symbolic loop and dispatch coordinates, multiplying the
+mandatory work of a retained visit without constructing its dynamic instances.
+An incomplete walk contributes only the established mandatory prefix; unknown
+access geometry or missing services can weaken that lower bound. This account
+cannot supply a feasible schedule or finish an otherwise unresolved selection.
+The runtime backend composition forwards demand relaxations for both partial
+domains and completed executions on the normal source-to-native path.
+
+### Structured scheduling
+
+Scheduling retains serial and parallel composition, repetition, and resident
+scopes. Leaves use the same primitive reservations as the flat scheduling model;
+composition owns dependencies, and a scope holds capacity until its entire body
+completes. Metal derives this structure directly: launch submission precedes
+parallel group bodies, each group holds its resident capacities across its
+parallel subgroups, and each subgroup retains terminal source order. Retained
+loops preserve their tests, bodies, and increments in order.
+
+Bounds combine dependency duration, service demand, and minimum resident
+lifetimes without enumerating repeated instances. Resource demand also retains
+necessary dependency margins: if all counted occupancy starts at least `head`
+ticks after region entry and ends at least `tail` ticks before completion, the
+duration is at least `head + ceil(work / capacity) + tail`. Serial composition
+shifts these margins by neighboring duration floors; parallel composition and
+repetition retain only margins valid for all counted work. These windows follow
+mandatory dependencies, not the timing of a selected feasible schedule.
+
+Mandatory serial boundaries admit independent scheduling subproblems. Their
+bounds and durations add; serial repetition solves its body once and scales the
+result. Refinement retains each bounded subproblem's exact scheduling frontier
+and checked starts. Inside a resident scope it subtracts the capacity held by
+that scope, cumulatively for nested scopes, then retains the full scope lifetime
+in the assembled witness. A fully held resource can be ignored only if the body
+never uses it; otherwise the scope stays in exact feasibility analysis. No
+zero-capacity hardware profile is manufactured.
+
+Checked child schedules provide compact resource profiles containing both
+instruction reservations and resident lifetimes. Profiles coalesce adjacent
+intervals of equal occupancy and can represent uninterrupted repeated work
+without expanding every operation. Their explicit limit bounds retained
+intervals; a fragmented profile exceeding that limit remains unresolved.
+Parallel children may run together when their peak envelopes fit. For differing
+children whose envelopes conflict, a retained interval search instead chooses
+start offsets under their actual profiles, allowing staggered overlap. The
+assembled witness validates the child models, starts, completion, and combined
+capacity use. A changed child witness invalidates that offset frontier.
+
+Parallel repetition reuses its common body's refined schedule. Peak envelopes
+admit concurrent waves; whole-body residency additionally bounds how many bodies
+can overlap. A retained initiation-period frontier can admit pipelined overlap
+using the body's compact profile. Complete-period occupancy and a residue sweep
+bound an infinite stream, hence any finite prefix, without expanding the repeated
+count. The profile is retained across advances and replaced when the body
+schedule changes. Period and child searches share the refinement budget;
+enclosing residency is held once rather than duplicated per child.
+
+These schedules are feasible upper witnesses. Restricting children to fixed
+internal schedules, or copies to waves or a common period, does not restrict the
+original model's legal interleavings. Even an exact optimum of the start-offset
+subproblem supplies only an upper bound for the original parallel region.
+Completion requires that upper to meet the independently derived lower bound.
+Missing mappings and optimistic-only models cannot supply executable witnesses.
+Bounded expansion into the flat exact oracle checks small cases; exceeding that
+bound is unfinished derivation, not infeasibility.
+
+### Memory accesses and knowledge
+
+Scalar device reads and writes, and selected packed-vector reads, retain the
+union of active-lane byte ranges from their actual pointer bindings and index
+expressions. Checked helper calls preserve those bindings. Accounts normalize
+away allocation-aligned whole prefixes while retaining binding offsets and the
+remaining alignment residue. Equivalent patterns can therefore share one count
+across different absolute tensor positions.
+
+A symbolic access can reuse one such union when every active lane has the same
+affine translation coefficients and coordinate domains, and all resulting
+addresses stay within their backing bounds. Each admitted transaction granularity
+must divide both the allocation alignment and every byte-address translation
+coefficient. This establishes the geometry over the entire coordinate domain;
+the origin used to express the pattern is not a sampled execution. Differing
+lane translations, insufficient alignment, or unsupported expressions require
+refinement or leave the access unmapped.
+
+A declared hardware service may charge per distinct aligned transaction block
+intersected by one operation. Its resource names the modeled memory boundary,
+and its granularity is an explicit power of two. Schedule construction,
+completed demand, and pruning use the same service expansion. This contract
+models request coalescing within one operation; it does not assert cache hits,
+cross-operation reuse, native vectorization, or DRAM traffic. For pruning only,
+an unresolved address still requires enough blocks to contain one participating
+lane's complete scalar or vector payload. That floor permits broadcast and any
+base-address residue. Exact scheduling continues to require admitted transaction
+geometry. Matrix and other address spaces retain their separate mappings.
+
+Immutable known bytes and typed integer domains can establish values read at
+indirect addresses. A bounded enumeration must cover every address in a finite
+strided superset of the possible locations with compatible domain facts or exact
+bytes. A single location preserves its input coordinate; multiple locations may
+produce a weaker value range. Repeated reads from the same immutable backing and
+symbolic address retain their value relationship. Missing bytes, incompatible
+types, or an exhausted address enumeration supply no invented value.
+
+Before using either external known bytes or integer domains, the terminal
+write-effect scan excludes every allocation that may be published anywhere in
+the invocation, preserving actual binding aliases. Unknown effects exclude all
+external backings. This prevents traversal order from inventing knowledge of
+concurrent publications, though it can leave an in-place or multi-launch
+invocation unresolved. Private arrays retain separate lane backings; shared
+arrays retain their selected byte layout. Writes retain known bytes and typed
+symbolic integer values through derived pointer aliases. Partial, conflicting,
+or unknown writes invalidate the affected facts and cached reads. Loop
+abstraction forgets mutable local state whose final value is not established,
+while retaining admitted immutable external facts.
+
+Counts describe selected terminal operations and requested memory bytes, not
+native instructions, cache transactions, or measured traffic. Unknown control
+and exhausted budgets leave explicitly incomplete accounts. CLI diagnostics use
+separate parameter backings and unknown tensor contents and report those
+assumptions. Local byte state and symbolic facts remain analyses of the selected
+implementation, not a second source interpreter or an independently authored
+accounting program.
+
 ## Units and resource boundaries
 
 | Quantity | Required distinction |

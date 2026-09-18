@@ -293,6 +293,28 @@ pub fn writes(s: &Stmt, out: &mut HashSet<VarId>) {
     }
 }
 
+/// Values requiring distinct bindings when copying a computation. Publishing
+/// through a tensor reference mutates its backing, not the reference itself.
+/// Effect/dependency analysis must still use `writes`, including those backings.
+pub fn value_writes(s: &Stmt, vars: &[crate::ir::Var], out: &mut HashSet<VarId>) {
+    let mut changed = HashSet::new();
+    writes(s, &mut changed);
+    out.extend(changed.into_iter().filter(|&v| !matches!(vars[v].ty, crate::types::Ty::Tensor(_))));
+    fn bindings(s: &Stmt, out: &mut HashSet<VarId>) {
+        match &s.kind {
+            StmtKind::Assign { target: Expr { kind: ExprKind::Var(v), .. }, .. } => { out.insert(*v); }
+            StmtKind::Reduction(r) => { for statement in r.bodies().flatten() { bindings(statement, out); } }
+            StmtKind::Owned { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. }
+            | StmtKind::LoadLoop { body, .. } | StmtKind::Parallel { body, .. } => {
+                for statement in body { bindings(statement, out); }
+            }
+            StmtKind::If { then, els, .. } => { for statement in then.iter().chain(els) { bindings(statement, out); } }
+            _ => {}
+        }
+    }
+    bindings(s, out);
+}
+
 /// Intrinsics mutate value storage through typed operand effects even when
 /// written as expression statements. They participate in the same dependency
 /// closure as ordinary tile assignments.
@@ -301,6 +323,7 @@ fn expression_writes(expr: &Expr, out: &mut HashSet<VarId>) {
         match &expr.kind {
             ExprKind::Var(v) => Some(*v),
             ExprKind::Index { base, .. } | ExprKind::Transpose(base) => root(base),
+            ExprKind::Builtin { name: crate::ir::Builtin::Reshape, args } => args.first().and_then(root),
             _ => None,
         }
     }
@@ -311,7 +334,24 @@ fn expression_writes(expr: &Expr, out: &mut HashSet<VarId>) {
             }
             for argument in args { expression_writes(argument, out); }
         }
-        ExprKind::Builtin { args, .. } | ExprKind::Call { args, .. } | ExprKind::Tuple(args) => {
+        ExprKind::Builtin { name: crate::ir::Builtin::Store, args } => {
+            if let Some(v) = args.get(1).and_then(root) { out.insert(v); }
+            for argument in args { expression_writes(argument, out); }
+        }
+        ExprKind::Builtin { name: crate::ir::Builtin::Atomic, args } => {
+            if let Some(v) = args.first().and_then(root) { out.insert(v); }
+            for argument in args { expression_writes(argument, out); }
+        }
+        ExprKind::Call { args, .. } => {
+            // Unresolved callees have not established a read-only contract.
+            for argument in args {
+                if argument.ty.shaped().is_some() {
+                    if let Some(v) = root(argument) { out.insert(v); }
+                }
+                expression_writes(argument, out);
+            }
+        }
+        ExprKind::Builtin { args, .. } | ExprKind::Tuple(args) => {
             for argument in args { expression_writes(argument, out); }
         }
         ExprKind::Index { base, indices } => {

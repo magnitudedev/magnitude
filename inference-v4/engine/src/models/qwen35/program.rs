@@ -8,6 +8,11 @@ use seismic_lang::{
 pub fn program() -> Result<Program, String> {
     let mut sources = seismic_std::sources();
     sources.push(SourceFile {
+        path: "qwen35/vision.seismic.portable".into(),
+        text: include_str!("../../../lib/vision.seismic.portable").into(),
+        scope: Scope::Portable,
+    });
+    sources.push(SourceFile {
         path: "qwen35/dense_suffix.seismic.portable".into(),
         text: include_str!("../../../lib/dense_suffix.seismic.portable").into(),
         scope: Scope::Portable,
@@ -30,6 +35,11 @@ pub fn program() -> Result<Program, String> {
     sources.push(SourceFile {
         path: "qwen35/routed_suffix.seismic.portable".into(),
         text: include_str!("../../../lib/routed_suffix.seismic.portable").into(),
+        scope: Scope::Portable,
+    });
+    sources.push(SourceFile {
+        path: "qwen35/sequence.seismic.portable".into(),
+        text: include_str!("../../../lib/sequence.seismic.portable").into(),
         scope: Scope::Portable,
     });
     compile(&sources, &["cpu".into(), "cuda".into(), "metal".into()]).map_err(|errors| {

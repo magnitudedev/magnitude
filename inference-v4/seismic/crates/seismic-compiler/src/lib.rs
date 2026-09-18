@@ -61,6 +61,7 @@ pub fn scalar_participants_resolved(
     }
     seismic_lang::normalize::bind_values(&mut normalized.body, &mut normalized.vars);
     let loads = seismic_lang::normalize::loads::selected(&normalized.body)?;
+    seismic_lang::verify::lowered(&normalized, seismic_lang::verify::Stage::Executable)?;
     seismic_lang::normalize::identify(&mut normalized.body, &mut 0);
     let lowered = &normalized;
     let mut function = ir::Function::new();
@@ -106,6 +107,7 @@ pub fn scalar_participants_resolved(
     Ok(ScalarProgram {
         conditions: seismic_realization::InvocationConditions::from_lowered(lowered)?,
         function,
+        public_buffer_count: buffers.len(),
         buffers,
         scalars,
         scratch_bytes: scratch_bytes
@@ -122,9 +124,8 @@ pub fn scalar_participants_resolved(
     })
 }
 
-/// Lower a natural sequence of outer parallel domains to ordered native phases.
-/// Local storage crossing domains requires a different realization and is rejected
-/// by each phase's ordinary binding validation; no kernel-source rewrite is needed.
+/// Lower serial setup and parallel domains through the shared phase plan. Values
+/// crossing a launch boundary use invocation-owned storage in the native ABI.
 pub fn scalar_sequence(
     lowered: &LoweredIr,
     call_conv: CallConv,
@@ -148,27 +149,29 @@ pub fn scalar_sequence_participants_resolved(
     participation: seismic_realization::dispatch::Participation,
 ) -> Result<seismic_realization::ScalarSequence, String> {
     use seismic_realization::{ScalarPhase, ScalarSequence};
+    let public_buffer_count = seismic_realization::storage::parameters(lowered)?.0.len();
+    let source_conditions = seismic_realization::InvocationConditions::from_lowered(lowered)?;
     if dispatch == Dispatch::Sequential {
         return Ok(ScalarSequence {
             name: lowered.name.clone(),
+            public_buffer_count,
+            retained: Vec::new(),
             phases: vec![ScalarPhase {
                 source_statement: 0,
                 program: scalar_participants_resolved(lowered, call_conv, dispatch, participation)?,
             }],
         });
     }
-    let mut normalized = lowered.clone();
-    seismic_lang::normalize::work_domain(&mut normalized.body);
-    let lowered = &normalized;
+    let plan = seismic_realization::phases::construct(lowered)?;
+    let lowered = &plan.function;
     let mut phases = Vec::new();
     for (source_statement, statement) in lowered.body.iter().enumerate() {
-        if !matches!(statement.kind, seismic_lang::ir::StmtKind::Parallel { .. }) {
-            return Err(format!("{}: statement {source_statement} needs cross-phase storage/control lowering; expected an outer parallel domain",lowered.name));
-        }
         let mut phase = lowered.clone();
         phase.body = vec![statement.clone()];
-        let program = scalar_participants_resolved(&phase, call_conv, dispatch, participation)
+        let mut program = scalar_participants_resolved(&phase, call_conv, dispatch, participation)
             .map_err(|error| format!("{} phase {source_statement}: {error}", lowered.name))?;
+        program.public_buffer_count = public_buffer_count;
+        program.conditions = source_conditions.clone();
         phases.push(ScalarPhase {
             source_statement,
             program,
@@ -177,6 +180,8 @@ pub fn scalar_sequence_participants_resolved(
     Ok(ScalarSequence {
         name: lowered.name.clone(),
         phases,
+        public_buffer_count,
+        retained: plan.retained,
     })
 }
 

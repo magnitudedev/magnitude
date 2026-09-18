@@ -1,0 +1,26 @@
+{
+  "name": "seismic-language",
+  "displayName": "Seismic",
+  "description": "Local syntax highlighting for Seismic source files.",
+  "version": "0.0.1",
+  "publisher": "seismic-local",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [{
+      "id": "seismic",
+      "aliases": ["Seismic", "seismic"],
+      "extensions": [".seismic", ".seismic.portable", ".seismic.cpu", ".seismic.metal", ".seismic.cuda"],
+      "filenamePatterns": ["*.seismic.*"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "seismic",
+      "scopeName": "source.seismic",
+      "path": "./syntaxes/seismic.tmLanguage.json"
+    }],
+    "configurationDefaults": {
+      "[seismic]": { "editor.insertSpaces": true, "editor.tabSize": 2 }
+    }
+  }
+}

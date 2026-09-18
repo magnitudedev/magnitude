@@ -2426,28 +2426,19 @@ fn path_bounds(cond: &Expr, negate: bool) -> Vec<(Atom, Option<Sym>, Option<Sym>
     };
     let Some((small, big)) = le else { return Vec::new() ;
     };
-    let mut out = Vec::new();
-    if let Some(a) = single_atom(&small) {
-        if !big.atoms().contains(&a) {
-            out.push((a, None, Some(big.clone())));
+    // Keep affine guards in the existing atom-bound owner. For example,
+    // `8 * block + lane < N` gives `lane <= N - 1 - 8 * block`;
+    // independent ranges alone lose exactly this tail correlation. Isolating
+    // a unit coefficient requires no integer division or rounding assumption.
+    let allowance = big.sub(&small);
+    allowance.atoms().into_iter().filter_map(|atom| {
+        let (coefficient, rest) = allowance.linear_in(&atom)?;
+        match coefficient {
+            1 => Some((atom, Some(rest.neg()), None)),
+            -1 => Some((atom, None, Some(rest))),
+            _ => None,
         }
-    }
-    if let Some(a) = single_atom(&big) {
-        if !small.atoms().contains(&a) {
-            out.push((a, Some(small.clone()), None));
-        }
-    }
-    out
-}
-
-fn single_atom(s: &Sym) -> Option<Atom> {
-    let atoms = s.atoms();
-    if let [a] = atoms.as_slice() {
-        if *s == Sym::atom(a.clone()) {
-            return Some(a.clone());
-        }
-    }
-    None
+    }).collect()
 }
 
 fn collect_value_variables(e:&Expr,out:&mut HashSet<VarId>) {

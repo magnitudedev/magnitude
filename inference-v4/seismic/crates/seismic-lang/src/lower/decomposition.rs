@@ -9,7 +9,7 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Domain {
     pub parameter: String,
     pub axes: Vec<Option<usize>>,

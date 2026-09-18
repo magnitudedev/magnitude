@@ -39,20 +39,36 @@ impl Choices for DispatchChoice {
 pub enum FoldImplementation {
     Thread,
     Subgroup,
+    SubgroupInsertSeed,
+    SubgroupWavefront,
+    SubgroupWavefrontInsertSeed,
+    SubgroupRootSeed,
+    SubgroupWavefrontRootSeed,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldChoice {
     pub site: usize,
+    pub wavefront: bool,
+    pub root_seed: bool,
 }
 impl Choices for FoldChoice {
     type Alternative = FoldImplementation;
     fn len(&self) -> usize {
-        2
+        if self.root_seed { if self.wavefront { 3 } else { 2 } } else if self.wavefront { 5 } else { 3 }
     }
     fn get(&self, index: usize) -> Option<Self::Alternative> {
-        [FoldImplementation::Thread, FoldImplementation::Subgroup]
-            .get(index)
-            .copied()
+        if self.root_seed {
+            return [FoldImplementation::Thread, FoldImplementation::SubgroupRootSeed, FoldImplementation::SubgroupWavefrontRootSeed][..self.len()].get(index).copied();
+        }
+        [
+            FoldImplementation::Thread,
+            FoldImplementation::Subgroup,
+            FoldImplementation::SubgroupInsertSeed,
+            FoldImplementation::SubgroupWavefront,
+            FoldImplementation::SubgroupWavefrontInsertSeed,
+        ][..self.len()]
+        .get(index)
+        .copied()
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +141,7 @@ impl PartialEq for BlockFamily {
             && self.phases.len() == other.phases.len()
             && self.phases.iter().zip(other.phases.iter()).all(|(a, b)| {
                 a.target == b.target
+                    && a.program.public_buffer_count == b.program.public_buffer_count
                     && a.program.buffers == b.program.buffers
                     && a.program.scalars == b.program.scalars
                     && a.program.conditions == b.program.conditions
@@ -257,6 +274,7 @@ pub fn prepare(
     if function.backend != "cuda" {
         return Err("CUDA preparation requires CUDA Lowered IR".into());
     }
+    seismic_lang::verify::lowered(function, seismic_lang::verify::Stage::Expanded)?;
     validate_device(device)?;
     let (function, consumed) = match loads::expand(function, path)? {
         loads::Expansion::Choice(choice) => {
@@ -270,20 +288,31 @@ pub fn prepare(
     let mut path = &path[consumed..];
     let mut selected_folds = Vec::new();
     if device.warp_size == 32 && device.max_threads_per_block >= 32 {
+        let root_seed_sites = seismic_lang::reduction::structured::participants::root_seed_candidates(&function, 32);
+        let wavefront_sites = seismic_lang::reduction::structured::participants::wavefront_candidates(&function, 32);
         for site in seismic_lang::reduction::structured::participants::candidates(&function, 32) {
-            let choice = FoldChoice { site };
+            let choice = FoldChoice { site, wavefront: wavefront_sites.contains(&site), root_seed: root_seed_sites.contains(&site) };
             let Some((&index, remaining)) = path.split_first() else {
                 return Ok(Preparation::Choice {
                     name: format!("CUDA fold {site} participant ownership"),
                     alternatives: selection::Domain::new(choice)?,
                 });
             };
-            if choice
+            use seismic_lang::reduction::structured::participants::{Completion, SeedPlacement, Selection};
+            let placement = match choice
                 .get(index)
                 .ok_or("CUDA fold ownership choice is outside its domain")?
-                == FoldImplementation::Subgroup
             {
-                selected_folds.push(site);
+                FoldImplementation::Thread => None,
+                FoldImplementation::SubgroupRootSeed => Some((SeedPlacement::AtRoot, Completion::RetainLeaves)),
+                FoldImplementation::SubgroupWavefrontRootSeed => Some((SeedPlacement::AtRoot, Completion::CompleteWaves)),
+                FoldImplementation::Subgroup => Some((SeedPlacement::LeadingLeaf, Completion::RetainLeaves)),
+                FoldImplementation::SubgroupInsertSeed => Some((SeedPlacement::InsertAfterSegments, Completion::RetainLeaves)),
+                FoldImplementation::SubgroupWavefront => Some((SeedPlacement::LeadingLeaf, Completion::CompleteWaves)),
+                FoldImplementation::SubgroupWavefrontInsertSeed => Some((SeedPlacement::InsertAfterSegments, Completion::CompleteWaves)),
+            };
+            if let Some((seed, completion)) = placement {
+                selected_folds.push(Selection { site, seed, completion });
             }
             path = remaining;
         }
@@ -305,6 +334,17 @@ pub fn prepare(
     let dispatch = dispatches
         .get(dispatch)
         .ok_or("CUDA dispatch choice is outside its domain")?;
+    if dispatch == Dispatch::ParallelRoot {
+        match seismic_realization::phases::assess(&function)? {
+            seismic_realization::phases::Applicability::Supported(_) => {},
+            seismic_realization::phases::Applicability::Unresolved { reason } => {
+                return Ok(Preparation::Unresolved(format!("CUDA phase realization: {reason}")));
+            },
+        }
+    }
+    // Only explicit applicability results may retain an unsupported member.
+    // Once admitted, lowering or target failures are compiler errors and must
+    // not disappear into the remaining search space.
     let sequence = seismic_compiler::scalar_sequence_participants_resolved(
         &function,
         CallConv::SystemV,
@@ -412,14 +452,15 @@ impl compiler::Backend for Backend {
         execution: &Vec<Execution>,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, DerivationError> {
-        model::derive_sequence(execution, &self.conditions.hardware, workload, limits)
+    ) -> Result<schedule::evaluation::Model, DerivationError> {
+        model::derive_sequence(execution, &self.conditions.hardware, workload, limits).map(Into::into)
     }
     fn relax(
         &self,
         alternatives: &selection::Domain,
         indices: std::ops::Range<usize>,
         _workload: &ScalarWorkload,
+        _limits: DerivationLimits,
     ) -> Result<Option<schedule::Demand>, String> {
         let Some(domain) = alternatives.owner::<IntegerRange<BlockChoice>>() else {
             return Ok(None);
@@ -431,9 +472,7 @@ impl compiler::Backend for Backend {
         execution: &Vec<Execution>,
         objective: &Objective,
     ) -> Result<Vec<Execution>, String> {
-        objective
-            .model()
-            .check_execution_upper(objective.schedule())?;
+        objective.check_execution_upper()?;
         Ok(execution.clone())
     }
     fn check_materialization(
@@ -442,9 +481,7 @@ impl compiler::Backend for Backend {
         selected: &Vec<Execution>,
         objective: &Objective,
     ) -> Result<(), String> {
-        objective
-            .model()
-            .check_execution_upper(objective.schedule())?;
+        objective.check_execution_upper()?;
         if source.len() != selected.len()
             || source
                 .iter()
@@ -471,6 +508,7 @@ pub fn prepare_fixed(
     let mut prepared = prepare(function, device, &path)?;
     loop {
         match prepared {
+            Preparation::Unresolved(reason) => return Err(format!("CUDA diagnostic assignment is unresolved: {reason}")),
             Preparation::Execution(executions) => return Ok(executions),
             Preparation::Infeasible(reason) => {
                 return Err(format!(

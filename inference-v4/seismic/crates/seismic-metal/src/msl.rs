@@ -38,6 +38,8 @@ pub struct Emitted {
     /// the order they follow the caller's buffers. A split reduction's partial states live
     /// here, so no kernel has to declare them.
     pub scratch: Vec<usize>,
+    /// Named compiler-owned bindings, in the same order as scratch allocations.
+    pub scratch_bindings: Vec<BufferSpec>,
     /// Compiler-owned invocation status, bound and checked by every execution path.
     pub status_slot: Option<usize>,
     /// Bound buffer pairs must be disjoint; exact alias is admitted only when
@@ -147,6 +149,7 @@ struct SplitTail {
 
 struct Printer<'a> {
     terminal: crate::terminal::Program,
+    terminal_indents: Vec<Vec<usize>>,
     expressions: HashMap<String, TE>,
     local_planes: HashMap<String, (TSpa, DType, u64)>,
     f: &'a LoweredIr,
@@ -198,6 +201,7 @@ pub fn emit_execution(execution: &Execution) -> Result<Emitted, String> {
 /// Native compilation and accounting consume this same result.
 pub fn prepare_execution(execution: &Execution) -> Result<&Emitted, String> {
     execution
+        .terminal
         .emission
         .get_or_init(|| build_execution(execution))
         .as_ref()
@@ -205,9 +209,14 @@ pub fn prepare_execution(execution: &Execution) -> Result<&Emitted, String> {
 }
 fn build_execution(execution: &Execution) -> Result<Emitted, String> {
     let f = &execution.function;
+    let phase_indices = execution.phases.iter()
+        .map(|phase| phase.split.iter().map(|split| split.part).collect())
+        .collect::<Vec<_>>();
+    seismic_lang::verify::executable_phases(f, &phase_indices)?;
     let cfg = &execution.config;
     let mut emitted = Printer {
         terminal: Default::default(),
+        terminal_indents: Vec::new(),
         expressions: HashMap::new(),
         local_planes: HashMap::new(),
         f,
@@ -231,6 +240,7 @@ fn build_execution(execution: &Execution) -> Result<Emitted, String> {
         simdgroups: cfg.sg_per_tg,
     }
     .emit()?;
+    emitted.terminal.validate_typed()?;
     let planned = execution.memory.launches();
     if emitted.launches.len() != planned.len() {
         return Err("emitted launch count disagrees with allocation plan".into());
@@ -297,10 +307,8 @@ fn scalar_dtype(t: &Ty) -> Option<DType> {
 }
 
 impl Printer<'_> {
-    fn line(&mut self, text: &str) {
-        self.target(crate::terminal::Statement::Unmapped(text.into()));
-    }
     fn target(&mut self, statement: crate::terminal::Statement) {
+        let statement = statement.realized();
         match &statement {
             TS::Let { name, ty, .. } => {
                 self.expressions
@@ -312,24 +320,80 @@ impl Printer<'_> {
             }
             _ => {}
         }
-        let text = statement.render();
         if self.terminal.launches.len() <= self.memory_launch {
             self.terminal
                 .launches
                 .resize_with(self.memory_launch + 1, Vec::new);
+            self.terminal_indents
+                .resize_with(self.memory_launch + 1, Vec::new);
         }
+        self.terminal_indents[self.memory_launch].push(self.indent);
         self.terminal.launches[self.memory_launch].push(crate::terminal::Site {
             operation: self.current_operation,
             statement,
         });
-        self.source_line(&text);
     }
-    fn source_line(&mut self, text: &str) {
-        for _ in 0..self.indent {
-            self.out.push_str("  ");
+
+    fn realize_kernel(&mut self) -> Result<(), String> {
+        self.terminal.realize_launch(self.memory_launch);
+        let synchronized = crate::terminal::synchronize::coalesce(
+            &mut self.terminal.launches[self.memory_launch],
+        )?;
+        let transferred = self
+            .execution
+            .transfers
+            .iter()
+            .any(|s| s.choice.launch == self.memory_launch && s.width != 1);
+        if transferred {
+            crate::terminal::transfer::apply(
+                &mut self.terminal.launches[self.memory_launch],
+                self.memory_launch,
+                &self.execution.transfers,
+            )?;
+            self.terminal.realize_launch(self.memory_launch);
         }
-        self.out.push_str(text);
-        self.out.push('\n');
+        let selected = self
+            .execution
+            .traversals
+            .iter()
+            .any(|s| s.choice.launch == self.memory_launch && s.width != 1);
+        if selected {
+            crate::terminal::traversal::apply(
+                &mut self.terminal.launches[self.memory_launch],
+                self.memory_launch,
+                &self.execution.traversals,
+            )?;
+            self.terminal.realize_launch(self.memory_launch);
+        }
+        if selected || transferred || synchronized {
+            let mut indent = 1usize;
+            self.terminal_indents[self.memory_launch] = self.terminal.launches[self.memory_launch]
+                .iter()
+                .map(|site| {
+                    if matches!(site.statement, TS::End | TS::Else) {
+                        indent = indent.saturating_sub(1);
+                    }
+                    let current = indent;
+                    if matches!(
+                        site.statement,
+                        TS::For { .. } | TS::If(_) | TS::Scope | TS::Else
+                    ) {
+                        indent += 1;
+                    }
+                    current
+                })
+                .collect();
+        }
+        self.out.clear();
+        for (site, indent) in self.terminal.launches[self.memory_launch]
+            .iter()
+            .zip(&self.terminal_indents[self.memory_launch])
+        {
+            self.out.push_str(&"  ".repeat(*indent));
+            self.out.push_str(&site.statement.render());
+            self.out.push('\n');
+        }
+        Ok(())
     }
 
     fn fresh(&mut self, base: &str) -> String {
@@ -379,6 +443,34 @@ impl Printer<'_> {
         let mut index = 0usize;
         let mut params_sig: Vec<String> = Vec::new();
         for (i, (name, ty)) in self.f.params.iter().enumerate() {
+            let variable = self
+                .f
+                .vars
+                .iter()
+                .position(|v| matches!(v.kind, VarKind::Param(parameter) if parameter == i))
+                .or_else(|| (i < self.execution.source().params.len()).then_some(i))
+                .ok_or("parameter has no variable binding")?;
+            if let Some(retained) = self.execution.retained().iter().find(|r| r.parameter == i) {
+                let Ty::Tensor(shaped) = ty else {
+                    return Err("retained binding must be a tensor".into());
+                };
+                if shaped.elem != Elem::Dtype(retained.dtype) {
+                    return Err("retained binding dtype disagrees with phase plan".into());
+                }
+                self.real.insert(
+                    variable,
+                    Realization::Param {
+                        name: name.clone(),
+                        shape: shaped
+                            .shape
+                            .iter()
+                            .map(|d| d.as_constant().ok_or("retained capacity must be static"))
+                            .collect::<Result<_, _>>()?,
+                        elem: shaped.elem.clone(),
+                    },
+                );
+                continue;
+            }
             match ty {
                 Ty::Tensor(s) => {
                     let shape: Vec<i64> = s
@@ -453,7 +545,7 @@ impl Printer<'_> {
                         }
                     }
                     self.real.insert(
-                        i,
+                        variable,
                         Realization::Param {
                             name: name.clone(),
                             shape,
@@ -465,12 +557,12 @@ impl Printer<'_> {
                     self.scalars
                         .push(ScalarParameter::from_lowered(self.f, name, *d)?);
                     self.real.insert(
-                        i,
+                        variable,
                         Realization::Scalar {
                             name: format!("sc.{name}"),
                         },
                     );
-                    if let VarKind::Index(Atom::Param(atom)) = &self.vars()[i].kind {
+                    if let VarKind::Index(Atom::Param(atom)) = &self.vars()[variable].kind {
                         self.names.insert(atom.clone(), format!("sc.{name}"));
                     }
                 }
@@ -481,12 +573,37 @@ impl Printer<'_> {
                 }
             }
         }
-        // Scratch the split needs, declared on every kernel so one binding list serves all.
-        for scratch in self.execution.memory.scratch() {
+        // Every launch shares one invocation ABI: source bindings followed by
+        // compiler-owned split and retained-value storage.
+        let scratch_bindings: Vec<_> = self
+            .execution
+            .memory
+            .scratch()
+            .iter()
+            .map(|scratch| {
+                let name = scratch
+                    .parameter
+                    .map(|parameter| self.f.params[parameter].0.clone())
+                    .unwrap_or_else(|| format!("split_{}", scratch.index));
+                BufferSpec {
+                    parameter: name,
+                    plane: String::new(),
+                    bytes: scratch.bytes,
+                    alignment: scratch.dtype.bytes() as usize,
+                }
+            })
+            .collect();
+        for (scratch, binding) in self
+            .execution
+            .memory
+            .scratch()
+            .iter()
+            .zip(&scratch_bindings)
+        {
             params_sig.push(format!(
-                "device {}* split_{} [[buffer({})]]",
+                "device {}* {} [[buffer({})]]",
                 ctype(scratch.dtype),
-                scratch.index,
+                binding.parameter,
                 index + scratch.index
             ));
         }
@@ -510,7 +627,13 @@ impl Printer<'_> {
         ));
         let mut launches = Vec::new();
         let body = &self.f.body;
+        let parameter_realizations = self.real.clone();
+        let parameter_names = self.names.clone();
         for (k, stmt) in body.iter().enumerate() {
+            self.real = parameter_realizations.clone();
+            self.names = parameter_names.clone();
+            self.expressions.clear();
+            self.local_planes.clear();
             let mut split_tails = Vec::new();
             let phase = &self.execution.phases[k];
             let StmtKind::Parallel { vars, body, .. } = &stmt.kind else {
@@ -561,6 +684,7 @@ impl Printer<'_> {
                 self.block(body)?;
             }
             self.target(TS::Return(None));
+            self.realize_kernel()?;
             self.indent = 0;
             std::mem::swap(&mut self.out, &mut kernel_out);
             self.out.push_str(&format!(
@@ -607,6 +731,10 @@ impl Printer<'_> {
                     unreachable!()
                 };
                 let dispatch = self.execution.phases[k].merge_dispatch.as_ref().unwrap();
+                self.real = parameter_realizations.clone();
+                self.names = parameter_names.clone();
+                self.expressions.clear();
+                self.local_planes.clear();
                 let kernel = format!("{first}_merge");
                 let mut kernel_out = String::new();
                 std::mem::swap(&mut self.out, &mut kernel_out);
@@ -625,6 +753,7 @@ impl Printer<'_> {
                 )?;
                 self.block(&tail)?;
                 self.target(TS::Return(None));
+                self.realize_kernel()?;
                 self.indent = 0;
                 std::mem::swap(&mut self.out, &mut kernel_out);
                 self.out.push_str(&format!(
@@ -658,6 +787,7 @@ impl Printer<'_> {
         }
         Ok(Emitted {
             terminal: self.terminal,
+            scratch_bindings,
             source: header + &self.out,
             launches,
             buffers: self.buffers,
@@ -687,7 +817,11 @@ impl Printer<'_> {
             V::Group => E::variable("tg_pos.x", T::U32),
             V::Subgroup => E::variable("sg_id", T::U32),
             V::Constant(n) => E::Integer(i64::from(n), T::U32),
-            V::Result(n) => E::variable(format!("seismic_entry_{n}"), T::U32),
+            V::Result(n) => E::variable(format!("seismic_entry_{n}"), match program.steps[n].operation {
+                O::SignedIndex(_) => T::I32,
+                O::Live(..) => T::Bool,
+                _ => T::U32,
+            }),
         };
         for (n, step) in program.steps.iter().enumerate() {
             let expression = match step.operation {
@@ -931,14 +1065,22 @@ impl Printer<'_> {
                     .clone();
                 // Evaluate sources in order before checking equality or entering
                 // the loop, even if no piece or element transfer will execute.
-                let realized: Vec<Realization> = vars.iter().zip(views)
+                let realized: Vec<Realization> = vars
+                    .iter()
+                    .zip(views)
                     .map(|(variable, view)| {
                         if self.execution.storage.requires_data(*variable) {
                             self.view_of(view)
                         } else {
                             let (shape, _) = self.geometry_of(view)?;
-                            self.geometry_snapshot(&shape, &view.ty.shaped()
-                                .ok_or("stream source has no geometry")?.shape)
+                            self.geometry_snapshot(
+                                &shape,
+                                &view
+                                    .ty
+                                    .shaped()
+                                    .ok_or("stream source has no geometry")?
+                                    .shape,
+                            )
                         }
                     })
                     .collect::<Result<_, _>>()?;
@@ -1054,11 +1196,17 @@ impl Printer<'_> {
                                 Realization::Geometry { mut dims, .. } => {
                                     dims[*axis] = self.dim(&Sym::atom(piece.clone()))?;
                                     let strides = row_major_syms(
-                                        &dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+                                        &dims.iter().map(|d| d.cap).collect::<Vec<_>>(),
+                                    );
                                     Realization::Geometry { dims, strides }
                                 }
                                 Realization::View {
-                                    space, param, elem, offset, strides, mut shape,
+                                    space,
+                                    param,
+                                    elem,
+                                    offset,
+                                    strides,
+                                    mut shape,
                                 } => {
                                     let offset = offset.add(
                                         &Sym::param(&chunk)
@@ -1067,7 +1215,12 @@ impl Printer<'_> {
                                     );
                                     shape[*axis] = Sym::atom(piece.clone());
                                     Realization::View {
-                                        space, param, elem, offset, strides, shape,
+                                        space,
+                                        param,
+                                        elem,
+                                        offset,
+                                        strides,
+                                        shape,
                                     }
                                 }
                                 _ => return Err("stream transfer requires view geometry".into()),
@@ -1095,6 +1248,17 @@ impl Printer<'_> {
                     .get(&tv)
                     .cloned()
                     .ok_or("owned() over an unrealized tile")?;
+                if matches!(
+                    real,
+                    Realization::View { .. } | Realization::Geometry { .. }
+                ) {
+                    return self.owned_view(
+                        vars,
+                        tile,
+                        body,
+                        s.id.ok_or("owned domain has no identity")?,
+                    );
+                }
                 let names: Vec<String> = vars.iter().map(|v| self.index_name(*v)).collect();
                 match real {
                     Realization::Replicated { dims, .. } | Realization::Geometry { dims, .. } => {
@@ -1363,7 +1527,11 @@ impl Printer<'_> {
                     })
                 }
                 Some(r @ Realization::View { .. }) => Ok(r),
-                other => Err(format!("not a tensor view: {other:?}")),
+                other => Err(format!(
+                    "not a tensor view in {}: variable {v:?} {:?}, realization {other:?}",
+                    self.f.name,
+                    self.vars().get(*v)
+                )),
             },
             ExprKind::Index { base, indices } => {
                 let Realization::View {
@@ -1496,12 +1664,16 @@ impl Printer<'_> {
         if shape.len() != checked.len() {
             return Err("geometry snapshot rank mismatch".into());
         }
-        let dims = shape.iter().zip(checked)
-            .map(|(actual, checked)| Ok(Dim {
-                cap: self.cap(checked)?,
-                ext: self.sym(actual)?,
-                value: self.target_sym(actual)?,
-            }))
+        let dims = shape
+            .iter()
+            .zip(checked)
+            .map(|(actual, checked)| {
+                Ok(Dim {
+                    cap: self.cap(checked)?,
+                    ext: self.sym(actual)?,
+                    value: self.target_sym(actual)?,
+                })
+            })
             .collect::<Result<Vec<_>, String>>()?;
         let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
         Ok(Realization::Geometry { dims, strides })
@@ -1814,10 +1986,17 @@ impl Printer<'_> {
             // Addressable tensor views evaluate their complete geometry before
             // point indices. Reuse it directly so reshape/slice guards are not
             // dropped or evaluated again by logical tile-coordinate mapping.
-            let Realization::View { space, param, elem, mut offset, strides, shape } =
-                self.view_of(base)? else {
-                    return Err("tensor element read requires a realized view".into());
-                };
+            let Realization::View {
+                space,
+                param,
+                elem,
+                mut offset,
+                strides,
+                shape,
+            } = self.view_of(base)?
+            else {
+                return Err("tensor element read requires a realized view".into());
+            };
             if indices.len() != shape.len() {
                 return Err("tensor element coordinate rank differs".into());
             }
@@ -1863,8 +2042,11 @@ impl Printer<'_> {
     ) -> Result<(), String> {
         let root = crate::storage::tile_root(tile).ok_or("owned view has no allocation")?;
         let shared = match self.real.get(&root) {
-            Some(Realization::Replicated { .. } | Realization::Geometry { .. }) => false,
+            Some(Realization::Replicated { .. }) => false,
             Some(Realization::Shared { .. }) => true,
+            Some(Realization::Geometry { .. } | Realization::View { .. }) => {
+                self.execution.storage.owned_cooperative(root)
+            }
             _ => return Err("owned view requires addressable selected tile storage".into()),
         };
         let shape = self.view_shape(tile)?;
@@ -2140,12 +2322,6 @@ impl Printer<'_> {
         Ok(r)
     }
 
-    fn coerce(&self, text: String, from: &Ty, to: DType) -> String {
-        match scalar_dtype(from) {
-            Some(d) if d != to => format!("{}({text})", ctype(to)),
-            _ => text,
-        }
-    }
     fn arithmetic(op: BinaryOp, left: TE, right: TE, ty: TT) -> TE {
         // Seismic integer arithmetic wraps; signed overflow in MSL is undefined.
         // Keep the bit conversion and unsigned operation visible to accounting.
@@ -2184,7 +2360,9 @@ impl Printer<'_> {
                         .ok_or("geometry binding has no shape")?
                         .shape;
                     let snapshot = self.geometry_snapshot(&shape, checked)?;
-                    let Realization::Geometry { dims, .. } = &snapshot else { unreachable!() };
+                    let Realization::Geometry { dims, .. } = &snapshot else {
+                        unreachable!()
+                    };
                     if let Some(Realization::Geometry { dims: previous, .. }) =
                         self.real.get(v).cloned()
                     {
@@ -2440,22 +2618,38 @@ impl Printer<'_> {
                         dtype.into(),
                     ),
                 };
-                let TE::Read {
-                    name,
-                    index,
-                    space,
-                    ty,
-                } = lhs
-                else {
-                    return Err("assignment needs owned tile storage".into());
-                };
-                self.target(TS::Write {
-                    name,
-                    index: *index,
-                    space,
-                    ty,
-                    value: value.cast(ty),
-                });
+                match lhs {
+                    TE::Read {
+                        name,
+                        index,
+                        space,
+                        ty,
+                    } => self.target(TS::Write {
+                        name,
+                        index: *index,
+                        space,
+                        ty,
+                        value: value.cast(ty),
+                    }),
+                    TE::Helper(crate::support::Helper::Read, mut args, ty) => {
+                        args.push(value.cast(ty));
+                        self.target(TS::If(TE::binary(
+                            BinaryOp::Eq,
+                            TE::variable("lane", TT::U32),
+                            TE::Integer(0, TT::U32),
+                            TT::Bool,
+                        )));
+                        self.indent += 1;
+                        self.target(TS::Evaluate(TE::Helper(
+                            crate::support::Helper::Write,
+                            args,
+                            TT::Bool,
+                        )));
+                        self.indent -= 1;
+                        self.target(TS::End);
+                    }
+                    _ => return Err("assignment needs addressable scalar storage".into()),
+                }
                 Ok(())
             }
             _ => Err("unsupported assignment target".into()),
@@ -2630,9 +2824,6 @@ impl Printer<'_> {
         self.barrier(site)
     }
 
-    fn tile_element(&mut self, tv: VarId, indices: &[Index]) -> Result<String, String> {
-        Ok(self.target_tile_element(tv, indices)?.render())
-    }
     fn target_tile_element(&mut self, tv: VarId, indices: &[Index]) -> Result<TE, String> {
         let real = self.real.get(&tv).cloned().ok_or("tile is not realized")?;
         let mut points = Vec::new();
@@ -2711,6 +2902,24 @@ impl Printer<'_> {
             _ => Err("cannot index selected realization".into()),
         }
     }
+    fn device_elements(&self, name: &str, dtype: DType) -> Result<usize, String> {
+        if let Some(slot) = self.buffers.iter().find(|b| {
+            if b.plane.is_empty() {
+                b.parameter == name
+            } else {
+                format!("{}_{}", b.parameter, b.plane) == name
+            }
+        }) {
+            return Ok(slot.bytes / dtype.bytes() as usize);
+        }
+        self.execution
+            .retained()
+            .iter()
+            .find(|r| r.name == name && r.dtype == dtype)
+            .map(|r| r.bytes / dtype.bytes() as usize)
+            .ok_or_else(|| format!("missing device storage contract for `{name}`"))
+    }
+
     fn target_raw_read(&self, ptr: &str, index: TE, dtype: DType) -> Result<TE, String> {
         if let Some((space, actual, count)) = self.local_planes.get(ptr) {
             if *actual != dtype {
@@ -2729,23 +2938,13 @@ impl Printer<'_> {
             });
         }
 
-        let slot = self
-            .buffers
-            .iter()
-            .find(|b| {
-                if b.plane.is_empty() {
-                    b.parameter == ptr
-                } else {
-                    format!("{}_{}", b.parameter, b.plane) == ptr
-                }
-            })
-            .ok_or("missing device storage contract")?;
+        let count = self.device_elements(ptr, dtype)?;
         Ok(TE::Helper(
             crate::support::Helper::Read,
             vec![
                 TE::variable(ptr, TT::U64),
                 index.cast(TT::I64),
-                TE::Integer((slot.bytes / dtype.bytes() as usize) as i64, TT::U64),
+                TE::Integer(count as i64, TT::U64),
             ],
             dtype.into(),
         ))
@@ -3639,13 +3838,7 @@ impl Printer<'_> {
         let Elem::Dtype(dtype) = elem else {
             return Err("store into packed tensor".into());
         };
-        let count = self
-            .buffers
-            .iter()
-            .find(|b| b.parameter == param && b.plane.is_empty())
-            .ok_or("missing store storage")?
-            .bytes
-            / dtype.bytes() as usize;
+        let count = self.device_elements(&param, dtype)?;
         let (name, dims, from, space, slots) = match real {
             Some(Realization::Replicated { name, dims, dtype }) => {
                 (name, dims, dtype, TSpa::Private, None)
@@ -4422,7 +4615,11 @@ impl Printer<'_> {
         if scalar_result {
             self.real
                 .insert(v, Realization::Scalar { name: name.clone() });
-            self.line(&format!("int {name};"));
+            self.target(TS::Let {
+                name: name.clone(),
+                ty: TT::I32,
+                value: TE::integer(0),
+            });
         } else {
             self.real.insert(
                 v,
@@ -4446,53 +4643,128 @@ impl Printer<'_> {
         }
         let inner_cap = domain.inner_capacity() as i64;
         let axis_cap = domain.axis_capacity() as i64;
-        let axis_ext = dims[axis].ext.clone();
-        let initial = reduction_identity(selected.decision.contract.identity());
+        let axis_ext = dims[axis].value.clone();
+        let identity = selected.decision.contract.identity().value();
+        let initial = if dtype.is_float() {
+            TE::Float(identity.to_bits(), dtype.into())
+        } else {
+            TE::Integer(identity as i64, dtype.into())
+        };
         let o = self.fresh("o");
         let best = self.fresh("best");
         let at = self.fresh("at");
-        self.line(&format!("for (int {o} = 0; {o} < {out_cap}; ++{o}) {{"));
-        self.indent += 1;
-        self.line(&format!(
-            "{} {best} = {}({initial}); int {at} = 0x7fffffff;",
-            ctype(dtype),
-            ctype(dtype)
-        ));
-        let tie_valid = if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
-            format!("{at} != 0x7fffffff && ")
-        } else {
-            String::new()
+        let integer = |op, a, b| TE::binary(op, a, b, TT::I32);
+        let compare = |op, a, b| TE::binary(op, a, b, TT::Bool);
+        let flatten = |k: TE| {
+            integer(
+                BinaryOp::Add,
+                integer(
+                    BinaryOp::Mul,
+                    integer(
+                        BinaryOp::Add,
+                        integer(
+                            BinaryOp::Mul,
+                            integer(
+                                BinaryOp::Div,
+                                TE::variable(&o, TT::I32),
+                                TE::integer(inner_cap),
+                            ),
+                            TE::integer(axis_cap),
+                        ),
+                        k,
+                    ),
+                    TE::integer(inner_cap),
+                ),
+                integer(
+                    BinaryOp::Rem,
+                    TE::variable(&o, TT::I32),
+                    TE::integer(inner_cap),
+                ),
+            )
         };
+        self.target(TS::For {
+            name: o.clone(),
+            start: TE::integer(0),
+            end: TE::integer(out_cap),
+            step: 1,
+        });
+        self.indent += 1;
+        self.target(TS::Let {
+            name: best.clone(),
+            ty: dtype.into(),
+            value: initial,
+        });
+        self.target(TS::Let {
+            name: at.clone(),
+            ty: TT::I32,
+            value: TE::integer(i64::from(i32::MAX)),
+        });
         match &src {
-            Realization::Replicated { name: sn, .. } | Realization::Shared { name: sn, .. } => {
+            Realization::Replicated { name: sn, .. }
+            | Realization::Shared { name: sn, .. }
+            | Realization::Distributed { name: sn, .. }
+                if algorithm == Algorithm::Ordered =>
+            {
                 let k = self.fresh("k");
-                self.line(&format!("for (int {k} = 0; {k} < {axis_ext}; ++{k}) {{"));
+                self.target(TS::For {
+                    name: k.clone(),
+                    start: TE::integer(0),
+                    end: axis_ext.clone(),
+                    step: 1,
+                });
                 self.indent += 1;
-                self.line(&format!("const int e = (({o} / {inner_cap}) * {axis_cap} + {k}) * {inner_cap} + ({o} % {inner_cap});"));
-                self.line(&format!("if ({sn}[e] > {best} || ({sn}[e] == {best} && {tie_valid}{k} < {at})) {{ {best} = {sn}[e]; {at} = {k}; }}"));
-                self.indent -= 1;
-                self.target(crate::terminal::Statement::End);
-            }
-            Realization::Distributed { name: sn, .. } if algorithm == Algorithm::Ordered => {
-                let k = self.fresh("k");
-                self.line(&format!("for (int {k} = 0; {k} < {axis_ext}; ++{k}) {{"));
-                self.indent += 1;
-                self.line(&format!("const int e = (({o} / {inner_cap}) * {axis_cap} + {k}) * {inner_cap} + ({o} % {inner_cap});"));
-                let read = if matches!(dtype, DType::F16 | DType::BF16) {
-                    format!(
-                        "{}(simd_shuffle(float({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))",
-                        ctype(dtype)
+                let e = self.fresh("element");
+                self.target(TS::Let {
+                    name: e.clone(),
+                    ty: TT::I32,
+                    value: flatten(TE::variable(&k, TT::I32)),
+                });
+                let distributed = matches!(src, Realization::Distributed { .. });
+                let index = if distributed {
+                    integer(
+                        BinaryOp::Div,
+                        TE::variable(&e, TT::I32),
+                        TE::integer(SUBGROUP),
                     )
-                } else if dtype == DType::Bool {
-                    format!("bool(simd_shuffle(uint({sn}[e / {SUBGROUP}]), uint(e % {SUBGROUP})))")
                 } else {
-                    format!("simd_shuffle({sn}[e / {SUBGROUP}], uint(e % {SUBGROUP}))")
+                    TE::variable(&e, TT::I32)
                 };
-                let x = self.fresh("x");
-                self.line(&format!("const {} {x} = {read};", ctype(dtype)));
-                self.line(&format!("if ({x} > {best} || ({x} == {best} && {tie_valid}{k} < {at})) {{ {best} = {x}; {at} = {k}; }}"));
+                let value = TE::Read {
+                    name: sn.clone(),
+                    index: Box::new(index),
+                    space: if matches!(src, Realization::Shared { .. }) {
+                        TSpa::Threadgroup
+                    } else {
+                        TSpa::Private
+                    },
+                    ty: dtype.into(),
+                };
+                let value = if distributed {
+                    let transport = match dtype {
+                        DType::F16 | DType::BF16 => TT::F32,
+                        DType::Bool => TT::U32,
+                        _ => dtype.into(),
+                    };
+                    TE::Builtin(
+                        "simd_shuffle".into(),
+                        vec![
+                            value.cast(transport),
+                            integer(
+                                BinaryOp::Rem,
+                                TE::variable(&e, TT::I32),
+                                TE::integer(SUBGROUP),
+                            )
+                            .cast(TT::U32),
+                        ],
+                        transport,
+                    )
+                    .cast(dtype.into())
+                } else {
+                    value
+                };
+                self.argmax_candidate(&best, &at, value, TE::variable(&k, TT::I32), dtype);
                 self.indent -= 1;
-                self.target(crate::terminal::Statement::End);
+                self.target(TS::End);
             }
             Realization::Distributed {
                 name: sn, slots, ..
@@ -4506,70 +4778,265 @@ impl Printer<'_> {
                     step: 1,
                 });
                 self.indent += 1;
-                self.line(&format!("const int e = int(lane) + {SUBGROUP} * {j};"));
-                self.line(&format!("const int k = (e / {inner_cap}) % {axis_cap};"));
-                self.line(&format!("if (e < {n_cap} && k < {axis_ext} && ((e / {inner_cap}) / {axis_cap}) * {inner_cap} + (e % {inner_cap}) == {o} && ({sn}[{j}] > {best} || ({sn}[{j}] == {best} && {tie_valid}k < {at}))) {{ {best} = {sn}[{j}]; {at} = k; }}"));
+                let e = self.fresh("element");
+                let k = self.fresh("k");
+                self.target(TS::Let {
+                    name: e.clone(),
+                    ty: TT::I32,
+                    value: integer(
+                        BinaryOp::Add,
+                        TE::variable("lane", TT::U32).cast(TT::I32),
+                        integer(
+                            BinaryOp::Mul,
+                            TE::integer(SUBGROUP),
+                            TE::variable(&j, TT::I32),
+                        ),
+                    ),
+                });
+                self.target(TS::Let {
+                    name: k.clone(),
+                    ty: TT::I32,
+                    value: integer(
+                        BinaryOp::Rem,
+                        integer(
+                            BinaryOp::Div,
+                            TE::variable(&e, TT::I32),
+                            TE::integer(inner_cap),
+                        ),
+                        TE::integer(axis_cap),
+                    ),
+                });
+                let output = integer(
+                    BinaryOp::Add,
+                    integer(
+                        BinaryOp::Mul,
+                        integer(
+                            BinaryOp::Div,
+                            integer(
+                                BinaryOp::Div,
+                                TE::variable(&e, TT::I32),
+                                TE::integer(inner_cap),
+                            ),
+                            TE::integer(axis_cap),
+                        ),
+                        TE::integer(inner_cap),
+                    ),
+                    integer(
+                        BinaryOp::Rem,
+                        TE::variable(&e, TT::I32),
+                        TE::integer(inner_cap),
+                    ),
+                );
+                let valid = Self::and(
+                    compare(BinaryOp::Lt, TE::variable(&e, TT::I32), TE::integer(n_cap)),
+                    Self::and(
+                        compare(BinaryOp::Lt, TE::variable(&k, TT::I32), axis_ext.clone()),
+                        compare(BinaryOp::Eq, output, TE::variable(&o, TT::I32)),
+                    ),
+                );
+                self.target(TS::If(valid));
+                self.indent += 1;
+                self.argmax_candidate(
+                    &best,
+                    &at,
+                    TE::Read {
+                        name: sn.clone(),
+                        index: Box::new(TE::variable(&j, TT::I32)),
+                        space: TSpa::Private,
+                        ty: dtype.into(),
+                    },
+                    TE::variable(&k, TT::I32),
+                    dtype,
+                );
                 self.indent -= 1;
-                self.target(crate::terminal::Statement::End);
-                self.line(&format!("{{ const {} m = simd_max({best}); {at} = simd_min({best} == m ? {at} : 0x7fffffff); }}", ctype(dtype)));
+                self.target(TS::End);
+                self.indent -= 1;
+                self.target(TS::End);
+                self.argmax_collective(&best, &at, dtype);
             }
             Realization::View { .. } => {
-                // Lanes stride through the reduced axis of the device view, then combine.
                 let k = self.fresh("k");
                 self.names.insert(k.clone(), k.clone());
                 let mut points = Vec::new();
-                for (d, _) in dims.iter().enumerate() {
+                for (d, dim) in dims.iter().enumerate() {
                     if d == axis {
                         points.push(Sym::param(&k));
                     } else {
-                        let outer: i64 = dims[d + 1..]
+                        let outer: i64 = dims
                             .iter()
-                            .filter(|_| true)
                             .enumerate()
-                            .map(|(i, dd)| if d + 1 + i == axis { 1 } else { dd.cap })
+                            .skip(d + 1)
+                            .map(|(i, dd)| if i == axis { 1 } else { dd.cap })
                             .product();
                         let c = self.fresh("c");
                         self.names.insert(c.clone(), c.clone());
-                        self.line(&format!(
-                            "const int {c} = ({o} / {outer}) % {};",
-                            dims[d].cap
-                        ));
+                        self.target(TS::Let {
+                            name: c.clone(),
+                            ty: TT::I32,
+                            value: integer(
+                                BinaryOp::Rem,
+                                integer(
+                                    BinaryOp::Div,
+                                    TE::variable(&o, TT::I32),
+                                    TE::integer(outer),
+                                ),
+                                TE::integer(dim.cap),
+                            ),
+                        });
                         points.push(Sym::param(&c));
                     }
                 }
-                let (start, step) = if algorithm == Algorithm::Collective {
-                    ("int(lane)", SUBGROUP)
-                } else {
-                    ("0", 1)
-                };
-                self.line(&format!(
-                    "for (int {k} = {start}; {k} < {axis_ext}; {k} += {step}) {{"
-                ));
+                let collective = algorithm == Algorithm::Collective;
+                self.target(TS::For {
+                    name: k.clone(),
+                    start: if collective {
+                        TE::variable("lane", TT::U32).cast(TT::I32)
+                    } else {
+                        TE::integer(0)
+                    },
+                    end: axis_ext.clone(),
+                    step: if collective { SUBGROUP } else { 1 },
+                });
                 self.indent += 1;
                 let (space, ptr, off, elem) = self.view_element(tv, &points)?;
-                let val = self.target_view_read(space, &ptr, &off, &elem)?.render();
-                let x = self.fresh("x");
-                self.line(&format!("const {} {x} = {val};", ctype(dtype)));
-                self.line(&format!("if ({x} > {best} || ({x} == {best} && {tie_valid}{k} < {at})) {{ {best} = {x}; {at} = {k}; }}"));
+                let value = self
+                    .target_view_read(space, &ptr, &off, &elem)?
+                    .cast(dtype.into());
+                self.argmax_candidate(&best, &at, value, TE::variable(&k, TT::I32), dtype);
                 self.indent -= 1;
-                self.target(crate::terminal::Statement::End);
-                if algorithm == Algorithm::Collective {
-                    self.line(&format!("{{ const {} m = simd_max({best}); {at} = simd_min({best} == m ? {at} : 0x7fffffff); }}", ctype(dtype)));
+                self.target(TS::End);
+                if collective {
+                    self.argmax_collective(&best, &at, dtype);
                 }
             }
-            _ => unreachable!(),
+            _ => return Err("argmax algorithm disagrees with input placement".into()),
         }
-        // An all-NaN row has no improving candidate; reference semantics
-        // select zero. Nonempty axes are established by the checked contract.
-        self.line(&format!("if ({at} == 0x7fffffff) {at} = 0;"));
+        // All-NaN and all-negative-infinity rows preserve the reference's index zero.
+        self.target(TS::Assign {
+            name: at.clone(),
+            value: TE::Select(
+                Box::new(compare(
+                    BinaryOp::Eq,
+                    TE::variable(&at, TT::I32),
+                    TE::integer(i64::from(i32::MAX)),
+                )),
+                Box::new(TE::integer(0)),
+                Box::new(TE::variable(&at, TT::I32)),
+            ),
+        });
         if scalar_result {
-            self.line(&format!("{name} = {at};"));
+            self.target(TS::Assign {
+                name,
+                value: TE::variable(at, TT::I32),
+            });
         } else {
-            self.line(&format!("{name}[{o}] = {at};"));
+            self.target(TS::Write {
+                name,
+                index: TE::variable(o, TT::I32),
+                space: TSpa::Private,
+                ty: TT::I32,
+                value: TE::variable(at, TT::I32),
+            });
         }
         self.indent -= 1;
-        self.target(crate::terminal::Statement::End);
+        self.target(TS::End);
         Ok(())
+    }
+
+    fn and(left: TE, right: TE) -> TE {
+        TE::ShortCircuit {
+            or: false,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    fn argmax_candidate(&mut self, best: &str, at: &str, value: TE, index: TE, dtype: DType) {
+        let x = self.fresh("candidate");
+        self.target(TS::Let {
+            name: x.clone(),
+            ty: dtype.into(),
+            value,
+        });
+        let value = TE::variable(&x, dtype.into());
+        let compare = |op, a, b| TE::binary(op, a, b, TT::Bool);
+        let earlier = compare(BinaryOp::Lt, index.clone(), TE::variable(at, TT::I32));
+        let earlier = if dtype.is_float() {
+            Self::and(
+                compare(
+                    BinaryOp::Ne,
+                    TE::variable(at, TT::I32),
+                    TE::integer(i64::from(i32::MAX)),
+                ),
+                earlier,
+            )
+        } else {
+            earlier
+        };
+        let condition = TE::ShortCircuit {
+            or: true,
+            left: Box::new(compare(
+                BinaryOp::Gt,
+                value.clone(),
+                TE::variable(best, dtype.into()),
+            )),
+            right: Box::new(Self::and(
+                compare(
+                    BinaryOp::Eq,
+                    value.clone(),
+                    TE::variable(best, dtype.into()),
+                ),
+                earlier,
+            )),
+        };
+        self.target(TS::If(condition));
+        self.indent += 1;
+        self.target(TS::Assign {
+            name: best.into(),
+            value,
+        });
+        self.target(TS::Assign {
+            name: at.into(),
+            value: index,
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+    }
+
+    fn argmax_collective(&mut self, best: &str, at: &str, dtype: DType) {
+        let maximum = self.fresh("maximum");
+        let transport = match dtype {
+            DType::F16 | DType::BF16 => TT::F32,
+            DType::Bool => TT::U32,
+            _ => dtype.into(),
+        };
+        self.target(TS::Let {
+            name: maximum.clone(),
+            ty: dtype.into(),
+            value: TE::Builtin(
+                "simd_max".into(),
+                vec![TE::variable(best, dtype.into()).cast(transport)],
+                transport,
+            )
+            .cast(dtype.into()),
+        });
+        self.target(TS::Assign {
+            name: at.into(),
+            value: TE::Builtin(
+                "simd_min".into(),
+                vec![TE::Select(
+                    Box::new(TE::binary(
+                        BinaryOp::Eq,
+                        TE::variable(best, dtype.into()),
+                        TE::variable(maximum, dtype.into()),
+                        TT::Bool,
+                    )),
+                    Box::new(TE::variable(at, TT::I32)),
+                    Box::new(TE::integer(i64::from(i32::MAX))),
+                )],
+                TT::I32,
+            ),
+        });
     }
 
     /// Write this part's carried state to compiler-allocated scratch, one region per
@@ -4585,28 +5052,31 @@ impl Printer<'_> {
             .memory
             .scratch()
             .iter()
-            .filter(|s| s.phase == phase)
+            .filter(|s| s.phase == phase && s.parameter.is_none())
             .cloned()
             .collect();
         if scratch.len() != carried.len() {
             return Err("split scratch plan does not match carried values".into());
         }
         for (v, allocation) in carried.iter().zip(scratch) {
-            let (name, cap) = match self.real.get(v) {
-                Some(Realization::Replicated { name, dims, .. })
-                | Some(Realization::Shared { name, dims, .. }) => (
-                    name.clone(),
-                    dims.iter().map(|d| d.cap).product::<i64>().max(1),
-                ),
+            let (name, cap, slots, space, distributed) = match self.real.get(v) {
+                Some(Realization::Replicated { name, dims, .. }) => {
+                    let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
+                    (name.clone(), cap, cap, TSpa::Private, false)
+                }
+                Some(Realization::Shared { name, dims, .. }) => {
+                    let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
+                    (name.clone(), cap, cap, TSpa::Threadgroup, false)
+                }
                 Some(Realization::Distributed {
                     name, dims, slots, ..
-                }) => {
-                    let _ = slots;
-                    (
-                        name.clone(),
-                        dims.iter().map(|d| d.cap).product::<i64>().max(1),
-                    )
-                }
+                }) => (
+                    name.clone(),
+                    dims.iter().map(|d| d.cap).product::<i64>().max(1),
+                    *slots,
+                    TSpa::Private,
+                    true,
+                ),
                 other => {
                     return Err(format!(
                         "carried tile is {other:?}; splitting cannot publish it"
@@ -4620,9 +5090,79 @@ impl Printer<'_> {
                 return Err("published partial value disagrees with scratch plan".into());
             }
             let buf = format!("split_{}", allocation.index);
-            let parts = allocation.parts;
             let i = self.fresh("i");
-            self.line(&format!("if (lane == 0) for (int {i} = 0; {i} < {cap}; ++{i}) {buf}[(uint({row}) * {parts} + uint(part)) * {cap} + uint({i})] = {name}[{i}];"));
+            if !distributed {
+                self.target(TS::If(TE::binary(
+                    BinaryOp::Eq,
+                    TE::variable("lane", TT::U32),
+                    TE::Integer(0, TT::U32),
+                    TT::Bool,
+                )));
+                self.indent += 1;
+            }
+            self.target(TS::For {
+                name: i.clone(),
+                start: TE::integer(0),
+                end: TE::integer(slots),
+                step: 1,
+            });
+            self.indent += 1;
+            let element = if distributed {
+                TE::binary(
+                    BinaryOp::Add,
+                    TE::variable("lane", TT::U32),
+                    TE::binary(
+                        BinaryOp::Mul,
+                        TE::Integer(SUBGROUP, TT::U32),
+                        TE::variable(&i, TT::I32).cast(TT::U32),
+                        TT::U32,
+                    ),
+                    TT::U32,
+                )
+            } else {
+                TE::variable(&i, TT::I32).cast(TT::U32)
+            };
+            if distributed {
+                self.target(TS::If(TE::binary(
+                    BinaryOp::Lt,
+                    element.clone(),
+                    TE::Integer(cap, TT::U32),
+                    TT::Bool,
+                )));
+                self.indent += 1;
+            }
+            let base = TE::binary(
+                BinaryOp::Mul,
+                TE::binary(
+                    BinaryOp::Add,
+                    TE::binary(
+                        BinaryOp::Mul,
+                        TE::variable(row, TT::U32),
+                        TE::Integer(allocation.parts as i64, TT::U32),
+                        TT::U32,
+                    ),
+                    TE::variable("part", TT::I32).cast(TT::U32),
+                    TT::U32,
+                ),
+                TE::Integer(cap, TT::U32),
+                TT::U32,
+            );
+            self.target(TS::Write {
+                name: buf,
+                index: TE::binary(BinaryOp::Add, base, element, TT::U32),
+                space: TSpa::Device,
+                ty: TT::F32,
+                value: TE::Read {
+                    name,
+                    index: Box::new(TE::variable(&i, TT::I32)),
+                    space,
+                    ty: TT::F32,
+                },
+            });
+            self.indent -= 1;
+            self.target(TS::End);
+            self.indent -= 1;
+            self.target(TS::End);
         }
         Ok(())
     }
@@ -4642,7 +5182,7 @@ impl Printer<'_> {
             .memory
             .scratch()
             .iter()
-            .filter(|s| s.phase == phase)
+            .filter(|s| s.phase == phase && s.parameter.is_none())
             .cloned()
             .collect();
         if carried.len() != scratch.len() || carried.len() != merges.len() {
@@ -4669,18 +5209,82 @@ impl Printer<'_> {
             if cap != 1 {
                 return Err("scalar merge state has non-scalar capacity".into());
             }
+            let space = if shared {
+                TSpa::Threadgroup
+            } else {
+                TSpa::Private
+            };
             if shared {
-                self.line("if (lane == 0) {");
+                self.target(TS::If(TE::binary(
+                    BinaryOp::Eq,
+                    TE::variable("lane", TT::U32),
+                    TE::Integer(0, TT::U32),
+                    TT::Bool,
+                )));
                 self.indent += 1;
             }
-            self.line(&format!("{name}[0] = {buf}[item * {parts}];"));
+            let base = TE::binary(
+                BinaryOp::Mul,
+                TE::variable("item", TT::U32),
+                TE::Integer(parts as i64, TT::U32),
+                TT::U32,
+            );
+            self.target(TS::Write {
+                name: name.clone(),
+                index: TE::integer(0),
+                space,
+                ty: TT::F32,
+                value: TE::Read {
+                    name: buf.clone(),
+                    index: Box::new(base.clone()),
+                    space: TSpa::Device,
+                    ty: TT::F32,
+                },
+            });
             let p = self.fresh("part");
-            match merge {
-                execution::Merge::Sum => self.line(&format!("for (int {p} = 1; {p} < {parts}; ++{p}) {name}[0] += {buf}[item * {parts} + uint({p})];")),
-            }
+            self.target(TS::For {
+                name: p.clone(),
+                start: TE::integer(1),
+                end: TE::integer(parts as i64),
+                step: 1,
+            });
+            self.indent += 1;
+            let partial = TE::Read {
+                name: buf,
+                index: Box::new(TE::binary(
+                    BinaryOp::Add,
+                    base,
+                    TE::variable(p, TT::I32).cast(TT::U32),
+                    TT::U32,
+                )),
+                space: TSpa::Device,
+                ty: TT::F32,
+            };
+            let value = match merge {
+                execution::Merge::Sum => TE::binary(
+                    BinaryOp::Add,
+                    TE::Read {
+                        name: name.clone(),
+                        index: Box::new(TE::integer(0)),
+                        space,
+                        ty: TT::F32,
+                    },
+                    partial,
+                    TT::F32,
+                ),
+            };
+            self.target(TS::Write {
+                name,
+                index: TE::integer(0),
+                space,
+                ty: TT::F32,
+                value,
+            });
+            self.indent -= 1;
+            self.target(TS::End);
             if shared {
                 self.indent -= 1;
-                self.target(crate::terminal::Statement::End);
+                self.target(TS::End);
             }
             self.barrier(BarrierSite {
                 operation,
@@ -4911,16 +5515,6 @@ impl Printer<'_> {
         Ok(())
     }
 
-    // Generic reads are checked as F32 even when specialization binds a narrow
-    // storage type. Preserve the checked expression type before native overload
-    // resolution or arithmetic, including when a load borrows device storage.
-    fn read_publication(&self, value: String, ty: &Ty) -> String {
-        match scalar_dtype(ty) {
-            Some(dtype) => format!("{}({value})", ctype(dtype)),
-            None => value,
-        }
-    }
-
     fn target_expr(&mut self, e: &Expr) -> Result<crate::terminal::Expression, String> {
         use crate::terminal::{Expression as E, Type as T};
         let ty = scalar_dtype(&e.ty).map(T::from).unwrap_or(T::I32);
@@ -4929,14 +5523,22 @@ impl Printer<'_> {
             ExprKind::Float(n) => E::Float(n.to_bits(), ty),
             ExprKind::Bool(v) => E::Integer(i64::from(*v), T::Bool),
             ExprKind::Var(v) => match self.real.get(v) {
-                Some(Realization::Scalar { name }) if *v < self.f.params.len() => E::Parameter {
-                    name: name.clone(),
-                    ty,
-                },
+                Some(Realization::Scalar { name }) if *v < self.execution.source().params.len() => {
+                    E::Parameter {
+                        name: name.clone(),
+                        ty,
+                    }
+                }
                 Some(Realization::Scalar { name }) | Some(Realization::Index { name }) => {
                     E::variable(name.clone(), ty)
                 }
-                _ => E::Unmapped(self.expr(e)?, ty),
+                None if e.sym.is_some() => self.target_sym(e.sym.as_ref().unwrap())?.cast(ty),
+                other => {
+                    return Err(format!(
+                        "compiler error: scalar `{}` has no typed Metal realization: {other:?}",
+                        self.vars()[*v].name
+                    ));
+                }
             },
             ExprKind::ShapeParam(_) => {
                 self.target_sym(e.sym.as_ref().ok_or("shape value lacks symbol")?)?
@@ -5095,12 +5697,16 @@ impl Printer<'_> {
                 E::Builtin(
                     name.into(),
                     args.iter()
-                        .map(|a| self.target_expr(a))
+                        .map(|a| self.target_expr(a).map(|value| value.cast(ty)))
                         .collect::<Result<_, _>>()?,
                     ty,
                 )
             }
-            _ => E::Unmapped(self.expr(e)?, ty),
+            other => {
+                return Err(format!(
+                    "compiler error: expression has no typed Metal realization: {other:?}"
+                ));
+            }
         })
     }
     /// Establish view metadata and guards before reading its logical extent.
@@ -5181,248 +5787,6 @@ impl Printer<'_> {
         Ok(sum.unwrap_or_else(|| E::integer(0)))
     }
 
-    fn expr(&mut self, e: &Expr) -> Result<String, String> {
-        match &e.kind {
-            ExprKind::Load { .. } => {
-                Err("selected load requires an explicit IR value binding".into())
-            }
-
-            ExprKind::Int(v) => Ok(match e.ty {
-                Ty::Scalar(d) if d.is_float() => format!("{}f", *v as f64),
-                _ => v.to_string(),
-            }),
-            ExprKind::ShapeParam(_) => self.sym(e.sym.as_ref().unwrap()),
-            ExprKind::Float(v) => Ok(if v.is_infinite() {
-                if *v > 0.0 {
-                    "INFINITY".into()
-                } else {
-                    "-INFINITY".into()
-                }
-            } else {
-                format!("{v:?}f")
-            }),
-            ExprKind::Bool(b) => Ok(b.to_string()),
-            ExprKind::Var(v) => match self.real.get(v).cloned() {
-                Some(Realization::Scalar { name })
-                | Some(Realization::Index { name })
-                | Some(Realization::Frag { name }) => Ok(name),
-                Some(other) => Err(format!(
-                    "`{}` ({other:?}) used as a value",
-                    self.vars()[*v].name
-                )),
-                None => match e.sym.as_ref() {
-                    Some(s) => self.sym(s),
-                    None => Err(format!("`{}` is not realized", self.vars()[*v].name)),
-                },
-            },
-            ExprKind::Index { base, indices } => {
-                let ExprKind::Var(tv) = base.kind else {
-                    // Transposition changes coordinates, not storage ownership.
-                    // Recurse so materialized and distributed tiles retain their
-                    // ordinary checked element reads just like borrowed views.
-                    if let ExprKind::Transpose(inner) = &base.kind {
-                        if indices.len() != 2 {
-                            return Err("transpose element read requires two indices".into());
-                        }
-                        let mut read = e.clone();
-                        read.kind = ExprKind::Index {
-                            base: inner.clone(),
-                            indices: vec![indices[1].clone(), indices[0].clone()],
-                        };
-                        return self.expr(&read);
-                    }
-                    if let ExprKind::Accessor { base: inner, name } = &base.kind {
-                        let value = self.accessor_element(inner, name, indices)?;
-                        return Ok(self.read_publication(value, &e.ty));
-                    }
-                    // A view expression (transpose or slice of a view): read through it.
-                    let Realization::View {
-                        space,
-                        param,
-                        elem,
-                        offset,
-                        strides,
-                        shape,
-                    } = self.view_of(base)?
-                    else {
-                        unreachable!()
-                    };
-                    let mut off = offset;
-                    for ((i, st), extent) in indices.iter().zip(&strides).zip(&shape) {
-                        let Index::Point(p) = i else {
-                            return Err("slice in an element read".into());
-                        };
-                        let v = self.int_value(p)?;
-                        let v = self.checked_index(&v, extent)?;
-                        off = off.add(&v.mul(st));
-                    }
-                    let value = self.target_view_read(space, &param, &off, &elem)?.render();
-                    return Ok(self.read_publication(value, &e.ty));
-                };
-                let value = self.tile_element(tv, indices)?;
-                Ok(self.read_publication(value, &e.ty))
-            }
-            ExprKind::Accessor { .. } => Err("a packet accessor must be indexed".into()),
-            ExprKind::Intrinsic { op: name, args } => match name {
-                seismic_lang::intrinsics::Operation::LaneIndex
-                | seismic_lang::intrinsics::Operation::ShuffleIndex => {
-                    self.target_expr(e).map(|e| e.render())
-                }
-                seismic_lang::intrinsics::Operation::SimdSum
-                | seismic_lang::intrinsics::Operation::SimdMax
-                | seismic_lang::intrinsics::Operation::SimdMin => {
-                    let a = self.expr(&args[0])?;
-                    let implementation = self.collective(*name)?;
-                    let builtin = implementation
-                        .metal_builtin()
-                        .ok_or("scalar collective has no builtin")?;
-                    Ok(format!("{builtin}({a})"))
-                }
-                seismic_lang::intrinsics::Operation::Matrix => {
-                    Err("simdgroup_matrix must be assigned to a variable".into())
-                }
-                other @ (seismic_lang::intrinsics::Operation::MatrixLoad
-                | seismic_lang::intrinsics::Operation::MatrixLoadTranspose
-                | seismic_lang::intrinsics::Operation::MatrixStore
-                | seismic_lang::intrinsics::Operation::MatrixMultiplyAccumulate) => {
-                    Err(format!("intrinsic `{other}` in expression position"))
-                }
-            },
-            ExprKind::Builtin {
-                name: Builtin::Reduce,
-                ..
-            } => Err("reduction expression reached emission without an IR binding".into()),
-            ExprKind::Builtin {
-                name: Builtin::Extent,
-                args,
-            } => self.target_extent(args).map(|e| e.render()),
-            ExprKind::Builtin { name, args } => {
-                let result = scalar_dtype(&e.ty);
-                let mut a: Vec<String> = Vec::new();
-                for x in args {
-                    let t = self.expr(x)?;
-                    a.push(match result {
-                        Some(d) if !matches!(name, Builtin::Extent) => self.coerce(t, &x.ty, d),
-                        _ => t,
-                    });
-                }
-                Ok(match name {
-                    Builtin::Fma => format!("fma({}, {}, {})", a[0], a[1], a[2]),
-                    Builtin::Exp => format!("exp({})", a[0]),
-                    Builtin::ExpFast => format!("fast::exp({})", a[0]),
-                    Builtin::Rsqrt => format!("rsqrt({})", a[0]),
-                    Builtin::Sqrt => format!("sqrt({})", a[0]),
-                    Builtin::Log => format!("log({})", a[0]),
-                    Builtin::Sin => format!("sin({})", a[0]),
-                    Builtin::Cos => format!("cos({})", a[0]),
-                    Builtin::Abs => format!("abs({})", a[0]),
-                    Builtin::Max => format!("max({}, {})", a[0], a[1]),
-                    Builtin::Min => format!("min({}, {})", a[0], a[1]),
-                    Builtin::Extent => self.sym(e.sym.as_ref().unwrap())?,
-                    Builtin::Reshape
-                    | Builtin::Load
-                    | Builtin::Store
-                    | Builtin::Atomic
-                    | Builtin::Reduce => return Err(format!("{name:?} is a statement")),
-                })
-            }
-            ExprKind::Unary { op, expr } => {
-                let x = self.expr(expr)?;
-                Ok(match op {
-                    UnaryOp::Neg => format!("(-{x})"),
-                    UnaryOp::Not => format!("(!{x})"),
-                    UnaryOp::BitNot => format!("(~{x})"),
-                })
-            }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.expr(lhs)?;
-                let r = self.expr(rhs)?;
-                let is_cmp = matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                );
-                let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
-                let (l, r) = if is_shift {
-                    (l, r)
-                } else {
-                    let target = if is_cmp {
-                        match (scalar_dtype(&lhs.ty), scalar_dtype(&rhs.ty)) {
-                            (Some(a), Some(b)) => DType::promote(a, b),
-                            _ => None,
-                        }
-                    } else {
-                        scalar_dtype(&e.ty)
-                    };
-                    match target {
-                        Some(d) => (self.coerce(l, &lhs.ty, d), self.coerce(r, &rhs.ty, d)),
-                        None => (l, r),
-                    }
-                };
-                if is_shift {
-                    let ty = ctype(scalar_dtype(&lhs.ty).ok_or("shift operand type missing")?);
-                    return Ok(format!(
-                        "seismic_shift({ty}({l}),long({r}),{},seismic_status)",
-                        if *op == BinaryOp::Shl {
-                            "true"
-                        } else {
-                            "false"
-                        }
-                    ));
-                }
-                if matches!(op, BinaryOp::Div | BinaryOp::Rem) {
-                    if let Some(dtype) = scalar_dtype(&e.ty).filter(|d| d.is_int()) {
-                        let ty = if dtype == DType::U32 { "uint" } else { "int" };
-                        return Ok(format!(
-                            "seismic_integer_division({ty}({l}), {ty}({r}), {}, seismic_status)",
-                            if *op == BinaryOp::Rem {
-                                "true"
-                            } else {
-                                "false"
-                            }
-                        ));
-                    }
-                }
-                // Logical operands are evaluated eagerly, matching the portable
-                // interpreter and typed scalar realization. Use `if` to guard work.
-                if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                    return Ok(format!(
-                        "bool(({l}) {} ({r}))",
-                        if *op == BinaryOp::And { "&" } else { "|" }
-                    ));
-                }
-                let o = match op {
-                    BinaryOp::And | BinaryOp::Or => unreachable!(),
-                    other => other.text(),
-                };
-                Ok(format!("({l} {o} {r})"))
-            }
-            ExprKind::Cast { dtype, expr } => {
-                let x = self.expr(expr)?;
-                Ok(format!("{}({x})", ctype(*dtype)))
-            }
-            ExprKind::Tuple(_) => Err("tuple in expression position".into()),
-            ExprKind::TileAlloc { .. } => {
-                Err("tile allocation must be assigned to a variable".into())
-            }
-            ExprKind::Transpose(_) => Err("transpose in expression position".into()),
-            ExprKind::Lanes { .. } => Err("lanes in expression position".into()),
-            ExprKind::Call { .. } => Err("call in expression position after inlining".into()),
-        }
-    }
-
-    fn accessor_element(
-        &mut self,
-        base: &Expr,
-        name: &str,
-        indices: &[Index],
-    ) -> Result<String, String> {
-        Ok(self.target_accessor(base, name, indices)?.render())
-    }
     fn target_accessor(
         &mut self,
         base: &Expr,
@@ -5530,19 +5894,6 @@ fn row_major_syms(shape: &[i64]) -> Vec<Sym> {
     strides.into_iter().map(Sym::constant).collect()
 }
 
-fn reduction_identity(identity: seismic_lang::reduction::Identity) -> &'static str {
-    use seismic_lang::reduction::Identity;
-    match identity {
-        Identity::Zero => "0",
-        Identity::One => "1",
-        Identity::NegativeInfinity => "-INFINITY",
-        Identity::PositiveInfinity => "INFINITY",
-        Identity::MinI32 => "(-2147483647 - 1)",
-        Identity::MaxI32 => "2147483647",
-        Identity::MaxU32 => "0xffffffffu",
-    }
-}
-
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
@@ -5578,7 +5929,7 @@ mod allocation_tests {
             .find(|statement| statement.id == Some(first))
             .unwrap();
         statement.id = Some(second);
-        execution.emission = Default::default();
+        execution.invalidate_terminal();
         assert!(
             emit_execution(&execution)
                 .unwrap_err()
@@ -5610,7 +5961,7 @@ mod allocation_tests {
             .find(|statement| matches!(statement.kind, StmtKind::Owned { .. }))
             .unwrap();
         owned.id = Some(OperationId(usize::MAX));
-        execution.emission = Default::default();
+        execution.invalidate_terminal();
         assert!(
             emit_execution(&execution)
                 .unwrap_err()

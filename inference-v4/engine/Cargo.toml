@@ -5,13 +5,24 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magnitude-templates = { path = "../templates" }
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+llguidance = { version = "=1.8.0", default-features = false, features = ["lark", "ahash"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+bytes = "=1.12.1"
+hyper = { version = "=1.8.1", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+tokio = { version = "=1.53.0", features = ["rt", "net", "sync", "macros", "io-util", "time"] }
 seismic-lang.workspace = true
 seismic-std.workspace = true
 seismic-runtime.workspace = true
 
 [dev-dependencies]
+seismic-cpu.workspace = true
 seismic-accounting.workspace = true
 seismic-realization.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+seismic-metal.workspace = true

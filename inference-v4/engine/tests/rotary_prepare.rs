@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 fn exercise(device: Device, candidate: Candidate) {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../validation/fixtures/qwen-rotary-reference.json"
+        "../../validation/results/fixtures/qwen-rotary-reference.json"
     ))
     .unwrap();
     let program = seismic_std::program().unwrap();

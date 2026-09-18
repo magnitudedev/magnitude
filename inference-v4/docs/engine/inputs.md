@@ -17,6 +17,15 @@ input. Host preprocessing and neural encoding have different owners. Unsupported
 media or artifact combinations fail explicitly rather than silently changing input.
 Text-only use keeps modality resources lazy.
 
+Prepared host tensors use immutable binary payloads with explicit names, dtypes,
+and shapes. Multibyte values are little-endian; supported host payload dtypes are
+float32, int32, int64, and uint8. Geometry must exactly match payload size. Tensor
+rank, tensor count, and aggregate prepared bytes are bounded before publication.
+Duplicate tensor names fail. Preparation identity includes the processor identity
+and every tensor's ordered name, dtype, shape, and bytes. Cloning shares immutable
+payloads rather than creating mutable aliases. Host dtype support does not imply
+that every model encoder accepts every dtype.
+
 ## Semantic spans
 
 | Property | Meaning |
@@ -32,6 +41,15 @@ Text-only use keeps modality resources lazy.
 - A soft service allowance may expand to finish the first indivisible unit; physical
   capacity limits still apply.
 - Physical pages do not define semantic input boundaries.
+
+For Qwen images, prepared patch tensors must match the bound processor identity,
+patch width, finite-value domain, and exact merge-aligned single-frame grids.
+Every image owns one matching marked prompt span and its patch slice. Image spans
+are causal and excluded from language history. Rotary coordinates advance through
+the merged spatial grid; later text continues from its maximum axis extent rather
+than from the physical token count. Conditioning identity includes processor, grid,
+and patch bytes. Encoder spatial controls preserve merge-group patch order and
+align-corners interpolation of the learned position table.
 
 ## Execution and lifetime
 

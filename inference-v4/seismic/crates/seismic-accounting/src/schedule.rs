@@ -8,8 +8,11 @@ mod demand;
 mod intervals;
 pub use demand::Demand;
 pub mod static_order;
+pub mod structured;
+pub mod evaluation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum CapacityUnit {
     Slots,
     Bytes,
@@ -18,12 +21,14 @@ pub enum CapacityUnit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Timebase {
     pub seconds_numerator: u64,
     pub seconds_denominator: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Resource {
     pub name: String,
     pub capacity: u64,

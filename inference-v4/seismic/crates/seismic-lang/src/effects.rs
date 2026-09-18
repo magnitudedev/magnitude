@@ -67,7 +67,7 @@ pub fn stream_load_can_borrow(body: &[Stmt], var: VarId, source: &Expr) -> bool 
         .any(|stmt| tensor_effect(stmt) || tile_mutated(stmt, var) || roots.iter().any(|v|tile_mutated(stmt,*v)))
 }
 
-fn expressions(e: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
+pub(crate) fn expressions(e: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
     if predicate(e) {
         return true;
     }
@@ -213,4 +213,58 @@ pub fn tile_mutated(s: &Stmt, var: VarId) -> bool {
             .any(|s| tile_mutated(s, var)),
         _ => false,
     }
+}
+
+/// Tensor inputs are immutable only when no store can reach their backing.
+/// Tensor views alias; loaded tiles and scalar values are independent snapshots.
+/// Unresolved calls conservatively may write any tensor passed to them.
+pub fn tensor_parameter_read_only(body: &[Stmt], root: VarId) -> bool {
+    use std::collections::HashSet;
+    fn backing(e: &Expr) -> Option<VarId> {
+        match &e.kind {
+            ExprKind::Var(v) => Some(*v),
+            ExprKind::Index { base, .. } | ExprKind::Transpose(base) => backing(base),
+            ExprKind::Builtin { name: Builtin::Reshape, args } => args.first().and_then(backing),
+            _ => None,
+        }
+    }
+    fn walk(body: &[Stmt], visit: &mut impl FnMut(&Stmt)) {
+        for s in body {
+            visit(s);
+            match &s.kind {
+                StmtKind::Range { body, .. } | StmtKind::Parallel { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::Lanes { body, .. }
+                | StmtKind::LoadLoop { body, .. } => walk(body, visit),
+                StmtKind::If { then, els, .. } => { walk(then, visit); walk(els, visit); }
+                StmtKind::Reduction(r) => for body in r.bodies() { walk(body, visit); },
+                _ => {}
+            }
+        }
+    }
+    let mut aliases = HashSet::from([root]);
+    loop {
+        let before = aliases.len();
+        walk(body, &mut |s| {
+            if let StmtKind::Assign { target, value, .. } = &s.kind {
+                if matches!(value.ty, crate::types::Ty::Tensor(_)) && backing(value).is_some_and(|v| aliases.contains(&v)) {
+                    if let ExprKind::Var(v) = target.kind { aliases.insert(v); }
+                }
+            }
+        });
+        if before == aliases.len() { break; }
+    }
+    let aliases_input = |e: &Expr| backing(e).is_some_and(|v| aliases.contains(&v));
+    let mut writes_element = false;
+    walk(body, &mut |s| {
+        if let StmtKind::Assign { target, .. } = &s.kind {
+            if matches!(target.kind, ExprKind::Index { .. }) && aliases_input(target) { writes_element = true; }
+        }
+    });
+    !writes_element && !body.iter().any(|s| statement(s, &|e| match &e.kind {
+        ExprKind::Builtin { name: Builtin::Store, args } => args.get(1).is_none_or(&aliases_input),
+        ExprKind::Builtin { name: Builtin::Atomic, args } => args.first().is_none_or(&aliases_input),
+        ExprKind::Call { args, .. } => args.iter().any(&aliases_input),
+        ExprKind::Intrinsic { op, args } => op.writes_arguments().iter().any(|&i| args.get(i).is_none_or(&aliases_input)),
+        _ => false,
+    }))
 }

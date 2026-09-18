@@ -1,0 +1,17 @@
+# Two-pass centered FP32 statistics; affine output publishes exactly once at V.
+# The caller supplies finite positive epsilon.
+fn layer_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, bias: tensor[W] B,
+    out: tensor[R, W] V, epsilon: f32):
+  for row in parallel:
+    values = load(x[row])
+    source = tile[W] f32
+    for i in owned(source): source[i] = f32(values[i])
+    mean = reduce(source, 0, sum) / f32(W)
+    squared = tile[W] f32
+    for i in owned(squared): squared[i] = (source[i] - mean) * (source[i] - mean)
+    inverse = rsqrt(reduce(squared, 0, sum) / f32(W) + epsilon)
+    scale = load(weight)
+    shift = load(bias)
+    result = tile[W] f32
+    for i in owned(result): result[i] = (source[i] - mean) * inverse * f32(scale[i]) + f32(shift[i])
+    store(result, out[row])

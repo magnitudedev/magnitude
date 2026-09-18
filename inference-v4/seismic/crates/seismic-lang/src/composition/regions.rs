@@ -803,9 +803,9 @@ fn substitute(
     };
     direct_exprs_mut(s, &mut |e| expression(e));
     if let StmtKind::Reduction(r) = &mut s.kind {
-        expression(&mut r.merge);
+        if let Some(call) = r.merge.source_mut() { expression(call); }
         if let Some(step) = &mut r.step {
-            expression(&mut step.call);
+            if let Some(call) = step.call.source_mut() { expression(call); }
         }
         for m in r.implementations_mut() {
             for e in m.left.iter_mut().chain(&mut m.right).chain(&mut m.output) {
@@ -845,9 +845,9 @@ fn substitute(
             }
         }
         StmtKind::Reduction(r) => {
-            map_expr(&mut r.merge, rename, atoms);
+            if let Some(call) = r.merge.source_mut() { map_expr(call, rename, atoms); }
             if let Some(step) = &mut r.step {
-                map_expr(&mut step.call, rename, atoms);
+                if let Some(call) = step.call.source_mut() { map_expr(call, rename, atoms); }
             }
             for m in r.implementations_mut() {
                 for e in m.left.iter_mut().chain(&mut m.right).chain(&mut m.output) {

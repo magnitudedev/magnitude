@@ -24,6 +24,7 @@ pub mod span;
 pub mod split;
 pub mod sym;
 pub mod types;
+pub mod verify;
 pub mod widen;
 pub mod token;
 

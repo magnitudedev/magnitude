@@ -835,3 +835,48 @@ fn cuda_grouped_contractions_share_bounded_pieces_and_preserve_state() {
     shared_bounded_pieces(&device, candidate.clone());
     bounded_state_dependencies(&device, candidate);
 }
+
+fn compact_epilogues(device: Device, candidate: Candidate) {
+    use seismic_lang::lowered_ir::GroupEpilogue;
+    let text = source("independent").replace(" + bias", " + f32(column) * 0.125");
+    let p = program(&text, device.backend(), "lower first: portable\nlower second: portable\n");
+    for width in [2, 5] {
+        for serial in [false, true] {
+            let mut epilogues = 0;
+            let ir = lower_selected(&p, "evaluate", device.backend(), &Default::default(), &Default::default(), &Options::default(), &mut |d| Ok(match d.kind {
+                DecisionKind::OutputGroup { .. } => Alternative::OutputWidth(width),
+                DecisionKind::GroupEpilogue { .. } => { epilogues += 1; Alternative::GroupEpilogue(if serial { GroupEpilogue::Serial } else { GroupEpilogue::Unrolled }) },
+                DecisionKind::OutputRemainders { .. } => Alternative::Concatenate,
+                DecisionKind::Stream { maximum, .. } => Alternative::StreamCapacity(maximum),
+                _ => d.alternatives.get(0).unwrap(),
+            })).unwrap();
+            assert_eq!(epilogues, 1);
+            execute(&device, candidate.clone(), &ir, "independent");
+            if serial {
+                assert!(ir.vars.iter().any(|v| v.name.starts_with("group_epilogue_")));
+            }
+        }
+    }
+    // Intervening state and live per-slot scalars are kept by the original form;
+    // a compact suffix cannot silently recompute or forget those values.
+    for mode in ["independent", "dependent", "same"] {
+        let p = program(&source(mode), device.backend(), "lower first: portable\nlower second: portable\n");
+        let ir = lower(&p, device.backend(), 2, [3,3]);
+        assert!(!ir.decisions.iter().any(|d| matches!(d.domain.kind, DecisionKind::GroupEpilogue { .. })));
+    }
+}
+#[test]
+fn cpu_compact_group_epilogues_preserve_rounded_outputs_and_partial_rectangles() {
+    compact_epilogues(Device::cpu(), Candidate::Cpu { loads: LoadStrategy::BorrowProvenReadOnly });
+}
+#[cfg(target_os="macos")]
+#[test]
+#[ignore="requires Metal hardware"]
+fn metal_compact_group_epilogues_preserve_rounded_outputs_and_partial_rectangles() {
+    compact_epilogues(Device::metal().unwrap(), Candidate::Metal(Default::default()));
+}
+#[test]
+#[ignore="requires CUDA hardware"]
+fn cuda_compact_group_epilogues_preserve_rounded_outputs_and_partial_rectangles() {
+    compact_epilogues(Device::cuda(0).unwrap(), Candidate::Cuda { options: seismic_realization::ScalarOptions { dispatch: seismic_realization::Dispatch::ParallelRoot, loads: LoadStrategy::BorrowProvenReadOnly }, threads_per_block: 64 });
+}

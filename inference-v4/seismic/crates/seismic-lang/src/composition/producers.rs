@@ -2,6 +2,8 @@
 //! projected value remains a snapshot and retains every intermediate conversion.
 use super::*;
 mod geometry;
+mod sharing;
+pub(super) use sharing::select as share;
 
 struct Projection {
     body: Vec<Stmt>,

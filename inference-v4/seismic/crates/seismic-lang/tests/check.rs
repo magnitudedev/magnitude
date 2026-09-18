@@ -325,3 +325,15 @@ fn symbolic_slice_endpoints_keep_static_bounds_obligations() {
     let es = errors(&[file("endpoints.seismic.portable", source)], &[]);
     assert!(es.is_empty(), "{es:#?}");
 }
+
+#[test]
+fn affine_tail_guards_bound_the_access_in_their_own_branch() {
+    let source = "fn copy[M](x:tensor[M] f32,out:tensor[M] f32):\n  a=load(x)\n  y=tile[M] f32\n  for p in owned(y): y[p]=0.0\n  for block in range((M+7)/8):\n    for lane in range(8):\n      if block*8+lane<M: y[block*8+lane]=a[block*8+lane]\n  store(y,out)\n";
+    assert!(errors(&[file("guard.seismic.portable", source)], &[]).is_empty());
+    for wrong in [source.replace("block*8+lane<M", "block*8+lane<=M"), source.replace("block*8+lane<M", "lane<M"), source.replace("if block*8+lane<M: ", "")] {
+        let errors = errors(&[file("guard.seismic.portable", &wrong)], &[]);
+        assert!(errors.iter().any(|error| error.contains("index may exceed extent")), "{errors:?}");
+    }
+    let after = source.replace("  store(y,out)", "      y[block*8+lane]=a[block*8+lane]\n  store(y,out)");
+    assert!(errors(&[file("guard.seismic.portable", &after)], &[]).iter().any(|error| error.contains("index may exceed extent")), "a completed guard cannot constrain the next access");
+}

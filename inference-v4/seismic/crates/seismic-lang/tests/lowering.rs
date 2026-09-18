@@ -87,6 +87,7 @@ fn stream_piece_domains_are_independent_and_symbolic() {
                 };path.push(index);
             }
             Expansion::Lowered{function,consumed}=>{assert_eq!(consumed,path.len());break function;}
+            Expansion::RetainedChoice(_)=>path.push(0),
         }
     };
     assert_eq!(capacities,vec![1,2]);

@@ -38,6 +38,16 @@ impl Sym {
         self.terms.iter().map(|(monomial, coefficient)| (monomial, *coefficient))
     }
 
+    /// A divisor of every integer value of this polynomial, independent of
+    /// parameter bounds. Zero denotes the identically-zero polynomial.
+    pub fn coefficient_divisor(&self) -> u64 {
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 { (a, b) = (b, a % b); }
+            a
+        }
+        self.terms.values().fold(0, |g, c| gcd(g, c.unsigned_abs()))
+    }
+
     /// If `self` is `c * atom + rest` with `rest` free of `atom`, return `(c, rest)`.
     pub fn linear_in(&self, atom: &Atom) -> Option<(i64, Sym)> {
         let mut c = 0i64;
@@ -369,6 +379,50 @@ impl Sym {
             total = total.checked_add(term)?;
         }
         Some(total)
+    }
+
+    /// Checked numeric enclosure under bounded parameter values. Unlike
+    /// substituting capacities into an expression, this also bounds remainders
+    /// and negative terms. Every intermediate in the structural evaluation must
+    /// fit i64; unknown bounds or a potentially zero divisor remain unsupported.
+    pub fn eval_interval(&self, env: &dyn Fn(&str) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+        fn atom(a: &Atom, env: &dyn Fn(&str) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+            let range = match a {
+                Atom::Param(name) => env(name)?,
+                Atom::Quot(n, d) | Atom::Rem(n, d) => {
+                    let (nl, nh) = n.eval_interval(env)?;
+                    let (dl, dh) = d.eval_interval(env)?;
+                    if nl < 0 || dl <= 0 { return None; }
+                    if matches!(a, Atom::Quot(..)) { (nl / dh, nh / dl) }
+                    else if nl == nh && dl == dh { (nl % dl, nl % dl) }
+                    else {
+                        let mut step = 1;
+                        if dl == dh {
+                            let (mut a, mut b) = (n.coefficient_divisor(), dl as u64);
+                            while b != 0 { (a, b) = (b, a % b); }
+                            step = i64::try_from(a).ok()?;
+                        }
+                        (0, nh.min(dh - step))
+                    }
+                }
+            };
+            (range.0 >= 0 && range.0 <= range.1).then_some(range)
+        }
+        let (mut low, mut high) = (0i64, 0i64);
+        for (monomial, coefficient) in &self.terms {
+            let (mut lo, mut hi) = (*coefficient, *coefficient);
+            for (a, power) in monomial {
+                let (al, ah) = atom(a, env)?;
+                for _ in 0..*power {
+                    let products = [lo.checked_mul(al)?, lo.checked_mul(ah)?, hi.checked_mul(al)?, hi.checked_mul(ah)?];
+                    lo = *products.iter().min()?;
+                    hi = *products.iter().max()?;
+                }
+            }
+            low = low.checked_add(lo)?;
+            high = high.checked_add(hi)?;
+        }
+        Some((low, high))
     }
 
     pub fn params(&self) -> Vec<String> {
@@ -987,6 +1041,41 @@ mod tests {
         assert!(Prover::new(&facts).lt(&at,&extent));
         let invalid=p("block").scale(210).add(&Sym::constant(210)).add(&p("g")).quot(&divisor);
         assert!(!Prover::new(&facts).lt(&invalid,&extent));
+    }
+
+    #[test]
+    fn checked_extent_intervals_bound_tails_and_reject_undefined_arithmetic() {
+        let n = p("N");
+        let group = Sym::constant(32);
+        let groups = n.quot(&group);
+        let tail = n.rem(&group);
+        let bounds = |name: &str| (name == "N").then_some((0,129));
+        assert_eq!(groups.eval_interval(&bounds), Some((0,4)));
+        assert_eq!(tail.eval_interval(&bounds), Some((0,31)));
+        for expression in [groups, tail, Sym::constant(129).sub(&n), n.mul(&n)] {
+            let (lo, hi) = expression.eval_interval(&bounds).unwrap();
+            for value in 0..=129 {
+                let actual = expression.eval(&|_| Some(value)).unwrap();
+                assert!(lo <= actual && actual <= hi);
+            }
+        }
+        assert_eq!(n.scale(i64::MAX).eval_interval(&bounds), None);
+        assert_eq!(Sym::constant(32).quot(&n).eval_interval(&bounds), None);
+        assert_eq!(n.eval_interval(&|_| None), None);
+    }
+
+    #[test]
+    fn remainder_enclosures_preserve_integer_packet_divisibility() {
+        for multiplier in 1..=32i64 {
+            for modulus in 1..=65i64 {
+                let expression = p("i").scale(multiplier).rem(&Sym::constant(modulus));
+                let (lo, hi) = expression.eval_interval(&|_| Some((0, 255))).unwrap();
+                for i in 0..=255 { assert!((lo..=hi).contains(&((i * multiplier) % modulus))); }
+            }
+        }
+        let offset = p("i").scale(16).rem(&Sym::constant(64));
+        assert_eq!(offset.eval_interval(&|_| Some((0, 255))), Some((0, 48)));
+        assert_eq!(offset.scale(4).quot(&Sym::constant(32)).eval_interval(&|_| Some((0, 255))), Some((0, 6)));
     }
 
 }

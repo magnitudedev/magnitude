@@ -7,6 +7,7 @@
 
 uv run inference-v4/validation/generate_fixtures.py
 uv run inference-v4/validation/generate_fixtures.py --test -- -p seismic-engine
+Outputs live under ignored validation/results/fixtures; commit generators only.
 No model downloads, GPU execution, or benchmark results are required/generated.
 """
 import argparse
@@ -18,6 +19,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
+OUTPUT = ROOT / "results" / "fixtures"
 GENERATORS = (
     ("gguf-codec-reference.json", "gguf_codec_reference.py", ()),
     ("qwen-attention-reference.json", "qwen_attention_reference.py", ()),
@@ -26,19 +28,23 @@ GENERATORS = (
     ("qwen-rotary-reference.json", "qwen_rotary_reference.py", ()),
     ("qwen-routed-reference.json", "qwen_routed_reference.py", ()),
     ("qwen-routed-decoder-reference.json", "qwen_decoder_reference.py", ("--routed",)),
+    ("sampling-v3-reference.json", "sampling_reference.py", ()),
+    ("qwen-vision-block-reference.json", "qwen_vision_block_reference.py", ()),
+    ("qwen-vision-merger-reference.json", "qwen_vision_merger_reference.py", ()),
+    ("erf-gelu-reference.json", "qwen_vision_merger_reference.py", ("--erf",)),
 )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", type=Path, default=ROOT.parents[1] / "inference-v3")
-    parser.add_argument("--output", type=Path, default=ROOT / "fixtures")
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--test", action="store_true", help="Run cargo test with arguments after --")
     parser.add_argument("cargo_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.cargo_args and not args.test:
         parser.error("Cargo arguments require --test")
-    if args.test and args.output.resolve() != (ROOT / "fixtures").resolve():
+    if args.test and args.output.resolve() != OUTPUT.resolve():
         parser.error("--test requires the default fixture output directory")
     source = args.source.resolve(strict=True)
     if not (source / "src/ops/tensor/ops.py").is_file():
@@ -53,7 +59,10 @@ def main():
                 "--output", str(destination), *flags,
             ], check=True)
             record = json.loads(destination.read_text())
-            if not record.get("source_sha256") or not record.get("generator_sha256"):
+            if name == "erf-gelu-reference.json":
+                if not isinstance(record, list) or not record:
+                    raise RuntimeError(f"{name}: missing erf/GELU samples")
+            elif not record.get("source_sha256") or not record.get("generator_sha256"):
                 raise RuntimeError(f"{name}: missing reference provenance")
         for name, _, _ in GENERATORS:
             os.replace(Path(temp) / name, args.output / name)

@@ -394,7 +394,7 @@ fn substitute(
     copy: &mut std::collections::HashMap<VarId, VarId>,
 ) -> Stmt {
     let mut w = HashSet::new();
-    crate::rewrite::writes(s, &mut w);
+    crate::rewrite::value_writes(s, vars, &mut w);
     // Variables a loop inside this statement binds are defined by that loop, so each copy of
     // the statement needs its own, exactly as it needs its own copy of what it writes.
     bound_vars(s, &mut w);
@@ -504,9 +504,9 @@ fn map_stmt(
             for e in r.operands_mut() {
                 *e = map_expr(e, inner, atom, value, copy);
             }
-            r.merge = map_expr(&r.merge, inner, atom, value, copy);
+            if let Some(call) = r.merge.source_mut() { *call = map_expr(call, inner, atom, value, copy); }
             if let Some(step) = &mut r.step {
-                step.call = map_expr(&step.call, inner, atom, value, copy);
+                if let Some(call) = step.call.source_mut() { *call = map_expr(call, inner, atom, value, copy); }
             }
             for merge in r.implementations_mut() {
                 for e in merge

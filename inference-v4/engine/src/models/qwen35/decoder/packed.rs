@@ -1,0 +1,248 @@
+//! Pack row-independent model stages while stateful mixers retain per-request
+//! views. Every operation still compiles through the same automatic path.
+use super::*;
+use crate::inputs::TokenId;
+
+pub(super) struct PackedRows {
+    embedding: Composition,
+    feedforwards: Vec<Composition>,
+    hidden: Buffer,
+    tokens: Buffer,
+}
+impl PackedRows {
+    pub(super) fn compositions(&self) -> impl Iterator<Item = &Composition> {
+        std::iter::once(&self.embedding).chain(self.feedforwards.iter())
+    }
+}
+struct Member {
+    geometry: (usize, usize),
+    position: usize,
+    ranges: Vec<(usize, usize)>,
+    hidden: Buffer,
+}
+impl Decoder {
+    fn ensure_packed(&mut self, count: usize) -> Result<(), Error> {
+        if self.packed.contains_key(&count) {
+            return Ok(());
+        }
+        if count == 0 || count > i32::MAX as usize {
+            return Err("packed row count exceeds index domain".into());
+        }
+        let base = self.rows.get(&(1, 1)).expect("base geometry");
+        let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
+        let dimensions = [("M", count)];
+        let packed = PackedRows {
+            embedding: base.embedding.with_dimensions(&mut compiler, &dimensions)?,
+            feedforwards: base
+                .blocks
+                .iter()
+                .map(|block| {
+                    block
+                        .feedforward
+                        .with_dimensions(&mut compiler, &dimensions)
+                })
+                .collect::<Result<_, _>>()?,
+            hidden: self.device.buffer(
+                count
+                    .checked_mul(base.hidden.len())
+                    .ok_or("packed hidden extent overflow")?,
+            )?,
+            tokens: self
+                .device
+                .buffer(count.checked_mul(4).ok_or("packed token extent overflow")?)?,
+        };
+        self.packed.insert(count, packed);
+        Ok(())
+    }
+    pub(super) fn execute_generation_states(
+        &mut self,
+        states: &mut [&mut SequenceState],
+        work: &[GenerationWork<'_>],
+    ) -> Result<Vec<Result<Option<TokenId>, String>>, Error> {
+        if states.len() != work.len() || work.is_empty() {
+            return Err("packed state and request membership differ".into());
+        }
+        for (state, row) in states.iter().zip(work) {
+            if !state.belongs_to(&self.store)
+                || row.proposal.tokens().is_empty()
+                || row.proposal.tokens().len() > self.context_capacity - state.position()
+                || row.proposal.tokens().iter().any(|token| {
+                    u64::from(token.0) >= self.geometry.vocabulary || token.0 > i32::MAX as u32
+                })
+                || row.mask.is_some_and(|mask| {
+                    mask.len() != (self.geometry.vocabulary as usize).div_ceil(32)
+                })
+            {
+                return Err("invalid packed model, context, vocabulary, or mask".into());
+            }
+        }
+        let total = work.iter().try_fold(0usize, |sum, row| {
+            sum.checked_add(row.proposal.tokens().len())
+                .ok_or("packed row count overflow")
+        })?;
+        self.ensure_packed(total)?;
+        for (state, row) in states.iter().zip(work) {
+            self.ensure_rows(
+                row.proposal.tokens().len(),
+                state.history_ranges().len().max(1),
+            )?;
+        }
+        if work.iter().any(|row| row.proposal.needs_sample()) && self.sampler.is_none() {
+            self.sampler = Some(Sampler::compile(
+                &self.device,
+                self.geometry.vocabulary as usize,
+                self.settings.clone(),
+            )?);
+        }
+        let packed = self
+            .packed
+            .get_mut(&total)
+            .expect("packed geometry prepared");
+        packed.tokens.write(
+            &work
+                .iter()
+                .flat_map(|row| {
+                    row.proposal
+                        .tokens()
+                        .iter()
+                        .flat_map(|token| (token.0 as i32).to_le_bytes())
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let width = usize::try_from(self.geometry.hidden)
+            .map_err(|_| "hidden width overflow")?
+            .checked_mul(4)
+            .ok_or("hidden byte width overflow")?;
+        let mut offset = 0;
+        let mut members = Vec::with_capacity(work.len());
+        for (state, row) in states.iter().zip(work) {
+            let count = row.proposal.tokens().len();
+            let mut ranges = state.history_ranges();
+            if ranges.is_empty() {
+                ranges.push((0, 0));
+            }
+            let bytes = count
+                .checked_mul(width)
+                .ok_or("member hidden extent overflow")?;
+            members.push(Member {
+                geometry: (count, ranges.len()),
+                position: state.position(),
+                ranges,
+                hidden: packed.hidden.view(offset..offset + bytes)?,
+            });
+            offset += bytes;
+        }
+        let mut advances = states
+            .iter_mut()
+            .zip(work)
+            .map(|(state, row)| state.begin(row.proposal.tokens().len()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut selected = Vec::with_capacity(work.len());
+        StateAdvance::execute_batch(&mut advances, |transitions| {
+            packed.embedding.execute(
+                &HashMap::from([
+                    ("tokens".into(), packed.tokens.clone()),
+                    ("out".into(), packed.hidden.clone()),
+                ]),
+                &HashMap::new(),
+            )?;
+            for (index, feedforward) in packed.feedforwards.iter_mut().enumerate() {
+                for (member, transition) in members.iter().zip(transitions) {
+                    let rows = self
+                        .rows
+                        .get_mut(&member.geometry)
+                        .expect("member geometry prepared");
+                    let block = &mut rows.blocks[index];
+                    let mut tensors = HashMap::from([
+                        ("hidden".into(), member.hidden.clone()),
+                        ("out".into(), member.hidden.clone()),
+                    ]);
+                    let i = block.state_index;
+                    if block.attention {
+                        rows.coordinates.write(
+                            &(0..member.geometry.0)
+                                .flat_map(|row| [((member.position + row) as i32); 4])
+                                .flat_map(i32::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        rows.visible.write(
+                            &(0..member.geometry.0)
+                                .flat_map(|_| {
+                                    member.ranges.iter().flat_map(|&(start, count)| {
+                                        [start as i32, (start + count) as i32]
+                                    })
+                                })
+                                .flat_map(i32::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        rows.destinations.write(
+                            &transition
+                                .destinations
+                                .iter()
+                                .flat_map(|&destination| (destination as i32).to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )?;
+                        tensors.extend([
+                            ("coordinates".into(), rows.coordinates.clone()),
+                            ("visible".into(), rows.visible.clone()),
+                            ("destinations".into(), rows.destinations.clone()),
+                            ("history_key".into(), transition.history[i].clone()),
+                            ("history_value".into(), transition.history[i + 1].clone()),
+                        ]);
+                    } else {
+                        tensors.extend([
+                            ("window".into(), transition.previous[i].clone()),
+                            ("delta".into(), transition.previous[i + 1].clone()),
+                            ("next_window".into(), transition.following[i].clone()),
+                            ("next_delta".into(), transition.following[i + 1].clone()),
+                        ]);
+                    }
+                    // Complete this member before reusing geometry-local scratch
+                    // or control buffers for another request of the same shape.
+                    block.mixer.execute(&tensors, &HashMap::new())?;
+                }
+                feedforward.execute(
+                    &HashMap::from([
+                        ("residual".into(), packed.hidden.clone()),
+                        ("out".into(), packed.hidden.clone()),
+                    ]),
+                    &HashMap::new(),
+                )?;
+            }
+            for (row, member) in work.iter().zip(&members) {
+                if !row.proposal.needs_sample() {
+                    selected.push(Ok(None));
+                    continue;
+                }
+                let rows = self
+                    .rows
+                    .get_mut(&member.geometry)
+                    .expect("member geometry prepared");
+                rows.readout.execute(
+                    &HashMap::from([
+                        ("hidden".into(), member.hidden.clone()),
+                        ("logits".into(), rows.logits.clone()),
+                    ]),
+                    &HashMap::new(),
+                )?;
+                let selection = self.sampler.as_mut().expect("sampler prepared").sample(
+                    &rows.logits,
+                    row.mask,
+                    row.proposal.sampling(),
+                    row.proposal.seed(),
+                    row.proposal.sample_position(),
+                )?;
+                selected.push(match selection {
+                    Selection::Token(token) => Ok(Some(token)),
+                    Selection::Empty => Err("empty sampling distribution".into()),
+                    Selection::Nonfinite => Err("nonfinite sampling distribution".into()),
+                });
+            }
+            Ok(())
+        })?;
+        for advance in advances {
+            advance.commit()?;
+        }
+        Ok(selected)
+    }
+}

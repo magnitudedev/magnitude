@@ -50,7 +50,7 @@ fn coupled_state_and_single_seed_are_preserved_through_realization() {
         let sum = (1..=n).sum::<usize>() as f64;
         let squares = (1..=n).map(|i|i*i).sum::<usize>() as f64;
         assert_eq!(reference,[10.0+sum,7.0+2.0*n as f64+10.0*sum+(sum*sum-squares)/2.0]);
-        for tree in [Tree::Ordered,Tree::Pairwise] {
+        for tree in [Tree::Ordered,Tree::Pairwise,Tree::SeedThenPairwise] {
             let lowered = lower_selected(&p,"coupled","cpu",&HashMap::from([("N".into(),n as i64)]),&HashMap::new(),&Options::default(), &mut |d| {
                 Ok(if matches!(d.kind,DecisionKind::Reduction{..}) && d.alternatives.contains(&Alternative::ReductionTree(tree)) {
                     Alternative::ReductionTree(tree)
@@ -129,7 +129,7 @@ fn mergeable_fold_preserves_step_arithmetic_and_covers_all_segment_extents() {
         let p=program(fold_source(false));
         let reference=run(&p,n);
         assert_eq!(reference,[10.0+(n*(n+1)) as f64;2]);
-        for tree in [Tree::Ordered,Tree::Pairwise,Tree::Explicit] {
+        for tree in [Tree::Ordered,Tree::Pairwise,Tree::Explicit,Tree::SeedThenPairwise] {
             for segment in 1..=n.max(1) {
                 let lowered=lower_selected(&p,"coupled","cpu",&HashMap::from([("N".into(),n as i64)]),&HashMap::new(),&Options::default(),&mut |d| {
                     let choice=match d.kind {
@@ -153,4 +153,112 @@ fn mergeable_fold_preserves_step_arithmetic_and_covers_all_segment_extents() {
         Ok(d.alternatives.get(0).unwrap())
     }).unwrap();
     assert!(lowered.body.iter().any(|s|matches!(s.kind,StmtKind::Reduction(_))));
+}
+
+#[test]
+fn retained_segment_state_preserves_cross_element_callback_reads() {
+    let p = program(r#"
+fn merge(left:tile[2] f32,right:tile[2] f32,out:tile[2] f32):
+  for i in owned(out): out[i] = left[i] + right[i]
+fn step(state:tile[2] f32,a:tile[1] f32,b:tile[1] f32,out:tile[2] f32):
+  for i in owned(out): out[i] = state[1-i] + a[0] + f32(i) * b[0]
+fn coupled[N](a:tensor[N,1] f32,b:tensor[N,1] f32,out:tensor[2] f32):
+  ta = load(a)
+  tb = load(b)
+  state = tile[2] f32
+  identity = tile[2] f32
+  for i in owned(state): state[i] = 10.0 + 10.0 * f32(i)
+  for i in owned(identity): identity[i] = 3.0 + 4.0 * f32(i)
+  reduce((ta,tb),0,merge,into=(state,),step=step,identity=(identity,),ordered=false)
+  store(state,out)
+"#.into());
+    for segment in [1, 2, 3, 7] {
+        let mut expected = [10.0, 20.0];
+        for group in (0..7).step_by(segment) {
+            let mut partial = [3.0, 7.0];
+            for i in group..(group + segment).min(7) {
+                partial = [partial[1] + (i + 1) as f64, partial[0] + (i + 1) as f64 + 2.0];
+            }
+            for i in 0..2 { expected[i] += partial[i]; }
+        }
+        for tree in [Tree::Pairwise, Tree::Explicit, Tree::SeedThenPairwise] {
+            let lowered = lower_selected(&p, "coupled", "cpu", &HashMap::from([("N".into(), 7)]), &HashMap::new(), &Options::default(), &mut |d| {
+                assert!(!matches!(d.kind, DecisionKind::FoldState { .. }));
+                Ok(match d.kind {
+                    DecisionKind::Reduction { .. } => Alternative::ReductionTree(tree),
+                    DecisionKind::ReductionSegments { .. } => Alternative::ReductionSegment(segment as i64),
+                    _ => d.alternatives.get(0).unwrap(),
+                })
+            }).unwrap();
+            let lowered = seismic_lang::reduction::structured::materialize(&lowered).unwrap();
+            let materialized = Program {
+                functions: vec![Function { name: lowered.name, is_construct: false, shape_params: vec![], elem_params: vec![], params: lowered.params, index_params: lowered.index_params, vars: lowered.vars, body: lowered.body }],
+                lowerings: vec![], signatures: HashMap::new(),
+            };
+            assert_eq!(run(&materialized, 7), expected, "{tree:?}/{segment}");
+        }
+    }
+}
+
+#[test]
+fn pointwise_step_retention_preserves_seed_tree_and_rejects_cross_element_reads() {
+    use seismic_lang::reduction::structured::StepState;
+    for cross in [false, true] {
+        let source = fold_source(false);
+        let source = if cross { source.replace("state[i])", "state[0])") } else { source };
+        let p = program(source);
+        let reference = run(&p, 7);
+        for tree in [Tree::Ordered, Tree::Pairwise, Tree::Explicit, Tree::SeedThenPairwise] {
+            for segment in [1, 3, 7] {
+                let mut offered = false;
+                let lowered = lower_selected(&p, "coupled", "cpu", &HashMap::from([("N".into(), 7)]), &HashMap::new(), &Options::default(), &mut |d| {
+                    Ok(match d.kind {
+                        DecisionKind::Reduction { .. } => Alternative::ReductionTree(tree),
+                        DecisionKind::ReductionSegments { .. } => Alternative::ReductionSegment(segment),
+                        DecisionKind::FoldOperand { .. } => Alternative::StepOperand(seismic_lang::reduction::structured::StepOperand::View),
+                        DecisionKind::FoldState { .. } => {
+                            offered = true;
+                            Alternative::StepState(StepState::Retained)
+                        },
+                        _ => d.alternatives.get(0).unwrap(),
+                    })
+                }).unwrap();
+                assert_eq!(offered, !cross);
+                let lowered = seismic_lang::reduction::structured::materialize(&lowered).unwrap();
+                let materialized = Program {
+                    functions: vec![Function { name: lowered.name, is_construct: false, shape_params: vec![], elem_params: vec![], params: lowered.params, index_params: lowered.index_params, vars: lowered.vars, body: lowered.body }],
+                    lowerings: vec![], signatures: HashMap::new(),
+                };
+                assert_eq!(run(&materialized, 7), reference, "{tree:?}/{segment}/{cross}");
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_seed_root_tree_matches_its_ordered_explicit_partition() {
+    // The second field deliberately has a non-associative, non-commutative
+    // callback: agreement must come from the selected tree, not an add identity.
+    let p = program(source(false).replace("lb[i] + rb[i]", "lb[i] * 2.0 + rb[i]"));
+    for n in [1usize, 2, 3, 4, 5, 8, 17, 32, 33, 64, 65] {
+        let mut results = Vec::new();
+        for tree in [Tree::SeedThenPairwise, Tree::Explicit] {
+            let f = lower_selected(&p, "coupled", "cpu", &HashMap::from([("N".into(), n as i64)]), &HashMap::new(), &Options::default(), &mut |d| {
+                Ok(match d.kind {
+                    DecisionKind::Reduction { .. } => Alternative::ReductionTree(tree),
+                    DecisionKind::ReductionBranch { start, end, .. } => {
+                        // The leading seed is alone; each input subtree splits
+                        // at the highest power of two strictly below its size.
+                        let cut = if start == 0 { 1 } else { start + (1i64 << (end - start - 1).ilog2()) };
+                        Alternative::ReductionCut(cut)
+                    }
+                    _ => d.alternatives.get(0).unwrap(),
+                })
+            }).unwrap();
+            let f = seismic_lang::reduction::structured::materialize(&f).unwrap();
+            let p = Program { functions: vec![Function { name:f.name, is_construct:false, shape_params:vec![], elem_params:vec![], params:f.params, index_params:f.index_params, vars:f.vars, body:f.body }], lowerings:vec![], signatures:HashMap::new() };
+            results.push(run(&p, n));
+        }
+        assert_eq!(results[0], results[1], "input leaves {n}");
+    }
 }

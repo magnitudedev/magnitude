@@ -16,47 +16,17 @@ use seismic_runtime::{
 };
 use std::collections::HashMap;
 
-fn contract(lowered: &seismic_lang::lowered_ir::LoweredIr) -> ScalarHardware {
-    let mut patterns = Vec::new();
-    for loads in [
-        LoadStrategy::Materialize,
-        LoadStrategy::BorrowProvenReadOnly,
-    ] {
-        let p = seismic_cpu::prepare(lowered, loads).unwrap();
-        for primitive in requirements(&p).unwrap() {
-            let pattern = primitive.signature();
-            if !patterns.contains(&pattern) {
-                patterns.push(pattern);
-            }
-        }
-    }
-    ScalarHardware {
-        identity: "hypothetical one-service scalar machine".into(),
-        scope: Scope::HypotheticalDirectScalarV1,
-        timebase: Timebase {
-            seconds_numerator: 1,
-            seconds_denominator: 1,
-        },
-        resources: vec![Resource {
-            name: "service".into(),
-            capacity: 1,
-            unit: CapacityUnit::Slots,
-        }],
-        timings: patterns
-            .into_iter()
-            .map(|primitive| PrimitiveTiming {
-                primitive,
-                latency: 1,
-                services: vec![Reservation {
-                    resource: 0,
-                    offset: 0,
-                    duration: 1,
-                    units: 1,
-                }],
-            })
-            .collect(),
-    }
+fn source_input(program: &seismic_lang::program::Program) -> Input<'_> {
+    static SHAPES: std::sync::LazyLock<HashMap<String, i64>> = std::sync::LazyLock::new(HashMap::new);
+    static ELEMENTS: std::sync::LazyLock<HashMap<String, seismic_lang::types::Elem>> = std::sync::LazyLock::new(HashMap::new);
+    static OPTIONS: std::sync::LazyLock<seismic_lang::lower::Options> = std::sync::LazyLock::new(Default::default);
+    Input::Portable { program, entry: &program.functions[0].name, shapes: &SHAPES, elements: &ELEMENTS, options: &OPTIONS }
 }
+
+use automatic_hardware::{cpu as contract, cuda as cuda_hardware};
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
+
 fn budget() -> Budget {
     Budget {
         nodes: 100,
@@ -90,8 +60,6 @@ fn floating_literal_resume_identity(initial: u64, changed: u64) {
     set_literal(&mut program, initial);
     let mut altered = program.clone();
     set_literal(&mut altered, changed);
-    let lowered = seismic_lang::lower::lower(&program, "write", "cpu", &shapes).unwrap();
-    let altered_lowered = seismic_lang::lower::lower(&altered, "write", "cpu", &shapes).unwrap();
     let device = Device::cpu();
     let facts = device.facts();
     let workload =
@@ -105,7 +73,6 @@ fn floating_literal_resume_identity(initial: u64, changed: u64) {
     };
     for (input, changed_input) in [
         (portable(&program), portable(&altered)),
-        (Input::Lowered(&lowered), Input::Lowered(&altered_lowered)),
     ] {
         let mut request = Request {
             input,
@@ -173,7 +140,7 @@ fn model_construction_limits_are_resumable_without_changing_execution_identity()
         },
     ] {
         let mut request = Request {
-            input: Input::Lowered(&lowered),
+            input: source_input(&program),
             device: &facts,
             form: Form::CpuScalar,
             hardware: &hardware,
@@ -202,7 +169,7 @@ fn model_construction_limits_are_resumable_without_changing_execution_identity()
         };
         assert_eq!(resumed.modeled_cost(), uninterrupted.modeled_cost());
         assert_eq!(resumed.selected_path(), uninterrupted.selected_path());
-        assert_eq!(resumed.model(), uninterrupted.model());
+        assert_eq!(resumed.objective().flat().unwrap().0, uninterrupted.objective().flat().unwrap().0);
     }
 }
 
@@ -268,14 +235,14 @@ fn source_to_native_keeps_checked_model_and_enforces_workload_conditions() {
     let emitted_order = seismic_realization::scheduling::Order::current(selected);
     assert_eq!(
         emitted_order.blocks,
-        static_order::orders(tuned.model(), tuned.schedule()).unwrap()
+        static_order::orders(tuned.objective().flat().unwrap().0, tuned.objective().flat().unwrap().1).unwrap()
     );
-    let selected_analysis = tuned.model().clone();
-    let selected_schedule = tuned.schedule().clone();
+    let selected_analysis = tuned.objective().flat().unwrap().0.clone();
+    let selected_schedule = tuned.objective().flat().unwrap().1.clone();
     let mut kernel = device.compile_tuned(tuned).unwrap();
-    let retained = kernel.tuning().unwrap();
-    assert_eq!(retained.model(), &selected_analysis);
-    assert_eq!(retained.schedule(), &selected_schedule);
+    let retained = kernel.tuning();
+    assert_eq!(retained.objective().flat().unwrap().0, &selected_analysis);
+    assert_eq!(retained.objective().flat().unwrap().1, &selected_schedule);
     assert!(retained.modeled_cost().is_exact());
     kernel.execute(&bindings, &[1.0]).unwrap();
     let mut output = vec![0; input.len()];
@@ -334,7 +301,7 @@ fn nested_views_derive_canonical_alias_geometry_and_resume_binds_all_inputs() {
     );
     assert_eq!(workload.buffers[0].offset, 8);
     let request = Request {
-        input: Input::Lowered(&lowered),
+        input: source_input(&program),
         device: &hardware,
         form: Form::CpuScalar,
         hardware: &model,
@@ -378,83 +345,7 @@ fn gpu_program() -> seismic_lang::program::Program {
     compile(&[SourceFile { path: "gpu-tuner.seismic.portable".into(), scope: LanguageScope::Portable,
         text: "fn copy(x: tensor[1] f32, out: tensor[1] f32, enabled: bool):\n  if enabled:\n    value = load(x)\n    store(value, out)\n".into() }], &[]).unwrap()
 }
-fn cuda_hardware(
-    lowered: &seismic_lang::lowered_ir::LoweredIr,
-    facts: &seismic_runtime::DeviceFacts,
-) -> Hardware {
-    use seismic_cuda::model as cuda;
-    let seismic_runtime::DeviceFacts::Cuda(device) = facts else {
-        panic!("CUDA device")
-    };
-    let mut primitives = Vec::new();
-    for loads in [
-        LoadStrategy::Materialize,
-        LoadStrategy::BorrowProvenReadOnly,
-    ] {
-        for dispatch in [
-            seismic_realization::Dispatch::Sequential,
-            seismic_realization::Dispatch::ParallelRoot,
-        ] {
-            let Execution::Cuda(phases) = Execution::prepare(
-                lowered,
-                seismic_runtime::Candidate::Cuda {
-                    options: seismic_realization::ScalarOptions { dispatch, loads },
-                    threads_per_block: 1,
-                },
-                facts,
-            )
-            .unwrap() else {
-                panic!("CUDA execution")
-            };
-            for phase in &phases {
-                for required in cuda::requirements(phase) {
-                    if let cuda::Requirement::Instruction(primitive) = required {
-                        if !primitives.contains(&primitive) {
-                            primitives.push(primitive);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Hardware::Cuda(cuda::CudaHardware {
-        identity: "hypothetical terminal instruction service".into(),
-        scope: cuda::Scope::HypotheticalInstructionPreservingPtxV1,
-        timebase: Timebase {
-            seconds_numerator: 1,
-            seconds_denominator: 1,
-        },
-        execution_units: device.multiprocessors as usize,
-        warp_width: device.warp_size,
-        cohorts: cuda::CohortPolicy::LowestPosition,
-        internal_alignment: 256,
-        resources: vec![cuda::Resource {
-            name: "issue".into(),
-            scope: cuda::ResourceScope::Device,
-            capacity: 1,
-            unit: CapacityUnit::Slots,
-        }],
-        timings: primitives
-            .into_iter()
-            .map(|primitive| cuda::PrimitiveTiming {
-                primitive,
-                latency: cuda::Ticks::Fixed(1),
-                reservations: vec![cuda::Reservation {
-                    resource: 0,
-                    offset: 0,
-                    duration: cuda::Ticks::Fixed(1),
-                    units: cuda::Amount::fixed(1),
-                }],
-            })
-            .collect(),
-        block_residency: vec![],
-        per_unit_residency: vec![cuda::UnitResidency {
-            name: "resident blocks".into(),
-            capacity: 1,
-            units_per_block: cuda::Amount::fixed(1),
-        }],
-    })
-}
+
 #[test]
 fn cuda_uses_compiler_selection_and_rejects_a_different_native_device() {
     let program = gpu_program();
@@ -489,7 +380,7 @@ fn cuda_uses_compiler_selection_and_rejects_a_different_native_device() {
     )
     .unwrap();
     let request = Request {
-        input: Input::Lowered(&lowered),
+        input: source_input(&program),
         device: &facts,
         form: Form::CudaScalar,
         hardware: &hardware,
@@ -511,7 +402,7 @@ fn cuda_uses_compiler_selection_and_rejects_a_different_native_device() {
         tuned.conditions().implementation(),
         ImplementationConditions::Cuda(_)
     ));
-    assert!(tuned.model().unmapped.is_empty());
+    assert!(tuned.objective().flat().unwrap().0.unmapped.is_empty());
     assert!(tuned.modeled_cost().is_exact());
     assert!(matches!(host.compile_tuned(tuned), Err(e) if e.contains("device differs")));
 }
@@ -532,7 +423,7 @@ fn cuda_tuned_native_artifact_retains_conditions_and_enforces_bindings() {
     let bindings = vec![source.clone(), target.clone()];
     let workload = tuner::workload("native CUDA copy", &bindings, &schema, &[1.0]).unwrap();
     let request = Request {
-        input: Input::Lowered(&lowered),
+        input: source_input(&program),
         device: &facts,
         form: Form::CudaScalar,
         hardware: &hardware,
@@ -552,9 +443,9 @@ fn cuda_tuned_native_artifact_retains_conditions_and_enforces_bindings() {
     .unwrap() else {
         panic!("CUDA conditional optimum")
     };
-    let selected_model = tuned.model().clone();
+    let selected_model = tuned.objective().flat().unwrap().0.clone();
     let mut kernel = device.compile_tuned(tuned).unwrap();
-    assert_eq!(kernel.tuning().unwrap().model(), &selected_model);
+    assert_eq!(kernel.tuning().objective().flat().unwrap().0, &selected_model);
     kernel.execute(&bindings, &[1.0]).unwrap();
     let mut result = [0; 4];
     target.read(&mut result).unwrap();
@@ -577,69 +468,20 @@ fn cuda_tuned_native_artifact_retains_conditions_and_enforces_bindings() {
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_tuned_native_artifact_preserves_publication_and_binding_conditions() {
-    use seismic_metal::{execution, model, tuning as metal};
     let program = compile(&[SourceFile { path: "metal-tuner.seismic.portable".into(), scope: LanguageScope::Portable,
         text: "fn evaluate(out: tensor[2] f32):\n  y = tile[2] f32\n  for i in owned(y): y[i] = 3.0\n  store(y,out)\n".into() }], &[]).unwrap();
     let lowered =
         seismic_lang::lower::lower(&program, "evaluate", "metal", &HashMap::new()).unwrap();
     let device = Device::metal().unwrap();
     let facts = device.facts();
-    let mut keys = Vec::new();
-    // A synthetic reusable instruction service, independent of native feedback.
-    // Inventory each storage implementation because its operations really differ.
-    for placement in [
-        seismic_realization::dispatch::TilePlacement::Replicated,
-        seismic_realization::dispatch::TilePlacement::Distributed,
-        seismic_realization::dispatch::TilePlacement::GroupShared,
-    ] {
-        let e = execution::prepare_storage_selected(
-            &lowered,
-            execution::Config::default(),
-            &mut |_| Ok(placement.clone()),
-        )
-        .unwrap();
-        let required = model::requirements(&e).unwrap();
-        assert!(required.unmapped.is_empty(), "{:?}", required.unmapped);
-        for key in required.primitives {
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-    }
-    let hardware = Hardware::Metal(model::Hardware {
-        identity: "test pooled MSL service; native timing unqualified".into(),
-        timebase: Timebase {
-            seconds_numerator: 1,
-            seconds_denominator: 1,
-        },
-        resources: vec![Resource {
-            name: "service".into(),
-            capacity: 1024,
-            unit: CapacityUnit::Slots,
-        }],
-        resident_groups: 2,
-        resident_shared_bytes: 65536,
-        timings: keys
-            .into_iter()
-            .map(|primitive| model::Timing {
-                primitive,
-                latency: 1,
-                services: vec![model::Service {
-                    resource: 0,
-                    offset: 0,
-                    duration: 1,
-                    units: model::Units::PerLane(1),
-                }],
-            })
-            .collect(),
-    });
+    let hardware = automatic_hardware::metal(&lowered);
     let backing = device.buffer_from(&[0xa5; 16]).unwrap();
     let out = backing.view(4..12).unwrap();
     let workload = tuner::workload("native Metal output", &[out.clone()], &[], &[]).unwrap();
     let request = Request {
-        input: Input::Lowered(&lowered),
+        input: source_input(&program),
         device: &facts,
-        form: Form::Metal(metal::Form::default()),
+        form: Form::Metal,
         hardware: &hardware,
         workload: &workload,
         derivation_limits: DerivationLimits {
@@ -658,11 +500,11 @@ fn metal_tuned_native_artifact_preserves_publication_and_binding_conditions() {
         panic!("Metal conditional optimum")
     };
     assert!(matches!(tuned.execution(), Execution::Metal(_)));
-    let selected_model = tuned.model().clone();
+    let selected_objective = tuned.objective().clone();
     let mut kernel = device.compile_tuned(tuned).unwrap();
-    assert_eq!(kernel.tuning().unwrap().model(), &selected_model);
+    assert_eq!(kernel.tuning().objective(), &selected_objective);
     assert!(matches!(
-        kernel.tuning().unwrap().conditions().implementation(),
+        kernel.tuning().conditions().implementation(),
         ImplementationConditions::Metal(_)
     ));
     kernel.execute(&[out], &[]).unwrap();
@@ -680,4 +522,247 @@ fn metal_tuned_native_artifact_preserves_publication_and_binding_conditions() {
             .unwrap_err()
             .contains("allocation/view")
     );
+}
+
+#[test]
+fn packet_table_lookup_has_a_complete_model_without_weight_values() {
+    use seismic_lang::{
+        interp::{Rng, TensorData},
+        lower::{Options, lower_selected},
+        lowered_ir::{Alternative, DecisionKind},
+        repr,
+    };
+    let program = compile(&[SourceFile {
+        path: "packet-table.seismic.portable".into(), scope: LanguageScope::Portable,
+        text: "fn decode(x:tensor[32] iq4g32,out:tensor[32] f32):\n  values = load(x)\n  result = tile[32] f32\n  for i in owned(result): result[i] = values[i]\n  store(result,out)\n".into(),
+    }], &[]).unwrap();
+    let lowered = lower_selected(&program, "decode", "cpu", &HashMap::new(), &HashMap::new(), &Options::default(), &mut |d| {
+        Ok(match d.kind {
+            DecisionKind::Representation { .. } => Alternative::DecodedPackets,
+            DecisionKind::PacketDecode { .. } => Alternative::PacketWidth(7),
+            _ => d.alternatives.get(0).unwrap(),
+        })
+    }).unwrap();
+    let prepared = seismic_cpu::prepare(&lowered, LoadStrategy::BorrowProvenReadOnly).unwrap();
+    let hardware = contract(&lowered);
+    let device = Device::cpu();
+    let source = TensorData::random_packed(&mut Rng(0x329018), repr::lookup("iq4g32").unwrap(), vec![32]);
+    let mut bindings = source.device_bytes().iter().map(|p| device.buffer_from(p).unwrap()).collect::<Vec<_>>();
+    let output = device.buffer(32 * 4).unwrap();
+    bindings.push(output.clone());
+    // Workload captures only allocation/scalar facts. The model may not inspect
+    // the packed code values or branch according to native observations.
+    let workload = tuner::workload("unknown table codes", &bindings, &[], &[]).unwrap();
+    let derived = derive_scalar(&prepared, &hardware, &workload, DerivationLimits {
+        instructions: 100_000, operations: 100_000,
+    }).unwrap();
+    assert!(derived.model.unmapped.is_empty(), "{:?}", derived.model.unmapped);
+    assert!(derived.accesses.iter().any(|a| a.write));
+    // Native execution is separately covered by completed-selection tests.
+    // This fixture checks that unknown packed values have a complete IR account.
+}
+
+#[test]
+fn runtime_rejects_preselected_frontends_and_fixed_decomposition() {
+    let program = gpu_program();
+    let lowered = seismic_lang::lower::lower(&program, "copy", "cpu", &HashMap::new()).unwrap();
+    let device = Device::cpu();
+    let facts = device.facts();
+    let hardware = Hardware::Cpu(contract(&lowered));
+    let buffers = [device.buffer(4).unwrap(), device.buffer(4).unwrap()];
+    let workload = tuner::workload("gate", &buffers, &[], &[]).unwrap();
+    let mut request = Request { input: Input::Lowered(&lowered), device: &facts, form: Form::CpuScalar,
+        hardware: &hardware, workload: &workload, derivation_limits: DerivationLimits { instructions: 1, operations: 1 } };
+    assert!(matches!(tuner::tune(&request, budget()), Err(e) if e.contains("requires portable source")));
+    let options = seismic_lang::lower::Options { piece: Some(1), ..Default::default() };
+    let shapes = HashMap::new(); let elements = HashMap::new();
+    request.input = Input::Portable { program: &program, entry: "copy", shapes: &shapes, elements: &elements, options: &options };
+    assert!(matches!(tuner::tune(&request, budget()), Err(e) if e.contains("fixed stream piece")));
+}
+
+#[test]
+fn automatic_selection_checks_control_contents_before_native_execution() {
+    let program = compile(&[SourceFile {
+        path: "control.seismic.portable".into(), scope: LanguageScope::Portable,
+        text: "fn count(control: tensor[1] i32, out: tensor[1] f32):\n  y = tile[1] f32\n  for i in owned(y):\n    if control[0] == 3:\n      y[i] = 3.0\n    else:\n      y[i] = 4.0\n  store(y, out)\n".into(),
+    }], &[]).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "count", "cpu", &HashMap::new()).unwrap();
+    let model = Hardware::Cpu(contract(&lowered));
+    let device = Device::cpu();
+    let facts = device.facts();
+    let control = device.buffer_from(&3i32.to_le_bytes()).unwrap();
+    let out = device.buffer(4).unwrap();
+    let buffers = vec![control.clone(), out.clone()];
+    let mut workload = tuner::workload("control bytes", &buffers, &[], &[]).unwrap();
+    tuner::capture_contents(&mut workload, &buffers, &[0]).unwrap();
+    let request = Request {
+        input: source_input(&program), device: &facts, form: Form::CpuScalar,
+        hardware: &model, workload: &workload,
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 },
+    };
+    let Outcome::Optimal(tuned) = tuner::tune(&request, budget()).unwrap() else { panic!("control data must admit complete selection"); };
+    let mut kernel = device.compile_tuned(tuned).unwrap();
+    kernel.execute(&buffers, &[]).unwrap();
+    let mut actual = [0; 4]; out.read(&mut actual).unwrap();
+    assert_eq!(f32::from_le_bytes(actual), 3.0);
+    control.write(&4i32.to_le_bytes()).unwrap();
+    assert!(kernel.execute(&buffers, &[]).unwrap_err().contains("contents differ"));
+    out.read(&mut actual).unwrap();
+    assert_eq!(f32::from_le_bytes(actual), 3.0, "rejected inputs must not execute");
+    control.write(&3i32.to_le_bytes()).unwrap();
+    let mut writable_workload = workload.clone();
+    tuner::capture_contents(&mut writable_workload, &buffers, &[1]).unwrap();
+    let writable_request = Request { workload: &writable_workload, ..request };
+    let Outcome::Optimal(tuned) = tuner::tune(&writable_request, budget()).unwrap() else { panic!("bounded writable case must complete analysis"); };
+    let mut kernel = device.compile_tuned(tuned).unwrap();
+    assert!(kernel.execute(&buffers, &[]).unwrap_err().contains("may be modified"));
+}
+
+#[test]
+fn content_conditions_cannot_be_invalidated_inside_a_batch() {
+    use seismic_runtime::plan::{Bindings, PlanCompiler, Settings, Submission};
+    let program = compile(&[SourceFile {
+        path: "contents.seismic.portable".into(), scope: LanguageScope::Portable,
+        text: "fn copy(x: tensor[1] f32, out: tensor[1] f32):\n  a = load(x)\n  store(a, out)\n".into(),
+    }], &[]).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "copy", "cpu", &HashMap::new()).unwrap();
+    let device = Device::cpu();
+    let settings = Settings {
+        hardware: Hardware::Cpu(contract(&lowered)), form: Form::CpuScalar,
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: budget(),
+    };
+    let mut compiler = PlanCompiler::new(&device, &program, settings);
+    let plan = compiler.compile_entry("copy", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
+    struct Binding { input: seismic_runtime::Buffer, out: seismic_runtime::Buffer, known: bool }
+    impl Bindings for Binding {
+        fn buffer(&self, root: &str, _: &str) -> Option<&seismic_runtime::Buffer> { match root { "x" => Some(&self.input), "out" => Some(&self.out), _ => None } }
+        fn scalar(&self, _: &str) -> Option<f64> { None }
+        fn known_buffer(&self, root: &str, _: &str) -> bool { self.known && root == "x" }
+    }
+    let source = device.buffer_from(&1f32.to_le_bytes()).unwrap();
+    let changed = device.buffer_from(&2f32.to_le_bytes()).unwrap();
+    let output = device.buffer_from(&0f32.to_le_bytes()).unwrap();
+    // Compile the conditioned reader first. If an unconditioned copy already
+    // exists it can safely serve the reader without a captured-byte assumption.
+    let reader = plan.prepare(&Binding { input: source.clone(), out: output, known: true }).unwrap();
+    let mut batch = Submission::default();
+    batch.append(plan.prepare(&Binding { input: changed, out: source.clone(), known: false }).unwrap());
+    batch.append(reader);
+    assert!(batch.execute_batched().unwrap_err().contains("may modify"));
+    let mut bytes = [0; 4]; source.read(&mut bytes).unwrap();
+    assert_eq!(f32::from_le_bytes(bytes), 1.0, "invalid batch must not submit its first kernel");
+}
+
+#[test]
+fn completed_artifact_reuses_weaker_content_contract() {
+    use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
+    let program = gpu_program();
+    let lowered = seismic_lang::lower::lower(&program, "copy", "cpu", &HashMap::new()).unwrap();
+    let device = Device::cpu();
+    let settings = Settings { hardware: Hardware::Cpu(contract(&lowered)), form: Form::CpuScalar,
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: budget() };
+    let mut compiler = PlanCompiler::new(&device, &program, settings);
+    let mut plan = compiler.compile_entry("copy", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
+    struct Binding { input: seismic_runtime::Buffer, out: seismic_runtime::Buffer, known: bool, enabled: bool }
+    impl Bindings for Binding {
+        fn buffer(&self, root: &str, _: &str) -> Option<&seismic_runtime::Buffer> {
+            match root { "x" => Some(&self.input), "out" => Some(&self.out), _ => None }
+        }
+        fn scalar(&self, name: &str) -> Option<f64> { (name == "enabled").then_some(if self.enabled { 1. } else { 0. }) }
+        fn known_buffer(&self, root: &str, _: &str) -> bool { self.known && root == "x" }
+    }
+    let mut binding = Binding { input: device.buffer(4).unwrap(), out: device.buffer(4).unwrap(), known: false, enabled: true };
+    binding.input.write(&3f32.to_le_bytes()).unwrap();
+    plan.execute(&binding).unwrap();
+    assert_eq!(plan.kernel_count(), 1);
+    binding.known = true;
+    for value in [7f32, 11f32] {
+        binding.input.write(&value.to_le_bytes()).unwrap();
+        plan.execute(&binding).unwrap();
+        let mut output = [0; 4];
+        binding.out.read(&mut output).unwrap();
+        assert_eq!(f32::from_le_bytes(output), value);
+        assert_eq!(plan.kernel_count(), 1, "additional facts cannot require retuning a valid broader artifact");
+    }
+    binding.enabled = false;
+    plan.execute(&binding).unwrap();
+    assert_eq!(plan.kernel_count(), 2, "changed scalar conditions must not reuse the old artifact");
+
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Metal hardware"]
+fn metal_automatic_selection_reuses_checked_indirect_input_domains() {
+    use seismic_metal::{execution, model};
+    use seismic_runtime::{Buffer, plan::{Bindings, PlanCompiler, Settings}};
+    use tuner::{BufferIntegerDomain, IntegerRange};
+    let program = compile(&[SourceFile {
+        path: "varying-gather.seismic.portable".into(), scope: LanguageScope::Portable,
+        text: "fn gather(table: tensor[4, 2] f32, tokens: tensor[1] i32, out: tensor[2] f32, bias: i32):\n  values = load(table[tokens[0]])\n  y = tile[2] f32\n  for i in owned(y): y[i] = values[i] + f32(bias)\n  store(y, out)\n".into(),
+    }], &[]).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "gather", "metal", &HashMap::new()).unwrap();
+    let mut keys = Vec::new();
+    for placement in [
+        seismic_realization::dispatch::TilePlacement::Replicated,
+        seismic_realization::dispatch::TilePlacement::Distributed,
+        seismic_realization::dispatch::TilePlacement::GroupShared,
+    ] {
+        let execution = execution::prepare_storage_selected(&lowered, execution::Config::default(), &mut |_| Ok(placement.clone())).unwrap();
+        let required = model::requirements(&execution).unwrap();
+        assert!(required.unmapped.is_empty(), "{:?}", required.unmapped);
+        for key in required.primitives { if !keys.contains(&key) { keys.push(key); } }
+    }
+    let hardware = Hardware::Metal(model::Hardware {
+        identity: "functional varying-input fixture; native timing unqualified".into(),
+        timebase: Timebase { seconds_numerator: 1, seconds_denominator: 1 },
+        resources: vec![Resource { name: "service".into(), capacity: 1024, unit: CapacityUnit::Slots }],
+        resident_groups: 2,
+        resident_shared_bytes: 65536,
+        timings: keys.into_iter().map(|primitive| model::Timing {
+            primitive, latency: 1,
+            services: vec![model::Service { resource: 0, offset: 0, duration: 1, units: model::Units::PerLane(1) }],
+        }).collect(),
+    });
+    let device = Device::metal().unwrap();
+    let settings = Settings { hardware, form: Form::Metal,
+        derivation_limits: DerivationLimits { instructions: 1_000_000, operations: 1_000_000 },
+        search: Budget { nodes: 20_000, schedule_assignments: 100_000 } };
+    let mut compiler = PlanCompiler::new(&device, &program, settings);
+    let mut plan = compiler.compile_entry("gather", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
+    struct Inputs { table: Buffer, tokens: Buffer, out: Buffer, bias: f64 }
+    impl Bindings for Inputs {
+        fn buffer(&self, root: &str, _: &str) -> Option<&Buffer> {
+            match root { "table" => Some(&self.table), "tokens" => Some(&self.tokens), "out" => Some(&self.out), _ => None }
+        }
+        fn scalar(&self, name: &str) -> Option<f64> { (name == "bias").then_some(self.bias) }
+        fn known_buffer(&self, root: &str, _: &str) -> bool { root == "tokens" }
+        fn scalar_domain(&self, name: &str) -> Option<IntegerRange> {
+            (name == "bias").then_some(IntegerRange { min: 0, max: 8, stride: 1 })
+        }
+        fn buffer_domains(&self, root: &str, _: &str) -> Vec<BufferIntegerDomain> {
+            if root != "tokens" { return Vec::new(); }
+            vec![BufferIntegerDomain { offset: 0, bytes: 4, signed: true, range: IntegerRange { min: 0, max: 3, stride: 1 } }]
+        }
+    }
+    let mut inputs = Inputs {
+        table: device.buffer_from(&[10f32, 11., 20., 21., 30., 31., 40., 41.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap(),
+        tokens: device.buffer_from(&0i32.to_le_bytes()).unwrap(),
+        out: device.buffer(8).unwrap(), bias: 0.,
+    };
+    for (token, bias) in [(0i32, 0.), (3, 5.), (1, 8.), (0, 2.)] {
+        inputs.tokens.write(&token.to_le_bytes()).unwrap();
+        inputs.bias = bias;
+        plan.execute(&inputs).unwrap();
+        let mut output = [0; 8];
+        inputs.out.read(&mut output).unwrap();
+        let expected = (token + 1) as f32 * 10. + bias as f32;
+        assert_eq!(output.to_vec(), [expected, expected + 1.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+        assert_eq!(plan.kernel_count(), 1, "changed admitted input must reuse completed selection");
+    }
+    let mut submission = plan.prepare(&inputs).unwrap();
+    inputs.tokens.write(&4i32.to_le_bytes()).unwrap();
+    assert!(submission.execute_batched().unwrap_err().contains("integer input domain"));
+    assert!(plan.prepare(&inputs).err().unwrap().contains("integer input domain"));
+    assert_eq!(plan.kernel_count(), 1);
 }

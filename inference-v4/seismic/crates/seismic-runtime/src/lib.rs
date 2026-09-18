@@ -1,10 +1,13 @@
 //! Native resource ownership and invocation. Numerical work stays in compiled
-//! Seismic. Candidates are explicit until accounting can justify selection.
+//! Seismic. Native executables require completed automatic selection.
+mod error;
+pub use error::Error;
 pub mod execution;
+pub mod memory;
 pub mod plan;
 pub mod tuner;
-use seismic_lang::{abi::ScalarParameter, lowered_ir::LoweredIr};
-use seismic_realization::{BufferSpec, LoadStrategy, ScalarOptions};
+use seismic_lang::abi::ScalarParameter;
+use seismic_realization::BufferSpec;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -15,7 +18,21 @@ enum BackendDevice {
     Metal(Rc<seismic_metal::runtime::Device>),
 }
 #[derive(Clone)]
-pub struct Device(BackendDevice);
+/// Native compilation accepts only a completed compiler selection.
+/// Fixed candidates and prepared executions are not executable API inputs.
+///
+/// ```compile_fail
+/// use seismic_runtime::{Candidate, Device};
+/// ```
+/// ```compile_fail
+/// fn bypass(device: &seismic_runtime::Device, execution: seismic_runtime::execution::Execution) {
+///     device.compile_execution(execution);
+/// }
+/// ```
+/// ```compile_fail
+/// use seismic_runtime::plan::{Diagnostic, PlanCompiler};
+/// ```
+pub struct Device(BackendDevice, Rc<memory::Domain>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceFacts {
     Cpu {
@@ -37,19 +54,7 @@ enum Storage {
 pub struct Buffer(Storage, Rc<Allocation>, usize);
 struct Allocation {
     bytes: usize,
-}
-/// A supplied realization, not an automatic performance preference.
-#[derive(Clone)]
-pub enum Candidate {
-    Cpu {
-        loads: LoadStrategy,
-    },
-    Cuda {
-        options: ScalarOptions,
-        threads_per_block: u32,
-    },
-    #[cfg(target_os = "macos")]
-    Metal(seismic_metal::execution::Config),
+    _charge: memory::Charge,
 }
 enum Executable {
     Cpu(Box<seismic_cpu::Kernel>),
@@ -83,7 +88,7 @@ pub struct Kernel {
     executable: Executable,
     buffers: Vec<BufferSpec>,
     scalars: Vec<ScalarParameter>,
-    tuning: Option<tuner::Artifact>,
+    tuning: tuner::Artifact,
 }
 impl Device {
     pub fn facts(&self) -> DeviceFacts {
@@ -98,18 +103,18 @@ impl Device {
         }
     }
     pub fn cpu() -> Self {
-        Self(BackendDevice::Cpu)
+        Self(BackendDevice::Cpu, Rc::default())
     }
     pub fn cuda(ordinal: i32) -> Result<Self, String> {
         Ok(Self(BackendDevice::Cuda(Rc::new(
             seismic_cuda::Device::open(ordinal)?,
-        ))))
+        )), Rc::default()))
     }
     #[cfg(target_os = "macos")]
     pub fn metal() -> Result<Self, String> {
         Ok(Self(BackendDevice::Metal(Rc::new(
             seismic_metal::runtime::Device::open()?,
-        ))))
+        )), Rc::default()))
     }
     pub fn backend(&self) -> &'static str {
         match self.0 {
@@ -119,7 +124,16 @@ impl Device {
             BackendDevice::Metal(_) => "metal",
         }
     }
-    pub fn buffer(&self, bytes: usize) -> Result<Buffer, String> {
+    pub fn memory_usage(&self) -> memory::Usage {
+        self.1.usage()
+    }
+    /// Set the storage budget shared by this device and all its clones. Native
+    /// allocator failures remain failures, not invented capacity measurements.
+    pub fn set_memory_limit(&self, bytes: Option<usize>) -> Result<(), Error> {
+        self.1.set_limit(bytes)
+    }
+    pub fn buffer(&self, bytes: usize) -> Result<Buffer, Error> {
+        let charge = self.1.charge(bytes)?;
         Ok(Buffer(
             match &self.0 {
                 BackendDevice::Cpu => Storage::Cpu(seismic_cpu::Buffer::new(bytes)?),
@@ -127,11 +141,11 @@ impl Device {
                 #[cfg(target_os = "macos")]
                 BackendDevice::Metal(device) => Storage::Metal(device.buffer(bytes)?),
             },
-            Rc::new(Allocation { bytes }),
+            Rc::new(Allocation { bytes, _charge: charge }),
             0,
         ))
     }
-    pub fn buffer_from(&self, bytes: &[u8]) -> Result<Buffer, String> {
+    pub fn buffer_from(&self, bytes: &[u8]) -> Result<Buffer, Error> {
         let buffer = self.buffer(bytes.len())?;
         buffer.write(bytes)?;
         Ok(buffer)
@@ -139,7 +153,7 @@ impl Device {
     pub fn compile_tuned(&self, tuned: tuner::TunedIr) -> Result<Kernel, String> {
         tuned.conditions().validate_device(&self.facts())?;
         let (execution, artifact) = tuned.into_parts();
-        let mut kernel = match (execution, artifact.conditions().implementation()) {
+        match (execution, artifact.conditions().implementation()) {
             (
                 execution::Execution::Cpu(program),
                 tuner::ImplementationConditions::Cpu(conditions),
@@ -148,40 +162,34 @@ impl Device {
                 let native = seismic_cpu::compile_execution_with(program, &conditions.codegen)?;
                 let buffers = native.buffers().to_vec();
                 let scalars = native.scalars().to_vec();
-                Kernel {
+                Ok(Kernel {
                     conditions: invocation_conditions,
                     executable: Executable::Cpu(Box::new(native)),
                     buffers,
                     scalars,
-                    tuning: None,
-                }
+                    tuning: artifact,
+                })
             }
             (
                 execution @ execution::Execution::Cuda(_),
                 tuner::ImplementationConditions::Cuda(_),
-            ) => self.compile_execution(execution)?,
+            ) => self.compile_execution(execution, artifact),
             #[cfg(target_os = "macos")]
             (
                 execution @ execution::Execution::Metal(_),
                 tuner::ImplementationConditions::Metal(_),
-            ) => self.compile_execution(execution)?,
+            ) => self.compile_execution(execution, artifact),
             _ => {
                 return Err(
                     "selected execution and retained implementation conditions differ".into(),
                 );
             }
-        };
-        kernel.tuning = Some(artifact);
-        Ok(kernel)
+        }
     }
 
-    pub fn compile(&self, lowered: &LoweredIr, candidate: Candidate) -> Result<Kernel, String> {
-        let execution = execution::Execution::prepare(lowered, candidate, &self.facts())?;
-        self.compile_execution(execution)
-    }
     /// Native compilation consumes a prepared execution. It cannot select or
     /// replace a candidate by re-running lowering or preparation.
-    pub fn compile_execution(&self, execution: execution::Execution) -> Result<Kernel, String> {
+    fn compile_execution(&self, execution: execution::Execution, artifact: tuner::Artifact) -> Result<Kernel, String> {
         use execution::Execution;
         let conditions = match &execution {
             Execution::Cpu(p) => p.conditions.clone(),
@@ -235,11 +243,15 @@ impl Device {
             executable,
             buffers,
             scalars,
-            tuning: None,
+            tuning: artifact,
         })
     }
 }
 impl Buffer {
+    /// Resource-domain identity includes cloned device handles and retained views.
+    pub fn belongs_to(&self, device: &Device) -> bool {
+        self.1._charge.belongs_to(&device.1)
+    }
     fn model_alignment(&self) -> Result<u64, String> {
         match &self.0 {
             // The owner allocates Vec<u64>; this is a stable guaranteed minimum,
@@ -346,8 +358,8 @@ impl Buffer {
     }
 }
 impl Kernel {
-    pub fn tuning(&self) -> Option<&tuner::Artifact> {
-        self.tuning.as_ref()
+    pub fn tuning(&self) -> &tuner::Artifact {
+        &self.tuning
     }
     fn validate_tuning(&self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
         if buffers.len() != self.buffers.len() {
@@ -368,9 +380,13 @@ impl Kernel {
         self.conditions.validate_aliases(&self.buffers, |i| {
             (Rc::as_ptr(&buffers[i].1) as usize as u64, buffers[i].2 as u64)
         })?;
-        if let Some(artifact) = &self.tuning {
-            tuner::validate_bindings(artifact.workload(), buffers, &self.scalars, scalars)?;
+        for (slot, binding) in self.tuning.workload().buffers.iter().enumerate() {
+            if self.tuning.workload().conditions_allocation(binding.allocation)
+                && !self.conditions.read_only_buffers().contains(&slot) {
+                return Err("content-conditioned allocation may be modified by this execution".into());
+            }
         }
+        tuner::validate_bindings(self.tuning.workload(), buffers, &self.scalars, scalars)?;
         Ok(())
     }
     #[cfg(target_os = "macos")]

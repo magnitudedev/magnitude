@@ -8,6 +8,8 @@ use objc2_metal::{
     MTLCompileOptions, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLBarrierScope, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::ptr::NonNull;
+mod observation;
+pub use observation::{DispatchObservation, Observation};
 
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -135,70 +137,184 @@ impl Device {
     /// Validate every binding before submission, encode in source order, and
     /// retain one error status through the entire command buffer. Later dispatches
     /// cannot erase an earlier failure. Physical completion precedes return.
-    pub fn run_many(&self, invocations: &[Invocation<'_>], repeat: usize) -> Result<f64,String> {
-        if repeat == 0 || invocations.is_empty() { return Err("Metal batch and repeat count must be nonempty".into()); }
-        let mut dispatch_count=0usize;
+    pub fn run_many(&self, invocations: &[Invocation<'_>], repeat: usize) -> Result<f64, String> {
+        Ok(self.submit(invocations, repeat, false)?.command_seconds)
+    }
+
+    /// Optional qualification: one sampled compute encoder per dispatch. Its
+    /// stage interval differs from the uninstrumented command-buffer interval.
+    /// Unsupported native counters are reported; no substituted clock is used.
+    pub fn profile(
+        &self,
+        pipeline: &Pipeline,
+        buffers: &[&Buffer],
+        scalars: &[u8],
+    ) -> Result<Observation, String> {
+        self.submit(
+            &[Invocation {
+                pipeline,
+                buffers: buffers.to_vec(),
+                scalars: scalars.to_vec(),
+            }],
+            1,
+            true,
+        )
+    }
+
+    fn submit(
+        &self,
+        invocations: &[Invocation<'_>],
+        repeat: usize,
+        profile: bool,
+    ) -> Result<Observation, String> {
+        if repeat == 0 || invocations.is_empty() {
+            return Err("Metal batch and repeat count must be nonempty".into());
+        }
+        let mut dispatch_count = 0usize;
         for invocation in invocations {
-            let Invocation {pipeline,buffers,scalars}=invocation;
+            let Invocation {
+                pipeline,
+                buffers,
+                scalars,
+            } = invocation;
             self.validate_pipeline(pipeline)?;
-            if buffers.len()!=pipeline.emitted.buffers.len() {return Err("Metal buffer binding count mismatch".into());}
-            for (buffer,slot) in buffers.iter().zip(&pipeline.emitted.buffers) {
-                self.validate_buffer(buffer)?;
-                if !buffer.offset.is_multiple_of(slot.alignment) {return Err("Metal resident view violates typed storage alignment".into());}
-                if buffer.len()<slot.bytes {return Err(format!("Metal buffer {}.{} has {} bytes; needs {}",slot.parameter,slot.plane,buffer.len(),slot.bytes));}
+            if buffers.len() != pipeline.emitted.buffers.len() {
+                return Err("Metal buffer binding count mismatch".into());
             }
-            for (a,b,exact_allowed) in &pipeline.emitted.alias_pairs {
-                let (left,right)=(buffers[*a],buffers[*b]);
-                let (left_size,right_size)=(pipeline.emitted.buffers[*a].bytes,pipeline.emitted.buffers[*b].bytes);
-                if std::ptr::eq(left.raw(),right.raw()) && left.offset < right.offset+right_size && right.offset < left.offset+left_size
-                    && !(*exact_allowed && left.offset==right.offset && left_size==right_size) {
+            for (buffer, slot) in buffers.iter().zip(&pipeline.emitted.buffers) {
+                self.validate_buffer(buffer)?;
+                if !buffer.offset.is_multiple_of(slot.alignment) {
+                    return Err("Metal resident view violates typed storage alignment".into());
+                }
+                if buffer.len() < slot.bytes {
+                    return Err(format!(
+                        "Metal buffer {}.{} has {} bytes; needs {}",
+                        slot.parameter,
+                        slot.plane,
+                        buffer.len(),
+                        slot.bytes
+                    ));
+                }
+            }
+            for (a, b, exact_allowed) in &pipeline.emitted.alias_pairs {
+                let (left, right) = (buffers[*a], buffers[*b]);
+                let (left_size, right_size) = (
+                    pipeline.emitted.buffers[*a].bytes,
+                    pipeline.emitted.buffers[*b].bytes,
+                );
+                if std::ptr::eq(left.raw(), right.raw())
+                    && left.offset < right.offset + right_size
+                    && right.offset < left.offset + left_size
+                    && !(*exact_allowed && left.offset == right.offset && left_size == right_size)
+                {
                     return Err("pointwise partition binding has unsafe overlapping storage".into());
                 }
             }
             pipeline.emitted.scalar_layout()?.validate_bytes(scalars)?;
-            dispatch_count=dispatch_count.checked_add(pipeline.states.len()).ok_or("Metal dispatch count overflow")?;
+            dispatch_count = dispatch_count
+                .checked_add(pipeline.states.len())
+                .ok_or("Metal dispatch count overflow")?;
         }
-        dispatch_count.checked_mul(repeat).ok_or("Metal repetition overflow")?;
+        let dispatch_count = dispatch_count
+            .checked_mul(repeat)
+            .ok_or("Metal repetition overflow")?;
         let status = self.buffer_from(&[0; 4])?;
-        let command = self.queue.commandBuffer().ok_or("could not create a command buffer")?;
-        let encoder = command.computeCommandEncoder().ok_or("could not create a compute encoder")?;
+        let mut capture = if profile {
+            Some(observation::Capture::new(self, dispatch_count)?)
+        } else {
+            None
+        };
+        let command = self
+            .queue
+            .commandBuffer()
+            .ok_or("could not create a command buffer")?;
+        let shared_encoder = if profile {
+            None
+        } else {
+            Some(
+                command
+                    .computeCommandEncoder()
+                    .ok_or("could not create a compute encoder")?,
+            )
+        };
         let mut first = true;
         for _ in 0..repeat {
-          for invocation in invocations {
-            let Invocation {pipeline,buffers,scalars}=invocation;
-            for (launch, state) in &pipeline.states {
-            if !first || launch.after_barrier {
-                encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            for (invocation_index, invocation) in invocations.iter().enumerate() {
+                let Invocation {
+                    pipeline,
+                    buffers,
+                    scalars,
+                } = invocation;
+                for (launch_index, (launch, state)) in pipeline.states.iter().enumerate() {
+                    let encoder = if let Some(capture) = &mut capture {
+                        capture.encoder(&command, invocation_index, launch_index, &launch.kernel)?
+                    } else {
+                        shared_encoder.as_ref().unwrap().clone()
+                    };
+                    if !profile && (!first || launch.after_barrier) {
+                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                    }
+                    first = false;
+                    encoder.setComputePipelineState(state);
+                    for (i, b) in buffers.iter().enumerate() {
+                        unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), b.offset, i) };
+                    }
+                    for (i, b) in pipeline.scratch.iter().enumerate() {
+                        unsafe {
+                            encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, buffers.len() + i)
+                        };
+                    }
+                    if let Some(slot) = pipeline.emitted.status_slot {
+                        unsafe { encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, slot) };
+                    }
+                    let scalar_slot = buffers.len() + pipeline.scratch.len();
+                    if !scalars.is_empty() {
+                        unsafe {
+                            encoder.setBytes_length_atIndex(
+                                NonNull::new(scalars.as_ptr() as *mut _).unwrap(),
+                                scalars.len(),
+                                scalar_slot,
+                            )
+                        };
+                    }
+                    let grid = MTLSize {
+                        width: launch.threadgroups as usize,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let group = MTLSize {
+                        width: launch.threads_per_threadgroup as usize,
+                        height: 1,
+                        depth: 1,
+                    };
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+                    if profile {
+                        encoder.endEncoding();
+                    }
+                }
             }
-            first = false;
-            encoder.setComputePipelineState(state);
-            for (i, b) in buffers.iter().enumerate() {
-                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), b.offset, i) };
-            }
-            for (i, b) in pipeline.scratch.iter().enumerate() {
-                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, buffers.len() + i) };
-            }
-            if let Some(slot) = pipeline.emitted.status_slot {
-                unsafe { encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, slot) };
-            }
-            let scalar_slot = buffers.len() + pipeline.scratch.len();
-            if !scalars.is_empty() {
-                unsafe { encoder.setBytes_length_atIndex(NonNull::new(scalars.as_ptr() as *mut _).unwrap(), scalars.len(), scalar_slot) };
-            }
-            let grid = MTLSize { width: launch.threadgroups as usize, height: 1, depth: 1 };
-            let group = MTLSize { width: launch.threads_per_threadgroup as usize, height: 1, depth: 1 };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
-            }
-          }
         }
-        encoder.endEncoding();
+        if let Some(encoder) = shared_encoder {
+            encoder.endEncoding();
+        }
         command.commit();
         command.waitUntilCompleted();
         if let Some(e) = command.error() {
-            return Err(format!("command buffer failed: {}", e.localizedDescription()));
+            return Err(format!(
+                "command buffer failed: {}",
+                e.localizedDescription()
+            ));
         }
-        if status.read(4) != [0; 4] { return Err("Metal invocation encountered an out-of-bounds view".into()); }
-        Ok(command.GPUEndTime() - command.GPUStartTime())
+        if status.read(4) != [0; 4] {
+            return Err("Metal invocation encountered an out-of-bounds view".into());
+        }
+        Ok(Observation {
+            command_seconds: command.GPUEndTime() - command.GPUStartTime(),
+            dispatches: capture
+                .map(|capture| capture.finish(self))
+                .transpose()?
+                .unwrap_or_default(),
+        })
     }
 }
 
@@ -271,6 +387,7 @@ kernel void stream_read(device const float4* x [[buffer(0)]], device float* out 
         status_slot: None,
         alias_pairs: Vec::new(),
         scratch: Vec::new(),
+        scratch_bindings: Vec::new(),
         source: source.to_string(),
         launches: vec![Launch { kernel: "stream_read".into(), threadgroups: 4096, threads_per_threadgroup: 256, after_barrier: false, dispatch: None, tiles:Vec::new(), declared_threadgroup_bytes:0 }],
         buffers: vec![seismic_realization::BufferSpec { parameter: "x".into(), plane: "".into(), bytes: n * 4, alignment: 4 }, seismic_realization::BufferSpec { parameter: "out".into(), plane: "".into(), bytes: 4096 * 8 * 4, alignment: 4 }],

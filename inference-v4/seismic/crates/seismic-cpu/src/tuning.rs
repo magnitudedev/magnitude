@@ -57,10 +57,10 @@ impl compiler::Backend for Backend {
         execution: &ScalarProgram,
         workload: &ScalarWorkload,
         limits: DerivationLimits,
-    ) -> Result<schedule::Model, DerivationError> {
+    ) -> Result<schedule::evaluation::Model, DerivationError> {
         Ok(
             execution_model::derive_scalar(execution, &self.conditions.hardware, workload, limits)?
-                .model,
+                .model.into(),
         )
     }
     fn materialize(
@@ -69,7 +69,7 @@ impl compiler::Backend for Backend {
         objective: &Objective,
     ) -> Result<ScalarProgram, String> {
         let order = scheduling::Order {
-            blocks: schedule::static_order::orders(objective.model(), objective.schedule())?,
+            blocks: schedule::static_order::orders(objective.flat()?.0, objective.flat()?.1)?,
         };
         let mut execution = source.clone();
         scheduling::apply(&mut execution, &order)?;
@@ -82,7 +82,7 @@ impl compiler::Backend for Backend {
         objective: &Objective,
     ) -> Result<(), String> {
         let order = scheduling::Order {
-            blocks: schedule::static_order::orders(objective.model(), objective.schedule())?,
+            blocks: schedule::static_order::orders(objective.flat()?.0, objective.flat()?.1)?,
         };
         scheduling::check_materialization(source, selected, &order)
     }

@@ -471,6 +471,7 @@ mod integer_facts_tests {
                 conditions: Default::default(),
                 function,
                 buffers: Vec::new(),
+                public_buffer_count: 0,
                 scalars: Vec::new(),
                 scratch_bytes: 0,
                 imports: Vec::new(),

@@ -1,14 +1,13 @@
 //! Retained execution resources for the dense feedforward suffix of a Qwen block.
 use crate::weights::residency::ResidentWeight;
 use seismic_lang::{
-    lower::Options,
     plan::plan_specialized,
     program::Program,
     types::{DType, Elem},
 };
 use seismic_runtime::{
-    plan::{Bindings, CompiledPlan},
-    Buffer, Candidate, Device,
+    plan::{Bindings, CompiledPlan, PlanCompiler, Settings},
+    Buffer, Device,
 };
 use std::collections::HashMap;
 
@@ -39,8 +38,7 @@ impl DenseSuffix {
         program: &Program,
         invocation: DenseInvocation,
         weights: DenseWeights,
-        candidate: Candidate,
-        options: &Options,
+        settings: Settings,
     ) -> Result<Self, String> {
         let DenseInvocation {
             rows,
@@ -89,7 +87,7 @@ impl DenseSuffix {
             ("DW".into(), weights.down.element().clone()),
         ]);
         let planned = plan_specialized(program, "qwen_dense_suffix", &shapes, &elements)?;
-        let plan = CompiledPlan::compile_diagnostic(device, program, &planned, options, candidate)?;
+        let plan = PlanCompiler::new(device, program, settings).compile(&planned)?;
         let mut scratch = HashMap::new();
         for (name, width) in [
             ("normalized", hidden),

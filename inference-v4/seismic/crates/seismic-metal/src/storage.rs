@@ -1,5 +1,6 @@
 //! IR-only legality of materialized tile placements. No source emission, native
 //! compilation, device query, timing or performance ranking is involved.
+mod ownership;
 use seismic_lang::{
     ir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind},
     sym::{Atom, Sym},
@@ -77,6 +78,7 @@ impl StorageDecision {
 /// introducing or changing variables must derive a new analysis before emission.
 pub struct StorageAnalysis {
     variables: Vec<VariableStorage>,
+    ownership: ownership::Analysis,
 }
 struct VariableStorage {
     name: String,
@@ -90,6 +92,7 @@ impl StorageAnalysis {
         let cross = analyze_usage(vars, body);
         let intrinsic = intrinsic_operands(body);
         Self {
+            ownership: ownership::Analysis::new(vars, body, &intrinsic),
             variables: vars
                 .iter()
                 .enumerate()
@@ -132,7 +135,9 @@ impl StorageAnalysis {
         }
         let mut alternatives = vec![TilePlacement::GroupShared];
         if !intrinsic_operand {
-            alternatives.insert(0, TilePlacement::Replicated);
+            if !self.ownership.requires_cooperation(variable) {
+                alternatives.insert(0, TilePlacement::Replicated);
+            }
             if !cross_lane_read && !packed {
                 alternatives.push(TilePlacement::Distributed);
             }
@@ -474,12 +479,14 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
 /// allocation/lifetime account: repeated definitions may allocate multiple arrays.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StoragePlan {
+    owned_cooperative: std::collections::BTreeMap<VarId, bool>,
     declarations: std::collections::BTreeMap<VarId, TileDeclaration>,
     data_variables: std::collections::HashSet<VarId>,
     bounds: seismic_lang::sym::Facts,
     packets: std::collections::BTreeMap<VarId, seismic_lang::repr::SnapshotLayout>,
 }
 impl StoragePlan {
+    pub fn owned_cooperative(&self, variable: VarId) -> bool { self.owned_cooperative.get(&variable).copied().unwrap_or(false) }
     pub fn requires_data(&self, variable: VarId) -> bool {
         self.data_variables.contains(&variable)
     }
@@ -719,7 +726,8 @@ pub fn plan(
             .bounds
             .set_range(atom.clone(), Sym::constant(0), bound.clone());
     }
-    let analysis = StorageAnalysis::new(vars, body);
+    let analysis = StorageAnalysis::new(vars, &demand_body);
+    let mut ownership = analysis.ownership.selection();
     for variable in requests.values {
         let Ty::Tile(tile) = &vars[variable].ty else {
             return Err("materialized value is not a tile".into());
@@ -733,7 +741,7 @@ pub fn plan(
                 .checked_mul(extent)
                 .ok_or_else(|| "storage capacity overflow".to_string())
         })?;
-        let decision = analysis.decision(
+        let mut decision = analysis.decision(
             variable,
             capacity,
             tile.elem.read_dtype().ok_or("unresolved storage dtype")?,
@@ -754,8 +762,11 @@ pub fn plan(
                 .ok_or("packet snapshot capacity overflow")?;
             result.packets.insert(variable, layout);
         }
+        ownership.restrict(&mut decision)?;
         let declaration = decision.select(select(&decision)?)?;
+        ownership.select(variable, &declaration.placement)?;
         result.declarations.insert(variable, declaration);
     }
+    result.owned_cooperative = ownership.owners();
     Ok(result)
 }

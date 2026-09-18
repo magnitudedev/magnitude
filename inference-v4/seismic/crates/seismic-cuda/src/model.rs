@@ -4,7 +4,9 @@
 //! is a virtual ISA: this module does not assert a native instruction mapping,
 //! register allocation, cache behavior, warp reconvergence, or block placement.
 //! Those premises are retained, never inferred from a device name or timings.
+mod affine;
 mod trace;
+pub use affine::Affine;
 
 use crate::{execution::Execution, ptx};
 use seismic_accounting::{
@@ -171,7 +173,7 @@ pub enum Allocation {
 pub struct Access {
     pub lane: u64,
     pub allocation: Allocation,
-    pub offset: u64,
+    pub offset: Affine,
     pub bytes: u32,
     pub alignment: u64,
     pub write: bool,
@@ -254,7 +256,7 @@ pub fn derive_cuda<'a>(
 ) -> Result<DerivedCudaModel<'a>, DerivationError> {
     let required = requirements(execution);
     validate(execution, hardware, placement, &required, limits)?;
-    let traced = trace::derive(execution, hardware, workload, limits)?;
+    let traced = trace::derive(execution, hardware, workload, limits, &BTreeMap::new())?;
     build(
         execution, hardware, workload, placement, traced, required, limits,
     )
@@ -275,6 +277,7 @@ pub fn derive_sequence(
         .ok_or("CUDA analysis needs a nonempty phase sequence")?;
     if executions.iter().any(|e| {
         e.program().buffers != first.program().buffers
+            || e.program().public_buffer_count != first.program().public_buffer_count
             || e.program().scalars != first.program().scalars
     }) {
         return Err("CUDA phase sequence has inconsistent invocation ABI".into());
@@ -312,7 +315,43 @@ pub fn derive_sequence(
         )));
     }
     let mut state = workload.clone();
+    if state.buffers.len() != first.program().public_buffer_count {
+        return Err("CUDA sequence workload must contain only source-visible bindings".into());
+    }
+    // Internal publication storage is distinct from every external allocation
+    // and persists through the ordered launches, exactly like the runtime's
+    // private pointer-table suffix. Initial bytes remain unknown.
+    let mut used_ids = state
+        .allocations
+        .iter()
+        .map(|allocation| allocation.id)
+        .collect::<BTreeSet<_>>();
+    let mut next_id = 0u64;
+    for buffer in &first.program().buffers[first.program().public_buffer_count..] {
+        while used_ids.contains(&next_id) {
+            next_id = next_id
+                .checked_add(1)
+                .ok_or("CUDA internal allocation identity exhausted")?;
+        }
+        used_ids.insert(next_id);
+        state
+            .allocations
+            .push(seismic_accounting::workload::Allocation {
+                id: next_id,
+                bytes: buffer.bytes as u64,
+                alignment: hardware.internal_alignment,
+                known_bytes: BTreeMap::new(),
+            });
+        state
+            .buffers
+            .push(seismic_accounting::workload::BufferBinding {
+                allocation: next_id,
+                offset: 0,
+                bytes: buffer.bytes as u64,
+            });
+    }
     let mut instructions = 0u64;
+    let mut symbolic = BTreeMap::new();
     let mut previous_completion = None;
     for (phase, execution) in executions.iter().enumerate() {
         let remaining = DerivationLimits {
@@ -334,11 +373,40 @@ pub fn derive_sequence(
             &required,
             remaining,
         )?;
-        let mut traced = trace::derive(execution, hardware, &state, remaining)?;
+        let mut traced = trace::derive(execution, hardware, &state, remaining, &symbolic)?;
         instructions = instructions
             .checked_add(traced.instructions)
             .ok_or("CUDA sequence instruction count overflow")?;
         let mut external_values = std::mem::take(&mut traced.external_values);
+        symbolic = std::mem::take(&mut traced.external_symbolic);
+        // Invocation domains are initial-state conditions. A phase write ends
+        // the condition for every overlapping field; subsequent phases inherit
+        // only the actual symbolic values established by that write.
+        let retained_domains = state
+            .integer_domains
+            .iter()
+            .filter(|domain| {
+                let seismic_accounting::workload::IntegerInput::Allocation { allocation, offset } =
+                    domain.input
+                else {
+                    return true;
+                };
+                !traced
+                    .events
+                    .iter()
+                    .flat_map(|event| &event.accesses)
+                    .any(|access| {
+                        access.write
+                            && access.allocation == Allocation::External(allocation)
+                            && access.offset.disjoint(
+                                u64::from(access.bytes),
+                                &offset.into(),
+                                u64::from(domain.bytes),
+                            ) != Some(true)
+                    })
+            })
+            .cloned()
+            .collect();
         let mut part = build(
             execution,
             hardware,
@@ -349,6 +417,7 @@ pub fn derive_sequence(
             remaining,
         )?
         .model;
+        state.integer_domains = retained_domains;
         for allocation in &mut state.allocations {
             allocation.known_bytes = external_values
                 .remove(&allocation.id)
@@ -480,12 +549,14 @@ pub(crate) fn validate_target(
             Requirement::Instruction(primitive)
                 if !hardware.timings.iter().any(|t| &t.primitive == primitive) =>
             {
-                return Err(format!("missing CUDA hardware timing for {primitive:?}").into());
+                return Err(DerivationError::Unsupported(format!(
+                    "missing CUDA hardware timing for {primitive:?}"
+                )));
             }
             Requirement::WholeBody(helper) => {
-                return Err(format!(
+                return Err(DerivationError::Unsupported(format!(
                     "CUDA analysis needs the retained {helper:?} implementation expanded into PTX operations; a supplied whole-body cost is not an implementation"
-                ).into());
+                )));
             }
             _ => {}
         }
@@ -559,7 +630,7 @@ fn quantity(
     event: &Event,
     execution: &Execution,
     hardware: &CudaHardware,
-) -> Result<u64, String> {
+) -> Result<u64, DerivationError> {
     Ok(match q {
         Quantity::One => 1,
         Quantity::IssuedLanes => event.issued_lanes.len() as u64,
@@ -574,11 +645,15 @@ fn quantity(
                 if access.alignment < bytes {
                     return Err("memory sector geometry needs known allocation alignment".into());
                 }
-                let end = access
-                    .offset
+                // Exact offsets retain existing sector accounting. Affine
+                // address traces are admissible for address-independent services;
+                // sector-dependent hardware needs a separate uniformity proof.
+                let offset = access.offset.exact().and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| DerivationError::Unsupported("CUDA memory-sector coverage of varying addresses is not yet established".into()))?;
+                let end = offset
                     .checked_add(u64::from(access.bytes))
                     .ok_or("memory range overflow")?;
-                for sector in access.offset / bytes..end.div_ceil(bytes) {
+                for sector in offset / bytes..end.div_ceil(bytes) {
                     coverage.insert((access.allocation.clone(), sector));
                 }
             }
@@ -619,21 +694,21 @@ pub(crate) fn virtual_register_bits(target: &ptx::TargetPlan) -> Result<u64, Str
         .ok_or_else(|| "virtual register storage overflow".into())
     })
 }
-fn amount(a: Amount, e: &Event, x: &Execution, c: &CudaHardware) -> Result<u64, String> {
+fn amount(a: Amount, e: &Event, x: &Execution, c: &CudaHardware) -> Result<u64, DerivationError> {
     amount_from(a, &|q| quantity(q, e, x, c))
 }
-fn amount_from(
+fn amount_from<E: From<String>>(
     a: Amount,
-    quantity: &impl Fn(Quantity) -> Result<u64, String>,
-) -> Result<u64, String> {
+    quantity: &impl Fn(Quantity) -> Result<u64, E>,
+) -> Result<u64, E> {
     quantity(a.quantity)?
         .checked_mul(a.scale)
-        .ok_or_else(|| "CUDA demand overflow".into())
+        .ok_or_else(|| E::from("CUDA demand overflow".to_string()))
 }
-fn ticks_from(
+fn ticks_from<E: From<String>>(
     t: Ticks,
-    quantity: &impl Fn(Quantity) -> Result<u64, String>,
-) -> Result<u64, String> {
+    quantity: &impl Fn(Quantity) -> Result<u64, E>,
+) -> Result<u64, E> {
     match t {
         Ticks::Fixed(t) => Ok(t),
         Ticks::Service {
@@ -643,16 +718,16 @@ fn ticks_from(
         } => amount_from(demand, quantity)?
             .div_ceil(per_tick)
             .checked_add(base)
-            .ok_or_else(|| "CUDA service time overflow".into()),
+            .ok_or_else(|| E::from("CUDA service time overflow".to_string())),
     }
 }
 
 /// One primitive's hardware service, shared by concrete trace accounting and
 /// necessary-demand relaxation. Only the derived quantity environment differs.
-pub(crate) fn primitive_service(
+pub(crate) fn primitive_service<E: From<String>>(
     timing: &PrimitiveTiming,
-    quantity: impl Fn(Quantity) -> Result<u64, String>,
-) -> Result<(u64, Vec<schedule::Reservation>), String> {
+    quantity: impl Fn(Quantity) -> Result<u64, E>,
+) -> Result<(u64, Vec<schedule::Reservation>), E> {
     let latency = ticks_from(timing.latency, &quantity)?;
     let mut reservations = Vec::new();
     for reservation in &timing.reservations {

@@ -4,3 +4,8 @@ pub mod models;
 pub mod weights;
 pub mod state;
 pub mod execution;
+pub mod chat;
+pub mod inputs;
+pub mod generation;
+pub mod service;
+pub mod serving;

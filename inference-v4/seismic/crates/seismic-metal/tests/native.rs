@@ -333,3 +333,39 @@ fn resident_subviews_preserve_offsets_owners_and_canaries() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn bf16_nested_arithmetic_preserves_each_rounding_boundary() {
+    use seismic_lang::{interp::{Arg, Interpreter, TensorData}, program::{compile, SourceFile}, types::DType, Scope};
+    let program = compile(&[SourceFile {
+        path: "bf16-arithmetic.seismic.portable".into(), scope: Scope::Portable,
+        text: r#"
+fn evaluate(x:tensor[4] bf16,b:tensor[4] bf16,out:tensor[4] bf16):
+  a = load(x)
+  v = load(b)
+  y = tile[4] bf16
+  for i in owned(y): y[i] = (a[i] + v[i]) * a[i] - v[i]
+  store(y,out)
+"#.into(),
+    }], &[]).unwrap();
+    let data = [
+        TensorData::dense(DType::BF16, vec![4], vec![1.0, -1.0, 1.0078125, 7.96875]),
+        TensorData::dense(DType::BF16, vec![4], vec![0.00390625, 0.001953125, 0.00390625, -0.03125]),
+        TensorData::dense(DType::BF16, vec![4], vec![0.0; 4]),
+    ];
+    let mut reference = Interpreter::new(&program);
+    let ids = data.iter().cloned().map(|d| reference.add_tensor(d)).collect::<Vec<_>>();
+    reference.run("evaluate", &ids.iter().copied().map(Arg::Tensor).collect::<Vec<_>>(), &Default::default()).unwrap();
+    let expected = reference.tensors[ids[2]].device_bytes().remove(0);
+    let lowered = seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
+    let execution = seismic_metal::execution::prepare(&lowered, Default::default()).unwrap();
+    let requirements = seismic_metal::model::requirements(&execution).unwrap();
+    assert!(requirements.unmapped.is_empty());
+    let emitted = seismic_metal::msl::emit_execution(&execution).unwrap();
+    let device = seismic_metal::runtime::Device::open().unwrap();
+    let buffers = data.iter().map(|d| device.buffer_from(&d.device_bytes()[0]).unwrap()).collect::<Vec<_>>();
+    let pipeline = device.compile(emitted).unwrap();
+    device.run(&pipeline, &buffers.iter().collect::<Vec<_>>(), &[], 1).unwrap();
+    assert_eq!(buffers[2].read(8), expected);
+}

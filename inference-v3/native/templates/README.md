@@ -15,6 +15,12 @@ cmake --build inference-v3/build/templates --parallel 4
 ctest --test-dir inference-v3/build/templates --output-on-failure
 ```
 
+The Rust engine's `inference-v4/templates` crate uses the same owned sources and
+C ABI with `-DTEMPLATES_STATIC=ON`, embedding the library in the executable. Its
+safe owners release native handles and copy borrowed stream events before the
+next mutation. Build tools are development dependencies, not runtime dependencies.
+The default shared-library build remains available to the Python consumer.
+
 To bundle the shared library with the development Python module:
 
 ```sh

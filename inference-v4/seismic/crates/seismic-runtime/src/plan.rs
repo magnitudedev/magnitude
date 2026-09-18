@@ -1,30 +1,24 @@
 //! Reusable compiled compositions with retained, checked runtime bindings.
-use crate::{Buffer, Candidate, Device, ExecutionObservation, Kernel};
+use crate::{Buffer, Device, ExecutionObservation, Kernel};
 use seismic_lang::{
-    lower::{Options, lower_specialized},
-    plan::{Plan, ScalarSource},
+    lower::Options,
+    plan::Plan,
     program::Program,
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     rc::Rc,
 };
 pub trait Bindings {
+    /// Immutable invocation input whose actual bytes affect indexing/control flow.
+    fn known_buffer(&self, _root: &str, _plane: &str) -> bool { false }
+    /// Admitted varying control values, modeled uniformly before selection and
+    /// checked against actual bytes before every native submission.
+    fn buffer_domains(&self, _root: &str, _plane: &str) -> Vec<crate::tuner::BufferIntegerDomain> { Vec::new() }
+    fn scalar_domain(&self, _name: &str) -> Option<crate::tuner::IntegerRange> { None }
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
     fn scalar(&self, name: &str) -> Option<f64>;
-}
-struct Slot {
-    root: String,
-    plane: String,
-    offset: usize,
-    bytes: usize,
-}
-struct Step {
-    entry: String,
-    kernel: usize,
-    slots: Vec<Slot>,
-    scalars: Vec<ScalarSource>,
 }
 #[derive(Clone, Debug)]
 pub struct StepObservation {
@@ -32,96 +26,40 @@ pub struct StepObservation {
     pub execution: ExecutionObservation,
 }
 pub struct CompiledPlan {
-    enclosing: Option<Enclosing>,
-    kernels: Vec<Rc<RefCell<Kernel>>>,
-    steps: Vec<Step>,
+    enclosing: Rc<Enclosing>,
 }
 impl CompiledPlan {
-    pub fn compile_diagnostic(
-        device: &Device,
-        program: &Program,
-        plan: &Plan,
-        lowering: &Options,
-        candidate: Candidate,
-    ) -> Result<Self, String> {
-        PlanCompiler::diagnostic(device, program, lowering.clone(), candidate).compile(plan)
-    }
-    pub fn step_count(&self) -> usize {
-        self.enclosing.as_ref().map_or(self.steps.len(), |_| 1)
-    }
-    pub fn kernel_count(&self) -> usize {
-        self.enclosing
-            .as_ref()
-            .map_or(self.kernels.len(), |e| e.kernels.borrow().len())
-    }
-    /// Resolve all named inputs and checked subviews before the first kernel.
-    /// This baseline completes each kernel synchronously; batched native submission
-    /// is a separate realization and is not claimed by this execution path.
+    pub fn supports_integer_domains(&self) -> bool { self.enclosing.settings.form.supports_integer_domains() }
+    pub fn shares_compilation(&self, other: &Self) -> bool { Rc::ptr_eq(&self.enclosing, &other.enclosing) }
+    pub fn step_count(&self) -> usize { 1 }
+    pub fn kernel_count(&self) -> usize { self.enclosing.kernels.borrow().len() }
     pub fn execute(&mut self, bindings: &dyn Bindings) -> Result<(), String> {
-        self.invoke(bindings, false).map(|_| ())
+        self.prepare(bindings)?.execute_sequential()
     }
-    pub fn execute_observed(
-        &mut self,
-        bindings: &dyn Bindings,
-    ) -> Result<Vec<StepObservation>, String> {
-        self.invoke(bindings, true)
+    pub fn execute_observed(&mut self, bindings: &dyn Bindings) -> Result<Vec<StepObservation>, String> {
+        self.prepare(bindings)?.execute_steps_observed()
     }
     pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
-        if let Some(enclosing) = &self.enclosing {
-            return enclosing.prepare(bindings);
-        }
-        let mut prepared = Vec::new();
-        for step in &self.steps {
-            let buffers = step
-                .slots
-                .iter()
-                .map(|slot| {
-                    let buffer = bindings
-                        .buffer(&slot.root, &slot.plane)
-                        .ok_or_else(|| format!("unbound tensor {}.{}", slot.root, slot.plane))?;
-                    let end = slot
-                        .offset
-                        .checked_add(slot.bytes)
-                        .ok_or("plan byte range overflow")?;
-                    buffer.view(slot.offset..end)
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let scalars = step
-                .scalars
-                .iter()
-                .map(|source| match source {
-                    ScalarSource::Literal(value) => Ok(*value),
-                    ScalarSource::Param(name) => bindings
-                        .scalar(name)
-                        .ok_or_else(|| format!("unbound scalar {name}")),
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            seismic_realization::encode_scalars(
-                self.kernels[step.kernel].borrow().scalars(),
-                &scalars,
-            )?;
-            prepared.push(BoundInvocation {
-                entry: step.entry.clone(),
-                kernel: self.kernels[step.kernel].clone(),
-                buffers,
-                scalars,
-            });
-        }
-        Ok(Submission {
-            invocations: prepared,
-        })
+        self.enclosing.prepare(bindings)
     }
-    fn invoke(
-        &mut self,
-        bindings: &dyn Bindings,
-        observed: bool,
-    ) -> Result<Vec<StepObservation>, String> {
-        let mut submission = self.prepare(bindings)?;
-        if observed {
-            submission.execute_steps_observed()
-        } else {
-            submission.execute_sequential().map(|_| Vec::new())
+    /// Bind a logical entry's ABI; selection still precedes native compilation.
+    pub fn execute_buffers(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
+        if buffers.len() != self.enclosing.buffers.len() || scalars.len() != self.enclosing.scalars.len() {
+            return Err("entry binding count differs from its logical ABI".into());
         }
+        struct Positional<'a> {
+            buffers: HashMap<(&'a str, &'a str), &'a Buffer>,
+            scalars: HashMap<&'a str, f64>,
+        }
+        impl Bindings for Positional<'_> {
+            fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> { self.buffers.get(&(root, plane)).copied() }
+            fn scalar(&self, name: &str) -> Option<f64> { self.scalars.get(name).copied() }
+        }
+        let bindings = Positional {
+            buffers: self.enclosing.buffers.iter().zip(buffers).map(|(s,b)| ((s.parameter.as_str(),s.plane.as_str()),b)).collect(),
+            scalars: self.enclosing.scalars.iter().zip(scalars).map(|(s,v)| (s.name.as_str(),*v)).collect(),
+        };
+        self.enclosing.prepare(&bindings)?.execute_sequential()
     }
 }
 
@@ -192,6 +130,23 @@ impl Submission {
                 return Err("mixed backends in submission".into());
             }
             backend = Some(kind);
+        }
+        // The whole batch validates before encoding. No invocation may mutate
+        // another invocation's content-conditioned allocation between checks.
+        for bound in &self.invocations {
+            let kernel = bound.kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+            for (slot, binding) in kernel.tuning.workload().buffers.iter().enumerate() {
+                let known = kernel.tuning.workload().conditions_allocation(binding.allocation);
+                if !known { continue; }
+                for other in &self.invocations {
+                    let other_kernel = other.kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+                    for (other_slot, buffer) in other.buffers.iter().enumerate() {
+                        if bound.buffers[slot].shares_allocation(buffer) && !other_kernel.conditions.read_only_buffers().contains(&other_slot) {
+                            return Err("batch may modify a content-conditioned allocation".into());
+                        }
+                    }
+                }
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -310,12 +265,43 @@ impl Enclosing {
                     .ok_or_else(|| format!("unbound scalar {}", s.name))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let workload = crate::tuner::workload(&self.entry, &buffers, &self.scalars, &scalars)?;
+        let mut workload = crate::tuner::workload(&self.entry, &buffers, &self.scalars, &scalars)?;
+        let known = self.buffers.iter().enumerate().filter_map(|(slot, b)| bindings.known_buffer(&b.parameter, &b.plane).then_some(slot)).collect::<Vec<_>>();
+        crate::tuner::capture_contents(&mut workload, &buffers, &known)?;
+        let mut domains = Vec::new();
+        for (slot, scalar) in self.scalars.iter().enumerate() {
+            if let Some(range) = bindings.scalar_domain(&scalar.name) {
+                domains.push(crate::tuner::IntegerDomain {
+                    input: crate::tuner::IntegerInput::Scalar { slot },
+                    bytes: scalar.dtype.bytes() as u8,
+                    signed: scalar.dtype == seismic_lang::types::DType::I32,
+                    range,
+                });
+            }
+        }
+        for (slot, buffer) in self.buffers.iter().enumerate() {
+            let binding = &workload.buffers[slot];
+            for domain in bindings.buffer_domains(&buffer.parameter, &buffer.plane) {
+                if domain.offset.checked_add(u64::from(domain.bytes)).is_none_or(|end| end > binding.bytes) {
+                    return Err("integer input domain exceeds its parameter view".into());
+                }
+                domains.push(crate::tuner::IntegerDomain {
+                    input: crate::tuner::IntegerInput::Allocation {
+                        allocation: binding.allocation,
+                        offset: binding.offset.checked_add(domain.offset).ok_or("integer input offset overflow")?,
+                    },
+                    bytes: domain.bytes,
+                    signed: domain.signed,
+                    range: domain.range,
+                });
+            }
+        }
+        crate::tuner::generalize_inputs(&mut workload, &buffers, &self.scalars, domains)?;
         let existing = self
             .kernels
             .borrow()
             .iter()
-            .find(|(w, _)| w == &workload)
+            .find(|(w, _)| w.covers(&workload))
             .map(|(_, k)| k.clone());
         let kernel = match existing {
             Some(k) => k,
@@ -353,8 +339,12 @@ impl Enclosing {
                     crate::tuner::Outcome::Incomplete(progress) => {
                         let unresolved = progress.unresolved();
                         let exhausted = progress.exhausted_derivations().collect::<Vec<_>>();
+                        let missing = progress.missing_mappings().flat_map(|(_, reasons)| reasons.iter()).collect::<std::collections::BTreeSet<_>>();
+                        let unsupported = progress.unsupported_analyses().collect::<Vec<_>>();
                         let message = format!(
-                            "composition tuning incomplete: lower bound {}, feasible upper {:?}; {} choice regions, {} deferred model derivations, {} unfinished schedules, {} models with unavailable resource mappings; exhausted limits: {exhausted:?}",
+                            "composition {} tuning incomplete after {} nodes: lower bound {}, feasible upper {:?}; {} choice regions, {} deferred model derivations, {} unfinished schedules, {} models with unavailable resource mappings; missing mappings: {missing:?}; exhausted limits: {exhausted:?}; unsupported analyses: {unsupported:?}",
+                            self.entry,
+                            progress.nodes_visited(),
                             progress.lower_bound()?,
                             progress.feasible_upper(),
                             unresolved.choice_regions,
@@ -391,53 +381,16 @@ impl Enclosing {
     }
 }
 
-#[derive(Clone)]
-pub struct Diagnostic {
-    pub lowering: Options,
-    pub candidate: Candidate,
-}
-type KernelKey = (
-    String,
-    Vec<(String, i64)>,
-    Vec<(String, String)>,
-    Vec<String>,
-);
-enum Configuration {
-    Tune(Settings),
-    Diagnostic(Diagnostic),
-}
-/// Reuse is scoped to the same program/device/settings. Both explicit assignments
-/// and selection consume the enclosing source and produce its invocation ABI.
+/// Compiles logical entries through completed automatic selection only.
 pub struct PlanCompiler<'a> {
     device: &'a Device,
-    program: &'a Program,
-    configuration: Configuration,
-    kernels: BTreeMap<KernelKey, Rc<RefCell<Kernel>>>,
+    program: Rc<Program>,
+    settings: Settings,
+    entries: Vec<Rc<Enclosing>>,
 }
 impl<'a> PlanCompiler<'a> {
-    pub fn diagnostic(
-        device: &'a Device,
-        program: &'a Program,
-        lowering: Options,
-        candidate: Candidate,
-    ) -> Self {
-        Self {
-            device,
-            program,
-            configuration: Configuration::Diagnostic(Diagnostic {
-                lowering,
-                candidate,
-            }),
-            kernels: BTreeMap::new(),
-        }
-    }
     pub fn new(device: &'a Device, program: &'a Program, settings: Settings) -> Self {
-        Self {
-            device,
-            program,
-            configuration: Configuration::Tune(settings),
-            kernels: BTreeMap::new(),
-        }
+        Self { device, program: Rc::new(program.clone()), settings, entries: Vec::new() }
     }
     pub fn compile_entry(
         &mut self,
@@ -446,77 +399,10 @@ impl<'a> PlanCompiler<'a> {
         elements: &HashMap<String, seismic_lang::types::Elem>,
         ownership: &seismic_lang::composition::Ownership,
     ) -> Result<CompiledPlan, String> {
-        let settings = match &self.configuration {
-            Configuration::Tune(settings) => settings,
-            Configuration::Diagnostic(assignment) => {
-                let mut shape_key = shapes
-                    .iter()
-                    .map(|(n, v)| (n.clone(), *v))
-                    .collect::<Vec<_>>();
-                shape_key.sort();
-                let mut element_key = elements
-                    .iter()
-                    .map(|(n, v)| (n.clone(), v.to_string()))
-                    .collect::<Vec<_>>();
-                element_key.sort();
-                let mut options = assignment.lowering.clone();
-                options
-                    .ownership
-                    .intermediates
-                    .extend(ownership.intermediates.iter().cloned());
-                let key = (
-                    entry.to_string(),
-                    shape_key,
-                    element_key,
-                    options.ownership.intermediates.iter().cloned().collect(),
-                );
-                let kernel = if let Some(k) = self.kernels.get(&key) {
-                    k.clone()
-                } else {
-                    let lowered = lower_specialized(
-                        self.program,
-                        entry,
-                        self.device.backend(),
-                        shapes,
-                        elements,
-                        &options,
-                    )?;
-                    let kernel = Rc::new(RefCell::new(
-                        self.device
-                            .compile(&lowered, assignment.candidate.clone())?,
-                    ));
-                    self.kernels.insert(key, kernel.clone());
-                    kernel
-                };
-                let k = kernel.borrow();
-                let slots = k
-                    .buffers()
-                    .iter()
-                    .map(|b| Slot {
-                        root: b.parameter.clone(),
-                        plane: b.plane.clone(),
-                        offset: 0,
-                        bytes: b.bytes,
-                    })
-                    .collect();
-                let scalars = k
-                    .scalars()
-                    .iter()
-                    .map(|s| ScalarSource::Param(s.name.clone()))
-                    .collect();
-                drop(k);
-                return Ok(CompiledPlan {
-                    enclosing: None,
-                    kernels: vec![kernel],
-                    steps: vec![Step {
-                        entry: entry.into(),
-                        kernel: 0,
-                        slots,
-                        scalars,
-                    }],
-                });
-            }
-        };
+        if let Some(enclosing) = self.entries.iter().find(|e| e.entry == entry && &e.shapes == shapes && &e.elements == elements && &e.options.ownership == ownership) {
+            return Ok(CompiledPlan { enclosing: enclosing.clone() });
+        }
+        let settings = &self.settings;
         let source = self
             .program
             .functions
@@ -559,7 +445,7 @@ impl<'a> PlanCompiler<'a> {
         let (buffers, scalars) = seismic_realization::storage::parameter_types(&params, &indices)?;
         let enclosing = Enclosing {
             device: self.device.clone(),
-            program: Rc::new(self.program.clone()),
+            program: self.program.clone(),
             entry: entry.into(),
             shapes: shapes.clone(),
             elements: elements.clone(),
@@ -573,20 +459,18 @@ impl<'a> PlanCompiler<'a> {
             pending: RefCell::new(Vec::new()),
             kernels: RefCell::new(Vec::new()),
         };
-        Ok(CompiledPlan {
-            enclosing: Some(enclosing),
-            kernels: Vec::new(),
-            steps: Vec::new(),
-        })
+        let enclosing = Rc::new(enclosing);
+        self.entries.push(enclosing.clone());
+        Ok(CompiledPlan { enclosing })
     }
     pub fn program(&self) -> &Program {
-        self.program
+        &self.program
     }
     pub fn device(&self) -> &Device {
         self.device
     }
     pub fn kernel_count(&self) -> usize {
-        self.kernels.len()
+        self.entries.iter().map(|e| e.kernels.borrow().len()).sum()
     }
     pub fn compile(&mut self, plan: &Plan) -> Result<CompiledPlan, String> {
         self.compile_entry(

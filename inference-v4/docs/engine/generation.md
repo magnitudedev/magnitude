@@ -54,6 +54,15 @@ bounds. They occupy ordinary output positions and remain decode work for fairnes
   forward, mask transfer, and selection share a completion obligation.
 - Row-local invalid distributions produce explicit failures.
 
+Greedy selection breaks ties by the smallest vocabulary index. Categorical
+selection uses V3's Philox4x32-10/Gumbel scoring, which samples the softmax
+distribution. Masked entries and negative infinity have zero mass. Any source
+NaN or positive infinity fails the row, including masked entries; no admitted
+finite entry is a distinct empty-distribution failure. Random draws are
+counter-addressed by vocabulary ID, request seed, accepted output position,
+and selection domain, so retries, replay, vocabulary partitioning, and changes
+in batch membership do not consume or shift randomness.
+
 ## Recovery and publication
 
 - Eviction retains prompt, accepted tokens, output queue/cursor, terminal state,

@@ -341,3 +341,49 @@ fn tile_reassignment_snapshots_overlapping_views_before_writing() {
         }
     }
 }
+
+const CROSS_PUBLICATION: &str = "fn evaluate(x:tensor[65] f32,out:tensor[65] f32):\n  a=load(x)\n  b=tile[65] f32\n  for i in owned(a): b[i]=a[i]+1.0\n  c=tile[65] f32\n  for i in owned(c): c[i]=b[(i+1)%65]\n  store(c,out)\n";
+
+#[test]
+fn storage_domains_couple_element_publication_and_distributed_read_owners() {
+    let f = program(CROSS_PUBLICATION, 65);
+    for first in [TilePlacement::Replicated, TilePlacement::Distributed, TilePlacement::GroupShared] {
+        let mut seen = 0;
+        let execution = seismic_metal::execution::prepare_storage_selected(&f, Config { loads: seismic_realization::LoadStrategy::Materialize, ..Default::default() }, &mut |d| {
+            seen += 1;
+            Ok(if d.name.starts_with("a") { first.clone() }
+            else if d.name.starts_with("b") {
+                let required = if first == TilePlacement::Replicated { TilePlacement::Replicated } else { TilePlacement::GroupShared };
+                assert_eq!(d.alternatives, vec![required.clone()], "publication must agree with its owner");
+                required
+            } else { TilePlacement::Replicated })
+        }).unwrap();
+        assert_eq!(seen, 3);
+        if first == TilePlacement::Distributed {
+            let a = f.vars.iter().position(|v| v.name.starts_with("a")).unwrap();
+            assert!(execution.memory().launches()[0].barriers.iter().any(|(site, barrier)| site.variable == a
+                && site.purpose == seismic_metal::memory::BarrierPurpose::Owned
+                && barrier.memory == seismic_metal::memory::MemorySpace::Threadgroup), "the shared destination must be published even when its loop owner is private distributed storage");
+        }
+    }
+    let error = seismic_metal::execution::prepare_storage_selected(&f, Config { loads: seismic_realization::LoadStrategy::Materialize, ..Default::default() }, &mut |d| Ok(if d.name.starts_with("a") { TilePlacement::GroupShared } else { TilePlacement::Replicated })).err().unwrap();
+    assert!(error.contains("incompatible"), "{error}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Metal hardware"]
+fn native_cross_tile_publication_preserves_cooperative_and_replicated_values() {
+    let device = seismic_metal::runtime::Device::open().unwrap();
+    let input: Vec<f32> = (0..65).map(|i| i as f32 / 8.0 - 4.0).collect();
+    let x = device.buffer_from(&input.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let out = device.buffer(65 * 4).unwrap();
+    let f = program(CROSS_PUBLICATION, 65);
+    for first in [TilePlacement::Replicated, TilePlacement::Distributed, TilePlacement::GroupShared] {
+        let execution = seismic_metal::execution::prepare_storage_selected(&f, Config { loads: seismic_realization::LoadStrategy::Materialize, ..Default::default() }, &mut |d| Ok(if d.name.starts_with("a") { first.clone() } else if d.name.starts_with("b") && first != TilePlacement::Replicated { TilePlacement::GroupShared } else { TilePlacement::Replicated })).unwrap();
+        let kernel = device.compile(seismic_metal::msl::emit_execution(&execution).unwrap()).unwrap();
+        device.run(&kernel, &[&x, &out], &[], 1).unwrap();
+        let expected = (0..65).flat_map(|i| (input[(i + 1) % 65] + 1.0).to_le_bytes()).collect::<Vec<_>>();
+        assert_eq!(out.read(65 * 4), expected, "{first:?}");
+    }
+}

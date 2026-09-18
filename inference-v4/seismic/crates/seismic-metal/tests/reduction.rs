@@ -400,6 +400,36 @@ fn argmax_domains_include_direct_reads_and_check_lane_participation() {
     );
 }
 
+#[test]
+fn every_argmax_placement_has_a_complete_typed_implementation() {
+    use seismic_lang::{Scope, program::{SourceFile, compile}};
+    use seismic_metal::{execution::{Config, prepare_selected}, msl::emit_execution, model};
+    use seismic_realization::LoadStrategy;
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::I32, DType::U32, DType::Bool] {
+        for (shape, axis, output) in [("3,65", 0, 65), ("4,33", 1, 4), ("3,0", 0, 0)] {
+            let source = format!("fn evaluate(x: tensor[{shape}] {}, out: tensor[{output}] i32):\n  a = load(x)\n  y = reduce(a,{axis},argmax)\n  store(y,out)\n", dtype.name());
+            let program = compile(&[SourceFile { path: "typed_argmax.seismic.portable".into(), scope: Scope::Portable, text: source }], &[]).unwrap();
+            let ir = support::common_ir(&program);
+            for loads in [LoadStrategy::Materialize, LoadStrategy::BorrowProvenReadOnly] {
+                for placement in [TilePlacement::Replicated, TilePlacement::Distributed, TilePlacement::GroupShared] {
+                    for algorithm in [Algorithm::Ordered, Algorithm::Collective] {
+                        let domain = ReductionDomain::argmax(
+                            &shape.split(',').map(|d| d.parse().unwrap()).collect::<Vec<_>>(), axis,
+                            dtype, (loads == LoadStrategy::Materialize).then(|| placement.clone()), true, 32).unwrap();
+                        if !domain.algorithms().contains(&algorithm) { continue; }
+                        let execution = prepare_selected(&ir, Config { loads, ..Default::default() },
+                            &mut |_| Ok(placement.clone()), &mut |_| Ok(algorithm)).unwrap();
+                        let emitted = emit_execution(&execution).unwrap();
+                        emitted.terminal.validate_typed().unwrap();
+                        let requirements = model::requirements(&execution).unwrap();
+                        assert!(requirements.unmapped.is_empty(), "{dtype:?}, {shape}, {placement:?}, {loads:?}, {algorithm:?}: {:?}", requirements.unmapped);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]

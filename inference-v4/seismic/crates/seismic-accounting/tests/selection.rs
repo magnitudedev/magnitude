@@ -47,8 +47,8 @@ impl Space for Tree {
             _ => return Err("invalid decision path".into()),
         })
     }
-    fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
-        Ok(self.models[*execution].clone())
+    fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
+        Ok(self.models[*execution].clone().into())
     }
     fn materialize(&self, execution: &usize, _: &Objective) -> Result<usize, String> {
         if self.reject_materialization {
@@ -88,6 +88,97 @@ fn model(latency: u64) -> Model {
         unmapped: vec![],
     }
 }
+
+struct StructuredSpace { context: Context, parallel: bool, missing: bool }
+impl Space for StructuredSpace {
+    type Execution = usize;
+    type Identity = (bool, bool);
+    fn identity(&self) -> Self::Identity { (self.parallel, self.missing) }
+    fn context(&self) -> &Context { &self.context }
+    fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> {
+        Ok(if path.is_empty() { Node::Choice { name: "implementation".into(), alternatives: Domain::new(FixtureChoice { site: 0 })? } }
+        else { Node::Realization(path[0]) })
+    }
+    fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
+        use std::sync::Arc;
+        use structured::{Node as Work, Order, Structured};
+        let flat = model(if *execution == 0 { 3 } else { 2 });
+        Ok(evaluation::Model::Structured { model: Structured {
+            relationship: flat.relationship, identity: flat.identity, timebase: flat.timebase, resources: flat.resources,
+            root: Arc::new(Work::Repeat { order: if self.parallel { Order::Parallel } else { Order::Serial },
+                count: if self.parallel { 2 } else { 1_000_000_000_000 },
+                body: Arc::new(Work::Operation(flat.operations[0].clone())) }),
+            unmapped: if self.missing { vec!["structured service missing".into()] } else { vec![] },
+        }, expansion_limit: 0 })
+    }
+    fn materialize(&self, execution: &usize, objective: &Objective) -> Result<usize, String> {
+        objective.check_execution_upper()?;
+        assert!(objective.structured().is_some());
+        Ok(*execution)
+    }
+}
+
+#[test]
+fn automatic_selection_retains_large_structured_optimum_without_expansion() {
+    let space = StructuredSpace { context: tree().context, parallel: false, missing: false };
+    let Outcome::Optimal(selected) = select(&space, budget(10)).unwrap() else { panic!("structured serial optima should complete") };
+    assert_eq!(*selected.execution(), 1);
+    assert_eq!(selected.cost().upper(), 2_000_000_000_000);
+    assert!(selected.objective().flat().is_err());
+    assert!(selected.objective().structured().unwrap().is_optimal());
+}
+
+#[test]
+fn structured_incumbent_and_missing_mappings_never_bypass_completion() {
+    for missing in [false, true] {
+        let space = StructuredSpace { context: tree().context, parallel: true, missing };
+        let Outcome::Incomplete(progress) = select(&space, budget(10)).unwrap() else { panic!("parallel schedule frontier is unresolved") };
+        if missing {
+            assert_eq!(progress.unresolved().unmapped_models, 2);
+            assert!(progress.feasible_upper().is_none());
+            assert_eq!(progress.missing_mappings().count(), 2);
+        } else {
+            assert!(progress.feasible_upper().is_some());
+            assert!(progress.lower_bound().unwrap() < progress.feasible_upper().unwrap());
+            assert!(progress.unresolved().schedules > 0);
+        }
+        assert!(matches!(resume(&space, progress, budget(10)).unwrap(), Outcome::Incomplete(_)));
+    }
+}
+
+#[test]
+fn automatic_selection_resumes_shared_structured_subproblem_before_materialization() {
+    struct RepeatedParallel { context: Context }
+    impl Space for RepeatedParallel {
+        type Execution = ();
+        type Identity = ();
+        fn identity(&self) {}
+        fn context(&self) -> &Context { &self.context }
+        fn expand(&self, _: &[usize]) -> Result<Node<()>, String> { Ok(Node::Realization(())) }
+        fn analyze(&self, _: &()) -> Result<evaluation::Model, DerivationError> {
+            use std::sync::Arc;
+            use structured::{Node as Work, Order, Structured};
+            let flat = model(3);
+            Ok(evaluation::Model::Structured { model: Structured {
+                relationship: flat.relationship, identity: flat.identity, timebase: flat.timebase, resources: flat.resources,
+                root: Arc::new(Work::Repeat { order: Order::Serial, count: 1_000_000_000_000,
+                    body: Arc::new(Work::Repeat { order: Order::Parallel, count: 2,
+                        body: Arc::new(Work::Operation(flat.operations[0].clone())) }) }), unmapped: vec![],
+            }, expansion_limit: 2 })
+        }
+        fn materialize(&self, _: &(), objective: &Objective) -> Result<(), String> {
+            objective.check_execution_upper()?;
+            assert!(objective.structured().unwrap().is_optimal());
+            assert_eq!(objective.cost().upper(), 4_000_000_000_000);
+            Ok(())
+        }
+    }
+    let space = RepeatedParallel { context: tree().context };
+    let Outcome::Incomplete(progress) = select(&space, Budget { nodes: 1, schedule_assignments: 0 }).unwrap() else { panic!("unfinished subproblem cannot materialize") };
+    assert_eq!(progress.feasible_upper(), Some(6_000_000_000_000));
+    let Outcome::Optimal(selected) = resume(&space, progress, Budget { nodes: 0, schedule_assignments: 1000 }).unwrap() else { panic!("retained shared body should complete") };
+    assert_eq!(selected.cost().upper(), 4_000_000_000_000);
+}
 fn tree() -> Tree {
     Tree {
         context: Context {
@@ -126,8 +217,7 @@ fn selection_resolves_dependent_choices_and_materializes_checked_execution() {
     assert_eq!(selected.cost().upper(), 3);
     selected
         .objective()
-        .model()
-        .check_schedule(selected.objective().schedule())
+        .check_execution_upper()
         .unwrap();
     space.reject_materialization = true;
     assert!(matches!(select(&space, budget(5)), Err(error) if error.contains("does not preserve")));
@@ -277,7 +367,7 @@ impl Space for RetainedTree {
             _ => return Err("invalid retained choice".into()),
         }))
     }
-    fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
+    fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
         self.tree.analyze(execution)
     }
     fn materialize(&self, execution: &usize, objective: &Objective) -> Result<usize, String> {
@@ -404,8 +494,8 @@ fn large_domains_retain_exact_frontier_without_expanding_each_alternative() {
                 Ok(Node::Realization(path[0]))
             }
         }
-        fn analyze(&self, _: &usize) -> Result<Model, DerivationError> {
-            Ok(self.0.models[0].clone())
+        fn analyze(&self, _: &usize) -> Result<evaluation::Model, DerivationError> {
+            Ok(self.0.models[0].clone().into())
         }
         fn materialize(&self, execution: &usize, _: &Objective) -> Result<usize, String> {
             Ok(*execution)
@@ -475,7 +565,7 @@ fn unchanged_inputs_reuse_visited_choices_and_models_on_resumption() {
             self.expansions.set(self.expansions.get() + 1);
             self.tree.expand(path)
         }
-        fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
             self.analyses.set(self.analyses.get() + 1);
             self.tree.analyze(execution)
         }
@@ -528,9 +618,10 @@ fn changed_execution_identity_invalidates_cached_costs_even_when_the_cost_is_equ
                 Node::Choice { name, alternatives } => Node::Choice { name, alternatives },
                 Node::Realization(index) => Node::Realization((index, self.generation)),
                 Node::Infeasible(reason) => Node::Infeasible(reason),
+                Node::Unresolved(reason) => Node::Unresolved(reason),
             })
         }
-        fn analyze(&self, execution: &Self::Execution) -> Result<Model, DerivationError> {
+        fn analyze(&self, execution: &Self::Execution) -> Result<evaluation::Model, DerivationError> {
             self.tree.analyze(&execution.0)
         }
         fn materialize(
@@ -598,6 +689,9 @@ fn incomplete_resource_information_keeps_known_bounds_without_an_upper() {
     assert_eq!(progress.lower_bound().unwrap(), 3);
     assert_eq!(progress.feasible_upper(), None);
     assert!(progress.frontier().is_empty());
+    let missing = progress.missing_mappings().collect::<Vec<_>>();
+    assert_eq!(missing.len(), 3);
+    assert!(missing.iter().all(|(_, reasons)| reasons == &["remaining instruction service".to_string()]));
     assert_eq!(
         progress.unresolved(),
         Unresolved {
@@ -613,6 +707,7 @@ fn symbolic_region_bounds_find_an_interior_optimum_without_enumerating_the_domai
         context: Context,
         optimum: usize,
         analyses: std::cell::Cell<usize>,
+        relaxed: std::cell::RefCell<std::collections::BTreeSet<(usize, usize)>>,
     }
     impl Family {
         fn operation(&self, index: usize) -> Model {
@@ -647,6 +742,8 @@ fn symbolic_region_bounds_find_an_interior_optimum_without_enumerating_the_domai
             domain: &Domain,
             range: std::ops::Range<usize>,
         ) -> Result<Option<Demand>, String> {
+            assert!(self.relaxed.borrow_mut().insert((range.start, range.end)),
+                "the same retained interval must not be reanalyzed within one selection call");
             let owner = domain
                 .owner::<IntegerRange<FixtureChoice>>()
                 .ok_or("wrong typed decision")?;
@@ -659,9 +756,9 @@ fn symbolic_region_bounds_find_an_interior_optimum_without_enumerating_the_domai
             demand.include(&witness.operations[0], 1)?;
             Ok(Some(demand))
         }
-        fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
             self.analyses.set(self.analyses.get() + 1);
-            Ok(self.operation(*execution))
+            Ok(self.operation(*execution).into())
         }
         fn materialize(&self, execution: &usize, _: &Objective) -> Result<usize, String> {
             Ok(*execution)
@@ -671,6 +768,7 @@ fn symbolic_region_bounds_find_an_interior_optimum_without_enumerating_the_domai
         context: tree().context,
         optimum: 743_987_654_321,
         analyses: Default::default(),
+        relaxed: Default::default(),
     };
     let selected = optimal(select(&family, budget(2)).unwrap());
     assert_eq!(*selected.execution(), family.optimum);
@@ -698,7 +796,7 @@ impl Space for LimitedDerivation {
         self.expansions.set(self.expansions.get() + 1);
         self.tree.expand(path)
     }
-    fn analyze(&self, execution: &usize) -> Result<Model, DerivationError> {
+    fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
         self.analyses.borrow_mut()[*execution] += 1;
         if *execution == 1 {
             if self.unsupported {
@@ -812,4 +910,301 @@ fn deferred_derivation_still_rejects_changed_semantics_and_unsupported_analysis(
     assert!(matches!(resume(&space, progress, budget(0)), Err(e) if e.contains("inputs changed")));
     space.unsupported = true;
     assert!(matches!(select(&space, budget(5)), Err(e) if e.contains("unsupported operation")));
+}
+
+#[test]
+fn dominated_schedule_models_are_released_without_losing_resume_coverage() {
+    let space = tree();
+    let Outcome::Incomplete(progress) = select(&space, budget(4)).unwrap() else {
+        panic!("one implementation remains unvisited")
+    };
+    assert_eq!(progress.nodes_visited(), 4);
+    assert_eq!(progress.feasible_upper(), Some(3));
+    assert_eq!(progress.retained_schedule_models(), 1,
+        "the earlier cost-9 model must not remain attached to a dominated leaf");
+    assert_eq!(progress.unresolved().choice_regions, 1);
+    let selected = optimal(resume(&space, progress, budget(1)).unwrap());
+    assert_eq!(*selected.execution(), 1);
+    assert_eq!(selected.selected_path(), &[0, 1]);
+    assert_eq!(selected.cost().lower(), 3);
+    assert_eq!(selected.cost().upper(), 3);
+}
+
+#[test]
+fn execution_demand_prunes_before_schedule_allocation_and_on_derivation_resume() {
+    struct Counted {
+        tree: Tree,
+        defer_first: bool,
+        analyzed: std::cell::RefCell<[u32; 3]>,
+    }
+    impl Space for Counted {
+        type Execution = usize;
+        type Identity = ([Model; 3], bool);
+        fn identity(&self) -> Self::Identity { (self.tree.models.clone(), self.defer_first) }
+        fn context(&self) -> &Context { self.tree.context() }
+        fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> { self.tree.expand(path) }
+        fn relax_execution(&self, execution: &usize) -> Result<Option<Demand>, String> {
+            let model = &self.tree.models[*execution];
+            let mut demand = Demand::new(model.timebase.clone(), model.resources.clone())?;
+            for operation in &model.operations { demand.include(operation, 1)?; }
+            Ok(Some(demand))
+        }
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
+            self.analyzed.borrow_mut()[*execution] += 1;
+            if self.defer_first && *execution == 0 {
+                return Err(DerivationError::Exhausted(DerivationLimit::Operations(1)));
+            }
+            assert_ne!(*execution, 2, "dominated execution must never allocate its schedule");
+            self.tree.analyze(execution)
+        }
+        fn materialize(&self, execution: &usize, objective: &Objective) -> Result<usize, String> {
+            self.tree.materialize(execution, objective)
+        }
+    }
+    for defer_first in [false, true] {
+        let space = Counted { tree: tree(), defer_first, analyzed: Default::default() };
+        let outcome = select(&space, budget(5)).unwrap();
+        let selected = if defer_first {
+            let Outcome::Incomplete(progress) = outcome else { panic!("first derivation is still unresolved") };
+            assert_eq!(progress.unresolved().derivations, 1);
+            assert_eq!(progress.feasible_upper(), Some(3));
+            optimal(resume(&space, progress, budget(0)).unwrap())
+        } else { optimal(outcome) };
+        assert_eq!(*selected.execution(), 1);
+        assert_eq!(selected.cost().upper(), 3);
+        assert_eq!(*space.analyzed.borrow(), [1, 1, 0]);
+    }
+}
+
+#[test]
+fn excluded_regions_release_preparation_owners_but_preserve_coverage() {
+    use std::{cell::RefCell, sync::{Arc, Weak}};
+    #[derive(Clone, Debug, PartialEq)]
+    struct Prepared {
+        site: usize,
+        ir: Arc<Vec<u8>>,
+    }
+    impl Choices for Prepared {
+        type Alternative = usize;
+        fn len(&self) -> usize { if self.site == 0 { 3 } else { 2 } }
+        fn get(&self, index: usize) -> Option<usize> { (index < self.len()).then_some(index) }
+    }
+    struct PreparedSpace {
+        context: Context,
+        owners: RefCell<Vec<(usize, Weak<Vec<u8>>)>>,
+    }
+    impl Space for PreparedSpace {
+        type Execution = usize;
+        type Identity = ();
+        fn identity(&self) {}
+        fn context(&self) -> &Context { &self.context }
+        fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> {
+            let site = match path {
+                [] => 0,
+                [0] => return Ok(Node::Realization(0)),
+                [1] => 1,
+                [2] => return Ok(Node::Realization(2)),
+                _ => panic!("excluded child must never be constructed: {path:?}"),
+            };
+            let ir = Arc::new(vec![site as u8; 4096]);
+            self.owners.borrow_mut().push((site, Arc::downgrade(&ir)));
+            Ok(Node::Choice { name: format!("prepared {site}"), alternatives: Domain::new(Prepared { site, ir })? })
+        }
+        fn relax(&self, domain: &Domain, _: std::ops::Range<usize>) -> Result<Option<Demand>, String> {
+            if domain.owner::<Prepared>().unwrap().site == 0 { return Ok(None); }
+            let m = model(7);
+            let mut demand = Demand::new(m.timebase, m.resources)?;
+            demand.include(&m.operations[0], 1)?;
+            Ok(Some(demand))
+        }
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
+            Ok(model(if *execution == 0 { 3 } else { 5 }).into())
+        }
+        fn materialize(&self, execution: &usize, _: &Objective) -> Result<usize, String> { Ok(*execution) }
+    }
+    let space = PreparedSpace { context: tree().context, owners: Default::default() };
+    let Outcome::Incomplete(progress) = select(&space, budget(3)).unwrap() else { panic!() };
+    assert!(space.owners.borrow()[0].1.upgrade().is_some(), "unvisited root member needs its prepared context");
+    assert!(space.owners.borrow()[1].1.upgrade().is_none(), "excluded domain and historical record must release the IR");
+    assert!(progress.decision(&[]).is_some());
+    assert!(progress.decision(&[1]).is_none());
+    let excluded = progress.excluded_regions();
+    assert_eq!(excluded.len(), 1);
+    assert_eq!(excluded[0].paths().collect::<Vec<_>>(), [vec![1, 0], vec![1, 1]]);
+    assert_eq!(excluded[0].lower_bound(), 7);
+    assert_eq!(progress.frontier().iter().flat_map(Region::paths).collect::<Vec<_>>(), [vec![2]]);
+    let selected = optimal(resume(&space, progress, budget(1)).unwrap());
+    assert_eq!(*selected.execution(), 0);
+    assert_eq!(selected.selected_path(), &[0]);
+    assert!(space.owners.borrow().iter().all(|(_, owner)| owner.upgrade().is_none()), "completed selection owns only its selected execution");
+}
+
+#[test]
+fn equal_derived_models_share_search_but_preserve_every_source_path() {
+    let mut space = tree();
+    let mut parallel = model(3);
+    parallel.resources.push(Resource {
+        name: "second issue".into(), capacity: 1, unit: CapacityUnit::Slots,
+    });
+    let mut second = parallel.operations[0].clone();
+    second.name = "second independent operation".into();
+    second.reservations[0].resource = 1;
+    parallel.operations.push(second);
+    space.models = [parallel.clone(), parallel.clone(), parallel];
+    let Outcome::Incomplete(progress) = select(
+        &space, Budget { nodes: 5, schedule_assignments: 0 },
+    ).unwrap() else { panic!("the shared schedule still needs refinement") };
+    assert_eq!(progress.nodes_visited(), 5);
+    assert_eq!(progress.unresolved().schedules, 3, "all three source paths remain unresolved");
+    assert_eq!(progress.retained_schedule_models(), 1, "the scheduling constraints are identical");
+    assert_eq!(progress.feasible_upper(), Some(6));
+    assert_eq!(progress.lower_bound().unwrap(), 3);
+    let selected = optimal(resume(&space, progress, budget(0)).unwrap());
+    assert_eq!(selected.selected_path(), &[0, 0]);
+    assert_eq!(*selected.execution(), 0);
+    assert_eq!(selected.cost().upper(), 3);
+    selected.objective().check_execution_upper().unwrap();
+}
+
+#[test]
+fn model_hash_collisions_do_not_identify_distinct_constraints() {
+    let mut space = tree();
+    let mut parallel = model(3);
+    parallel.resources.push(Resource {
+        name: "second issue".into(), capacity: 1, unit: CapacityUnit::Slots,
+    });
+    let mut second = parallel.operations[0].clone();
+    second.name = "second independent operation".into();
+    second.reservations[0].resource = 1;
+    parallel.operations.push(second);
+    space.models = [parallel.clone(), parallel.clone(), parallel];
+    // The accelerator hashes capacities and demands, while exact comparison
+    // additionally checks their units. These intentionally share a hash bucket.
+    space.models[1].resources[1].unit = CapacityUnit::Bytes;
+    let Outcome::Incomplete(progress) = select(
+        &space, Budget { nodes: 5, schedule_assignments: 0 },
+    ).unwrap() else { panic!("both distinct schedules still need refinement") };
+    assert_eq!(progress.retained_schedule_models(), 2);
+    assert_eq!(progress.unresolved().schedules, 3);
+    let selected = optimal(resume(&space, progress, budget(0)).unwrap());
+    assert_eq!(selected.cost().upper(), 3);
+}
+
+#[test]
+fn positive_dependent_bounds_do_not_starve_first_feasible_execution() {
+    struct Dependent(Tree);
+    impl Space for Dependent {
+        type Execution = usize;
+        type Identity = <Tree as Space>::Identity;
+        fn identity(&self) -> Self::Identity { self.0.identity() }
+        fn context(&self) -> &Context { self.0.context() }
+        fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> { self.0.expand(path) }
+        fn relax(&self, domain: &Domain, _: std::ops::Range<usize>) -> Result<Option<Demand>, String> {
+            if domain.owner::<FixtureChoice>().is_none_or(|choice| choice.site != 1) { return Ok(None); }
+            let mandatory = model(3);
+            let mut demand = Demand::new(mandatory.timebase, mandatory.resources)?;
+            demand.include(&mandatory.operations[0], 1)?;
+            Ok(Some(demand))
+        }
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> { self.0.analyze(execution) }
+        fn materialize(&self, execution: &usize, objective: &Objective) -> Result<usize, String> {
+            self.0.materialize(execution, objective)
+        }
+    }
+    let space = Dependent(tree());
+    let Outcome::Incomplete(progress) = select(&space, budget(3)).unwrap() else {
+        panic!("finding a witness cannot substitute for closing the remaining domain")
+    };
+    assert_eq!(progress.incumbent(), Some(&0), "the deeper positive-bound path must finish before zero-bound siblings");
+    assert_eq!(progress.feasible_upper(), Some(9));
+    assert_eq!(progress.nodes_visited(), 3);
+    assert_eq!(progress.frontier().iter().flat_map(Region::paths).collect::<Vec<_>>(), [vec![1], vec![0, 1]]);
+    let selected = optimal(resume(&space, progress, budget(2)).unwrap());
+    assert_eq!(*selected.execution(), 1);
+    assert_eq!(selected.cost().upper(), 3);
+}
+
+#[test]
+fn dependent_refinement_continues_to_improve_an_existing_incumbent() {
+    struct Family(Context);
+    impl Space for Family {
+        type Execution = u64;
+        type Identity = ();
+        fn identity(&self) {}
+        fn context(&self) -> &Context { &self.0 }
+        fn expand(&self, path: &[usize]) -> Result<Node<u64>, String> {
+            Ok(match path {
+                [] => Node::Choice { name: "outer".into(), alternatives: Domain::new(IntegerRange::new(0u8, 0, 999)?)? },
+                [_] => Node::Choice { name: "inner".into(), alternatives: Domain::new(IntegerRange::new(1u8, 0, 1)?)? },
+                [outer, _] => Node::Realization(if *outer == 0 { 99 } else { 1 }),
+                _ => return Err("unexpected path".into()),
+            })
+        }
+        fn relax(&self, domain: &Domain, _: std::ops::Range<usize>) -> Result<Option<Demand>, String> {
+            if domain.owner::<IntegerRange<u8>>().unwrap().decision == 0 { return Ok(None); }
+            let mandatory = model(1);
+            let mut demand = Demand::new(mandatory.timebase, mandatory.resources)?;
+            demand.include(&mandatory.operations[0], 1)?;
+            Ok(Some(demand))
+        }
+        fn analyze(&self, latency: &u64) -> Result<evaluation::Model, DerivationError> { Ok(model(*latency).into()) }
+        fn materialize(&self, latency: &u64, _: &Objective) -> Result<u64, String> { Ok(*latency) }
+    }
+    let space = Family(tree().context);
+    let Outcome::Incomplete(progress) = select(&space, budget(5)).unwrap() else {
+        panic!("unvisited outer branches still need coverage");
+    };
+    assert_eq!(progress.feasible_upper(), Some(1), "positive dependent bounds must not starve improvement of a poor incumbent");
+    assert_eq!(progress.lower_bound().unwrap(), 0);
+    assert!(!progress.frontier().is_empty());
+    let result = optimal(resume(&space, progress, budget(2000)).unwrap());
+    assert_eq!(result.cost().upper(), 1);
+}
+
+#[test]
+fn unavailable_realization_and_model_keep_regions_until_proven_dominated() {
+    struct Unsupported { context: Context, realization: bool, bound: u64 }
+    impl Space for Unsupported {
+        type Execution = usize;
+        type Identity = (bool, u64);
+        fn identity(&self) -> Self::Identity { (self.realization, self.bound) }
+        fn context(&self) -> &Context { &self.context }
+        fn expand(&self, path: &[usize]) -> Result<Node<usize>, String> {
+            Ok(match path {
+                [] => Node::Choice { name: "legal forms".into(), alternatives: Domain::new(FixtureChoice { site: 0 })? },
+                [0] => Node::Realization(0),
+                [1] if self.realization => Node::Unresolved("phase publication analysis".into()),
+                [1] => Node::Realization(1),
+                _ => return Err("invalid fixture path".into()),
+            })
+        }
+        fn relax(&self, _: &Domain, indices: std::ops::Range<usize>) -> Result<Option<Demand>, String> {
+            let mut demand = Demand::new(model(1).timebase, vec![])?;
+            if indices == (1..2) { demand.include(&Operation { name: "required work".into(), predecessors: vec![], start_predecessors: vec![], latency: self.bound, reservations: vec![] }, 1)?; }
+            Ok(Some(demand))
+        }
+        fn analyze(&self, execution: &usize) -> Result<evaluation::Model, DerivationError> {
+            if *execution == 1 { return Err(DerivationError::Unsupported("varying address geometry".into())); }
+            Ok(model(7).into())
+        }
+        fn materialize(&self, execution: &usize, _: &Objective) -> Result<usize, String> { Ok(*execution) }
+    }
+    for realization in [false, true] {
+        for bound in [0, 7] {
+            let fixture = Unsupported { context: tree().context, realization, bound };
+            let outcome = select(&fixture, budget(100)).unwrap();
+            if bound == 7 {
+                assert_eq!(optimal(outcome).execution(), &0);
+            } else {
+                let Outcome::Incomplete(progress) = outcome else { panic!("unproved region cannot complete") };
+                assert_eq!(progress.feasible_upper(), Some(7));
+                assert_eq!(progress.unresolved().unsupported, 1);
+                assert_eq!(progress.unsupported_analyses().count(), 1);
+                assert_eq!(progress.lower_bound().unwrap(), 0);
+                let Outcome::Incomplete(resumed) = resume(&fixture, progress, budget(100)).unwrap() else { panic!("identical resumption must retain missing analysis") };
+                assert_eq!(resumed.unresolved().unsupported, 1);
+                assert_eq!(resumed.unsupported_analyses().count(), 1);
+            }
+        }
+    }
 }

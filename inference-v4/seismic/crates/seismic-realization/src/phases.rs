@@ -1,0 +1,1465 @@
+//! Checked source-order launch boundaries and invocation-owned value handoffs.
+//! A serial region executes once. Its values are published once and reloaded
+//! after completion, never recomputed independently by parallel consumers.
+use seismic_lang::{
+    ast::AssignOp,
+    ir::*,
+    lowered_ir::LoweredIr,
+    span::Span,
+    sym::Sym,
+    types::{DType, Elem, Shaped, Ty},
+};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedValue {
+    pub variable: VarId,
+    /// Appended tensor parameter ordinal in the transformed function.
+    pub parameter: usize,
+    pub name: String,
+    pub dtype: DType,
+    pub elements: u64,
+    pub bytes: usize,
+    pub producer: usize,
+    pub consumers: Vec<usize>,
+    /// Ordered publications, including subsequent serial updates.
+    pub writers: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Phase {
+    /// Physical completion is required before this phase begins.
+    pub predecessor: Option<usize>,
+    pub inputs: Vec<VarId>,
+    pub outputs: Vec<VarId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhasePlan {
+    pub function: LoweredIr,
+    pub phases: Vec<Phase>,
+    pub retained: Vec<RetainedValue>,
+    pub source_parameters: usize,
+}
+
+/// Applicability never turns a missing realization into an infeasibility proof.
+/// Malformed checked IR is an error; a well-formed program whose phase storage
+/// or work domain is not represented yet retains an explicit unresolved reason.
+pub enum Applicability {
+    Supported(PhasePlan),
+    Unresolved { reason: String },
+}
+#[derive(Debug)]
+enum FormationError {
+    Unresolved(String),
+    Invalid(String),
+}
+impl std::fmt::Display for FormationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresolved(reason) | Self::Invalid(reason) => formatter.write_str(reason),
+        }
+    }
+}
+impl From<String> for FormationError {
+    fn from(reason: String) -> Self {
+        Self::Invalid(reason)
+    }
+}
+impl From<&str> for FormationError {
+    fn from(reason: &str) -> Self {
+        Self::Invalid(reason.into())
+    }
+}
+pub fn assess(source: &LoweredIr) -> Result<Applicability, String> {
+    seismic_lang::verify::lowered(source, seismic_lang::verify::Stage::Expanded)?;
+    match construct_checked(source) {
+        Ok(plan) => Ok(Applicability::Supported(plan)),
+        Err(FormationError::Unresolved(reason)) => Ok(Applicability::Unresolved { reason }),
+        Err(FormationError::Invalid(reason)) => Err(reason),
+    }
+}
+
+/// Construct one legal materialized phase realization. Parallel-local values
+/// cannot escape their owner domain, and parallel consumers cannot mutate a
+/// broadcast snapshot without a separately established ownership/merge rule.
+pub fn construct(source: &LoweredIr) -> Result<PhasePlan, String> {
+    construct_checked(source).map_err(|error| error.to_string())
+}
+fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
+    let mut function = work_domains_checked(source)?;
+    let parameters = parameter_variables(&function)?;
+    let mut available = parameters.clone();
+    let mut producers = BTreeMap::new();
+    let mut phases = Vec::new();
+    let mut captures: BTreeMap<VarId, (usize, Vec<usize>)> = BTreeMap::new();
+    let mut writes = Vec::new();
+    for (index, root) in function.body.iter().enumerate() {
+        let StmtKind::Parallel {
+            vars,
+            extents,
+            body,
+        } = &root.kind
+        else {
+            unreachable!()
+        };
+        if vars.len() != extents.len() {
+            return Err("phase index/extent arity differs".into());
+        }
+        if extents
+            .iter()
+            .any(|e| e.as_constant().is_none_or(|n| n < 0))
+        {
+            return Err(FormationError::Unresolved(
+                "phase work domain must have static nonnegative extents".into(),
+            ));
+        }
+        let mut bound = parameters.clone();
+        bound.extend(vars);
+        let mut scope = Scope {
+            function: &function,
+            inputs: BTreeSet::new(),
+            symbols: BTreeSet::new(),
+        };
+        scope.body(body, &mut bound)?;
+        if let Some(symbol) = scope.unbound_symbol(&bound) {
+            return Err(FormationError::Unresolved(format!(
+                "phase {index} needs an explicit captured value for runtime symbol `{symbol}`"
+            )));
+        }
+        let mut changed = HashSet::new();
+        for statement in body {
+            seismic_lang::rewrite::value_writes(statement, &function.vars, &mut changed);
+        }
+        // Reassignment of an existing tile copies into its captured geometry.
+        // Even a complete overwrite must retain the earlier shape checks.
+        scope
+            .inputs
+            .extend(changed.iter().copied().filter(|variable| {
+                available.contains(variable) && matches!(function.vars[*variable].ty, Ty::Tile(_))
+            }));
+        let inputs: Vec<_> = scope.inputs.into_iter().collect();
+        for &variable in &inputs {
+            if !available.contains(&variable) {
+                return Err(format!(
+                    "phase {index} reads `{}` outside its defining scope",
+                    function.vars[variable].name
+                )
+                .into());
+            }
+            let producer = *producers
+                .get(&variable)
+                .ok_or("phase input has no completed value producer")?;
+            captures
+                .entry(variable)
+                .or_insert_with(|| (producer, Vec::new()))
+                .1
+                .push(index);
+        }
+        if !vars.is_empty()
+            && available.iter().any(|v| {
+                !parameters.contains(v)
+                    && !matches!(function.vars[*v].ty, Ty::Tensor(_))
+                    && changed.contains(v)
+            })
+        {
+            return Err(FormationError::Unresolved(format!(
+                "phase {index} mutates a retained value without an inter-item ownership or merge proof"
+            )));
+        }
+        // Only source serial scopes publish bindings. Iteration-local values
+        // stay in their domain even when its extent happens to equal one.
+        let outputs = if vars.is_empty() {
+            bound
+                .difference(&parameters)
+                .copied()
+                .filter(|v| !inputs.contains(v) || changed.contains(v))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for &variable in &outputs {
+            available.insert(variable);
+            producers.entry(variable).or_insert(index);
+        }
+        phases.push(Phase {
+            predecessor: index.checked_sub(1),
+            inputs,
+            outputs,
+        });
+        writes.push(changed);
+    }
+    let source_parameters = source.params.len();
+    let mut retained = Vec::new();
+    let mut restores = vec![Vec::new(); phases.len()];
+    let mut publications = vec![Vec::new(); phases.len()];
+    for (variable, (producer, consumers)) in captures {
+        let ty = function.vars[variable].ty.clone();
+        let span = function.vars[variable].span;
+        let logical = match &ty {
+            Ty::Scalar(dtype) => Shaped::new(vec![Sym::constant(1)], Elem::Dtype(*dtype)),
+            Ty::Tile(shape) | Ty::Frag(shape) if matches!(shape.elem, Elem::Dtype(_)) => {
+                shape.clone()
+            }
+            _ => {
+                return Err(FormationError::Unresolved(format!(
+                    "cross-phase value `{}` requires retained value storage, found {ty}",
+                    function.vars[variable].name
+                )));
+            }
+        };
+        let last = *consumers.last().unwrap();
+        let writers: Vec<_> = (producer..last)
+            .filter(|&phase| writes[phase].contains(&variable))
+            .collect();
+        let mut physical = logical.clone();
+        let mut dimensions = Vec::new();
+        for (axis, extent) in logical.shape.iter().enumerate() {
+            if extent.as_constant().is_some() {
+                dimensions.push(None);
+                continue;
+            }
+            let capacity = variable_capacity(variable, axis, &function, &mut BTreeSet::new())?;
+            physical.shape[axis] = Sym::constant(capacity);
+            let dimension = function.vars.len();
+            function.vars.push(Var {
+                name: format!("phase_extent_{variable}_{axis}"),
+                ty: Ty::Scalar(DType::I32),
+                span,
+                kind: VarKind::Local,
+            });
+            let storage = allocate(
+                &mut function,
+                &mut retained,
+                dimension,
+                Shaped::new(vec![Sym::constant(1)], Elem::Dtype(DType::I32)),
+                producer,
+                &consumers,
+                &writers,
+            )?;
+            for &phase in &consumers {
+                restores[phase].push(restore(
+                    dimension,
+                    element(storage, &function.vars, span),
+                    &function.vars,
+                    span,
+                ));
+                phases[phase].inputs.push(dimension);
+            }
+            for &phase in &writers {
+                let value = Expr {
+                    kind: ExprKind::Builtin {
+                        name: Builtin::Extent,
+                        args: vec![
+                            reference(variable, &function.vars, span),
+                            integer(axis as i64, span),
+                        ],
+                    },
+                    ty: Ty::Scalar(DType::I32),
+                    sym: None,
+                    span,
+                };
+                publications[phase].push(Stmt {
+                    id: None,
+                    span,
+                    kind: StmtKind::Assign {
+                        target: reference(dimension, &function.vars, span),
+                        op: AssignOp::Assign,
+                        value,
+                    },
+                });
+                publications[phase].push(publish(
+                    dimension,
+                    element(storage, &function.vars, span),
+                    &function.vars,
+                    span,
+                ));
+                phases[phase].outputs.push(dimension);
+            }
+            dimensions.push(Some(dimension));
+        }
+        let storage = allocate(
+            &mut function,
+            &mut retained,
+            variable,
+            physical,
+            producer,
+            &consumers,
+            &writers,
+        )?;
+        if let Ty::Frag(shape) = &ty {
+            let Elem::Dtype(dtype) = shape.elem else {
+                unreachable!()
+            };
+            let bridge = function.vars.len();
+            function.vars.push(Var {
+                name: format!("phase_fragment_{variable}"),
+                ty: Ty::Tile(shape.clone()),
+                span,
+                kind: VarKind::Local,
+            });
+            let memory = reference(storage, &function.vars, span);
+            for &phase in &consumers {
+                restores[phase].push(restore(bridge, memory.clone(), &function.vars, span));
+                restores[phase].push(Stmt {
+                    id: None,
+                    span,
+                    kind: StmtKind::Assign {
+                        target: reference(variable, &function.vars, span),
+                        op: AssignOp::Assign,
+                        value: Expr {
+                            kind: ExprKind::Intrinsic {
+                                op: seismic_lang::intrinsics::Operation::Matrix,
+                                args: vec![Expr {
+                                    kind: ExprKind::Int(0),
+                                    ty: Ty::Scalar(dtype),
+                                    sym: None,
+                                    span,
+                                }],
+                            },
+                            ty: ty.clone(),
+                            sym: None,
+                            span,
+                        },
+                    },
+                });
+                restores[phase].push(fragment_transfer(
+                    seismic_lang::intrinsics::Operation::MatrixLoad,
+                    variable,
+                    bridge,
+                    &function.vars,
+                    span,
+                ));
+            }
+            for &phase in &writers {
+                publications[phase].push(Stmt {
+                    id: None,
+                    span,
+                    kind: StmtKind::Assign {
+                        target: reference(bridge, &function.vars, span),
+                        op: AssignOp::Assign,
+                        value: Expr {
+                            kind: ExprKind::TileAlloc {
+                                shape: shape.shape.clone(),
+                                dtype: shape.elem.clone(),
+                            },
+                            ty: Ty::Tile(shape.clone()),
+                            sym: None,
+                            span,
+                        },
+                    },
+                });
+                publications[phase].push(fragment_transfer(
+                    seismic_lang::intrinsics::Operation::MatrixStore,
+                    variable,
+                    bridge,
+                    &function.vars,
+                    span,
+                ));
+                publications[phase].push(publish(bridge, memory.clone(), &function.vars, span));
+            }
+            continue;
+        }
+        let view = if matches!(ty, Ty::Scalar(_)) {
+            element(storage, &function.vars, span)
+        } else if dimensions.iter().all(Option::is_none) {
+            reference(storage, &function.vars, span)
+        } else {
+            Expr {
+                kind: ExprKind::Index {
+                    base: Box::new(reference(storage, &function.vars, span)),
+                    indices: dimensions
+                        .iter()
+                        .map(|dimension| Index::Slice {
+                            start: None,
+                            end: dimension.map(|v| reference(v, &function.vars, span)),
+                        })
+                        .collect(),
+                },
+                ty: Ty::Tensor(logical),
+                sym: None,
+                span,
+            }
+        };
+        for &phase in &consumers {
+            restores[phase].push(restore(variable, view.clone(), &function.vars, span));
+        }
+        for &phase in &writers {
+            publications[phase].push(publish(variable, view.clone(), &function.vars, span));
+        }
+    }
+    for (phase, root) in function.body.iter_mut().enumerate() {
+        let StmtKind::Parallel { body, .. } = &mut root.kind else {
+            unreachable!()
+        };
+        let mut completed = std::mem::take(&mut restores[phase]);
+        completed.append(body);
+        completed.append(&mut publications[phase]);
+        *body = completed;
+    }
+    // Each launch is independently scoped. Check the exact transformed phase
+    // bodies, rather than trusting the capture bookkeeping alone.
+    verify(&function)?;
+    Ok(PhasePlan {
+        function,
+        phases,
+        retained,
+        source_parameters,
+    })
+}
+
+fn fragment_transfer(
+    operation: seismic_lang::intrinsics::Operation,
+    fragment: VarId,
+    tile: VarId,
+    vars: &[Var],
+    span: Span,
+) -> Stmt {
+    Stmt {
+        id: None,
+        span,
+        kind: StmtKind::Expr(Expr {
+            kind: ExprKind::Intrinsic {
+                op: operation,
+                args: vec![
+                    reference(fragment, vars, span),
+                    reference(tile, vars, span),
+                    integer(0, span),
+                    integer(0, span),
+                ],
+            },
+            ty: Ty::Void,
+            sym: None,
+            span,
+        }),
+    }
+}
+
+/// Tensor values are captured views, not snapshots of their referents. Retain
+/// their evaluated coordinates as scalars, then reconstruct the same view in
+/// each consuming launch. In particular, a coordinate loaded from a mutable
+/// tensor is read once at the original view definition.
+fn close_views(function: &mut LoweredIr) -> Result<Vec<usize>, FormationError> {
+    let mut recipes: BTreeMap<VarId, Expr> = BTreeMap::new();
+    let original = function.body.clone();
+    let mut prefixes = Vec::new();
+    for phase in 0..function.body.len() {
+        let StmtKind::Parallel {
+            vars: indices,
+            extents,
+            body,
+        } = &mut function.body[phase].kind
+        else {
+            unreachable!()
+        };
+        let mut prefix = Vec::new();
+        let mut symbols = control_symbols(body);
+        symbols.extend(extents.iter().flat_map(Sym::params));
+        let mut control_views = BTreeSet::new();
+        for symbol in &symbols {
+            let owners = recipes
+                .iter()
+                .filter(|(_, recipe)| {
+                    recipe.ty.shaped().is_some_and(|shape| {
+                        shape
+                            .shape
+                            .iter()
+                            .any(|extent| extent.params().contains(symbol))
+                    })
+                })
+                .collect::<Vec<_>>();
+            if let Some((&variable, recipe)) = owners.first().copied() {
+                if owners.iter().any(|(_, other)| *other != recipe) {
+                    return Err(FormationError::Unresolved(format!(
+                        "runtime control symbol `{symbol}` has multiple captured geometry versions"
+                    )));
+                }
+                control_views.insert(variable);
+            }
+        }
+        for (&variable, recipe) in &recipes {
+            if control_views.contains(&variable)
+                || body
+                    .iter()
+                    .any(|s| seismic_lang::effects::uses(s, variable))
+            {
+                let span = function.vars[variable].span;
+                prefix.push(Stmt {
+                    id: None,
+                    span,
+                    kind: StmtKind::Assign {
+                        target: reference(variable, &function.vars, span),
+                        op: AssignOp::Assign,
+                        value: recipe.clone(),
+                    },
+                });
+            }
+        }
+        prefixes.push(prefix.len());
+        if indices.is_empty() {
+            for mut statement in std::mem::take(body) {
+                if let StmtKind::Assign {
+                    target,
+                    op: AssignOp::Assign,
+                    value,
+                } = &mut statement.kind
+                {
+                    if let ExprKind::Var(variable) = target.kind {
+                        if matches!(target.ty, Ty::Tensor(_))
+                            && original[phase + 1..].iter().any(|s| {
+                                seismic_lang::effects::uses(s, variable)
+                                    || target.ty.shaped().is_some_and(|shape| {
+                                        let symbols = control_symbols(std::slice::from_ref(s));
+                                        shape
+                                            .shape
+                                            .iter()
+                                            .flat_map(Sym::params)
+                                            .any(|symbol| symbols.contains(&symbol))
+                                    })
+                            })
+                        {
+                            if recipes.contains_key(&variable) {
+                                return Err(FormationError::Unresolved("retained tensor view rebinding needs an explicit alias version".into()));
+                            }
+                            let recipe =
+                                freeze_view(value, &mut function.vars, &recipes, &mut prefix)?;
+                            recipes.insert(variable, recipe);
+                        }
+                    }
+                }
+                prefix.push(statement);
+            }
+        } else {
+            prefix.append(body);
+        }
+        *body = prefix;
+    }
+    Ok(prefixes)
+}
+
+fn control_symbols(body: &[Stmt]) -> BTreeSet<String> {
+    fn visit(body: &[Stmt], symbols: &mut BTreeSet<String>) {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::Range { lo, hi, body, .. } => {
+                    symbols.extend(lo.params());
+                    symbols.extend(hi.params());
+                    visit(body, symbols);
+                }
+                StmtKind::Lanes { extent, body, .. } => {
+                    symbols.extend(extent.params());
+                    visit(body, symbols);
+                }
+                StmtKind::Parallel { extents, body, .. } => {
+                    symbols.extend(extents.iter().flat_map(Sym::params));
+                    visit(body, symbols);
+                }
+                StmtKind::Owned { body, .. } | StmtKind::LoadLoop { body, .. } => {
+                    visit(body, symbols)
+                }
+                StmtKind::If { then, els, .. } => {
+                    visit(then, symbols);
+                    visit(els, symbols);
+                }
+                StmtKind::Reduction(reduction) => {
+                    for body in reduction.bodies() {
+                        visit(body, symbols);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut symbols = BTreeSet::new();
+    visit(body, &mut symbols);
+    symbols
+}
+
+/// Physical work domains retain a structural capacity and guard their logical
+/// runtime extent. This is shared by dispatch-domain choice construction and
+/// full phase formation, so mapping choices see the same bounded domain.
+pub fn work_domains(source: &LoweredIr) -> Result<LoweredIr, String> {
+    work_domains_checked(source).map_err(|error| error.to_string())
+}
+fn work_domains_checked(source: &LoweredIr) -> Result<LoweredIr, FormationError> {
+    let mut function = source.clone();
+    seismic_lang::normalize::work_domain(&mut function.body);
+    let prefixes = close_views(&mut function)?;
+    for phase in 0..function.body.len() {
+        let StmtKind::Parallel { vars, extents, .. } = &function.body[phase].kind else {
+            unreachable!()
+        };
+        let mut bounded = Vec::new();
+        let mut condition = None;
+        for (&variable, extent) in vars.iter().zip(extents) {
+            if let Some(value) = extent.as_constant() {
+                bounded.push(Sym::constant(value));
+                continue;
+            }
+            let capacity = extent_capacity(extent, &function)?;
+            bounded.push(Sym::constant(capacity));
+            let span = function.vars[variable].span;
+            let limit = Expr {
+                kind: ExprKind::ShapeParam(format!("phase_{phase}_extent")),
+                ty: Ty::Scalar(DType::I32),
+                sym: Some(extent.clone()),
+                span,
+            };
+            let active = Expr {
+                kind: ExprKind::Binary {
+                    op: seismic_lang::ast::BinaryOp::Lt,
+                    lhs: Box::new(reference(variable, &function.vars, span)),
+                    rhs: Box::new(limit),
+                },
+                ty: Ty::Scalar(DType::Bool),
+                sym: None,
+                span,
+            };
+            condition = Some(match condition {
+                None => active,
+                Some(previous) => Expr {
+                    kind: ExprKind::Binary {
+                        op: seismic_lang::ast::BinaryOp::And,
+                        lhs: Box::new(previous),
+                        rhs: Box::new(active),
+                    },
+                    ty: Ty::Scalar(DType::Bool),
+                    sym: None,
+                    span,
+                },
+            });
+        }
+        if let Some(cond) = condition {
+            let StmtKind::Parallel { extents, body, .. } = &mut function.body[phase].kind else {
+                unreachable!()
+            };
+            *extents = bounded;
+            let then = body.split_off(prefixes[phase]);
+            body.push(Stmt {
+                id: None,
+                span: cond.span,
+                kind: StmtKind::If {
+                    cond,
+                    then,
+                    els: Vec::new(),
+                },
+            });
+        }
+    }
+    Ok(function)
+}
+fn extent_capacity(extent: &Sym, function: &LoweredIr) -> Result<i64, FormationError> {
+    let mut intervals = BTreeMap::new();
+    for symbol in extent.params() {
+        if let Some(&value) = function.shapes.get(&symbol) {
+            intervals.insert(symbol, (value, value));
+            continue;
+        }
+        if let Some((_, upper)) = function
+            .index_params
+            .iter()
+            .find(|(name, _)| *name == symbol)
+        {
+            if let Some(upper) = upper.as_constant() {
+                intervals.insert(symbol, (0, upper.saturating_sub(1)));
+                continue;
+            }
+        }
+        let mut capacity = None;
+        for (variable, var) in function.vars.iter().enumerate() {
+            if let Some(shape) = var.ty.shaped() {
+                for (axis, dimension) in shape.shape.iter().enumerate() {
+                    if dimension == &Sym::param(&symbol) {
+                        match variable_capacity(variable, axis, function, &mut BTreeSet::new()) {
+                            Ok(bound) => {
+                                capacity = Some(
+                                    capacity.map_or(bound, |previous: i64| previous.max(bound)),
+                                )
+                            }
+                            Err(FormationError::Unresolved(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+        let capacity = capacity.ok_or_else(|| {
+            FormationError::Unresolved(format!(
+                "parallel extent `{extent}` has no structural bound for `{symbol}`"
+            ))
+        })?;
+        intervals.insert(symbol, (0, capacity));
+    }
+    let (minimum, maximum) = extent
+        .eval_interval(&|name| intervals.get(name).copied())
+        .ok_or_else(|| {
+            FormationError::Unresolved(format!("parallel extent `{extent}` has no finite capacity"))
+        })?;
+    if minimum < 0 || maximum > i64::from(i32::MAX) {
+        return Err(FormationError::Unresolved(format!(
+            "parallel extent `{extent}` does not have a nonnegative i32 capacity"
+        )));
+    }
+    Ok(maximum)
+}
+
+fn freeze_view(
+    expr: &mut Expr,
+    vars: &mut Vec<Var>,
+    recipes: &BTreeMap<VarId, Expr>,
+    setup: &mut Vec<Stmt>,
+) -> Result<Expr, FormationError> {
+    let mut recipe = expr.clone();
+    match (&mut expr.kind, &mut recipe.kind) {
+        (ExprKind::Var(variable), _) => {
+            if let Some(recipe) = recipes.get(variable) {
+                return Ok(recipe.clone());
+            }
+            if !matches!(
+                vars.get(*variable)
+                    .ok_or("retained view has an invalid variable identity")?
+                    .kind,
+                VarKind::Param(_)
+            ) {
+                return Err(FormationError::Unresolved(
+                    "retained tensor view has no captured backing identity".into(),
+                ));
+            }
+        }
+        (
+            ExprKind::Index { base, indices },
+            ExprKind::Index {
+                base: retained_base,
+                indices: retained_indices,
+            },
+        ) => {
+            **retained_base = freeze_view(base, vars, recipes, setup)?;
+            capture_geometry(base, vars, setup);
+            for index in indices.iter_mut() {
+                match index {
+                    Index::Point(point) => freeze_coordinate(point, vars, setup)?,
+                    Index::Slice { start, end } => {
+                        for value in start.iter_mut().chain(end) {
+                            freeze_coordinate(value, vars, setup)?;
+                        }
+                    }
+                }
+            }
+            *retained_indices = indices.clone();
+        }
+        (ExprKind::Transpose(base), ExprKind::Transpose(retained_base)) => {
+            **retained_base = freeze_view(base, vars, recipes, setup)?;
+        }
+        (
+            ExprKind::Builtin {
+                name: Builtin::Reshape,
+                args,
+            },
+            ExprKind::Builtin {
+                args: retained_args,
+                ..
+            },
+        ) => {
+            let (base, dimensions) = args
+                .split_first_mut()
+                .ok_or("retained reshape has no backing")?;
+            let retained_base = freeze_view(base, vars, recipes, setup)?;
+            capture_geometry(base, vars, setup);
+            for dimension in dimensions {
+                freeze_coordinate(dimension, vars, setup)?;
+            }
+            *retained_args = args.clone();
+            retained_args[0] = retained_base;
+        }
+        _ => {
+            return Err(FormationError::Unresolved(
+                "retained tensor view needs ordinary indexing, transpose, or reshape geometry"
+                    .into(),
+            ));
+        }
+    }
+    Ok(recipe)
+}
+fn capture_geometry(expr: &mut Expr, vars: &mut Vec<Var>, setup: &mut Vec<Stmt>) {
+    if matches!(expr.kind, ExprKind::Var(_)) {
+        return;
+    }
+    let variable = vars.len();
+    vars.push(Var {
+        name: format!("phase_geometry_{variable}"),
+        ty: expr.ty.clone(),
+        span: expr.span,
+        kind: VarKind::Local,
+    });
+    let target = reference(variable, vars, expr.span);
+    let value = std::mem::replace(expr, target.clone());
+    setup.push(Stmt {
+        id: None,
+        span: value.span,
+        kind: StmtKind::Assign {
+            target,
+            op: AssignOp::Assign,
+            value,
+        },
+    });
+}
+
+fn freeze_coordinate(
+    expr: &mut Expr,
+    vars: &mut Vec<Var>,
+    setup: &mut Vec<Stmt>,
+) -> Result<(), String> {
+    if matches!(expr.kind, ExprKind::Int(_) | ExprKind::ShapeParam(_)) {
+        return Ok(());
+    }
+    if !matches!(expr.ty, Ty::Scalar(DType::I32 | DType::U32)) {
+        return Err("retained view coordinate must have integer type".into());
+    }
+    let variable = vars.len();
+    vars.push(Var {
+        name: format!("phase_coordinate_{variable}"),
+        ty: expr.ty.clone(),
+        span: expr.span,
+        kind: VarKind::Local,
+    });
+    let target = reference(variable, vars, expr.span);
+    let value = std::mem::replace(expr, target.clone());
+    setup.push(Stmt {
+        id: None,
+        span: value.span,
+        kind: StmtKind::Assign {
+            target,
+            op: AssignOp::Assign,
+            value,
+        },
+    });
+    Ok(())
+}
+
+fn parameter_variables(function: &LoweredIr) -> Result<BTreeSet<VarId>, String> {
+    let mut result = BTreeSet::new();
+    for (id, var) in function.vars.iter().enumerate() {
+        if let VarKind::Param(parameter) = var.kind {
+            if function
+                .params
+                .get(parameter)
+                .is_none_or(|(_, ty)| ty != &var.ty)
+            {
+                return Err(format!(
+                    "variable `{}` disagrees with its parameter type",
+                    var.name
+                ));
+            }
+            result.insert(id);
+        }
+    }
+    Ok(result)
+}
+
+/// Validate independent launch scope, variable types, condition types, and
+/// participation index bindings. Backend collective checks refine this contract.
+pub fn verify(function: &LoweredIr) -> Result<(), String> {
+    let parameters = parameter_variables(function)?;
+    for (phase, statement) in function.body.iter().enumerate() {
+        let StmtKind::Parallel {
+            vars,
+            extents,
+            body,
+        } = &statement.kind
+        else {
+            return Err("execution phase is not a work domain".into());
+        };
+        if vars.len() != extents.len() {
+            return Err("phase index/extent arity differs".into());
+        }
+        let mut bound = parameters.clone();
+        let mut scope = Scope {
+            function,
+            inputs: BTreeSet::new(),
+            symbols: BTreeSet::new(),
+        };
+        scope.indices(vars, &mut bound)?;
+        scope.body(body, &mut bound)?;
+        if let Some(symbol) = scope.unbound_symbol(&bound) {
+            return Err(format!(
+                "phase {phase} has an unbound runtime symbol `{symbol}`"
+            ));
+        }
+        if !scope.inputs.is_empty() {
+            return Err(format!(
+                "phase {phase} has unbound inputs {:?}",
+                scope.inputs
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reference(variable: VarId, vars: &[Var], span: Span) -> Expr {
+    Expr {
+        kind: ExprKind::Var(variable),
+        ty: vars[variable].ty.clone(),
+        sym: None,
+        span,
+    }
+}
+fn element(storage: VarId, vars: &[Var], span: Span) -> Expr {
+    let Ty::Tensor(shape) = &vars[storage].ty else {
+        unreachable!()
+    };
+    Expr {
+        kind: ExprKind::Index {
+            base: Box::new(reference(storage, vars, span)),
+            indices: vec![Index::Point(Expr {
+                kind: ExprKind::Int(0),
+                ty: Ty::Scalar(DType::I32),
+                sym: Some(Sym::constant(0)),
+                span,
+            })],
+        },
+        ty: Ty::Scalar(shape.elem.read_dtype().unwrap()),
+        sym: None,
+        span,
+    }
+}
+fn integer(value: i64, span: Span) -> Expr {
+    Expr {
+        kind: ExprKind::Int(value),
+        ty: Ty::Scalar(DType::I32),
+        sym: Some(Sym::constant(value)),
+        span,
+    }
+}
+fn restore(variable: VarId, view: Expr, vars: &[Var], span: Span) -> Stmt {
+    let value = if matches!(vars[variable].ty, Ty::Scalar(_)) {
+        view
+    } else {
+        Expr {
+            kind: ExprKind::Load {
+                view: Box::new(view),
+                mode: LoadMode::Materialize,
+            },
+            ty: vars[variable].ty.clone(),
+            sym: None,
+            span,
+        }
+    };
+    Stmt {
+        id: None,
+        span,
+        kind: StmtKind::Assign {
+            target: reference(variable, vars, span),
+            op: AssignOp::Assign,
+            value,
+        },
+    }
+}
+fn publish(variable: VarId, view: Expr, vars: &[Var], span: Span) -> Stmt {
+    let value = reference(variable, vars, span);
+    Stmt {
+        id: None,
+        span,
+        kind: if matches!(vars[variable].ty, Ty::Scalar(_)) {
+            StmtKind::Assign {
+                target: view,
+                op: AssignOp::Assign,
+                value,
+            }
+        } else {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Builtin {
+                    name: Builtin::Store,
+                    args: vec![value, view],
+                },
+                ty: Ty::Void,
+                sym: None,
+                span,
+            })
+        },
+    }
+}
+fn allocate(
+    function: &mut LoweredIr,
+    retained: &mut Vec<RetainedValue>,
+    variable: VarId,
+    shape: Shaped,
+    producer: usize,
+    consumers: &[usize],
+    writers: &[usize],
+) -> Result<VarId, String> {
+    let Elem::Dtype(dtype) = shape.elem else {
+        return Err("retained storage requires resolved dense planes".into());
+    };
+    let elements = shape.shape.iter().try_fold(1u64, |n, extent| {
+        extent
+            .as_constant()
+            .and_then(|n| u64::try_from(n).ok())
+            .and_then(|extent| n.checked_mul(extent))
+            .ok_or("retained value capacity must be static and fit u64")
+    })?;
+    let bytes = elements
+        .checked_mul(u64::from(dtype.bytes()))
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or("retained value byte capacity overflow")?;
+    let parameter = function.params.len();
+    let mut name = format!("__seismic_retained_{variable}");
+    while function.params.iter().any(|(n, _)| n == &name) {
+        name.push('_');
+    }
+    let buffer_ty = Ty::Tensor(shape);
+    function.params.push((name.clone(), buffer_ty.clone()));
+    function.ownership.intermediates.insert(name.clone());
+    let storage = function.vars.len();
+    function.vars.push(Var {
+        name: name.clone(),
+        ty: buffer_ty,
+        span: function.vars[variable].span,
+        kind: VarKind::Param(parameter),
+    });
+    retained.push(RetainedValue {
+        variable,
+        parameter,
+        name,
+        dtype,
+        elements,
+        bytes,
+        producer,
+        consumers: consumers.to_vec(),
+        writers: writers.to_vec(),
+    });
+    Ok(storage)
+}
+
+fn variable_capacity(
+    variable: VarId,
+    axis: usize,
+    function: &LoweredIr,
+    visiting: &mut BTreeSet<VarId>,
+) -> Result<i64, FormationError> {
+    let extent = function.vars[variable]
+        .ty
+        .shaped()
+        .and_then(|s| s.shape.get(axis))
+        .ok_or("retained value axis is absent")?;
+    if let Some(n) = extent.as_constant() {
+        return Ok(n);
+    }
+    if !visiting.insert(variable) {
+        return Err(FormationError::Unresolved(
+            "retained shape capacity depends on its own value".into(),
+        ));
+    }
+    fn definitions<'a>(body: &'a [Stmt], variable: VarId, out: &mut Vec<&'a Expr>) {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::Assign {
+                    target:
+                        Expr {
+                            kind: ExprKind::Var(v),
+                            ..
+                        },
+                    op: AssignOp::Assign,
+                    value,
+                } if *v == variable => out.push(value),
+                StmtKind::Parallel { body, .. }
+                | StmtKind::Owned { body, .. }
+                | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. }
+                | StmtKind::LoadLoop { body, .. } => definitions(body, variable, out),
+                StmtKind::If { then, els, .. } => {
+                    definitions(then, variable, out);
+                    definitions(els, variable, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut values = Vec::new();
+    definitions(&function.body, variable, &mut values);
+    let result = values
+        .into_iter()
+        .map(|expr| expression_capacity(expr, axis, function, visiting))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| {
+            FormationError::Unresolved("retained runtime shape has no bounded definition".into())
+        });
+    visiting.remove(&variable);
+    Ok(result?)
+}
+fn expression_capacity(
+    expr: &Expr,
+    axis: usize,
+    function: &LoweredIr,
+    visiting: &mut BTreeSet<VarId>,
+) -> Result<i64, FormationError> {
+    let shape = expr
+        .ty
+        .shaped()
+        .ok_or("retained capacity needs a shaped value")?;
+    if let Some(n) = shape.shape.get(axis).and_then(Sym::as_constant) {
+        return Ok(n);
+    }
+    match &expr.kind {
+        ExprKind::Var(v) => variable_capacity(*v, axis, function, visiting),
+        ExprKind::Load { view, .. } => expression_capacity(view, axis, function, visiting),
+        ExprKind::Builtin {
+            name: Builtin::Load,
+            args,
+        } => expression_capacity(&args[0], axis, function, visiting),
+        ExprKind::Transpose(base) => {
+            expression_capacity(base, shape.shape.len() - 1 - axis, function, visiting)
+        }
+        ExprKind::Index { base, indices } => {
+            let rank = base
+                .ty
+                .shaped()
+                .ok_or("retained view needs a shaped parent")?
+                .shape
+                .len();
+            let parent = (0..rank)
+                .filter(|i| !matches!(indices.get(*i), Some(Index::Point(_))))
+                .nth(axis)
+                .ok_or("retained view axis is absent")?;
+            expression_capacity(base, parent, function, visiting)
+        }
+        _ => Err(FormationError::Unresolved(
+            "retained runtime shape has no structural capacity proof".into(),
+        )),
+    }
+}
+
+struct Scope<'a> {
+    function: &'a LoweredIr,
+    inputs: BTreeSet<VarId>,
+    symbols: BTreeSet<String>,
+}
+impl Scope<'_> {
+    fn symbol_bound(&self, symbol: &str, bound: &BTreeSet<VarId>) -> bool {
+        self.function.shapes.contains_key(symbol)
+            || self.function.index_params.iter().any(|(name, _)| name == symbol)
+            || bound.iter().chain(&self.inputs).any(|&v| {
+                self.function.vars.get(v).is_some_and(|var| {
+                    matches!(&var.kind, VarKind::Index(seismic_lang::sym::Atom::Param(name)) if name == symbol)
+                        || var.ty.shaped().is_some_and(|shape| shape.shape.iter().any(|extent| extent.params().iter().any(|name| name == symbol)))
+                })
+            })
+    }
+    fn use_symbols(&mut self, value: &Sym, bound: &BTreeSet<VarId>) {
+        for name in value.params() {
+            if !self.symbol_bound(&name, bound) {
+                self.symbols.insert(name);
+            }
+        }
+    }
+    fn unbound_symbol<'a>(&'a self, bound: &BTreeSet<VarId>) -> Option<&'a str> {
+        self.symbols
+            .iter()
+            .find(|symbol| !self.symbol_bound(symbol, bound))
+            .map(String::as_str)
+    }
+    fn variable(&self, id: VarId) -> Result<&Var, String> {
+        self.function
+            .vars
+            .get(id)
+            .ok_or_else(|| format!("invalid variable identity {id}"))
+    }
+    fn indices(&self, vars: &[VarId], bound: &mut BTreeSet<VarId>) -> Result<(), String> {
+        for &v in vars {
+            let var = self.variable(v)?;
+            if !matches!(var.kind, VarKind::Index(_)) || var.ty != Ty::Scalar(DType::I32) {
+                return Err("execution index requires a typed i32 index binding".into());
+            }
+            bound.insert(v);
+        }
+        Ok(())
+    }
+    fn expr(&mut self, expr: &Expr, bound: &BTreeSet<VarId>) -> Result<(), String> {
+        match &expr.kind {
+            ExprKind::ShapeParam(symbol) => {
+                if let Some(value) = &expr.sym {
+                    self.use_symbols(value, bound);
+                } else if !self.symbol_bound(symbol, bound) {
+                    self.symbols.insert(symbol.clone());
+                }
+            }
+            ExprKind::Var(v) => {
+                let variable = self.variable(*v)?;
+                if variable.ty != expr.ty {
+                    return Err(format!(
+                        "variable `{}` reference type differs from its binding",
+                        variable.name
+                    ));
+                }
+                if !bound.contains(v) {
+                    self.inputs.insert(*v);
+                }
+            }
+            ExprKind::Index { base, indices } => {
+                self.expr(base, bound)?;
+                for index in indices {
+                    match index {
+                        Index::Point(point) => self.expr(point, bound)?,
+                        Index::Slice { start, end } => {
+                            for value in start.iter().chain(end) {
+                                self.expr(value, bound)?;
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Load { view: expr, .. }
+            | ExprKind::Transpose(expr)
+            | ExprKind::Accessor { base: expr, .. }
+            | ExprKind::Lanes { base: expr, .. }
+            | ExprKind::Unary { expr, .. }
+            | ExprKind::Cast { expr, .. } => self.expr(expr, bound)?,
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs, bound)?;
+                self.expr(rhs, bound)?;
+            }
+            ExprKind::Builtin { args, .. }
+            | ExprKind::Call { args, .. }
+            | ExprKind::Intrinsic { args, .. }
+            | ExprKind::Tuple(args) => {
+                for argument in args {
+                    self.expr(argument, bound)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn body(&mut self, body: &[Stmt], bound: &mut BTreeSet<VarId>) -> Result<(), String> {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::Assign { target, op, value } => {
+                    self.expr(value, bound)?;
+                    if let ExprKind::Var(v) = target.kind {
+                        let variable = self.variable(v)?;
+                        if variable.ty != target.ty {
+                            return Err("assignment target type differs from binding".into());
+                        }
+                        if *op != AssignOp::Assign {
+                            self.expr(target, bound)?;
+                        }
+                        bound.insert(v);
+                    } else {
+                        self.expr(target, bound)?;
+                    }
+                }
+                StmtKind::Expr(expr) => self.expr(expr, bound)?,
+                StmtKind::If { cond, then, els } => {
+                    if cond.ty != Ty::Scalar(DType::Bool) {
+                        return Err("execution condition must be boolean".into());
+                    }
+                    self.expr(cond, bound)?;
+                    self.body(then, &mut bound.clone())?;
+                    self.body(els, &mut bound.clone())?;
+                }
+                StmtKind::Parallel {
+                    vars,
+                    extents,
+                    body,
+                } => {
+                    if vars.len() != extents.len() {
+                        return Err("parallel index/extent arity differs".into());
+                    }
+                    let mut inner = bound.clone();
+                    self.indices(vars, &mut inner)?;
+                    self.body(body, &mut inner)?;
+                }
+                StmtKind::Owned { vars, tile, body } => {
+                    self.expr(tile, bound)?;
+                    let mut inner = bound.clone();
+                    self.indices(vars, &mut inner)?;
+                    self.body(body, &mut inner)?;
+                }
+                StmtKind::Range { var, lo, hi, body } => {
+                    self.use_symbols(lo, bound);
+                    self.use_symbols(hi, bound);
+                    let mut inner = bound.clone();
+                    self.indices(&[*var], &mut inner)?;
+                    self.body(body, &mut inner)?;
+                    if let VarKind::Index(seismic_lang::sym::Atom::Param(name)) =
+                        self.variable(*var)?.kind.clone()
+                    {
+                        self.symbols.remove(&name);
+                    }
+                }
+                StmtKind::Lanes {
+                    var, extent, body, ..
+                } => {
+                    self.use_symbols(extent, bound);
+                    let mut inner = bound.clone();
+                    self.indices(&[*var], &mut inner)?;
+                    self.body(body, &mut inner)?;
+                    if let VarKind::Index(seismic_lang::sym::Atom::Param(name)) =
+                        self.variable(*var)?.kind.clone()
+                    {
+                        self.symbols.remove(&name);
+                    }
+                }
+                StmtKind::LoadLoop {
+                    domain,
+                    offset,
+                    vars,
+                    views,
+                    axes,
+                    body,
+                    ..
+                } => {
+                    if vars.len() != views.len() || vars.len() != axes.len() {
+                        return Err("stream binding arity differs".into());
+                    }
+                    self.expr(&domain.view, bound)?;
+                    for view in views {
+                        self.expr(view, bound)?;
+                    }
+                    let mut inner = bound.clone();
+                    inner.extend(vars);
+                    inner.extend(offset);
+                    self.body(body, &mut inner)?;
+                }
+                StmtKind::Reduction(reduction) => {
+                    for operand in reduction.operands() {
+                        self.expr(operand, bound)?;
+                    }
+                    for implementation in reduction.implementations() {
+                        let mut inner = bound.clone();
+                        for value in implementation
+                            .left
+                            .iter()
+                            .chain(&implementation.right)
+                            .chain(&implementation.output)
+                        {
+                            if let ExprKind::Var(v) = value.kind {
+                                inner.insert(v);
+                            }
+                        }
+                        self.body(&implementation.body, &mut inner)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn lowered(source: &str) -> LoweredIr {
+        let program = seismic_lang::program::compile(
+            &[seismic_lang::program::SourceFile {
+                path: "phases.seismic.portable".into(),
+                scope: seismic_lang::Scope::Portable,
+                text: source.into(),
+            }],
+            &[],
+        )
+        .unwrap_or_else(|errors| {
+            panic!(
+                "{}",
+                errors
+                    .iter()
+                    .map(|e| e.render())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        seismic_lang::lower::lower(&program, "evaluate", "cpu", &Default::default()).unwrap()
+    }
+    #[test]
+    fn serial_values_are_published_once_and_serial_updates_publish_new_versions() {
+        let function = lowered(
+            "fn evaluate(x:tensor[8] f32,out:tensor[8] f32):\n  a = x[0]\n  snapshot = load(x)\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = snapshot[row] + a\n    store(y,out[row:row+1])\n  a += 1.0\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = a\n    store(y,out[row:row+1])\n",
+        );
+        let plan = construct(&function).unwrap();
+        assert_eq!(plan.phases.len(), 4);
+        assert_eq!(plan.retained.len(), 2);
+        let scalar = plan.retained.iter().find(|v| v.elements == 1).unwrap();
+        assert_eq!(scalar.producer, 0);
+        assert_eq!(scalar.consumers, [1, 2, 3]);
+        assert_eq!(scalar.writers, [0, 2]);
+        let tile = plan.retained.iter().find(|v| v.elements == 8).unwrap();
+        assert_eq!(tile.consumers, [1]);
+        assert_eq!(plan.function.params.len(), function.params.len() + 2);
+        verify(&plan.function).unwrap();
+    }
+    #[test]
+    fn captured_view_retains_coordinate_reads_without_copying_its_referent() {
+        let function = lowered(
+            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] i32):\n  view = x[bounds[0]:bounds[1]]\n  for row in parallel:\n    y = tile[1] i32\n    for i in owned(y): y[i] = extent(view,0)\n    store(y,out[row:row+1])\n",
+        );
+        let plan = construct(&function).unwrap();
+        assert_eq!(plan.retained.len(), 2);
+        assert!(
+            plan.retained
+                .iter()
+                .all(|v| v.dtype == DType::I32 && v.elements == 1)
+        );
+        let StmtKind::Parallel { body, .. } = &plan.function.body[1].kind else {
+            unreachable!()
+        };
+        let bounds = function
+            .vars
+            .iter()
+            .position(|v| v.name == "bounds")
+            .unwrap();
+        assert!(!body.iter().any(|s| seismic_lang::effects::uses(s, bounds)));
+        verify(&plan.function).unwrap();
+    }
+    #[test]
+    fn geometry_used_only_by_a_symbolic_range_is_a_phase_input() {
+        let function = lowered(
+            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] i32):\n  view = x[bounds[0]:bounds[1]]\n  for row in parallel:\n    count = 0\n    for j in range(extent(view,0)): count += 1\n    y = tile[1] i32\n    for i in owned(y): y[i] = count\n    store(y,out[row:row+1])\n",
+        );
+        let plan = construct(&function).unwrap();
+        assert_eq!(plan.retained.len(), 2);
+        let StmtKind::Parallel { body, .. } = &plan.function.body[1].kind else {
+            unreachable!()
+        };
+        let view = function.vars.iter().position(|v| v.name == "view").unwrap();
+        assert!(body.iter().any(|s| matches!(&s.kind, StmtKind::Assign { target: Expr { kind: ExprKind::Var(v), .. }, .. } if *v == view)));
+        verify(&plan.function).unwrap();
+    }
+    #[test]
+    fn runtime_tile_shape_has_retained_lengths_and_structural_capacity() {
+        let function = lowered(
+            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] f32):\n  snapshot = load(x[bounds[0]:bounds[1]])\n  for row in parallel:\n    result = tile[1] f32\n    for i in owned(result): result[i] = reduce(snapshot,0,sum)\n    store(result,out[row:row+1])\n",
+        );
+        let plan = construct(&function).unwrap();
+        assert!(
+            plan.retained
+                .iter()
+                .any(|v| v.dtype == DType::I32 && v.elements == 1)
+        );
+        assert!(
+            plan.retained
+                .iter()
+                .any(|v| v.dtype == DType::F32 && v.elements == 8)
+        );
+        verify(&plan.function).unwrap();
+    }
+    #[test]
+    fn phase_scope_rejects_an_iteration_value_escaping_to_the_next_launch() {
+        let mut function = lowered(
+            "fn evaluate(x:tensor[8] f32,out:tensor[8] f32):\n  for row in parallel:\n    value = load(x[row:row+1])\n    store(value,out[row:row+1])\n",
+        );
+        let StmtKind::Parallel { body, .. } = &function.body[0].kind else {
+            unreachable!()
+        };
+        let StmtKind::Assign { target, .. } = &body[0].kind else {
+            unreachable!()
+        };
+        function.body.push(Stmt {
+            id: None,
+            span: target.span,
+            kind: StmtKind::Expr(target.clone()),
+        });
+        let error = construct(&function).unwrap_err();
+        assert!(error.contains("outside its defining scope"), "{error}");
+    }
+}

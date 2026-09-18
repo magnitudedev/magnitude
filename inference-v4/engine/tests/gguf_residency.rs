@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 fn exercise(device: Device, candidate: Candidate) {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../validation/fixtures/gguf-codec-reference.json"
+        "../../validation/results/fixtures/gguf-codec-reference.json"
     ))
     .unwrap();
     let program = seismic_std::program().unwrap();

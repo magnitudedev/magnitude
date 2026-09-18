@@ -49,7 +49,7 @@ fn encode(xs: &[f32], dtype: DType) -> Vec<u8> {
 fn exercise(device: Device, candidate: Candidate) {
     let device = Rc::new(device);
     let reference: Value = serde_json::from_str(include_str!(
-        "../../validation/fixtures/qwen-recurrent-reference.json"
+        "../../validation/results/fixtures/qwen-recurrent-reference.json"
     ))
     .unwrap();
     let program = seismic_engine::models::qwen35::program::program().unwrap();

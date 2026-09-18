@@ -10,7 +10,8 @@ use seismic_lang::{
 use seismic_runtime::{Candidate, Device};
 
 fn exercise(device: Device) {
-    for name in ["q4k", "q5k", "q6k"] {
+    for rep in repr::REPRS {
+        let name = rep.name;
         let rep = repr::lookup(name).unwrap();
         let word_count = rep.planes()[0].storage_elements(256).unwrap() as usize;
         let input = TensorData::random_packed(&mut Rng(0x743292), rep, vec![2, 512]);
@@ -42,7 +43,7 @@ fn cache(x:tensor[2,512] {name},out:tensor[4,2,255] f32,raw:tensor[2,{word_count
             &[backend.clone()],
         )
         .unwrap();
-        for decoded in [false, true] {
+        for representation in [Alternative::Encoded, Alternative::Decoded, Alternative::DecodedPackets] {
             let mut decisions = 0;
             let f = lower_selected(
                 &p,
@@ -54,11 +55,8 @@ fn cache(x:tensor[2,512] {name},out:tensor[4,2,255] f32,raw:tensor[2,{word_count
                 &mut |d| {
                     Ok(if matches!(d.kind, DecisionKind::Representation { .. }) {
                         decisions += 1;
-                        if decoded {
-                            Alternative::Decoded
-                        } else {
-                            Alternative::Encoded
-                        }
+                        assert!(d.alternatives.contains(&representation), "{name}: {representation:?} is unavailable");
+                        representation.clone()
                     } else {
                         d.alternatives.get(0).unwrap()
                     })
@@ -115,7 +113,7 @@ fn cache(x:tensor[2,512] {name},out:tensor[4,2,255] f32,raw:tensor[2,{word_count
                 assert_eq!(
                     f32::from_le_bytes(b.try_into().unwrap()),
                     expected,
-                    "{name} decoded={decoded}, element{i}"
+                    "{name} representation={representation:?}, element{i}"
                 );
             }
             let mut bytes = vec![0; 2 * word_count * 4];

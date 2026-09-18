@@ -1,5 +1,6 @@
 //! Abstract evaluation of terminal PTX, with symbolic allocation addresses.
-//! Unknown data stays unknown. Trace-shaping predicates/addresses must be known.
+//! Unknown data stays unknown, including checked varying integer inputs.
+//! Trace-shaping predicates/addresses must be known.
 use super::*;
 use ptx::{
     Address, AddressBase, Binary, Comparison, DataType, Item, Operand, Operation, ParameterRole,
@@ -10,22 +11,33 @@ pub(super) struct Trace {
     pub events: Vec<Event>,
     pub instructions: u64,
     pub external_values: BTreeMap<u64, BTreeMap<u64, u8>>,
+    pub external_symbolic: SymbolicMemory,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Value {
+pub(super) enum Value {
     Bits(u64),
-    Pointer(Allocation, u64),
+    Pointer(Allocation, Affine),
+    Integer(Affine),
     Unknown,
 }
 impl Value {
-    fn bits(&self) -> Result<u64, String> {
-        if let Self::Bits(v) = self {
-            Ok(*v)
-        } else {
-            Err("CUDA trace needs a known integer or predicate".into())
+    fn bits(&self) -> Result<u64, DerivationError> {
+        match self {
+            Self::Bits(v) => Ok(*v),
+            Self::Integer(value) => value.exact().map(|v| v as u64).ok_or_else(|| {
+                DerivationError::Unsupported(
+                    "CUDA trace needs a uniform integer or predicate".into(),
+                )
+            }),
+            Self::Unknown => Err(DerivationError::Unsupported(
+                "CUDA trace needs an input-independent integer or predicate".into(),
+            )),
+            Self::Pointer(..) => {
+                Err("PTX uses an allocation pointer as an integer or predicate".into())
+            }
         }
     }
-    fn predicate(&self) -> Result<bool, String> {
+    fn predicate(&self) -> Result<bool, DerivationError> {
         match self.bits()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -47,11 +59,13 @@ struct Lane {
     control: usize,
     status: Option<u32>,
 }
+pub(super) type SymbolicMemory = BTreeMap<u64, BTreeMap<(Affine, u32), Value>>;
 struct Storage {
     bytes: u64,
     alignment: u64,
     known: BTreeMap<u64, u8>,
     pointers: BTreeMap<u64, Value>,
+    symbolic: BTreeMap<(Affine, u32), Value>,
 }
 struct Memory {
     allocations: BTreeMap<Allocation, Storage>,
@@ -65,6 +79,7 @@ impl Memory {
         hardware: &CudaHardware,
         limits: DerivationLimits,
     ) -> Result<Self, DerivationError> {
+        workload.validate()?;
         let program = execution.program();
         if workload.identity.is_empty() || workload.buffers.len() != program.buffers.len() {
             return Err("invalid CUDA workload shape".into());
@@ -103,6 +118,7 @@ impl Memory {
                             alignment: a.alignment,
                             known: a.known_bytes.clone(),
                             pointers: BTreeMap::new(),
+                            symbolic: BTreeMap::new(),
                         },
                     )
                     .is_some()
@@ -130,7 +146,10 @@ impl Memory {
             }
             pointers.insert(
                 (i as u64).checked_mul(8).ok_or("buffer table overflow")?,
-                Value::Pointer(Allocation::External(binding.allocation), binding.offset),
+                Value::Pointer(
+                    Allocation::External(binding.allocation),
+                    binding.offset.into(),
+                ),
             );
         }
         allocations.insert(
@@ -140,20 +159,39 @@ impl Memory {
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers,
+                symbolic: BTreeMap::new(),
             },
         );
+        // The canonical bytes of a scalar domain encode its minimum only for
+        // workload identity. They are not an exact input. Erase those bytes so
+        // every permitted value follows the same traced instructions and memory
+        // accesses; numerical data may vary, but unresolved control or addresses
+        // cannot accidentally be modeled using the minimum as a representative.
+        let mut scalar_known: BTreeMap<_, _> = workload
+            .scalars
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| (i as u64, value))
+            .collect();
+        for domain in &workload.integer_domains {
+            if let seismic_accounting::workload::IntegerInput::Scalar { slot } = domain.input {
+                let offset = u64::try_from(slot)
+                    .map_err(|_| "CUDA scalar domain slot overflow")?
+                    .checked_mul(8)
+                    .ok_or("CUDA scalar domain offset overflow")?;
+                for byte in 0..u64::from(domain.bytes) {
+                    scalar_known.remove(&(offset + byte));
+                }
+            }
+        }
         allocations.insert(
             Allocation::Scalars,
             Storage {
                 bytes: workload.scalars.len() as u64,
                 alignment: hardware.internal_alignment,
-                known: workload
-                    .scalars
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &v)| (i as u64, v))
-                    .collect(),
+                known: scalar_known,
                 pointers: BTreeMap::new(),
+                symbolic: BTreeMap::new(),
             },
         );
         allocations.insert(
@@ -163,6 +201,7 @@ impl Memory {
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers: BTreeMap::new(),
+                symbolic: BTreeMap::new(),
             },
         );
         allocations.insert(
@@ -172,29 +211,60 @@ impl Memory {
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers: BTreeMap::new(),
+                symbolic: BTreeMap::new(),
             },
         );
+        for domain in &workload.integer_domains {
+            let (allocation, offset) = match domain.input {
+                seismic_accounting::workload::IntegerInput::Scalar { slot } => {
+                    (Allocation::Scalars, (slot as u64) * 8)
+                }
+                seismic_accounting::workload::IntegerInput::Allocation { allocation, offset } => {
+                    (Allocation::External(allocation), offset)
+                }
+            };
+            let expression = Affine::domain(domain.input, domain.range)
+                .ok_or("CUDA integer domain expression overflow")?;
+            allocations
+                .get_mut(&allocation)
+                .ok_or("CUDA integer domain storage is missing")?
+                .symbolic
+                .insert(
+                    (offset.into(), u32::from(domain.bytes)),
+                    Value::Integer(expression),
+                );
+        }
         Ok(Self {
             allocations,
             accesses: Vec::new(),
         })
     }
-    fn access(&self, value: &Value, bytes: u32, lane: u64, write: bool) -> Result<Access, String> {
+    fn access(
+        &self,
+        value: &Value,
+        bytes: u32,
+        lane: u64,
+        write: bool,
+    ) -> Result<Access, DerivationError> {
         let Value::Pointer(allocation, offset) = value else {
-            return Err("CUDA memory address is not a known allocation-relative pointer".into());
+            return Err("CUDA memory address is not an allocation-relative pointer".into());
         };
         let storage = self
             .allocations
             .get(allocation)
             .ok_or("unknown CUDA storage")?;
+        let (lo, hi) = offset.bounds().ok_or("CUDA affine address overflow")?;
         if bytes == 0
-            || offset
-                .checked_add(u64::from(bytes))
-                .is_none_or(|end| end > storage.bytes)
-            || offset % u64::from(bytes) != 0
+            || lo < 0
+            || hi
+                .checked_add(i128::from(bytes))
+                .is_none_or(|end| end > i128::from(storage.bytes))
+            || !offset.aligned(u64::from(bytes))
             || storage.alignment < u64::from(bytes)
         {
-            return Err("PTX memory access exceeds storage or natural alignment".into());
+            return Err(DerivationError::Unsupported(
+                "CUDA input domain does not establish in-bounds aligned memory accesses".into(),
+            ));
         }
         if write && matches!(allocation, Allocation::BufferTable | Allocation::Scalars) {
             return Err("CUDA kernel writes immutable ABI input storage".into());
@@ -202,65 +272,96 @@ impl Memory {
         Ok(Access {
             lane,
             allocation: allocation.clone(),
-            offset: *offset,
+            offset: offset.clone(),
             bytes,
             alignment: storage.alignment,
             write,
         })
     }
-    fn dependencies(&self, access: &Access) -> Result<Vec<usize>, String> {
+    fn dependencies(&self, access: &Access) -> Result<Vec<usize>, DerivationError> {
         let mut dependencies = Vec::new();
         for (prior, event) in &self.accesses {
-            if access.allocation == prior.allocation
-                && (access.write || prior.write)
-                && access.offset < prior.offset + u64::from(prior.bytes)
-                && prior.offset < access.offset + u64::from(access.bytes)
-            {
-                if prior.lane != access.lane {
+            if access.allocation != prior.allocation || !(access.write || prior.write) {
+                continue;
+            }
+            match access.offset.disjoint(
+                u64::from(access.bytes),
+                &prior.offset,
+                u64::from(prior.bytes),
+            ) {
+                Some(true) => {}
+                Some(false) if prior.lane == access.lane => dependencies.push(*event),
+                Some(false) => {
                     return Err("unsynchronized cross-lane conflicting CUDA memory access".into());
                 }
-                dependencies.push(*event);
+                None => return Err(DerivationError::Unsupported(
+                    "CUDA memory dependence or cross-lane conflict varies across the input domain"
+                        .into(),
+                )),
             }
         }
         Ok(dependencies)
     }
-    fn load(&self, a: &Access) -> Value {
-        let storage = &self.allocations[&a.allocation];
-        if a.bytes == 8 {
-            if let Some(p) = storage.pointers.get(&a.offset) {
-                return p.clone();
+    fn load(&self, access: &Access) -> Value {
+        let storage = &self.allocations[&access.allocation];
+        if let Some(value) = storage.symbolic.get(&(access.offset.clone(), access.bytes)) {
+            return value.clone();
+        }
+        let Some(offset) = access.offset.exact().and_then(|n| u64::try_from(n).ok()) else {
+            return Value::Unknown;
+        };
+        if access.bytes == 8 {
+            if let Some(pointer) = storage.pointers.get(&offset) {
+                return pointer.clone();
             }
         }
         let mut value = 0u64;
-        for byte in 0..a.bytes {
-            let Some(&b) = storage.known.get(&(a.offset + u64::from(byte))) else {
+        for byte in 0..access.bytes {
+            let Some(&b) = storage.known.get(&(offset + u64::from(byte))) else {
                 return Value::Unknown;
             };
             value |= u64::from(b) << (byte * 8);
         }
         Value::Bits(value)
     }
-    fn store(&mut self, a: &Access, value: Value) -> Result<(), String> {
-        let storage = self.allocations.get_mut(&a.allocation).unwrap();
-        // A partial write invalidates every overlapping saved pointer word.
-        storage
-            .pointers
-            .retain(|&offset, _| offset >= a.offset + u64::from(a.bytes) || offset + 8 <= a.offset);
-        for byte in 0..a.bytes {
-            let offset = a.offset + u64::from(byte);
-            if let Value::Bits(value) = value {
-                storage
-                    .known
-                    .insert(offset, ((value >> (8 * byte)) & 255) as u8);
-            } else {
-                storage.known.remove(&offset);
+    fn store(&mut self, access: &Access, value: Value) -> Result<(), DerivationError> {
+        let storage = self.allocations.get_mut(&access.allocation).unwrap();
+        // A varying write invalidates every potentially overlapping fact. A
+        // retained exact symbolic address/value can then be read through that
+        // same address; it is not installed as known bytes at a sampled offset.
+        storage.pointers.retain(|&offset, _| {
+            access
+                .offset
+                .disjoint(u64::from(access.bytes), &offset.into(), 8)
+                == Some(true)
+        });
+        storage.known.retain(|&offset, _| {
+            access
+                .offset
+                .disjoint(u64::from(access.bytes), &offset.into(), 1)
+                == Some(true)
+        });
+        storage.symbolic.retain(|(offset, bytes), _| {
+            access
+                .offset
+                .disjoint(u64::from(access.bytes), offset, u64::from(*bytes))
+                == Some(true)
+        });
+        if let (Some(offset), Value::Bits(value)) = (
+            access.offset.exact().and_then(|n| u64::try_from(n).ok()),
+            &value,
+        ) {
+            for byte in 0..access.bytes {
+                storage.known.insert(
+                    offset + u64::from(byte),
+                    ((value >> (8 * byte)) & 255) as u8,
+                );
             }
         }
-        if let Value::Pointer(..) = value {
-            if a.bytes != 8 {
-                return Err("partial PTX pointer store is not modeled".into());
-            }
-            storage.pointers.insert(a.offset, value);
+        if !matches!(value, Value::Unknown) {
+            storage
+                .symbolic
+                .insert((access.offset.clone(), access.bytes), value);
         }
         Ok(())
     }
@@ -309,6 +410,7 @@ pub(super) fn derive(
     hardware: &CudaHardware,
     workload: &ScalarWorkload,
     limits: DerivationLimits,
+    inherited: &SymbolicMemory,
 ) -> Result<Trace, DerivationError> {
     let plan = execution.target_plan();
     let d = execution.dispatch();
@@ -341,6 +443,14 @@ pub(super) fn derive(
         })
         .collect::<BTreeMap<_, _>>();
     let mut memory = Memory::new(execution, workload, hardware, limits)?;
+    for (&allocation, values) in inherited {
+        memory
+            .allocations
+            .get_mut(&Allocation::External(allocation))
+            .ok_or("CUDA retained symbolic storage is missing")?
+            .symbolic
+            .extend(values.clone());
+    }
     let mut events = Vec::new();
     let launch = lifecycle(
         &mut events,
@@ -384,10 +494,18 @@ pub(super) fn derive(
                 let mut parameters = Vec::new();
                 for parameter in plan.parameters() {
                     let value = match parameter.role {
-                        ParameterRole::Buffers => Some(Value::Pointer(Allocation::BufferTable, 0)),
-                        ParameterRole::Scalars => Some(Value::Pointer(Allocation::Scalars, 0)),
-                        ParameterRole::Scratch => Some(Value::Pointer(Allocation::Scratch, 0)),
-                        ParameterRole::Statuses => Some(Value::Pointer(Allocation::Statuses, 0)),
+                        ParameterRole::Buffers => {
+                            Some(Value::Pointer(Allocation::BufferTable, 0u64.into()))
+                        }
+                        ParameterRole::Scalars => {
+                            Some(Value::Pointer(Allocation::Scalars, 0u64.into()))
+                        }
+                        ParameterRole::Scratch => {
+                            Some(Value::Pointer(Allocation::Scratch, 0u64.into()))
+                        }
+                        ParameterRole::Statuses => {
+                            Some(Value::Pointer(Allocation::Statuses, 0u64.into()))
+                        }
                         ParameterRole::CallArgument(_) | ParameterRole::CallResult(_) => None,
                     };
                     parameters.push(value.map(|value| Cell {
@@ -626,24 +744,23 @@ pub(super) fn derive(
         block_ends,
         limits,
     )?;
+    let mut external_values = BTreeMap::new();
+    let mut external_symbolic = BTreeMap::new();
+    for (allocation, storage) in memory.allocations {
+        if let Allocation::External(id) = allocation {
+            external_values.insert(id, storage.known);
+            external_symbolic.insert(id, storage.symbolic);
+        }
+    }
     Ok(Trace {
         events,
         instructions,
-        external_values: memory
-            .allocations
-            .into_iter()
-            .filter_map(|(allocation, storage)| {
-                if let Allocation::External(id) = allocation {
-                    Some((id, storage.known))
-                } else {
-                    None
-                }
-            })
-            .collect(),
+        external_values,
+        external_symbolic,
     })
 }
 
-fn operand(op: Operand, lane: &Lane, block: u64, width: u64) -> Result<Value, String> {
+fn operand(op: Operand, lane: &Lane, block: u64, width: u64) -> Result<Value, DerivationError> {
     Ok(match op {
         Operand::Register(r) => lane.registers[r.0]
             .as_ref()
@@ -661,19 +778,27 @@ fn operand(op: Operand, lane: &Lane, block: u64, width: u64) -> Result<Value, St
         }),
     })
 }
-fn address(a: Address, lane: &Lane) -> Result<Value, String> {
+fn address(a: Address, lane: &Lane) -> Result<Value, DerivationError> {
     let AddressBase::Register(r) = a.base else {
         return Err("parameter address used as a global pointer".into());
     };
-    let Value::Pointer(allocation, offset) = &lane.registers[r.0]
+    let value = &lane.registers[r.0]
         .as_ref()
         .ok_or("undefined address register")?
-        .value
-    else {
-        return Err("unknown CUDA memory address".into());
+        .value;
+    let (allocation, offset) = match value {
+        Value::Pointer(allocation, offset) => (allocation, offset),
+        Value::Unknown => {
+            return Err(DerivationError::Unsupported(
+                "CUDA trace needs an input-independent memory address".into(),
+            ));
+        }
+        Value::Bits(_) | Value::Integer(_) => {
+            return Err("PTX global address has no allocation provenance".into());
+        }
     };
     let offset = offset
-        .checked_add_signed(i64::from(a.offset))
+        .add(&Affine::constant(i128::from(a.offset)))
         .ok_or("CUDA pointer offset overflow")?;
     Ok(Value::Pointer(allocation.clone(), offset))
 }
@@ -684,7 +809,7 @@ fn parameter_access(lane: &Lane, parameter: ptx::ParameterId, bytes: u32, write:
             lane: lane.linear,
             parameter: parameter.0,
         },
-        offset: 0,
+        offset: 0u64.into(),
         bytes,
         alignment: u64::from(bytes),
         write,
@@ -702,7 +827,7 @@ fn execute(
     event: &mut Event,
     event_id: usize,
     body_id: Option<usize>,
-) -> Result<(), String> {
+) -> Result<(), DerivationError> {
     let pc = lane.pc.unwrap();
     let mut destination = None;
     let mut value = Value::Unknown;
@@ -854,7 +979,12 @@ fn execute(
                     memory.access(&address(at, lane)?, data_type.bits() / 8, lane.linear, true)?;
                 if a.allocation == Allocation::Statuses {
                     if a.bytes != 4
-                        || a.offset != lane.linear.checked_mul(4).ok_or("status index overflow")?
+                        || a.offset
+                            != lane
+                                .linear
+                                .checked_mul(4)
+                                .ok_or("status index overflow")?
+                                .into()
                     {
                         return Err("CUDA lane writes another invocation status".into());
                     }
@@ -864,12 +994,21 @@ fn execute(
                 event.predecessors.extend(memory.dependencies(&a)?);
                 // Also check other lanes of this same instruction before mutation.
                 for prior in &event.accesses {
-                    if prior.lane != a.lane
-                        && prior.allocation == a.allocation
-                        && prior.offset < a.offset + u64::from(a.bytes)
-                        && a.offset < prior.offset + u64::from(prior.bytes)
-                    {
-                        return Err("unsynchronized CUDA cohort writes alias".into());
+                    if prior.lane == a.lane || prior.allocation != a.allocation {
+                        continue;
+                    }
+                    match prior.offset.disjoint(
+                        u64::from(prior.bytes),
+                        &a.offset,
+                        u64::from(a.bytes),
+                    ) {
+                        Some(true) => {}
+                        Some(false) => return Err("unsynchronized CUDA cohort writes alias".into()),
+                        None => {
+                            return Err(DerivationError::Unsupported(
+                                "CUDA cohort write conflicts vary across the input domain".into(),
+                            ));
+                        }
                     }
                 }
                 memory.store(&a, value)?;
@@ -936,12 +1075,123 @@ fn truncate(v: Value, t: DataType) -> Value {
     match v {
         Value::Bits(v) => Value::Bits(v & mask(t)),
         p @ Value::Pointer(..) if t.bits() == 64 => p,
+        Value::Integer(expression) if t != DataType::F32 => {
+            affine_value(expression.interpreted(t.bits(), is_signed(t)))
+        }
         _ => Value::Unknown,
     }
 }
-fn unary(op: Unary, t: DataType, a: Value) -> Result<Value, String> {
+fn affine_value(expression: Option<Affine>) -> Value {
+    match expression {
+        Some(expression) => expression
+            .exact()
+            .map_or(Value::Integer(expression), |n| Value::Bits(n as u64)),
+        None => Value::Unknown,
+    }
+}
+fn integer(value: &Value, ty: DataType) -> Option<Affine> {
+    if ty == DataType::F32 {
+        return None;
+    }
+    match value {
+        Value::Bits(bits) => Some(Affine::constant(if is_signed(ty) {
+            i128::from(signed(*bits, ty))
+        } else {
+            i128::from(*bits & mask(ty))
+        })),
+        Value::Integer(expression) => expression.interpreted(ty.bits(), is_signed(ty)),
+        _ => None,
+    }
+}
+fn symbolic_binary(op: Binary, t: DataType, a: &Value, b: &Value) -> Option<Affine> {
+    let (a, b) = (integer(a, t)?, integer(b, t)?);
+    let result = match op {
+        Binary::Add => a.add(&b),
+        Binary::Subtract => a.sub(&b),
+        Binary::Multiply(_) => {
+            if let Some(n) = a.exact() {
+                b.scale(n)
+            } else {
+                a.scale(b.exact()?)
+            }
+        }
+        Binary::Divide => {
+            let divisor = u64::try_from(b.exact()?).ok()?;
+            // Signed truncation agrees with floor for nonnegative values, or
+            // an exactly divisible affine expression.
+            let quotient = a.quotient(divisor)?;
+            if is_signed(t) && a.bounds()?.0 < 0 && a.remainder(divisor)?.exact() != Some(0) {
+                return None;
+            }
+            Some(quotient)
+        }
+        Binary::Remainder => {
+            if a.bounds()?.0 < 0 {
+                return None;
+            }
+            a.remainder(u64::try_from(b.exact()?).ok()?)
+        }
+        Binary::ShiftLeft => {
+            let shift = u32::try_from(b.exact()?).ok()?;
+            if shift >= t.bits() {
+                Some(Affine::constant(0))
+            } else {
+                a.scale(1i128.checked_shl(shift)?)
+            }
+        }
+        Binary::ShiftRight => {
+            let shift = u32::try_from(b.exact()?).ok()?;
+            if shift >= t.bits() && !is_signed(t) {
+                Some(Affine::constant(0))
+            } else {
+                a.quotient(1u64.checked_shl(shift.min(t.bits() - 1))?)
+            }
+        }
+        Binary::And => {
+            let mask = b.exact().or_else(|| a.exact())?;
+            let other = if b.exact().is_some() { &a } else { &b };
+            let divisor = u64::try_from(mask.checked_add(1)?).ok()?;
+            if !divisor.is_power_of_two() {
+                return None;
+            }
+            other.remainder(divisor)
+        }
+        Binary::Or if a.exact() == Some(0) => Some(b),
+        Binary::Or if b.exact() == Some(0) || a == b => Some(a),
+        Binary::Xor if a == b => Some(Affine::constant(0)),
+        Binary::Xor if a.exact() == Some(0) => Some(b),
+        Binary::Xor if b.exact() == Some(0) => Some(a),
+        _ => None,
+    }?;
+    let bits = if matches!(op, Binary::Multiply(ptx::Multiply::Wide)) {
+        t.bits().checked_mul(2)?
+    } else {
+        t.bits()
+    };
+    result.interpreted(bits, is_signed(t))
+}
+fn unary(op: Unary, t: DataType, a: Value) -> Result<Value, DerivationError> {
     if op == Unary::Move {
         return Ok(truncate(a, t));
+    }
+    if matches!(a, Value::Integer(_)) {
+        let result = integer(&a, t)
+            .and_then(|a| match op {
+                Unary::Negate => a.scale(-1),
+                Unary::Absolute => {
+                    let (lo, hi) = a.bounds()?;
+                    if lo >= 0 {
+                        Some(a)
+                    } else if hi <= 0 {
+                        a.scale(-1)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .and_then(|a| a.interpreted(t.bits(), is_signed(t)));
+        return Ok(affine_value(result));
     }
     let Value::Bits(v) = a else {
         return Ok(Value::Unknown);
@@ -955,23 +1205,28 @@ fn unary(op: Unary, t: DataType, a: Value) -> Result<Value, String> {
         (Unary::Move, _) => unreachable!(),
     })
 }
-fn binary(op: Binary, t: DataType, a: Value, b: Value) -> Result<Value, String> {
-    if let (Value::Pointer(allocation, offset), Value::Bits(delta)) = (&a, &b) {
+fn binary(op: Binary, t: DataType, a: Value, b: Value) -> Result<Value, DerivationError> {
+    if let Value::Pointer(allocation, offset) = &a {
         if t.bits() == 64 && matches!(op, Binary::Add | Binary::Subtract) {
-            let delta = *delta as i64;
-            let offset = if op == Binary::Add {
-                offset.checked_add_signed(delta)
+            let delta = integer(&b, DataType::S64).ok_or_else(|| {
+                DerivationError::Unsupported(
+                    "CUDA pointer arithmetic needs a representable input domain".into(),
+                )
+            })?;
+            let address = if op == Binary::Add {
+                offset.add(&delta)
             } else {
-                delta
-                    .checked_neg()
-                    .and_then(|d| offset.checked_add_signed(d))
+                offset.sub(&delta)
             }
-            .ok_or("PTX symbolic pointer arithmetic overflow")?;
-            return Ok(Value::Pointer(allocation.clone(), offset));
+            .ok_or("CUDA affine pointer arithmetic overflow")?;
+            return Ok(Value::Pointer(allocation.clone(), address));
         }
     }
     if matches!(a, Value::Pointer(..)) || matches!(b, Value::Pointer(..)) {
         return Err("unsupported PTX pointer arithmetic".into());
+    }
+    if matches!(a, Value::Integer(_)) || matches!(b, Value::Integer(_)) {
+        return Ok(affine_value(symbolic_binary(op, t, &a, &b)));
     }
     let (Value::Bits(a), Value::Bits(b)) = (a, b) else {
         return Ok(Value::Unknown);
@@ -1089,7 +1344,16 @@ mod tests {
         );
     }
 }
-fn convert(to: DataType, from: DataType, value: Value) -> Result<Value, String> {
+fn convert(to: DataType, from: DataType, value: Value) -> Result<Value, DerivationError> {
+    if matches!(value, Value::Integer(_)) {
+        return Ok(affine_value(integer(&value, from).and_then(|v| {
+            if to == DataType::F32 {
+                None
+            } else {
+                v.interpreted(to.bits(), is_signed(to))
+            }
+        })));
+    }
     let Value::Bits(value) = value else {
         return Ok(Value::Unknown);
     };
@@ -1104,7 +1368,44 @@ fn convert(to: DataType, from: DataType, value: Value) -> Result<Value, String> 
         }) & mask(to),
     ))
 }
-fn compare(c: Comparison, t: DataType, a: Value, b: Value) -> Result<Value, String> {
+fn compare(c: Comparison, t: DataType, a: Value, b: Value) -> Result<Value, DerivationError> {
+    if matches!(a, Value::Integer(_)) || matches!(b, Value::Integer(_)) {
+        let result = (|| {
+            let (lo, hi) = integer(&a, t)?.sub(&integer(&b, t)?)?.bounds()?;
+            let equal = if lo == 0 && hi == 0 {
+                Some(true)
+            } else if hi < 0 || lo > 0 {
+                Some(false)
+            } else {
+                None
+            };
+            let less = if hi < 0 {
+                Some(true)
+            } else if lo >= 0 {
+                Some(false)
+            } else {
+                None
+            };
+            let greater = if lo > 0 {
+                Some(true)
+            } else if hi <= 0 {
+                Some(false)
+            } else {
+                None
+            };
+            match c {
+                Comparison::Equal | Comparison::EqualOrUnordered => equal,
+                Comparison::NotEqual | Comparison::NotEqualOrUnordered => equal.map(|x| !x),
+                Comparison::Less | Comparison::LessOrUnordered => less,
+                Comparison::LessEqual | Comparison::LessEqualOrUnordered => greater.map(|x| !x),
+                Comparison::Greater | Comparison::GreaterOrUnordered => greater,
+                Comparison::GreaterEqual | Comparison::GreaterEqualOrUnordered => less.map(|x| !x),
+                Comparison::Number => Some(true),
+                Comparison::NaN => Some(false),
+            }
+        })();
+        return Ok(result.map_or(Value::Unknown, |b| Value::Bits(u64::from(b))));
+    }
     let (Value::Bits(a), Value::Bits(b)) = (a, b) else {
         return Ok(Value::Unknown);
     };

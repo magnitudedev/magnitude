@@ -10,7 +10,8 @@ use seismic_realization::{dispatch::TilePlacement, execution::Multiplicity};
 use std::sync::Arc;
 
 use std::collections::HashMap;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FragmentLayout {
     pub rows: u64,
     pub columns: u64,

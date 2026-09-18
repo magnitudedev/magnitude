@@ -337,7 +337,7 @@ impl Walker<'_> {
     fn expr(&mut self, e: &Expr, f: &Function, b: &Bindings, mult: &Count) {
         if let Some(r)=seismic_lang::reduction::structured::Reduction::from_expr(e) {
             for operand in r.operands() {self.expr(operand,f,b,mult);}
-            self.expr(r.step.as_ref().map_or(&r.merge,|s|&s.call),f,b,&Count::multiply(mult,&count(r.extent(),b)));
+            self.expr(r.step.as_ref().map_or(&r.merge,|s|&s.call).source().expect("source reduction callback"),f,b,&Count::multiply(mult,&count(r.extent(),b)));
             return;
         }
         match &e.kind {

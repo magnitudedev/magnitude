@@ -28,6 +28,24 @@ accepted state → reserve private destinations → submit tentative work
 - Abort preserves accepted history and waits before recycling destinations that
   submitted work can still write. Allocation retention alone does not reserve a range.
 - Checkpoints cannot capture unresolved advances.
+- A generation checkpoint captures reconciled numerical state together with the
+  retained input layout, accepted output, pending token, grammar, publication
+  cursor, recovery boundary, sampling options, and terminal outcome. Forks have
+  distinct proposal identities and independent matcher/output state. A checkpoint
+  during replay retains the remaining recovery obligation without resampling.
+
+Service checkpoints are opaque, owner-scoped handles. Their logical and numerical
+snapshots remain on the execution worker; host handles cannot transfer live device
+or matcher objects between owners. Capture requires reconciled state and matching
+logical/numerical positions. Fork admission observes the normal request limit,
+creates a distinct request identity, and preserves queued output, terminal errors,
+and any recovery protection. A fresh deferred numerical sequence can be captured
+without allocating model state. Evicted or unresolved state cannot be captured.
+
+Snapshot count is bounded separately from live requests, using the configured
+request-count limit. Dropped or abandoned handles release through reserved lifecycle
+delivery; shutdown disposes every retained snapshot. Numerical alias accounting
+includes snapshots when pricing eviction. Releasing one can wake capacity waits.
 
 ## Sharing and visibility
 
@@ -38,6 +56,10 @@ accepted state → reserve private destinations → submit tentative work
 - Recurrent successors have independent handles and compatible component schemas.
 - Visibility comes from explicit metadata, never from allocation capacity.
 - Fragmented storage changes views and access geometry, not attention semantics.
+  Attention combines ordered visible spans under one normalization and then
+  consumes the fresh causal rows. Physical gaps, empty spans, and unrelated
+  requests' storage do not become visible; logical rotary positions remain
+  independent of physical row destinations.
 - Trimming one sequence does not change retained checkpoint history.
 
 ## Reclamation and recovery

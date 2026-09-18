@@ -232,7 +232,7 @@ fn scalar_predicate_counts_follow_narrow_integer_wrap() {
         execution.blocks.insert(no, Arc::new(Multiplicity::Predicate { value: predicate, expected: false }));
         let program = ScalarProgram {
             conditions: Default::default(),
-            function, buffers: Vec::new(), scalars: Vec::new(), scratch_bytes: 0,
+            function, buffers: Vec::new(), public_buffer_count: 0, scalars: Vec::new(), scratch_bytes: 0,
             imports: Vec::new(), backend_calls: Vec::new(), participation: seismic_realization::dispatch::Participation::Thread, work_items: 1, dispatch: Dispatch::Sequential,
             loads: Vec::new(), execution,
         };

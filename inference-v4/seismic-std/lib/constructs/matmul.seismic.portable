@@ -16,3 +16,16 @@ construct matmul[M, N, K](A: tile[M, K] T, B: tile[N, K] U, acc: tile[M, N] f32)
     for s in owned(zero): zero[s] = 0.0
     reduce((a, b), 1, matmul_add, into=(state,), step=matmul_accumulate, identity=(zero,), ordered=false)
     acc[i, j] = state[0]
+
+# A common contraction tree across the output rectangle retains each activation
+# leaf once for all columns. Every output keeps its FMA chain and its own seed.
+fn matmul_rectangle_add[M,N](left:tile[M,N] f32,right:tile[M,N] f32,out:tile[M,N] f32):
+  for i,j in owned(out): out[i,j] = left[i,j] + right[i,j]
+
+fn matmul_rectangle_accumulate[M,N](state:tile[M,N] f32,a:tile[M] T,b:tile[N] U,out:tile[M,N] f32):
+  for i,j in owned(out): out[i,j] = fma(a[i],b[j],state[i,j])
+
+fn matmul_rectangle[M,N,K](A:tile[M,K] T,B:tile[N,K] U,acc:tile[M,N] f32):
+  zero = tile[M,N] f32
+  for i,j in owned(zero): zero[i,j] = 0.0
+  reduce((A,B),1,matmul_rectangle_add,into=(acc,),step=matmul_rectangle_accumulate,identity=(zero,),ordered=false)

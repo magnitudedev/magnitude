@@ -576,7 +576,7 @@ impl<'a> Interpreter<'a> {
                             shape.packed_axis=None;
                         }
                     }
-                    for call in std::iter::once(&mut reduction.merge).chain(reduction.step.iter_mut().map(|s|&mut s.call)) {
+                    for call in std::iter::once(&mut reduction.merge).chain(reduction.step.iter_mut().map(|s|&mut s.call)).filter_map(|c|c.source_mut()) {
                         if let ExprKind::Call{elem_args,..}=&mut call.kind {
                             for element in elem_args {
                                 let resolved=crate::lower::subst_elem(element,&frame.elements);
@@ -598,17 +598,33 @@ impl<'a> Interpreter<'a> {
             ExprKind::Call { callee, shape_args, elem_args, args } => {
                 let f = self.program.functions.iter().find(|f| &f.name == callee).ok_or_else(|| format!("no function `{callee}`"))?.clone();
                 let mut inner = Frame { vars: vec![None; f.vars.len()], index: HashMap::new(), shapes: HashMap::new(), elements: HashMap::new() };
+                // Runtime slices carry their realized extent in the evaluated
+                // value. Such extents need not have a named binding in the caller.
+                let values = args.iter().map(|a| self.expr(a, frame)).collect::<Result<Vec<_>, _>>()?;
                 for (p, s) in f.shape_params.iter().zip(shape_args) {
-                    inner.shapes.insert(p.clone(), self.eval_sym(s, frame));
+                    let mut extent = s.eval(&|n| frame.index.get(n).copied().or_else(|| frame.shapes.get(n).copied()));
+                    for ((_, ty), value) in f.params.iter().zip(&values) {
+                        let (declared, actual) = match (ty, value) {
+                            (Ty::Tensor(t), Value::View(v)) => (&t.shape, &v.shape),
+                            (Ty::Tile(t), Value::Tile(v)) => (&t.shape, &v.shape),
+                            _ => continue,
+                        };
+                        for (dimension, actual) in declared.iter().zip(actual) {
+                            if dimension == &Sym::param(p) {
+                                let actual = i64::try_from(*actual).map_err(|_| "call extent exceeds index range")?;
+                                if extent.is_some_and(|previous| previous != actual) {
+                                    return Err(format!("inconsistent call extent {callee}.{p}"));
+                                }
+                                extent = Some(actual);
+                            }
+                        }
+                    }
+                    inner.shapes.insert(p.clone(), extent.ok_or_else(|| format!("unresolved call extent {callee}.{p}"))?);
                 }
                 for (p, element) in f.elem_params.iter().zip(elem_args) {
                     inner.elements.insert(p.clone(), crate::lower::subst_elem(element, &frame.elements));
                 }
                 // Tile arguments are passed by reference: copy in, run, copy back.
-                let mut values = Vec::new();
-                for a in args {
-                    values.push(self.expr(a, frame)?);
-                }
                 for (i, v) in values.iter().enumerate() {
                     inner.vars[i] = Some(v.clone());
                 }

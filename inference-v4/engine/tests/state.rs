@@ -251,3 +251,47 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let other = StateStore::new(Rc::new(Device::cpu()), 16, 32, vec![], vec![]).unwrap();
     assert!(other.reclaimable(&[&fork]).is_err());
 }
+
+#[test]
+fn shared_execution_publishes_completion_for_all_rows_or_none() {
+    use seismic_engine::state::StateAdvance;
+    let store = store(true, true);
+    let mut first = store.create().unwrap();
+    let mut second = store.create().unwrap();
+    let mut advances = vec![first.begin(2).unwrap(), second.begin(1).unwrap()];
+    StateAdvance::execute_batch(&mut advances, |bindings| {
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].history[0].shares_allocation(&bindings[1].history[0]));
+        assert!(!bindings[0].following[0].shares_allocation(&bindings[1].following[0]));
+        assert!(bindings[0]
+            .destinations
+            .iter()
+            .all(|row| !bindings[1].destinations.contains(row)));
+        bindings[0].following[0].write(&[1; 16])?;
+        bindings[1].following[0].write(&[2; 16])?;
+        Ok(())
+    })
+    .unwrap();
+    advances.remove(0).commit().unwrap();
+    drop(advances); // An independently cancelled peer never publishes its successor.
+    assert_eq!(first.position(), 2);
+    assert_eq!(second.position(), 0);
+    assert_eq!(store.occupied_rows(), 2);
+    let mut bytes = [0; 16];
+    first.values()[0].read(&mut bytes).unwrap();
+    assert_eq!(bytes, [1; 16]);
+    second.values()[0].read(&mut bytes).unwrap();
+    assert_eq!(bytes, [0; 16]);
+    let mut advances = vec![first.begin(1).unwrap(), second.begin(1).unwrap()];
+    assert!(StateAdvance::execute_batch(&mut advances, |bindings| {
+        bindings[0].following[0].write(&[3; 16])?;
+        Err("shared native completion failed".into())
+    })
+    .is_err());
+    for advance in advances {
+        assert!(advance.commit().is_err());
+    }
+    assert_eq!(first.position(), 2);
+    assert_eq!(second.position(), 0);
+    assert_eq!(store.occupied_rows(), 2);
+}

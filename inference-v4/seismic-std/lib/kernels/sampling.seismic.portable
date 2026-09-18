@@ -1,0 +1,62 @@
+# V3 selection semantics: Philox4x32-10 counters are token, output position,
+# and draw domain; the request seed is the key. Partitioning never changes a draw.
+# Output pairs are (token, status): 0 success, 1 empty, 2 nonfinite source.
+fn sample_rows[M, V](logits: tensor[M, V] f32, mask: tensor[M, (V + 31) / 32] u32,
+    draws: tensor[M, 6] u32, out: tensor[M, 2] i32):
+  for row in parallel:
+    scores = tile[V] f32
+    invalid = tile[V] i32
+    for token in owned(scores):
+      value = logits[row, token]
+      scores[token] = -inf
+      invalid[token] = 0
+      if value != value or value == inf: invalid[token] = 1
+      if ((mask[row, token / 32] >> (token % 32)) & 1) != 0 and value > -inf and value < inf:
+        if draws[row, 0] == 1:
+          c0 = u32(token)
+          c1 = draws[row, 3]
+          c2 = draws[row, 4]
+          c3 = draws[row, 5]
+          k0 = draws[row, 1]
+          k1 = draws[row, 2]
+          for round in range(10):
+            a0 = u32(3528531795)
+            a1 = u32(3449720151)
+            p00 = (a0 & 65535) * (c0 & 65535)
+            p01 = (a0 >> 16) * (c0 & 65535)
+            p02 = (a0 & 65535) * (c0 >> 16)
+            p03 = (a0 >> 16) * (c0 >> 16)
+            middle0 = (p00 >> 16) + (p01 & 65535) + (p02 & 65535)
+            hi0 = p03 + (p01 >> 16) + (p02 >> 16) + (middle0 >> 16)
+            lo0 = (middle0 << 16) | (p00 & 65535)
+            p10 = (a1 & 65535) * (c2 & 65535)
+            p11 = (a1 >> 16) * (c2 & 65535)
+            p12 = (a1 & 65535) * (c2 >> 16)
+            p13 = (a1 >> 16) * (c2 >> 16)
+            middle1 = (p10 >> 16) + (p11 & 65535) + (p12 & 65535)
+            hi1 = p13 + (p11 >> 16) + (p12 >> 16) + (middle1 >> 16)
+            lo1 = (middle1 << 16) | (p10 & 65535)
+            next0 = hi1 ^ c1 ^ k0
+            next2 = hi0 ^ c3 ^ k1
+            c0 = next0
+            c1 = lo1
+            c2 = next2
+            c3 = lo0
+            k0 = k0 + u32(2654435769)
+            k1 = k1 + u32(3144134277)
+          uniform = (f32(c0 >> 9) + 0.5) * 0.00000011920928955078125
+          value = value - log(-log(uniform))
+        scores[token] = value
+    bad = reduce(invalid, 0, max)
+    maximum = reduce(scores, 0, max)
+    winner = reduce(scores, 0, argmax)
+    result = tile[2] i32
+    for i in owned(result):
+      status = 0
+      if maximum == -inf: status = 1
+      if bad != 0: status = 2
+      result[i] = status
+      if i == 0:
+        result[i] = -1
+        if status == 0: result[i] = winner
+    store(result, out[row])
