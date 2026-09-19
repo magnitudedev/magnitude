@@ -26,6 +26,11 @@ Build receipts bind the snapshot digest, base commit and native host; final mani
 package byte are verified before the installer can consume them. A base commit alone never
 identifies dirty source. Producer reuse across targets and separate consumer allocation remain
 implementation work; same-machine source probes do not qualify the clean remote consumer gate.
+An update run may additionally bind a previous-release artifact manifest. Its packages are
+frozen and verified like candidate artifacts, registered under the same owner and included in
+the immutable assignment. Admission requires both inputs. Worker transfer authority includes
+exactly their manifest graphs; unrelated uploaded artifacts remain inaccessible. Supplying a
+baseline alone does not establish version ordering, update trust or a successful installation.
 
 `iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
 and consumer state. Neither mode may touch a developer's normal application data. Local execution

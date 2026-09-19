@@ -1,5 +1,5 @@
 import { Cache, Context, Data, Effect, Exit, Layer, Redacted, Schema, Stream } from "effect"
-import { Digest, InfrastructureFailure, OwnerId } from "./domain"
+import { Digest, InfrastructureFailure, OwnerId, runInputs } from "./domain"
 import { InputManifest, InputRegistry } from "./inputs"
 import { sha256 } from "./snapshot"
 import { WorkerAccessDenied, WorkerTickets } from "./worker-tickets"
@@ -33,13 +33,17 @@ export const WorkerInputsLive = Layer.effect(WorkerInputs, Effect.gen(function* 
   return {
     read: (token, digest) => Effect.gen(function* () {
       const { assignment } = yield* tickets.authorize(token)
-      const { owner, input } = assignment.plan.request
-      yield* inputs.require(owner, input)
-      if (digest === input.digest) return yield* inputs.read(owner, digest)
-      const key = Data.struct({ owner, digest: input.digest, kind: input.kind })
-      // Explicit invalidation also covers a second request in the same clock tick as a zero-TTL failure.
-      const allowed = yield* graphs.get(key).pipe(Effect.tapError(() => graphs.invalidate(key)))
-      if (!allowed.has(digest)) return yield* new WorkerAccessDenied({})
+      const { owner } = assignment.plan.request
+      let permitted = false
+      for (const input of runInputs(assignment.plan.request)) {
+        yield* inputs.require(owner, input)
+        if (digest === input.digest) { permitted = true; break }
+        const key = Data.struct({ owner, digest: input.digest, kind: input.kind })
+        // Explicit invalidation covers a second request in the same clock tick as a zero-TTL failure.
+        const allowed = yield* graphs.get(key).pipe(Effect.tapError(() => graphs.invalidate(key)))
+        if (allowed.has(digest)) { permitted = true; break }
+      }
+      if (!permitted) return yield* new WorkerAccessDenied({})
       // Only the immutable graph is cached, never current credential authority.
       yield* tickets.authorize(token)
       return yield* inputs.read(owner, digest)

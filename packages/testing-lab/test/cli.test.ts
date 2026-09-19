@@ -42,3 +42,11 @@ test("requires exactly one source or artifact input", async () => {
     expect((await Effect.runPromise(parseArguments(args).pipe(Effect.either)))._tag).toBe("Left")
   }
 })
+
+test("accepts an explicit previous release for both source and artifact candidates", async () => {
+  expect((await Effect.runPromise(parseArguments(["status", "--update-from", "old.json"]).pipe(Effect.either)))._tag).toBe("Left")
+  for (const input of ["--source", "--artifacts"]) {
+    const parsed = await Effect.runPromise(parseArguments(["run", input, "candidate", "--update-from", "/tmp/old release/release.json"]))
+    expect(parsed.options.get("update-from")).toBe("/tmp/old release/release.json")
+  }
+})

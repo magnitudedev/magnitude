@@ -1,3 +1,4 @@
+import releasePlan from "../../release/release-plan.json"
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
@@ -31,12 +32,20 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       const bytes = "owned input file"
       const wire = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
         entries: [{ kind: "file", path: "test.txt", sha256: sha256(bytes), bytes: bytes.length, executable: false }] })
+      const oldBytes = "old native package"
+      const baseline = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
+        schemaVersion: 2, version: "0.1.2", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.2", sourceCommit: "b".repeat(40),
+        artifacts: [{ id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64", filename: "Magnitude.dmg", bytes: oldBytes.length, sha256: sha256(oldBytes) }],
+      } })
       const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, owner: "developer", trust: mode === "untrusted-local" ? "untrusted-ci" : "developer", idempotencyKey: `transport-${mode}`,
-        input: { kind: "source", digest: sha256(wire) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-cpu-apple-silicon" }, mode: "verify", allowSpark: false,
+        input: { kind: "source", digest: sha256(wire) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-cpu-apple-silicon" }, mode: "verify", allowSpark: false,
         limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 25, idleMinutes: 15 } })
       yield* inputs.upload(request.owner, sha256(bytes), Stream.make(new TextEncoder().encode(bytes)))
       yield* inputs.upload(request.owner, sha256(wire), Stream.make(new TextEncoder().encode(wire)))
       yield* inputs.register(request.owner, request.input)
+      yield* inputs.upload(request.owner, sha256(oldBytes), Stream.make(new TextEncoder().encode(oldBytes)))
+      yield* inputs.upload(request.owner, sha256(baseline), Stream.make(new TextEncoder().encode(baseline)))
+      yield* inputs.register(request.owner, { kind: "artifacts", digest: sha256(baseline) })
       const plan = yield* planRun(mode === "foreign-owner" ? { ...request, owner: RunRequest.fields.owner.make("someone-else") } : request)
       const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "transport-fixture" },
         plan, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
@@ -52,6 +61,8 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
           executions++
           const invocation = yield* fs.readFileString(args[0]!).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(WorkerInvocation))))
           expect(invocation.assignment.claim).toEqual(assignment.claim)
+          expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(baseline)))).toBe(baseline)
+          expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(oldBytes)))).toBe(oldBytes)
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(bytes)))).toBe(bytes)
           const output = mode === "corrupt-evidence" ? "corrupt evidence" : evidence
           yield* fs.writeFileString(join(dirname(args[0]!), "objects", sha256(evidence)), output)

@@ -3,7 +3,7 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { dirname, join, resolve } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
-import { Digest, InfrastructureFailure } from "./domain"
+import { Digest, InfrastructureFailure, runInputs } from "./domain"
 import { GuestExecutor } from "./guest-executor"
 import { InputManifest } from "./inputs"
 import { ProcessExecutorLive } from "./process"
@@ -31,18 +31,19 @@ export const runOutwardWorker = (config: typeof OutwardWorkerConfig.Type) => Eff
   yield* fs.writeFileString(join(root, "invocation.json"), yield* Schema.encode(Schema.parseJson(WorkerInvocation))(invocation), { flag: "wx", mode: 0o600 })
   const store = Context.get(yield* Layer.build(fileArtifactStore(join(root, "objects"))), ArtifactStore)
   const journey = Effect.gen(function* () {
-    const input = invocation.assignment.plan.request.input
-    let length = 0
-    yield* store.put(input.digest, client.download(input.digest).pipe(Stream.tap(chunk => Effect.gen(function* () {
-      length += chunk.byteLength
-      if (length > 16 * 1024 * 1024) return yield* fail("Input manifest exceeds 16 MiB")
-    }))))
-    const bytes = yield* store.get(input.digest).pipe(Stream.runCollect)
-    const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(Buffer.concat(Array.from(bytes)).toString("utf8"))
-    if (manifest.kind !== input.kind) return yield* fail("Assigned input kind differs from its manifest")
-    const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(entry => entry.kind === "file" ? [entry.sha256] : [])
-      : manifest.release.artifacts.map(artifact => Digest.make(artifact.sha256)))]
-    yield* Effect.forEach(digests, digest => store.put(digest, client.download(digest)), { concurrency: 4, discard: true })
+    for (const input of runInputs(invocation.assignment.plan.request)) {
+      let length = 0
+      yield* store.put(input.digest, client.download(input.digest).pipe(Stream.tap(chunk => Effect.gen(function* () {
+        length += chunk.byteLength
+        if (length > 16 * 1024 * 1024) return yield* fail("Input manifest exceeds 16 MiB")
+      }))))
+      const bytes = yield* store.get(input.digest).pipe(Stream.runCollect)
+      const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(Buffer.concat(Array.from(bytes)).toString("utf8"))
+      if (manifest.kind !== input.kind) return yield* fail("Assigned input kind differs from its manifest")
+      const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(entry => entry.kind === "file" ? [entry.sha256] : [])
+        : manifest.release.artifacts.map(artifact => Digest.make(artifact.sha256)))]
+      yield* Effect.forEach(digests, digest => store.put(digest, client.download(digest)), { concurrency: 4, discard: true })
+    }
     const reply = yield* executor.run(invocation, root)
     if (!Schema.equivalence(WorkClaim)(reply.claim, invocation.assignment.claim)) return yield* fail("Executor replied for another attempt")
     yield* validateTargetResult(invocation.assignment.target, reply.result)

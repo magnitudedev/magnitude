@@ -1,3 +1,4 @@
+import releasePlan from "../../release/release-plan.json"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { DateTime, Effect, Layer, Schema, Stream } from "effect"
@@ -20,8 +21,13 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   const report = new TextEncoder().encode("native executor fixture evidence")
   const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
     entries: [{ kind: "file", path: "file.ts", sha256: sha256(payload), bytes: payload.length, executable: false }] })
+  const oldPackage = "previous installed package"
+  const baseline = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
+    schemaVersion: 2, version: "0.1.2", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.2", sourceCommit: "b".repeat(40),
+    artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: oldPackage.length, sha256: sha256(oldPackage) }],
+  } })
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "outward-guest-test", owner: "fixture", trust: "developer", mode: "verify", allowSpark: false,
-    input: { kind: "source", digest: sha256(manifest) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
+    input: { kind: "source", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
     limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 10, idleMinutes: 15 } })
   const plan = yield* planRun(request)
   const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
@@ -30,7 +36,7 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   let executed = 0, uploads = 0, submissions = 0, cleaned = 0, started = false, downloads = 0, recovering = false, redeliveryStarted = false
   const client = Layer.succeed(WorkerClient, {
     assignment: Effect.suspend(() => (mode === "revoked" && started || mode === "delivery-revoked" && recovering || mode === "delivery-revoked-upload" && redeliveryStarted) ? Effect.fail(new WorkerApiError({ status: 401, message: "Revoked fixture" })) : Effect.succeed(invocation)),
-    download: digest => { downloads++; return Stream.make(digest === request.input.digest ? new TextEncoder().encode(manifest) : mode === "corrupt-input" ? new TextEncoder().encode("wrong bytes") : payload) },
+    download: digest => { downloads++; return Stream.make(digest === request.input.digest ? new TextEncoder().encode(manifest) : digest === sha256(baseline) ? new TextEncoder().encode(baseline) : digest === sha256(oldPackage) ? new TextEncoder().encode(oldPackage) : mode === "corrupt-input" ? new TextEncoder().encode("wrong bytes") : payload) },
     upload: (digest, size, content) => Effect.gen(function* () {
       uploads++
       if (mode === "delivery-revoked-upload" && recovering) {
@@ -45,6 +51,8 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   const executor = Layer.succeed(GuestExecutor, { run: (received, directory) => Effect.gen(function* () {
     executed++; started = true
     expect(received).toEqual(invocation)
+    expect(yield* fs.readFileString(join(directory, "objects", sha256(baseline)))).toBe(baseline)
+    expect(yield* fs.readFileString(join(directory, "objects", sha256(oldPackage)))).toBe(oldPackage)
     expect(yield* fs.readFileString(join(directory, "objects", sha256(payload)))).toBe(new TextDecoder().decode(payload))
     if (mode === "revoked") return yield* Effect.never.pipe(Effect.ensuring(Effect.sync(() => { cleaned++ })))
     yield* fs.writeFile(join(directory, "objects", sha256(report)), report)

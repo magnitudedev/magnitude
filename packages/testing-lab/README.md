@@ -589,3 +589,17 @@ Five targeted driver/session/error tests passed and testing-lab typechecking pas
 package typecheck returned exit 2 with Effect diagnostics in unchanged main/preload and dependency
 files, including `multipleEffectProvide` at desktop/src/main.ts:146; no renderer/automation diagnostic
 was emitted. Full output: `/tmp/ml-desktop-update-typecheck-20260918.log`.
+
+## Previous-release input for update testing
+
+`bun lab run --source . --update-from /path/to/old/release-manifest.json --target <target> --suite update`
+freezes the previous release alongside the unpublished source. `--artifacts` may replace
+`--source` for an already packaged candidate. The API request uses optional
+`updateFrom: { kind: "artifacts", digest: "<manifest sha256>" }`.
+
+Both manifests must be registered by the caller before admission. Missing baseline registration
+is rejected. Namespace transport and outward HTTP workers transfer both verified graphs; worker
+credentials do not gain access to other owner uploads. Tests exercise baseline graph download,
+revoked/missing access, native-executor handoff and real HTTP/PostgreSQL admission rejection.
+This input path is implemented; U1–U6 still require installation-transition orchestration and
+acceptance trust routing. A supplied baseline is not yet proof of a valid upgrade pair.

@@ -1,7 +1,7 @@
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { timingSafeEqual } from "node:crypto"
-import { Digest, InfrastructureFailure, Input, ObjectBatch, Principal, RunId, RunPlan, RunRequest, RunResult, Target } from "./domain"
+import { Digest, InfrastructureFailure, Input, ObjectBatch, Principal, RunId, RunPlan, RunRequest, RunResult, Target, runInputs } from "./domain"
 import { planRun, targets } from "./catalog"
 import { RunRecord, RunStore } from "./run-store"
 import { InputRegistry } from "./inputs"
@@ -81,7 +81,8 @@ export const api = HttpRouter.empty.pipe(
   })),
   HttpRouter.post("/v1/runs", Effect.gen(function* () {
     const plan = yield* planRun(yield* admittedRequest)
-    yield* (yield* InputRegistry).require(plan.request.owner, plan.request.input)
+    const inputs = yield* InputRegistry
+    yield* Effect.forEach(runInputs(plan.request), input => inputs.require(plan.request.owner, input), { discard: true })
     const run = yield* (yield* RunStore).submit(plan)
     return yield* HttpServerResponse.schemaJson(RunRecord)(run, { status: 201 })
   })),

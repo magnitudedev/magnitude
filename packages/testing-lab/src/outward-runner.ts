@@ -1,6 +1,6 @@
 import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { posix, win32 } from "node:path"
-import { InfrastructureFailure, Provider } from "./domain"
+import { InfrastructureFailure, Provider, runInputs } from "./domain"
 import { InputRegistry } from "./inputs"
 import { Machine } from "./machines"
 import { WorkerRunner } from "./scheduler"
@@ -43,7 +43,7 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
       const base = machine.provider === "local" ? machine.root : runtime.root
       if (!path.isAbsolute(base)) return yield* fail("Guest root must be absolute")
       const root = path.join(base, machine.tags.leaseId, `attempt-${assignment.claim.fence}`)
-      yield* inputs.require(assignment.plan.request.owner, assignment.plan.request.input)
+      yield* Effect.forEach(runInputs(assignment.plan.request), input => inputs.require(assignment.plan.request.owner, input), { discard: true })
       const cleanupErrors: string[] = []
       const result = yield* Effect.scoped(Effect.gen(function* () {
         const invocation = WorkerInvocation.make({ schemaVersion: 1, assignment, disposable: runtime.disposable, port: runtime.port, model: runtime.model })

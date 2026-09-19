@@ -1,4 +1,4 @@
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 
 export const RunId = Schema.String.pipe(Schema.pattern(/^run-[a-f0-9-]{36}$/), Schema.brand("LabRunId"))
 export type RunId = typeof RunId.Type
@@ -53,10 +53,11 @@ export const Limits = Schema.Struct({
 })
 export const RunRequest = Schema.Struct({
   schemaVersion: Schema.Literal(1), idempotencyKey: IdempotencyKey, owner: OwnerId,
-  input: Input, selection: Selection, mode: Mode, trust: Trust, limits: Limits,
+  input: Input, updateFrom: Schema.optionalWith(Schema.Struct({ kind: Schema.Literal("artifacts"), digest: Digest }), { as: "Option", exact: true }), selection: Selection, mode: Mode, trust: Trust, limits: Limits,
   allowSpark: Schema.Boolean,
 })
 export type RunRequest = typeof RunRequest.Type
+export const runInputs = (request: RunRequest): readonly (typeof Input.Type)[] => [request.input, ...Option.toArray(request.updateFrom)]
 
 export const PlannedCase = Schema.Struct({
   id: CaseId, suite: Suite, title: Schema.String, timeoutSeconds: Schema.Int.pipe(Schema.positive()),

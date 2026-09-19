@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { join, posix, win32 } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
-import { Digest, InfrastructureFailure, Provider, Target } from "./domain"
+import { Digest, InfrastructureFailure, Provider, Target, runInputs } from "./domain"
 import { InputManifest, InputRegistry } from "./inputs"
 import { WorkerTransport } from "./machines"
 import { WorkerRunner } from "./scheduler"
@@ -38,29 +38,30 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
       const directory = remotePath.join(base, machine.tags.leaseId, `attempt-${assignment.claim.fence}`)
       const local = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-transfer-" })
       const owner = assignment.plan.request.owner
-      const input = assignment.plan.request.input
       const program = Effect.gen(function* () {
-        yield* inputs.require(owner, input)
         const store = yield* ArtifactStore
         const copyInput = (digest: Digest) => Effect.gen(function* () {
           yield* store.put(digest, yield* inputs.read(owner, digest))
           yield* transport.upload(machine, join(local, "objects", digest), remotePath.join(directory, "objects", digest))
         })
-        const manifestStream = yield* inputs.read(owner, input.digest)
-        let size = 0
-        const chunks = yield* manifestStream.pipe(Stream.tap(chunk => Effect.gen(function* () {
-          size += chunk.byteLength
-          if (size > 16 * 1024 * 1024) return yield* fail("Input manifest exceeds 16 MiB")
-        })), Stream.runCollect)
-        const bytes = Buffer.concat(Array.from(chunks))
-        if (sha256(bytes) !== input.digest) return yield* fail("Input manifest digest differs from admitted input")
-        const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(bytes.toString("utf8"))
-        if (manifest.kind !== input.kind) return yield* fail("Input manifest kind differs from assignment")
-        const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : [])
-          : manifest.release.artifacts.map(a => Digest.make(a.sha256)))]
-        yield* store.put(input.digest, Stream.make(bytes))
-        yield* transport.upload(machine, join(local, "objects", input.digest), remotePath.join(directory, "objects", input.digest))
-        yield* Effect.forEach(digests, copyInput, { concurrency: 4, discard: true })
+        for (const input of runInputs(assignment.plan.request)) {
+          yield* inputs.require(owner, input)
+          const manifestStream = yield* inputs.read(owner, input.digest)
+          let size = 0
+          const chunks = yield* manifestStream.pipe(Stream.tap(chunk => Effect.gen(function* () {
+            size += chunk.byteLength
+            if (size > 16 * 1024 * 1024) return yield* fail("Input manifest exceeds 16 MiB")
+          })), Stream.runCollect)
+          const bytes = Buffer.concat(Array.from(chunks))
+          if (sha256(bytes) !== input.digest) return yield* fail("Input manifest digest differs from admitted input")
+          const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(bytes.toString("utf8"))
+          if (manifest.kind !== input.kind) return yield* fail("Input manifest kind differs from assignment")
+          const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : [])
+            : manifest.release.artifacts.map(a => Digest.make(a.sha256)))]
+          yield* store.put(input.digest, Stream.make(bytes))
+          yield* transport.upload(machine, join(local, "objects", input.digest), remotePath.join(directory, "objects", input.digest))
+          yield* Effect.forEach(digests, copyInput, { concurrency: 4, discard: true })
+        }
         const invocation = WorkerInvocation.make({ schemaVersion: 1, assignment, disposable: runtime.disposable, port: runtime.port, model: runtime.model })
         const job = join(local, "invocation.json")
         yield* fs.writeFileString(job, yield* Schema.encode(Schema.parseJson(WorkerInvocation))(invocation), { mode: 0o600 })

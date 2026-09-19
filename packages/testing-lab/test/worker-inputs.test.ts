@@ -1,8 +1,9 @@
+import releasePlan from "../../release/release-plan.json"
 import { DateTime, Effect, Layer, Redacted, Schema, Stream } from "effect"
 import { expect, test } from "vitest"
 import { planRun } from "../src/catalog"
 import { InfrastructureFailure, RunId, RunRequest } from "../src/domain"
-import { InputRegistry } from "../src/inputs"
+import { InputDenied, InputRegistry } from "../src/inputs"
 import { Fence } from "../src/lease"
 import { sha256 } from "../src/snapshot"
 import { WorkerInputs, WorkerInputsLive } from "../src/worker-inputs"
@@ -14,18 +15,23 @@ for (const transient of [false, true]) test(`manifest cache coalesces downloads 
   const digest = sha256(content)
   const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
     entries: [{ kind: "file", path: "file.ts", sha256: digest, bytes: content.length, executable: false }] })
+  const oldBytes = "old package"
+  const baseline = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
+    schemaVersion: 2, version: "0.1.2", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.2", sourceCommit: "b".repeat(40),
+    artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: oldBytes.length, sha256: sha256(oldBytes) }],
+  } })
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "worker-cache-test", owner: "owner", trust: "developer",
-    input: { kind: "source", digest: sha256(manifest) }, selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", allowSpark: false,
+    input: { kind: "source", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", allowSpark: false,
     limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 10, idleMinutes: 15 } })
   const plan = yield* planRun(request)
   const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
     claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
-  let authorized = true, manifestReads = 0, checks = 0
+  let authorized = true, manifestReads = 0, checks = 0, baselineAllowed = true
   const tickets = Layer.succeed(WorkerTickets, { issue: () => Effect.dieMessage("Not used"), withAuthority: () => Effect.dieMessage("Not used"), revoke: () => Effect.void, authorize: () => Effect.suspend(() => {
     checks++
     return authorized ? Effect.succeed(invocation) : Effect.fail(new WorkerAccessDenied({}))
   }) })
-  const inputs = Layer.succeed(InputRegistry, { require: () => Effect.void, register: () => Effect.void, missing: () => Effect.succeed([]), upload: () => Effect.void,
+  const inputs = Layer.succeed(InputRegistry, { require: (_owner, input) => input.kind === "artifacts" && !baselineAllowed ? Effect.fail(new InputDenied({})) : Effect.void, register: () => Effect.void, missing: () => Effect.succeed([]), upload: () => Effect.void,
     read: (_owner, key) => Effect.gen(function* () {
       if (key === request.input.digest) {
         manifestReads++
@@ -33,7 +39,7 @@ for (const transient of [false, true]) test(`manifest cache coalesces downloads 
         yield* Effect.yieldNow()
         return Stream.make(new TextEncoder().encode(manifest))
       }
-      return Stream.make(content)
+      return Stream.make(key === sha256(baseline) ? new TextEncoder().encode(baseline) : key === sha256(oldBytes) ? new TextEncoder().encode(oldBytes) : content)
     }) })
   yield* Effect.gen(function* () {
     const service = yield* WorkerInputs
@@ -42,6 +48,11 @@ for (const transient of [false, true]) test(`manifest cache coalesces downloads 
     yield* Effect.forEach(Array.from({ length: 100 }), () => service.read(token, digest).pipe(Effect.flatMap(Stream.runCollect)), { concurrency: 16 })
     expect(manifestReads).toBe(transient ? 2 : 1)
     expect(checks).toBeGreaterThanOrEqual(200)
+    expect(Buffer.concat(Array.from(yield* service.read(token, sha256(baseline)).pipe(Effect.flatMap(Stream.runCollect)))).toString()).toBe(baseline)
+    expect(Buffer.concat(Array.from(yield* service.read(token, sha256(oldBytes)).pipe(Effect.flatMap(Stream.runCollect)))).toString()).toBe(oldBytes)
+    expect((yield* service.read(token, sha256("unrelated package")).pipe(Effect.either))._tag).toBe("Left")
+    baselineAllowed = false
+    expect((yield* service.read(token, sha256(oldBytes)).pipe(Effect.either))._tag).toBe("Left")
     authorized = false
     expect((yield* service.read(token, digest).pipe(Effect.either))._tag).toBe("Left")
     expect(manifestReads).toBe(transient ? 2 : 1)
