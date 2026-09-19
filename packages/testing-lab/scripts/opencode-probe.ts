@@ -19,6 +19,8 @@ const run = Effect.gen(function* () {
   const task = yield* fileFixture(root, { "opencode.json": yield* Schema.encode(Schema.parseJson(Schema.Struct({ $schema: Schema.Literal("https://opencode.ai/config.json"), permission: Schema.Record({ key: Schema.String, value: Schema.Literal("allow", "deny") }) })))({ $schema: "https://opencode.ai/config.json", permission: { "*": "deny", read: "allow", edit: "allow" } }) })
   const fixture = task.directory
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(11279)
   environment.PATH = `${join(client, "..")}:/usr/local/bin:/usr/bin:/bin:${environment.PATH ?? ""}`
   const home = join(root, "profile", "harness-home")
   const turns: OpenCodeTurn[] = []
@@ -42,7 +44,7 @@ const run = Effect.gen(function* () {
     if (turns[2]!.text.trim() !== "after") return yield* new AssertionFailure({ message: "OpenCode did not retain the previous conversation after process restart" })
     yield* desktop.disconnect("opencode")
     yield* desktop.screenshot("opencode-disconnected")
-  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "opencode-evidence"), port: 11279, environment })))
+  }).pipe(Effect.provide(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "opencode-evidence"), port: 11279, environment })))
   const outcome = yield* program.pipe(Effect.either)
   yield* fs.writeFileString(join(root, "opencode-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ turns: Schema.Array(OpenCodeTurn), passed: Schema.Boolean, detail: Schema.String })))({
     turns, passed: outcome._tag === "Right", detail: outcome._tag === "Right" ? "Connected through app, generated, real read/edit, resumed session, disconnected" : String(outcome.left),

@@ -35,6 +35,8 @@ const run = Effect.gen(function* () {
     filename: `Magnitude.${target.packageFormat}`, sha256: hash.digest("hex"), bytes })
   const candidate = Candidate.make({ artifact, version, target, path: file })
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LOCALAPPDATA", "APPDATA", "SystemRoot", "TEMP"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   const program = Effect.scoped(Effect.gen(function* () {
     const installer = yield* Installer
     yield* rejectCorruptInstaller(candidate)
@@ -46,7 +48,7 @@ const run = Effect.gen(function* () {
     const identity = yield* Effect.gen(function* () {
       const desktop = yield* DesktopDriver
       return yield* inspectPackageIdentity(app, yield* desktop.host(), environment)
-    }).pipe(Effect.provide(playwrightDesktop({ executable: app.executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment })))
+    }).pipe(Effect.provide(playwrightDesktop({ mode: "isolated", executable: app.executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment })))
     yield* fs.writeFileString(join(root, "package-identity.json"), yield* Schema.encode(Schema.parseJson(PackageIdentity))(identity))
   })).pipe(Effect.provide(nativeInstaller({ disposable, root: join(root, "application"), environment })))
   yield* program

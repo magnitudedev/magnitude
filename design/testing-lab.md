@@ -51,6 +51,13 @@ retains ordinary released-runtime acquisition and does not qualify unpublished i
 `iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
 and consumer state. Neither mode may touch a developer's normal application data. Local execution
 requires an isolated profile, and privileged install/uninstall is restricted to disposable hosts.
+Desktop launches explicitly distinguish an isolated profile from an installed OS-user context.
+The driver must not silently rewrite profile or endpoint settings: isolated launch configuration
+must agree with the environment shared by the bundled CLI. Installed-user mode requires a
+separately supplied qualified disposable-user capability, uses normal product data and endpoint
+policy, and rejects development profile or control-directory overrides. A HOME substitution is
+not proof of disposable OS-user authority. Existing isolated probes cannot qualify native login
+registration; provider/user qualification and installed-mode orchestration are required separately.
 
 `quick`, `pr`, `full` and `release` select cases and targets. Target expansion is explicit, including
 unqualified targets. Missing capacity or credentials blocks a case; it never removes it or makes

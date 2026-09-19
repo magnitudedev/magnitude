@@ -31,7 +31,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   let observations: ApplicationIdentity[] = []
   let interruptions: typeof CliInterruption.Type[] = []
   const result = yield* Effect.scoped(Effect.gen(function* () {
-    const session = yield* desktopSession({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, detail => { cleanupErrors.push(detail) })
+    const session = yield* desktopSession({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, detail => { cleanupErrors.push(detail) })
     const driver = yield* session.driver
     yield* driver.ready()
     const before = yield* driver.identity()

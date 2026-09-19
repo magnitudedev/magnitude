@@ -25,8 +25,8 @@ it.skipIf(process.platform === "win32").each([0, 7, null])("observes the exact u
       app.whenReady().then(()=>{const w=new BrowserWindow({show:false,webPreferences:{nodeIntegration:true,contextIsolation:false}});w.loadFile(${yield* Schema.encode(Schema.parseJson(Schema.String))(html)});});
       ipcMain.on('restart',()=>{${exit === null ? "" : `setTimeout(()=>${exit === 0 ? "app.quit()" : `app.exit(${exit})`},50);`}});
       app.on('window-all-closed',()=>app.quit());`)
-    const driver = Context.get(yield* Layer.build(playwrightDesktop({ executable, profile: join(root, "profile"),
-      evidence: join(root, "evidence"), port: 11459, environment: { HOME: root, PATH: process.env.PATH ?? "" },
+    const driver = Context.get(yield* Layer.build(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"),
+      evidence: join(root, "evidence"), port: 11459, environment: { MAGNITUDE_DEV_DATA_DIR: join(root, "profile"), MAGNITUDE_DEV_PORT: "11459", HOME: root, PATH: process.env.PATH ?? "" },
     }, undefined, detail => { cleanup.push(detail) })), DesktopDriver)
     if (exit === null) {
       expect(Option.isNone(yield* driver.restartForUpdate().pipe(Effect.timeoutOption("300 millis")))).toBe(true)

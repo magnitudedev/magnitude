@@ -32,6 +32,8 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   const state = yield* fs.makeTempDirectoryScoped({ ...(process.platform === "win32" ? {} : { directory: "/tmp" }), prefix: "ml-execution-" })
   const collector = yield* executionTelemetry()
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   const prepared = Option.isSome(manifest) ? yield* Effect.gen(function* () {
     const objects = join(root, "objects")
     const frozen = yield* snapshotArtifacts(manifest.value, objects)
@@ -63,7 +65,7 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
       }
     }
     yield* desktop.screenshot("native-generation")
-  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port,
+  }).pipe(Effect.provide(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port,
     environment: { ...prepared.environment, MAGNITUDE_DESKTOP_STATE_DIR: state,
       MAGNITUDE_OTEL_ENDPOINT: collector.endpoint },
   }, undefined, detail => cleanup.push(detail))), Effect.either)

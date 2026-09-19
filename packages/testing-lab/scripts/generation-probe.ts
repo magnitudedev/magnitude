@@ -21,6 +21,8 @@ const run = Effect.gen(function* () {
   const checks: { name: string; passed: boolean; detail: string }[] = []
   let appVersion = "unknown"
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(11279)
   environment.MAGNITUDE_DESKTOP_STATE_DIR = state
   const program = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
@@ -53,7 +55,7 @@ const run = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.screenshot("failure").pipe(Effect.ignore)
     yield* fs.writeFileString(join(root, "failure.txt"), yield* desktop.text()).pipe(Effect.ignore)
-  })), Effect.provide(Layer.merge(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11279, environment }),
+  })), Effect.provide(Layer.merge(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11279, environment }),
     endpointTests("http://127.0.0.1:11279", model).pipe(Layer.provide(FetchHttpClient.layer)))))
   const result = yield* program.pipe(Effect.either)
   if (result._tag === "Left") checks.push({ name: "Application model journey", passed: false, detail: String(result.left) })

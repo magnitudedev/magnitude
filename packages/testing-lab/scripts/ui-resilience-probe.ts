@@ -16,6 +16,8 @@ const run = Effect.gen(function* () {
   const port = yield* Config.integer("LAB_PROBE_PORT").pipe(Config.withDefault(11279))
   const fs = yield* FileSystem.FileSystem
   const environment: Record<string, string> = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   environment.PATH = `${toolsPath}:${environment.PATH ?? ""}`
   const program = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
@@ -32,7 +34,7 @@ const run = Effect.gen(function* () {
     yield* desktop.screenshot("reworded-recolored-reordered-ui")
     yield* desktop.disconnect("pi")
     yield* endpoint.generate
-  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "resilience-evidence"), port, environment }, challengePresentation),
+  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "resilience-evidence"), port, environment }, challengePresentation),
     endpointTests(`http://127.0.0.1:${port}`, model).pipe(Layer.provide(FetchHttpClient.layer)))))
   const result = yield* program.pipe(Effect.either)
   yield* fs.writeFileString(join(root, "resilience-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String })))({

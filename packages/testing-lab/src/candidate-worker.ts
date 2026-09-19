@@ -123,7 +123,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     let fixtureCleanupFailed = false
     const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
-      const value = yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
+      const value = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
         evidence: join(evidenceDirectory, "desktop"), port: config.port, environment: yield* candidateEnvironment }, detail => { cleanupErrors.push(detail) }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
       activeSession = Option.some(value)
@@ -178,7 +178,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
                 : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" })
               const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
               const updateEnvironment = { ...baselineEnvironment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
-              const updateSession = yield* desktopSession({ executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
+              const updateSession = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
                 evidence: join(evidenceDirectory, "update-baseline"), port: config.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
               const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
               const driver = yield* updateSession.driver

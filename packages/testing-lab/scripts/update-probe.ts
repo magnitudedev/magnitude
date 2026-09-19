@@ -65,8 +65,8 @@ const run = Effect.gen(function* () {
     const installed = yield* installationSession(candidate, detail => { cleanupErrors.push(detail) })
     const app = yield* installed.get
     const state = yield* fs.makeTempDirectoryScoped({ prefix: "ml-update-state-" })
-    const appEnvironment = { ...environment, HOME: home, NODE_EXTRA_CA_CERTS: fixture.caPath, MAGNITUDE_DESKTOP_STATE_DIR: state }
-    const session = yield* desktopSession({ executable: app.executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11449,
+    const appEnvironment = { ...environment, MAGNITUDE_DEV_DATA_DIR: join(root, "profile"), MAGNITUDE_DEV_PORT: "11449", HOME: home, NODE_EXTRA_CA_CERTS: fixture.caPath, MAGNITUDE_DESKTOP_STATE_DIR: state }
+    const session = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11449,
       environment: appEnvironment,
     }, detail => { cleanupErrors.push(detail) })
     const baseline = yield* verifyUpdateBaseline(session, previousVersion)

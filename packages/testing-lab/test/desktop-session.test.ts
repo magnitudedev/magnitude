@@ -19,7 +19,7 @@ import { desktopSession } from "../src/desktop-session"
 test("closes each app and trace before its replacement starts and closes the last on scope exit", async () => {
   events.length = 0
   await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const session = yield* desktopSession({ executable: "/unused", profile: "/profile", evidence: "/evidence", port: 11349, environment: {} }, () => {}, launchDriver)
+    const session = yield* desktopSession({ mode: "isolated", executable: "/unused", profile: "/profile", evidence: "/evidence", port: 11349, environment: {} }, () => {}, launchDriver)
     expect(events).toEqual([])
     yield* session.driver
     yield* session.driver

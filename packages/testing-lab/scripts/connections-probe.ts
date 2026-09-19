@@ -17,6 +17,8 @@ BunRuntime.runMain(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-connections-" })
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   environment.PATH = `${toolsPath}:${environment.PATH ?? ""}`
   environment.MAGNITUDE_DESKTOP_STATE_DIR = state
   const fixtures = yield* Effect.forEach(["pi", "opencode", "hermes"] as const, harness => connectionFixture(join(root, "profile", "harness-home"), harness, `http://127.0.0.1:${port}/inference/v1`))
@@ -35,7 +37,7 @@ BunRuntime.runMain(Effect.gen(function* () {
       checks.push({ harness: fixture.harness, passed: Exit.isSuccess(check), detail: Exit.isSuccess(check)
         ? "Connection lifecycle and malformed-file recovery passed" : Cause.pretty(check.cause) })
     }
-  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, undefined, detail => { cleanupErrors.push(detail) })), Effect.exit)
+  }).pipe(Effect.provide(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, undefined, detail => { cleanupErrors.push(detail) })), Effect.exit)
   const passed = Exit.isSuccess(result) && cleanupErrors.length === 0 && checks.length === fixtures.length && checks.every(check => check.passed)
   const report = Schema.Struct({ passed: Schema.Boolean, checks: Schema.Array(Schema.Struct({ harness: Harness, passed: Schema.Boolean, detail: Schema.String })),
     setupFailure: Schema.String, cleanupErrors: Schema.Array(Schema.String) })

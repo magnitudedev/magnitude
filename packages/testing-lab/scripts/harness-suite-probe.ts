@@ -20,6 +20,8 @@ BunRuntime.runMain(Effect.gen(function* () {
   const suiteRoot = yield* fs.makeTempDirectory({ directory: root, prefix: "suite-" })
   const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-harness-" })
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   environment.PATH = `${toolsPath}:${environment.PATH ?? ""}`
   environment.MAGNITUDE_DESKTOP_STATE_DIR = state
   const results: { harness: Harness; passed: boolean; detail: string; turns: typeof HarnessTurn.Type[] }[] = []
@@ -41,7 +43,7 @@ BunRuntime.runMain(Effect.gen(function* () {
       }).pipe(Effect.either)
       results.push({ harness, passed: result._tag === "Right", detail: result._tag === "Right" ? "Generation, follow-up, exact tool edit and persisted recall passed" : String(result.left), turns })
     }
-  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "suite-ui"), port, environment })))
+  }).pipe(Effect.provide(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "suite-ui"), port, environment })))
   yield* fs.writeFileString(join(root, "harness-suite-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Array(Schema.Struct({ harness: Harness, passed: Schema.Boolean, detail: Schema.String, turns: Schema.Array(HarnessTurn) }))))(results))
   if (results.some(result => !result.passed)) return yield* new AssertionFailure({ message: "Harness suite diagnostic failed; inspect harness-suite-report.json" })
 }).pipe(Effect.scoped, Effect.provide([BunContext.layer, ProcessExecutorLive, configuredHarnessTools])))

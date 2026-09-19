@@ -33,7 +33,7 @@ BunRuntime.runMain(Effect.gen(function* () {
     const tests = yield* CliTests
     yield* tests.version
     for (const fixture of fixtures) yield* tests.connections(fixture.harness, fixture.inspect)
-  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }), bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment }))), Effect.either)
+  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }), bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment }))), Effect.either)
   yield* fs.writeFileString(join(root, "cli-connections-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String })))({ passed: result._tag === "Right", detail: result._tag === "Right" ? "Bundled CLI Pi, OpenCode and Hermes add, sync, remove, reconnect preserved unrelated providers and used the test endpoint" : String(result.left) }))
   if (result._tag === "Left") return yield* result.left
 }).pipe(Effect.scoped, Effect.provide(Layer.merge(BunContext.layer, ProcessExecutorLive))))

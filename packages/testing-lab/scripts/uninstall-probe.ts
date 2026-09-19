@@ -36,13 +36,15 @@ const run = Effect.gen(function* () {
     filename: `Magnitude.${target.packageFormat}`, sha256: hash.digest("hex"), bytes })
   const candidate = Candidate.make({ artifact, version, target, path: file })
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LOCALAPPDATA", "APPDATA", "SystemRoot", "TEMP"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(port)
   const cleanupErrors: string[] = []
   const result = yield* Effect.scoped(Effect.gen(function* () {
     const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" })
     const profile = join(root, "profile")
     const installation = yield* installationSession(candidate, detail => { cleanupErrors.push(detail) })
     const first = yield* installation.get
-    const session = yield* desktopSession({ executable: first.executable, profile, evidence: join(root, "evidence"), port,
+    const session = yield* desktopSession({ mode: "isolated", executable: first.executable, profile, evidence: join(root, "evidence"), port,
       environment: { ...environment, MAGNITUDE_DESKTOP_STATE_DIR: state } }, detail => { cleanupErrors.push(detail) })
     const driver = yield* session.driver
     yield* driver.host()

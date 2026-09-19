@@ -41,7 +41,7 @@ const run = Effect.gen(function* () {
       const result = yield* test.pipe(Effect.either)
       checks.push({ name, passed: result._tag === "Right", detail: result._tag === "Right" ? "Passed" : String(result.left) })
     }
-  }).pipe(Effect.provide(Layer.mergeAll(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "cli-ui-evidence"), port: 11279, environment }),
+  }).pipe(Effect.provide(Layer.mergeAll(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "cli-ui-evidence"), port: 11279, environment }),
     bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment }),
     endpointTests("http://127.0.0.1:11279", model).pipe(Layer.provide(FetchHttpClient.layer)))))
   const result = yield* program.pipe(Effect.either)

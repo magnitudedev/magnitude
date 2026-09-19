@@ -38,7 +38,7 @@ BunRuntime.runMain(Effect.gen(function* () {
     generations.push(yield* endpoint.generate)
     yield* tests.reloadModel
     generations.push(yield* endpoint.generate)
-  }).pipe(Effect.provide(Layer.mergeAll(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }), bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment }), endpointTests(`http://127.0.0.1:${port}`, model).pipe(Layer.provide(FetchHttpClient.layer)))), Effect.either)
+  }).pipe(Effect.provide(Layer.mergeAll(playwrightDesktop({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }), bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment }), endpointTests(`http://127.0.0.1:${port}`, model).pipe(Layer.provide(FetchHttpClient.layer)))), Effect.either)
   yield* fs.writeFileString(join(root, "reload-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String, generations: Schema.Array(Generation) })))({ generations, passed: result._tag === "Right", detail: result._tag === "Right" ? "Generation succeeded before and after CLI stop/unload/reload; backend allocation is not attested by this diagnostic" : String(result.left) }))
   if (result._tag === "Left") return yield* result.left
 }).pipe(Effect.scoped, Effect.provide(Layer.merge(BunContext.layer, ProcessExecutorLive))))

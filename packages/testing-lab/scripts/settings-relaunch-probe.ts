@@ -14,9 +14,11 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   yield* fs.makeDirectory(root, { recursive: true, mode: 0o700 })
   const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" })
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(11349)
   const cleanupErrors: string[] = []
   const result = yield* Effect.scoped(Effect.gen(function* () {
-    const session = yield* desktopSession({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11349,
+    const session = yield* desktopSession({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11349,
       environment: { ...environment, MAGNITUDE_DESKTOP_STATE_DIR: state } }, detail => { cleanupErrors.push(detail) })
     yield* (yield* session.driver).host()
     for (const theme of ["dark", "light"] as const) {

@@ -16,8 +16,10 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" })
   const cleanupErrors: string[] = []
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DEV_DATA_DIR = join(root, "profile")
+  environment.MAGNITUDE_DEV_PORT = String(11379)
   const result = yield* Effect.scoped(Effect.gen(function* () {
-    const session = yield* desktopSession({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11379,
+    const session = yield* desktopSession({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11379,
       environment: { ...environment, MAGNITUDE_DESKTOP_STATE_DIR: state } }, detail => { cleanupErrors.push(detail) })
     const diagnostic = yield* Effect.scoped(Effect.gen(function* () {
       yield* occupyServicePort(11379)

@@ -30,7 +30,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   const cleanupErrors: string[] = []
   let observations: ApplicationIdentity[] = []
   const result = yield* Effect.scoped(Effect.gen(function* () {
-    const session = yield* desktopSession({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, detail => { cleanupErrors.push(detail) })
+    const session = yield* desktopSession({ mode: "isolated", executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, detail => { cleanupErrors.push(detail) })
     observations = yield* verifyServiceOwnership(session)
   })).pipe(Effect.provide(bundledCliTests({ executable: cli, version, model, evidence: join(root, "cli-evidence"), environment })), Effect.either)
   yield* fs.writeFileString(join(root, "ownership-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String, cleanupErrors: Schema.Array(Schema.String), observations: Schema.Array(ApplicationIdentity) })))({

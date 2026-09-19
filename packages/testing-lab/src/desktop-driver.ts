@@ -6,10 +6,10 @@ import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { _electron, type Page } from "playwright"
 import type { ChildProcess } from "node:child_process"
 import { join } from "node:path"
+import { desktopEnvironment, DesktopEnvironment } from "./desktop-environment"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
 
-export const DesktopLaunch = Schema.Struct({ executable: Schema.String, profile: Schema.String, evidence: Schema.String,
-  port: Schema.Int.pipe(Schema.between(1024, 65535)), environment: Schema.Record({ key: Schema.String, value: Schema.String }) })
+export const DesktopLaunch = Schema.Struct({ ...DesktopEnvironment.fields, executable: Schema.String, evidence: Schema.String })
 export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
   readonly updates: DesktopUpdates
@@ -39,6 +39,7 @@ const action = <A>(description: string, run: () => Promise<A>) => Effect.tryProm
   catch: error => new AssertionFailure({ message: `${description}: ${error instanceof Error ? error.message.slice(0, 1800) : "Playwright failed"}` }) })
 export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Page) => Promise<void>, onCleanupError?: (detail: string) => void) => Layer.scoped(DesktopDriver, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
+  const environment = yield* desktopEnvironment(config)
   yield* fs.makeDirectory(config.profile, { recursive: true, mode: 0o700 })
   yield* fs.makeDirectory(config.evidence, { recursive: true, mode: 0o700 })
   // With an explicit result collector, keep cleanup failures separate from the test failure.
@@ -48,7 +49,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   let processLog = ""
   const collect = (chunk: Buffer) => { processLog = (processLog + chunk.toString("utf8")).slice(-2 * 1024 * 1024) }
   const app = yield* Effect.acquireRelease(Effect.tryPromise({ try: () => _electron.launch({ executablePath: config.executable, chromiumSandbox: true,
-    env: { ...config.environment, MAGNITUDE_DEV_DATA_DIR: config.profile, MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }, timeout: 60_000 }),
+    env: environment, timeout: 60_000 }),
     catch: error => new InfrastructureFailure({ operation: "desktop-launch", message: error instanceof Error ? error.message : "Packaged Electron launch failed" }) }),
   app => action("Close packaged application", async () => {
     if (!nativeProcess || (nativeProcess.exitCode === null && nativeProcess.signalCode === null)) await app.close()
