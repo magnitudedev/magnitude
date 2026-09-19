@@ -97,7 +97,8 @@
     "remark": "^15.0.1",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
-    "remark-wiki-link": "^2.0.1"
+    "remark-wiki-link": "^2.0.1",
+    "toml": "4.2.0"
   },
   "resolutions": {
     "effect": "3.21.2",
