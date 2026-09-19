@@ -1,9 +1,10 @@
 # Magnitude testing lab
 
 This package is under active implementation. The coordinator protocol, persistence, source
-transport, provider allocation adapters and initial functional drivers exist. A deployed
-scheduler, complete case implementations, image qualification, and CI
-workflow are still required before the full target matrix can execute.
+transport, provider allocation adapters and initial functional drivers exist. The Azure-hosted
+coordinator's HTTPS API has been verified with Entra authentication and private PostgreSQL.
+Complete scheduled worker acceptance, remaining case implementations, image qualification,
+and a real CI workflow run are still required before the full target matrix can execute.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
@@ -50,6 +51,12 @@ Spark remains opt-in and has not been exercised during implementation.
 The A10 (72 vCPU) and RTX PRO 6000 (144 vCPU) quota requests returned `ContactSupport`;
 the portal support request is prepared but awaits required contact details before submission.
 Neither GPU family is currently qualified for lab execution.
+
+Azure images can supply an `initialization` file/digest pair. The allocator verifies that
+administrator-owned cloud-init file before allocation and waits for successful cloud-init
+completion before returning the worker. The Ubuntu 24.04 runtime preparation recipe and
+network template are described in [infra/README.md](infra/README.md). Preparation alone does
+not qualify app tests or complete coordinator deployment.
 
 ## Functional probes
 

@@ -76,6 +76,10 @@ The planner and worker use the same harness selection policy.
 ## Responsibilities
 
 The coordinator durably records admission, work, attempts, leases, events and results.
+The deployed coordinator keeps database and artifact state outside its container replica. Its
+managed identity owns cloud allocation and storage access; that identity is never assigned to
+workers. HTTPS ingress exposes the authenticated API, and the database uses private networking
+and verified TLS. Infrastructure and runtime-image references are explicit deployment inputs.
 Database migrations finish before HTTP admission starts. Scheduler and reconciliation loops run
 under the coordinator's scope; unexpected loop defects terminate the service rather than silently
 leaving a live API without its worker or cleanup loop. Allocators
@@ -150,6 +154,12 @@ allocation deadline. Credential revocation runs on success, failure, timeout and
 Revocation failures remain separate cleanup errors when a valid test result exists; the
 scheduler retains responsibility for releasing the allocated machine.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
+Fresh Azure Linux workers may prepare their trusted runtime through administrator-pinned
+cloud-init configuration. The allocator verifies its digest and size before creating resources,
+binds that digest to the VM, and requires successful native initialization before admitting it.
+Azure provisioning success alone is not runtime readiness. Initialization receives no run or
+provider credential; downloaded tooling has explicit length and digest checks. Candidate source
+is delivered only after preparation. Preparation failures retain normal lease cleanup ownership.
 Credentials must not appear in command arguments, script text or returned provider errors;
 temporary delivery files are private and scoped. Guest launch uses the intended application
 user and a qualified display environment. Service-session execution cannot qualify an
