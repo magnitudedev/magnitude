@@ -4,7 +4,7 @@ import { Effect, Option } from "effect"
 import { join } from "node:path"
 import { expect, test } from "vitest"
 import { command, ProcessExecutor, ProcessExecutorLive } from "../src/process"
-import { appleTrustPolicy, verifyAppleNotarization, verifyAppleSignature } from "../src/suites/apple-package-trust"
+import { AppleTeamId, appleTrustPolicy, verifyAppleNotarization, verifyAppleSignature } from "../src/suites/apple-package-trust"
 
 test("release signature policy cannot inherit a missing or malformed publisher", async () => {
   for (const team of [undefined, "", "wrong", 'ABCDEFGHIJ\" or true']) {
@@ -17,7 +17,7 @@ test("release signature policy cannot inherit a missing or malformed publisher",
 for (const scenario of ["valid", "adhoc", "wrong-team", "no-timestamp", "empty-timestamp", "invalid-seal", "missing-identity", "wrong-identity"] as const) {
   test(`production signature verification: ${scenario}`, async () => {
     const calls: string[][] = []
-    const result = await Effect.runPromise(verifyAppleSignature("/fixture.app", { kind: "production", team: "ABCDEFGHIJ" }, "dev.magnitude.desktop").pipe(
+    const result = await Effect.runPromise(verifyAppleSignature("/fixture.app", { kind: "production", team: AppleTeamId.make("ABCDEFGHIJ") }, "dev.magnitude.desktop").pipe(
       Effect.provideService(ProcessExecutor, { run: spec => Effect.sync(() => {
         calls.push([...spec.args])
         if (spec.args.includes("--verify")) return { exitCode: scenario === "invalid-seal" ? 1 : 0, stdout: "", stderr: "" }

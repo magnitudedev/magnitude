@@ -8,9 +8,10 @@ import { nativeInventory } from "../native-inventory"
 import { command } from "../process"
 import { admittedRuntimeComposition } from "../runtime-composition"
 
+export const AppleTeamId = Schema.String.pipe(Schema.pattern(/^[A-Z0-9]{10}$/), Schema.brand("AppleTeamId"))
 export const AppleTrustPolicy = Schema.Union(
   Schema.Struct({ kind: Schema.Literal("development") }),
-  Schema.Struct({ kind: Schema.Literal("production"), team: Schema.String.pipe(Schema.pattern(/^[A-Z0-9]{10}$/)) }),
+  Schema.Struct({ kind: Schema.Literal("production"), team: AppleTeamId }),
 )
 export const AppleCodeSignature = Schema.Struct({ path: Schema.String, identifier: Schema.NonEmptyString,
   kind: Schema.Literal("adhoc", "certificate"), team: Schema.optionalWith(Schema.String, { as: "Option", exact: true }) })

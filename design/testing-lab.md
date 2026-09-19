@@ -193,6 +193,22 @@ they cannot claim production trust. Release checks require an explicitly configu
 Apple team, Developer ID requirements, secure timestamps, the installed application's stapled
 notarization ticket and a successful native Gatekeeper assessment. Missing publisher configuration
 blocks release verification. Verification never re-signs a candidate or changes host trust.
+Windows package trust inspects Authenticode on the admitted installer, every installed PE image,
+and the admitted runtime composition. Required app/service/CLI, bridge, uninstaller and inference
+entrypoints must appear in the native inventory. Development evidence records unsigned files
+explicitly and rejects invalid signatures; it cannot claim publisher trust. Release verification
+requires the configured expected publisher and SignTool for Magnitude-owned code, a valid timestamped
+Authenticode result, and successful all-signature verification under the default authentication policy. Only known
+Microsoft CRT filenames in the runtime library directory can use the explicit Microsoft publisher
+exception. Paths enter PowerShell as literal-path environment data, never interpolated script code.
+Other vendor code retains its vendor identity. Until its expected publisher or signed-container
+provenance is independently verified, release trust remains blocked; an arbitrary valid signer
+cannot satisfy it and vendor code must not be required to impersonate Magnitude.
+Evidence distinguishes embedded Authenticode signatures from Windows catalog signatures and
+unsigned code. A changed catalog-signed file can appear unsigned; that is not evidence of damaged
+embedded-signature rejection. Negative native fixtures select an observed embedded signature and
+change a covered PE section while preserving the signature structure.
+These checks do not establish SmartScreen reputation or qualify a client OS from a Server probe.
 Native dependency inspection preserves required, weak and delayed imports and platform loader
 search paths. A missing or malformed tool report cannot become an empty successful graph.
 Reading declarations does not establish dependency closure: acceptance must resolve the complete

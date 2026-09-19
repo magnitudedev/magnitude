@@ -793,9 +793,42 @@ environment. This is a public expected publisher identity, not a signing credent
 malformed value blocks verification. Every native signature must satisfy that Developer ID team
 and contain a secure timestamp; the installed app must pass stapler validation and Gatekeeper
 assessment. No candidate is re-signed and no host trust settings are changed. The production path
-has fixture coverage but has not been qualified with a production-signed release. Windows/Linux
-P5 verification remains outstanding.
+has fixture coverage but has not been qualified with a production-signed release. Linux P5 verification remains outstanding; the Windows implementation is described below.
 
 Real local macOS verification at `/tmp/ml-signature-worker-20260919/result.json` passed nine
 selected cases, including 37 signature records covering the app, CPU base and Metal pack; cleanup
 errors were empty. A separate native negative test modified signed bytes and verified rejection.
+
+### Windows package signatures
+
+Windows P5 inspects the admitted installer, all installed native PE files, and the admitted
+runtime archives. The required application, bundled CLI/service, desktop bridge, uninstaller
+and inference executable must be present in that inventory. Development receipts retain each
+file's `Valid` or `NotSigned` status, signature type, and explicitly decline production trust. Hash mismatches,
+untrusted signatures and malformed native responses fail verification.
+
+The release profile requires `LAB_EXPECTED_WINDOWS_PUBLISHER` and `LAB_WINDOWS_SIGNTOOL` in the
+worker configuration. Magnitude-owned code must have a valid signature from that publisher and
+a timestamp, then pass `signtool verify /pa /all /tw`. Known Microsoft CRT files under the admitted runtime
+library directory retain the release pipeline's explicit Microsoft publisher exception. Other vendor DLLs retain their vendor identity; release verification stays blocked until their
+expected publisher or signed-container provenance is independently verified. A generic valid
+signature cannot establish that policy. No certificate is installed and no file is re-signed. Authenticode acceptance does not certify
+SmartScreen reputation. Production-signed package and Windows client execution remain unqualified.
+
+`azure-windows-signature-probe.ts` exercises the exact native PowerShell inspection script against
+a pinned Microsoft-signed redistributable (never executed), an unsigned compiled fixture, and changed signed bytes. It owns
+an Azure lease and releases VM/NIC/disk resources after success or failure. Its report records the
+actual OS and does not qualify Windows 10/11 app behavior when using a Server diagnostic image.
+
+The native diagnostic distinguishes embedded Authenticode signatures from catalog membership,
+which PowerShell can prefer when both are available ([Microsoft documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature)).
+The first Server probe correctly failed its negative-test expectation: an altered OS executable
+was reported as unsigned, not `HashMismatch`. The final fixture pins the Microsoft download URL and SHA256, verifies its embedded Microsoft
+signature before changing a PE section byte, and records the original file identity and digest. A
+catalog change cannot be relabelled as successful embedded-signature corruption detection.
+
+The pinned-fixture probe passed on a real Azure Windows Server 2025 guest (build26100):
+`/tmp/ml-azure-windows-signature-pinned-20260919/observation.json` records Valid/Authenticode,
+NotSigned/None, and HashMismatch/Authenticode for the three cases. The report has no cleanup
+errors. This validates native inspection and corrupted embedded-signature detection, not a
+Windows 10/11 application, a full installer, third-party publisher policy, or production signing.

@@ -33,6 +33,7 @@ import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
 import { inspectMacPackageDependencies, MacPackageDependencies } from "./suites/package-dependencies"
 import { appleTrustPolicy, ApplePackageTrust, inspectApplePackageTrust } from "./suites/apple-package-trust"
+import { windowsTrustPolicy, WindowsPackageTrust, inspectWindowsPackageTrust } from "./suites/windows-package-trust"
 import { inspectLinuxPackageDependencies, LinuxPackageDependencies } from "./suites/linux-package-dependencies"
 import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
@@ -236,13 +237,20 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", MacPackageDependencies, report)] })
         }
         case "P5": {
-          if (target.os !== "macos") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
+          if (target.os !== "macos" && target.os !== "windows") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
           const production = assignment.plan.request.selection.kind === "profile" && assignment.plan.request.selection.profile === "release"
-          const policy = yield* appleTrustPolicy(production, config.environment.LAB_EXPECTED_APPLE_TEAM_ID)
           const release = (yield* manifest).release
           if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
             return yield* unavailable("Complete signature verification requires the admitted native runtime archives")
           }
+          if (target.os === "windows") {
+            const policy = yield* windowsTrustPolicy(production, config.environment)
+            const receipt = yield* inspectWindowsPackageTrust(yield* installed, release, policy, config.environment).pipe(Effect.provide(NodeArchiveExtractor))
+            return CaseObservation.make({ detail: receipt.productionTrusted ? "Verified timestamped Authenticode signatures and expected publishers on installer, application and admitted runtime"
+              : "Inspected development Authenticode status; unsigned files recorded explicitly, no production trust claimed",
+              evidence: [yield* inputEvidence, yield* evidence("P5-windows-package-trust.json", WindowsPackageTrust, receipt)] })
+          }
+          const policy = yield* appleTrustPolicy(production, config.environment.LAB_EXPECTED_APPLE_TEAM_ID)
           const receipt = yield* inspectApplePackageTrust(yield* installed, release, policy).pipe(Effect.provide(NodeArchiveExtractor))
           return CaseObservation.make({ detail: receipt.productionTrusted ? "Verified expected publisher, timestamps, notarization and Gatekeeper acceptance"
             : "Verified application and admitted runtime code signatures; development integrity only, no production trust claimed",
