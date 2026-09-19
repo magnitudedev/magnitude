@@ -13,6 +13,7 @@ import { selectedHarnesses } from "./catalog"
 import { captureRetainedProfile, RetainedProfile, verifyRetainedProfile } from "./retained-profile"
 import { ApplicationIdentity, assertServiceExited } from "./application-identity"
 import { verifyServiceOwnership } from "./suites/service"
+import { InstallationOwnership, verifyInstallationOwnership } from "./suites/installation-ownership"
 import { occupyServicePort } from "./port-fault"
 import { exerciseConnectionError } from "./harnesses/connection-error"
 import { desktopSession } from "./desktop-session"
@@ -244,6 +245,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           break
         }
         case "I5": yield* rejectCorruptInstaller(yield* candidate).pipe(Effect.provideService(Installer, installer), Effect.provideService(FileSystem.FileSystem, fs)); break
+        case "I4": {
+          const receipt = yield* verifyInstallationOwnership(yield* installed, yield* desktop).pipe(Effect.provideService(CliTests, yield* cli))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("I4-installation-ownership.json", InstallationOwnership, receipt)] })
+        }
         case "A1": yield* (yield* desktop).ready(); break
         case "A2": yield* (yield* desktop).search(config.model); yield* (yield* desktop).details(config.model); break
         case "A3": yield* (yield* desktop).search(config.model); yield* (yield* desktop).download(config.model); break

@@ -166,6 +166,10 @@ termination is limited to processes owned by the attempt.
 ## Evidence and acceptance
 
 Each case records its input identity, observed hardware, outcome, diagnostics and evidence paths.
+Installation ownership verifies that the installer-selected CLI resolves to the exact bundled file
+inside the installed package, including native launcher symlinks. Invoking its version and service
+start commands must preserve the observed application PID, service PID and service instance.
+This does not imply global shell registration where the platform does not install one.
 Installed package identity is verified against native binary headers and the running desktop,
 service and CLI versions. Artifact names alone cannot qualify architecture or version agreement.
 Native dependency inspection preserves required, weak and delayed imports and platform loader
