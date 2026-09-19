@@ -37,7 +37,10 @@ it pass. Release acceptance requires final production-signed artifacts and compl
 
 ## Responsibilities
 
-The coordinator durably records admission, work, attempts, leases, events and results. Allocators
+The coordinator durably records admission, work, attempts, leases, events and results.
+Database migrations finish before HTTP admission starts. Scheduler and reconciliation loops run
+under the coordinator's scope; unexpected loop defects terminate the service rather than silently
+leaving a live API without its worker or cleanup loop. Allocators
 own Azure, Namespace, office Spark or local-machine leases. Transports execute bounded worker
 commands. Scenario drivers interact with the installed application, endpoint, actual harness or
 bundled CLI. No mocked model response, developer binary or hosted provider can satisfy generation.

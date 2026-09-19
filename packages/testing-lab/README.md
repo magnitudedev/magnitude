@@ -281,3 +281,34 @@ high-volume transfer throughput and outward worker bootstrap remain to be qualif
 `LAB_ARTIFACT_REPORT` and verifies a real round trip. It leaves the immutable private object in
 the configured container. The live 201335712-byte Mac DMG round trip passed in the credited
 subscription's private `magnitudelab5304c4b3/artifacts` storage. No compute resource is retained.
+
+## Coordinator service
+
+Run `bun lab serve` with the pinned Bun runtime, `LAB_COORDINATOR_CONFIG` pointing to a JSON
+configuration and `LAB_DATABASE_URL` holding the PostgreSQL connection string. Secrets are read
+from named environment variables, not embedded in the configuration or printed at startup.
+A minimal local API configuration is:
+
+```json
+{
+  "coordinator": { "instance": "local-dev", "concurrency": 2, "accountBudgetUsd": 100, "pollMs": 1000, "reconcileMs": 10000 },
+  "hostname": "127.0.0.1",
+  "port": 11399,
+  "credentials": [{ "tokenEnvironment": "LAB_DEVELOPER_TOKEN", "principal": { "owner": "developer", "trust": "developer" } }],
+  "storage": { "kind": "file", "directory": "/absolute/path/to/lab-objects" },
+  "runtimes": []
+}
+```
+
+Supply a distinct credential of at least 32 characters per configured identity. The server runs
+migrations before accepting HTTP work, shares durable stores with scheduler/reconciler loops,
+and keeps cleanup scoped to its leases. Empty runtimes/providers support API setup and return
+explicit blocked run results; they cannot qualify an app test. Namespace configuration requires
+both pinned image observations and an installed guest runtime. This entry point does not yet
+configure Azure/Spark execution or provision fresh guest runtimes. Azure Blob storage can replace
+the file storage using `{"kind":"azure","config":<AzureArtifactConfig>}`.
+
+For remote deployment, terminate HTTPS at the ingress; the bearer credential mode is the initial
+private-service path. Entra/GitHub OIDC, outward worker polling, Bicep deployment and managed
+coordinator hosting remain unfinished. A real HTTP/PostgreSQL test covers upload, admission,
+idempotent submission, automatic scheduling, results, owner isolation and configured startup.

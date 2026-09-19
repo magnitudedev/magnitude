@@ -11,9 +11,11 @@ import { manifestJson, snapshotSource } from "./snapshot"
 import { assertRuntime } from "./runtime"
 import { snapshotArtifacts } from "./artifact-input"
 import { RunRecord } from "./run-store"
+import { serveConfiguredCoordinator } from "./server"
 
 const help = `Magnitude testing lab
 
+  bun lab serve
   bun lab targets
   bun lab plan --request run.json
   bun lab run --source . --target macos-26-arm64-metal-apple-silicon
@@ -29,6 +31,8 @@ LAB_URL and LAB_TOKEN select the authenticated coordinator. Token identity deter
 ownership and trust. --mode iterate|verify defaults to verify. --no-wait submits and
 returns the run ID. --allow-spark is explicit consent to use the shared office Spark.
 Results exit 0 only when every selected case passed and cleanup completed.
+Serve reads LAB_COORDINATOR_CONFIG and LAB_DATABASE_URL; credential values come from
+the environment variables named in the server configuration.
 `
 export const parseArguments = (args: readonly string[]) => Effect.gen(function* () {
   const command = args[0] ?? "help"
@@ -59,6 +63,7 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const required = (name: string) => Effect.fromNullable(options.get(name)).pipe(Effect.mapError(() => new InvalidInput({ message: `Missing --${name}` })))
   if (command === "help" || command === "--help") return yield* Console.log(help)
+  if (command === "serve") return yield* serveConfiguredCoordinator
   if (command === "targets") return yield* print(Schema.Array(Target), targets)
   if (command === "plan") {
     const request = yield* fs.readFileString(yield* required("request")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(RunRequest))))
