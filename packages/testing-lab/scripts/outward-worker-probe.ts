@@ -11,13 +11,13 @@ import { LocalMachine } from "../src/machines"
 import { outwardWorkerRunner, type WorkerBootstrap, WorkerBootstraps } from "../src/outward-runner"
 import { WorkerRunner } from "../src/scheduler"
 import { InputRegistry, InputRegistryLive } from "../src/inputs"
-import { runOutwardWorker } from "../src/outward-worker"
+import { deliverOutwardWorkerResult, runOutwardWorker } from "../src/outward-worker"
 import { ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import { RunStore, runStoreLayer } from "../src/run-store"
 import { assertRuntime } from "../src/runtime"
 import { WorkStore, WorkStoreLive } from "../src/work-store"
 import { workerApi } from "../src/worker-api"
-import { workerClientLayer } from "../src/worker-client"
+import { WorkerApiError, WorkerClient, workerClientLayer } from "../src/worker-client"
 import { GuestExecutorLive } from "../src/worker-entry"
 import { WorkerEvidenceLive } from "../src/worker-evidence"
 import { WorkerInputsLive } from "../src/worker-inputs"
@@ -30,6 +30,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   yield* assertRuntime
   const root = yield* Config.string("LAB_PROBE_ROOT")
   const manifest = yield* Config.string("LAB_PROBE_MANIFEST")
+  const recoverDelivery = yield* Config.boolean("LAB_PROBE_DELIVERY_RECOVERY").pipe(Config.withDefault(false))
   const fs = yield* FileSystem.FileSystem
   if (yield* fs.exists(root)) return yield* new AssertionFailure({ message: "Probe needs a fresh root" })
   yield* fs.makeDirectory(root, { recursive: true, mode: 0o700 })
@@ -63,7 +64,19 @@ const program = Effect.scoped(Effect.gen(function* () {
     let guestRoot = ""
     const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { start: (_machine, launch) => Effect.gen(function* () {
       guestRoot = launch.root
-      yield* runOutwardWorker({ root: launch.root, pollMs: 1000 }).pipe(Effect.provide([workerClientLayer(launch.origin, launch.token), GuestExecutorLive]), Effect.provide(guestServices), Effect.forkIn(scope))
+      const guest = Effect.gen(function* () {
+        const client = yield* WorkerClient
+        const config = { root: launch.root, pollMs: 1000 }
+        if (!recoverDelivery) return yield* runOutwardWorker(config).pipe(Effect.provide(GuestExecutorLive))
+        const interrupted = yield* runOutwardWorker(config).pipe(Effect.provide(GuestExecutorLive),
+          Effect.provideService(WorkerClient, { ...client, submit: () => Effect.fail(new WorkerApiError({ status: 503, message: "Injected result delivery failure" })) }), Effect.either)
+        if (interrupted._tag !== "Left" || interrupted.left._tag !== "WorkerApiError" || interrupted.left.status !== 503) return yield* new AssertionFailure({ message: "Probe did not reach the intended result delivery failure" })
+        if (yield* fs.exists(join(launch.root, "installation", "Magnitude.app"))) return yield* new AssertionFailure({ message: "Native installation was not cleaned before result recovery" })
+        const reply = yield* deliverOutwardWorkerResult(config)
+        yield* fs.writeFileString(join(root, "delivery-recovery.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, recoveredWithoutExecutor: Schema.Boolean, cleanedBeforeDelivery: Schema.Boolean })))({ passed: true, recoveredWithoutExecutor: true, cleanedBeforeDelivery: true }))
+        return reply
+      })
+      yield* guest.pipe(Effect.provide(workerClientLayer(launch.origin, launch.token)), Effect.provide(guestServices), Effect.forkIn(scope))
     }) }]]) })
     const runner = Context.get(yield* Layer.build(outwardWorkerRunner({ origin, pollMs: 100, runtimes: [{ provider: "local", artifactHost: "darwin-arm64", root: join(root, "guest"),
       executable: "bun", args: ["src/outward-worker.ts"], disposable: false, port: 11429, model: "qwen3.5-4b:gguf:q4" }] }).pipe(Layer.provide(bootstrap))), WorkerRunner)

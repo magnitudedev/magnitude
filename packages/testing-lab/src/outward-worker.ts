@@ -49,27 +49,62 @@ export const runOutwardWorker = (config: typeof OutwardWorkerConfig.Type) => Eff
     const temporary = join(root, "reply.json.tmp")
     yield* fs.writeFileString(temporary, yield* Schema.encode(Schema.parseJson(WorkerReply))(reply), { mode: 0o600, flag: "wx" })
     yield* fs.rename(temporary, join(root, "reply.json"))
-    const evidence = new Map<Digest, number>()
-    for (const item of reply.result.cases.flatMap(test => test.evidence)) {
-      if (evidence.has(item.sha256) && evidence.get(item.sha256) !== item.bytes) return yield* fail("Conflicting evidence byte counts")
-      evidence.set(item.sha256, item.bytes)
-    }
-    for (const [digest, size] of evidence) {
-      if (Number((yield* fs.stat(join(root, "objects", digest))).size) !== size) return yield* fail("Local evidence length differs from reply")
-      yield* client.upload(digest, size, store.get(digest))
-    }
-    yield* client.submit(reply)
-    return reply
+    return yield* deliverReply(client, store, fs, root, invocation, reply)
   })
   const authority = Effect.forever(Effect.sleep(config.pollMs).pipe(Effect.zipRight(client.assignment), Effect.flatMap(current =>
     Schema.equivalence(WorkerInvocation)(invocation, current) ? Effect.void : Effect.fail(fail("Worker assignment changed during execution")))))
   return yield* Effect.raceFirst(journey, authority).pipe(Effect.timeoutFail({ duration: Math.max(1, deadline - Date.now()), onTimeout: () => fail("Worker assignment deadline expired") }))
 })
 
+const deliverReply = (client: WorkerClient, store: ArtifactStore, fs: FileSystem.FileSystem, root: string,
+  invocation: typeof WorkerInvocation.Type, reply: typeof WorkerReply.Type) => Effect.gen(function* () {
+  if (!Schema.equivalence(WorkClaim)(reply.claim, invocation.assignment.claim)) return yield* fail("Saved reply belongs to another attempt")
+  yield* validateTargetResult(invocation.assignment.target, reply.result)
+  const evidence = new Map<Digest, number>()
+  for (const item of reply.result.cases.flatMap(test => test.evidence)) {
+    if (evidence.has(item.sha256) && evidence.get(item.sha256) !== item.bytes) return yield* fail("Conflicting evidence byte counts")
+    evidence.set(item.sha256, item.bytes)
+  }
+  for (const [digest, size] of evidence) {
+    if (Number((yield* fs.stat(join(root, "objects", digest))).size) !== size) return yield* fail("Local evidence length differs from reply")
+    yield* client.upload(digest, size, store.get(digest))
+  }
+  yield* client.submit(reply)
+  return reply
+})
+
+/** Explicit delivery-only recovery never acquires a GuestExecutor or downloads input objects. */
+export const deliverOutwardWorkerResult = (config: typeof OutwardWorkerConfig.Type) => Effect.gen(function* () {
+  const client = yield* WorkerClient
+  const fs = yield* FileSystem.FileSystem
+  const invocation = yield* client.assignment
+  const deadline = DateTime.toEpochMillis(invocation.assignment.deadline)
+  if (deadline <= Date.now()) return yield* fail("Worker assignment has expired")
+  const root = resolve(config.root)
+  const readSaved = (name: string) => fs.stream(join(root, name)).pipe(
+    Stream.runFoldEffect({ bytes: 0, chunks: [] as Uint8Array[] }, (state, chunk) => state.bytes + chunk.byteLength > 16 * 1024 * 1024
+      ? Effect.fail(fail("Saved worker document exceeds 16 MiB"))
+      : Effect.succeed({ bytes: state.bytes + chunk.byteLength, chunks: [...state.chunks, chunk] })),
+    Effect.map(value => Buffer.concat(value.chunks).toString("utf8")),
+  )
+  const delivery = Effect.gen(function* () {
+    const saved = yield* readSaved("invocation.json").pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(WorkerInvocation))))
+    if (!Schema.equivalence(WorkerInvocation)(saved, invocation)) return yield* fail("Saved invocation differs from the live assignment")
+    const reply = yield* readSaved("reply.json").pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(WorkerReply))))
+    const store = Context.get(yield* Layer.build(fileArtifactStore(join(root, "objects"))), ArtifactStore)
+    return yield* deliverReply(client, store, fs, root, invocation, reply)
+  })
+  const authority = Effect.forever(Effect.sleep(config.pollMs).pipe(Effect.zipRight(client.assignment), Effect.flatMap(current =>
+    Schema.equivalence(WorkerInvocation)(invocation, current) ? Effect.void : Effect.fail(fail("Worker assignment changed during delivery")))))
+  return yield* Effect.raceFirst(delivery, authority).pipe(Effect.timeoutFail({ duration: Math.max(1, deadline - Date.now()), onTimeout: () => fail("Worker delivery deadline expired") }))
+})
+
 export const outwardGuestMain = Effect.scoped(Effect.gen(function* () {
   yield* assertRuntime
   const config = yield* Schema.decodeUnknown(OutwardWorkerConfig)({ root: yield* Config.string("LAB_WORKER_ROOT"), pollMs: 10_000 })
   const client = workerClientLayer(yield* Config.string("LAB_URL"), yield* Config.redacted("LAB_WORKER_TOKEN")).pipe(Layer.provide(FetchHttpClient.layer))
-  yield* runOutwardWorker(config).pipe(Effect.provide([client, GuestExecutorLive]))
+  const action = yield* Config.literal("execute", "deliver")("LAB_WORKER_ACTION").pipe(Config.withDefault("execute"))
+  if (action === "deliver") yield* deliverOutwardWorkerResult(config).pipe(Effect.provide(client))
+  else yield* runOutwardWorker(config).pipe(Effect.provide([client, GuestExecutorLive]))
 }))
 if (import.meta.main) BunRuntime.runMain(outwardGuestMain.pipe(Effect.provide([BunContext.layer, ProcessExecutorLive])))

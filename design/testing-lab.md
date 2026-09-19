@@ -102,6 +102,11 @@ An existing workspace cannot trigger another execution. The guest saves its vali
 before delivery, deduplicates evidence by content identity and monitors live assignment
 authority while working. Lost authority or the attempt deadline interrupts execution and
 its owned cleanup scope; transport failures do not silently rerun tests.
+Explicit delivery recovery requires the saved invocation to match the entire live assignment
+and validates the saved reply, evidence lengths and hashes again. It never acquires the native
+executor or downloads execution inputs. Missing, malformed or oversized saved documents fail;
+they cannot fall back to another execution. Recovery retains the original attempt deadline and
+authority checks, and cannot resurrect a revoked or completed attempt.
 The outward runner validates allocation ownership and trust before issuing a guest credential,
 delivers it through a provider bootstrap, and waits for the immutable receipt within the
 allocation deadline. Credential revocation runs on success, failure, timeout and cancellation.

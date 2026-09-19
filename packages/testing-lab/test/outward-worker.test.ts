@@ -7,12 +7,12 @@ import { planRun } from "../src/catalog"
 import { RunId, RunRequest } from "../src/domain"
 import { GuestExecutor } from "../src/guest-executor"
 import { Fence } from "../src/lease"
-import { runOutwardWorker } from "../src/outward-worker"
+import { deliverOutwardWorkerResult, runOutwardWorker } from "../src/outward-worker"
 import { sha256 } from "../src/snapshot"
 import { WorkerApiError, WorkerClient } from "../src/worker-client"
 import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 
-for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim", "revoked"] as const) test(`outward guest preserves single execution and evidence for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim", "revoked", "saved-claim", "saved-invocation", "missing-reply", "oversized-reply", "saved-evidence", "delivery-revoked", "delivery-revoked-upload"] as const) test(`outward guest preserves single execution and evidence for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const parent = yield* fs.makeTempDirectoryScoped({ prefix: "lab-outward-" })
   const root = join(parent, "attempt")
@@ -26,16 +26,21 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   const plan = yield* planRun(request)
   const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
     claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
-  let executed = 0, uploads = 0, submissions = 0, cleaned = 0, started = false
+  const recovery = ["delivery-error", "saved-claim", "saved-invocation", "missing-reply", "oversized-reply", "saved-evidence", "delivery-revoked", "delivery-revoked-upload"].includes(mode)
+  let executed = 0, uploads = 0, submissions = 0, cleaned = 0, started = false, downloads = 0, recovering = false, redeliveryStarted = false
   const client = Layer.succeed(WorkerClient, {
-    assignment: Effect.suspend(() => mode === "revoked" && started ? Effect.fail(new WorkerApiError({ status: 401, message: "Revoked fixture" })) : Effect.succeed(invocation)),
-    download: digest => Stream.make(digest === request.input.digest ? new TextEncoder().encode(manifest) : mode === "corrupt-input" ? new TextEncoder().encode("wrong bytes") : payload),
+    assignment: Effect.suspend(() => (mode === "revoked" && started || mode === "delivery-revoked" && recovering || mode === "delivery-revoked-upload" && redeliveryStarted) ? Effect.fail(new WorkerApiError({ status: 401, message: "Revoked fixture" })) : Effect.succeed(invocation)),
+    download: digest => { downloads++; return Stream.make(digest === request.input.digest ? new TextEncoder().encode(manifest) : mode === "corrupt-input" ? new TextEncoder().encode("wrong bytes") : payload) },
     upload: (digest, size, content) => Effect.gen(function* () {
       uploads++
+      if (mode === "delivery-revoked-upload" && recovering) {
+        redeliveryStarted = true
+        return yield* Effect.never.pipe(Effect.ensuring(Effect.sync(() => { cleaned++ })))
+      }
       const bytes = Buffer.concat(Array.from(yield* content.pipe(Stream.runCollect)))
       expect(digest).toBe(sha256(report)); expect(size).toBe(report.length); expect(bytes.toString()).toBe(new TextDecoder().decode(report))
     }).pipe(Effect.mapError(() => new WorkerApiError({ status: 0, message: "Fixture upload failed" }))),
-    submit: () => Effect.suspend(() => { submissions++; return mode === "delivery-error" ? Effect.fail(new WorkerApiError({ status: 500, message: "Delivery fixture failed" })) : Effect.void }),
+    submit: () => Effect.suspend(() => { submissions++; return recovery && !recovering ? Effect.fail(new WorkerApiError({ status: 500, message: "Delivery fixture failed" })) : Effect.void }),
   })
   const executor = Layer.succeed(GuestExecutor, { run: (received, directory) => Effect.gen(function* () {
     executed++; started = true
@@ -53,13 +58,29 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   const outcome = yield* run.pipe(Effect.either)
   expect(outcome._tag).toBe(mode === "success" ? "Right" : "Left")
   expect(executed).toBe(mode === "corrupt-input" ? 0 : 1)
-  expect(uploads).toBe(mode === "success" || mode === "delivery-error" ? 1 : 0)
-  expect(submissions).toBe(mode === "success" || mode === "delivery-error" ? 1 : 0)
+  expect(uploads).toBe(mode === "success" || recovery ? 1 : 0)
+  expect(submissions).toBe(mode === "success" || recovery ? 1 : 0)
   expect(cleaned).toBe(mode === "revoked" ? 1 : 0)
-  if (mode === "success" || mode === "delivery-error") {
+  if (mode === "success" || recovery) {
     const saved = yield* Schema.decodeUnknown(Schema.parseJson(WorkerReply))(yield* fs.readFileString(join(root, "reply.json")))
     expect(saved.claim).toEqual(invocation.assignment.claim)
     expect((yield* run.pipe(Effect.either))._tag).toBe("Left")
     expect(executed).toBe(1)
+    if (recovery) {
+      if (mode === "saved-claim") yield* fs.writeFileString(join(root, "reply.json"), yield* Schema.encode(Schema.parseJson(WorkerReply))({ ...saved, claim: { ...saved.claim, fence: Fence.make(2) } }))
+      if (mode === "saved-invocation") yield* fs.writeFileString(join(root, "invocation.json"), yield* Schema.encode(Schema.parseJson(WorkerInvocation))({ ...invocation, model: "different-model" }))
+      if (mode === "missing-reply") yield* fs.remove(join(root, "reply.json"))
+      if (mode === "oversized-reply") yield* fs.writeFileString(join(root, "reply.json"), " ".repeat(16 * 1024 * 1024 + 1))
+      if (mode === "saved-evidence") yield* fs.writeFile(join(root, "objects", sha256(report)), new Uint8Array(report.length))
+      const initialDownloads = downloads
+      recovering = true
+      // No GuestExecutor is provided: recovery cannot accidentally execute native tests.
+      const delivered = yield* deliverOutwardWorkerResult({ root, pollMs: 20 }).pipe(Effect.provide(client), Effect.either)
+      expect(delivered._tag).toBe(mode === "delivery-error" ? "Right" : "Left")
+      expect(executed).toBe(1)
+      expect(downloads).toBe(initialDownloads)
+      if (mode === "delivery-revoked-upload") expect(cleaned).toBe(1)
+      expect(submissions).toBe(mode === "delivery-error" ? 2 : 1)
+    }
   }
 })).pipe(Effect.provide(BunContext.layer))))

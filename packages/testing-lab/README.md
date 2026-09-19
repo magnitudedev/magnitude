@@ -460,9 +460,9 @@ request checks the current claim/fence, run deadline and state. Cancellation,
 completion, revocation and reassignment deny access immediately; responses are
 noncacheable. Native provider credentials are not included in the invocation.
 
-Bootstrap delivery and scheduler integration are still required for a working Azure
-worker path. The current execution runner continues using its existing
-transport path. PostgreSQL plus live HTTP tests cover credential persistence and
+Azure Linux bootstrap and scheduler integration are implemented as described below;
+qualified guest images and complete cloud app execution remain outstanding. Namespace
+continues using its existing transport path. PostgreSQL plus live HTTP tests cover credential persistence and
 invalidation; no Azure worker qualification is claimed by those tests.
 
 Worker input downloads are now available at `/v1/worker/objects/:digest`. They permit
@@ -502,8 +502,20 @@ into a fresh owned workspace, invokes the same native executor as the transport
 worker, saves `reply.json` before delivery, uploads unique evidence and returns the
 result. It checks live assignment authority every ten seconds and honors the run
 deadline. Existing workspaces cannot trigger another execution. Failed delivery
-leaves the reply available for inspection; a delivery-only resume command is not
-implemented yet. Provider bootstrap and configured deployment wiring are still unfinished.
+leaves the reply available for inspection. Set `LAB_WORKER_ACTION=deliver` with the same
+workspace, origin and still-live attempt credential to deliver the saved result without
+running the native executor. The default action remains `execute`, which rejects an existing
+workspace. Recovery checks the complete saved invocation against live authority, bounds
+saved JSON documents to 16 MiB, validates the reply, and rechecks every evidence hash/length.
+It cannot recover after the attempt is revoked, completed or expired. No top-level coordinator
+resume operation or automatic provider relaunch is claimed by this guest entry point.
+
+The native recovery probe (`LAB_PROBE_DELIVERY_RECOVERY=true`) deliberately rejected its
+first result submission after packaged app cleanup, then delivered through the real HTTP and
+PostgreSQL path without providing a native executor. Its reports are
+`/tmp/ml-outward-redelivery-20260918/delivery-recovery.json` and `outward-report.json`:
+seven cases passed, P4/P5/I4 remained blocked, and cleanup errors were empty. This is a
+local macOS package/install recovery probe, not Azure or GPU qualification.
 
 The real macOS 15 ARM64 artifact probe in `scripts/outward-worker-probe.ts` passed
 its install/launch/version/corrupt-installer checks through a loopback HTTP coordinator,
