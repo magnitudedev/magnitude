@@ -260,3 +260,24 @@ OpenCode generated and recalled the identifier but failed to perform the request
 its JSON adapter also cannot attest token streaming. Fresh-profile Hermes rejected the app-created
 connection during first-run setup before generation. These live failures are retained, not converted
 into passes by injecting provider settings or retrying assertions.
+
+`azure-lifecycle-probe.ts` exercises the real allocator on a disposable Ubuntu x64 Intel VM:
+allocate the same lease twice, run a bounded native guest identity command through Azure's agent,
+and release only that lease's resources even when the probe fails. Set `LAB_AZURE_CONFIG` to a
+validated AzureConfig JSON file, `LAB_AZURE_PROBE_ROOT` to a diagnostic directory and
+`LAB_AZURE_TARGET=ubuntu-24.04-x64-cpu-intel`. The configured subnet must already exist in the
+same subscription/resource group. This probe owns its VM/NIC/disk, not the shared subnet. It does
+not qualify app installation, artifact transfer, the full guest bootstrap or GPU execution.
+The live probe passed in the credited subscription's `magnitude-ci` group in WestUS2 with
+Standard_D4s_v6 and Canonical Ubuntu24.04 image24.04.202609040. The VM had no public IP;
+the guest reported Ubuntu24.04, x86_64 and GenuineIntel. VM, disk and NIC cleanup passed.
+
+Azure Blob storage is available behind the same ArtifactStore interface. The coordinator uses
+Entra authentication (`--auth-mode login`), stages bounded files, verifies SHA-256 before upload
+and on download, publishes each content address once and pins downloads to the observed ETag.
+Workers do not receive account keys. The current implementation uses the installed Azure CLI;
+high-volume transfer throughput and outward worker bootstrap remain to be qualified.
+`azure-artifact-probe.ts` accepts `LAB_AZURE_ARTIFACT_CONFIG`, `LAB_ARTIFACT_FILE` and
+`LAB_ARTIFACT_REPORT` and verifies a real round trip. It leaves the immutable private object in
+the configured container. The live 201335712-byte Mac DMG round trip passed in the credited
+subscription's private `magnitudelab5304c4b3/artifacts` storage. No compute resource is retained.

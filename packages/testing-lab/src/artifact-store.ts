@@ -12,7 +12,7 @@ export interface ArtifactStore {
 }
 export const ArtifactStore = Context.GenericTag<ArtifactStore>("@magnitudedev/testing-lab/ArtifactStore")
 const failure = (message: string) => new InfrastructureFailure({ operation: "artifact-store", message })
-const verified = (digest: Digest, content: Stream.Stream<Uint8Array, InfrastructureFailure>, maxBytes: number) => Stream.unwrap(Effect.sync(() => {
+export const verifiedArtifactContent = (digest: Digest, content: Stream.Stream<Uint8Array, InfrastructureFailure>, maxBytes: number) => Stream.unwrap(Effect.sync(() => {
   const hash = createHash("sha256")
   let bytes = 0
   return content.pipe(Stream.filter(chunk => chunk.byteLength > 0), Stream.tap(chunk => Effect.gen(function* () {
@@ -30,10 +30,10 @@ export const fileArtifactStore = (root: string, maxBytes = 4 * 1024 ** 3) => Lay
     put: (digest, content) => Effect.scoped(Effect.gen(function* () {
       const temporary = join(root, `.upload-${crypto.randomUUID()}`)
       yield* Effect.addFinalizer(() => fs.remove(temporary, { force: true }).pipe(Effect.orDie))
-      yield* Stream.run(verified(digest, content, maxBytes), fs.sink(temporary, { flag: "wx", mode: 0o600 }))
+      yield* Stream.run(verifiedArtifactContent(digest, content, maxBytes), fs.sink(temporary, { flag: "wx", mode: 0o600 }))
       yield* fs.rename(temporary, join(root, digest))
     })).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : failure("Cannot persist object"))),
-    get: digest => verified(digest, fs.stream(join(root, digest)).pipe(Stream.mapError(() => failure("Cannot read object"))), maxBytes),
+    get: digest => verifiedArtifactContent(digest, fs.stream(join(root, digest)).pipe(Stream.mapError(() => failure("Cannot read object"))), maxBytes),
     exists: digest => fs.exists(join(root, digest)).pipe(Effect.mapError(() => failure("Cannot inspect object"))),
   } satisfies ArtifactStore
 }))
