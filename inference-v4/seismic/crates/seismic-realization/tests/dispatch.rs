@@ -95,6 +95,7 @@ fn physical_arrays_cover_logical_tiles_including_empty_and_partial_lanes() {
                 TilePlacement::Replicated,
                 TilePlacement::Distributed,
                 TilePlacement::GroupShared,
+                TilePlacement::GroupWide,
             ] {
                 let tile = TileDeclaration {
                     symbol: "t".into(),
@@ -116,7 +117,7 @@ fn physical_arrays_cover_logical_tiles_including_empty_and_partial_lanes() {
                         assert!(slots == 1 || (slots - 1) * 32 < capacity);
                         assert_eq!(layout.shared_elements_per_item, 0);
                     }
-                    TilePlacement::GroupShared => {
+                    TilePlacement::GroupShared | TilePlacement::GroupWide => {
                         assert_eq!(layout.private_elements_per_lane, 0);
                         assert_eq!(layout.shared_elements_per_item, capacity.max(1));
                     }
@@ -125,9 +126,11 @@ fn physical_arrays_cover_logical_tiles_including_empty_and_partial_lanes() {
                     layout.private_bytes_per_lane,
                     layout.private_elements_per_lane * width
                 );
+                // A group-wide array exists once per group; an item-owned one once per item.
+                let items = if placement == TilePlacement::GroupWide { 1 } else { 4 };
                 assert_eq!(
                     layout.shared_bytes_per_group,
-                    layout.shared_elements_per_item * width * 4
+                    layout.shared_elements_per_item * width * items
                 );
                 assert_eq!(
                     tile.bytes(&dispatch).unwrap(),

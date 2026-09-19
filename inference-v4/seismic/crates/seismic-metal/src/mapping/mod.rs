@@ -406,7 +406,7 @@ mod tests {
     fn estimate_is_monotone_in_launches() {
         let model = EstimateModel::default();
         let totals = Totals { lane_ops: 1 << 20, visits: 16, device_bits: 1 << 23, ..Totals::default() };
-        let costs: Vec<u64> = (0..4).map(|launches| model.scope_ns(launches, &totals, 64, 0).unwrap()).collect();
+        let costs: Vec<u64> = (0..4).map(|launches| model.scope_ns(launches, &totals, 64, 0, Group::default()).unwrap()).collect();
         assert!(costs.windows(2).all(|w| w[0] < w[1]), "{costs:?}");
     }
 
