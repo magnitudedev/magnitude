@@ -321,7 +321,7 @@ Supported events are pull_request, push, workflow_dispatch and merge_group. This
 verification boundary. In GitHub jobs set `LAB_AUTH=github`, `LAB_OIDC_AUDIENCE` to the
 configured audience, and grant `id-token: write`; omit `LAB_TOKEN`. The CLI uses the runner
 provided token endpoint and renews its cached credential after one minute. A deployed GitHub
-workflow and live Entra application registration/consent are still pending. See [GitHub OIDC claims](https://docs.github.com/en/actions/reference/security/oidc)
+workflow qualification remains pending. Live Entra acquisition and verification have passed. See [GitHub OIDC claims](https://docs.github.com/en/actions/reference/security/oidc)
 and [JOSE verification](https://github.com/panva/jose).
 
 Developer identity authentication uses `LAB_AUTH=entra`, `LAB_ENTRA_TENANT` and
@@ -331,6 +331,32 @@ The server's `entra` configuration contains `tenantId`, `applicationId`, and `us
 and expose the delegated `Lab.Access` scope under `api://<applicationId>`; Azure CLI
 needs consent for that scope. The client renews through Azure CLI without printing tokens.
 Only allowed users with that delegated scope receive developer permissions. ARM tokens,
-ID tokens and app-only role tokens do not qualify. The tenant currently has no application
-named `magnitude-testing-lab`; registration and live consent qualification are unfinished.
+ID tokens and app-only role tokens do not qualify. The `magnitude-testing-lab` registration is provisioned in tenant
+`4581d4bf-a664-4a42-a66a-c842beeec9e7`, application
+`b47912ec-a3bb-49f4-ac37-25e06b4f7743`. Azure CLI is preauthorized only for
+its `Lab.Access` scope; no client secrets or certificates exist. Real Azure CLI
+acquisition and Microsoft JWKS verification passed for Tom's allowed object ID
+`7b68fd28-7906-4529-aab6-c550148572f1`. This qualifies authentication, not remote
+worker execution or the full target matrix.
 See [Microsoft's claims validation guidance](https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation).
+
+Recheck developer authentication with `scripts/entra-auth-probe.ts` using
+`LAB_ENTRA_PROBE_CONFIG` containing the server's `entra` JSON configuration.
+The probe prints the admitted principal only, and does not save credentials.
+
+A4 now changes appearance through stable UI action IDs, closes the packaged app,
+restarts with the same isolated profile, verifies the persisted choice, repeats for
+a second choice, and checks service readiness. Each launch retains separate trace
+and process evidence. `scripts/settings-relaunch-probe.ts` exercises the same session
+lifecycle locally using `LAB_PROBE_ROOT` and `LAB_PROBE_EXECUTABLE`. The real packaged
+macOS 15 ARM64 probe passed both dark/light persistence and final readiness, with no
+cleanup errors. This does not qualify Windows, Linux or macOS 26.
+
+A6 exercises sidebar and native window hide/reopen behavior, requests normal Electron
+quit, requires exit code zero without a termination signal, then relaunches and checks
+service readiness. Forced cleanup is never a passing quit result. The local settings
+relaunch probe also runs this lifecycle case; traces close before quitting and logs
+remain available after the process exits.
+The combined A4/A6 packaged macOS 15 ARM64 probe passed with zero cleanup
+errors at `/tmp/ml-app-lifecycle-fixed-20260918/report.json`; all four launch
+traces were saved and no probe application process remained.

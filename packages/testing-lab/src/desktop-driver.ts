@@ -2,6 +2,7 @@ import { desktopAutomation as automation } from "../../../desktop/src/automation
 import { FileSystem } from "@effect/platform"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { _electron, type Page } from "playwright"
+import type { ChildProcess } from "node:child_process"
 import { join } from "node:path"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
 
@@ -19,8 +20,10 @@ export interface DesktopDriver {
   readonly connect: (harnessId: string) => Effect.Effect<void, AssertionFailure>
   readonly disconnect: (harnessId: string) => Effect.Effect<void, AssertionFailure>
   readonly theme: (theme: "light" | "dark" | "system") => Effect.Effect<void, AssertionFailure>
+  readonly verifyTheme: (theme: "light" | "dark" | "system") => Effect.Effect<void, AssertionFailure>
   readonly screenshot: (name: string) => Effect.Effect<string, AssertionFailure>
   readonly text: () => Effect.Effect<string, AssertionFailure>
+  readonly quit: () => Effect.Effect<void, AssertionFailure>
   readonly chrome: () => Effect.Effect<void, AssertionFailure>
 }
 export const DesktopDriver = Context.GenericTag<DesktopDriver>("@magnitudedev/testing-lab/DesktopDriver")
@@ -34,17 +37,20 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   // With an explicit result collector, keep cleanup failures separate from the test failure.
   const reportCleanup = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.catchAllCause(cause =>
     onCleanupError ? Effect.sync(() => onCleanupError(Cause.pretty(cause))) : Effect.die(cause)))
+  let nativeProcess: ChildProcess | undefined
   let processLog = ""
   const collect = (chunk: Buffer) => { processLog = (processLog + chunk.toString("utf8")).slice(-2 * 1024 * 1024) }
   const app = yield* Effect.acquireRelease(Effect.tryPromise({ try: () => _electron.launch({ executablePath: config.executable, chromiumSandbox: true,
     env: { ...config.environment, MAGNITUDE_DEV_DATA_DIR: config.profile, MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }, timeout: 60_000 }),
     catch: error => new InfrastructureFailure({ operation: "desktop-launch", message: error instanceof Error ? error.message : "Packaged Electron launch failed" }) }),
-  app => action("Close packaged application", () => app.close()).pipe(
+  app => action("Close packaged application", async () => {
+    if (!nativeProcess || (nativeProcess.exitCode === null && nativeProcess.signalCode === null)) await app.close()
+  }).pipe(
     Effect.interruptible, Effect.timeoutFail({ duration: "20 seconds", onTimeout: () => new AssertionFailure({ message: "Packaged application did not quit within 20 seconds" }) }),
     Effect.tapError(() => Effect.sync(() => {
-      const child = app.process()
+      const child = nativeProcess
       // Playwright launches a separate process group on Unix; reap its helpers as well.
-      if (child.pid && child.exitCode === null && child.signalCode === null) {
+      if (child?.pid && child.exitCode === null && child.signalCode === null) {
         try { if (process.platform === "win32") child.kill("SIGKILL"); else process.kill(-child.pid, "SIGKILL") }
         catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error }
       }
@@ -52,13 +58,16 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     Effect.ensuring(fs.writeFileString(join(config.evidence, "desktop.log"), processLog.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")).pipe(Effect.orDie)),
     reportCleanup,
   ))
-  app.process().stdout?.on("data", collect)
-  app.process().stderr?.on("data", collect)
+  nativeProcess = app.process()
+  nativeProcess.stdout?.on("data", collect)
+  nativeProcess.stderr?.on("data", collect)
   const page = yield* action("Wait for packaged application window", () => app.firstWindow({ timeout: 60_000 }))
   page.setDefaultTimeout(30_000)
   if (preparePage) yield* action("Prepare UI resilience challenge", () => preparePage(page))
   yield* action("Start UI trace", () => app.context().tracing.start({ screenshots: true, snapshots: true, sources: false }))
-  yield* Effect.addFinalizer(() => action("Save UI trace", () => app.context().tracing.stop({ path: join(config.evidence, "ui-trace.zip") })).pipe(Effect.interruptible, Effect.timeout("20 seconds"), reportCleanup))
+  const saveTrace = yield* Effect.cached(action("Save UI trace", () => app.context().tracing.stop({ path: join(config.evidence, "ui-trace.zip") })).pipe(
+    Effect.timeoutFail({ duration: "20 seconds", onTimeout: () => new AssertionFailure({ message: "UI trace did not finish" }) })))
+  yield* Effect.addFinalizer(() => saveTrace.pipe(Effect.interruptible, reportCleanup))
   const navigate: DesktopDriver["navigate"] = name => action(`Open ${name}`, async () => {
     await page.getByTestId(automation.navigation(name)).click()
     await page.getByTestId(automation.page(name)).waitFor()
@@ -121,6 +130,8 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       await page.getByTestId(automation.theme(theme)).click()
       await page.getByTestId(automation.theme(theme)).and(page.locator('[aria-pressed="true"]')).waitFor()
     }))),
+    verifyTheme: theme => navigate("settings").pipe(Effect.zipRight(action("Verify saved appearance", () =>
+      page.getByTestId(automation.theme(theme)).and(page.locator('[aria-pressed="true"]')).waitFor()))),
     screenshot: name => action("Capture UI evidence", async () => {
       if (!/^[a-z0-9-]+$/.test(name)) throw new Error("Invalid screenshot name")
       const path = join(config.evidence, `${name}.png`)
@@ -128,6 +139,20 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       return path
     }),
     text: () => action("Read visible application state", () => page.locator("body").innerText()),
+    quit: () => Effect.gen(function* () {
+      yield* saveTrace
+      // Playwright's Electron close handler invokes app.quit(), allowing the application's
+      // normal before-quit shutdown path to run. Only cleanup may force termination.
+      yield* action("Quit packaged application", () => app.close())
+      const child = nativeProcess!
+      yield* Effect.async<void>(resume => {
+        if (child.exitCode !== null || child.signalCode !== null) { resume(Effect.void); return }
+        const exited = () => resume(Effect.void)
+        child.once("exit", exited)
+        return Effect.sync(() => { child.removeListener("exit", exited) })
+      })
+      if (child.exitCode !== 0 || child.signalCode !== null) return yield* new AssertionFailure({ message: "Application did not exit cleanly through normal quit" })
+    }).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new AssertionFailure({ message: "Application quit did not terminate the process within 30 seconds" }) })),
     chrome: () => action("Exercise packaged window controls", async () => {
       const toggle = page.getByTestId(automation.sidebarToggle)
       const sidebar = page.getByTestId(automation.sidebar)

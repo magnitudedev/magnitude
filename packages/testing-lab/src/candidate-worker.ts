@@ -6,7 +6,8 @@ import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
-import { DesktopDriver, playwrightDesktop } from "./desktop-driver"
+import { desktopSession } from "./desktop-session"
+import { DesktopDriver } from "./desktop-driver"
 import { AssertionFailure, Evidence, InfrastructureFailure } from "./domain"
 import { HostInspector } from "./host-inspector"
 import { HostObservation } from "./hardware"
@@ -97,12 +98,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Uninstall: ${error.message}`) })),
       )).pipe(Effect.provideService(Scope.Scope, scope))
     }))
-    const desktop = yield* Effect.cached(Effect.gen(function* () {
+    const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
-      const context = yield* Layer.buildWithScope(playwrightDesktop({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
-        evidence: join(evidenceDirectory, "desktop"), port: config.port, environment }, undefined, detail => { cleanupErrors.push(detail) }).pipe(Layer.provide(Layer.succeed(FileSystem.FileSystem, fs))), scope)
-      return Context.get(context, DesktopDriver)
+      return yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
+        evidence: join(evidenceDirectory, "desktop"), port: config.port, environment }, detail => { cleanupErrors.push(detail) }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
     }))
+    const desktop = session.pipe(Effect.flatMap(value => value.driver))
     const cli = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
       const context = yield* Layer.buildWithScope(bundledCliTests({ executable: app.cli, version: (yield* manifest).release.version, model: config.model,
@@ -149,10 +151,29 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "A1": yield* (yield* desktop).ready(); break
         case "A2": yield* (yield* desktop).search(config.model); yield* (yield* desktop).details(config.model); break
         case "A3": yield* (yield* desktop).search(config.model); yield* (yield* desktop).download(config.model); break
+        case "A4": {
+          yield* (yield* desktop).theme("dark")
+          const restarted = yield* (yield* session).restart
+          yield* restarted.host()
+          yield* restarted.verifyTheme("dark")
+          yield* restarted.theme("light")
+          const second = yield* (yield* session).restart
+          yield* second.host()
+          yield* second.verifyTheme("light")
+          yield* second.ready()
+          break
+        }
         case "A5": {
           const driver = yield* desktop
           const receipts = yield* Effect.forEach(connections, connection => connection.exercise.pipe(Effect.provideService(DesktopDriver, driver)))
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, yield* evidence("connections.json", Schema.Array(ConnectionReceipt), receipts)] })
+        }
+        case "A6": {
+          const driver = yield* desktop
+          yield* driver.chrome()
+          yield* driver.quit()
+          yield* (yield* (yield* session).restart).ready()
+          break
         }
         case "E1": yield* (yield* desktop).search(config.model); yield* (yield* desktop).load(config.model); yield* (yield* endpoint).discover; break
         case "E2":
@@ -217,6 +238,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, item] }
   }).pipe(Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Evidence ${relative}: ${error.message}`) })))
   if (yield* fs.exists(join(evidenceDirectory, "desktop", "ui-trace.zip"))) yield* exportFile("desktop/ui-trace.zip", "I3", 128 * 1024 * 1024)
+  const desktopEvidence = join(evidenceDirectory, "desktop")
+  if (yield* fs.exists(desktopEvidence)) {
+    const relaunches = (yield* fs.readDirectory(desktopEvidence)).filter(name => /^relaunch-\d+$/.test(name))
+    for (const name of relaunches) {
+      for (const file of ["ui-trace.zip", "desktop.log"]) {
+        if (yield* fs.exists(join(desktopEvidence, name, file))) {
+          for (const caseId of ["A4", "A6"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+        }
+      }
+    }
+  }
   const cliEvidence = join(evidenceDirectory, "cli")
   if (yield* fs.exists(cliEvidence)) {
     const names = (yield* fs.readDirectory(cliEvidence)).filter(name => /^\d+-[a-z0-9-]+\.json$/.test(name)).sort()

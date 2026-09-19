@@ -84,6 +84,11 @@ service and CLI versions. Artifact names alone cannot qualify architecture or ve
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
+Settings persistence is checked across actual application process restarts using the same
+isolated profile; a page reload cannot satisfy it. Each launch preserves its own trace and
+process log, and the previous process is released before the next launches. Application quit
+must traverse normal shutdown and terminate the main process with a successful exit code;
+window hiding and forced cleanup cannot satisfy quit acceptance.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
 Finalized UI traces and command logs are published as content-addressed evidence before worker
