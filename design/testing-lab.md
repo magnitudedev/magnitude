@@ -166,11 +166,17 @@ publication preserves the preceding offer. Signed request admission validates ta
 timestamp and bounded nonce replay state. Artifact capability routes expose only the owned copy,
 support exact byte ranges and reject forwarded installation credentials. Scope release closes
 the listener and removes its temporary trust and artifacts.
+Corrupt-delivery scenarios first verify the admitted artifact, then alter only the fixture's copy
+while preserving its length and authentic signed metadata. Recovery republishes the intact source;
+neither malformed metadata nor a failed source-admission check substitutes for download rejection.
 Settings persistence is checked across actual application process restarts using the same
 isolated profile; a page reload cannot satisfy it. Each launch preserves its own trace and
 process log, and the previous process is released before the next launches. Application quit
 must traverse normal shutdown and terminate the main process with a successful exit code;
-window hiding and forced cleanup cannot satisfy quit acceptance. Repeated service starts
+window hiding and forced cleanup cannot satisfy quit acceptance. Update restart
+observes the exact retiring process and requires a clean exit; that observation alone cannot
+qualify native replacement or automatic relaunch. Those require independent installed-byte and
+replacement-owner evidence. Repeated service starts
 retain the native application PID, service PID and service instance identity. After a
 restart the previous owning service must have exited and the replacement must have
 a new identity; tests never terminate a leftover process to manufacture acceptance.

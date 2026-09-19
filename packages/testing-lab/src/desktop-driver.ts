@@ -30,6 +30,7 @@ export interface DesktopDriver {
   readonly screenshot: (name: string) => Effect.Effect<string, AssertionFailure>
   readonly text: () => Effect.Effect<string, AssertionFailure>
   readonly quit: () => Effect.Effect<void, AssertionFailure>
+  readonly restartForUpdate: () => Effect.Effect<void, AssertionFailure>
   readonly chrome: () => Effect.Effect<void, AssertionFailure>
 }
 export const DesktopDriver = Context.GenericTag<DesktopDriver>("@magnitudedev/testing-lab/DesktopDriver")
@@ -79,8 +80,21 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     await page.getByTestId(automation.page(name)).waitFor()
   })
   const card = (id: string) => page.getByTestId(automation.model(id))
+  const updates = playwrightUpdates(page, navigate("settings"))
+  const exited = Effect.async<void>(resume => {
+    const child = nativeProcess!
+    if (child.exitCode !== null || child.signalCode !== null) { resume(Effect.void); return }
+    const done = () => resume(Effect.void)
+    child.once("exit", done)
+    return Effect.sync(() => { child.removeListener("exit", done) })
+  }).pipe(Effect.flatMap(() => nativeProcess!.exitCode === 0 && nativeProcess!.signalCode === null
+    ? Effect.void : new AssertionFailure({ message: "Application did not exit cleanly through normal quit" })))
   return {
-    updates: playwrightUpdates(page, navigate("settings")),
+    updates,
+    // Finalize diagnostics before native replacement retires the Playwright connection.
+    // The caller separately observes the replacement owner; this proves only the old process exit.
+    restartForUpdate: () => saveTrace.pipe(Effect.zipRight(updates.action("restart")), Effect.zipRight(exited),
+      Effect.timeoutFail({ duration: "2 minutes", onTimeout: () => new AssertionFailure({ message: "Application update did not retire the previous process" }) })),
     navigate,
     identity: () => Effect.gen(function* () {
       const wire = yield* action("Read native service ownership", () => page.evaluate(() => new Promise<unknown>((resolve, reject) => {
@@ -186,14 +200,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       // Playwright's Electron close handler invokes app.quit(), allowing the application's
       // normal before-quit shutdown path to run. Only cleanup may force termination.
       yield* action("Quit packaged application", () => app.close())
-      const child = nativeProcess!
-      yield* Effect.async<void>(resume => {
-        if (child.exitCode !== null || child.signalCode !== null) { resume(Effect.void); return }
-        const exited = () => resume(Effect.void)
-        child.once("exit", exited)
-        return Effect.sync(() => { child.removeListener("exit", exited) })
-      })
-      if (child.exitCode !== 0 || child.signalCode !== null) return yield* new AssertionFailure({ message: "Application did not exit cleanly through normal quit" })
+      yield* exited
     }).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new AssertionFailure({ message: "Application quit did not terminate the process within 30 seconds" }) })),
     chrome: () => action("Exercise packaged window controls", async () => {
       const toggle = page.getByTestId(automation.sidebarToggle)

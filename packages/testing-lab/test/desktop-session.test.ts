@@ -11,7 +11,7 @@ const launchDriver = (config: DesktopLaunch) => Layer.scoped(DesktopDriver, Effe
     details: () => Effect.void, download: () => Effect.void, load: () => Effect.void,
     connect: () => Effect.void, connectionFailure: () => Effect.succeed("unused"), disconnect: () => Effect.void, theme: () => Effect.void,
     verifyTheme: () => Effect.void, screenshot: () => Effect.succeed("unused"),
-    text: () => Effect.succeed("unused"), quit: () => Effect.void, chrome: () => Effect.void,
+    text: () => Effect.succeed("unused"), quit: () => Effect.void, restartForUpdate: () => Effect.void, chrome: () => Effect.void,
   } satisfies DesktopDriver }),
   () => Effect.sync(() => { events.push(`close:${config.evidence}`) }),
 ))

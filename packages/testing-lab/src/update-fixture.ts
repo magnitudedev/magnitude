@@ -1,7 +1,7 @@
 import { FileSystem } from "@effect/platform"
 import { acceptsUpdateRelease, decodeUpdateRequest, ReleaseTarget, signUpdateRelease, UpdateConfiguration, UpdateRelease, verifyUpdateRequest } from "@magnitudedev/release/hosted-update"
 import { defineFSM } from "@magnitudedev/utils/fsm"
-import { Clock, Effect, Ref, Runtime, Schema, Stream } from "effect"
+import { Clock, Effect, Option, Ref, Runtime, Schema, Stream } from "effect"
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { AssertionFailure, Digest, InfrastructureFailure } from "./domain"
@@ -11,6 +11,7 @@ export const UpdateFixtureArtifact = Schema.Struct({
   path: Schema.NonEmptyString, version: Schema.NonEmptyString, target: ReleaseTarget,
   bytes: Schema.Int.pipe(Schema.positive()), sha256: Digest,
 })
+export const UpdateFixtureDelivery = Schema.Literal("Exact", "Corrupt")
 class Empty extends Schema.TaggedClass<Empty>()("Empty", {}) {}
 class Offering extends Schema.TaggedClass<Offering>()("Offering", {
   path: Schema.String, release: UpdateRelease, target: ReleaseTarget, route: Schema.String,
@@ -97,8 +98,9 @@ export const updateFixture = (parent: string) => Effect.gen(function* () {
   })
   const configPath = join(directory, "configuration.json")
   yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(UpdateConfiguration))(configuration), { mode: 0o600 })
-  const publish = (artifact: typeof UpdateFixtureArtifact.Type) => gate.withPermits(1)(Effect.gen(function* () {
+  const publish = (artifact: typeof UpdateFixtureArtifact.Type, delivery: typeof UpdateFixtureDelivery.Type = "Exact") => gate.withPermits(1)(Effect.gen(function* () {
     const checked = yield* Schema.decodeUnknown(UpdateFixtureArtifact)(artifact)
+    const behavior = yield* Schema.decodeUnknown(UpdateFixtureDelivery)(delivery)
     const path = join(directory, `${randomUUID()}.package`)
     yield* fs.copyFile(checked.path, path)
     yield* fs.chmod(path, 0o600)
@@ -107,6 +109,15 @@ export const updateFixture = (parent: string) => Effect.gen(function* () {
     yield* fs.stream(path).pipe(Stream.runForEach(chunk => Effect.sync(() => { hash.update(chunk); bytes += chunk.byteLength })))
     if (bytes !== checked.bytes || hash.digest("hex") !== checked.sha256) return yield* new AssertionFailure({ message: "Update fixture artifact does not match admitted bytes" })
     const release = yield* signUpdateRelease({ version: checked.version, bytes, sha256: checked.sha256 }, checked.target, publisher.privateKey)
+    // Fault injection preserves valid signed metadata and length, changing only owned delivery bytes.
+    // Admission always checks the original source first; corrupt input cannot masquerade as a fixture.
+    if (behavior === "Corrupt") yield* Effect.scoped(Effect.gen(function* () {
+      const file = yield* fs.open(path, { flag: "r+" })
+      const first = yield* file.readAlloc(1)
+      if (Option.isNone(first)) return yield* new AssertionFailure({ message: "Update fixture copy is empty" })
+      yield* file.seek(0, "start")
+      yield* file.write(new Uint8Array([first.value[0]! ^ 0xff]))
+    }))
     yield* Ref.update(state, current => lifecycle.transition(current, "Offering", {
       path, release, target: checked.target, route: `/artifacts/${randomBytes(32).toString("hex")}/package`,
     }))

@@ -70,11 +70,20 @@ const run = Effect.gen(function* () {
     if ((yield* driver.host()) !== previousVersion) return yield* new AssertionFailure({ message: "Previous installed app has the wrong version" })
     yield* driver.theme("dark")
     yield* driver.updates.automatic(false)
-    yield* fixture.publish({ path: join(root, "candidate/artifacts", zip.filename), version: nextVersion,
-      target: { os: "darwin", arch: "arm64", package: "mac-zip" }, bytes: zip.bytes, sha256: Digest.make(zip.sha256) })
+    const update = { path: join(root, "candidate/artifacts", zip.filename), version: nextVersion,
+      target: { os: "darwin", arch: "arm64", package: "mac-zip" } as const, bytes: zip.bytes, sha256: Digest.make(zip.sha256) }
+    yield* fixture.publish(update, "Corrupt")
     yield* driver.updates.action("check")
     const available = yield* driver.updates.wait("Available")
     if (!Option.contains(available.version, nextVersion)) return yield* new AssertionFailure({ message: "App offered the wrong update version" })
+    yield* driver.updates.action("download")
+    yield* driver.updates.wait("Failed")
+    yield* driver.screenshot("private-update-corrupt-rejected")
+    if ((yield* driver.host()) !== previousVersion) return yield* new AssertionFailure({ message: "Corrupt update changed the installed app version" })
+    yield* driver.verifyTheme("dark")
+    yield* fixture.publish(update)
+    yield* driver.updates.action("check")
+    yield* driver.updates.wait("Available")
     yield* driver.updates.action("download")
     const ready = yield* driver.updates.wait("Ready")
     if (!Option.contains(ready.version, nextVersion)) return yield* new AssertionFailure({ message: "App prepared the wrong update version" })
@@ -88,7 +97,7 @@ const run = Effect.gen(function* () {
   yield* fs.writeFileString(join(root, "update-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({
     passed: Schema.Boolean, sourceDigest: Digest, detail: Schema.String, cleanupErrors: Schema.Array(Schema.String),
   })))({ passed, sourceDigest: source.digest, cleanupErrors,
-    detail: Exit.isFailure(result) ? Cause.pretty(result.cause) : "Installed older acceptance app checked, downloaded, verified and discarded the newer ZIP over private HTTPS; native replacement/relaunch and production trust are not qualified",
+    detail: Exit.isFailure(result) ? Cause.pretty(result.cause) : "Installed older acceptance app rejected a same-length corrupt update, retained its version and theme, then downloaded, verified and discarded the intact ZIP over private HTTPS; native replacement/relaunch and production trust are not qualified",
   }))
   if (!passed) return yield* new AssertionFailure({ message: "Native update acquisition failed; inspect update-report.json" })
 })

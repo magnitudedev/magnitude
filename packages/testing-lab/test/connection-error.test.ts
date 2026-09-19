@@ -22,7 +22,7 @@ for (const behavior of ["preserve", "overwrite", "missing-alert"] as const) test
     search: () => Effect.void, details: () => Effect.void, download: () => Effect.void,
     load: () => Effect.void, disconnect: () => Effect.void, theme: () => Effect.void,
     verifyTheme: () => Effect.void, screenshot: () => Effect.succeed("unused"), text: () => Effect.succeed("unused"),
-    quit: () => Effect.void, chrome: () => Effect.void,
+    quit: () => Effect.void, restartForUpdate: () => Effect.void, chrome: () => Effect.void,
     connectionFailure: (_harness, name) => {
       expect(name).toBe("models.json")
       if (behavior === "missing-alert") return Effect.fail(new AssertionFailure({ message: "No alert" }))

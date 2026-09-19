@@ -664,8 +664,10 @@ requires its production-trusted release path and remains a separate qualificatio
 uses the pinned Bun runtime, snapshots unpublished source into a separate directory, installs frozen
 dependencies and builds 0.1.3/0.1.4 acceptance packages for one scoped HTTPS fixture. These are fixture
 versions of the same source, not a historical release migration. It installs the older DMG, changes
-an appearance setting, disables automatic downloads through the UI, offers the newer ZIP and uses
-Settings to check, download, verify and discard it. It then quits and removes the owned installation.
+an appearance setting and disables automatic downloads through the UI. It first offers a same-length
+corrupt copy of the newer ZIP with authentic signed metadata, requires download rejection and checks
+that the old version and theme remain. It then republishes the intact archive and uses Settings to
+check, download, verify and discard it. It quits and removes the owned installation.
 It records build logs, source digest, host observation, Playwright trace, screenshot and cleanup errors.
 
 The native macOS15 ARM64 probe passed at `/tmp/ml-native-update-controls-20260919/update-report.json`
@@ -673,6 +675,21 @@ with no cleanup errors. Both package builds passed. The installation, temporary 
 probe disk mounts were gone afterward. This establishes native acquisition, not U2 replacement,
 relaunch, retained-data migration, post-update generation, or production publisher trust.
 Local code-signing inventory currently reports zero valid identities; the fixture builds are ad hoc.
+
+The corrupt-download and recovery probe passed at
+`/tmp/ml-native-update-corruption-20260919/update-report.json`, with both builds successful and no
+cleanup errors. Screenshots capture rejection and the subsequent intact download reaching Ready.
+This qualifies the corrupt-download portion of U5 on this local Mac; publisher rejection, scheduled
+suite integration and the rest of native update acceptance remain outstanding. The fixture test
+separately proves the corrupt response preserves length and authentic metadata, changes only its
+private copy, and returns exact bytes again after republishing.
+
+`DesktopDriver.restartForUpdate()` saves the trace, invokes the normal restart control and requires
+the exact retiring Electron process to exit successfully. Real Electron tests cover clean exit,
+nonzero exit and an interrupted wait that leaves the application usable. This is a handoff witness,
+not proof of replacement or automatic relaunch. An ephemeral self-signed identity diagnostic failed
+local code-signing trust; its temporary keychain was deleted and the user search list was unchanged.
+No host trust changes were made to manufacture native updater acceptance.
 
 The probe found and fixed two issues: DMG authoring now selects HFS+ explicitly rather than depending
 on the host's APFS default (the fresh-image layout regression passes), and the update checkbox driver
