@@ -11,6 +11,8 @@ import { Installer, nativeInstaller } from "../src/installer"
 import { targets } from "../src/catalog"
 import { ProcessExecutor } from "../src/process"
 import { sha256 } from "../src/snapshot"
+import { rejectCorruptInstaller } from "../src/suites/install"
+import { AssertionFailure } from "../src/domain"
 
 const target = targets.find(t => t.id === "macos-15-arm64-metal-apple-silicon")!
 const payload = new TextEncoder().encode("fixture installer bytes")
@@ -52,4 +54,31 @@ test("native installer rejects altered bytes before executing any package comman
   expect(result._tag).toBe("Left")
   if (result._tag === "Left") expect(result.left.message).toContain("changed after download")
   expect(calls).toBe(0)
+})).pipe(Effect.provide(BunContext.layer))))
+
+test("corruption scenario changes a private copy and requires an integrity rejection", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-corruption-scenario-" })
+  const path = join(root, "Magnitude.dmg")
+  yield* fs.writeFile(path, payload)
+  const candidate = Candidate.make({ artifact: manifest.artifacts[0], version: manifest.version, target, path })
+  for (const mode of ["integrity", "unrelated", "accepted"] as const) {
+    let corruptPath = "", removed = 0
+    const result = yield* rejectCorruptInstaller(candidate).pipe(Effect.provideService(Installer, {
+      install: changed => Effect.gen(function* () {
+        corruptPath = changed.path
+        expect(changed.path).not.toBe(path)
+        const bytes = yield* fs.readFile(changed.path).pipe(Effect.orDie)
+        expect(bytes.length).toBe(payload.length)
+        expect(sha256(bytes)).not.toBe(candidate.artifact.sha256)
+        if (mode !== "accepted") return yield* new AssertionFailure({ message: mode === "integrity" ? "Installer changed after download; refusing installation" : "An unrelated install failure" })
+        return { candidate: changed, root, executable: "fixture", cli: "fixture", packageVersion: manifest.version }
+      }),
+      uninstall: () => Effect.sync(() => { removed++ }),
+    }), Effect.either)
+    expect(result._tag).toBe(mode === "integrity" ? "Right" : "Left")
+    expect(removed).toBe(mode === "accepted" ? 1 : 0)
+    expect(yield* fs.exists(corruptPath)).toBe(false)
+    expect(Buffer.from(yield* fs.readFile(path))).toEqual(Buffer.from(payload))
+  }
 })).pipe(Effect.provide(BunContext.layer))))

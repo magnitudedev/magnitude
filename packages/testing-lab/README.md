@@ -182,6 +182,10 @@ cases; the current incomplete worker returns failures/blocks, not a narrowed gre
 Its environment inputs match the artifact-worker probe (`LAB_WORKER_ROOT`,
 `LAB_WORKER_MANIFEST`, `LAB_WORKER_TARGET`). Failure diagnostics are content-addressed
 and transferred before the scheduler deletes the owned worker.
+Finalized Playwright traces and bundled-CLI command logs are also exported to content-addressed
+storage. UI traces are attached to the launch case and CLI logs to the CLI version case. Export
+failures remain visible as cleanup errors while preserving the original test results; files outside
+the owned evidence directory, symlinks and oversized diagnostics are rejected.
 
 ## Source build execution
 
@@ -228,3 +232,8 @@ production-signature validation, which remain separate cases. `install-probe.ts`
 host identity, installs the exact package, launches its desktop, checks payload identity and removes
 the owned installation even when assertions fail. This path passed with the current DMG on
 macOS15.5 ARM64; Linux and Windows header fixtures do not qualify native installation there.
+The corrupt-candidate case changes one byte in a same-length private installer copy and requires
+the integrity rejection before native package commands. It preserves the admitted original and
+removes the corrupt copy. The real macOS probe passed this rejection followed by normal installation,
+package identity verification and removal. Scheduled CLI coverage also connects catalog list/show,
+cached pull, status, stop and reload through the bundled binary.

@@ -14,6 +14,7 @@ import { DesktopDriver, playwrightDesktop } from "../src/desktop-driver"
 import { inspectPackageIdentity, PackageIdentity } from "../src/suites/package"
 import { HostInspector, HostInspectorLive } from "../src/host-inspector"
 import { HostObservation } from "../src/hardware"
+import { rejectCorruptInstaller } from "../src/suites/install"
 
 const run = Effect.gen(function* () {
   yield* assertRuntime
@@ -36,6 +37,7 @@ const run = Effect.gen(function* () {
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LOCALAPPDATA", "APPDATA", "SystemRoot", "TEMP"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const program = Effect.scoped(Effect.gen(function* () {
     const installer = yield* Installer
+    yield* rejectCorruptInstaller(candidate)
     const app = yield* Effect.acquireRelease(installer.install(candidate), app => installer.uninstall(app).pipe(Effect.orDie))
     yield* fs.writeFileString(join(root, "installed.json"), yield* Schema.encode(Schema.parseJson(Schema.Unknown))(app))
     const result = yield* checkedCommand(app.cli, ["--version"], { env: environment, inheritEnv: false })
@@ -48,6 +50,6 @@ const run = Effect.gen(function* () {
     yield* fs.writeFileString(join(root, "package-identity.json"), yield* Schema.encode(Schema.parseJson(PackageIdentity))(identity))
   })).pipe(Effect.provide(nativeInstaller({ disposable, root: join(root, "application"), environment })))
   yield* program
-  yield* fs.writeFileString(join(root, "install-report.json"), '{"installed":true,"bundledCliVersion":true,"packageIdentity":true,"removed":true}\n')
+  yield* fs.writeFileString(join(root, "install-report.json"), '{"corruptCandidateRejected":true,"installed":true,"bundledCliVersion":true,"packageIdentity":true,"removed":true}\n')
 })
 BunRuntime.runMain(run.pipe(Effect.provide(HostInspectorLive.pipe(Layer.provideMerge(Layer.merge(BunContext.layer, ProcessExecutorLive))))))

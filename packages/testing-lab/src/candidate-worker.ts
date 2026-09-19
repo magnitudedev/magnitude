@@ -13,7 +13,9 @@ import { HostObservation } from "./hardware"
 import { Installer } from "./installer"
 import { ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
+import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
+import { rejectCorruptInstaller } from "./suites/install"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { WorkAssignment, TargetResult } from "./work-store"
@@ -131,6 +133,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           if (version !== (yield* manifest).release.version) return yield* new AssertionFailure({ message: "Installed desktop reports a different version from the admitted candidate" })
           break
         }
+        case "I5": yield* rejectCorruptInstaller(yield* candidate).pipe(Effect.provideService(Installer, installer), Effect.provideService(FileSystem.FileSystem, fs)); break
         case "A1": yield* (yield* desktop).ready(); break
         case "A2": yield* (yield* desktop).search(config.model); yield* (yield* desktop).details(config.model); break
         case "A3": yield* (yield* desktop).search(config.model); yield* (yield* desktop).download(config.model); break
@@ -147,6 +150,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "E5": yield* (yield* endpoint).invalid; break
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
+        case "C3": yield* (yield* cli).modelLifecycle; break
         case "C6": yield* (yield* cli).nativeRuntime; break
         default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
@@ -176,6 +180,21 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const log = yield* evidence("desktop-process.json", Schema.Struct({ detail: Schema.String }), { detail })
     const index = finalCases.findIndex(result => result.caseId === "I3")
     if (index >= 0) finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, log] }
+  }
+  // Traces are finalized when the desktop scope closes. Publish before the allocator removes
+  // the worker; a local path alone is not durable evidence. Export errors preserve case results.
+  const exportFile = (relative: string, caseId: string, maxBytes: number) => Effect.gen(function* () {
+    const index = finalCases.findIndex(result => result.caseId === caseId)
+    if (index < 0) return
+    const item = yield* publishEvidenceFile(evidenceDirectory, relative, maxBytes)
+    finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, item] }
+  }).pipe(Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Evidence ${relative}: ${error.message}`) })))
+  if (yield* fs.exists(join(evidenceDirectory, "desktop", "ui-trace.zip"))) yield* exportFile("desktop/ui-trace.zip", "I3", 128 * 1024 * 1024)
+  const cliEvidence = join(evidenceDirectory, "cli")
+  if (yield* fs.exists(cliEvidence)) {
+    const names = (yield* fs.readDirectory(cliEvidence)).filter(name => /^\d+-[a-z0-9-]+\.json$/.test(name)).sort()
+    if (names.length > 100) cleanupErrors.push("CLI evidence exceeded its file-count limit")
+    else for (const name of names) yield* exportFile(`cli/${name}`, "C1", 32 * 1024 * 1024)
   }
   return TargetResult.make({ cases: finalCases, cleanupErrors })
 }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" || error._tag === "CandidateWorkerFailure" ? error : unavailable(error.message)))

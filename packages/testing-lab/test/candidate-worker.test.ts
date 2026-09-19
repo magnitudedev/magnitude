@@ -77,6 +77,7 @@ for (const mode of ["success", "wrong-version", "corrupt", "cleanup-failure", "c
       expect(yield* fs.exists(nativeState)).toBe(false)
     }
     expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" ? 1 : 0)
+    if (installed > 0 && mode !== "defect") expect(result.cases.find(c => c.caseId === "C1")!.evidence.some(item => item.path.startsWith("evidence/cli/"))).toBe(true)
     for (const item of result.cases.flatMap(c => c.evidence)) expect(yield* objects.exists(item.sha256)).toBe(true)
   })
   yield* program.pipe(Effect.provide([

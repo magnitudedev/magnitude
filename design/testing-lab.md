@@ -75,6 +75,8 @@ DOM position. UI redesign preserves those identities; changed workflows are cent
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
+Finalized UI traces and command logs are published as content-addressed evidence before worker
+removal. Evidence export failures remain visible without replacing the original case outcome.
 
 Blocked prerequisites propagate without hiding the original product failure. Pass means every
 required selected case passed and cleanup completed. Tests must demonstrate corrupt-input rejection,
