@@ -5,6 +5,7 @@ import { ArtifactStore } from "./artifact-store"
 import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
 import { runtimeEnvironment } from "./runtime-release"
+import { prepareApplicationContext } from "./application-context"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
 import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
@@ -96,15 +97,10 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       yield* selectInstaller(value.release, target)
       return yield* evidence("artifact-input.json", ArtifactInput, value)
     }))
-    // Native Unix control sockets have a small byte limit independent of the artifact path.
-    // Keep one private, scope-owned state directory shared by the app and bundled CLI.
-    const stateDirectory = process.platform === "win32" ? join(config.root, "profile", "state")
-      : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" }).pipe(Effect.provideService(Scope.Scope, scope))
-    const environment = { ...config.environment, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory, HOME: join(config.root, "home"), USERPROFILE: join(config.root, "home"),
-      APPDATA: join(config.root, "home", "AppData", "Roaming"), LOCALAPPDATA: join(config.root, "home", "AppData", "Local"),
-      XDG_CONFIG_HOME: join(config.root, "home", ".config"), XDG_DATA_HOME: join(config.root, "home", ".local", "share"),
-      MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
-    yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
+    const application = yield* prepareApplicationContext(config.root, config.port, config.environment).pipe(Effect.provideService(Scope.Scope, scope))
+    const applicationEvidence = yield* evidence("application-context.json", Schema.Struct({ mode: Schema.String, profile: Schema.String, port: Schema.Int, harnessHome: Schema.String }),
+      { mode: application.mode, profile: application.profile, port: application.port, harnessHome: application.harnessHome })
+    const environment = application.environment
     const collector = assignment.target.cases.some(test => test.id === "E6")
       ? Option.some(yield* executionTelemetry().pipe(Effect.provideService(Scope.Scope, scope))) : Option.none()
     const candidateEnvironment = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => runtimeEnvironment(value.release, target.artifactHost,
@@ -113,7 +109,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const selection = assignment.plan.request.selection
     const harnesses = selectedHarnesses(selection)
     const connections = assignment.target.cases.some(test => test.id === "A5" || test.id === "C4" || test.id === "A7")
-      ? yield* Effect.forEach(harnesses, harness => connectionFixture(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), harness, `http://127.0.0.1:${config.port}/inference/v1`)) : []
+      ? yield* Effect.forEach(harnesses, harness => connectionFixture(application.harnessHome, harness, `http://127.0.0.1:${application.port}/inference/v1`)) : []
     const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs)))
     const installation = yield* Effect.cached(candidate.pipe(Effect.flatMap(value => installationSession(value,
@@ -123,8 +119,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     let fixtureCleanupFailed = false
     const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
-      const value = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
-        evidence: join(evidenceDirectory, "desktop"), port: config.port, environment: yield* candidateEnvironment }, detail => { cleanupErrors.push(detail) }).pipe(
+      const value = yield* desktopSession({ mode: application.mode, executable: app.executable, profile: application.profile,
+        evidence: join(evidenceDirectory, "desktop"), port: application.port, environment: yield* candidateEnvironment }, detail => { cleanupErrors.push(detail) }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
       activeSession = Option.some(value)
       return value
@@ -136,7 +132,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       yield* driver.theme("dark")
       yield* driver.quit()
       yield* (yield* session).stop
-      return yield* captureRetainedProfile(environment.MAGNITUDE_DEV_DATA_DIR).pipe(Effect.provideService(FileSystem.FileSystem, fs))
+      return yield* captureRetainedProfile(application.profile).pipe(Effect.provideService(FileSystem.FileSystem, fs))
     }))
     const cli = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
@@ -145,13 +141,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       return Context.get(context, CliTests)
     }))
     const endpoint = yield* Effect.cached(Effect.gen(function* () {
-      const context = yield* Layer.buildWithScope(endpointTests(`http://127.0.0.1:${config.port}`, config.model).pipe(Layer.provide(FetchHttpClient.layer)), scope)
+      const context = yield* Layer.buildWithScope(endpointTests(`http://127.0.0.1:${application.port}`, config.model).pipe(Layer.provide(FetchHttpClient.layer)), scope)
       return Context.get(context, EndpointTests)
     }))
     const tools = yield* Effect.serviceOption(HarnessTools)
     const harnessSuites = new Map<Harness, ReturnType<typeof harnessSuite>>()
     for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(candidateEnvironment.pipe(Effect.flatMap(prepared => harnessSuite(harness, config.model,
-      join(evidenceDirectory, "harness", harness), join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), prepared)))))
+      join(evidenceDirectory, "harness", harness), application.harnessHome, prepared)))))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       if (fixtureCleanupFailed) return yield* unavailable("Native fixture restoration failed; refusing further operations on an uncertain installation")
       switch (test.id as string) {
@@ -177,9 +173,9 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
               const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
                 : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" })
               const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
-              const updateEnvironment = { ...baselineEnvironment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
+              const updateEnvironment = { ...baselineEnvironment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
               const updateSession = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
-                evidence: join(evidenceDirectory, "update-baseline"), port: config.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
+                evidence: join(evidenceDirectory, "update-baseline"), port: application.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
               const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
               const driver = yield* updateSession.driver
               const identity = yield* inspectPackageIdentity(app, yield* driver.host(), updateEnvironment)
@@ -281,7 +277,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const running = yield* session
           yield* running.stop
           const serviceError = yield* Effect.scoped(Effect.gen(function* () {
-            yield* occupyServicePort(config.port)
+            yield* occupyServicePort(application.port)
             const failed = yield* desktop
             const message = yield* failed.serviceFailure()
             yield* failed.screenshot("service-failure")
@@ -292,7 +288,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const driver = yield* desktop
           for (const fixture of connections) {
             yield* fixture.exercise.pipe(Effect.provideService(DesktopDriver, driver))
-            yield* exerciseConnectionError(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), fixture.harness).pipe(
+            yield* exerciseConnectionError(application.harnessHome, fixture.harness).pipe(
               Effect.provideService(DesktopDriver, driver), Effect.provideService(FileSystem.FileSystem, fs))
             yield* fixture.inspect(true)
           }
@@ -303,7 +299,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "E6": {
           if (Option.isNone(collector)) return yield* unavailable("Backend verification requires the scoped native execution collector")
           const expected = yield* admittedRuntimeModules((yield* manifest).release, target.artifactHost).pipe(Effect.provide(NodeArchiveExtractor))
-          const observed = yield* observeGeneration(`http://127.0.0.1:${config.port}`, config.model, collector.value).pipe(Effect.provide(FetchHttpClient.layer))
+          const observed = yield* observeGeneration(`http://127.0.0.1:${application.port}`, config.model, collector.value).pipe(Effect.provide(FetchHttpClient.layer))
           const receipt = yield* evidence("E6-native-generation.json", GenerationExecution, observed)
           const modules = yield* evidence("E6-admitted-modules.json", Schema.Array(LoadedBackendModule), expected)
           backendEvidence.push(receipt, modules)
@@ -356,7 +352,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const before = yield* driver.identity()
           const tests = yield* cli
           yield* tests.invalid
-          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: config.port, environment: yield* candidateEnvironment }, before).pipe(
+          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: application.port, environment: yield* candidateEnvironment }, before).pipe(
             Effect.provideService(ProcessExecutor, processes))
           yield* tests.inspect
           if (!Schema.equivalence(ApplicationIdentity)(before, yield* driver.identity())) return yield* new AssertionFailure({ message: "CLI interruption changed the owning application or service" })
@@ -375,7 +371,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             yield* evidence("X1-native-removal.json", RemovalReceipt, receipt)] })
         }
         case "X3": {
-          const receipt = yield* verifyRetainedProfile(environment.MAGNITUDE_DEV_DATA_DIR, yield* retainedProfile).pipe(Effect.provideService(FileSystem.FileSystem, fs))
+          const receipt = yield* verifyRetainedProfile(application.profile, yield* retainedProfile).pipe(Effect.provideService(FileSystem.FileSystem, fs))
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
             yield* evidence("X3-retained-profile.json", RetainedProfile, receipt)] })
         }
@@ -399,7 +395,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
       const buildEvidence = source && (result.caseId === "P1" || result.caseId === "P2") ? source.evidence().filter(item => result.caseId !== "P1" || item.path !== "evidence/build-package.json") : []
-      const refs = [...result.evidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(diagnostic ? [diagnostic] : [])]
+      const refs = [...result.evidence, applicationEvidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })

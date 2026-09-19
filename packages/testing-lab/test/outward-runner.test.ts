@@ -11,7 +11,7 @@ import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 import { WorkerResults } from "../src/worker-results"
 import { WorkerAccessDenied, WorkerTicketId, WorkerTickets } from "../src/worker-tickets"
 
-for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "deadline", "foreign-lease", "untrusted-local"] as const) test(`outward runner preserves result and credential cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "deadline", "foreign-lease", "untrusted-local", "shared-disposable"] as const) test(`outward runner preserves result and credential cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "outward-runner-test", owner: "fixture", trust: mode === "untrusted-local" ? "untrusted-ci" : "developer", mode: "verify", allowSpark: false,
     input: { kind: "source", digest: "a".repeat(64) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
     limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 10, idleMinutes: 15 } })
@@ -43,7 +43,7 @@ for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "dea
     if (mode === "bootstrap-error") return yield* new InfrastructureFailure({ operation: "fixture-start", message: "Bootstrap failed" })
     if (mode === "cancel") return yield* Effect.never
   }) }]]) })
-  const runner = outwardWorkerRunner({ origin: "https://lab.example.com", pollMs: 10, runtimes: [{ provider: "local", artifactHost: "linux-x64-gnu", root: "/tmp/unused", executable: "/runner/bun", args: ["outward-worker.ts"], disposable: false, port: 11279, model: "fixture" }] }).pipe(Layer.provide(Layer.mergeAll(tickets, results, inputs, bootstrap)))
+  const runner = outwardWorkerRunner({ origin: "https://lab.example.com", pollMs: 10, runtimes: [{ provider: "local", artifactHost: "linux-x64-gnu", root: "/tmp/unused", executable: "/runner/bun", args: ["outward-worker.ts"], disposable: mode === "shared-disposable", port: 11279, model: "fixture" }] }).pipe(Layer.provide(Layer.mergeAll(tickets, results, inputs, bootstrap)))
   yield* Effect.gen(function* () {
     const executing = (yield* WorkerRunner).run(machine, assignment)
     if (mode === "cancel") {
@@ -55,7 +55,7 @@ for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "dea
       expect(result._tag).toBe(mode === "success" || mode === "revoke-error" ? "Right" : "Left")
       if (result._tag === "Right") { expect(result.right.cases).toEqual(reply.result.cases); expect(result.right.cleanupErrors.length).toBe(mode === "revoke-error" ? 1 : 0) }
     }
-    expect(issued).toBe(mode === "foreign-lease" || mode === "untrusted-local" ? 0 : 1)
+    expect(issued).toBe(mode === "foreign-lease" || mode === "untrusted-local" || mode === "shared-disposable" ? 0 : 1)
     expect(revoked).toBe(issued)
   }).pipe(Effect.provide(runner))
 }))))

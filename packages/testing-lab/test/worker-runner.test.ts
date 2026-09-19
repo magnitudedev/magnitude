@@ -19,7 +19,7 @@ import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 import { transportWorkerRunner, WorkerTransports } from "../src/worker-runner"
 import { temporaryDatabase } from "./postgres"
 
-for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local"] as const) {
+for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable"] as const) {
   test(`transported workers reject unauthorized or mismatched results: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-runner-" })
@@ -77,10 +77,10 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       }
       const result = yield* Effect.flatMap(WorkerRunner, runner => runner.run(machine, assignment)).pipe(Effect.either,
         Effect.provide(transportWorkerRunner([{ provider: "local", artifactHost: "darwin-arm64", executable: "fixture", args: [], root: root,
-          disposable: false, port: 11279, model: "fixture" }]).pipe(Layer.provide(Layer.succeed(WorkerTransports, { transports: new Map([["local" as const, transport]]) })))))
+          disposable: mode === "shared-disposable", port: 11279, model: "fixture" }]).pipe(Layer.provide(Layer.succeed(WorkerTransports, { transports: new Map([["local" as const, transport]]) })))))
       expect(result._tag).toBe(mode === "success" ? "Right" : "Left")
-      expect(executions).toBe(["foreign-owner", "untrusted-local"].includes(mode) ? 0 : 1)
-      if (["foreign-owner", "untrusted-local"].includes(mode)) expect(uploads).toBe(0)
+      expect(executions).toBe(["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode) ? 0 : 1)
+      if (["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode)) expect(uploads).toBe(0)
       expect(yield* inputs.missing(request.owner, [sha256(evidence)])).toEqual(mode === "success" ? [] : [sha256(evidence)])
     }).pipe(Effect.provide(Layer.mergeAll(database, registry, objectLayer)))
   })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))), 30_000)

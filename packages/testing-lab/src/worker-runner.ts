@@ -28,6 +28,7 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
       const transport = transports.transports.get(machine.provider)
       if (selected.length !== 1 || !transport) return yield* fail("Exactly one qualified guest runtime and transport must match the worker")
       const runtime = selected[0]!
+      if (runtime.disposable && (machine.provider === "local" || machine.provider === "spark")) return yield* fail("Shared hosts cannot grant a disposable OS-user context")
       if (machine.tags.runId !== assignment.claim.runId || assignment.claim.targetId !== assignment.target.target.id) return yield* fail("Worker ownership does not match its assignment")
       if (assignment.plan.request.trust === "untrusted-ci" && (!runtime.disposable || machine.provider === "local" || machine.provider === "spark")) return yield* fail("Untrusted work requires a disposable cloud worker")
       const deadline = Math.min(DateTime.toEpochMillis(machine.tags.expiresAt), DateTime.toEpochMillis(assignment.deadline))

@@ -35,6 +35,7 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
       const bootstrap = bootstraps.providers.get(machine.provider)
       if (matches.length !== 1 || !bootstrap) return yield* fail("Exactly one guest runtime and bootstrap must match the worker")
       const runtime = matches[0]!
+      if (runtime.disposable && (machine.provider === "local" || machine.provider === "spark")) return yield* fail("Shared hosts cannot grant a disposable OS-user context")
       if (machine.tags.runId !== assignment.claim.runId || assignment.claim.targetId !== assignment.target.target.id) return yield* fail("Worker ownership differs from assignment")
       if (assignment.plan.request.trust === "untrusted-ci" && (!runtime.disposable || machine.provider === "local" || machine.provider === "spark")) return yield* fail("Untrusted work requires disposable cloud execution")
       const deadline = Math.min(DateTime.toEpochMillis(machine.tags.expiresAt), DateTime.toEpochMillis(assignment.deadline))

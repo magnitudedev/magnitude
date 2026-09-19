@@ -58,6 +58,13 @@ separately supplied qualified disposable-user capability, uses normal product da
 policy, and rejects development profile or control-directory overrides. A HOME substitution is
 not proof of disposable OS-user authority. Existing isolated probes cannot qualify native login
 registration; provider/user qualification and installed-mode orchestration are required separately.
+The shared worker derives application, CLI, endpoint, harness and retained-data paths from one
+context and records its mode and nonsecret paths in case evidence. A native guest context uses
+the actual OS account, verifies non-root Unix identity and home ownership, and rejects preexisting
+application data, including dangling links. Only coordinator-designated disposable cloud workers
+can grant that context; shared-host runners reject a disposable claim even for trusted source.
+Native Mac guest installation uses Applications so normal installed-app policies can be exercised.
+These admission checks do not themselves qualify native login registration or update behavior.
 
 `quick`, `pr`, `full` and `release` select cases and targets. Target expansion is explicit, including
 unqualified targets. Missing capacity or credentials blocks a case; it never removes it or makes
