@@ -1,0 +1,17 @@
+{
+  "name": "@magnitudedev/testing-lab",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "bunx --bun vitest run" },
+  "dependencies": {
+    "@effect/platform": "^0.96.1",
+    "@effect/platform-bun": "^0.90.0",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "effect": "3.21.2",
+    "pg": "8.20.0",
+    "playwright": "^1.62.1"
+  },
+  "devDependencies": { "@types/bun": "1.3.14", "@types/pg": "8.20.0", "vitest": "^3.2.4" }
+}

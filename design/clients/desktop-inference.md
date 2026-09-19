@@ -29,6 +29,8 @@ Main permits three automatic renderer-crash retries. After exhaustion or a faile
 model observations become unavailable and the tray retains Open and Quit. Explicit Open retries
 the renderer with a renewed budget. Background demand never renews it or shows a window. Renderer
 failure cannot terminate or restart the service, and teardown never starts renderer recovery.
+Preload and native RPC contracts import the schema-only client-common desktop contract entry.
+They must not initialize renderer services, React hooks, or draft state in Electron's isolated preload world.
 The privileged IPC transport identifies each preload/runtime occurrence independently of its retained
 window. Crash or main-document navigation disconnects that occurrence and releases its subscriptions.
 Messages carry the renderer-session identity; retired requests and queued replies cannot cross into

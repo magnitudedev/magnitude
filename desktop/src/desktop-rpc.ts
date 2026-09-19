@@ -1,11 +1,11 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common"
+import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common/desktop/contracts"
 import { Schema } from "effect"
 
-export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
-import { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
+export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
+import { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
 export const InferenceHostRpcs = RpcGroup.make(

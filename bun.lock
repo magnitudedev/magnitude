@@ -608,6 +608,23 @@
         "vitest": "^3.2.4",
       },
     },
+    "packages/testing-lab": {
+      "name": "@magnitudedev/testing-lab",
+      "dependencies": {
+        "@effect/platform": "^0.96.1",
+        "@effect/platform-bun": "^0.90.0",
+        "@magnitudedev/release": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
+        "effect": "3.21.2",
+        "pg": "8.20.0",
+        "playwright": "^1.62.1",
+      },
+      "devDependencies": {
+        "@types/bun": "1.3.14",
+        "@types/pg": "8.20.0",
+        "vitest": "^3.2.4",
+      },
+    },
     "packages/tracing": {
       "name": "@magnitudedev/tracing",
       "version": "0.0.1",
@@ -1131,6 +1148,8 @@
     "@magnitudedev/skills": ["@magnitudedev/skills@workspace:packages/skills"],
 
     "@magnitudedev/storage": ["@magnitudedev/storage@workspace:packages/storage"],
+
+    "@magnitudedev/testing-lab": ["@magnitudedev/testing-lab@workspace:packages/testing-lab"],
 
     "@magnitudedev/tracing": ["@magnitudedev/tracing@workspace:packages/tracing"],
 

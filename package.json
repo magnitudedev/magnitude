@@ -75,7 +75,8 @@
     "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- doctor",
     "icn:version": "cargo run --manifest-path inference/Cargo.toml -p icn-server -- version --json",
     "icn:catalog:update": "cargo run --manifest-path inference/Cargo.toml -p icn-catalog -- update-lock --output inference/catalog/models.lock.json --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
-    "icn:catalog:build-bundle": "cargo run --manifest-path inference/Cargo.toml -p icn-catalog -- build-bundle --output inference/target/catalog-inputs/model-planner-inputs.bundle --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache"
+    "icn:catalog:build-bundle": "cargo run --manifest-path inference/Cargo.toml -p icn-catalog -- build-bundle --output inference/target/catalog-inputs/model-planner-inputs.bundle --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
+    "lab": "bun packages/testing-lab/src/cli.ts"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",

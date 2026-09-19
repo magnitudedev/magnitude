@@ -1,4 +1,4 @@
-import { DesktopConnectRequest, DesktopConnectionsSnapshot } from "@magnitudedev/client-common"
+import { DesktopConnectRequest, DesktopConnectionsSnapshot } from "@magnitudedev/client-common/desktop/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"

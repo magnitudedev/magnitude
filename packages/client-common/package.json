@@ -17,6 +17,10 @@
     "./types/menu-action": {
       "types": "./src/types/menu-action.ts",
       "import": "./src/types/menu-action.ts"
+    },
+    "./desktop/contracts": {
+      "types": "./src/desktop/contracts.ts",
+      "import": "./src/desktop/contracts.ts"
     }
   },
   "scripts": {
