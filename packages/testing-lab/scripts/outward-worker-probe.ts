@@ -1,15 +1,18 @@
-import { FetchHttpClient, FileSystem, HttpServer } from "@effect/platform"
+import { FetchHttpClient, FileSystem, HttpClient, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Config, Context, Effect, Layer, Option, Schema, Scope, Stream } from "effect"
 import { join } from "node:path"
 import { snapshotArtifacts } from "../src/artifact-input"
 import { fileArtifactStore } from "../src/artifact-store"
 import { planRun } from "../src/catalog"
 import { initializeDatabase } from "../src/database"
-import { AssertionFailure, RunRequest } from "../src/domain"
+import { AssertionFailure, LeaseId, RunRequest } from "../src/domain"
+import { LocalMachine } from "../src/machines"
+import { outwardWorkerRunner, type WorkerBootstrap, WorkerBootstraps } from "../src/outward-runner"
+import { WorkerRunner } from "../src/scheduler"
 import { InputRegistry, InputRegistryLive } from "../src/inputs"
 import { runOutwardWorker } from "../src/outward-worker"
-import { ProcessExecutorLive } from "../src/process"
+import { ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import { RunStore, runStoreLayer } from "../src/run-store"
 import { assertRuntime } from "../src/runtime"
 import { WorkStore, WorkStoreLive } from "../src/work-store"
@@ -18,9 +21,9 @@ import { workerClientLayer } from "../src/worker-client"
 import { GuestExecutorLive } from "../src/worker-entry"
 import { WorkerEvidenceLive } from "../src/worker-evidence"
 import { WorkerInputsLive } from "../src/worker-inputs"
-import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
+import { WorkerReply } from "../src/worker-protocol"
 import { WorkerResults, WorkerResultsLive } from "../src/worker-results"
-import { WorkerTickets, WorkerTicketsLive } from "../src/worker-tickets"
+import { WorkerTicketsLive } from "../src/worker-tickets"
 import { temporaryDatabase } from "../test/postgres"
 
 const program = Effect.scoped(Effect.gen(function* () {
@@ -51,19 +54,29 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* (yield* RunStore).submit(yield* planRun(request))
     const work = yield* WorkStore
     const assignment = Option.getOrThrow(yield* work.claim("native-local-probe", 3600))
-    const invocation = WorkerInvocation.make({ schemaVersion: 1, assignment, disposable: false, port: 11429, model: "qwen3.5-4b:gguf:q4" })
-    const ticket = yield* (yield* WorkerTickets).issue(invocation)
     const server = yield* HttpServer.HttpServer
     yield* server.serve(workerApi)
     if (server.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected TCP server")
-    const reply = yield* runOutwardWorker({ root: join(root, "guest"), pollMs: 1000 }).pipe(Effect.provide([
-      workerClientLayer(`http://127.0.0.1:${server.address.port}`, ticket.token), GuestExecutorLive,
-    ]))
+    const origin = `http://127.0.0.1:${server.address.port}`
+    const scope = yield* Effect.scope
+    const guestServices = yield* Effect.context<FileSystem.FileSystem | ProcessExecutor | HttpClient.HttpClient | Scope.Scope>()
+    let guestRoot = ""
+    const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { start: (_machine, launch) => Effect.gen(function* () {
+      guestRoot = launch.root
+      yield* runOutwardWorker({ root: launch.root, pollMs: 1000 }).pipe(Effect.provide([workerClientLayer(launch.origin, launch.token), GuestExecutorLive]), Effect.provide(guestServices), Effect.forkIn(scope))
+    }) }]]) })
+    const runner = Context.get(yield* Layer.build(outwardWorkerRunner({ origin, pollMs: 100, runtimes: [{ provider: "local", artifactHost: "darwin-arm64", root: join(root, "guest"),
+      executable: "bun", args: ["src/outward-worker.ts"], disposable: false, port: 11429, model: "qwen3.5-4b:gguf:q4" }] }).pipe(Layer.provide(bootstrap))), WorkerRunner)
+    const machine = LocalMachine.make({ provider: "local", root: join(root, "guest"), tags: { schemaVersion: 1, runId: assignment.claim.runId,
+      leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), expiresAt: assignment.deadline } })
+    const result = yield* runner.run(machine, assignment)
+    const reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result })
     const received = Option.getOrThrow(yield* (yield* WorkerResults).read(assignment.claim))
     if (!Schema.equivalence(WorkerReply)(reply, received)) return yield* new AssertionFailure({ message: "Received worker result differs from guest reply" })
     yield* fs.writeFileString(join(root, "outward-report.json"), yield* Schema.encode(Schema.parseJson(WorkerReply))(received), { mode: 0o600 })
     yield* work.finish(assignment.claim, received.result)
     yield* work.reconcile()
+    if (yield* fs.exists(join(guestRoot, "installation", "Magnitude.app"))) return yield* new AssertionFailure({ message: "Native app remains after outward execution" })
     if (received.result.cleanupErrors.length || ["P3", "I1", "I2", "I3", "I5"].some(id => received.result.cases.find(test => test.caseId === id)?.outcome.status !== "passed")) {
       return yield* new AssertionFailure({ message: "Native outward probe did not pass its required exercised cases; inspect outward-report.json" })
     }

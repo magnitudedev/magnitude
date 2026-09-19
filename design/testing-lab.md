@@ -102,6 +102,16 @@ An existing workspace cannot trigger another execution. The guest saves its vali
 before delivery, deduplicates evidence by content identity and monitors live assignment
 authority while working. Lost authority or the attempt deadline interrupts execution and
 its owned cleanup scope; transport failures do not silently rerun tests.
+The outward runner validates allocation ownership and trust before issuing a guest credential,
+delivers it through a provider bootstrap, and waits for the immutable receipt within the
+allocation deadline. Credential revocation runs on success, failure, timeout and cancellation.
+Revocation failures remain separate cleanup errors when a valid test result exists; the
+scheduler retains responsibility for releasing the allocated machine.
+Provider bootstraps verify the resource's exact lease identity before delivering authority.
+Credentials must not appear in command arguments, script text or returned provider errors;
+temporary delivery files are private and scoped. Guest launch uses the intended application
+user and a qualified display environment. Service-session execution cannot qualify an
+interactive desktop test, and accepting a launch request alone never establishes a test pass.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
 Installed-package ownership follows explicit present/absent transitions. Removal updates

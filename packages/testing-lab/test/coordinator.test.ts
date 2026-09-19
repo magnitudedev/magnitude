@@ -8,7 +8,7 @@ import { fileArtifactStore } from "../src/artifact-store"
 import { LabClient, labClientLayer } from "../src/client"
 import { startCoordinator } from "../src/coordinator"
 import { OwnerId, Principal, RunRequest } from "../src/domain"
-import { ProcessExecutorLive } from "../src/process"
+import { ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import { MachineProviders, WorkerRunner } from "../src/scheduler"
 import { sha256 } from "../src/snapshot"
 import { temporaryDatabase } from "./postgres"
@@ -56,7 +56,7 @@ test("live coordinator admits API inputs, schedules runs and preserves owner iso
   yield* program
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))
 
-test("configured entry point keeps the server alive and rejects weak credentials", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const provider of ["none", "azure"] as const) test(`configured ${provider} entry point keeps the server alive and rejects weak credentials`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-server-config-" })
   const database = yield* temporaryDatabase
@@ -65,12 +65,24 @@ test("configured entry point keeps the server alive and rejects weak credentials
   const file = join(root, "server.json")
   yield* fs.writeFileString(file, yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ coordinator: { instance: "configured-test", concurrency: 1, accountBudgetUsd: 50, pollMs: 20, reconcileMs: 50 },
     hostname: "127.0.0.1", port: 0, credentials: [{ tokenEnvironment: "TEST_LAB_TOKEN", principal: { owner: "configured", trust: "developer" } }],
-    storage: { kind: "file", directory: join(root, "objects") }, runtimes: [] }))
+    storage: { kind: "file", directory: join(root, "objects") },
+    ...(provider === "azure" ? { azure: { workerOrigin: "https://lab.example.com", allocation: {
+      executable: "fixture-az", subscription: "5304c4b3-d605-4193-b0cb-766c065acfa6", resourceGroup: "magnitude-ci", location: "westus2",
+      subnetId: "/subscriptions/5304c4b3-d605-4193-b0cb-766c065acfa6/resourceGroups/magnitude-ci/providers/Microsoft.Network/virtualNetworks/lab/subnets/workers",
+      adminUsername: "labworker", sshPublicKey: "ssh-ed25519 fixture", images: [],
+    } } } : {}),
+    runtimes: provider === "azure" ? [{ provider: "azure", artifactHost: "linux-x64-gnu", executable: "/opt/lab/bun", args: ["/opt/lab/outward-worker.ts"],
+      root: "/home/labworker/runs", disposable: true, port: 11499, model: "fixture-model" }] : [] }))
   const values = new Map([["LAB_COORDINATOR_CONFIG", file], ["LAB_DATABASE_URL", `postgresql://lab@localhost/postgres?host=${encodeURIComponent(row.socket)}`], ["TEST_LAB_TOKEN", "short"]])
-  const invalid = yield* configuredCoordinator.pipe(Effect.withConfigProvider(ConfigProvider.fromMap(values)), Effect.either)
+  const configured = configuredCoordinator.pipe(Effect.provideService(ProcessExecutor, { run: spec => {
+    expect(spec.executable).toBe("fixture-az")
+    expect(spec.args[0]).toBe("resource")
+    return Effect.succeed({ exitCode: 0, stdout: "[]", stderr: "" })
+  } }))
+  const invalid = yield* configured.pipe(Effect.withConfigProvider(ConfigProvider.fromMap(values)), Effect.either)
   expect(invalid._tag === "Left" && invalid.left._tag).toBe("InvalidInput")
   values.set("TEST_LAB_TOKEN", "c".repeat(40))
-  const service = yield* configuredCoordinator.pipe(Effect.withConfigProvider(ConfigProvider.fromMap(values)))
+  const service = yield* configured.pipe(Effect.withConfigProvider(ConfigProvider.fromMap(values)))
   const running = yield* Effect.forkScoped(service.run)
   if (service.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected configured TCP address")
   const identity = yield* Effect.flatMap(LabClient, client => client.identity()).pipe(Effect.provide(

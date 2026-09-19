@@ -304,13 +304,14 @@ Supply a distinct credential of at least 32 characters per configured identity. 
 migrations before accepting HTTP work, shares durable stores with scheduler/reconciler loops,
 and keeps cleanup scoped to its leases. Empty runtimes/providers support API setup and return
 explicit blocked run results; they cannot qualify an app test. Namespace configuration requires
-both pinned image observations and an installed guest runtime. This entry point does not yet
-configure Azure/Spark execution or provision fresh guest runtimes. Azure Blob storage can replace
+both pinned image observations and an installed guest runtime. Azure Linux can use the outward
+worker protocol through the optional `azure` configuration described below. Spark execution
+and fresh guest runtime provisioning are not yet configured by this entry point. Azure Blob storage can replace
 the file storage using `{"kind":"azure","config":<AzureArtifactConfig>}`.
 
 For remote deployment, terminate HTTPS at the ingress; the bearer credential mode is the initial
-private-service path. Entra/GitHub OIDC, outward worker polling, Bicep deployment and managed
-coordinator hosting remain unfinished. A real HTTP/PostgreSQL test covers upload, admission,
+private-service path. Entra/GitHub OIDC and outward worker polling are implemented; Bicep
+deployment and managed coordinator hosting remain unfinished. A real HTTP/PostgreSQL test covers upload, admission,
 idempotent submission, automatic scheduling, results, owner isolation and configured startup.
 
 GitHub OIDC admission can be enabled with a `github` configuration containing `audience`
@@ -502,7 +503,7 @@ worker, saves `reply.json` before delivery, uploads unique evidence and returns 
 result. It checks live assignment authority every ten seconds and honors the run
 deadline. Existing workspaces cannot trigger another execution. Failed delivery
 leaves the reply available for inspection; a delivery-only resume command is not
-implemented yet. Scheduler/bootstrap wiring is still unfinished.
+implemented yet. Provider bootstrap and configured deployment wiring are still unfinished.
 
 The real macOS 15 ARM64 artifact probe in `scripts/outward-worker-probe.ts` passed
 its install/launch/version/corrupt-installer checks through a loopback HTTP coordinator,
@@ -511,3 +512,28 @@ including evidence upload and result receipt. Report:
 remain explicitly blocked. Cleanup errors were empty and the installed app was gone.
 P1/P2 recorded artifact provenance/verification; they did not compile or package anew.
 This does not qualify Metal inference, other platforms or Azure execution.
+
+`outwardWorkerRunner` implements the scheduler's worker interface: it validates the
+allocation, issues a scoped credential, calls a configured provider bootstrap, polls
+the receipt and revokes the credential on every exit path. A revocation failure adds
+a cleanup error without replacing valid case results. The scheduler still owns machine
+release. The native probe now exercises this runner with a local bootstrap; its latest
+report is `/tmp/ml-outward-runner-captured-20260918/outward-report.json` (seven passed,
+P4/P5/I4 blocked, no cleanup errors, test app removed).
+
+The configured coordinator retains Namespace transport and accepts an optional Azure entry:
+`"azure": { "allocation": <AzureConfig>, "workerOrigin": "https://your-coordinator" }`.
+Azure runtimes use provider `azure`, an absolute guest executable/root and Linux artifact host.
+The image must already contain the pinned worker runtime, build/package tools and display
+setup; configuring an ordinary marketplace image alone does not supply these dependencies.
+The coordinator validates VM identity and exact lease tags, then delivers the attempt credential
+through a managed Run Command protected parameter. The request body exists only in a scoped
+0600 temporary file; the token is absent from CLI arguments and script text. The script runs as
+the configured guest user, and the guest returns results through HTTPS. Delivery is bounded by
+the lease deadline and is never automatically replayed after an ambiguous response.
+
+Azure Linux bootstrap and server wiring have targeted tests, including executing the generated
+shell with hostile-looking argument literals. They are **not yet live cloud qualified**.
+Windows is rejected by this bootstrap and requires an interactive-session launcher; a VM agent
+service-session launch cannot qualify the desktop suite. Microsoft's parameter semantics are
+specified in [Managed Run Command](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/run-command-managed).
