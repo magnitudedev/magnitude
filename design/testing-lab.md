@@ -197,6 +197,11 @@ guessing loader precedence. Package ownership alone does not prove symbol-versio
 Version requirements are matched by exact ABI identity against the resolved provider’s version
 definitions, including owned dependencies. Missing or truncated version reports fail; a newer-looking
 version number cannot substitute for an absent required identity.
+Linux package inspection covers every installed native file and the admitted runtime composition.
+Program headers must identify the architecture’s standard GNU loader when an interpreter is
+present, and that loader must exist as an OS-directory ELF image of the correct architecture.
+Only explicit desktop/system ABI names may cross the OS boundary; inference implementation and
+CUDA toolkit libraries must remain owned. The NVIDIA driver library is admitted only for CUDA.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
