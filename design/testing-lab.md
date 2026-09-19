@@ -19,7 +19,13 @@ files and recursive submodule working trees. Concurrent mutation invalidates a s
 download and extracted file is integrity checked; extraction cannot escape its owned directory.
 Existing artifacts are copied into content-addressed storage and verified against their declared
 hashes and lengths before submission. Subsequent edits to local packages cannot alter an admitted
-input. Existing artifacts are never rebuilt or relabelled as a successful compilation.
+input. Existing artifacts are never rebuilt or relabelled as a successful compilation. Source execution
+extracts the admitted snapshot into a fresh workspace, installs frozen dependencies, and records
+compilation and final packaging independently. A failed compile blocks packaging and consumption.
+Build receipts bind the snapshot digest, base commit and native host; final manifests and every
+package byte are verified before the installer can consume them. A base commit alone never
+identifies dirty source. Producer reuse across targets and separate consumer allocation remain
+implementation work; same-machine source probes do not qualify the clean remote consumer gate.
 
 `iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
 and consumer state. Neither mode may touch a developer's normal application data. Local execution

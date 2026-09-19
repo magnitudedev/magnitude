@@ -4,7 +4,7 @@ import { Config, DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { join } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "../src/artifact-store"
 import { snapshotArtifacts } from "../src/artifact-input"
-import { runArtifactWorker } from "../src/artifact-worker"
+import { runCandidateWorker } from "../src/candidate-worker"
 import { planRun } from "../src/catalog"
 import { RunId, RunRequest } from "../src/domain"
 import { HostInspectorLive } from "../src/host-inspector"
@@ -36,7 +36,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   const result = yield* Effect.gen(function* () {
     const store = yield* ArtifactStore
     yield* store.put(input.digest, Stream.make(new TextEncoder().encode(input.json)))
-    return yield* runArtifactWorker(assignment, { root: join(root, "attempt"), port: 11279, model: "qwen3.5-4b:gguf:q4", environment })
+    return yield* runCandidateWorker(assignment, { root: join(root, "attempt"), port: 11279, model: "qwen3.5-4b:gguf:q4", environment })
   }).pipe(Effect.provide([fileArtifactStore(objects), HostInspectorLive, nativeInstaller({ disposable, root: join(root, "installation"), environment })]))
   yield* fs.writeFileString(join(root, "result.json"), yield* Schema.encode(Schema.parseJson(TargetResult))(result))
   if (result.cases.some(c => c.outcome.status !== "passed") || result.cleanupErrors.length) process.exitCode = 1

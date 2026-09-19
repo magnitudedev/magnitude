@@ -2,7 +2,8 @@ import { FileSystem } from "@effect/platform"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { join } from "node:path"
 import { ArtifactStore } from "./artifact-store"
-import { ArtifactInput } from "./inputs"
+import { ArtifactInput, InputManifest } from "./inputs"
+import { SourceBuilder } from "./source-builder"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
 import { DesktopDriver, playwrightDesktop } from "./desktop-driver"
@@ -15,14 +16,13 @@ import { sha256 } from "./snapshot"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { WorkAssignment, TargetResult } from "./work-store"
 
-export const ArtifactWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
+export const CandidateWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
   model: Schema.NonEmptyString, environment: Schema.Record({ key: Schema.String, value: Schema.String }) })
-export class ArtifactWorkerFailure extends Schema.TaggedError<ArtifactWorkerFailure>()("ArtifactWorkerFailure", { message: Schema.String, cleanupErrors: Schema.Array(Schema.String) }) {}
-const unavailable = (message: string) => new InfrastructureFailure({ operation: "artifact-worker", message })
+export class CandidateWorkerFailure extends Schema.TaggedError<CandidateWorkerFailure>()("CandidateWorkerFailure", { message: Schema.String, cleanupErrors: Schema.Array(Schema.String) }) {}
+const unavailable = (message: string) => new InfrastructureFailure({ operation: "candidate-worker", message })
 
 /** Guest-side execution. The caller supplies scoped objects and a native installer, never cloud credentials. */
-export const runArtifactWorker = (assignment: WorkAssignment, config: typeof ArtifactWorkerConfig.Type) => Effect.gen(function* () {
-  if (assignment.plan.request.input.kind !== "artifacts") return yield* unavailable("Artifact worker requires an existing-artifact input")
+export const runCandidateWorker = (assignment: WorkAssignment, config: typeof CandidateWorkerConfig.Type) => Effect.gen(function* () {
   if (DateTime.toEpochMillis(assignment.deadline) <= Date.now()) return yield* unavailable("Worker assignment has expired")
   const fs = yield* FileSystem.FileSystem
   const objects = yield* ArtifactStore
@@ -33,7 +33,7 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
   const cleanupErrors: string[] = []
   const diagnostics = new Map<string, typeof Evidence.Type>()
   const evidenceDirectory = join(config.root, "evidence")
-  if (yield* fs.exists(config.root)) return yield* unavailable("Artifact worker requires a fresh owned workspace")
+  if (yield* fs.exists(config.root)) return yield* unavailable("Candidate worker requires a fresh owned workspace")
   yield* fs.makeDirectory(evidenceDirectory, { recursive: true, mode: 0o700 })
   const scope = yield* Scope.make()
   const evidence = <A, I>(name: string, schema: Schema.Schema<A, I>, value: A) => Effect.gen(function* () {
@@ -55,9 +55,19 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
     })), Stream.runCollect)
     const wire = Buffer.concat(Array.from(chunks))
     if (sha256(wire) !== input.digest) return yield* unavailable("Worker input manifest does not match admitted digest")
-    const manifest = yield* Schema.decodeUnknown(Schema.parseJson(ArtifactInput))(wire.toString("utf8")).pipe(Effect.mapError(() => unavailable("Invalid admitted artifact manifest")))
-    yield* selectInstaller(manifest.release, target)
-    const inputEvidence = yield* evidence("artifact-input.json", ArtifactInput, manifest)
+    const admitted = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(wire.toString("utf8")).pipe(Effect.mapError(() => unavailable("Invalid admitted input manifest")))
+    if (admitted.kind !== input.kind) return yield* unavailable("Input kind does not match assignment")
+    const builder = yield* Effect.serviceOption(SourceBuilder)
+    if (admitted.kind === "source" && Option.isNone(builder)) return yield* unavailable("Worker has no source builder")
+    const source = admitted.kind === "source" ? yield* Option.getOrThrow(builder).prepare(admitted, input.digest, target) : undefined
+    const manifest = yield* Effect.cached(admitted.kind === "artifacts" ? Effect.succeed(admitted)
+      : source!.package.pipe(Effect.map(result => result.input)))
+    const sourceEvidence = yield* evidence("admitted-input.json", InputManifest, admitted)
+    const inputEvidence = yield* Effect.cached(Effect.gen(function* () {
+      const value = yield* manifest
+      yield* selectInstaller(value.release, target)
+      return yield* evidence("artifact-input.json", ArtifactInput, value)
+    }))
     // Native Unix control sockets have a small byte limit independent of the artifact path.
     // Keep one private, scope-owned state directory shared by the app and bundled CLI.
     const stateDirectory = process.platform === "win32" ? join(config.root, "profile", "state")
@@ -67,7 +77,7 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
       XDG_CONFIG_HOME: join(config.root, "home", ".config"), XDG_DATA_HOME: join(config.root, "home", ".local", "share"),
       MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
-    const candidate = yield* Effect.cached(prepareCandidate(manifest.release, target, join(config.root, "candidate")).pipe(
+    const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs)))
     const installed = yield* Effect.cached(Effect.gen(function* () {
       const packageFile = yield* candidate
@@ -83,31 +93,40 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
     }))
     const cli = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
-      const context = yield* Layer.buildWithScope(bundledCliTests({ executable: app.cli, version: manifest.release.version, model: config.model,
+      const context = yield* Layer.buildWithScope(bundledCliTests({ executable: app.cli, version: (yield* manifest).release.version, model: config.model,
         evidence: join(evidenceDirectory, "cli"), environment }).pipe(Layer.provide(Layer.merge(Layer.succeed(ProcessExecutor, processes), Layer.succeed(FileSystem.FileSystem, fs)))), scope)
       return Context.get(context, CliTests)
     }))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       switch (test.id as string) {
-        case "P1": return CaseObservation.make({ detail: `Recorded supplied artifact provenance ${manifest.release.sourceCommit}; compilation was not executed`, evidence: [inputEvidence, hostEvidence] })
+        case "P1": {
+          if (source) {
+            const result = yield* source.compile
+            return CaseObservation.make({ ...result, evidence: [...result.evidence, sourceEvidence, hostEvidence] })
+          }
+          return CaseObservation.make({ detail: `Recorded supplied artifact provenance ${(yield* manifest).release.sourceCommit}; compilation was not executed`, evidence: [yield* inputEvidence, hostEvidence] })
+        }
         case "P2":
         case "I1": {
           yield* candidate
-          return CaseObservation.make({ detail: "Downloaded the selected native installer and verified its admitted hash and length; no package build was executed", evidence: [inputEvidence] })
+          const build = source ? yield* source.package : undefined
+          return CaseObservation.make({ detail: source ? "Built final native packages from the admitted source and verified exact installer bytes"
+            : "Downloaded the selected native installer and verified its admitted hash and length; no package build was executed",
+            evidence: [yield* inputEvidence, sourceEvidence, ...(build?.evidence ?? [])] })
         }
         case "I2": yield* installed; break
         case "I3": {
           const version = yield* (yield* desktop).host()
-          if (version !== manifest.release.version) return yield* new AssertionFailure({ message: "Installed desktop reports a different version from the admitted candidate" })
+          if (version !== (yield* manifest).release.version) return yield* new AssertionFailure({ message: "Installed desktop reports a different version from the admitted candidate" })
           break
         }
         case "A1": yield* (yield* desktop).ready(); break
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
         case "C6": yield* (yield* cli).nativeRuntime; break
-        default: return yield* unavailable(`Case ${test.id} is not yet connected to the artifact worker; no acceptance claimed`)
+        default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
-      return CaseObservation.make({ detail: test.title, evidence: [inputEvidence, hostEvidence] })
+      return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, hostEvidence] })
     }).pipe(Effect.onExit(exit => Exit.isFailure(exit) ? Effect.gen(function* () {
       const identity = `${test.id}-${Option.getOrElse(test.harness, () => "shared")}`
       const detail = Cause.pretty(exit.cause).replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").slice(0, 32 * 1024)
@@ -116,13 +135,15 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
     const results = yield* runCases(target, assignment.target.cases).pipe(Effect.provideService(CaseExecutor, { execute }))
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
-      return diagnostic ? { ...result, evidence: [...result.evidence, diagnostic] } : result
+      const buildEvidence = source && (result.caseId === "P1" || result.caseId === "P2") ? source.evidence().filter(item => result.caseId !== "P1" || item.path !== "evidence/build-package.json") : []
+      const refs = [...result.evidence, ...buildEvidence, ...(diagnostic ? [diagnostic] : [])]
+      return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })
   // Closing the shared scope closes the UI before uninstalling its package. Cleanup cannot mask test results.
   const cases = yield* program.pipe(Effect.timeoutFail({ duration: Math.max(1, DateTime.toEpochMillis(assignment.deadline) - Date.now()), onTimeout: () => unavailable("Worker assignment deadline expired") }), Effect.ensuring(Scope.close(scope, Exit.void).pipe(
     Effect.catchAllCause(() => Effect.sync(() => { cleanupErrors.push("Application cleanup failed; inspect local worker diagnostics") })),
-  )), Effect.mapError(error => new ArtifactWorkerFailure({ message: error.message, cleanupErrors: [...cleanupErrors] })))
+  )), Effect.mapError(error => new CandidateWorkerFailure({ message: error.message, cleanupErrors: [...cleanupErrors] })))
   // Export bounded, redacted process output after the desktop scope has flushed it.
   const desktopLog = join(evidenceDirectory, "desktop", "desktop.log")
   const finalCases = [...cases]
@@ -133,4 +154,4 @@ export const runArtifactWorker = (assignment: WorkAssignment, config: typeof Art
     if (index >= 0) finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, log] }
   }
   return TargetResult.make({ cases: finalCases, cleanupErrors })
-}).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" || error._tag === "ArtifactWorkerFailure" ? error : unavailable(error.message)))
+}).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" || error._tag === "CandidateWorkerFailure" ? error : unavailable(error.message)))

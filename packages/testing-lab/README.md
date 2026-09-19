@@ -171,7 +171,7 @@ installer download, native installation, packaged launch/readiness, bundled CLI 
 scoped uninstall. Unconnected cases return blocked outcomes. The scheduler now transfers
 owner-authorized immutable inputs to this worker and verifies the returned attempt, case set
 and evidence hashes. Guest execution receives no coordinator or provider credentials.
-Source builds still need their worker path; guest runtimes must be explicitly configured
+Source compilation and packaging now use the guest worker path; guest runtimes must be explicitly configured
 for each provider/artifact host and are not automatically installed on stock cloud images.
 `artifact-worker-probe.ts` is an explicitly limited five-case install/CLI diagnostic, not a
 full-profile run; it has passed against the local macOS 15 DMG with verified removal.
@@ -182,3 +182,20 @@ cases; the current incomplete worker returns failures/blocks, not a narrowed gre
 Its environment inputs match the artifact-worker probe (`LAB_WORKER_ROOT`,
 `LAB_WORKER_MANIFEST`, `LAB_WORKER_TARGET`). Failure diagnostics are content-addressed
 and transferred before the scheduler deletes the owned worker.
+
+## Source build execution
+
+Source workers extract admitted objects into a fresh workspace and use `bun install --frozen-lockfile`
+under the pinned runtime. Compilation and packaging invoke the existing release helpers in separate
+processes. The compile receipt binds source digest, commit and native host; packaging emits the
+release manifest (including the Mac update ZIP). Artifact admission verifies all output bytes before
+installation. Compiler/packager failures remain separate case outcomes and preserve command logs.
+
+`scripts/source-build-probe.ts` exercises these phases on a real local source snapshot. Set
+`LAB_BUILD_PROBE_ROOT` to a new directory and `LAB_BUILD_PROBE_TARGET` to the actual local target.
+The lower-level candidate script accepts `LAB_BUILD_PHASE=compile|package|all`, `LAB_BUILD_OUTPUT`,
+`LAB_BUILD_SOURCE_DIGEST`, and `LAB_BUILD_SOURCE_COMMIT`.
+
+This initial integration builds on the allocated target before installation. Separate producer and
+consumer machines, shared producer deduplication, private engine payload publication, and native
+Windows toolchain configuration are still required for full remote verification.

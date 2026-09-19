@@ -8,9 +8,9 @@ export interface CaseExecutor {
 }
 export const CaseExecutor = Context.GenericTag<CaseExecutor>("@magnitudedev/testing-lab/CaseExecutor")
 const key = (id: CaseId, harness: Option.Option<Harness>) => `${id}:${Option.getOrElse(harness, () => "")}`
-const category = (suite: PlannedCase["suite"]): "package" | "app" | "endpoint" | "harness" =>
-  suite === "package" || suite === "install" || suite === "uninstall" || suite === "update" ? "package"
-    : suite === "endpoint" ? "endpoint" : suite === "harness" ? "harness" : "app"
+const category = (test: PlannedCase): "build" | "package" | "app" | "endpoint" | "harness" =>
+  test.id === "P1" ? "build" : test.suite === "package" || test.suite === "install" || test.suite === "uninstall" || test.suite === "update" ? "package"
+    : test.suite === "endpoint" ? "endpoint" : test.suite === "harness" ? "harness" : "app"
 const now = DateTime.now.pipe(Effect.map(DateTime.formatIso))
 
 /** Test dependencies are evaluated per harness, with shared application prerequisites evaluated once. */
@@ -56,7 +56,7 @@ export const runCases = (target: Target, cases: readonly PlannedCase[]) => Effec
         else {
           const error = Cause.failureOption(exit.cause)
           if (Option.isSome(error) && error.value._tag === "InfrastructureFailure") outcome = { status: "blocked", detail: error.value.message }
-          else outcome = { status: "failed", category: category(test.suite), detail: Option.isSome(error) ? error.value.message : "Test executor defect; inspect worker diagnostics" }
+          else outcome = { status: "failed", category: category(test), detail: Option.isSome(error) ? error.value.message : "Test executor defect; inspect worker diagnostics" }
         }
       }
       const result = CaseResult.make({ targetId: target.id, caseId: test.id, harness: test.harness, startedAt, endedAt: yield* now, outcome, evidence })
