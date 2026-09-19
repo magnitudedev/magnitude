@@ -13,6 +13,7 @@ export interface DesktopDriver {
   readonly host: () => Effect.Effect<string, AssertionFailure>
   readonly ready: () => Effect.Effect<void, AssertionFailure>
   readonly search: (modelId: string) => Effect.Effect<void, AssertionFailure>
+  readonly details: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly download: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly load: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly connect: (harnessId: string) => Effect.Effect<void, AssertionFailure>
@@ -77,6 +78,15 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       await page.getByTestId(automation.modelSearch).fill(name)
       await card(name).waitFor({ timeout: 120_000 })
     }))),
+    details: name => action("Open model details", async () => {
+      // The disclosure's accessibility relationship identifies its content independently of copy.
+      const disclosure = card(name).locator('button[aria-controls][aria-expanded]')
+      const controlled = await disclosure.getAttribute("aria-controls")
+      if (!controlled) throw new Error("Model details has no controlled content identity")
+      if (await disclosure.getAttribute("aria-expanded") !== "true") await disclosure.click()
+      await disclosure.and(page.locator('[aria-expanded="true"]')).waitFor()
+      await page.locator(`[id="${controlled.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"]`).waitFor()
+    }),
     download: name => action("Download model through packaged UI", async () => {
       const model = card(name)
       await model.getByTestId(automation.modelDownload).click({ timeout: 120_000 })

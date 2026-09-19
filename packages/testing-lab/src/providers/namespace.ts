@@ -14,8 +14,15 @@ const failed = (message: string) => new InfrastructureFailure({ operation: "name
 export const namespaceAllocator = (executable: string, images: ReadonlyArray<NamespaceImage>) => Layer.effect(MachineAllocator, Effect.gen(function* () {
   const executor = yield* ProcessExecutor
   const checked = (...args: Parameters<typeof checkedCommand>) => checkedCommand(...args).pipe(Effect.provideService(ProcessExecutor, executor))
-  const list = () => checked(executable, ["list", "--output", "json"]).pipe(Effect.flatMap(output =>
-    Schema.decodeUnknown(Schema.parseJson(Schema.Array(Box)))(output.stdout)), Effect.mapError(() => failed("Cannot read Namespace inventory")))
+  const list = () => checked(executable, ["list", "--output", "json"]).pipe(Effect.flatMap(output => Effect.gen(function* () {
+    // devbox 0.0.189 prefixes its empty JSON inventory with this human-facing notice.
+    const notice = "No devbox available yet. Try running `devbox create`."
+    const lines = output.stdout.replaceAll("\r\n", "\n")
+    const emptyNotice = lines.startsWith(`${notice}\n`)
+    const boxes = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Array(Box)))(emptyNotice ? lines.slice(notice.length + 1) : lines)
+    if (emptyNotice && boxes.length !== 0) return yield* failed("Namespace empty-inventory notice contradicts its machine list")
+    return boxes
+  })), Effect.mapError(() => failed("Cannot read Namespace inventory")))
   const tagged = (box: typeof Box.Type) => Effect.gen(function* () {
     if (box.documented_purpose._tag !== "Some" || !box.documented_purpose.value.startsWith(marker)) return yield* failed("Machine is not owned by the lab")
     const tags = yield* Schema.decodeUnknown(Schema.parseJson(MachineTags))(box.documented_purpose.value.slice(marker.length)).pipe(Effect.mapError(() => failed("Invalid Namespace ownership metadata")))

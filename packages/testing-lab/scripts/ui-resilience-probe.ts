@@ -13,6 +13,7 @@ const run = Effect.gen(function* () {
   const executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
   const toolsPath = yield* Config.string("LAB_PROBE_TOOLS_PATH")
+  const port = yield* Config.integer("LAB_PROBE_PORT").pipe(Config.withDefault(11279))
   const fs = yield* FileSystem.FileSystem
   const environment: Record<string, string> = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   environment.PATH = `${toolsPath}:${environment.PATH ?? ""}`
@@ -25,13 +26,14 @@ const run = Effect.gen(function* () {
     yield* desktop.theme("light")
     yield* desktop.chrome()
     yield* desktop.search(model)
+    yield* desktop.details(model)
     yield* desktop.load(model)
     yield* desktop.connect("pi")
     yield* desktop.screenshot("reworded-recolored-reordered-ui")
     yield* desktop.disconnect("pi")
     yield* endpoint.generate
-  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "resilience-evidence"), port: 11279, environment }, challengePresentation),
-    endpointTests("http://127.0.0.1:11279", model).pipe(Layer.provide(FetchHttpClient.layer)))))
+  }).pipe(Effect.provide(Layer.merge(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "resilience-evidence"), port, environment }, challengePresentation),
+    endpointTests(`http://127.0.0.1:${port}`, model).pipe(Layer.provide(FetchHttpClient.layer)))))
   const result = yield* program.pipe(Effect.either)
   yield* fs.writeFileString(join(root, "resilience-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String })))({
     passed: result._tag === "Right", detail: result._tag === "Right" ? "Changed labels, accessible names, placeholders, colors and visual order; navigation, settings, window lifecycle, model loading, connections and generation passed" : String(result.left),

@@ -35,7 +35,7 @@ export const prTargetIds = [
 const suiteCases: Readonly<Record<Suite, readonly string[]>> = {
   package: ["Compile declared inputs", "Produce final packages", "Versions and architectures agree", "Owned runtime dependencies are complete", "Validate package signatures and trust"],
   install: ["Download exact bytes and verify digest", "Install through the supported package manager", "Launch the installed application", "Verify CLI path and service ownership", "Reject a corrupt candidate before installation"],
-  app: ["Complete setup to a ready application", "Search Discover and open model details", "Download the pinned model through the application", "Persist settings across relaunch", "Manage harness Connections without clobbering unrelated config", "Hide, reopen and quit the application", "Surface actionable harness and service errors"],
+  app: ["Complete setup to a ready application", "Search catalog and open model details", "Download the pinned model through the application", "Persist settings across relaunch", "Manage harness Connections without clobbering unrelated config", "Hide, reopen and quit the application", "Surface actionable harness and service errors"],
   endpoint: ["Discover the installed model", "Generate a nonstreamed answer", "Generate a complete valid stream", "Complete a tool call and result follow-up", "Reject invalid model and malformed requests without crashing", "Attest the requested backend and device"],
   harness: ["Consume the product-generated harness connection", "Select the served model", "Generate a streamed answer", "Continue the same session", "Read and edit a bounded fixture through actual tools", "Resume a persisted transcript", "Drive the TUI and interrupt generation"],
   recovery: ["Cancel generation and generate again", "Recover an interrupted model download", "Generate offline from cached model bytes", "Recover an owned worker fault", "Stop and reload the model", "Restart without duplicate owning services"],
@@ -51,7 +51,7 @@ const prerequisites: Readonly<Record<string, readonly string[]>> = {
   E1: ["A3"], E2: ["E1", "E6"], E3: ["E1", "E6"], E4: ["E1", "E6"], E5: ["E1"], E6: ["E1"],
   H1: ["A5", "E6"], H2: ["H1"], H3: ["H2"], H4: ["H3"], H5: ["H2"], H6: ["H4"], H7: ["H2"],
   R1: ["E3"], R2: ["A3"], R3: ["E2"], R4: ["E2"], R5: ["E2"], R6: ["I3"],
-  C1: ["I2"], C2: ["C1"], C3: ["C1", "A3"], C4: ["C1", "A5"], C5: ["C1"], C6: ["C1"],
+  C1: ["I2"], C2: ["C1", "A1"], C3: ["C1", "A3"], C4: ["C1", "A5"], C5: ["C1"], C6: ["C1"],
   U1: ["P2"], U2: ["U1"], U3: ["U2"], U4: ["U3"], U5: ["U1"], U6: ["U1"],
   X1: ["I2"], X2: ["X1"], X3: ["X1"], X4: ["X2", "X3"],
 }

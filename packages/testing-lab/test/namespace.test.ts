@@ -55,3 +55,30 @@ test("inventory discovers tagged allocations without database acknowledgment", a
   expect(result).toHaveLength(1)
   expect(result[0]?.tags.leaseId).toBe(allocation.leaseId)
 })
+
+const emptyInventory = "No devbox available yet. Try running `devbox create`.\n[\n]\n"
+test("empty Namespace inventory accepts only its exact documented CLI notice", async () => {
+  expect(await run(Effect.flatMap(MachineAllocator, a => a.inventory()), () => output(emptyInventory))).toEqual([])
+  for (const wire of ["unexpected diagnostic\n[]", emptyInventory.replace("[\n]", "{}"), emptyInventory.replace("[\n]", Schema.encodeSync(Schema.parseJson(Schema.Unknown))([box(lease())]))]) {
+    expect((await run(Effect.flatMap(MachineAllocator, a => a.inventory()).pipe(Effect.either), () => output(wire)))._tag).toBe("Left")
+  }
+})
+test("Namespace release verifies the provider's banner-prefixed empty inventory", async () => {
+  const allocation = lease()
+  let present = true
+  const commands: string[] = []
+  await run(Effect.gen(function* () {
+    const allocator = yield* MachineAllocator
+    const machine = (yield* allocator.inventory())[0]!
+    yield* allocator.release(machine)
+    expect(yield* allocator.inventory()).toEqual([])
+  }), command => {
+    commands.push(command.args[0]!)
+    if (command.args[0] === "list") return output(present ? Schema.encodeSync(Schema.parseJson(Schema.Unknown))([box(allocation)]) : emptyInventory)
+    if (command.args[0] === "shutdown") return output("")
+    if (command.args[0] === "expire") { present = false; return output("") }
+    throw new Error("Unexpected command")
+  })
+  expect(commands).toContain("shutdown")
+  expect(commands).toContain("expire")
+})

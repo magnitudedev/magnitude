@@ -1,4 +1,4 @@
-import { FileSystem } from "@effect/platform"
+import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { join } from "node:path"
 import { ArtifactStore } from "./artifact-store"
@@ -13,6 +13,7 @@ import { HostObservation } from "./hardware"
 import { Installer } from "./installer"
 import { ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
+import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { WorkAssignment, TargetResult } from "./work-store"
 
@@ -97,6 +98,10 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         evidence: join(evidenceDirectory, "cli"), environment }).pipe(Layer.provide(Layer.merge(Layer.succeed(ProcessExecutor, processes), Layer.succeed(FileSystem.FileSystem, fs)))), scope)
       return Context.get(context, CliTests)
     }))
+    const endpoint = yield* Effect.cached(Effect.gen(function* () {
+      const context = yield* Layer.buildWithScope(endpointTests(`http://127.0.0.1:${config.port}`, config.model).pipe(Layer.provide(FetchHttpClient.layer)), scope)
+      return Context.get(context, EndpointTests)
+    }))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       switch (test.id as string) {
         case "P1": {
@@ -121,6 +126,19 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           break
         }
         case "A1": yield* (yield* desktop).ready(); break
+        case "A2": yield* (yield* desktop).search(config.model); yield* (yield* desktop).details(config.model); break
+        case "A3": yield* (yield* desktop).search(config.model); yield* (yield* desktop).download(config.model); break
+        case "E1": yield* (yield* desktop).search(config.model); yield* (yield* desktop).load(config.model); yield* (yield* endpoint).discover; break
+        case "E2":
+        case "E3":
+        case "E4":
+        case "R1": {
+          const tests = yield* endpoint
+          const generation = yield* test.id === "E2" ? tests.generate : test.id === "E3" ? tests.stream : test.id === "E4" ? tests.tools : tests.cancelAndRetry
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence(`${test.id}-generation.json`, Generation, generation)] })
+        }
+        case "E5": yield* (yield* endpoint).invalid; break
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
         case "C6": yield* (yield* cli).nativeRuntime; break

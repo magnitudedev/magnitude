@@ -199,3 +199,24 @@ The lower-level candidate script accepts `LAB_BUILD_PHASE=compile|package|all`, 
 This initial integration builds on the allocated target before installation. Separate producer and
 consumer machines, shared producer deduplication, private engine payload publication, and native
 Windows toolchain configuration are still required for full remote verification.
+
+## Current packaged-app execution
+
+The candidate worker connects catalog search and details, a fresh UI model download, UI model
+loading, endpoint discovery, nonstreamed/streamed/tool generation, invalid requests and cancellation.
+Generation cases still depend on backend attestation; they remain blocked until the live observation
+adapter is connected. A capability inventory does not qualify CPU/Metal/CUDA execution.
+CLI readiness depends on successful app readiness, so a failed owning service blocks that dependent
+check instead of repeating the readiness timeout.
+
+`namespace-worker-probe.ts` exercises the real transport against an explicitly named, already
+lab-tagged Namespace Mac and releases it afterward. It needs `LAB_NAMESPACE_NAME`,
+`LAB_NAMESPACE_CLI`, `LAB_GUEST_BUN`, `LAB_GUEST_ENTRY`, and the three artifact worker variables.
+The guest runtime and its dependencies must already be installed. This is a provider qualification
+probe, not production coordinator deployment or a replacement for scheduled allocation.
+
+A current source snapshot built a DMG and update ZIP successfully on Namespace macOS26.6.2.
+The exact DMG passed local macOS15 launch/readiness/CLI checks and a fresh UI acquisition/model-load
+run (11 passed,11 blocked,zero failed cases,clean removal). The cloud app launched but its inference
+process exited before readiness; cloud generation remains unqualified. Provider cleanup completed;
+the empty-inventory CLI notice exposed and now has a tested parser fix. No borrowed Mac remains.
