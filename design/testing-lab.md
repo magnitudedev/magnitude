@@ -73,6 +73,17 @@ Admission is idempotent and reserves a bounded budget. Durable transactional cla
 attempt fences prevent stale workers from committing results. Worker invocation binds the assignment and attempt fence; returned case membership and evidence
 hashes are verified before acceptance. Transfers expose only the owner-authorized input graph.
 Workers receive only scoped run credentials when needed; untrusted source never receives provider credentials or office-network access.
+Worker credentials identify one admitted target attempt. Only their digests are persisted.
+Every use checks the current work fence, claim expiry and run state, so cancellation,
+completion or reassignment invalidates access. Issuing another credential for the same
+attempt is rejected rather than silently replacing a credential already delivered to a guest.
+Worker input access is limited to the assigned manifest and its referenced content objects.
+Knowledge of a digest, including one uploaded by the same owner for another purpose, grants
+no access outside that graph. Manifest size and integrity are checked before authorizing
+referenced content.
+The immutable manifest graph may be cached within bounded memory; live worker authorization
+is never cached. Failed graph reads are evicted so later requests can recover from an
+infrastructure failure without replaying a test assertion.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
 Installed-package ownership follows explicit present/absent transitions. Removal updates

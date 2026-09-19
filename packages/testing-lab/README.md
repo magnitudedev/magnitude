@@ -449,3 +449,29 @@ blocked/cancelled/not-selected required cases as errors. Missing/duplicate resul
 unselected result entries and cleanup failures also become errors, so CI cannot
 mistake incomplete coverage for success. Evidence digests and paths accompany each
 case. Existing command exit-code semantics remain authoritative.
+
+## Outward worker access (in progress)
+
+The coordinator now serves `/v1/worker/assignment` using an attempt-scoped opaque
+credential, separate from developer/CI authentication. Issuance verifies the durable
+assignment, stores only a token digest and allows one credential per attempt. Each
+request checks the current claim/fence, run deadline and state. Cancellation,
+completion, revocation and reassignment deny access immediately; responses are
+noncacheable. Native provider credentials are not included in the invocation.
+
+This is the assignment/authentication foundation, not a working Azure worker path.
+Scoped object transfer, result return, bootstrap delivery and scheduler integration
+are still required. The current execution runner continues using its existing
+transport path. PostgreSQL plus live HTTP tests cover credential persistence and
+invalidation; no Azure worker qualification is claimed by those tests.
+
+Worker input downloads are now available at `/v1/worker/objects/:digest`. They permit
+only the assigned manifest and its referenced source/artifact objects; other
+same-owner uploads remain inaccessible. Live HTTP/SQL tests exercise both input
+kinds and credential invalidation. Result/evidence return and bootstrap/runner
+integration are still unfinished, so this does not yet enable Azure execution.
+
+Worker input graphs use a bounded, owner-scoped immutable cache (eight manifests,
+five-minute lifetime). Concurrent object downloads share manifest parsing. Every
+request still checks live credential authority, and failed graph reads are evicted
+immediately. This avoids rereading a large source manifest for every source file.
