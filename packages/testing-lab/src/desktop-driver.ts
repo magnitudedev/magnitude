@@ -110,6 +110,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       const harness = page.getByTestId(automation.harness(name))
       await harness.getByTestId(automation.harnessConnect).click()
       await harness.and(page.locator('[data-connected="true"]')).waitFor()
+      await harness.getByTestId(automation.harnessConnect).and(page.locator(':enabled')).waitFor()
     }))),
     disconnect: name => navigate("connections").pipe(Effect.zipRight(action(`Disconnect ${name} through the app`, async () => {
       const harness = page.getByTestId(automation.harness(name))

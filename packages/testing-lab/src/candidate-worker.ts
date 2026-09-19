@@ -16,6 +16,9 @@ import { sha256 } from "./snapshot"
 import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
 import { rejectCorruptInstaller } from "./suites/install"
+import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
+import { Harness } from "./domain"
+import { harnessSuite, HarnessTools, HarnessTurn } from "./harnesses/suite"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { WorkAssignment, TargetResult } from "./work-store"
@@ -81,6 +84,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       XDG_CONFIG_HOME: join(config.root, "home", ".config"), XDG_DATA_HOME: join(config.root, "home", ".local", "share"),
       MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
+    const selection = assignment.plan.request.selection
+    const harnesses: readonly Harness[] = selection.kind === "custom" && selection.harnesses.length > 0 ? selection.harnesses
+      : selection.kind === "profile" && selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"]
+    const connections = assignment.target.cases.some(test => test.id === "A5")
+      ? yield* Effect.forEach(harnesses, harness => connectionFixture(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), harness, `http://127.0.0.1:${config.port}/inference/v1`)) : []
     const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs)))
     const installed = yield* Effect.cached(Effect.gen(function* () {
@@ -105,6 +113,10 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       const context = yield* Layer.buildWithScope(endpointTests(`http://127.0.0.1:${config.port}`, config.model).pipe(Layer.provide(FetchHttpClient.layer)), scope)
       return Context.get(context, EndpointTests)
     }))
+    const tools = yield* Effect.serviceOption(HarnessTools)
+    const harnessSuites = new Map<Harness, ReturnType<typeof harnessSuite>>()
+    for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(harnessSuite(harness, config.model,
+      join(evidenceDirectory, "harness", harness), join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), environment)))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       switch (test.id as string) {
         case "P1": {
@@ -137,6 +149,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "A1": yield* (yield* desktop).ready(); break
         case "A2": yield* (yield* desktop).search(config.model); yield* (yield* desktop).details(config.model); break
         case "A3": yield* (yield* desktop).search(config.model); yield* (yield* desktop).download(config.model); break
+        case "A5": {
+          const driver = yield* desktop
+          const receipts = yield* Effect.forEach(connections, connection => connection.exercise.pipe(Effect.provideService(DesktopDriver, driver)))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, yield* evidence("connections.json", Schema.Array(ConnectionReceipt), receipts)] })
+        }
         case "E1": yield* (yield* desktop).search(config.model); yield* (yield* desktop).load(config.model); yield* (yield* endpoint).discover; break
         case "E2":
         case "E3":
@@ -148,6 +165,16 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             yield* evidence(`${test.id}-generation.json`, Generation, generation)] })
         }
         case "E5": yield* (yield* endpoint).invalid; break
+        case "H1": case "H2": case "H3": case "H4": case "H5": case "H6": {
+          if (Option.isNone(tools) || Option.isNone(test.harness)) return yield* unavailable("Worker has no qualified harness tool configuration")
+          const suite = yield* harnessSuites.get(test.harness.value)!.pipe(Effect.provideService(HarnessTools, tools.value),
+            Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
+          const turn = yield* (test.id === "H5" ? suite.tools : test.id === "H4" || test.id === "H6" ? suite.recall : suite.initial).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
+          if (test.id === "H3" && !turn.streamed) return yield* unavailable("This harness reports completed text parts; token streaming qualification requires additional evidence")
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence(`${test.id}-${test.harness.value}-turn.json`, HarnessTurn, turn)] })
+        }
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
         case "C3": yield* (yield* cli).modelLifecycle; break
@@ -183,8 +210,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   }
   // Traces are finalized when the desktop scope closes. Publish before the allocator removes
   // the worker; a local path alone is not durable evidence. Export errors preserve case results.
-  const exportFile = (relative: string, caseId: string, maxBytes: number) => Effect.gen(function* () {
-    const index = finalCases.findIndex(result => result.caseId === caseId)
+  const exportFile = (relative: string, caseId: string, maxBytes: number, harness?: Harness) => Effect.gen(function* () {
+    const index = finalCases.findIndex(result => result.caseId === caseId && (harness === undefined || Option.contains(result.harness, harness)))
     if (index < 0) return
     const item = yield* publishEvidenceFile(evidenceDirectory, relative, maxBytes)
     finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, item] }
@@ -195,6 +222,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const names = (yield* fs.readDirectory(cliEvidence)).filter(name => /^\d+-[a-z0-9-]+\.json$/.test(name)).sort()
     if (names.length > 100) cleanupErrors.push("CLI evidence exceeded its file-count limit")
     else for (const name of names) yield* exportFile(`cli/${name}`, "C1", 32 * 1024 * 1024)
+  }
+  for (const harness of Harness.literals) {
+    const directory = join(evidenceDirectory, "harness", harness, "events")
+    if (!(yield* fs.exists(directory))) continue
+    const names = (yield* fs.readDirectory(directory)).filter(name => /^(version\.txt|models\.txt|turn-\d+\.(jsonl|stderr\.log|prompt\.txt|session\.json))$/.test(name)).sort()
+    if (names.length > 100) cleanupErrors.push(`${harness} evidence exceeded its file-count limit`)
+    else for (const name of names) yield* exportFile(`harness/${harness}/events/${name}`, "H1", 32 * 1024 * 1024, harness)
   }
   return TargetResult.make({ cases: finalCases, cleanupErrors })
 }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" || error._tag === "CandidateWorkerFailure" ? error : unavailable(error.message)))

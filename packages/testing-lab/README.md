@@ -237,3 +237,26 @@ the integrity rejection before native package commands. It preserves the admitte
 removes the corrupt copy. The real macOS probe passed this rejection followed by normal installation,
 package identity verification and removal. Scheduled CLI coverage also connects catalog list/show,
 cached pull, status, stop and reload through the bundled binary.
+
+Connections acceptance seeds an unrelated provider in the isolated harness home, then uses the
+app to connect, refresh, disconnect and reconnect each selected harness. It checks preservation,
+provider removal, the exact app endpoint and records the final configuration digest. Quick runs
+exercise Pi; broader profiles exercise Pi, OpenCode and Hermes. `connections-probe.ts` qualified
+all three UI flows locally against a packaged app with cached model bytes; this does not qualify
+their generation on other operating systems. The probe requires the usual `LAB_PROBE_ROOT`,
+`LAB_PROBE_EXECUTABLE`, `LAB_PROBE_TOOLS_PATH` and an isolated profile with a downloaded model.
+
+The worker connects H1–H6 to real Pi/OpenCode/Hermes processes, with shared generation evidence,
+conversation identifier recall, bounded read/edit fixtures and persisted-session reuse. Images must
+configure absolute `LAB_PI_EXECUTABLE`, `LAB_OPENCODE_EXECUTABLE`, `LAB_HERMES_EXECUTABLE` paths;
+the suite rejects versions outside the pinned tools set. Native event logs are retained per harness.
+Version checks alone do not qualify an immutable worker image. H7 terminal interaction remains
+unimplemented, and the backend gate still blocks scheduled generation acceptance.
+
+`harness-suite-probe.ts` exercises these scenarios independently of backend qualification. It accepts
+the Connections probe variables plus `LAB_PROBE_MODEL_ID` and optional comma-separated
+`LAB_PROBE_HARNESSES`. Local Pi passed generation, recall, exact editing and persisted recall.
+OpenCode generated and recalled the identifier but failed to perform the requested file tools;
+its JSON adapter also cannot attest token streaming. Fresh-profile Hermes rejected the app-created
+connection during first-run setup before generation. These live failures are retained, not converted
+into passes by injecting provider settings or retrying assertions.

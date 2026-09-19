@@ -11,6 +11,7 @@ import { ProcessExecutorLive } from "./process"
 import { nativeSourceBuilder } from "./source-builder"
 import { assertRuntime } from "./runtime"
 import { WorkerInvocation, WorkerReply } from "./worker-protocol"
+import { configuredHarnessTools } from "./harnesses/suite"
 
 export const guestMain = (args: readonly string[]) => Effect.gen(function* () {
   yield* assertRuntime
@@ -22,7 +23,7 @@ export const guestMain = (args: readonly string[]) => Effect.gen(function* () {
   const root = dirname(file)
   const environment = Object.fromEntries(["PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* runCandidateWorker(invocation.assignment, { root: join(root, "workspace"), port: invocation.port, model: invocation.model, environment }).pipe(
-    Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive,
+    Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive, configuredHarnessTools,
       nativeInstaller({ disposable: invocation.disposable, root: join(root, "installation"), environment }),
       nativeSourceBuilder({ root: join(root, "build"), objects: join(root, "objects"), environment }).pipe(Layer.provide(fileArtifactStore(join(root, "objects"))))]),
     Effect.catchAll(error => Effect.sync(() => {
