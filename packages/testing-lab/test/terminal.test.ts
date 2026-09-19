@@ -124,4 +124,5 @@ test.skipIf(!runtime)("excessive terminal output fails and cleans up the native 
   expect(Number((yield* fs.stat(join(root, "evidence", "terminal-output.txt"))).size)).toBeLessThanOrEqual(16 * 1024 * 1024)
   expect(cleanup).toEqual([])
   expect(yield* fs.exists(join(root, "evidence", "terminal-screen.json"))).toBe(true)
+  expect(yield* fs.exists(join(root, "evidence", "failure-screen.json"))).toBe(true)
 })).pipe(Effect.timeout("35 seconds"), Effect.provide(Layer.merge(BunContext.layer, NativeTerminalDriver.pipe(Layer.provide(BunContext.layer)))))), 45000)

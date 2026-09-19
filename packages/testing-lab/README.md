@@ -113,7 +113,7 @@ with explicit persistent model selection through the actual bundled CLI. Its fre
 connection remains a reproduced failure: Hermes's first-run guard ignores the named provider
 without a selected default. `LAB_PROBE_HERMES_SET_MODEL=true` with `LAB_PROBE_BUNDLED_CLI` exercises
 the separate explicit-selection scenario; it must not replace or hide the fresh-profile case.
-Pi terminal interaction also passed against real local generation; OpenCode/Hermes TUI interaction,
+Pi and OpenCode terminal interaction also passed against real local generation; Hermes TUI interaction,
 complete suite integration, GPU/backend receipts and the full OS matrix remain unqualified. No performance benchmark gates have been introduced.
 
 ## UI resilience
@@ -268,8 +268,8 @@ The worker connects H1–H6 to real Pi/OpenCode/Hermes processes, with shared ge
 conversation identifier recall, bounded read/edit fixtures and persisted-session reuse. Images must
 configure absolute `LAB_PI_EXECUTABLE`, `LAB_OPENCODE_EXECUTABLE`, `LAB_HERMES_EXECUTABLE` paths;
 the suite rejects versions outside the pinned tools set. Native event logs are retained per harness.
-Version checks alone do not qualify an immutable worker image. H7 dispatches the Pi terminal journey;
-OpenCode and Hermes H7 remain explicitly blocked until their terminal journeys are implemented.
+Version checks alone do not qualify an immutable worker image. H7 dispatches Pi and OpenCode terminal journeys;
+Hermes H7 remains explicitly blocked until its terminal journey is implemented.
 Worker images must also configure an absolute `LAB_TERMINAL_NODE_EXECUTABLE` for Node 24+.
 
 `TerminalDriver` owns a Node.js 24+ subprocess hosting `node-pty`, while the Effect worker
@@ -292,16 +292,26 @@ With `LAB_PI_EXECUTABLE` additionally pointing to Pi 0.85.1, `test/pi-terminal.t
 exercises the real Pi TUI against a controlled loopback SSE endpoint: keyboard model selection,
 rendered streaming output, Escape cancellation confirmed by both the aborted request and Pi's
 persisted assistant record, a successful follow-up, and normal keyboard exit. This passed on
-Mac ARM64. It qualifies terminal automation against the pinned client, not Magnitude generation;
+Mac ARM64. It qualifies terminal automation against the pinned client, not Magnitude generation.
 A second fixture rejects a first turn that finishes naturally before Escape; keyboard input alone
 cannot satisfy interruption. The fixture waits
 through Pi's startup using only an idempotent model-selection command and never retries generation.
 
-`pi-terminal-probe.ts` uses the packaged app's UI-created connection and the same reusable Pi
-journey as H7. It passed on local Mac ARM64 with Qwen3.5 4B Q4: rendered partial generation,
-a persisted aborted assistant turn, successful follow-up in the same identified session, and
-normal keyboard exit with no cleanup errors. It takes `LAB_PROBE_ROOT`, `LAB_PROBE_EXECUTABLE`,
-`LAB_PROBE_MODEL_ID`, `LAB_PI_EXECUTABLE`, `LAB_TERMINAL_NODE_EXECUTABLE`, and optional
+`test/opencode-terminal.test.ts`, with `LAB_OPENCODE_EXECUTABLE` set, exercises OpenCode
+1.18.31's real terminal against synthetic SSE. It selects a model and off variant by keyboard,
+observes streamed output, performs the pinned two-Escape interruption, validates the exported
+assistant abort record, completes a follow-up and exits normally. Its negative fixture rejects
+naturally completed generation before interruption. Model labels come from the app-created
+connection; canonical session/provider/model IDs in the native export remain the assertions.
+The keyboard contract is verified against the [pinned OpenCode source](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/tui/src/component/prompt/index.tsx).
+Failure screens are captured before terminal cleanup restores the alternate screen.
+
+`harness-terminal-probe.ts` uses the packaged app's UI-created connection and the same reusable
+journeys as H7. Both Pi and OpenCode passed on local Mac ARM64 with Qwen3.5 4B Q4: rendered
+partial generation, a persisted aborted assistant turn, successful follow-up in the same identified
+session, and normal keyboard exit with no cleanup errors. It takes `LAB_PROBE_HARNESS` (`pi` or
+`opencode`), `LAB_PROBE_ROOT`, `LAB_PROBE_EXECUTABLE`, `LAB_PROBE_MODEL_ID`, the corresponding
+`LAB_PI_EXECUTABLE` or `LAB_OPENCODE_EXECUTABLE`, `LAB_TERMINAL_NODE_EXECUTABLE`, and optional
 `LAB_PROBE_PORT`. This standalone probe does not qualify the complete worker matrix or backend;
 regular H7 retains the existing H2/backend prerequisites and exports session, screen and terminal
 artifacts before a guest is removed.

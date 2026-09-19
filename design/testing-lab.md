@@ -298,6 +298,11 @@ input, and requires a native persisted aborted assistant turn followed by a comp
 the same session with the selected provider/model. A turn that naturally finishes before Escape
 fails interruption qualification. Session records and intermediate rendered screens are exported
 alongside the terminal transcript; a standalone probe does not establish full worker qualification.
+OpenCode similarly requires a still-active native assistant message before its two-key interrupt,
+an exported abort error for that same message, and a distinct completed recovery message in the
+same session. Presentation labels may guide the pinned third-party picker, but canonical native
+provider/model IDs decide acceptance. Failed terminal journeys capture the rendered screen before
+cleanup restores the alternate screen.
 Error scenarios preserve malformed harness files and restore the original fixture bytes
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback

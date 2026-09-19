@@ -45,7 +45,9 @@ import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
 import { Harness } from "./domain"
 import { harnessSuite, HarnessTools, HarnessTurn } from "./harnesses/suite"
-import { piTerminal, PiTerminalReceipt } from "./harnesses/pi-terminal"
+import { piTerminal } from "./harnesses/pi-terminal"
+import { openCodeModelName, openCodeTerminal } from "./harnesses/opencode-terminal"
+import { HarnessTerminalReceipt } from "./harnesses/terminal"
 import { TerminalDriver } from "./terminal"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
@@ -408,26 +410,31 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             yield* evidence(`${test.id}-${test.harness.value}-turn.json`, HarnessTurn, turn)] })
         }
         case "H7": {
-          if (!Option.contains(test.harness, "pi")) return yield* unavailable("Interactive terminal qualification is not yet implemented for this harness")
+          if (Option.isNone(test.harness) || test.harness.value === "hermes") return yield* unavailable("Interactive terminal qualification is not yet implemented for this harness")
+          const harness = test.harness.value
           const terminal = yield* Effect.serviceOption(TerminalDriver)
           const runtime = config.environment.LAB_TERMINAL_NODE_EXECUTABLE
           if (Option.isNone(tools) || Option.isNone(terminal) || !runtime || !isAbsolute(runtime)) {
-            return yield* unavailable("Pi terminal tests require qualified harness tools, a TerminalDriver and an absolute LAB_TERMINAL_NODE_EXECUTABLE")
+            return yield* unavailable("Terminal tests require qualified harness tools, a TerminalDriver and an absolute LAB_TERMINAL_NODE_EXECUTABLE")
           }
           const home = application.harnessHome, prepared = yield* candidateEnvironment
           const first = crypto.randomUUID().replaceAll("-", "").slice(0, 8), second = crypto.randomUUID().replaceAll("-", "").slice(0, 8)
-          const receipt = yield* piTerminal({ executable: yield* tools.value.executable("pi"), runtime,
-            cwd: config.root, evidence: join(evidenceDirectory, "harness", "pi", "terminal"), model: config.model, initialModel: config.model,
+          const terminalConfig = { executable: yield* tools.value.executable(harness), runtime,
+            cwd: config.root, evidence: join(evidenceDirectory, "harness", harness, "terminal"), model: config.model, initialModel: config.model,
             environment: { ...prepared, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
               XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
               XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
               PATH: `${dirname(runtime)}${target.os === "windows" ? ";" : ":"}${prepared.PATH ?? ""}` },
             interrupt: { prompt: `First concatenate READY and ${first} without a space and print that word. Then count from 1 to 10000, one number per line. Do not use tools.`, expected: `READY${first}` },
             recovery: { prompt: `Concatenate DONE and ${second} without a space. Reply only with the resulting word. Do not use tools.`, expected: `DONE${second}` },
-          }, message => { cleanupErrors.push(`Pi terminal: ${message}`) }).pipe(Effect.provideService(TerminalDriver, terminal.value),
+          }
+          const cleanup = (message: string) => { cleanupErrors.push(`${harness} terminal: ${message}`) }
+          const journey = harness === "pi" ? piTerminal(terminalConfig, cleanup) : openCodeModelName(home, config.model).pipe(
+            Effect.flatMap(name => openCodeTerminal({ ...terminalConfig, modelName: name, initialModelName: name }, cleanup)))
+          const receipt = yield* journey.pipe(Effect.provideService(TerminalDriver, terminal.value),
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
-            yield* evidence("H7-pi-terminal.json", PiTerminalReceipt, receipt)] })
+            yield* evidence(`H7-${harness}-terminal.json`, HarnessTerminalReceipt, receipt)] })
         }
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
@@ -544,7 +551,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     else if (cliCase) for (const name of names) yield* exportFile(`cli/${name}`, cliCase.caseId, 32 * 1024 * 1024, Option.getOrUndefined(cliCase.harness))
   }
   for (const harness of Harness.literals) {
-    for (const file of ["session.jsonl", "streaming.json", "recovered.json", "terminal-output.txt", "terminal-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {
+    for (const file of ["session.jsonl", "aborted.session.json", "recovered.session.json", "streaming.json", "recovered.json", "terminal-output.txt", "terminal-screen.json", "failure-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {
       const relative = `harness/${harness}/terminal/${file}`
       if (yield* fs.exists(join(evidenceDirectory, relative))) yield* exportFile(relative, "H7", 32 * 1024 * 1024, harness)
     }

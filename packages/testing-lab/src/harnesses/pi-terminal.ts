@@ -3,15 +3,11 @@ import { Effect, Option, Schedule, Schema } from "effect"
 import { join } from "node:path"
 import { AssertionFailure } from "../domain"
 import { command } from "../process"
-import { LabProcessId } from "../application-identity"
+import { HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
 import { TerminalConfig, TerminalDriver, TerminalScreen, waitForTerminal } from "../terminal"
 
-const safeInput = Schema.NonEmptyString.pipe(Schema.pattern(/^[^\x00-\x1f\x7f]+$/))
-const Turn = Schema.Struct({ prompt: safeInput, expected: safeInput })
 export const PiTerminalConfig = Schema.Struct({ ...TerminalConfig.omit("args", "columns", "rows").fields,
-  model: safeInput, initialModel: safeInput, interrupt: Turn, recovery: Turn })
-export const PiTerminalReceipt = Schema.Struct({ sessionId: Schema.NonEmptyString, pid: LabProcessId, model: Schema.NonEmptyString,
-  interruptedMessageId: Schema.NonEmptyString, recoveredMessageId: Schema.NonEmptyString, text: Schema.NonEmptyString })
+  model: TerminalInput, initialModel: TerminalInput, interrupt: TerminalTurn, recovery: TerminalTurn })
 const Header = Schema.Struct({ type: Schema.Literal("session"), id: Schema.NonEmptyString })
 const Assistant = Schema.Struct({ type: Schema.Literal("message"), id: Schema.NonEmptyString,
   message: Schema.Struct({ role: Schema.Literal("assistant"), model: Schema.String, provider: Schema.String,
@@ -76,6 +72,6 @@ export const piTerminal = (config: typeof PiTerminalConfig.Type, onCleanupError:
   yield* terminal.write("\u0004")
   const exited = yield* terminal.exited.pipe(Effect.timeoutFail({ duration: "15 seconds", onTimeout: () => fail("Pi did not exit through keyboard input") }))
   if (exited.code !== 0 || Option.isSome(exited.signal)) return yield* fail("Pi terminal did not exit normally")
-  return PiTerminalReceipt.make({ sessionId: completed.headers[0]!.id, pid: terminal.pid, model: config.model,
+  return HarnessTerminalReceipt.make({ sessionId: completed.headers[0]!.id, pid: terminal.pid, model: config.model,
     interruptedMessageId: completed.messages[0]!.id, recoveredMessageId: completed.messages[1]!.id, text })
 }))

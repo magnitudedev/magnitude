@@ -15,9 +15,9 @@ Hermes's Tirith startup dependency must finish installation before collecting st
 
 These are test clients, not application runtime dependencies. Installed directories and ephemeral credentials must never enter the application package or source snapshot.
 
-Pi H7 additionally requires `LAB_TERMINAL_NODE_EXECUTABLE` pointing to a real Node.js 24+
+Pi and OpenCode H7 additionally requires `LAB_TERMINAL_NODE_EXECUTABLE` pointing to a real Node.js 24+
 executable. The native terminal bridge runs under Node; the lab worker still runs under Bun.
-Local Mac ARM64 qualification used Node 26.8.1, Bun 1.4.2 and Pi 0.85.1. Pin and verify the
+Local Mac ARM64 qualification used Node 26.8.1, Bun 1.4.2 Pi 0.85.1 and OpenCode 1.18.31. Pin and verify the
 Node distribution in each worker image; the minimum-version guard is not an image qualification.
 Do not resolve Node through Bun's `--bun` PATH shim. Linux/Windows native terminal qualification
-and OpenCode/Hermes terminal journeys remain outstanding.
+and the Hermes terminal journey remain outstanding.

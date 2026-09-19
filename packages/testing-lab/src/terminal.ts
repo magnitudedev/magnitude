@@ -1,6 +1,6 @@
 import { FileSystem } from "@effect/platform"
 import { Terminal as Screen } from "@xterm/headless"
-import { Context, Deferred, Effect, FiberSet, Layer, Option, Schedule, Schema, Scope } from "effect"
+import { Context, Deferred, Effect, Exit, FiberSet, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
@@ -71,7 +71,10 @@ export const NativeTerminalDriver = Layer.effect(TerminalDriver, Effect.gen(func
       fault = Option.some(error)
       yield* Deferred.fail(exited, error)
     })), Effect.forkScoped)
-    yield* Effect.addFinalizer(() => Effect.gen(function* () {
+    yield* Effect.addFinalizer(exit => Effect.gen(function* () {
+      if (Exit.isFailure(exit)) yield* snapshot.pipe(Effect.flatMap(Schema.encode(Schema.parseJson(TerminalScreen))),
+        Effect.flatMap(json => fs.writeFileString(join(config.evidence, "failure-screen.json"), json, { mode: 0o600 })),
+        Effect.catchAll(error => Effect.sync(() => { onCleanupError(`Terminal failure evidence: ${error.message}`) })))
       if (Option.isSome(yield* Deferred.poll(exited))) return
       yield* child.send({ _tag: "Stop", force: false })
       const stopped = yield* Deferred.await(exited).pipe(Effect.interruptible, Effect.timeoutOption("1 second"))
