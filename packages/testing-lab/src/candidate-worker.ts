@@ -19,7 +19,11 @@ import { desktopSession } from "./desktop-session"
 import { DesktopDriver } from "./desktop-driver"
 import { AssertionFailure, Evidence, InfrastructureFailure } from "./domain"
 import { HostInspector } from "./host-inspector"
-import { HostObservation } from "./hardware"
+import { attestGeneration, HostObservation } from "./hardware"
+import { executionTelemetry, LoadedBackendModule } from "./execution-telemetry"
+import { GenerationExecution, observeGeneration } from "./generation-evidence"
+import { admittedRuntimeModules, attestRuntimeModules } from "./runtime-modules"
+import { NodeArchiveExtractor } from "../../release/src/archive"
 import { Installer } from "./installer"
 import { ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
@@ -52,6 +56,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   const target = assignment.target.target
   const cleanupErrors: string[] = []
   const diagnostics = new Map<string, typeof Evidence.Type>()
+  const backendEvidence: (typeof Evidence.Type)[] = []
   const evidenceDirectory = join(config.root, "evidence")
   if (yield* fs.exists(config.root)) return yield* unavailable("Candidate worker requires a fresh owned workspace")
   yield* fs.makeDirectory(evidenceDirectory, { recursive: true, mode: 0o700 })
@@ -97,7 +102,10 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       XDG_CONFIG_HOME: join(config.root, "home", ".config"), XDG_DATA_HOME: join(config.root, "home", ".local", "share"),
       MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
-    const candidateEnvironment = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => runtimeEnvironment(value.release, target.artifactHost, environment)),
+    const collector = assignment.target.cases.some(test => test.id === "E6")
+      ? Option.some(yield* executionTelemetry().pipe(Effect.provideService(Scope.Scope, scope))) : Option.none()
+    const candidateEnvironment = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => runtimeEnvironment(value.release, target.artifactHost,
+      Option.isSome(collector) ? { ...environment, MAGNITUDE_OTEL_ENDPOINT: collector.value.endpoint } : environment)),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope)))
     const selection = assignment.plan.request.selection
     const harnesses = selectedHarnesses(selection)
@@ -269,6 +277,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             yield* evidence("service-error.json", Schema.Struct({ message: Schema.String }), { message: serviceError })] })
         }
         case "E1": yield* (yield* desktop).search(config.model); yield* (yield* desktop).load(config.model); yield* (yield* endpoint).discover; break
+        case "E6": {
+          if (Option.isNone(collector)) return yield* unavailable("Backend verification requires the scoped native execution collector")
+          const expected = yield* admittedRuntimeModules((yield* manifest).release, target.artifactHost).pipe(Effect.provide(NodeArchiveExtractor))
+          const observed = yield* observeGeneration(`http://127.0.0.1:${config.port}`, config.model, collector.value).pipe(Effect.provide(FetchHttpClient.layer))
+          const receipt = yield* evidence("E6-native-generation.json", GenerationExecution, observed)
+          const modules = yield* evidence("E6-admitted-modules.json", Schema.Array(LoadedBackendModule), expected)
+          backendEvidence.push(receipt, modules)
+          yield* attestRuntimeModules(observed.native, expected)
+          yield* attestGeneration(target, host, config.model, observed.native)
+          return CaseObservation.make({ detail: "Public generation matched admitted runtime modules and requested target-model allocation", evidence: [yield* inputEvidence, hostEvidence, receipt, modules] })
+        }
         case "E2":
         case "E3":
         case "E4":
@@ -357,7 +376,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
       const buildEvidence = source && (result.caseId === "P1" || result.caseId === "P2") ? source.evidence().filter(item => result.caseId !== "P1" || item.path !== "evidence/build-package.json") : []
-      const refs = [...result.evidence, ...buildEvidence, ...(diagnostic ? [diagnostic] : [])]
+      const refs = [...result.evidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })

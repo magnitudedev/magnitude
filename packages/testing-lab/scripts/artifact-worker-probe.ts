@@ -22,6 +22,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   const target = yield* Config.string("LAB_WORKER_TARGET")
   const manifest = yield* Config.string("LAB_WORKER_MANIFEST")
   const disposable = yield* Config.boolean("LAB_WORKER_DISPOSABLE").pipe(Config.withDefault(false))
+  const generation = yield* Config.boolean("LAB_WORKER_GENERATION").pipe(Config.withDefault(false))
   const objects = join(root, "objects")
   const input = yield* snapshotArtifacts(manifest, objects)
   const baselinePath = yield* Config.option(Config.string("LAB_WORKER_BASELINE"))
@@ -29,14 +30,15 @@ BunRuntime.runMain(Effect.gen(function* () {
     onSome: path => snapshotArtifacts(path, objects).pipe(Effect.map(Option.some)) })
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: crypto.randomUUID(), owner: "local-worker-probe",
     input: { kind: "artifacts", digest: input.digest }, ...(Option.isSome(baseline) ? { updateFrom: { kind: "artifacts", digest: baseline.value.digest } } : {}),
-    selection: Option.isSome(baseline) ? { kind: "custom", targets: [target], suites: ["package", "install", "cli", "update", "uninstall"], harnesses: ["pi"] } : { kind: "profile", profile: "quick", target },
-    mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 15, budgetUsd: 25, idleMinutes: 15 } })
+    selection: Option.isSome(baseline) || generation ? { kind: "custom", targets: [target], suites: ["package", "install", "app", "endpoint", "cli", "update", "uninstall"], harnesses: ["pi"] } : { kind: "profile", profile: "quick", target },
+    mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: generation ? 45 : 15, budgetUsd: 25, idleMinutes: 15 } })
   const original = yield* planRun(request)
-  const ids = Option.isSome(baseline) ? ["P1", "P2", "I1", "I2", "U1", "C1", "X1"] : ["P1", "P2", "I1", "I2", "C1"]
+  const ids = Option.isSome(baseline) ? ["P1", "P2", "I1", "I2", "U1", "C1", "X1"]
+    : generation ? ["P1", "P2", "I1", "I2", "I3", "A1", "A2", "A3", "E1", "E6", "E2", "E3", "E4", "C1", "X1"] : ["P1", "P2", "I1", "I2", "C1"]
   const selected = { ...original.targets[0]!, cases: ids.map(id => original.targets[0]!.cases.find(c => c.id === id)!) }
   const plan = { ...original, targets: [selected] }
   const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "local-worker-probe" },
-    plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + 15 * 60_000) })
+    plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + (generation ? 45 : 15) * 60_000) })
   const environment = Object.fromEntries(["PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* Effect.gen(function* () {
     const store = yield* ArtifactStore

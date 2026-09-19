@@ -219,6 +219,13 @@ Backend acceptance must correlate its public generation with the native completi
 allocation evidence. Hardware enumeration, load-plan intent, or draft/projector GPU allocations
 cannot qualify the target model's backend. Native completion diagnostics preserve the pre-aggregation
 device locations; the lab must still validate runtime-module identity and request correlation.
+The shared backend case combines these checks on one public generation and preserves the native
+receipt even when allocation or module validation fails. CPU acceptance requires positive host
+model allocation with no target-model accelerator allocation. GPU acceptance requires positive
+target-model allocation on the requested backend and hardware. Physical identifiers must match
+host discovery exactly. Metal's absent physical identifier is accepted only for native index zero
+on a host with exactly one enumerated Metal device; multiple-device ambiguity fails explicitly.
+Requested layer counts are not a substitute for resident target-model allocation evidence.
 The scoped execution collector accepts OTLP/JSON only on random loopback routes, retains only
 reviewed ICN completion fields, bounds request and retained record sizes, and removes its listener
 on scope exit. Exact exporter retries are idempotent; conflicting records invalidate collection.

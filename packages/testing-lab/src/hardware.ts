@@ -1,5 +1,6 @@
 import { Effect, Schema } from "effect"
-import { Architecture, AssertionFailure, Backend, Target } from "./domain"
+import { Architecture, AssertionFailure, Target } from "./domain"
+import { NativeExecution } from "./execution-telemetry"
 
 export const ObservedGpu = Schema.Struct({ name: Schema.NonEmptyString, backend: Schema.Literal("cuda", "metal"),
   uuid: Schema.NonEmptyString, driver: Schema.String, memoryBytes: Schema.NullOr(Schema.Int.pipe(Schema.nonNegative())) })
@@ -23,23 +24,31 @@ export const attestHost = (target: Target, observed: HostObservation) => Effect.
   if (target.backend !== "cpu") yield* assert(observed.gpus.some(g => g.backend === target.backend), `No usable ${target.backend} device was observed`)
 })
 
-/** Generation receipts are observations of the executing engine, not hardware capability listings. */
-export const BackendObservation = Schema.Struct({ backend: Backend, model: Schema.NonEmptyString, requestId: Schema.NonEmptyString,
-  loadedModuleDigest: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/)),
-  devices: Schema.Array(Schema.Struct({ uuid: Schema.NonEmptyString, name: Schema.NonEmptyString, allocatedModelBytes: Schema.Int.pipe(Schema.nonNegative()) })),
-  offloadedLayers: Schema.Int.pipe(Schema.nonNegative()), totalLayers: Schema.Int.pipe(Schema.positive()),
-})
-export type BackendObservation = typeof BackendObservation.Type
-export const attestGeneration = (target: Target, expectedModel: string, expectedRequestId: string, observation: BackendObservation) => Effect.gen(function* () {
-  if (observation.backend !== target.backend || observation.model !== expectedModel || observation.requestId !== expectedRequestId) {
-    return yield* new AssertionFailure({ message: "Generation evidence belongs to a different backend, model or request" })
+/** Use actual target-model allocations; a requested layer count is not execution evidence. */
+export const attestGeneration = (target: Target, host: HostObservation, expectedModel: string, observation: NativeExecution) => Effect.gen(function* () {
+  yield* attestHost(target, host)
+  if (observation.model !== expectedModel || observation.allocations.length === 0) {
+    return yield* new AssertionFailure({ message: "Generation has no allocation evidence for the expected model" })
   }
+  const devices = observation.allocations.filter(allocation => allocation.kind === "device")
   if (target.backend === "cpu") {
-    if (observation.offloadedLayers !== 0 || observation.devices.some(d => d.allocatedModelBytes > 0)) {
+    if (devices.length > 0) {
       return yield* new AssertionFailure({ message: "CPU-only generation used accelerator model allocations" })
     }
-  } else if (observation.offloadedLayers < 1 || observation.offloadedLayers > observation.totalLayers ||
-    !observation.devices.some(d => d.allocatedModelBytes > 0 && gpuMatches(target.hardware, d.name))) {
-    return yield* new AssertionFailure({ message: "Accelerator generation has no matching device allocation and layer offload evidence; CPU fallback cannot pass" })
+    return
+  }
+  if (devices.length === 0) return yield* new AssertionFailure({ message: "Accelerator generation has no target-model device allocation; CPU fallback cannot pass" })
+  for (const allocation of devices) {
+    const backend = allocation.backend.toLowerCase() === "mtl" ? "metal" : allocation.backend.toLowerCase()
+    if (backend !== target.backend) return yield* new AssertionFailure({ message: "Target-model allocation used a different backend" })
+    const available = host.gpus.filter(gpu => gpu.backend === backend)
+    // Metal has no exported physical ID today. Only one enumerated device at index zero
+    // is unambiguous; CUDA and multi-device hosts require an exact physical identity.
+    const matches = allocation.physical_id === null
+      ? backend === "metal" && allocation.native_index === 0 && available.length === 1 ? available : []
+      : available.filter(gpu => gpu.uuid === allocation.physical_id)
+    if (matches.length !== 1 || !gpuMatches(target.hardware, matches[0]!.name)) {
+      return yield* new AssertionFailure({ message: "Target-model allocation cannot be uniquely matched to the requested hardware" })
+    }
   }
 })
