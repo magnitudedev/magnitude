@@ -29,6 +29,7 @@ import { ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
 import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
+import { inspectMacPackageDependencies, MacPackageDependencies } from "./suites/package-dependencies"
 import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
 import { Harness } from "./domain"
@@ -219,6 +220,16 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const identity = yield* inspectPackageIdentity(yield* installed, yield* (yield* desktop).host(), environment).pipe(
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, yield* evidence("package-identity.json", PackageIdentity, identity)] })
+        }
+        case "P4": {
+          if (target.os !== "macos") return yield* unavailable("Native dependency closure is not yet qualified for this platform")
+          const release = (yield* manifest).release
+          if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
+            return yield* unavailable("Dependency closure requires the admitted native runtime archives")
+          }
+          const report = yield* inspectMacPackageDependencies(yield* installed, release).pipe(Effect.provide(NodeArchiveExtractor))
+          return CaseObservation.make({ detail: "Verified every packaged Mach-O executable/library and selected native runtime dependency graph; OS shared-cache boundaries recorded separately",
+            evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", MacPackageDependencies, report)] })
         }
         case "I2": yield* installed; break
         case "I3": {

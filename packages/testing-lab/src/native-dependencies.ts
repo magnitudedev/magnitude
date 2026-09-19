@@ -1,4 +1,6 @@
 import { Effect, Schema } from "effect"
+import { FileSystem } from "@effect/platform"
+import { join, resolve } from "node:path"
 import { Architecture, AssertionFailure } from "./domain"
 import { inspectNativeImage } from "./native-image"
 import { checkedCommand } from "./process"
@@ -79,8 +81,16 @@ export const inspectNativeDependencies = (path: string, arch: typeof Architectur
   const environment = { PATH: process.env.PATH ?? "", LC_ALL: "C", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) }
   const options = { env: environment, inheritEnv: false, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024 }
   if (image.format === "mach-o") {
-    const output = yield* checkedCommand("/usr/bin/otool", ["-arch", arch === "arm64" ? "arm64" : "x86_64", "-l", path], options)
-    return yield* decodeMachDependencies(output.stdout)
+    return yield* Effect.scoped(Effect.gen(function* () {
+      // otool treats trailing parentheses as archive-member syntax, even in an argv
+      // filename. An owned temporary alias changes only inspection, never loader context.
+      const fs = yield* FileSystem.FileSystem
+      const temporary = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-mach-inspect-" })
+      const alias = join(temporary, "image")
+      yield* fs.symlink(resolve(path), alias)
+      const output = yield* checkedCommand("/usr/bin/otool", ["-arch", arch === "arm64" ? "arm64" : "x86_64", "-l", alias], options)
+      return yield* decodeMachDependencies(output.stdout)
+    }))
   }
   if (image.format === "elf") {
     const output = yield* checkedCommand("readelf", ["--wide", "--dynamic", path], options)

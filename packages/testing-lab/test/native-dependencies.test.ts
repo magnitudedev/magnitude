@@ -78,7 +78,7 @@ test("missing or malformed reports cannot become empty successful dependency gra
 test.runIf(process.platform === "darwin")("reads actual native import declarations after the linked library is removed", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-native-dependencies-" })
-  const library = join(root, "libowned.dylib"), executable = join(root, "candidate")
+  const library = join(root, "libowned.dylib"), executable = join(root, "candidate (GPU)")
   yield* fs.writeFileString(join(root, "library.c"), "int owned(void) { return 0; }\n")
   yield* fs.writeFileString(join(root, "main.c"), "int owned(void); int main(void) { return owned(); }\n")
   yield* checkedCommand("/usr/bin/clang", ["-dynamiclib", join(root, "library.c"), "-Wl,-install_name,@rpath/libowned.dylib", "-o", library])

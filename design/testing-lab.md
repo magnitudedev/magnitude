@@ -172,6 +172,17 @@ Native dependency inspection preserves required, weak and delayed imports and pl
 search paths. A missing or malformed tool report cannot become an empty successful graph.
 Reading declarations does not establish dependency closure: acceptance must resolve the complete
 owned graph from final application and runtime bytes without developer-machine search paths.
+Mach-O resolution follows load-command ancestry and executable-relative paths, retains system
+framework/shared-cache boundaries separately, and rejects missing owned imports, escaping symlinks
+and ambient build-tool paths. A system boundary is not evidence that its shared-cache image was
+independently inspected. Each executable and dynamically loaded package root requires coverage.
+Native inventory deduplicates internal framework aliases, rejects escaping links, and reads the
+selected universal-binary slice to assign executable contexts. Inspection tools use a scoped
+plain-name alias when their filename grammar would reinterpret a package path; resolution still
+uses the original installed loader context. Runtime inspection composes only integrity-verified
+admitted base/selected-pack archives, requires matching native identities, and rejects path
+collisions. Missing admitted runtime inputs block complete closure rather than borrowing a
+developer installation. The fixture is scoped to inspection and cannot qualify runtime execution.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.

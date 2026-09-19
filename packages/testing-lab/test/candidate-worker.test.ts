@@ -37,7 +37,7 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     input: { kind: isSource ? "source" : "artifacts", digest: sha256(json) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-metal-apple-silicon" },
     mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 100, idleMinutes: 15 } })
   const plan = yield* planRun(request)
-  const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P5", "I1", "I2", "C1"].includes(c.id)) }
+  const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P4", "P5", "I1", "I2", "C1"].includes(c.id)) }
   if (mode === "explicit-uninstall") selected.cases.push(allCases.find(test => test.id === "X1")!)
   if (mode.startsWith("update-baseline-")) selected.cases.push(allCases.find(test => test.id === "U1")!)
   const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "fixture" },
@@ -64,6 +64,7 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     const result = yield* execution
     yield* validateTargetResult(selected, result)
     expect(result.cases.find(c => c.caseId === "P5")!.outcome.status).toBe("blocked")
+    expect(result.cases.find(c => c.caseId === "P4")!.outcome.status).toBe("blocked")
     expect(result.cases.find(c => c.caseId === "C1")!.outcome.status).toBe((mode === "corrupt" || sourceFailed) ? "blocked" : (mode === "wrong-version" || mode === "defect") ? "failed" : "passed")
     if (mode === "wrong-version" || mode === "defect") {
       const failed = result.cases.find(c => c.caseId === "C1")!
