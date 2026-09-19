@@ -46,6 +46,9 @@ OS disks. Ownership metadata allows cleanup to discover VM, NIC and disk leftove
 an interrupted allocation. The Namespace adapter verifies its catalog timestamp and guest OS
 version/build; this is a drift check, not an immutable provider image guarantee. The shared
 Spark remains opt-in and has not been exercised during implementation.
+The A10 (72 vCPU) and RTX PRO 6000 (144 vCPU) quota requests returned `ContactSupport`;
+the portal support request is prepared but awaits required contact details before submission.
+Neither GPU family is currently qualified for lab execution.
 
 ## Functional probes
 
@@ -165,7 +168,17 @@ This observation does not prove that inference used the selected backend.
 
 The initial guest-side artifact worker connects manifest integrity, host inspection, exact
 installer download, native installation, packaged launch/readiness, bundled CLI checks and
-scoped uninstall. Unconnected cases return blocked outcomes. The scheduler transport has
-not yet been wired to this worker, and source builds still need their worker path.
+scoped uninstall. Unconnected cases return blocked outcomes. The scheduler now transfers
+owner-authorized immutable inputs to this worker and verifies the returned attempt, case set
+and evidence hashes. Guest execution receives no coordinator or provider credentials.
+Source builds still need their worker path; guest runtimes must be explicitly configured
+for each provider/artifact host and are not automatically installed on stock cloud images.
 `artifact-worker-probe.ts` is an explicitly limited five-case install/CLI diagnostic, not a
 full-profile run; it has passed against the local macOS 15 DMG with verified removal.
+
+`scheduler-worker-probe.ts` runs a full quick-profile plan through PostgreSQL, the scheduler,
+a local lease, the actual guest subprocess and native installer. It preserves all required
+cases; the current incomplete worker returns failures/blocks, not a narrowed green profile.
+Its environment inputs match the artifact-worker probe (`LAB_WORKER_ROOT`,
+`LAB_WORKER_MANIFEST`, `LAB_WORKER_TARGET`). Failure diagnostics are content-addressed
+and transferred before the scheduler deletes the owned worker.

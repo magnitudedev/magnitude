@@ -1,0 +1,76 @@
+import { expect, test } from "vitest"
+import { FileSystem } from "@effect/platform"
+import { BunContext } from "@effect/platform-bun"
+import { DateTime, Effect, Layer, Schema, Stream } from "effect"
+import { dirname, join } from "node:path"
+import { fileArtifactStore } from "../src/artifact-store"
+import { planRun } from "../src/catalog"
+import { initializeDatabase } from "../src/database"
+import { InfrastructureFailure, LeaseId, RunId, RunRequest } from "../src/domain"
+import { InputRegistry, InputRegistryLive } from "../src/inputs"
+import { Fence } from "../src/lease"
+import { LocalMachine, type WorkerTransport } from "../src/machines"
+import { ProcessExecutorLive } from "../src/process"
+import { WorkerRunner } from "../src/scheduler"
+import { sha256 } from "../src/snapshot"
+import { WorkAssignment } from "../src/work-store"
+import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
+import { transportWorkerRunner, WorkerTransports } from "../src/worker-runner"
+import { temporaryDatabase } from "./postgres"
+
+for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local"] as const) {
+  test(`transported workers reject unauthorized or mismatched results: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-runner-" })
+    const database = yield* temporaryDatabase
+    const objectLayer = fileArtifactStore(join(root, "coordinator-objects"))
+    const registry = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, objectLayer)))
+    yield* Effect.gen(function* () {
+      yield* initializeDatabase
+      const inputs = yield* InputRegistry
+      const bytes = "owned input file"
+      const wire = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
+        entries: [{ kind: "file", path: "test.txt", sha256: sha256(bytes), bytes: bytes.length, executable: false }] })
+      const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, owner: "developer", trust: mode === "untrusted-local" ? "untrusted-ci" : "developer", idempotencyKey: `transport-${mode}`,
+        input: { kind: "source", digest: sha256(wire) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-cpu-apple-silicon" }, mode: "verify", allowSpark: false,
+        limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 25, idleMinutes: 15 } })
+      yield* inputs.upload(request.owner, sha256(bytes), Stream.make(new TextEncoder().encode(bytes)))
+      yield* inputs.upload(request.owner, sha256(wire), Stream.make(new TextEncoder().encode(wire)))
+      yield* inputs.register(request.owner, request.input)
+      const plan = yield* planRun(mode === "foreign-owner" ? { ...request, owner: RunRequest.fields.owner.make("someone-else") } : request)
+      const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "transport-fixture" },
+        plan, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
+      const machine = LocalMachine.make({ provider: "local", root: join(root, "guest"), tags: { schemaVersion: 1, runId: assignment.claim.runId,
+        leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), expiresAt: assignment.deadline } })
+      let executions = 0, uploads = 0
+      const evidence = "fixture evidence"
+      const transport: WorkerTransport = {
+        upload: (_machine, local, remote) => Effect.gen(function* () { uploads++; yield* fs.makeDirectory(dirname(remote), { recursive: true }); yield* fs.copyFile(local, remote) })
+          .pipe(Effect.mapError(e => new InfrastructureFailure({ operation: "fixture-upload", message: e.message }))),
+        download: (_machine, remote, local) => fs.copyFile(remote, local).pipe(Effect.mapError(e => new InfrastructureFailure({ operation: "fixture-download", message: e.message }))),
+        execute: (_machine, _executable, args) => Effect.gen(function* () {
+          executions++
+          const invocation = yield* fs.readFileString(args[0]!).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(WorkerInvocation))))
+          expect(invocation.assignment.claim).toEqual(assignment.claim)
+          expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(bytes)))).toBe(bytes)
+          const output = mode === "corrupt-evidence" ? "corrupt evidence" : evidence
+          yield* fs.writeFileString(join(dirname(args[0]!), "objects", sha256(evidence)), output)
+          const now = new Date().toISOString()
+          const result = { cleanupErrors: [], cases: assignment.target.cases.map(c => ({ targetId: assignment.claim.targetId, caseId: c.id, harness: c.harness,
+            startedAt: now, endedAt: now, outcome: { status: "passed" as const, detail: "Transport fixture, not product acceptance" },
+            evidence: [{ path: "fixture.txt", sha256: sha256(evidence), bytes: evidence.length }] })) }
+          if (mode === "missing-case") result.cases.pop()
+          const reply = { schemaVersion: 1 as const, claim: mode === "wrong-claim" ? { ...assignment.claim, fence: Fence.make(2) } : assignment.claim, result }
+          return { exitCode: 0, stdout: yield* Schema.encode(Schema.parseJson(WorkerReply))(reply), stderr: "" }
+        }).pipe(Effect.mapError(e => new InfrastructureFailure({ operation: "fixture-execute", message: e.message }))),
+      }
+      const result = yield* Effect.flatMap(WorkerRunner, runner => runner.run(machine, assignment)).pipe(Effect.either,
+        Effect.provide(transportWorkerRunner([{ provider: "local", artifactHost: "darwin-arm64", executable: "fixture", args: [], root: root,
+          disposable: false, port: 11279, model: "fixture" }]).pipe(Layer.provide(Layer.succeed(WorkerTransports, { transports: new Map([["local" as const, transport]]) })))))
+      expect(result._tag).toBe(mode === "success" ? "Right" : "Left")
+      expect(executions).toBe(["foreign-owner", "untrusted-local"].includes(mode) ? 0 : 1)
+      if (["foreign-owner", "untrusted-local"].includes(mode)) expect(uploads).toBe(0)
+      expect(yield* inputs.missing(request.owner, [sha256(evidence)])).toEqual(mode === "success" ? [] : [sha256(evidence)])
+    }).pipe(Effect.provide(Layer.mergeAll(database, registry, objectLayer)))
+  })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))), 30_000)
+}

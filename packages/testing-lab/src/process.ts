@@ -33,12 +33,12 @@ export const ProcessExecutorLive = Layer.succeed(ProcessExecutor, {
         yield* Effect.sync(() => {
           try { if (process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM") } catch { /* Already exited. */ }
         })
-        const exited = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("2 seconds"))
+        const exited = yield* Effect.promise(() => child.exited).pipe(Effect.interruptible, Effect.timeoutOption("2 seconds"))
         if (Option.isNone(exited)) yield* Effect.sync(() => {
           try { if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL") } catch { /* Already exited. */ }
         })
       }
-      yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("3 seconds"))
+      yield* Effect.promise(() => child.exited).pipe(Effect.interruptible, Effect.timeoutOption("3 seconds"))
     }))
     const collect = (stream: ReadableStream<Uint8Array>) => Stream.fromReadableStream(() => stream, () => failure("read-output", "Subprocess output stream failed")).pipe(
       Stream.runFoldEffect({ bytes: 0, chunks: [] as Uint8Array[] }, (state, chunk) => state.bytes + chunk.byteLength > spec.maxOutputBytes
@@ -50,7 +50,7 @@ export const ProcessExecutorLive = Layer.succeed(ProcessExecutor, {
       collect(child.stdout), collect(child.stderr), Effect.promise(() => child.exited),
     ], { concurrency: "unbounded" })
     return { stdout, stderr, exitCode }
-  })).pipe(Effect.timeoutFail({ duration: spec.timeoutMs, onTimeout: () => failure("timeout", `${spec.executable} exceeded ${spec.timeoutMs}ms`) })),
+  })).pipe(Effect.interruptible, Effect.timeoutFail({ duration: spec.timeoutMs, onTimeout: () => failure("timeout", `${spec.executable} exceeded ${spec.timeoutMs}ms`) })),
 })
 
 export const command = (executable: string, args: readonly string[], options: Partial<Omit<CommandSpec, "executable" | "args">> = {}) =>

@@ -47,15 +47,17 @@ qualify generation. Generation checks output/protocol/tool behavior, not speed.
 ## Ownership and recovery
 
 Admission is idempotent and reserves a bounded budget. Durable transactional claims and monotonic
-attempt fences prevent stale workers from committing results. Workers receive only scoped run
-credentials; untrusted source never receives provider credentials or office-network access.
+attempt fences prevent stale workers from committing results. Worker invocation binds the assignment and attempt fence; returned case membership and evidence
+hashes are verified before acceptance. Transfers expose only the owner-authorized input graph.
+Workers receive only scoped run credentials when needed; untrusted source never receives provider credentials or office-network access.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
 Every rented resource is tagged with lab/run/lease identity and an absolute expiry. Cancellation,
 timeouts and failures release owned resources; reconciliation also inventories providers to find
 allocations lost between provisioning and persistence. Cleanup failures remain visible independently
 of test results. No test assertion is automatically retried. Infrastructure retry preserves the
-original attempt and evidence.
+original attempt and evidence. Cleanup deadlines remain effective inside finalizers, and forced
+termination is limited to processes owned by the attempt.
 
 ## Evidence and acceptance
 

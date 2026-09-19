@@ -1,6 +1,6 @@
 import { desktopAutomation as automation } from "../../../desktop/src/automation"
 import { FileSystem } from "@effect/platform"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { _electron, type Page } from "playwright"
 import { join } from "node:path"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
@@ -26,20 +26,30 @@ export const DesktopDriver = Context.GenericTag<DesktopDriver>("@magnitudedev/te
 // Playwright is the explicit Promise boundary. Test orchestration and lifecycle stay in Effect.
 const action = <A>(description: string, run: () => Promise<A>) => Effect.tryPromise({ try: run,
   catch: error => new AssertionFailure({ message: `${description}: ${error instanceof Error ? error.message.slice(0, 1800) : "Playwright failed"}` }) })
-export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Page) => Promise<void>) => Layer.scoped(DesktopDriver, Effect.gen(function* () {
+export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Page) => Promise<void>, onCleanupError?: (detail: string) => void) => Layer.scoped(DesktopDriver, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   yield* fs.makeDirectory(config.profile, { recursive: true, mode: 0o700 })
   yield* fs.makeDirectory(config.evidence, { recursive: true, mode: 0o700 })
+  // With an explicit result collector, keep cleanup failures separate from the test failure.
+  const reportCleanup = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.catchAllCause(cause =>
+    onCleanupError ? Effect.sync(() => onCleanupError(Cause.pretty(cause))) : Effect.die(cause)))
   let processLog = ""
   const collect = (chunk: Buffer) => { processLog = (processLog + chunk.toString("utf8")).slice(-2 * 1024 * 1024) }
   const app = yield* Effect.acquireRelease(Effect.tryPromise({ try: () => _electron.launch({ executablePath: config.executable, chromiumSandbox: true,
     env: { ...config.environment, MAGNITUDE_DEV_DATA_DIR: config.profile, MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }, timeout: 60_000 }),
     catch: error => new InfrastructureFailure({ operation: "desktop-launch", message: error instanceof Error ? error.message : "Packaged Electron launch failed" }) }),
   app => action("Close packaged application", () => app.close()).pipe(
-    Effect.timeoutFail({ duration: "20 seconds", onTimeout: () => new AssertionFailure({ message: "Packaged application did not quit within 20 seconds" }) }),
-    Effect.tapError(() => Effect.sync(() => { app.process().kill("SIGKILL") })),
+    Effect.interruptible, Effect.timeoutFail({ duration: "20 seconds", onTimeout: () => new AssertionFailure({ message: "Packaged application did not quit within 20 seconds" }) }),
+    Effect.tapError(() => Effect.sync(() => {
+      const child = app.process()
+      // Playwright launches a separate process group on Unix; reap its helpers as well.
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        try { if (process.platform === "win32") child.kill("SIGKILL"); else process.kill(-child.pid, "SIGKILL") }
+        catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error }
+      }
+    })),
     Effect.ensuring(fs.writeFileString(join(config.evidence, "desktop.log"), processLog.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")).pipe(Effect.orDie)),
-    Effect.orDie,
+    reportCleanup,
   ))
   app.process().stdout?.on("data", collect)
   app.process().stderr?.on("data", collect)
@@ -47,7 +57,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   page.setDefaultTimeout(30_000)
   if (preparePage) yield* action("Prepare UI resilience challenge", () => preparePage(page))
   yield* action("Start UI trace", () => app.context().tracing.start({ screenshots: true, snapshots: true, sources: false }))
-  yield* Effect.addFinalizer(() => action("Save UI trace", () => app.context().tracing.stop({ path: join(config.evidence, "ui-trace.zip") })).pipe(Effect.timeout("20 seconds"), Effect.orDie))
+  yield* Effect.addFinalizer(() => action("Save UI trace", () => app.context().tracing.stop({ path: join(config.evidence, "ui-trace.zip") })).pipe(Effect.interruptible, Effect.timeout("20 seconds"), reportCleanup))
   const navigate: DesktopDriver["navigate"] = name => action(`Open ${name}`, async () => {
     await page.getByTestId(automation.navigation(name)).click()
     await page.getByTestId(automation.page(name)).waitFor()

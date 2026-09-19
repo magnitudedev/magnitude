@@ -34,6 +34,7 @@ for (const mode of ["success", "wrong-version", "corrupt", "cleanup-failure", "c
     plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
   const started = yield* Deferred.make<void>()
   let installed = 0, removed = 0
+  let nativeState: string | undefined
   const program = Effect.gen(function* () {
     const objects = yield* ArtifactStore
     yield* objects.put(sha256(json), Stream.make(new TextEncoder().encode(json)))
@@ -52,8 +53,16 @@ for (const mode of ["success", "wrong-version", "corrupt", "cleanup-failure", "c
     yield* validateTargetResult(selected, result)
     expect(result.cases.find(c => c.caseId === "P5")!.outcome.status).toBe("blocked")
     expect(result.cases.find(c => c.caseId === "C1")!.outcome.status).toBe(mode === "corrupt" ? "blocked" : (mode === "wrong-version" || mode === "defect") ? "failed" : "passed")
+    if (mode === "wrong-version" || mode === "defect") {
+      const failed = result.cases.find(c => c.caseId === "C1")!
+      expect(failed.evidence.some(e => e.path.endsWith("C1-shared-failure.json"))).toBe(true)
+    }
     expect(installed).toBe(mode === "corrupt" ? 0 : 1)
     expect(removed).toBe(installed)
+    if (nativeState && process.platform !== "win32") {
+      expect(Buffer.byteLength(join(nativeState, "application.sock"))).toBeLessThanOrEqual(103)
+      expect(yield* fs.exists(nativeState)).toBe(false)
+    }
     expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" ? 1 : 0)
     for (const item of result.cases.flatMap(c => c.evidence)) expect(yield* objects.exists(item.sha256)).toBe(true)
   })
@@ -62,7 +71,7 @@ for (const mode of ["success", "wrong-version", "corrupt", "cleanup-failure", "c
     Layer.succeed(HostInspector, { inspect: () => Effect.succeed({ os: "macos", version: "15.5", build: "fixture", arch: "arm64", cpuVendor: "Apple", cpuName: "fixture", machineModel: "fixture", memoryBytes: 1024, gpus: [] }) }),
     Layer.succeed(Installer, { install: candidate => Effect.sync(() => { installed++; return { candidate, root: "fixture", executable: "fixture", cli: "fixture", packageVersion: "0.1.3" } }),
       uninstall: () => Effect.gen(function* () { removed++; if (mode === "cleanup-failure") return yield* new InfrastructureFailure({ operation: "fixture-cleanup", message: "Failed cleanup fixture" }) }) }),
-    Layer.succeed(ProcessExecutor, { run: () => mode === "cancel" ? Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never))
-      : mode === "defect" ? Effect.dieMessage("Injected command defect") : Effect.succeed({ exitCode: 0, stdout: mode === "wrong-version" ? "0.0.0" : "0.1.3", stderr: "" }) }),
+    Layer.succeed(ProcessExecutor, { run: spec => { nativeState = spec.env.MAGNITUDE_DESKTOP_STATE_DIR; return mode === "cancel" ? Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never))
+      : mode === "defect" ? Effect.dieMessage("Injected command defect") : Effect.succeed({ exitCode: 0, stdout: mode === "wrong-version" ? "0.0.0" : "0.1.3", stderr: "" }) } }),
   ]))
 })).pipe(Effect.provide(BunContext.layer))))

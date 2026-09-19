@@ -13,7 +13,7 @@ import { WorkStoreLive, type TargetResult } from "../src/work-store"
 import { ProcessExecutorLive } from "../src/process"
 import { temporaryDatabase } from "./postgres"
 
-const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout") => Effect.scoped(Effect.gen(function* () {
+const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout" | "interrupt") => Effect.scoped(Effect.gen(function* () {
   const database = yield* temporaryDatabase
   const stores = Layer.mergeAll(database, runStoreLayer(100).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)), LeaseStoreLive.pipe(Layer.provide(database)))
   return yield* Effect.gen(function* () {
@@ -43,7 +43,7 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout") =
       expect((yield* leases.list()).some(l => l.state.leaseId === machine.tags.leaseId && l.state._tag === "Ready")).toBe(true)
       expect(DateTime.toEpochMillis(machine.tags.expiresAt)).toBe(DateTime.toEpochMillis(job.deadline))
       yield* Deferred.succeed(started, undefined)
-      if (mode === "cancel") return yield* Effect.never
+      if (mode === "cancel" || mode === "interrupt") return yield* Effect.never
       const now = new Date().toISOString()
       return { cleanupErrors: [], cases: job.target.cases.map(c => ({ targetId: job.target.target.id, caseId: c.id, harness: c.harness,
         startedAt: now, endedAt: now, evidence: [], outcome: { status: "passed", detail: "Scheduler fixture, not application qualification" } })) } satisfies TargetResult
@@ -54,6 +54,15 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout") =
     const run = yield* runs.submit(yield* planRun(request))
     yield* Effect.gen(function* () {
       const scheduler = yield* Scheduler
+      if (mode === "interrupt") {
+        const executing = yield* scheduler.next("fixture-worker").pipe(Effect.fork)
+        yield* Deferred.await(started)
+        yield* Fiber.interrupt(executing)
+        expect(inventory).toEqual([])
+        expect(removals).toBe(1)
+        expect((yield* leases.list()).every(l => l.state._tag === "Released")).toBe(true)
+        return
+      }
       if (mode === "cancel") {
         const executing = yield* scheduler.next("fixture-worker").pipe(Effect.fork)
         yield* Deferred.await(started)
@@ -80,4 +89,4 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout") =
   }).pipe(Effect.provide(stores))
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))
 
-test.each(["success", "ambiguous", "cancel", "cleanup-timeout"] as const)("scheduler preserves durable ownership and cleanup for %s", mode => Effect.runPromise(fixture(mode)), 30_000)
+test.each(["success", "ambiguous", "cancel", "cleanup-timeout", "interrupt"] as const)("scheduler preserves durable ownership and cleanup for %s", mode => Effect.runPromise(fixture(mode)), 30_000)

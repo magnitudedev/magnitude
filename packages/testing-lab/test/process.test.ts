@@ -17,3 +17,13 @@ test("times out and reaps long-lived subprocesses", async () => {
   expect(result).toMatchObject({ _tag: "Left", left: { operation: "timeout" } })
   expect(Date.now() - start).toBeLessThan(6000)
 })
+
+test("cleanup subprocess deadlines still apply inside an uninterruptible finalizer", async () => {
+  const started = Date.now()
+  await Effect.runPromise(Effect.scoped(Effect.addFinalizer(() => command(process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { timeoutMs: 250 })
+    .pipe(Effect.either, Effect.tap(result => Effect.sync(() => {
+      expect(result).toMatchObject({ _tag: "Left", left: { operation: "timeout" } })
+    }))))).pipe(Effect.provide(ProcessExecutorLive)))
+  expect(Date.now() - started).toBeLessThan(6000)
+}, 8000)
