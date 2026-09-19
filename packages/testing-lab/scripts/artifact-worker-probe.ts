@@ -36,7 +36,7 @@ BunRuntime.runMain(Effect.gen(function* () {
     mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: generation ? 45 : 15, budgetUsd: 25, idleMinutes: 15 } })
   const original = yield* planRun(request)
   const ids = Option.isSome(baseline) ? ["P1", "P2", "P4", "I1", "I2", "U1", "C1", "X1"]
-    : generation ? ["P1", "P2", "P4", "I1", "I2", "I3", "I4", "A1", "A2", "A3", ...(harnesses ? ["A5"] : []), "E1", "E6", "E2", "E3", "E4", ...(harnesses ? ["H1", "H2", "H5", "C4"] : []), "C1", "X1"] : ["P1", "P2", "P4", "I1", "I2", "I3", "I4", "C1"]
+    : generation ? ["P1", "P2", "P4", "I1", "I2", "I3", "I4", "A1", "A2", "A3", ...(harnesses ? ["A5"] : []), "E1", "E6", "E2", "E3", "E4", ...(harnesses ? ["H1", "H2", "H5", "C4"] : []), "C1", "X1"] : ["P1", "P2", "P4", "P5", "I1", "I2", "I3", "I4", "C1"]
   const selected = { ...original.targets[0]!, cases: ids.flatMap(id => original.targets[0]!.cases.filter(c => c.id === id)) }
   const plan = { ...original, targets: [selected] }
   const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "local-worker-probe" },

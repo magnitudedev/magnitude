@@ -63,7 +63,10 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     }
     const result = yield* execution
     yield* validateTargetResult(selected, result)
-    expect(result.cases.find(c => c.caseId === "P5")!.outcome.status).toBe("blocked")
+    // This fixture returns version text for all commands, not valid signature evidence.
+    const signature = result.cases.find(c => c.caseId === "P5")!.outcome
+    expect(signature.status).toBe(mode === "runtime-artifacts" ? "failed" : "blocked")
+    if (signature.status === "failed") expect(signature.detail).toContain("Missing or ambiguous signature identity")
     expect(result.cases.find(c => c.caseId === "P4")!.outcome.status).toBe("blocked")
     expect(result.cases.find(c => c.caseId === "C1")!.outcome.status).toBe((mode === "corrupt" || sourceFailed) ? "blocked" : (mode === "wrong-version" || mode === "defect") ? "failed" : "passed")
     if (mode === "wrong-version" || mode === "defect") {

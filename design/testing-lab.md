@@ -186,6 +186,13 @@ start commands must preserve the observed application PID, service PID and servi
 This does not imply global shell registration where the platform does not install one.
 Installed package identity is verified against native binary headers and the running desktop,
 service and CLI versions. Artifact names alone cannot qualify architecture or version agreement.
+Apple package trust verifies the installed application's sealed resources and every native file
+in both the application and admitted runtime composition, across all signed architectures.
+Development checks accept valid ad-hoc or certificate signatures as integrity evidence only;
+they cannot claim production trust. Release checks require an explicitly configured expected
+Apple team, Developer ID requirements, secure timestamps, the installed application's stapled
+notarization ticket and a successful native Gatekeeper assessment. Missing publisher configuration
+blocks release verification. Verification never re-signs a candidate or changes host trust.
 Native dependency inspection preserves required, weak and delayed imports and platform loader
 search paths. A missing or malformed tool report cannot become an empty successful graph.
 Reading declarations does not establish dependency closure: acceptance must resolve the complete

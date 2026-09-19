@@ -778,3 +778,24 @@ clicks once then waits for its asynchronous rendered acknowledgement. It does no
 or require an immediate DOM toggle. The renderer regression checks delayed state and idempotent
 selection while still perturbing presentation. Fourteen lab tests and three native image tests pass;
 release and testing-lab targeted typechecks pass.
+
+### Apple package signatures
+
+P5 now verifies the installed app resource seal and each native application/runtime file with
+strict, all-architecture code-signature checks. The runtime comes exclusively from the admitted
+base and selected backend archives. Its receipt records each relative path, signing identifier,
+signature kind and team. Development runs explicitly report `productionTrusted: false`; an ad-hoc
+signature proves integrity, not publisher trust or notarization. App-only inputs without admitted
+runtime archives remain blocked for complete signature coverage.
+
+The release profile additionally requires `LAB_EXPECTED_APPLE_TEAM_ID` in the worker's configured
+environment. This is a public expected publisher identity, not a signing credential. An absent or
+malformed value blocks verification. Every native signature must satisfy that Developer ID team
+and contain a secure timestamp; the installed app must pass stapler validation and Gatekeeper
+assessment. No candidate is re-signed and no host trust settings are changed. The production path
+has fixture coverage but has not been qualified with a production-signed release. Windows/Linux
+P5 verification remains outstanding.
+
+Real local macOS verification at `/tmp/ml-signature-worker-20260919/result.json` passed nine
+selected cases, including 37 signature records covering the app, CPU base and Metal pack; cleanup
+errors were empty. A separate native negative test modified signed bytes and verified rejection.

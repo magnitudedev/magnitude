@@ -32,6 +32,7 @@ import { sha256 } from "./snapshot"
 import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
 import { inspectMacPackageDependencies, MacPackageDependencies } from "./suites/package-dependencies"
+import { appleTrustPolicy, ApplePackageTrust, inspectApplePackageTrust } from "./suites/apple-package-trust"
 import { inspectLinuxPackageDependencies, LinuxPackageDependencies } from "./suites/linux-package-dependencies"
 import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
@@ -233,6 +234,19 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const report = yield* inspectMacPackageDependencies(yield* installed, release).pipe(Effect.provide(NodeArchiveExtractor))
           return CaseObservation.make({ detail: "Verified every packaged Mach-O executable/library and selected native runtime dependency graph; OS shared-cache boundaries recorded separately",
             evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", MacPackageDependencies, report)] })
+        }
+        case "P5": {
+          if (target.os !== "macos") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
+          const production = assignment.plan.request.selection.kind === "profile" && assignment.plan.request.selection.profile === "release"
+          const policy = yield* appleTrustPolicy(production, config.environment.LAB_EXPECTED_APPLE_TEAM_ID)
+          const release = (yield* manifest).release
+          if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
+            return yield* unavailable("Complete signature verification requires the admitted native runtime archives")
+          }
+          const receipt = yield* inspectApplePackageTrust(yield* installed, release, policy).pipe(Effect.provide(NodeArchiveExtractor))
+          return CaseObservation.make({ detail: receipt.productionTrusted ? "Verified expected publisher, timestamps, notarization and Gatekeeper acceptance"
+            : "Verified application and admitted runtime code signatures; development integrity only, no production trust claimed",
+            evidence: [yield* inputEvidence, yield* evidence("P5-apple-package-trust.json", ApplePackageTrust, receipt)] })
         }
         case "I2": yield* installed; break
         case "I3": {
