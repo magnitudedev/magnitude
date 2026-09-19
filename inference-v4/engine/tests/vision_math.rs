@@ -69,8 +69,9 @@ fn affine_bias_precedes_compact_publication() {
             &HashMap::from([("M".into(), 1), ("N".into(), 1), ("K".into(), 2)]),
         );
         assert_eq!(vm.tensors[out].get(0), 1.0078125);
-        let premature =
-            seismic_lang::numeric::bf16_round(seismic_lang::numeric::bf16_round(1.00390625) + 0.001);
+        let premature = seismic_lang::numeric::bf16_round(
+            seismic_lang::numeric::bf16_round(1.00390625) + 0.001,
+        );
         assert_ne!(vm.tensors[out].get(0), premature as f64);
     }
 }
@@ -300,11 +301,13 @@ fn vision_attention_includes_future_rows_and_keeps_heads_independent() {
                     for channel in 0..width {
                         let expected: f64 = (0..rows)
                             .map(|key| {
-                                exp[key] / total * values[(key * heads + head) * width + channel] as f64
+                                exp[key] / total
+                                    * values[(key * heads + head) * width + channel] as f64
                             })
                             .sum();
                         assert!(
-                            (vm.tensors[out].get((row * heads + head) * width + channel) - expected)
+                            (vm.tensors[out].get((row * heads + head) * width + channel)
+                                - expected)
                                 .abs()
                                 < 2e-6
                         );
@@ -492,7 +495,8 @@ fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
                     let variance =
                         row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
                     let inverse = 1. / (variance + 1e-6).sqrt();
-                    (0..width).map(move |i| round((row[i] - mean) * inverse * scales[i] + shifts[i]))
+                    (0..width)
+                        .map(move |i| round((row[i] - mean) * inverse * scales[i] + shifts[i]))
                 })
                 .collect();
             for (i, &expected) in expected.iter().enumerate() {
@@ -505,7 +509,8 @@ fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
                     });
                     let expected = round(sum + biases[output]);
                     assert!(
-                        (vm.tensors[up].get(group * merged + output) - expected as f64).abs() < 1e-6
+                        (vm.tensors[up].get(group * merged + output) - expected as f64).abs()
+                            < 1e-6
                     );
                 }
             }
@@ -516,22 +521,26 @@ fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
 #[test]
 fn erf_gelu_matches_python_oracle_at_boundaries_small_values_and_tails() {
     for slice_width in WIDTHS {
-        use seismic_lang::{
-            program::{compile, SourceFile},
-            Scope,
-        };
+        use seismic_lang::program::{compile, SourceFile};
         let reference: Vec<[f64; 3]> = serde_json::from_str(include_str!(
             "../../validation/results/fixtures/erf-gelu-reference.json"
         ))
         .unwrap();
         let mut sources = seismic_std::sources();
         sources.push(SourceFile {
-            path: "erf-test.seismic.portable".into(),
+            path: "erf-test.seismic".into(),
             text: "fn erf_test[M, N](x: tensor[M, N] f32, out out: tensor[M, N] f32):\n    parallel [rows] in 0..M:\n        for row in rows:\n            publish erf_values(f32(x[row])) to out[row]\n".into(),
-            scope: Scope::Portable,
         });
-        let program = compile(&sources, &["cpu".into(), "metal".into()])
-            .unwrap_or_else(|errors| panic!("{}", errors.iter().map(|e| e.render()).collect::<Vec<_>>().join("\n")));
+        let program = compile(&sources).unwrap_or_else(|errors| {
+            panic!(
+                "{}",
+                errors
+                    .iter()
+                    .map(|e| e.render())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
         let mut values: Vec<f64> = reference.iter().map(|row| row[0]).collect();
         values.extend([-0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN]);
         let n = values.len();
@@ -540,8 +549,18 @@ fn erf_gelu_matches_python_oracle_at_boundaries_small_values_and_tails() {
         let erf = vm.add_tensor(TensorData::dense(DType::F32, vec![1, n], vec![0.; n]));
         let gelu = vm.add_tensor(TensorData::dense(DType::F32, vec![1, n], vec![0.; n]));
         let shape = HashMap::from([("M".into(), 1), ("N".into(), n as i64)]);
-        reference::run(&mut vm, "erf_test", &[Arg::Tensor(x), Arg::Tensor(erf)], &shape);
-        reference::run(&mut vm, "gelu", &[Arg::Tensor(x), Arg::Tensor(gelu)], &shape);
+        reference::run(
+            &mut vm,
+            "erf_test",
+            &[Arg::Tensor(x), Arg::Tensor(erf)],
+            &shape,
+        );
+        reference::run(
+            &mut vm,
+            "gelu",
+            &[Arg::Tensor(x), Arg::Tensor(gelu)],
+            &shape,
+        );
         for (i, &[x, expected_erf, expected_gelu]) in reference.iter().enumerate() {
             let actual = vm.tensors[erf].get(i) as f32;
             let expected = expected_erf as f32;

@@ -3,7 +3,6 @@ use seismic_lang::{
     lower::Options,
     lowered_ir::LoweredIr,
     program::{compile, SourceFile},
-    Scope,
 };
 use std::collections::HashMap;
 pub fn exercise(
@@ -11,9 +10,9 @@ pub fn exercise(
     backend: &str,
 ) {
     let p = compile(&[SourceFile {
-        path: "stream.seismic.portable".into(), scope: Scope::Portable,
+        path: "stream.seismic".into(),
         text: "fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] = reduce(t, 0, sum, ordered=true)\n  store(acc, out)\n".into(),
-    }], &[]).unwrap();
+    }]).unwrap();
     for piece in [None, Some(1), Some(17), Some(64), Some(200)] {
         let l = seismic_lang::lower::lower_with(
             &p,

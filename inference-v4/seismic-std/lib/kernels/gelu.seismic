@@ -1,0 +1,58 @@
+# Error-function rational coefficients adapted from rust-lang/libm 0.2.16
+# src/math/erff.rs (FreeBSD msun / SunPro). See ../../THIRD_PARTY.md.
+# FP32 arithmetic, signed zero, NaN propagation and saturation at |x| >= 6.
+# All work is portable IR, including piecewise control and existing exp calls.
+fn erf_values[N](source: tile[N] f32) -> tile[N] f32:
+    let mut result = tile[N] f32
+    for i in owned(result):
+        let x = source[i]
+        let magnitude = abs(x)
+        if magnitude < 0.84375:
+            if magnitude < 3.725290298461914e-9:
+                result[i] = 0.125 * (8.0 * x + 1.0270333290e+00 * x)
+            else:
+                let z = x * x
+                let numerator = 1.2837916613e-01 + z * (-3.2504209876e-01 + z * (-2.8481749818e-02 + z * (-5.7702702470e-03 + z * (-2.3763017452e-05))))
+                let denominator = 1.0 + z * (3.9791721106e-01 + z * (6.5022252500e-02 + z * (5.0813062117e-03 + z * (1.3249473704e-04 + z * (-3.9602282413e-06)))))
+                result[i] = x + x * (numerator / denominator)
+        else:
+            let mut positive = f32(1.0)
+            if magnitude < 1.25:
+                let s = magnitude - 1.0
+                let numerator = -2.3621185683e-03 + s * (4.1485610604e-01 + s * (-3.7220788002e-01 + s * (3.1834661961e-01 + s * (-1.1089469492e-01 + s * (3.5478305072e-02 + s * (-2.1663755178e-03))))))
+                let denominator = 1.0 + s * (1.0642088205e-01 + s * (5.4039794207e-01 + s * (7.1828655899e-02 + s * (1.2617121637e-01 + s * (1.3637083583e-02 + s * (1.1984500103e-02))))))
+                let complement = (1.0 - 8.4506291151e-01) - numerator / denominator
+                positive = 1.0 - complement
+            else:
+                if magnitude < 6.0:
+                    let s = 1.0 / (magnitude * magnitude)
+                    let mut numerator = f32(0.0)
+                    let mut denominator = f32(1.0)
+                    if magnitude < 2.857142925262451:
+                        numerator = -9.8649440333e-03 + s * (-6.9385856390e-01 + s * (-1.0558626175e+01 + s * (-6.2375331879e+01 + s * (-1.6239666748e+02 + s * (-1.8460508728e+02 + s * (-8.1287437439e+01 + s * (-9.8143291473e+00)))))))
+                        denominator = 1.0 + s * (1.9651271820e+01 + s * (1.3765776062e+02 + s * (4.3456588745e+02 + s * (6.4538726807e+02 + s * (4.2900814819e+02 + s * (1.0863500214e+02 + s * (6.5702495575e+00 + s * (-6.0424413532e-02))))))))
+                    else:
+                        numerator = -9.8649431020e-03 + s * (-7.9928326607e-01 + s * (-1.7757955551e+01 + s * (-1.6063638306e+02 + s * (-6.3756646729e+02 + s * (-1.0250950928e+03 + s * (-4.8351919556e+02))))))
+                        denominator = 1.0 + s * (3.0338060379e+01 + s * (3.2579251099e+02 + s * (1.5367296143e+03 + s * (3.1998581543e+03 + s * (2.5530502930e+03 + s * (4.7452853394e+02 + s * (-2.2440952301e+01)))))))
+                    # On [1.25,6), this truncation has <=11 significant bits, making
+                    # z*z exact in FP32. The residual restores the discarded fraction.
+                    # A bounded numeric cast avoids a new reinterpretation primitive.
+                    let z = f32(i32(magnitude * 256.0)) / 256.0
+                    let complement = exp(-z * z - 0.5625) * exp((z - magnitude) * (z + magnitude) + numerator / denominator) / magnitude
+                    positive = 1.0 - complement
+            if x != x:
+                result[i] = x
+            else:
+                if x < 0.0:
+                    result[i] = -positive
+                else:
+                    result[i] = positive
+    return result
+
+# Erf-form GELU in FP32; the output dtype owns the final publication.
+fn gelu[M, N](x: tensor[M, N] T, out out: tensor[M, N] U):
+    parallel [rows] in 0..M:
+        for row in rows:
+            let source = f32(x[row])
+            let probability = erf_values(source * 0.7071067811865476)
+            publish 0.5 * source * (1.0 + probability) to out[row]

@@ -1,0 +1,29 @@
+# Explicit publication operations. Compositions retain separate calls wherever the
+# model equations require intermediate rounding. Owners span rows and columns: the work is
+# pointwise, so a single row still divides into independent column slices.
+fn silu[M, N](x: tensor[M, N] T, out out: tensor[M, N] U) alias(x, out):
+    parallel [rows, cols] in (0..M, 0..N):
+        let a = f32(x[rows, cols])
+        publish a / (1.0 + exp(-a)) to out[rows, cols]
+
+fn multiply[M, N](x: tensor[M, N] T, y: tensor[M, N] U, out out: tensor[M, N] V) alias(x, out):
+    parallel [rows, cols] in (0..M, 0..N):
+        publish f32(x[rows, cols]) * f32(y[rows, cols]) to out[rows, cols]
+
+fn add[M, N](x: tensor[M, N] T, y: tensor[M, N] U, out out: tensor[M, N] V) alias(x, out):
+    parallel [rows, cols] in (0..M, 0..N):
+        publish f32(x[rows, cols]) + f32(y[rows, cols]) to out[rows, cols]
+
+fn sigmoid[M, N](x: tensor[M, N] T, out out: tensor[M, N] U) alias(x, out):
+    parallel [rows, cols] in (0..M, 0..N):
+        publish 1.0 / (1.0 + exp(-f32(x[rows, cols]))) to out[rows, cols]
+
+# Tanh-form GELU used by Qwen vision blocks. The sigmoid identity avoids a
+# separate tanh helper: tanh(z) = 2 / (1 + exp(-2*z)) - 1. Merger erf-GELU is a
+# different operation and must not use this entry.
+fn gelu_tanh[M, N](x: tensor[M, N] T, out out: tensor[M, N] U):
+    parallel [rows] in 0..M:
+        let value = f32(x[rows])
+        let argument = 0.7978845608028654 * (value + 0.044715 * value * value * value)
+        let hyperbolic = 2.0 / (1.0 + exp(-2.0 * argument)) - 1.0
+        publish 0.5 * value * (1.0 + hyperbolic) to out[rows]

@@ -1,6 +1,6 @@
 # Third-party numerical code
 
-`lib/kernels/gelu.seismic.portable` adapts the error-function rational
+`lib/kernels/gelu.seismic` adapts the error-function rational
 approximations in rust-lang/libm 0.2.16, `src/math/erff.rs`, originating from
 FreeBSD msun `s_erff.c`. The adaptation expresses the work as portable Seismic
 and uses a bounded arithmetic truncation for the tail exponent split.

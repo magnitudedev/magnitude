@@ -2,11 +2,13 @@
 //! element/coordinate loops, publication, `yield`/`return` path rules.
 
 use super::{elem_rounds, var_atom, Checker, Frame, FrameKind, YieldCtx, YieldKind};
+use crate::sir::{
+    self, Expr, ExprKind, RegionDecl, SliceDecl, SliceParent, Stmt, StmtKind, VarId, VarKind,
+};
 use crate::span::Span;
-use crate::sir::{self, Expr, ExprKind, RegionDecl, SliceDecl, SliceParent, Stmt, StmtKind, VarId, VarKind};
+use crate::sym::Sym;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, ExprKind as A, RegionMode};
 use crate::types::{DType, Extent, RegionId, ResultTy, SliceId, Ty};
-use crate::sym::Sym;
 use std::collections::HashSet;
 
 impl<'a> Checker<'a> {
@@ -24,12 +26,21 @@ impl<'a> Checker<'a> {
         while i < b.stmts.len() {
             let s = &b.stmts[i];
             if self.yields.last().is_some_and(|y| y.done) {
-                self.error(s.span, "unreachable statement: `yield`/`return` is terminal for its result boundary");
+                self.error(
+                    s.span,
+                    "unreachable statement: `yield`/`return` is terminal for its result boundary",
+                );
             }
             if matches!(s.kind, ast::StmtKind::Stage { .. }) {
-                let end = b.stmts[i..].iter().position(|s| !matches!(s.kind, ast::StmtKind::Stage { .. })).map_or(b.stmts.len(), |n| i + n);
+                let end = b.stmts[i..]
+                    .iter()
+                    .position(|s| !matches!(s.kind, ast::StmtKind::Stage { .. }))
+                    .map_or(b.stmts.len(), |n| i + n);
                 let stages = self.stages(&b.stmts[i..end], end == b.stmts.len());
-                out.push(Stmt { kind: StmtKind::Stages(stages), span: s.span.to(b.stmts[end - 1].span) });
+                out.push(Stmt {
+                    kind: StmtKind::Stages(stages),
+                    span: s.span.to(b.stmts[end - 1].span),
+                });
                 i = end;
                 continue;
             }
@@ -50,12 +61,21 @@ impl<'a> Checker<'a> {
 
     fn stmt(&mut self, s: &ast::Stmt) -> Option<StmtKind> {
         match &s.kind {
-            ast::StmtKind::Let { pattern, value } => self.bind(pattern, value, false),
-            ast::StmtKind::Var { pattern, value } => self.bind(pattern, value, true),
+            ast::StmtKind::Let {
+                mutable,
+                pattern,
+                value,
+            } => self.bind(pattern, value, *mutable),
             ast::StmtKind::Assign { target, op, value } => self.assign(target, *op, value),
-            ast::StmtKind::Region(region) => self.region(region, false).map(|(region, _, _)| StmtKind::Region(region)),
+            ast::StmtKind::Region(region) => self
+                .region(region, false)
+                .map(|(region, _, _)| StmtKind::Region(region)),
             ast::StmtKind::Stage { .. } => None,
-            ast::StmtKind::For { targets, iter, body } => {
+            ast::StmtKind::For {
+                targets,
+                iter,
+                body,
+            } => {
                 // State carried through a loop is not its pre-loop definition on every visit.
                 self.dyn_slices.clear();
                 if let Some(y) = self.yields.last_mut() {
@@ -68,7 +88,9 @@ impl<'a> Checker<'a> {
                 kind
             }
             ast::StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els.as_ref()),
-            ast::StmtKind::Publish { value, destination } => self.publish(value, destination, s.span),
+            ast::StmtKind::Publish { value, destination } => {
+                self.publish(value, destination, s.span)
+            }
             ast::StmtKind::Yield(values) => self.yield_stmt(values, s.span),
             ast::StmtKind::Return(values) => self.return_stmt(values, s.span),
             ast::StmtKind::Expr(e) => {
@@ -83,11 +105,19 @@ impl<'a> Checker<'a> {
 
     // ---- bindings ----
 
-    /// The value of `let`/`var`/`yield`/`return`: the only positions of a result-producing region.
+    /// The value of `let`/`yield`/`return`: the only positions of a result-producing region.
     fn value(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> Option<Expr> {
-        let A::Region(region) = &e.kind else { return self.expr(e, expected) };
+        let A::Region(region) = &e.kind else {
+            return self.expr(e, expected);
+        };
         let (region, ty, partial) = self.region(region, true)?;
-        Some(Expr { kind: ExprKind::Region(Box::new(region)), ty, sym: None, partial, span: e.span })
+        Some(Expr {
+            kind: ExprKind::Region(Box::new(region)),
+            ty,
+            sym: None,
+            partial,
+            span: e.span,
+        })
     }
 
     /// Partial flags of the components of a tuple-typed value.
@@ -95,7 +125,12 @@ impl<'a> Checker<'a> {
         match &e.kind {
             ExprKind::Tuple(items) if items.len() == n => items.iter().map(|i| i.partial).collect(),
             ExprKind::Member { result, .. } => match &result.ty {
-                Ty::Result(r) => self.result_partials.get(&r.producer).filter(|p| p.len() == n).cloned().unwrap_or_else(|| vec![e.partial; n]),
+                Ty::Result(r) => self
+                    .result_partials
+                    .get(&r.producer)
+                    .filter(|p| p.len() == n)
+                    .cloned()
+                    .unwrap_or_else(|| vec![e.partial; n]),
                 _ => vec![e.partial; n],
             },
             _ => vec![e.partial; n],
@@ -137,18 +172,34 @@ impl<'a> Checker<'a> {
         Some(StmtKind::Bind { pattern, value })
     }
 
-    fn destructure(&mut self, pattern: &ast::Pattern, ty: &Ty, value: &Expr, state: bool, origin: Option<RegionId>) -> Option<sir::Pattern> {
+    fn destructure(
+        &mut self,
+        pattern: &ast::Pattern,
+        ty: &Ty,
+        value: &Expr,
+        state: bool,
+        origin: Option<RegionId>,
+    ) -> Option<sir::Pattern> {
         match pattern {
             ast::Pattern::Name(name) => {
-                if state && matches!(ty, Ty::Tensor(_) | Ty::View(_) | Ty::Slice(_) | Ty::Coord(_) | Ty::Domain) {
-                    self.error(name.span, format!("`var` declares mutable value state; a {ty} is a borrowed or structural handle and is bound with `let`"));
+                if state && matches!(ty, Ty::Slice(_) | Ty::Coord(_) | Ty::Domain) {
+                    self.error(name.span, format!("`let mut` declares mutable state or a mutable storage capability; a {ty} is a structural handle and is bound with `let`"));
                     return None;
                 }
                 if matches!(ty, Ty::Coord(_)) {
                     self.error(name.span, "a tile coordinate cannot be rebound; it indexes tiles sharing its axis or is converted with `coord(i)`");
                     return None;
                 }
-                let id = self.declare(&name.name, ty.clone(), name.span, if state { VarKind::State } else { VarKind::Value });
+                let id = self.declare(
+                    &name.name,
+                    ty.clone(),
+                    name.span,
+                    if state {
+                        VarKind::State
+                    } else {
+                        VarKind::Value
+                    },
+                );
                 self.vars[id].partial = value.partial;
                 if value.partial {
                     if let Some(origin) = origin {
@@ -170,10 +221,24 @@ impl<'a> Checker<'a> {
                             self.scalar_symbols.insert(id, sym.clone());
                         }
                         // A scalar argmax over a semantic axis is an index into that axis.
-                        (None, ExprKind::Reduce { value: reduced, axis, op: sir::ReduceOp::Argmax, .. }) => {
-                            if let Some(Extent::Semantic(extent)) = reduced.ty.shaped().and_then(|s| s.axes.get(*axis)).cloned() {
+                        (
+                            None,
+                            ExprKind::Reduce {
+                                value: reduced,
+                                axis,
+                                op: sir::ReduceOp::Argmax,
+                                ..
+                            },
+                        ) => {
+                            if let Some(Extent::Semantic(extent)) =
+                                reduced.ty.shaped().and_then(|s| s.axes.get(*axis)).cloned()
+                            {
                                 let atom = var_atom(&name.name, id);
-                                self.facts.set_range(atom.clone(), Sym::constant(0), extent.sub(&Sym::constant(1)));
+                                self.facts.set_range(
+                                    atom.clone(),
+                                    Sym::constant(0),
+                                    extent.sub(&Sym::constant(1)),
+                                );
                                 self.atoms.insert(id, atom);
                             }
                         }
@@ -184,23 +249,42 @@ impl<'a> Checker<'a> {
             }
             ast::Pattern::Tuple(items) => {
                 let Ty::Tuple(tys) = ty else {
-                    self.error(value.span, format!("a tuple pattern destructures a tuple; this value is a {ty}"));
+                    self.error(
+                        value.span,
+                        format!("a tuple pattern destructures a tuple; this value is a {ty}"),
+                    );
                     return None;
                 };
                 if tys.len() != items.len() {
-                    self.error(value.span, format!("pattern binds {} names but the value has {} components", items.len(), tys.len()));
+                    self.error(
+                        value.span,
+                        format!(
+                            "pattern binds {} names but the value has {} components",
+                            items.len(),
+                            tys.len()
+                        ),
+                    );
                     return None;
                 }
                 let partials = self.component_partials(value, tys.len());
                 let parts: Vec<Option<&Expr>> = match &value.kind {
-                    ExprKind::Tuple(parts) if parts.len() == tys.len() => parts.iter().map(Some).collect(),
+                    ExprKind::Tuple(parts) if parts.len() == tys.len() => {
+                        parts.iter().map(Some).collect()
+                    }
                     _ => vec![None; tys.len()],
                 };
                 let mut out = Vec::new();
-                for (((item, ty), partial), part) in items.iter().zip(tys).zip(partials).zip(parts) {
+                for (((item, ty), partial), part) in items.iter().zip(tys).zip(partials).zip(parts)
+                {
                     let component = match part {
                         Some(part) => part.clone(),
-                        None => Expr { kind: ExprKind::Tuple(Vec::new()), ty: ty.clone(), sym: None, partial, span: value.span },
+                        None => Expr {
+                            kind: ExprKind::Tuple(Vec::new()),
+                            ty: ty.clone(),
+                            sym: None,
+                            partial,
+                            span: value.span,
+                        },
                     };
                     out.push(self.destructure(item, ty, &component, state, origin)?);
                 }
@@ -221,7 +305,10 @@ impl<'a> Checker<'a> {
                 let mut targets = Vec::new();
                 for place in places {
                     let A::Name(name) = &place.kind else {
-                        self.error(place.span, "tuple assignment installs whole `var` state objects");
+                        self.error(
+                            place.span,
+                            "tuple assignment installs whole `let mut` state objects",
+                        );
                         return None;
                     };
                     targets.push(self.state_place(name)?);
@@ -244,7 +331,13 @@ impl<'a> Checker<'a> {
                         }
                         let ty = Ty::Tuple(out.iter().map(|e| e.ty.clone()).collect());
                         let partial = out.iter().any(|e| e.partial);
-                        Expr { kind: ExprKind::Tuple(out), ty, sym: None, partial, span: value.span }
+                        Expr {
+                            kind: ExprKind::Tuple(out),
+                            ty,
+                            sym: None,
+                            partial,
+                            span: value.span,
+                        }
                     }
                     _ => {
                         let value = self.expr(value, Some(&expected))?;
@@ -255,13 +348,25 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if !self.assignable(&expected, &value.ty) {
-                    self.error(value.span, format!("tuple assignment expects {expected} but the value is {}", value.ty));
+                    self.error(
+                        value.span,
+                        format!(
+                            "tuple assignment expects {expected} but the value is {}",
+                            value.ty
+                        ),
+                    );
                     return None;
                 }
                 for place in &targets {
                     self.write(place, place.span, true)?;
                 }
-                let target = Expr { kind: ExprKind::Tuple(targets), ty: expected, sym: None, partial: false, span: target.span };
+                let target = Expr {
+                    kind: ExprKind::Tuple(targets),
+                    ty: expected,
+                    sym: None,
+                    partial: false,
+                    span: target.span,
+                };
                 Some(StmtKind::Assign { target, op, value })
             }
             A::Name(name) => {
@@ -273,7 +378,13 @@ impl<'a> Checker<'a> {
                 };
                 if op == AssignOp::Assign {
                     if !self.assignable(&ty, &value.ty) {
-                        self.error(value.span, format!("`{}` has type {ty} but the value has type {}", name.name, value.ty));
+                        self.error(
+                            value.span,
+                            format!(
+                                "`{}` has type {ty} but the value has type {}",
+                                name.name, value.ty
+                            ),
+                        );
                         return None;
                     }
                 } else {
@@ -284,51 +395,88 @@ impl<'a> Checker<'a> {
                 }
                 let root = self.write(&place, target.span, true)?;
                 self.unassigned.remove(&root);
-                Some(StmtKind::Assign { target: place, op, value })
+                Some(StmtKind::Assign {
+                    target: place,
+                    op,
+                    value,
+                })
             }
             A::Index { base, .. } => {
                 let A::Name(base_name) = &base.kind else {
-                    self.error(base.span, "element assignment indexes a tile variable directly");
+                    self.error(
+                        base.span,
+                        "element assignment indexes a tile variable directly",
+                    );
                     return None;
                 };
                 let Some(id) = self.lookup(&base_name.name) else {
-                    self.error(base_name.span, format!("`{}` is not declared", base_name.name));
+                    self.error(
+                        base_name.span,
+                        format!("`{}` is not declared", base_name.name),
+                    );
                     return None;
                 };
                 if !matches!(self.vars[id].ty, Ty::Tile(_)) {
                     self.error(target.span, format!("only tile elements are assigned; `{}` is a {}. `publish` is the only write to tensor storage", base_name.name, self.vars[id].ty));
                     return None;
                 }
-                let pending = self.pending_full_assign.iter().find(|(v, _)| *v == id).map(|(_, axes)| axes.clone());
+                let pending = self
+                    .pending_full_assign
+                    .iter()
+                    .find(|(v, _)| *v == id)
+                    .map(|(_, axes)| axes.clone());
                 if self.unassigned.contains(&id) && pending.is_none() {
                     self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through `for … in owned(…)`", base_name.name));
                     return None;
                 }
                 let place = self.place(target)?;
-                let covers = op == AssignOp::Assign && pending.as_ref().is_some_and(|axes| {
-                    let ExprKind::Index { indices, .. } = &place.kind else { return false };
-                    indices.len() == axes.len() && indices.iter().zip(axes).all(|(index, axis)| match index {
-                        sir::Index::Coord(v) => v == axis,
-                        sir::Index::Point(e) => matches!(e.kind, ExprKind::Var(v) if v == *axis),
-                        _ => false,
-                    })
-                });
+                let covers = op == AssignOp::Assign
+                    && pending.as_ref().is_some_and(|axes| {
+                        let ExprKind::Index { indices, .. } = &place.kind else {
+                            return false;
+                        };
+                        indices.len() == axes.len()
+                            && indices.iter().zip(axes).all(|(index, axis)| match index {
+                                sir::Index::Coord(v) => v == axis,
+                                sir::Index::Point(e) => {
+                                    matches!(e.kind, ExprKind::Var(v) if v == *axis)
+                                }
+                                _ => false,
+                            })
+                    });
                 if self.unassigned.contains(&id) && !covers {
                     self.error(target.span, format!("`{}` is written before initialization; its first `owned` write must cover every element (`{}[i, …] = …` at the loop's own coordinates)", base_name.name, base_name.name));
                     return None;
                 }
                 let Ty::Scalar(dtype) = place.ty else {
-                    self.error(target.span, "an assignment target selects a single element; write views with `publish`");
+                    self.error(
+                        target.span,
+                        "an assignment target selects a single element; write views with `publish`",
+                    );
                     return None;
                 };
                 let value = self.expr(value, Some(&Ty::Scalar(dtype)))?;
                 let Some(vd) = value.ty.scalar_dtype() else {
-                    self.error(value.span, format!("cannot assign {} to an element of dtype {}", value.ty, dtype.name()));
+                    self.error(
+                        value.span,
+                        format!(
+                            "cannot assign {} to an element of dtype {}",
+                            value.ty,
+                            dtype.name()
+                        ),
+                    );
                     return None;
                 };
                 if op == AssignOp::Assign {
                     if !(vd == dtype || (vd.is_float() && dtype.is_float())) {
-                        self.error(value.span, format!("cannot assign {} to an element of dtype {}; cast explicitly", vd.name(), dtype.name()));
+                        self.error(
+                            value.span,
+                            format!(
+                                "cannot assign {} to an element of dtype {}; cast explicitly",
+                                vd.name(),
+                                dtype.name()
+                            ),
+                        );
                     }
                 } else {
                     self.arith_assign(&Ty::Scalar(dtype), &value, op)?;
@@ -339,10 +487,17 @@ impl<'a> Checker<'a> {
                     self.unassigned.remove(&id);
                     self.pending_full_assign.retain(|(v, _)| *v != id);
                 }
-                Some(StmtKind::Assign { target: place, op, value })
+                Some(StmtKind::Assign {
+                    target: place,
+                    op,
+                    value,
+                })
             }
             _ => {
-                self.error(target.span, "an assignment target is `var` state, a tile element, or a tuple of state");
+                self.error(
+                    target.span,
+                    "an assignment target is `let mut` state, a tile element, or a tuple of state",
+                );
                 None
             }
         }
@@ -350,46 +505,96 @@ impl<'a> Checker<'a> {
 
     fn state_place(&mut self, name: &ast::Ident) -> Option<Expr> {
         let Some(id) = self.lookup(&name.name) else {
-            self.error(name.span, format!("`{}` is not declared; introduce state with `var`", name.name));
+            self.error(
+                name.span,
+                format!(
+                    "`{}` is not declared; introduce state with `let mut`",
+                    name.name
+                ),
+            );
             return None;
         };
         let ty = self.vars[id].ty.clone();
         match self.vars[id].kind {
             VarKind::State => {}
-            VarKind::Param(i) if self.sig.params[i].mode != ast::Mode::In && matches!(ty, Ty::Tile(_)) => {}
+            VarKind::Param(i)
+                if self.sig.params[i].mode != ast::Mode::In && matches!(ty, Ty::Tile(_)) => {}
             VarKind::Slice(_) => {
-                self.error(name.span, format!("slice `{}` is immutable geometry and cannot be reassigned", name.name));
+                self.error(
+                    name.span,
+                    format!(
+                        "slice `{}` is immutable geometry and cannot be reassigned",
+                        name.name
+                    ),
+                );
                 return None;
             }
             _ => {
-                self.error(name.span, format!("`{}` is not mutable state; only `var` bindings and `out`/`inout` tiles are assigned", name.name));
+                self.error(name.span, format!("`{}` is not mutable state; only `let mut` bindings and `out`/`inout` tiles are assigned", name.name));
                 return None;
             }
         }
         if matches!(ty, Ty::Result(_) | Ty::Native(_)) {
-            self.error(name.span, format!("a {ty} is immutable once produced and cannot be reassigned"));
+            self.error(
+                name.span,
+                format!("a {ty} is immutable once produced and cannot be reassigned"),
+            );
             return None;
         }
-        Some(Expr { kind: ExprKind::Var(id), ty, sym: None, partial: self.vars[id].partial, span: name.span })
+        Some(Expr {
+            kind: ExprKind::Var(id),
+            ty,
+            sym: None,
+            partial: self.vars[id].partial,
+            span: name.span,
+        })
     }
 
-    fn accumulation_if(&mut self, op: AssignOp, value: &ast::Expr, place: &Expr) -> Option<Option<Expr>> {
-        if op == AssignOp::Assign { self.accumulation(value, place) } else { None }
+    fn accumulation_if(
+        &mut self,
+        op: AssignOp,
+        value: &ast::Expr,
+        place: &Expr,
+    ) -> Option<Option<Expr>> {
+        if op == AssignOp::Assign {
+            self.accumulation(value, place)
+        } else {
+            None
+        }
     }
 
     /// `s = s + p`, `s = max(s, p)`, `s = min(s, p)`: with `p` a forwarded partial of the
     /// result being traversed this is the one admitted accumulation of partials into state
     /// outside an `admit fn`. `None` when `value` does not have this form.
     fn accumulation(&mut self, value: &ast::Expr, place: &Expr) -> Option<Option<Expr>> {
-        let ExprKind::Var(state) = place.kind else { return None };
+        let ExprKind::Var(state) = place.kind else {
+            return None;
+        };
         let is_state = |e: &ast::Expr, c: &Checker| matches!(&e.kind, A::Name(n) if c.lookup(&n.name) == Some(state));
         let (math, operands): (Option<sir::Math>, [&ast::Expr; 2]) = match &value.kind {
-            A::Binary { op: BinaryOp::Add, lhs, rhs } => (None, [lhs, rhs]),
-            A::Call { callee, bindings, args } if bindings.is_empty() && args.len() == 2 && args.iter().all(|a| a.name.is_none()) => match &callee.kind {
-                A::Name(n) if n.name == "max" => (Some(sir::Math::Max), [&args[0].value, &args[1].value]),
-                A::Name(n) if n.name == "min" => (Some(sir::Math::Min), [&args[0].value, &args[1].value]),
-                _ => return None,
-            },
+            A::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+            } => (None, [lhs, rhs]),
+            A::Call {
+                callee,
+                bindings,
+                args,
+            } if bindings.is_empty()
+                && args.len() == 2
+                && args.iter().all(|a| a.name.is_none()) =>
+            {
+                match &callee.kind {
+                    A::Name(n) if n.name == "max" => {
+                        (Some(sir::Math::Max), [&args[0].value, &args[1].value])
+                    }
+                    A::Name(n) if n.name == "min" => {
+                        (Some(sir::Math::Min), [&args[0].value, &args[1].value])
+                    }
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         let state_first = is_state(operands[0], self);
@@ -399,19 +604,30 @@ impl<'a> Checker<'a> {
         Some(self.accumulate(math, operands, state_first, place, value.span))
     }
 
-    fn accumulate(&mut self, math: Option<sir::Math>, operands: [&ast::Expr; 2], state_first: bool, place: &Expr, span: Span) -> Option<Expr> {
+    fn accumulate(
+        &mut self,
+        math: Option<sir::Math>,
+        operands: [&ast::Expr; 2],
+        state_first: bool,
+        place: &Expr,
+        span: Span,
+    ) -> Option<Expr> {
         let mut other = self.expr(operands[usize::from(state_first)], Some(&place.ty))?;
         let state = self.expr(operands[usize::from(!state_first)], None)?;
         let admitted = other.partial && !self.partial_free();
         if admitted {
             if !self.accumulates_into(&other) {
-                self.error(other.span, "a partial value accumulates into `var` state only inside a traversal of the result it belongs to (`ordered [p] in results:`)");
+                self.error(other.span, "a partial value accumulates into `let mut` state only inside a traversal of the result it belongs to (`ordered [p] in results:`)");
                 return None;
             }
             // The accumulated state is whole once the traversal completes.
             other.partial = false;
         }
-        let (lhs, rhs) = if state_first { (state, other) } else { (other, state) };
+        let (lhs, rhs) = if state_first {
+            (state, other)
+        } else {
+            (other, state)
+        };
         match math {
             Some(op) => self.math_exprs(op, lhs, rhs, span),
             None => self.binary_exprs(BinaryOp::Add, lhs, rhs, span),
@@ -420,28 +636,60 @@ impl<'a> Checker<'a> {
 
     /// Whether `e` is a forwarded partial of a result the current code is traversing.
     fn accumulates_into(&self, e: &Expr) -> bool {
-        e.partial && self.partial_origin_of(e).is_some_and(|origin| self.frames.iter().any(|f| matches!(&f.kind, FrameKind::Region { origin: Some(o), .. } if *o == origin)))
+        e.partial
+            && self.partial_origin_of(e).is_some_and(|origin| {
+                self.frames.iter().any(
+                |f| matches!(&f.kind, FrameKind::Region { origin: Some(o), .. } if *o == origin),
+            )
+            })
     }
 
     fn arith_assign(&mut self, target: &Ty, value: &Expr, op: AssignOp) -> Option<()> {
         if let (Ty::Tile(a), Ty::Tile(b)) = (target, &value.ty) {
             if !self.same_axes(a, b) || !elem_rounds(&b.elem, &a.elem) {
-                self.error(value.span, format!("`{}` needs tiles over identical axes: {} vs {}", op.text(), target, value.ty));
+                self.error(
+                    value.span,
+                    format!(
+                        "`{}` needs tiles over identical axes: {} vs {}",
+                        op.text(),
+                        target,
+                        value.ty
+                    ),
+                );
                 return None;
             }
             return Some(());
         }
         if let (Ty::Tile(a), Some(v)) = (target, value.ty.scalar_dtype()) {
-            if a.elem.read_dtype().is_none_or(|t| DType::promote(t, v).is_some()) {
+            if a.elem
+                .read_dtype()
+                .is_none_or(|t| DType::promote(t, v).is_some())
+            {
                 return Some(());
             }
         }
         let (Some(t), Some(v)) = (target.scalar_dtype(), value.ty.scalar_dtype()) else {
-            self.error(value.span, format!("`{}` needs numeric operands, found {} and {}", op.text(), target, value.ty));
+            self.error(
+                value.span,
+                format!(
+                    "`{}` needs numeric operands, found {} and {}",
+                    op.text(),
+                    target,
+                    value.ty
+                ),
+            );
             return None;
         };
         if !t.is_numeric() || DType::promote(t, v).is_none() {
-            self.error(value.span, format!("`{}` between {} and {} needs an explicit cast", op.text(), t.name(), v.name()));
+            self.error(
+                value.span,
+                format!(
+                    "`{}` between {} and {} needs an explicit cast",
+                    op.text(),
+                    t.name(),
+                    v.name()
+                ),
+            );
             return None;
         }
         Some(())
@@ -449,7 +697,12 @@ impl<'a> Checker<'a> {
 
     // ---- control ----
 
-    fn if_stmt(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Block>) -> Option<StmtKind> {
+    fn if_stmt(
+        &mut self,
+        cond: &ast::Expr,
+        then: &ast::Block,
+        els: Option<&ast::Block>,
+    ) -> Option<StmtKind> {
         let cond = self.expr(cond, Some(&Ty::Scalar(DType::Bool)))?;
         match &cond.ty {
             Ty::Scalar(DType::Bool) => {}
@@ -458,7 +711,10 @@ impl<'a> Checker<'a> {
                 return None;
             }
             other => {
-                self.error(cond.span, format!("an `if` condition is a scalar `bool`, found {other}"));
+                self.error(
+                    cond.span,
+                    format!("an `if` condition is a scalar `bool`, found {other}"),
+                );
                 return None;
             }
         }
@@ -493,15 +749,23 @@ impl<'a> Checker<'a> {
             self.error(cond.span, "one path of this `if` yields/returns and the other does not; every path through a result boundary produces exactly one value with one schema");
         }
         self.unassigned.extend(unassigned_then);
-        self.scalar_symbols.retain(|id, sym| symbols_then.get(id) == Some(sym));
-        self.pending_full_assign = pending_before.into_iter().filter(|(v, _)| self.unassigned.contains(v)).collect();
+        self.scalar_symbols
+            .retain(|id, sym| symbols_then.get(id) == Some(sym));
+        self.pending_full_assign = pending_before
+            .into_iter()
+            .filter(|(v, _)| self.unassigned.contains(v))
+            .collect();
         Some(StmtKind::If { cond, then, els })
     }
 
     /// Path facts of a condition over symbolic integers (or of its negation).
     fn assume(&mut self, cond: &Expr, negate: bool) {
         let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
-            if let ExprKind::Unary { op: ast::UnaryOp::Not, expr } = &cond.kind {
+            if let ExprKind::Unary {
+                op: ast::UnaryOp::Not,
+                expr,
+            } = &cond.kind
+            {
                 self.assume(expr, !negate);
             }
             return;
@@ -515,7 +779,9 @@ impl<'a> Checker<'a> {
             (BinaryOp::And, true) | (BinaryOp::Or, false) => return,
             _ => {}
         }
-        let (Some(l), Some(r)) = (&lhs.sym, &rhs.sym) else { return };
+        let (Some(l), Some(r)) = (&lhs.sym, &rhs.sym) else {
+            return;
+        };
         let one = Sym::constant(1);
         match (op, negate) {
             (BinaryOp::Lt, false) | (BinaryOp::Ge, true) => self.assume_nonneg(&r.sub(l).sub(&one)),
@@ -532,7 +798,10 @@ impl<'a> Checker<'a> {
     fn bound(&mut self, e: &ast::Expr) -> Option<(Expr, Sym)> {
         let checked = self.expr(e, Some(&Ty::Scalar(DType::I32)))?;
         if checked.ty.scalar_dtype() != Some(DType::I32) {
-            self.error(checked.span, format!("a domain bound is an `i32`, found {}", checked.ty));
+            self.error(
+                checked.span,
+                format!("a domain bound is an `i32`, found {}", checked.ty),
+            );
             return None;
         }
         self.forbid_partial(&checked, "a domain bound");
@@ -540,7 +809,10 @@ impl<'a> Checker<'a> {
             return Some((checked, sym));
         }
         if let ExprKind::Var(v) = checked.kind {
-            if matches!(self.vars[v].kind, VarKind::Value | VarKind::Param(_) | VarKind::Port) {
+            if matches!(
+                self.vars[v].kind,
+                VarKind::Value | VarKind::Param(_) | VarKind::Port
+            ) {
                 let atom = var_atom(&self.vars[v].name, v);
                 self.atoms.insert(v, atom.clone());
                 return Some((checked, Sym::atom(atom)));
@@ -550,7 +822,12 @@ impl<'a> Checker<'a> {
         None
     }
 
-    fn for_stmt(&mut self, targets: &[ast::Ident], iter: &ast::Expr, body: &ast::Block) -> Option<StmtKind> {
+    fn for_stmt(
+        &mut self,
+        targets: &[ast::Ident],
+        iter: &ast::Expr,
+        body: &ast::Block,
+    ) -> Option<StmtKind> {
         match &iter.kind {
             A::Range { lo, hi } => {
                 let [target] = targets else {
@@ -560,10 +837,15 @@ impl<'a> Checker<'a> {
                 let (lo, lo_sym) = self.bound(lo)?;
                 let (hi, hi_sym) = self.bound(hi)?;
                 self.push_scope();
-                let ty = if lo_sym.is_zero() { Ty::Index(hi_sym.clone()) } else { Ty::Scalar(DType::I32) };
+                let ty = if lo_sym.is_zero() {
+                    Ty::Index(hi_sym.clone())
+                } else {
+                    Ty::Scalar(DType::I32)
+                };
                 let var = self.declare(&target.name, ty, target.span, VarKind::RangeIndex);
                 let atom = var_atom(&target.name, var);
-                self.facts.set_range(atom.clone(), lo_sym, hi_sym.sub(&Sym::constant(1)));
+                self.facts
+                    .set_range(atom.clone(), lo_sym, hi_sym.sub(&Sym::constant(1)));
                 self.atoms.insert(var, atom);
                 let body = self.block(body);
                 self.pop_scope();
@@ -581,16 +863,24 @@ impl<'a> Checker<'a> {
                         return None;
                     }
                     _ => {
-                        self.error(iter.span, "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice");
+                        self.error(
+                            iter.span,
+                            "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
+                        );
                         return None;
                     }
                 };
                 let (lo, hi) = self.root_domain(slice);
                 self.push_scope();
-                let ty = if self.prover().nonneg(&lo) { Ty::Index(hi.clone()) } else { Ty::Scalar(DType::I32) };
+                let ty = if self.prover().nonneg(&lo) {
+                    Ty::Index(hi.clone())
+                } else {
+                    Ty::Scalar(DType::I32)
+                };
                 let var = self.declare(&target.name, ty, target.span, VarKind::SliceMember(slice));
                 let atom = var_atom(&target.name, var);
-                self.facts.set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
+                self.facts
+                    .set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
                 self.atoms.insert(var, atom);
                 self.structural_loops.push(var);
                 let body = self.block(body);
@@ -598,13 +888,22 @@ impl<'a> Checker<'a> {
                 self.pop_scope();
                 Some(StmtKind::Members { var, slice, body })
             }
-            A::Call { callee, bindings, args } if bindings.is_empty() => {
+            A::Call {
+                callee,
+                bindings,
+                args,
+            } if bindings.is_empty() => {
                 let A::Name(callee) = &callee.kind else {
-                    self.error(iter.span, "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice");
+                    self.error(
+                        iter.span,
+                        "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
+                    );
                     return None;
                 };
                 match callee.name.as_str() {
-                    "owned" | "axis" => self.coordinates(callee.name == "owned", targets, args, body, iter.span),
+                    "owned" | "axis" => {
+                        self.coordinates(callee.name == "owned", targets, args, body, iter.span)
+                    }
                     "lanes" => {
                         if self.target_form(iter.span, "`lanes`", None) {
                             self.error(iter.span, "`lanes` has no structured IR form: participant distribution belongs to the selected mapping, and target code reads its participant with the target's index intrinsic");
@@ -618,43 +917,84 @@ impl<'a> Checker<'a> {
                 }
             }
             _ => {
-                self.error(iter.span, "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice");
+                self.error(
+                    iter.span,
+                    "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
+                );
                 None
             }
         }
     }
 
-    fn coordinates(&mut self, owned: bool, targets: &[ast::Ident], args: &[ast::Arg], body: &ast::Block, span: Span) -> Option<StmtKind> {
+    fn coordinates(
+        &mut self,
+        owned: bool,
+        targets: &[ast::Ident],
+        args: &[ast::Arg],
+        body: &ast::Block,
+        span: Span,
+    ) -> Option<StmtKind> {
         if args.iter().any(|a| a.name.is_some()) || args.len() != if owned { 1 } else { 2 } {
-            self.error(span, if owned { "`owned(t)` takes one tile or view" } else { "`axis(t, n)` takes a tile or view and a constant axis" });
+            self.error(
+                span,
+                if owned {
+                    "`owned(t)` takes one tile or view"
+                } else {
+                    "`axis(t, n)` takes a tile or view and a constant axis"
+                },
+            );
             return None;
         }
         let of = self.expr_inner(&args[0].value, None, true)?;
         let Some(shaped) = of.ty.shaped().cloned() else {
-            self.error(of.span, format!("coordinate loops range over a tile or view, found {}", of.ty));
+            self.error(
+                of.span,
+                format!(
+                    "coordinate loops range over a tile or view, found {}",
+                    of.ty
+                ),
+            );
             return None;
         };
         let axes: Vec<usize> = if owned {
             (0..shaped.rank()).collect()
         } else {
             let axis = self.expr(&args[1].value, Some(&Ty::Scalar(DType::I32)))?;
-            match axis.sym.as_ref().and_then(Sym::as_constant).and_then(|a| usize::try_from(a).ok()).filter(|a| *a < shaped.rank()) {
+            match axis
+                .sym
+                .as_ref()
+                .and_then(Sym::as_constant)
+                .and_then(|a| usize::try_from(a).ok())
+                .filter(|a| *a < shaped.rank())
+            {
                 Some(a) => vec![a],
                 None => {
-                    self.error(axis.span, format!("`axis` needs a constant axis below rank {}", shaped.rank()));
+                    self.error(
+                        axis.span,
+                        format!("`axis` needs a constant axis below rank {}", shaped.rank()),
+                    );
                     return None;
                 }
             }
         };
         if axes.len() != targets.len() {
-            self.error(span, format!("the loop ranges over {} axes but binds {} names", axes.len(), targets.len()));
+            self.error(
+                span,
+                format!(
+                    "the loop ranges over {} axes but binds {} names",
+                    axes.len(),
+                    targets.len()
+                ),
+            );
             return None;
         }
         self.push_scope();
         let mut vars = Vec::new();
         for (target, axis) in targets.iter().zip(&axes) {
             let (ty, lo, hi) = match &shaped.axes[*axis] {
-                Extent::Semantic(extent) => (Ty::Index(extent.clone()), Sym::constant(0), extent.clone()),
+                Extent::Semantic(extent) => {
+                    (Ty::Index(extent.clone()), Sym::constant(0), extent.clone())
+                }
                 Extent::Structural(slice) => {
                     let (lo, hi) = self.root_domain(*slice);
                     (Ty::Coord(*slice), lo, hi)
@@ -662,7 +1002,8 @@ impl<'a> Checker<'a> {
             };
             let var = self.declare(&target.name, ty, target.span, VarKind::Coordinate);
             let atom = var_atom(&target.name, var);
-            self.facts.set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
+            self.facts
+                .set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
             self.atoms.insert(var, atom);
             vars.push(var);
         }
@@ -680,7 +1021,9 @@ impl<'a> Checker<'a> {
         } else {
             None
         };
-        let structural = axes.iter().any(|axis| matches!(shaped.axes[*axis], Extent::Structural(_)));
+        let structural = axes
+            .iter()
+            .any(|axis| matches!(shaped.axes[*axis], Extent::Structural(_)));
         if structural {
             self.structural_loops.push(vars[0]);
         }
@@ -692,25 +1035,46 @@ impl<'a> Checker<'a> {
             self.pending_full_assign = saved;
         }
         self.pop_scope();
-        Some(StmtKind::Coordinates { vars, of, axes, body })
+        Some(StmtKind::Coordinates {
+            vars,
+            of,
+            axes,
+            body,
+        })
     }
 
     // ---- publication ----
 
-    fn publish(&mut self, value: &ast::Expr, destination: &ast::Expr, span: Span) -> Option<StmtKind> {
+    fn publish(
+        &mut self,
+        value: &ast::Expr,
+        destination: &ast::Expr,
+        span: Span,
+    ) -> Option<StmtKind> {
         let destination = self.place(destination)?;
         let hint = destination.ty.scalar_dtype().map(Ty::Scalar);
         let value = self.expr(value, hint.as_ref())?;
         self.forbid_partial(&value, "a published value");
         let ok = match (&value.ty, &destination.ty) {
-            (v, Ty::Scalar(d)) => v.scalar_dtype().is_some_and(|v| v == *d || (v.is_float() && d.is_float())),
-            (Ty::Tile(v) | Ty::View(v) | Ty::Tensor(v), Ty::Tensor(d) | Ty::View(d) | Ty::Tile(d)) => {
+            (v, Ty::Scalar(d)) => v
+                .scalar_dtype()
+                .is_some_and(|v| v == *d || (v.is_float() && d.is_float())),
+            (
+                Ty::Tile(v) | Ty::View(v) | Ty::Tensor(v),
+                Ty::Tensor(d) | Ty::View(d) | Ty::Tile(d),
+            ) => {
                 if matches!(d.elem, crate::types::Elem::Repr(_)) && v.elem != d.elem {
                     self.error(span, format!("publishing into packed `{}` storage needs an explicit encode operation", d.elem));
                     return None;
                 }
                 if !self.same_axes(v, d) {
-                    self.error(span, format!("`publish` needs matching domains: value {} into destination {}", value.ty, destination.ty));
+                    self.error(
+                        span,
+                        format!(
+                            "`publish` needs matching domains: value {} into destination {}",
+                            value.ty, destination.ty
+                        ),
+                    );
                     return None;
                 }
                 elem_rounds(&v.elem, &d.elem)
@@ -718,10 +1082,17 @@ impl<'a> Checker<'a> {
             _ => false,
         };
         if !ok {
-            self.error(span, format!("cannot publish {} to {}; convert explicitly", value.ty, destination.ty));
+            self.error(
+                span,
+                format!(
+                    "cannot publish {} to {}; convert explicitly",
+                    value.ty, destination.ty
+                ),
+            );
             return None;
         }
-        let whole = matches!(destination.kind, ExprKind::Var(_)) && matches!(destination.ty, Ty::Tile(_));
+        let whole =
+            matches!(destination.kind, ExprKind::Var(_)) && matches!(destination.ty, Ty::Tile(_));
         let root = self.write(&destination, span, false)?;
         if whole || self.covers_whole(&destination) {
             self.unassigned.remove(&root);
@@ -733,7 +1104,17 @@ impl<'a> Checker<'a> {
     fn covers_whole(&self, place: &Expr) -> bool {
         match &place.kind {
             ExprKind::Var(_) => true,
-            ExprKind::Index { base, indices } => indices.iter().all(|i| matches!(i, sir::Index::Range { start: None, end: None })) && self.covers_whole(base),
+            ExprKind::Index { base, indices } => {
+                indices.iter().all(|i| {
+                    matches!(
+                        i,
+                        sir::Index::Range {
+                            start: None,
+                            end: None
+                        }
+                    )
+                }) && self.covers_whole(base)
+            }
             _ => false,
         }
     }
@@ -798,7 +1179,9 @@ impl<'a> Checker<'a> {
     }
 
     fn checked_yield(&mut self, values: &[ast::Expr], span: Span) -> Option<StmtKind> {
-        let Some(ctx) = self.yields.last().cloned() else { return None };
+        let Some(ctx) = self.yields.last().cloned() else {
+            return None;
+        };
         if ctx.kind == YieldKind::Function {
             self.error(span, "`yield` needs a structural consumer: a next-stage port, a result-producing region, or a `merge` body");
             return None;
@@ -825,15 +1208,34 @@ impl<'a> Checker<'a> {
     }
 
     fn record_yield(&mut self, tys: Vec<Ty>, partials: Vec<bool>, span: Span) {
-        let Some(index) = self.yields.len().checked_sub(1) else { return };
+        let Some(index) = self.yields.len().checked_sub(1) else {
+            return;
+        };
         if self.yields[index].done {
-            self.error(span, "this path already yielded; every path yields exactly once");
+            self.error(
+                span,
+                "this path already yielded; every path yields exactly once",
+            );
         }
         match self.yields[index].schema.clone() {
             Some(schema) => {
-                if schema.len() != tys.len() || !schema.iter().zip(&tys).all(|(a, b)| self.same_ty(a, b)) {
-                    let show = |t: &[Ty]| t.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
-                    self.error(span, format!("every path yields one schema: ({}) here but ({}) earlier", show(&tys), show(&schema)));
+                if schema.len() != tys.len()
+                    || !schema.iter().zip(&tys).all(|(a, b)| self.same_ty(a, b))
+                {
+                    let show = |t: &[Ty]| {
+                        t.iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    self.error(
+                        span,
+                        format!(
+                            "every path yields one schema: ({}) here but ({}) earlier",
+                            show(&tys),
+                            show(&schema)
+                        ),
+                    );
                 }
                 for (flag, partial) in self.yields[index].partials.iter_mut().zip(&partials) {
                     *flag |= *partial;
@@ -848,12 +1250,19 @@ impl<'a> Checker<'a> {
     }
 
     fn return_stmt(&mut self, values: &[ast::Expr], span: Span) -> Option<StmtKind> {
-        if self.frames.iter().any(|f| !matches!(f.kind, FrameKind::Stage { pipeline: false })) {
+        if self
+            .frames
+            .iter()
+            .any(|f| !matches!(f.kind, FrameKind::Stage { pipeline: false }))
+        {
             self.error(span, "`return` leaves the function; it cannot appear inside a region, a pipeline stage or a `merge` body");
             return None;
         }
         if self.yields.iter().any(|y| y.loops > 0) {
-            self.error(span, "`return` inside an element loop is not one result per path; return after the loop");
+            self.error(
+                span,
+                "`return` inside an element loop is not one result per path; return after the loop",
+            );
             return None;
         }
         let expected: Vec<Ty> = match &self.sig.result {
@@ -862,7 +1271,15 @@ impl<'a> Checker<'a> {
             other => vec![other.clone()],
         };
         if values.len() != expected.len() {
-            self.error(span, format!("`{}` returns {} but this `return` has {} values", self.sig.name, self.sig.result, values.len()));
+            self.error(
+                span,
+                format!(
+                    "`{}` returns {} but this `return` has {} values",
+                    self.sig.name,
+                    self.sig.result,
+                    values.len()
+                ),
+            );
             return None;
         }
         let exprs = self.yielded(values, Some(expected.clone()))?;
@@ -871,7 +1288,13 @@ impl<'a> Checker<'a> {
                 return None;
             }
             if !self.assignable(ty, &e.ty) {
-                self.error(e.span, format!("`{}` returns {ty} but this value is {}", self.sig.name, e.ty));
+                self.error(
+                    e.span,
+                    format!(
+                        "`{}` returns {ty} but this value is {}",
+                        self.sig.name, e.ty
+                    ),
+                );
                 return None;
             }
             if e.partial && !self.admit {
@@ -890,10 +1313,24 @@ impl<'a> Checker<'a> {
 
     // ---- regions ----
 
-    fn new_slice(&mut self, binder: &ast::Ident, region: RegionId, parent: SliceParent) -> (VarId, SliceId) {
+    fn new_slice(
+        &mut self,
+        binder: &ast::Ident,
+        region: RegionId,
+        parent: SliceParent,
+    ) -> (VarId, SliceId) {
         let slice = SliceId(self.slices.len() as u32);
-        let var = self.declare(&binder.name, Ty::Slice(slice), binder.span, VarKind::Slice(slice));
-        self.slices.push(SliceDecl { var, region, parent });
+        let var = self.declare(
+            &binder.name,
+            Ty::Slice(slice),
+            binder.span,
+            VarKind::Slice(slice),
+        );
+        self.slices.push(SliceDecl {
+            var,
+            region,
+            parent,
+        });
         (var, slice)
     }
 
@@ -904,10 +1341,18 @@ impl<'a> Checker<'a> {
             return None;
         }
         if r.merge.is_some() && (r.mode != RegionMode::Parallel || !as_expr) {
-            self.error(r.span, "`merge` combines the partials of a `parallel` region expression");
+            self.error(
+                r.span,
+                "`merge` combines the partials of a `parallel` region expression",
+            );
             return None;
         }
-        if r.mode == RegionMode::Parallel && self.frames.iter().any(|f| matches!(f.kind, FrameKind::Stage { pipeline: true })) {
+        if r.mode == RegionMode::Parallel
+            && self
+                .frames
+                .iter()
+                .any(|f| matches!(f.kind, FrameKind::Stage { pipeline: true }))
+        {
             self.error(r.span, "a pipeline stage cannot create new concurrent owners; use `ordered` refinement or restructure the enclosing regions");
             return None;
         }
@@ -916,7 +1361,12 @@ impl<'a> Checker<'a> {
             FrameKind::Region { id, .. } => Some(*id),
             _ => None,
         });
-        self.regions.push(RegionDecl { mode: r.mode, binders: Vec::new(), parent, span: r.span });
+        self.regions.push(RegionDecl {
+            mode: r.mode,
+            binders: Vec::new(),
+            parent,
+            span: r.span,
+        });
 
         // Sources are evaluated in the enclosing scope, before the binders exist.
         enum Source {
@@ -946,10 +1396,22 @@ impl<'a> Checker<'a> {
                         A::Range { lo, hi } => {
                             let (_, lo) = self.bound(lo)?;
                             let (_, hi) = self.bound(hi)?;
-                            let static_bounds = lo.params().iter().chain(hi.params().iter()).all(|p| !p.contains('#'));
+                            let static_bounds = lo
+                                .params()
+                                .iter()
+                                .chain(hi.params().iter())
+                                .all(|p| !p.contains('#'));
                             if static_bounds {
-                                self.require_nonneg(&lo, source.span, "domain start may be negative");
-                                self.require_nonneg(&hi.sub(&lo), source.span, "domain may be reversed");
+                                self.require_nonneg(
+                                    &lo,
+                                    source.span,
+                                    "domain start may be negative",
+                                );
+                                self.require_nonneg(
+                                    &hi.sub(&lo),
+                                    source.span,
+                                    "domain may be reversed",
+                                );
                             }
                             parents.push(SliceParent::Domain { lo, hi });
                         }
@@ -977,7 +1439,14 @@ impl<'a> Checker<'a> {
         let (region_source, origin, rebound) = match source {
             Source::Parents(parents) => {
                 if parents.len() != r.binders.len() {
-                    self.error(r.span, format!("{} binders for {} domains; there is one domain per bound name", r.binders.len(), parents.len()));
+                    self.error(
+                        r.span,
+                        format!(
+                            "{} binders for {} domains; there is one domain per bound name",
+                            r.binders.len(),
+                            parents.len()
+                        ),
+                    );
                     self.pop_scope();
                     return None;
                 }
@@ -1001,15 +1470,38 @@ impl<'a> Checker<'a> {
                     binder_slices.push(slice);
                     rebound.push((slice, *original));
                 }
-                (sir::RegionSource::Results(Box::new(e)), Some((result.origin, result.binders.clone())), rebound)
+                (
+                    sir::RegionSource::Results(Box::new(e)),
+                    Some((result.origin, result.binders.clone())),
+                    rebound,
+                )
             }
         };
         self.regions[id.0 as usize].binders = binder_slices.clone();
 
-        self.frames.push(Frame { kind: FrameKind::Region { id, mode: r.mode, origin: origin.as_ref().map(|(o, _)| *o) }, floor });
-        self.yields.push(YieldCtx { kind: YieldKind::Region, done: false, loops: 0, schema: None, partials: Vec::new(), failed: false });
+        self.frames.push(Frame {
+            kind: FrameKind::Region {
+                id,
+                mode: r.mode,
+                origin: origin.as_ref().map(|(o, _)| *o),
+            },
+            floor,
+        });
+        self.yields.push(YieldCtx {
+            kind: YieldKind::Region,
+            done: false,
+            loops: 0,
+            schema: None,
+            partials: Vec::new(),
+            failed: false,
+        });
         if r.mode == RegionMode::Pipeline {
-            if let Some(other) = r.body.stmts.iter().find(|s| !matches!(s.kind, ast::StmtKind::Stage { .. })) {
+            if let Some(other) = r
+                .body
+                .stmts
+                .iter()
+                .find(|s| !matches!(s.kind, ast::StmtKind::Stage { .. }))
+            {
                 self.error(other.span, "a `pipeline` body consists only of stages");
             }
         }
@@ -1023,47 +1515,102 @@ impl<'a> Checker<'a> {
             if ctx.schema.is_some() {
                 self.error(r.span, "a statement region cannot collect or discard yielded members; bind it (`let results = …`) or attach a `merge`");
             }
-            return Some((sir::Region { id, mode: r.mode, binders, source: region_source, body, merge: None, result: None }, Ty::Void, false));
+            return Some((
+                sir::Region {
+                    id,
+                    mode: r.mode,
+                    binders,
+                    source: region_source,
+                    body,
+                    merge: None,
+                    result: None,
+                },
+                Ty::Void,
+                false,
+            ));
         }
         if ctx.failed {
             return None;
         }
         let Some(schema) = ctx.schema.filter(|_| ctx.done) else {
-            self.error(r.span, "a result-producing region yields exactly one value on every path through its body");
+            self.error(
+                r.span,
+                "a result-producing region yields exactly one value on every path through its body",
+            );
             return None;
         };
-        let member = if schema.len() == 1 { schema[0].clone() } else { Ty::Tuple(schema.clone()) };
+        let member = if schema.len() == 1 {
+            schema[0].clone()
+        } else {
+            Ty::Tuple(schema.clone())
+        };
         // A yielded component is pointwise over the visit only if it is shaped by every binder;
         // anything else is one aggregate per tuned piece.
         let pointwise = |ty: &Ty| match ty {
-            Ty::Tile(s) | Ty::View(s) => binder_slices.iter().all(|b| s.axes.contains(&Extent::Structural(*b))),
+            Ty::Tile(s) | Ty::View(s) => binder_slices
+                .iter()
+                .all(|b| s.axes.contains(&Extent::Structural(*b))),
             Ty::Result(_) => true,
             _ => false,
         };
-        let partials: Vec<bool> = schema.iter().zip(&ctx.partials).map(|(ty, partial)| *partial || !pointwise(ty)).collect();
+        let partials: Vec<bool> = schema
+            .iter()
+            .zip(&ctx.partials)
+            .map(|(ty, partial)| *partial || !pointwise(ty))
+            .collect();
 
         if let Some(merge) = &r.merge {
             let merge = self.merge(merge, &member, &partials)?;
-            let region = sir::Region { id, mode: r.mode, binders, source: region_source, body, merge: Some(merge), result: None };
+            let region = sir::Region {
+                id,
+                mode: r.mode,
+                binders,
+                source: region_source,
+                body,
+                merge: Some(merge),
+                result: None,
+            };
             return Some((region, member, false));
         }
         self.result_partials.insert(id, partials);
         let (origin, origin_binders) = origin.unwrap_or((id, binder_slices));
         // The member schema refers to the origin's binders, whoever traverses them.
         let member = self.rebind_ty(&member, &rebound);
-        let ty = Ty::Result(Box::new(ResultTy { origin, producer: id, binders: origin_binders, member }));
-        let region = sir::Region { id, mode: r.mode, binders, source: region_source, body, merge: None, result: Some(ty.clone()) };
+        let ty = Ty::Result(Box::new(ResultTy {
+            origin,
+            producer: id,
+            binders: origin_binders,
+            member,
+        }));
+        let region = sir::Region {
+            id,
+            mode: r.mode,
+            binders,
+            source: region_source,
+            body,
+            merge: None,
+            result: Some(ty.clone()),
+        };
         Some((region, ty, false))
     }
 
     fn merge(&mut self, m: &ast::Merge, member: &Ty, partials: &[bool]) -> Option<sir::Merge> {
         let floor = self.vars.len();
-        self.frames.push(Frame { kind: FrameKind::Merge, floor });
+        self.frames.push(Frame {
+            kind: FrameKind::Merge,
+            floor,
+        });
         self.push_scope();
         let identity = self.expr(&m.identity, Some(member));
         let result = identity.and_then(|identity| {
             if !self.assignable(member, &identity.ty) {
-                self.error(identity.span, format!("the `merge` identity must have the partial type {member}, found {}", identity.ty));
+                self.error(
+                    identity.span,
+                    format!(
+                        "the `merge` identity must have the partial type {member}, found {}",
+                        identity.ty
+                    ),
+                );
                 return None;
             }
             let left = self.merge_operand(&m.left, member, partials, m.span)?;
@@ -1072,24 +1619,45 @@ impl<'a> Checker<'a> {
                 Ty::Tuple(items) => items.clone(),
                 other => vec![other.clone()],
             };
-            self.yields.push(YieldCtx { kind: YieldKind::Merge, done: false, loops: 0, schema: Some(schema), partials: vec![false; partials.len()], failed: false });
+            self.yields.push(YieldCtx {
+                kind: YieldKind::Merge,
+                done: false,
+                loops: 0,
+                schema: Some(schema),
+                partials: vec![false; partials.len()],
+                failed: false,
+            });
             let body = self.block(&m.body);
             let ctx = self.yields.pop()?;
             if ctx.failed {
                 return None;
             }
             if !ctx.done {
-                self.error(m.span, format!("a `merge` body yields the combined partial ({member}) on every path"));
+                self.error(
+                    m.span,
+                    format!("a `merge` body yields the combined partial ({member}) on every path"),
+                );
                 return None;
             }
-            Some(sir::Merge { left, right, identity, body })
+            Some(sir::Merge {
+                left,
+                right,
+                identity,
+                body,
+            })
         });
         self.pop_scope();
         self.frames.pop();
         result
     }
 
-    fn merge_operand(&mut self, pattern: &ast::Pattern, member: &Ty, partials: &[bool], span: Span) -> Option<sir::Pattern> {
+    fn merge_operand(
+        &mut self,
+        pattern: &ast::Pattern,
+        member: &Ty,
+        partials: &[bool],
+        span: Span,
+    ) -> Option<sir::Pattern> {
         match (pattern, member) {
             (ast::Pattern::Name(name), _) => {
                 let id = self.declare(&name.name, member.clone(), name.span, VarKind::MergeOperand);
@@ -1105,7 +1673,10 @@ impl<'a> Checker<'a> {
                 Some(sir::Pattern::Tuple(out))
             }
             _ => {
-                self.error(span, format!("the `merge` operand pattern does not match the partial type {member}"));
+                self.error(
+                    span,
+                    format!("the `merge` operand pattern does not match the partial type {member}"),
+                );
                 None
             }
         }
@@ -1114,22 +1685,40 @@ impl<'a> Checker<'a> {
     // ---- stages ----
 
     fn stages(&mut self, run: &[ast::Stmt], ends_block: bool) -> Vec<sir::Stage> {
-        let pipeline = matches!(self.frames.last(), Some(Frame { kind: FrameKind::Region { mode: RegionMode::Pipeline, .. }, .. }));
+        let pipeline = matches!(
+            self.frames.last(),
+            Some(Frame {
+                kind: FrameKind::Region {
+                    mode: RegionMode::Pipeline,
+                    ..
+                },
+                ..
+            })
+        );
         let pipeline_floor = self.frames.last().map_or(0, |f| f.floor);
         let mut out = Vec::new();
         let mut previous: Option<(Vec<Ty>, Vec<bool>)> = None;
         let mut updated: Vec<(VarId, String)> = Vec::new();
         let mut read: Vec<(HashSet<VarId>, String)> = Vec::new();
         for (ordinal, s) in run.iter().enumerate() {
-            let ast::StmtKind::Stage { name, ports, body } = &s.kind else { continue };
+            let ast::StmtKind::Stage { name, ports, body } = &s.kind else {
+                continue;
+            };
             let last = ordinal + 1 == run.len();
             let floor = self.vars.len();
             self.push_scope();
-            self.frames.push(Frame { kind: FrameKind::Stage { pipeline }, floor });
+            self.frames.push(Frame {
+                kind: FrameKind::Stage { pipeline },
+                floor,
+            });
             let (tys, partials) = previous.take().unwrap_or_default();
             if tys.len() != ports.len() {
                 let message = if ordinal == 0 {
-                    format!("stage `{}` is first in its chain and has no predecessor to bind {} ports", name.name, ports.len())
+                    format!(
+                        "stage `{}` is first in its chain and has no predecessor to bind {} ports",
+                        name.name,
+                        ports.len()
+                    )
                 } else {
                     format!("stage `{}` binds {} ports but the previous stage yields {} values; ports bind the previous `yield` positionally", name.name, ports.len(), tys.len())
                 };
@@ -1142,7 +1731,14 @@ impl<'a> Checker<'a> {
                 self.vars[id].partial = partials.get(i).copied().unwrap_or(false);
                 port_vars.push(id);
             }
-            self.yields.push(YieldCtx { kind: YieldKind::Stage, done: false, loops: 0, schema: None, partials: Vec::new(), failed: false });
+            self.yields.push(YieldCtx {
+                kind: YieldKind::Stage,
+                done: false,
+                loops: 0,
+                schema: None,
+                partials: Vec::new(),
+                failed: false,
+            });
             let mutated_from = self.mutated.len();
             let reads_from = self.reads.len();
             let checked = self.block(body);
@@ -1151,8 +1747,19 @@ impl<'a> Checker<'a> {
             self.pop_scope();
 
             if pipeline {
-                read.push((self.reads[reads_from..].iter().copied().filter(|v| *v < pipeline_floor && self.vars[*v].kind == VarKind::State).collect(), name.name.clone()));
-                let states: HashSet<VarId> = self.mutated[mutated_from..].iter().copied().filter(|v| *v < pipeline_floor && self.vars[*v].kind == VarKind::State).collect();
+                read.push((
+                    self.reads[reads_from..]
+                        .iter()
+                        .copied()
+                        .filter(|v| *v < pipeline_floor && self.vars[*v].kind == VarKind::State)
+                        .collect(),
+                    name.name.clone(),
+                ));
+                let states: HashSet<VarId> = self.mutated[mutated_from..]
+                    .iter()
+                    .copied()
+                    .filter(|v| *v < pipeline_floor && self.vars[*v].kind == VarKind::State)
+                    .collect();
                 for state in states {
                     match updated.iter().find(|(v, _)| *v == state) {
                         Some((_, other)) => {
@@ -1182,11 +1789,19 @@ impl<'a> Checker<'a> {
                     (None, _, _) => {}
                 }
             }
-            out.push(sir::Stage { name: name.name.clone(), ports: port_vars, body: checked, span: s.span });
+            out.push(sir::Stage {
+                name: name.name.clone(),
+                ports: port_vars,
+                body: checked,
+                span: s.span,
+            });
         }
         // Stages of different visits overlap: only the updating stage may access its state.
         for (state, updater) in &updated {
-            if let Some((_, reader)) = read.iter().find(|(states, reader)| reader != updater && states.contains(state)) {
+            if let Some((_, reader)) = read
+                .iter()
+                .find(|(states, reader)| reader != updater && states.contains(state))
+            {
                 let state_name = self.vars[*state].name.clone();
                 let span = run.first().map_or(Span::default(), |s| s.span);
                 self.error(span, format!("stage `{reader}` reads state `{state_name}`, which stage `{updater}` updates; pipeline visits overlap, so only the updating stage may access that state"));

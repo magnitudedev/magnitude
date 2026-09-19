@@ -3,7 +3,9 @@
 use super::walk;
 use crate::exec::ir::{self, Expr, ExprKind, Stmt, StmtKind};
 use crate::exec::types::{Shaped, Ty};
-use crate::family::{Candidate, CandidateRef, Family, SiteId, SiteKind, Template, UnitKind, Witness};
+use crate::family::{
+    Candidate, CandidateRef, Family, SiteId, SiteKind, Template, UnitKind, Witness,
+};
 use crate::sir;
 use crate::span::Span;
 use crate::sym::{Atom, Sym};
@@ -76,7 +78,11 @@ pub(super) struct Slots<'a> {
 #[derive(Debug)]
 pub(super) enum YieldSink<'a> {
     Slots(Slots<'a>),
-    Result { member: Member, pieces: Vec<Expr>, loops: u32 },
+    Result {
+        member: Member,
+        pieces: Vec<Expr>,
+        loops: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +126,11 @@ pub(super) struct Frame<'a> {
 impl<'a> Frame<'a> {
     pub fn var(&self, id: sir::VarId) -> Result<&Value<'a>, String> {
         self.vars.get(id).and_then(Option::as_ref).ok_or_else(|| {
-            format!("`{}` in `{}` is used before instantiation bound it", self.name(id), self.definition.name)
+            format!(
+                "`{}` in `{}` is used before instantiation bound it",
+                self.name(id),
+                self.definition.name
+            )
         })
     }
 
@@ -129,11 +139,21 @@ impl<'a> Frame<'a> {
     }
 
     pub fn declared(&self, id: sir::VarId) -> Result<&'a sir::Var, String> {
-        self.body.vars.get(id).ok_or_else(|| format!("variable {id} is outside the body of `{}`", self.definition.name))
+        self.body.vars.get(id).ok_or_else(|| {
+            format!(
+                "variable {id} is outside the body of `{}`",
+                self.definition.name
+            )
+        })
     }
 
     pub fn slice(&self, id: st::SliceId) -> Result<&Slice, String> {
-        self.slices.get(&id).ok_or_else(|| format!("slice#{} of `{}` is not bound in this visit", id.0, self.definition.name))
+        self.slices.get(&id).ok_or_else(|| {
+            format!(
+                "slice#{} of `{}` is not bound in this visit",
+                id.0, self.definition.name
+            )
+        })
     }
 
     pub fn fused_at(&self, block: usize, index: usize) -> Option<&Fused> {
@@ -198,11 +218,17 @@ impl<'a> Instantiation<'a> {
     }
 
     pub fn template(&self, candidate: &Candidate) -> Result<&'a Template, String> {
-        self.family.templates.get(candidate.template.0 as usize).ok_or_else(|| format!("template {} is outside the family", candidate.template.0))
+        self.family
+            .templates
+            .get(candidate.template.0 as usize)
+            .ok_or_else(|| format!("template {} is outside the family", candidate.template.0))
     }
 
     pub fn definition(&self, id: sir::DefId) -> Result<&'a sir::Definition, String> {
-        self.program.definitions.get(id.0 as usize).ok_or_else(|| format!("definition {} is outside the program", id.0))
+        self.program
+            .definitions
+            .get(id.0 as usize)
+            .ok_or_else(|| format!("definition {} is outside the program", id.0))
     }
 
     /// The frame of a selected candidate: template bindings, use counts, folded bindings
@@ -211,7 +237,7 @@ impl<'a> Instantiation<'a> {
         let candidate = self.candidate(r)?;
         let template = self.template(candidate)?;
         let definition = self.definition(template.definition)?;
-        let body = definition.body.as_ref().ok_or_else(|| format!("selected definition `{}` has no body", definition.name))?;
+        let body = &definition.body;
         let mut structural = BTreeMap::new();
         for (name, site) in &candidate.structural {
             let slice = self.live_sites.get(&site.0).ok_or_else(|| {
@@ -223,24 +249,49 @@ impl<'a> Instantiation<'a> {
         let mut blocks = Vec::new();
         let mut ranges = Vec::new();
         for id in &candidate.sequences {
-            let sequence = self.family.sequences.get(id.0 as usize).ok_or_else(|| format!("sequence {} is outside the family", id.0))?;
-            let block = walk::scope(body, &sequence.scope).map_err(|e| format!("sequence {} of `{}`: {e}", id.0, definition.name))?;
+            let sequence = self
+                .family
+                .sequences
+                .get(id.0 as usize)
+                .ok_or_else(|| format!("sequence {} is outside the family", id.0))?;
+            let block = walk::scope(body, &sequence.scope)
+                .map_err(|e| format!("sequence {} of `{}`: {e}", id.0, definition.name))?;
             let mut next = 0;
             for unit in &sequence.units {
                 let stage = matches!(unit.kind, UnitKind::Stage(_)) && unit.statements.end == next;
                 if !stage && (unit.statements.start != next || unit.statements.end <= next) {
-                    return Err(format!("sequence {} of `{}` does not tile its block contiguously", id.0, definition.name));
+                    return Err(format!(
+                        "sequence {} of `{}` does not tile its block contiguously",
+                        id.0, definition.name
+                    ));
                 }
                 next = unit.statements.end;
             }
             if next != block.len() {
-                return Err(format!("sequence {} of `{}` covers {next} statements but the block at {:?} has {}", id.0, definition.name, sequence.scope, block.len()));
+                return Err(format!(
+                    "sequence {} of `{}` covers {next} statements but the block at {:?} has {}",
+                    id.0,
+                    definition.name,
+                    sequence.scope,
+                    block.len()
+                ));
             }
             blocks.push(block);
-            ranges.push(sequence.units.iter().map(|u| u.statements.clone()).collect::<Vec<_>>());
+            ranges.push(
+                sequence
+                    .units
+                    .iter()
+                    .map(|u| u.statements.clone())
+                    .collect::<Vec<_>>(),
+            );
         }
-        let pairs: Vec<(&sir::Block, &[std::ops::Range<usize>])> = blocks.iter().copied().zip(ranges.iter().map(Vec::as_slice)).collect();
-        let folded = walk::folded(body, &uses, &pairs).map_err(|e| format!("`{}`: {e}", definition.name))?;
+        let pairs: Vec<(&sir::Block, &[std::ops::Range<usize>])> = blocks
+            .iter()
+            .copied()
+            .zip(ranges.iter().map(Vec::as_slice))
+            .collect();
+        let folded =
+            walk::folded(body, &uses, &pairs).map_err(|e| format!("`{}`: {e}", definition.name))?;
         let mut frame = Frame {
             candidate: r,
             definition,
@@ -267,19 +318,33 @@ impl<'a> Instantiation<'a> {
 
     fn fused_intervals(&self, candidate: &Candidate, frame: &mut Frame<'a>) -> Result<(), String> {
         for id in &candidate.sequences {
-            let sequence = self.family.sequences.get(id.0 as usize).ok_or_else(|| format!("sequence {} is outside the family", id.0))?;
+            let sequence = self
+                .family
+                .sequences
+                .get(id.0 as usize)
+                .ok_or_else(|| format!("sequence {} is outside the family", id.0))?;
             let cover = self.witness.covers.get(id).ok_or_else(|| {
-                format!("witness has no cover for active sequence {} of `{}`", id.0, frame.definition.name)
+                format!(
+                    "witness has no cover for active sequence {} of `{}`",
+                    id.0, frame.definition.name
+                )
             })?;
-            if cover.iter().all(|(start, end)| end.saturating_sub(*start) <= 1) {
+            if cover
+                .iter()
+                .all(|(start, end)| end.saturating_sub(*start) <= 1)
+            {
                 continue;
             }
-            let block = walk::scope(frame.body, &sequence.scope).map_err(|e| format!("sequence {} of `{}`: {e}", id.0, frame.definition.name))?;
+            let block = walk::scope(frame.body, &sequence.scope)
+                .map_err(|e| format!("sequence {} of `{}`: {e}", id.0, frame.definition.name))?;
             for &(start, end) in cover {
                 if end <= start + 1 {
                     continue;
                 }
-                let units = sequence.units.get(start as usize..end as usize).ok_or_else(|| format!("cover of sequence {} leaves its units", id.0))?;
+                let units = sequence
+                    .units
+                    .get(start as usize..end as usize)
+                    .ok_or_else(|| format!("cover of sequence {} leaves its units", id.0))?;
                 let kind = if units.iter().all(|u| u.kind == UnitKind::Elementwise) {
                     FusedKind::Elementwise
                 } else if units.iter().all(|u| matches!(u.kind, UnitKind::Region(_))) {
@@ -294,29 +359,59 @@ impl<'a> Instantiation<'a> {
                 };
                 let first = units[0].statements.start;
                 let last = units[units.len() - 1].statements.end - 1;
-                frame.fused.entry(block_key(block)).or_default().push(Fused { first, last, kind });
+                frame
+                    .fused
+                    .entry(block_key(block))
+                    .or_default()
+                    .push(Fused { first, last, kind });
             }
         }
         Ok(())
     }
 
     /// The numerical site of a binder owned by this frame's candidate, with its value.
-    pub fn site(&self, f: &Frame<'a>, region: st::RegionId, slice: st::SliceId) -> Result<(SiteId, bool, i64), String> {
+    pub fn site(
+        &self,
+        f: &Frame<'a>,
+        region: st::RegionId,
+        slice: st::SliceId,
+    ) -> Result<(SiteId, bool, i64), String> {
         let candidate = self.candidate(f.candidate)?;
         for id in &candidate.sites {
-            let site = self.family.sites.get(id.0 as usize).ok_or_else(|| format!("site {} is outside the family", id.0))?;
+            let site = self
+                .family
+                .sites
+                .get(id.0 as usize)
+                .ok_or_else(|| format!("site {} is outside the family", id.0))?;
             let parts = match &site.kind {
-                SiteKind::Width { region: r, slice: s } if *r == region && *s == slice => false,
-                SiteKind::Parts { region: r, slice: s } if *r == region && *s == slice => true,
+                SiteKind::Width {
+                    region: r,
+                    slice: s,
+                } if *r == region && *s == slice => false,
+                SiteKind::Parts {
+                    region: r,
+                    slice: s,
+                } if *r == region && *s == slice => true,
                 _ => continue,
             };
-            let value = *self.witness.sites.get(id).ok_or_else(|| format!("witness has no value for active site {} of `{}`", id.0, f.definition.name))?;
+            let value = *self.witness.sites.get(id).ok_or_else(|| {
+                format!(
+                    "witness has no value for active site {} of `{}`",
+                    id.0, f.definition.name
+                )
+            })?;
             if value <= 0 {
-                return Err(format!("site {} of `{}` has the non-positive value {value}", id.0, f.definition.name));
+                return Err(format!(
+                    "site {} of `{}` has the non-positive value {value}",
+                    id.0, f.definition.name
+                ));
             }
             return Ok((*id, parts, value));
         }
-        Err(format!("region#{} binder slice#{} of `{}` has no numerical site in the family", region.0, slice.0, f.definition.name))
+        Err(format!(
+            "region#{} binder slice#{} of `{}` has no numerical site in the family",
+            region.0, slice.0, f.definition.name
+        ))
     }
 
     // ---- execution variables ----
@@ -329,8 +424,18 @@ impl<'a> Instantiation<'a> {
     pub fn local(&mut self, name: &str, ty: Ty, span: Span) -> Expr {
         let id = self.vars.len();
         let n = self.fresh();
-        self.vars.push(ir::Var { name: format!("{name}_{n}"), ty: ty.clone(), span, kind: ir::VarKind::Local });
-        Expr { kind: ExprKind::Var(id), ty, sym: None, span }
+        self.vars.push(ir::Var {
+            name: format!("{name}_{n}"),
+            ty: ty.clone(),
+            span,
+            kind: ir::VarKind::Local,
+        });
+        Expr {
+            kind: ExprKind::Var(id),
+            ty,
+            sym: None,
+            span,
+        }
     }
 
     /// A loop or work-item index with its own atom.
@@ -339,8 +444,22 @@ impl<'a> Instantiation<'a> {
         let n = self.fresh();
         let atom = Atom::Param(format!("{name}#{n}"));
         let ty = Ty::Scalar(DType::I32);
-        self.vars.push(ir::Var { name: format!("{name}_{n}"), ty: ty.clone(), span, kind: ir::VarKind::Index(atom.clone()) });
-        (id, atom.clone(), Expr { kind: ExprKind::Var(id), ty, sym: Some(Sym::atom(atom)), span })
+        self.vars.push(ir::Var {
+            name: format!("{name}_{n}"),
+            ty: ty.clone(),
+            span,
+            kind: ir::VarKind::Index(atom.clone()),
+        });
+        (
+            id,
+            atom.clone(),
+            Expr {
+                kind: ExprKind::Var(id),
+                ty,
+                sym: Some(Sym::atom(atom)),
+                span,
+            },
+        )
     }
 
     /// Symbolic value of an integer expression; a data-dependent one is bound to an index
@@ -361,7 +480,12 @@ impl<'a> Instantiation<'a> {
 
     pub fn elem(&self, f: &Frame<'a>, elem: &Elem) -> Result<Elem, String> {
         match elem {
-            Elem::Param(p) => f.elems.get(p).cloned().ok_or_else(|| format!("element parameter `{p}` of `{}` is unbound in its template", f.definition.name)),
+            Elem::Param(p) => f.elems.get(p).cloned().ok_or_else(|| {
+                format!(
+                    "element parameter `{p}` of `{}` is unbound in its template",
+                    f.definition.name
+                )
+            }),
             other => Ok(other.clone()),
         }
     }
@@ -370,7 +494,10 @@ impl<'a> Instantiation<'a> {
         match ty {
             st::Ty::Scalar(d) => Ok(*d),
             st::Ty::Index(_) | st::Ty::Coord(_) => Ok(DType::I32),
-            other => Err(format!("`{other}` in `{}` is not a scalar type", f.definition.name)),
+            other => Err(format!(
+                "`{other}` in `{}` is not a scalar type",
+                f.definition.name
+            )),
         }
     }
 
@@ -385,20 +512,33 @@ impl<'a> Instantiation<'a> {
     }
 
     pub fn shaped(&self, f: &Frame<'a>, shaped: &st::Shaped) -> Result<Shaped, String> {
-        let shape = shaped.axes.iter().map(|a| self.extent(f, a)).collect::<Result<Vec<_>, _>>()?;
+        let shape = shaped
+            .axes
+            .iter()
+            .map(|a| self.extent(f, a))
+            .collect::<Result<Vec<_>, _>>()?;
         let elem = self.elem(f, &shaped.elem)?;
         let packed_axis = match (&elem, shaped.packed_axis) {
             (Elem::Repr(_), None) => Some(shape.len().saturating_sub(1)),
             (Elem::Repr(_), axis) => axis,
             _ => None,
         };
-        Ok(Shaped { shape, elem, packed_axis })
+        Ok(Shaped {
+            shape,
+            elem,
+            packed_axis,
+        })
     }
 
     /// Selected width and piece count of a binder that is not bound in the current visit
     /// (an inner producer whose result storage an outer producer allocates).
     pub fn static_geometry(&self, f: &Frame<'a>, slice: st::SliceId) -> Result<(i64, i64), String> {
-        let decl = f.body.slices.get(slice.0 as usize).ok_or_else(|| format!("slice#{} is outside the body of `{}`", slice.0, f.definition.name))?;
+        let decl = f.body.slices.get(slice.0 as usize).ok_or_else(|| {
+            format!(
+                "slice#{} is outside the body of `{}`",
+                slice.0, f.definition.name
+            )
+        })?;
         let extent = match &decl.parent {
             sir::SliceParent::Domain { lo, hi } => self.resolve(f, &hi.sub(lo))?.as_constant().ok_or_else(|| {
                 format!("the extent of slice#{} in `{}` is not static where its storage is allocated", slice.0, f.definition.name)
@@ -410,7 +550,8 @@ impl<'a> Instantiation<'a> {
             sir::SliceParent::Rebind(origin) => return self.static_geometry(f, *origin),
         };
         let (_, parts, value) = self.site(f, decl.region, slice)?;
-        let width = width_of(extent, parts, value).map_err(|e| format!("slice#{} of `{}`: {e}", slice.0, f.definition.name))?;
+        let width = width_of(extent, parts, value)
+            .map_err(|e| format!("slice#{} of `{}`: {e}", slice.0, f.definition.name))?;
         Ok((width, if width == 0 { 0 } else { extent / width }))
     }
 
@@ -468,7 +609,10 @@ pub(super) fn width_of(extent: i64, parts: bool, value: i64) -> Result<i64, Stri
 }
 
 /// Simultaneous substitution through quotient and remainder atoms.
-pub(super) fn substitute(sym: &Sym, value: &dyn Fn(&Atom) -> Result<Option<Sym>, String>) -> Result<Sym, String> {
+pub(super) fn substitute(
+    sym: &Sym,
+    value: &dyn Fn(&Atom) -> Result<Option<Sym>, String>,
+) -> Result<Sym, String> {
     let mut out = Sym::constant(0);
     for (monomial, coefficient) in sym.monomials() {
         let mut term = Sym::constant(coefficient);
@@ -493,7 +637,11 @@ pub(super) fn substitute(sym: &Sym, value: &dyn Fn(&Atom) -> Result<Option<Sym>,
 // ---- execution-IR builders ----
 
 pub(super) fn stmt(kind: StmtKind, span: Span) -> Stmt {
-    Stmt { id: None, kind, span }
+    Stmt {
+        id: None,
+        kind,
+        span,
+    }
 }
 
 pub(super) fn assign(target: Expr, value: Expr) -> Stmt {
@@ -506,14 +654,24 @@ pub(super) fn assign_op(target: Expr, op: AssignOp, value: Expr) -> Stmt {
 }
 
 pub(super) fn int(n: i64, span: Span) -> Expr {
-    Expr { kind: ExprKind::Int(n), ty: Ty::Scalar(DType::I32), sym: Some(Sym::constant(n)), span }
+    Expr {
+        kind: ExprKind::Int(n),
+        ty: Ty::Scalar(DType::I32),
+        sym: Some(Sym::constant(n)),
+        span,
+    }
 }
 
 /// An `i32` expression denoting exactly `sym`.
 pub(super) fn symbol(sym: Sym, span: Span) -> Expr {
     match sym.as_constant() {
         Some(n) => int(n, span),
-        None => Expr { kind: ExprKind::ShapeParam(sym.to_string()), ty: Ty::Scalar(DType::I32), sym: Some(sym), span },
+        None => Expr {
+            kind: ExprKind::ShapeParam(sym.to_string()),
+            ty: Ty::Scalar(DType::I32),
+            sym: Some(sym),
+            span,
+        },
     }
 }
 
@@ -527,7 +685,12 @@ pub(super) fn literal(dtype: DType, value: f64, span: Span) -> Expr {
         ExprKind::Int(n) => Some(Sym::constant(n)),
         _ => None,
     };
-    Expr { kind, ty: Ty::Scalar(dtype), sym, span }
+    Expr {
+        kind,
+        ty: Ty::Scalar(dtype),
+        sym,
+        span,
+    }
 }
 
 /// Conversion to `dtype` where assignment would not already convert.
@@ -537,7 +700,15 @@ pub(super) fn coerce(e: Expr, dtype: DType) -> Expr {
         _ => {
             let span = e.span;
             let sym = if dtype.is_int() { e.sym.clone() } else { None };
-            Expr { kind: ExprKind::Cast { dtype, expr: Box::new(e) }, ty: Ty::Scalar(dtype), sym, span }
+            Expr {
+                kind: ExprKind::Cast {
+                    dtype,
+                    expr: Box::new(e),
+                },
+                ty: Ty::Scalar(dtype),
+                sym,
+                span,
+            }
         }
     }
 }
@@ -564,7 +735,16 @@ pub(super) fn binary(op: BinaryOp, lhs: Expr, rhs: Expr, ty: Ty) -> Expr {
         _ => None,
     };
     let span = lhs.span;
-    Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, ty, sym, span }
+    Expr {
+        kind: ExprKind::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        ty,
+        sym,
+        span,
+    }
 }
 
 /// Indexing with the execution IR's typing: points drop their axis, slices keep it with
@@ -574,12 +754,21 @@ pub(super) fn index(base: Expr, indices: Vec<ir::Index>, span: Span) -> Result<E
 }
 
 /// `extents[axis]` names the extent of a slice whose bounds are data-dependent.
-pub(super) fn index_with(base: Expr, indices: Vec<ir::Index>, extents: &[Option<Sym>], span: Span) -> Result<Expr, String> {
+pub(super) fn index_with(
+    base: Expr,
+    indices: Vec<ir::Index>,
+    extents: &[Option<Sym>],
+    span: Span,
+) -> Result<Expr, String> {
     if indices.is_empty() {
         return Ok(base);
     }
     // A point prefix of a point prefix addresses the same storage directly.
-    if let ExprKind::Index { base: inner, indices: prefix } = &base.kind {
+    if let ExprKind::Index {
+        base: inner,
+        indices: prefix,
+    } = &base.kind
+    {
         if prefix.iter().all(|i| matches!(i, ir::Index::Point(_))) {
             let mut all = prefix.clone();
             let mut named = vec![None; prefix.len()];
@@ -594,11 +783,18 @@ pub(super) fn index_with(base: Expr, indices: Vec<ir::Index>, extents: &[Option<
         other => return Err(format!("cannot index a {other}")),
     };
     if indices.len() > source.shape.len() {
-        return Err(format!("{} indices for rank {}", indices.len(), source.shape.len()));
+        return Err(format!(
+            "{} indices for rank {}",
+            indices.len(),
+            source.shape.len()
+        ));
     }
     let mut shape = Vec::new();
     let point = |axis: usize| matches!(indices.get(axis), Some(ir::Index::Point(_)));
-    let packed_axis = source.packed_axis.filter(|p| !point(*p)).map(|p| p - (0..p).filter(|a| point(*a)).count());
+    let packed_axis = source
+        .packed_axis
+        .filter(|p| !point(*p))
+        .map(|p| p - (0..p).filter(|a| point(*a)).count());
     for (axis, idx) in indices.iter().enumerate() {
         match idx {
             ir::Index::Point(_) => {}
@@ -621,29 +817,60 @@ pub(super) fn index_with(base: Expr, indices: Vec<ir::Index>, extents: &[Option<
     }
     shape.extend(source.shape[indices.len()..].iter().cloned());
     let ty = if shape.is_empty() {
-        Ty::Scalar(source.elem.read_dtype().ok_or("element read of an unbound element type")?)
+        Ty::Scalar(
+            source
+                .elem
+                .read_dtype()
+                .ok_or("element read of an unbound element type")?,
+        )
     } else if tensor {
-        Ty::Tensor(Shaped { shape, elem: source.elem.clone(), packed_axis })
+        Ty::Tensor(Shaped {
+            shape,
+            elem: source.elem.clone(),
+            packed_axis,
+        })
     } else {
-        Ty::Tile(Shaped { shape, elem: source.elem.clone(), packed_axis })
+        Ty::Tile(Shaped {
+            shape,
+            elem: source.elem.clone(),
+            packed_axis,
+        })
     };
-    Ok(Expr { kind: ExprKind::Index { base: Box::new(base), indices }, ty, sym: None, span })
+    Ok(Expr {
+        kind: ExprKind::Index {
+            base: Box::new(base),
+            indices,
+        },
+        ty,
+        sym: None,
+        span,
+    })
 }
 
 pub(super) fn points(base: Expr, coordinates: &[Expr]) -> Result<Expr, String> {
     let span = base.span;
-    index(base, coordinates.iter().cloned().map(ir::Index::Point).collect(), span)
+    index(
+        base,
+        coordinates.iter().cloned().map(ir::Index::Point).collect(),
+        span,
+    )
 }
 
 pub(super) fn tile_shape(e: &Expr) -> Result<&Shaped, String> {
-    e.ty.shaped().ok_or_else(|| format!("a {} value is used as a tile", e.ty))
+    e.ty.shaped()
+        .ok_or_else(|| format!("a {} value is used as a tile", e.ty))
 }
 
 pub(super) fn root(e: &Expr) -> Option<ir::VarId> {
     match &e.kind {
         ExprKind::Var(v) => Some(*v),
-        ExprKind::Index { base, .. } | ExprKind::Transpose(base) | ExprKind::Accessor { base, .. } => root(base),
-        ExprKind::Builtin { name: ir::Builtin::Reshape, args } => args.first().and_then(root),
+        ExprKind::Index { base, .. }
+        | ExprKind::Transpose(base)
+        | ExprKind::Accessor { base, .. } => root(base),
+        ExprKind::Builtin {
+            name: ir::Builtin::Reshape,
+            args,
+        } => args.first().and_then(root),
         _ => None,
     }
 }

@@ -6,7 +6,10 @@ use super::parser::{binary_bp, NOT_BP, RANGE_BP, UNARY_BP};
 use std::fmt::Write;
 
 pub fn print(file: &File) -> String {
-    let mut p = Printer { out: String::new(), level: 0 };
+    let mut p = Printer {
+        out: String::new(),
+        level: 0,
+    };
     for (i, decl) in file.decls.iter().enumerate() {
         if i > 0 {
             p.out.push('\n');
@@ -17,13 +20,19 @@ pub fn print(file: &File) -> String {
 }
 
 pub fn expr_to_string(e: &Expr) -> String {
-    let mut p = Printer { out: String::new(), level: 0 };
+    let mut p = Printer {
+        out: String::new(),
+        level: 0,
+    };
     p.expr(e, 0);
     p.out
 }
 
 pub fn type_to_string(ty: &TypeExpr) -> String {
-    let mut p = Printer { out: String::new(), level: 0 };
+    let mut p = Printer {
+        out: String::new(),
+        level: 0,
+    };
     p.ty(ty);
     p.out
 }
@@ -62,37 +71,25 @@ impl Printer {
     fn decl(&mut self, decl: &Decl) {
         match decl {
             Decl::Fn(f) => {
-                if f.export {
-                    self.out.push_str("export ");
-                }
                 if f.admit {
                     self.out.push_str("admit ");
                 }
                 let _ = write!(self.out, "fn {}", f.name.name);
                 self.signature(&f.signature);
-                self.predicates(&f.signature.predicates);
-                match &f.body {
-                    Some(body) => {
-                        self.out.push_str(":\n");
-                        self.block(body);
-                    }
-                    None => self.out.push_str(";\n"),
+                if let Some(target) = &f.target {
+                    let _ = write!(self.out, " for {}", target.name);
                 }
+                self.predicates(&f.signature.predicates);
+                self.out.push_str(":\n");
+                self.block(&f.body);
             }
             Decl::Lower(l) => {
                 let _ = write!(self.out, "lower {}", l.name.name);
-                if let Some(signature) = &l.signature {
-                    self.signature(signature);
-                }
+                self.signature(&l.signature);
                 let _ = write!(self.out, " for {}", l.target.name);
                 self.predicates(&l.predicates);
-                match &l.implementation {
-                    LowerImpl::Body(body) => {
-                        self.out.push_str(":\n");
-                        self.block(body);
-                    }
-                    LowerImpl::Portable => self.out.push_str(" = portable\n"),
-                }
+                self.out.push_str(":\n");
+                self.block(&l.body);
             }
         }
     }
@@ -221,8 +218,13 @@ impl Printer {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
-            StmtKind::Let { pattern, value } | StmtKind::Var { pattern, value } => {
-                self.out.push_str(if matches!(stmt.kind, StmtKind::Let { .. }) { "let " } else { "var " });
+            StmtKind::Let {
+                mutable,
+                pattern,
+                value,
+            } => {
+                self.out
+                    .push_str(if *mutable { "let mut " } else { "let " });
                 self.pattern(pattern);
                 self.out.push_str(" = ");
                 self.value(value);
@@ -242,7 +244,11 @@ impl Printer {
                 }
                 self.suite(body);
             }
-            StmtKind::For { targets, iter, body } => {
+            StmtKind::For {
+                targets,
+                iter,
+                body,
+            } => {
                 self.out.push_str("for ");
                 self.names(targets);
                 self.out.push_str(" in ");
@@ -270,7 +276,10 @@ impl Printer {
         let Some(els) = els else { return };
         self.indent();
         match els.stmts.as_slice() {
-            [Stmt { kind: StmtKind::If { cond, then, els }, .. }] => {
+            [Stmt {
+                kind: StmtKind::If { cond, then, els },
+                ..
+            }] => {
                 self.out.push_str("else ");
                 self.if_stmt(cond, then, els.as_ref());
             }
@@ -358,7 +367,11 @@ impl Printer {
                 self.out.push_str("tile");
                 self.shape_and_elem(shape, elem);
             }
-            ExprKind::Call { callee, bindings, args } => {
+            ExprKind::Call {
+                callee,
+                bindings,
+                args,
+            } => {
                 self.expr(callee, UNARY_BP);
                 if !bindings.is_empty() {
                     self.out.push('[');
@@ -399,7 +412,11 @@ impl Printer {
                 let _ = write!(self.out, ".{}", name.name);
             }
             ExprKind::Unary { op, expr } => {
-                let bp = if *op == UnaryOp::Not { NOT_BP } else { UNARY_BP };
+                let bp = if *op == UnaryOp::Not {
+                    NOT_BP
+                } else {
+                    UNARY_BP
+                };
                 let paren = bp <= min_bp;
                 if paren {
                     self.out.push('(');

@@ -31,7 +31,7 @@ those paths and exact everywhere else.
 | Form | Meaning |
 | --- | --- |
 | `parallel` | Independent visits, one slice per binder per visit. A body cannot mutate enclosing state; it may publish to provably disjoint views and yield a result. |
-| `ordered` | Visits in ascending lexicographic order, last binder fastest. Each visit completes before the next begins. A body may update enclosing `var` state. |
+| `ordered` | Visits in ascending lexicographic order, last binder fastest. Each visit completes before the next begins. A body may update enclosing `let mut` state. |
 | `pipeline` | Ordered visits whose body is one linear stage chain. Each state object has exactly one updating stage. Preparation may run ahead only across stable reads. |
 | `merge` clause | Canonical near-equal contiguous partition of the axis; adjacent partials combine level by level, an odd value is forwarded. Empty domain gives the identity; one part gives its partial. |
 | Refinement | A region over an enclosing slice partitions that slice. It owns a new site. |
@@ -89,7 +89,7 @@ backend execution. Units partition the block's statements in authored order.
 | --- | --- |
 | Elementwise | Tile-valued binding or tile state update computed pointwise over identical axes, with scalar broadcast |
 | Local | Reduction, scalar work, loop, branch, helper call, or any other non-elementwise computation |
-| Call | Call occurrence at a lowering boundary |
+| Call | Static call occurrence |
 | Publish | `publish` |
 | Region | Nested region, as statement or bound expression |
 | Stage | One stage of a chain |

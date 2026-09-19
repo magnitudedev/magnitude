@@ -39,51 +39,60 @@ impl Program {
         &self.families[self.definition(id).family]
     }
 
-    pub fn export(&self, name: &str) -> Option<&ContractFamily> {
-        self.families.iter().find(|f| f.name == name && f.export)
+    /// Resolve a name-only root request. Calls already carry an exact family index, but an
+    /// embedding request has no argument-type selector and therefore must fail closed when
+    /// several disjoint overload families share the name.
+    pub fn family_index(&self, name: &str) -> Result<usize, String> {
+        let mut matches = self
+            .families
+            .iter()
+            .enumerate()
+            .filter(|(_, family)| family.name == name)
+            .map(|(index, _)| index);
+        let Some(first) = matches.next() else {
+            return Err(format!("no linked function `{name}`"));
+        };
+        if matches.next().is_some() {
+            return Err(format!(
+                "ambiguous linked function `{name}`: a name-only root request matches multiple disjoint signatures"
+            ));
+        }
+        Ok(first)
+    }
+
+    pub fn resolve_family(&self, name: &str) -> Result<&ContractFamily, String> {
+        Ok(&self.families[self.family_index(name)?])
+    }
+
+    pub fn family(&self, name: &str) -> Option<&ContractFamily> {
+        self.resolve_family(name).ok()
     }
 }
 
-/// A connected component of same-name overloads with overlapping applicability and a
-/// compatible contract. Lowering boundaries belong to (family, target).
+/// A connected component of same-name implementations with overlapping applicability and a
+/// compatible contract.
 #[derive(Clone, Debug)]
 pub struct ContractFamily {
     pub name: String,
-    /// Portable bodies and target-dependent `fn` bodies.
+    /// Portable and backend-specific `fn` bodies.
     pub bodies: Vec<DefId>,
-    /// Bodyless contracts (`fn …;`).
-    pub contracts: Vec<DefId>,
-    /// `lower … for target` bodies and `= portable` adoptions.
+    /// Backend `lower` bodies.
     pub lowerings: Vec<DefId>,
-    pub export: bool,
-}
-
-impl ContractFamily {
-    /// Whether calls on `target` must resolve through explicit lowerings.
-    pub fn is_boundary(&self, target: &str, program: &Program) -> bool {
-        self.export
-            || !self.contracts.is_empty()
-            || self.lowerings.iter().any(|id| program.definition(*id).kind.target() == Some(target))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DefKind {
-    /// `fn` with a body.
-    Body,
-    /// `fn …;`
-    Contract,
+    /// A `fn` body. `None` is portable; `Some` restricts it to one backend.
+    Body { target: Option<String> },
     /// `lower … for target:` with a body.
     Lower { target: String },
-    /// `lower … for target = portable`: imports the family's matching portable bodies.
-    Adopt { target: String },
 }
 
 impl DefKind {
     pub fn target(&self) -> Option<&str> {
         match self {
-            DefKind::Lower { target } | DefKind::Adopt { target } => Some(target),
-            _ => None,
+            DefKind::Body { target } => target.as_deref(),
+            DefKind::Lower { target } => Some(target),
         }
     }
 }
@@ -106,10 +115,7 @@ pub struct Definition {
     /// Applicability: every predicate must hold.
     pub predicates: Vec<Predicate>,
     pub admit: bool,
-    pub export: bool,
-    /// The target whose primitives the body names, if any (independent of `kind`).
-    pub requires_target: Option<String>,
-    pub body: Option<Body>,
+    pub body: Body,
     /// Index into `Program::files`.
     pub file: usize,
     pub span: Span,
@@ -161,7 +167,7 @@ pub enum VarKind {
     Param(usize),
     /// `let`
     Value,
-    /// `var`
+    /// `let mut`
     State,
     /// Region binder.
     Slice(SliceId),
@@ -248,22 +254,50 @@ pub enum Pattern {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
-    /// `let`/`var`: one producer occurrence in this lexical scope.
-    Bind { pattern: Pattern, value: Expr },
+    /// `let`/`let mut`: one producer occurrence in this lexical scope.
+    Bind {
+        pattern: Pattern,
+        value: Expr,
+    },
     /// State update. For tuple targets all right-hand sides read old versions first.
-    Assign { target: Expr, op: AssignOp, value: Expr },
+    Assign {
+        target: Expr,
+        op: AssignOp,
+        value: Expr,
+    },
     /// A region in statement position.
     Region(Region),
     /// A maximal run of consecutive `stage` statements.
     Stages(Vec<Stage>),
     /// `for i in lo..hi`
-    Range { var: VarId, lo: Expr, hi: Expr, body: Block },
+    Range {
+        var: VarId,
+        lo: Expr,
+        hi: Expr,
+        body: Block,
+    },
     /// `for i, j in owned(t)` (all axes) / `for k in axis(t, n)` (`axes == [n]`)
-    Coordinates { vars: Vec<VarId>, of: Expr, axes: Vec<usize>, body: Block },
+    Coordinates {
+        vars: Vec<VarId>,
+        of: Expr,
+        axes: Vec<usize>,
+        body: Block,
+    },
     /// `for h in slice`
-    Members { var: VarId, slice: SliceId, body: Block },
-    If { cond: Expr, then: Block, els: Block },
-    Publish { value: Expr, destination: Expr },
+    Members {
+        var: VarId,
+        slice: SliceId,
+        body: Block,
+    },
+    If {
+        cond: Expr,
+        then: Block,
+        els: Block,
+    },
+    Publish {
+        value: Expr,
+        destination: Expr,
+    },
     Yield(Vec<Expr>),
     Return(Vec<Expr>),
     /// A call evaluated for its `out`/`inout` effects.
@@ -336,17 +370,33 @@ pub enum Index {
     /// Slice binder.
     Slice(SliceId),
     /// `lo:hi` semantic range; `None` is the axis bound.
-    Range { start: Option<Expr>, end: Option<Expr> },
+    Range {
+        start: Option<Expr>,
+        end: Option<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Math {
-    Fma, Exp, ExpFast, Rsqrt, Sqrt, Log, Sin, Cos, Abs, Max, Min,
+    Fma,
+    Exp,
+    ExpFast,
+    Rsqrt,
+    Sqrt,
+    Log,
+    Sin,
+    Cos,
+    Abs,
+    Max,
+    Min,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceOp {
-    Sum, Max, Min, Argmax,
+    Sum,
+    Max,
+    Min,
+    Argmax,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -358,44 +408,101 @@ pub enum ExprKind {
     /// A shape parameter used as a value.
     ShapeParam(String),
     Tuple(Vec<Expr>),
-    Field { base: Box<Expr>, index: usize },
+    Field {
+        base: Box<Expr>,
+        index: usize,
+    },
     /// `tile[shape] elem`: uninitialized owned tile.
     TileAlloc,
     /// `zeros_like` / `ones_like`: shape of the operand, given dtype, constant fill.
-    Filled { like: Box<Expr>, value: f64 },
+    Filled {
+        like: Box<Expr>,
+        value: f64,
+    },
     /// Element read (all points) or view (otherwise) of a tensor, view, tile.
-    Index { base: Box<Expr>, indices: Vec<Index> },
+    Index {
+        base: Box<Expr>,
+        indices: Vec<Index>,
+    },
     /// `results[p]` / `results[rows, cols]`
-    Member { result: Box<Expr>, slices: Vec<SliceId> },
+    Member {
+        result: Box<Expr>,
+        slices: Vec<SliceId>,
+    },
     Transpose(Box<Expr>),
-    Reshape { base: Box<Expr>, axes: Vec<Extent> },
+    Reshape {
+        base: Box<Expr>,
+        axes: Vec<Extent>,
+    },
     /// Snapshot in the view's own representation.
     Load(Box<Expr>),
     /// Dense f32 tile of a packed view.
     Decode(Box<Expr>),
     /// Scalar cast, or elementwise read-and-convert of a tile/view (yields a tile).
-    Cast { dtype: DType, expr: Box<Expr> },
+    Cast {
+        dtype: DType,
+        expr: Box<Expr>,
+    },
     /// Scalar or elementwise (tile operands, scalar broadcast).
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Math { op: Math, args: Vec<Expr> },
-    Select { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Math {
+        op: Math,
+        args: Vec<Expr>,
+    },
+    Select {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
     /// `unordered` (`reduce(t, axis, sum, unordered=true)`, legal only inside an `admit fn`)
     /// permits reassociation: a backend may combine lane partials. The reference
     /// interpreter always accumulates in ascending index order.
-    Reduce { value: Box<Expr>, axis: usize, op: ReduceOp, unordered: bool },
+    Reduce {
+        value: Box<Expr>,
+        axis: usize,
+        op: ReduceOp,
+        unordered: bool,
+    },
     /// Semantic coordinate of a tile coordinate.
     CoordOf(VarId),
     /// `extent(v, axis)` on a semantic axis.
-    ExtentOf { base: Box<Expr>, axis: usize },
-    Call { call: CallId, args: Vec<Expr> },
+    ExtentOf {
+        base: Box<Expr>,
+        axis: usize,
+    },
+    Call {
+        call: CallId,
+        args: Vec<Expr>,
+    },
     /// A result-producing region (with or without merge).
     Region(Box<Region>),
     // Target-dependent forms.
-    Intrinsic { op: Operation, args: Vec<Expr> },
+    Intrinsic {
+        op: Operation,
+        args: Vec<Expr>,
+    },
     /// Packed plane accessor: `words`, `scale`, `bias`.
-    Accessor { base: Box<Expr>, name: String },
+    Accessor {
+        base: Box<Expr>,
+        name: String,
+    },
     /// `capacity(t, axis)` / `valid(t, axis)` under geometry authority.
-    Geometry { base: Box<Expr>, axis: usize, valid: bool },
-    Atomic { op: BinaryOp, place: Box<Expr>, value: Box<Expr> },
+    Geometry {
+        base: Box<Expr>,
+        axis: usize,
+        valid: bool,
+    },
+    Atomic {
+        op: BinaryOp,
+        place: Box<Expr>,
+        value: Box<Expr>,
+    },
 }

@@ -1,0 +1,222 @@
+# Tile assignment copies values; later mutation cannot alter the source tile.
+fn tile_copy(x: tensor[4] f32, out out: tensor[4] f32):
+    let t = load(x)
+    let mut u = t
+    for i in owned(u):
+        u[i] = 0.0
+    publish t to out
+
+
+# A loop-carried tile retains its value while the next iteration allocates locals.
+fn loop_carried(out out: tensor[1] f32):
+    let mut m = tile[1] f32
+    let mut a = tile[1] f32
+    for i in owned(m):
+        m[i] = 1.0
+        a[i] = 0.0
+    for step in 0..3:
+        let mut n = tile[1] f32
+        for i in owned(n):
+            n[i] = m[i] + 1.0
+        for i in owned(a):
+            a[i] = m[i] + n[i]
+        m = n
+    publish a to out
+
+
+# Existing scalar bindings merge through control flow; branch locals do not escape.
+fn branch_merge(out out: tensor[1] f32, choose: bool):
+    let mut value = f32(3.0)
+    if choose:
+        value = 7.0
+    else:
+        value = 11.0
+    let mut y = tile[1] f32
+    for i in owned(y):
+        y[i] = value
+    publish y to out
+
+
+# BF16 arithmetic publishes a BF16 value even when the next expression widens it.
+fn bf16_rounding(x: tensor[1] bf16, out out: tensor[1] f32):
+    let t = load(x)
+    let mut y = tile[1] f32
+    for i in owned(y):
+        y[i] = f32(t[i] * t[i])
+    publish y to out
+
+
+# Producer substitution cannot move a read past mutation of its source tile.
+fn changed_source(x: tensor[4] f32, out out: tensor[4] f32):
+    let mut t = load(x)
+    let mut y = tile[4] f32
+    for i in owned(y):
+        y[i] = t[i] * 2.0
+    for i in owned(t):
+        t[i] = 0.0
+    let mut z = tile[4] f32
+    for i in owned(z):
+        z[i] = y[i] + 1.0
+    publish z to out
+
+
+fn mixed_scalars(out out: tensor[1] f32, first: bool, a: f32, b: bf16, last: bool):
+    let mut value = a + f32(b)
+    if first:
+        value = value + 10.0
+    if last:
+        value = value * 10.0
+    let mut y = tile[1] f32
+    for i in owned(y):
+        y[i] = value
+    publish y to out
+
+
+# A loaded value remains a snapshot even when its tensor backing is overwritten.
+fn large_snapshot(inout x: tensor[65] f32, out out: tensor[65] f32):
+    let t = load(x)
+    let mut zero = tile[65] f32
+    for i in owned(zero):
+        zero[i] = 0.0
+    publish zero to x
+    let mut y = tile[65] f32
+    for i in owned(y):
+        y[i] = t[64 - coord(i)]
+    publish y to out
+
+
+fn snapshot_reduction(inout x: tensor[65] f32, out out: tensor[1] f32):
+    let t = load(x)
+    let mut zero = tile[65] f32
+    for i in owned(zero):
+        zero[i] = 0.0
+    publish zero to x
+    let mut acc = tile[1] f32
+    for i in owned(acc):
+        acc[i] = reduce(t, 0, sum)
+    publish acc to out
+
+
+# Mutating a logical loaded tile does not mutate its source tensor.
+fn loaded_mutation(x: tensor[65] f32, out out: tensor[1] f32):
+    let mut t = load(x)
+    for i in owned(t):
+        t[i] = 0.0
+    let mut acc = tile[1] f32
+    for i in owned(acc):
+        acc[i] = reduce(t, 0, sum)
+    publish acc to out
+
+
+fn half_rounding(x: tensor[1] f16, out out: tensor[1] f32, value: f16):
+    let t = load(x)
+    let mut y = tile[1] f32
+    for i in owned(y):
+        y[i] = f32(t[i] * value)
+    publish y to out
+
+
+fn bounded_index(x: tensor[4] f32, pos: index[4], out out: tensor[1] f32):
+    let t = load(x[pos:pos + 1])
+    publish t to out
+
+
+fn reduction_extrema(x: tensor[3, 65] f32, out minima: tensor[3] f32, out maxima: tensor[3] f32, out indices: tensor[3] i32):
+    let t = load(x)
+    let low = reduce(t, 1, min)
+    let high = reduce(t, 1, max)
+    let at = reduce(t, 1, argmax)
+    publish low to minima
+    publish high to maxima
+    publish at to indices
+
+
+fn argmax_lookup(x: tensor[65] f32, out out: tensor[1] f32, out index: tensor[1] i32):
+    let t = load(x)
+    let at = reduce(t, 0, argmax)
+    let mut value = tile[1] f32
+    let mut winner = tile[1] i32
+    for i in owned(value):
+        value[i] = t[at]
+        winner[i] = at
+    publish value to out
+    publish winner to index
+
+
+# Narrow accumulation is an explicit ascending chain in the input dtype: every
+# addition rounds to BF16 / F16 before the next one.
+fn narrow_sum(x: tensor[4] bf16, h: tensor[4] f16, out out: tensor[2] f32):
+    let t = load(x)
+    let u = load(h)
+    let mut s = bf16(0.0)
+    for i in 0..4:
+        s = s + t[i]
+    let mut r = f16(0.0)
+    for i in 0..4:
+        r = r + u[i]
+    let mut value = tile[2] f32
+    for i in owned(value):
+        if coord(i) == 0:
+            value[i] = f32(s)
+        else:
+            value[i] = f32(r)
+    publish value to out
+
+
+fn integer_extrema(x: tensor[2, 33] i32, out minima: tensor[2] i32, out maxima: tensor[2] i32, out indices: tensor[2] i32):
+    let t = load(x)
+    let low = reduce(t, 1, min)
+    let high = reduce(t, 1, max)
+    let at = reduce(t, 1, argmax)
+    publish low to minima
+    publish high to maxima
+    publish at to indices
+
+
+# Ordered sums are explicit ascending chains, each in its input dtype.
+fn ordered_large_sum(x: tensor[65] f32, b: tensor[65] bf16, h: tensor[65] f16, out out: tensor[3] f32):
+    let xt = load(x)
+    let bt = load(b)
+    let ht = load(h)
+    let mut xs = f32(0.0)
+    for i in 0..65:
+        xs = xs + xt[i]
+    let mut bs = bf16(0.0)
+    for i in 0..65:
+        bs = bs + bt[i]
+    let mut hs = f16(0.0)
+    for i in 0..65:
+        hs = hs + ht[i]
+    let mut value = tile[3] f32
+    for i in owned(value):
+        if coord(i) == 0:
+            value[i] = xs
+        else:
+            if coord(i) == 1:
+                value[i] = f32(bs)
+            else:
+                value[i] = f32(hs)
+    publish value to out
+
+
+fn explicit_fma(x: tensor[3] f32, out out: tensor[2] f32):
+    let t = load(x)
+    let mut y = tile[2] f32
+    for i in owned(y):
+        if coord(i) == 0:
+            y[i] = t[0] * t[1] + t[2]
+        else:
+            y[i] = fma(t[0], t[1], t[2])
+    publish y to out
+
+
+# An empty logical reduction returns its identity; a logical window guard
+# has no body effects for the empty domain, regardless of slice widths.
+fn empty_window(x: tensor[1] f32, out out: tensor[1] f32):
+    let t = load(x[0:0])
+    let mut acc = tile[1] f32
+    for i in owned(acc):
+        acc[i] = reduce(t, 0, sum)
+    if extent(t, 0) > 0:
+        acc[0] = acc[0] + 1.0
+    publish acc to out

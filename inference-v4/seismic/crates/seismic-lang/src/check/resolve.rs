@@ -3,12 +3,11 @@
 
 use crate::intrinsics::{self, IntrinsicResult, Semantics};
 use crate::repr;
-use crate::span::{Diagnostic, Span};
 use crate::sir::{ContractFamily, DefId, DefKind, Predicate};
+use crate::span::{Diagnostic, Span};
+use crate::sym::{Atom, Sym};
 use crate::syntax::ast::{self, BinaryOp, ExprKind as A, Mode, ShapedHead, TypeKind};
 use crate::types::{DType, Elem, Extent, NativeTy, Shaped, Ty};
-use crate::sym::Sym;
-use crate::Scope;
 use std::collections::HashMap;
 
 /// A diagnostic attributed to a source file (index into the compiled file list).
@@ -44,11 +43,9 @@ pub(crate) struct Declared<'a> {
     pub kind: DefKind,
     pub family: usize,
     pub admit: bool,
-    pub export: bool,
     pub elem_bindings: Vec<(String, Elem)>,
-    pub body: Option<&'a ast::Block>,
+    pub body: &'a ast::Block,
     pub file: usize,
-    pub scope: Scope,
     pub span: Span,
     pub name_span: Span,
 }
@@ -60,12 +57,46 @@ pub(crate) struct Resolved<'a> {
     pub by_name: HashMap<String, Vec<usize>>,
 }
 
+fn native_targets(ty: &Ty, out: &mut Vec<String>) {
+    match ty {
+        Ty::Native(native) => out.push(native.target.clone()),
+        Ty::Tuple(items) => items.iter().for_each(|item| native_targets(item, out)),
+        _ => {}
+    }
+}
+
+fn check_signature_target(sig: &Sig, target: Option<&str>, span: Span) -> Result<(), Diagnostic> {
+    let mut native = Vec::new();
+    for param in &sig.params {
+        native_targets(&param.ty, &mut native);
+    }
+    native_targets(&sig.result, &mut native);
+    if let Some(found) = native
+        .into_iter()
+        .find(|found| Some(found.as_str()) != target)
+    {
+        return Err(Diagnostic::new(span, match target {
+            Some(expected) => format!("native type for backend `{found}` cannot appear in a declaration for backend `{expected}`"),
+            None => format!("native type for backend `{found}` cannot appear in a portable function signature"),
+        }));
+    }
+    Ok(())
+}
+
 /// A shape expression: integers, shape parameters, and `+ - * / %` over them.
 pub(crate) fn shape_sym(e: &ast::Expr, shape_params: &[String]) -> Result<Sym, Diagnostic> {
     match &e.kind {
-        A::Int(v) => i64::try_from(*v).map(Sym::constant).map_err(|_| Diagnostic::new(e.span, "shape constant does not fit a signed 64-bit integer")),
+        A::Int(v) => i64::try_from(*v).map(Sym::constant).map_err(|_| {
+            Diagnostic::new(
+                e.span,
+                "shape constant does not fit a signed 64-bit integer",
+            )
+        }),
         A::Name(n) if shape_params.contains(&n.name) => Ok(Sym::param(&n.name)),
-        A::Name(n) => Err(Diagnostic::new(n.span, format!("`{}` is not a declared shape parameter", n.name))),
+        A::Name(n) => Err(Diagnostic::new(
+            n.span,
+            format!("`{}` is not a declared shape parameter", n.name),
+        )),
         A::Binary { op, lhs, rhs } => {
             let l = shape_sym(lhs, shape_params)?;
             let r = shape_sym(rhs, shape_params)?;
@@ -77,42 +108,85 @@ pub(crate) fn shape_sym(e: &ast::Expr, shape_params: &[String]) -> Result<Sym, D
                     if r.as_constant().is_some_and(|c| c <= 0) {
                         return Err(Diagnostic::new(rhs.span, "shape divisor must be positive"));
                     }
-                    Ok(if *op == BinaryOp::Div { l.quot(&r) } else { l.rem(&r) })
+                    Ok(if *op == BinaryOp::Div {
+                        l.quot(&r)
+                    } else {
+                        l.rem(&r)
+                    })
                 }
-                _ => Err(Diagnostic::new(e.span, "only + - * / % are allowed in shapes")),
+                _ => Err(Diagnostic::new(
+                    e.span,
+                    "only + - * / % are allowed in shapes",
+                )),
             }
         }
-        _ => Err(Diagnostic::new(e.span, "a shape is an integer expression over shape parameters")),
+        _ => Err(Diagnostic::new(
+            e.span,
+            "a shape is an integer expression over shape parameters",
+        )),
     }
 }
 
 /// Element descriptor: dtype, representation, or an implicit element parameter (capitalized name).
-pub(crate) fn elem_of(name: &ast::Ident, elem_params: &mut Vec<String>) -> Result<Elem, Diagnostic> {
+pub(crate) fn elem_of(
+    name: &ast::Ident,
+    elem_params: &mut Vec<String>,
+) -> Result<Elem, Diagnostic> {
     if let Some(d) = DType::from_name(&name.name) {
         return Ok(Elem::Dtype(d));
     }
     if repr::lookup(&name.name).is_some() {
         return Ok(Elem::Repr(name.name.clone()));
     }
-    if name.name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+    if name
+        .name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
         if !elem_params.contains(&name.name) {
             elem_params.push(name.name.clone());
         }
         return Ok(Elem::Param(name.name.clone()));
     }
-    Err(Diagnostic::new(name.span, format!("`{}` is not a dtype, a representation, or an element parameter", name.name)))
+    Err(Diagnostic::new(
+        name.span,
+        format!(
+            "`{}` is not a dtype, a representation, or an element parameter",
+            name.name
+        ),
+    ))
 }
 
 /// The native type `target.name(args)` from the target's intrinsic table.
-pub(crate) fn native_type(target: &ast::Ident, name: &ast::Ident, args: &[ast::Expr], span: Span) -> Result<NativeTy, Diagnostic> {
+pub(crate) fn native_type(
+    target: &ast::Ident,
+    name: &ast::Ident,
+    args: &[ast::Expr],
+    span: Span,
+) -> Result<NativeTy, Diagnostic> {
     let Some(table) = intrinsics::table(&target.name) else {
-        return Err(Diagnostic::new(target.span, format!("`{}` is not a target namespace", target.name)));
+        return Err(Diagnostic::new(
+            target.span,
+            format!("`{}` is not a target namespace", target.name),
+        ));
     };
-    let Some(intrinsic) = table.iter().find(|i| i.operation.name() == name.name && matches!(i.result, IntrinsicResult::Frag8x8OfNamedDtype)) else {
-        return Err(Diagnostic::new(name.span, format!("`{}.{}` is not a native type of target `{}`", target.name, name.name, target.name)));
+    let Some(intrinsic) = table.iter().find(|i| {
+        i.operation.name() == name.name && matches!(i.result, IntrinsicResult::Frag8x8OfNamedDtype)
+    }) else {
+        return Err(Diagnostic::new(
+            name.span,
+            format!(
+                "`{}.{}` is not a native type of target `{}`",
+                target.name, name.name, target.name
+            ),
+        ));
     };
     let [arg] = args else {
-        return Err(Diagnostic::new(span, format!("`{}.{}` takes one dtype name", target.name, name.name)));
+        return Err(Diagnostic::new(
+            span,
+            format!("`{}.{}` takes one dtype name", target.name, name.name),
+        ));
     };
     let dtype = match &arg.kind {
         A::Name(n) => DType::from_name(&n.name),
@@ -122,12 +196,27 @@ pub(crate) fn native_type(target: &ast::Ident, name: &ast::Ident, args: &[ast::E
         return Err(Diagnostic::new(arg.span, "expected a dtype name"));
     };
     let Semantics::Fragment { rows, columns } = intrinsic.operation.semantics() else {
-        return Err(Diagnostic::new(name.span, format!("`{}.{}` does not declare a native fragment", target.name, name.name)));
+        return Err(Diagnostic::new(
+            name.span,
+            format!(
+                "`{}.{}` does not declare a native fragment",
+                target.name, name.name
+            ),
+        ));
     };
-    Ok(NativeTy { target: target.name.clone(), name: name.name.clone(), shape: vec![Sym::constant(rows as i64), Sym::constant(columns as i64)], elem: Some(Elem::Dtype(dtype)) })
+    Ok(NativeTy {
+        target: target.name.clone(),
+        name: name.name.clone(),
+        shape: vec![Sym::constant(rows as i64), Sym::constant(columns as i64)],
+        elem: Some(Elem::Dtype(dtype)),
+    })
 }
 
-fn type_from_ast(t: &ast::TypeExpr, shape_params: &[String], elem_params: &mut Vec<String>) -> Result<Ty, Diagnostic> {
+fn type_from_ast(
+    t: &ast::TypeExpr,
+    shape_params: &[String],
+    elem_params: &mut Vec<String>,
+) -> Result<Ty, Diagnostic> {
     match &t.kind {
         TypeKind::Scalar(name) => match DType::from_name(&name.name) {
             Some(d) => Ok(Ty::Scalar(d)),
@@ -168,7 +257,11 @@ fn type_from_ast(t: &ast::TypeExpr, shape_params: &[String], elem_params: &mut V
 
 /// Conjuncts of a `where` clause: comparisons, divisibility and equalities over shape
 /// parameters and integer literals, plus `full(X)`.
-fn predicates_of(e: &ast::Expr, shape_params: &[String], out: &mut Vec<Predicate>) -> Result<(), Diagnostic> {
+fn predicates_of(
+    e: &ast::Expr,
+    shape_params: &[String],
+    out: &mut Vec<Predicate>,
+) -> Result<(), Diagnostic> {
     match &e.kind {
         A::Binary { op: BinaryOp::And, lhs, rhs } => {
             predicates_of(lhs, shape_params, out)?;
@@ -209,11 +302,18 @@ fn predicates_of(e: &ast::Expr, shape_params: &[String], out: &mut Vec<Predicate
     }
 }
 
-pub(crate) fn signature_of(name: &str, s: &ast::Signature, extra_predicates: &[ast::Expr]) -> Result<Sig, Diagnostic> {
+pub(crate) fn signature_of(
+    name: &str,
+    s: &ast::Signature,
+    extra_predicates: &[ast::Expr],
+) -> Result<Sig, Diagnostic> {
     let mut shape_params: Vec<String> = Vec::new();
     for p in &s.shape {
         if shape_params.contains(&p.name) {
-            return Err(Diagnostic::new(p.span, format!("duplicate shape parameter `{}`", p.name)));
+            return Err(Diagnostic::new(
+                p.span,
+                format!("duplicate shape parameter `{}`", p.name),
+            ));
         }
         shape_params.push(p.name.clone());
     }
@@ -221,20 +321,48 @@ pub(crate) fn signature_of(name: &str, s: &ast::Signature, extra_predicates: &[a
     let mut params: Vec<SigParam> = Vec::new();
     for p in &s.params {
         if params.iter().any(|q| q.name == p.name.name) || shape_params.contains(&p.name.name) {
-            return Err(Diagnostic::new(p.name.span, format!("duplicate parameter `{}`", p.name.name)));
+            return Err(Diagnostic::new(
+                p.name.span,
+                format!("duplicate parameter `{}`", p.name.name),
+            ));
         }
         let ty = type_from_ast(&p.ty, &shape_params, &mut elem_params)?;
         if ty == Ty::Void {
             return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
         }
-        if p.mode != Mode::In && !matches!(ty, Ty::Tensor(_) | Ty::View(_) | Ty::Tile(_) | Ty::Native(_)) {
-            return Err(Diagnostic::new(p.ty.span, format!("`out`/`inout` applies to tensors, views, tiles and native values, not {ty}")));
+        if p.mode != Mode::In
+            && !matches!(
+                ty,
+                Ty::Tensor(_) | Ty::View(_) | Ty::Tile(_) | Ty::Native(_)
+            )
+        {
+            return Err(Diagnostic::new(
+                p.ty.span,
+                format!(
+                    "`out`/`inout` applies to tensors, views, tiles and native values, not {ty}"
+                ),
+            ));
         }
-        params.push(SigParam { name: p.name.name.clone(), mode: p.mode, ty, span: p.name.span });
+        params.push(SigParam {
+            name: p.name.name.clone(),
+            mode: p.mode,
+            ty,
+            span: p.name.span,
+        });
     }
     let mut aliases = Vec::new();
     for (a, b) in &s.aliases {
-        let find = |id: &ast::Ident| params.iter().position(|p| p.name == id.name).ok_or_else(|| Diagnostic::new(id.span, format!("`alias` names unknown parameter `{}`", id.name)));
+        let find = |id: &ast::Ident| {
+            params
+                .iter()
+                .position(|p| p.name == id.name)
+                .ok_or_else(|| {
+                    Diagnostic::new(
+                        id.span,
+                        format!("`alias` names unknown parameter `{}`", id.name),
+                    )
+                })
+        };
         aliases.push((find(a)?, find(b)?));
     }
     let result = match &s.result {
@@ -245,7 +373,15 @@ pub(crate) fn signature_of(name: &str, s: &ast::Signature, extra_predicates: &[a
     for e in s.predicates.iter().chain(extra_predicates) {
         predicates_of(e, &shape_params, &mut predicates)?;
     }
-    Ok(Sig { name: name.to_string(), shape_params, elem_params, params, aliases, result, predicates })
+    Ok(Sig {
+        name: name.to_string(),
+        shape_params,
+        elem_params,
+        params,
+        aliases,
+        result,
+        predicates,
+    })
 }
 
 fn elems_overlap(a: &Elem, b: &Elem) -> bool {
@@ -256,16 +392,27 @@ fn elems_overlap(a: &Elem, b: &Elem) -> bool {
 /// constant extents. Shape relationships between parameters are not compared.
 pub(crate) fn kinds_overlap(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
-        (Ty::Scalar(_) | Ty::Index(_), Ty::Scalar(_) | Ty::Index(_)) => a.scalar_dtype() == b.scalar_dtype(),
-        (Ty::Tensor(x), Ty::Tensor(y)) | (Ty::View(x), Ty::View(y)) | (Ty::Tile(x), Ty::Tile(y)) => {
+        (Ty::Scalar(_) | Ty::Index(_), Ty::Scalar(_) | Ty::Index(_)) => {
+            a.scalar_dtype() == b.scalar_dtype()
+        }
+        (Ty::Tensor(x), Ty::Tensor(y))
+        | (Ty::View(x), Ty::View(y))
+        | (Ty::Tile(x), Ty::Tile(y)) => {
             x.rank() == y.rank()
                 && elems_overlap(&x.elem, &y.elem)
-                && x.axes.iter().zip(&y.axes).all(|(p, q)| match (p.semantic().and_then(Sym::as_constant), q.semantic().and_then(Sym::as_constant)) {
-                    (Some(m), Some(n)) => m == n,
-                    _ => true,
+                && x.axes.iter().zip(&y.axes).all(|(p, q)| {
+                    match (
+                        p.semantic().and_then(Sym::as_constant),
+                        q.semantic().and_then(Sym::as_constant),
+                    ) {
+                        (Some(m), Some(n)) => m == n,
+                        _ => true,
+                    }
                 })
         }
-        (Ty::Tuple(x), Ty::Tuple(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| kinds_overlap(p, q)),
+        (Ty::Tuple(x), Ty::Tuple(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| kinds_overlap(p, q))
+        }
         (Ty::Native(x), Ty::Native(y)) => x == y,
         (Ty::Void, Ty::Void) => true,
         _ => false,
@@ -273,19 +420,150 @@ pub(crate) fn kinds_overlap(a: &Ty, b: &Ty) -> bool {
 }
 
 pub(crate) fn structures_overlap(a: &Sig, b: &Sig) -> bool {
-    a.params.len() == b.params.len() && a.params.iter().zip(&b.params).all(|(p, q)| kinds_overlap(&p.ty, &q.ty))
+    a.params.len() == b.params.len()
+        && a.params
+            .iter()
+            .zip(&b.params)
+            .all(|(p, q)| kinds_overlap(&p.ty, &q.ty))
 }
 
 /// Overlapping definitions agree on result, modes and numerical contract.
 fn contract_mismatch(a: &Sig, a_admit: bool, b: &Sig, b_admit: Option<bool>) -> Option<String> {
-    if let Some((p, q)) = a.params.iter().zip(&b.params).find(|(p, q)| p.mode != q.mode) {
-        return Some(format!("parameter `{}` has a different mode than `{}` of an overlapping definition of `{}`", q.name, p.name, a.name));
+    if let Some((p, q)) = a
+        .params
+        .iter()
+        .zip(&b.params)
+        .find(|(p, q)| p.mode != q.mode)
+    {
+        return Some(format!(
+            "parameter `{}` has a different mode than `{}` of an overlapping definition of `{}`",
+            q.name, p.name, a.name
+        ));
     }
-    if !kinds_overlap(&a.result, &b.result) {
-        return Some(format!("overlapping definitions of `{}` must agree on the result: {} vs {}", a.name, a.result, b.result));
+    let normalize_aliases = |aliases: &[(usize, usize)]| {
+        let mut normalized: Vec<(usize, usize)> = aliases
+            .iter()
+            .map(|&(left, right)| (left.min(right), left.max(right)))
+            .collect();
+        normalized.sort_unstable();
+        normalized.dedup();
+        normalized
+    };
+    if normalize_aliases(&a.aliases) != normalize_aliases(&b.aliases) {
+        return Some(format!(
+            "overlapping definitions of `{}` must declare identical `alias` permissions",
+            a.name
+        ));
+    }
+    if a.shape_params.len() != b.shape_params.len() {
+        return Some(format!(
+            "overlapping definitions of `{}` must declare the same number of shape parameters",
+            a.name
+        ));
+    }
+
+    fn rename_shape(sym: &Sym, names: &HashMap<String, String>) -> Sym {
+        let mut out = Sym::constant(0);
+        for (monomial, coefficient) in sym.monomials() {
+            let mut term = Sym::constant(coefficient);
+            for (atom, power) in monomial {
+                let renamed = match atom {
+                    Atom::Param(name) => Sym::param(names.get(name).map_or(name, String::as_str)),
+                    Atom::Quot(numerator, denominator) => {
+                        rename_shape(numerator, names).quot(&rename_shape(denominator, names))
+                    }
+                    Atom::Rem(numerator, denominator) => {
+                        rename_shape(numerator, names).rem(&rename_shape(denominator, names))
+                    }
+                };
+                for _ in 0..*power {
+                    term = term.mul(&renamed);
+                }
+            }
+            out = out.add(&term);
+        }
+        out
+    }
+
+    #[derive(Default)]
+    struct Elements {
+        implementations: HashMap<String, Elem>,
+    }
+    impl Elements {
+        fn constrain(&mut self, contract: &Elem, implementation: &Elem) -> bool {
+            match contract {
+                Elem::Param(name) => match self.implementations.get(name) {
+                    Some(bound) => bound == implementation,
+                    None => {
+                        self.implementations
+                            .insert(name.clone(), implementation.clone());
+                        true
+                    }
+                },
+                concrete => concrete == implementation,
+            }
+        }
+    }
+
+    fn equivalent_type(
+        a: &Ty,
+        b: &Ty,
+        shape_names: &HashMap<String, String>,
+        elements: &mut Elements,
+    ) -> bool {
+        match (a, b) {
+            (Ty::Scalar(a), Ty::Scalar(b)) => a == b,
+            (Ty::Index(a), Ty::Index(b)) => a == &rename_shape(b, shape_names),
+            (Ty::Tensor(a), Ty::Tensor(b))
+            | (Ty::View(a), Ty::View(b))
+            | (Ty::Tile(a), Ty::Tile(b)) => {
+                a.axes.len() == b.axes.len()
+                    && a.axes.iter().zip(&b.axes).all(|(a, b)| {
+                        matches!((a.semantic(), b.semantic()), (Some(a), Some(b)) if a == &rename_shape(b, shape_names))
+                    })
+                    && elements.constrain(&a.elem, &b.elem)
+            }
+            (Ty::Tuple(a), Ty::Tuple(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(a, b)| equivalent_type(a, b, shape_names, elements))
+            }
+            (Ty::Native(a), Ty::Native(b)) => a == b,
+            (Ty::Void, Ty::Void) => true,
+            _ => false,
+        }
+    }
+
+    let shape_names: HashMap<String, String> = b
+        .shape_params
+        .iter()
+        .cloned()
+        .zip(a.shape_params.iter().cloned())
+        .collect();
+    let mut elements = Elements::default();
+    if !a
+        .params
+        .iter()
+        .zip(&b.params)
+        .all(|(a, b)| equivalent_type(&a.ty, &b.ty, &shape_names, &mut elements))
+    {
+        return Some(format!(
+            "overlapping definitions of `{}` must have equivalent parameter shape and element relationships",
+            a.name
+        ));
+    }
+    if !equivalent_type(&a.result, &b.result, &shape_names, &mut elements) {
+        return Some(format!(
+            "overlapping definitions of `{}` must have equivalent results: {} vs {}",
+            a.name, a.result, b.result
+        ));
     }
     if b_admit.is_some_and(|b_admit| b_admit != a_admit) {
-        return Some(format!("overlapping definitions of `{}` must agree on `admit`", a.name));
+        return Some(format!(
+            "overlapping definitions of `{}` must agree on `admit`",
+            a.name
+        ));
     }
     None
 }
@@ -295,7 +573,9 @@ fn elem_bindings(contract: &Sig, lowering: &Sig) -> Vec<(String, Elem)> {
     let mut out: Vec<(String, Elem)> = Vec::new();
     for (c, l) in contract.params.iter().zip(&lowering.params) {
         if let (Some(cs), Some(ls)) = (c.ty.shaped(), l.ty.shaped()) {
-            if let (Elem::Param(p), concrete @ (Elem::Dtype(_) | Elem::Repr(_))) = (&cs.elem, &ls.elem) {
+            if let (Elem::Param(p), concrete @ (Elem::Dtype(_) | Elem::Repr(_))) =
+                (&cs.elem, &ls.elem)
+            {
                 if !out.iter().any(|(n, _)| n == p) {
                     out.push((p.clone(), concrete.clone()));
                 }
@@ -305,26 +585,57 @@ fn elem_bindings(contract: &Sig, lowering: &Sig) -> Vec<(String, Elem)> {
     out
 }
 
-pub(crate) fn resolve<'a>(files: &'a [(usize, Scope, ast::File)], diagnostics: &mut Vec<Located>) -> Resolved<'a> {
+pub(crate) fn resolve<'a>(
+    files: &'a [(usize, ast::File)],
+    diagnostics: &mut Vec<Located>,
+) -> Resolved<'a> {
     let mut declared: Vec<Declared<'a>> = Vec::new();
-    for (file, scope, parsed) in files {
+    for (file, parsed) in files {
         for decl in &parsed.decls {
             let ast::Decl::Fn(f) = decl else { continue };
+            if let Some(target) = &f.target {
+                if intrinsics::table(&target.name).is_none() {
+                    diagnostics.push(Located {
+                        file: *file,
+                        diagnostic: Diagnostic::new(
+                            target.span,
+                            format!("`{}` is not a known target", target.name),
+                        ),
+                    });
+                    continue;
+                }
+            }
             match signature_of(&f.name.name, &f.signature, &[]) {
-                Ok(sig) => declared.push(Declared {
-                    sig,
-                    kind: if f.body.is_some() { DefKind::Body } else { DefKind::Contract },
-                    family: 0,
-                    admit: f.admit,
-                    export: f.export,
-                    elem_bindings: Vec::new(),
-                    body: f.body.as_ref(),
+                Ok(sig) => {
+                    if let Err(diagnostic) = check_signature_target(
+                        &sig,
+                        f.target.as_ref().map(|t| t.name.as_str()),
+                        f.name.span,
+                    ) {
+                        diagnostics.push(Located {
+                            file: *file,
+                            diagnostic,
+                        });
+                        continue;
+                    }
+                    declared.push(Declared {
+                        sig,
+                        kind: DefKind::Body {
+                            target: f.target.as_ref().map(|t| t.name.clone()),
+                        },
+                        family: 0,
+                        admit: f.admit,
+                        elem_bindings: Vec::new(),
+                        body: &f.body,
+                        file: *file,
+                        span: f.span,
+                        name_span: f.name.span,
+                    })
+                }
+                Err(diagnostic) => diagnostics.push(Located {
                     file: *file,
-                    scope: scope.clone(),
-                    span: f.span,
-                    name_span: f.name.span,
+                    diagnostic,
                 }),
-                Err(diagnostic) => diagnostics.push(Located { file: *file, diagnostic }),
             }
         }
     }
@@ -340,11 +651,30 @@ pub(crate) fn resolve<'a>(files: &'a [(usize, Scope, ast::File)], diagnostics: &
     }
     for i in 0..declared.len() {
         for j in 0..i {
-            if declared[i].sig.name != declared[j].sig.name || !structures_overlap(&declared[i].sig, &declared[j].sig) {
+            if declared[i].sig.name != declared[j].sig.name
+                || !structures_overlap(&declared[i].sig, &declared[j].sig)
+            {
                 continue;
             }
-            if let Some(message) = contract_mismatch(&declared[j].sig, declared[j].admit, &declared[i].sig, Some(declared[i].admit)) {
-                diagnostics.push(Located { file: declared[i].file, diagnostic: Diagnostic::new(declared[i].name_span, message) });
+            if declared[i].kind.target().is_some() != declared[j].kind.target().is_some() {
+                diagnostics.push(Located {
+                    file: declared[i].file,
+                    diagnostic: Diagnostic::new(
+                        declared[i].name_span,
+                        format!("portable and backend-specific functions named `{}` overlap; a backend-specific function is a separate helper, not an implementation of a portable family", declared[i].sig.name),
+                    ),
+                });
+            }
+            if let Some(message) = contract_mismatch(
+                &declared[j].sig,
+                declared[j].admit,
+                &declared[i].sig,
+                Some(declared[i].admit),
+            ) {
+                diagnostics.push(Located {
+                    file: declared[i].file,
+                    diagnostic: Diagnostic::new(declared[i].name_span, message),
+                });
             }
             let (a, b) = (root(&mut component, i), root(&mut component, j));
             component[a.max(b)] = a.min(b);
@@ -356,22 +686,24 @@ pub(crate) fn resolve<'a>(files: &'a [(usize, Scope, ast::File)], diagnostics: &
     for i in 0..declared.len() {
         let r = root(&mut component, i);
         let family = *family_of_root.entry(r).or_insert_with(|| {
-            families.push(ContractFamily { name: declared[i].sig.name.clone(), bodies: Vec::new(), contracts: Vec::new(), lowerings: Vec::new(), export: false });
-            by_name.entry(declared[i].sig.name.clone()).or_default().push(families.len() - 1);
+            families.push(ContractFamily {
+                name: declared[i].sig.name.clone(),
+                bodies: Vec::new(),
+                lowerings: Vec::new(),
+            });
+            by_name
+                .entry(declared[i].sig.name.clone())
+                .or_default()
+                .push(families.len() - 1);
             families.len() - 1
         });
         declared[i].family = family;
         let id = DefId(i as u32);
-        match declared[i].kind {
-            DefKind::Body => families[family].bodies.push(id),
-            _ => families[family].contracts.push(id),
-        }
-        families[family].export |= declared[i].export;
+        families[family].bodies.push(id);
     }
 
-    // Lowerings attach to the family their restated signature overlaps (long form) or to
-    // every same-name family (short form).
-    for (file, scope, parsed) in files {
+    // Lowerings attach to the portable family their restated signature overlaps.
+    for (file, parsed) in files {
         for decl in &parsed.decls {
             let ast::Decl::Lower(l) = decl else { continue };
             let Some(named) = by_name.get(&l.name.name).cloned() else {
@@ -380,31 +712,53 @@ pub(crate) fn resolve<'a>(files: &'a [(usize, Scope, ast::File)], diagnostics: &
             };
             let target = l.target.name.clone();
             if intrinsics::table(&target).is_none() {
-                diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.target.span, format!("`{target}` is not a known target")) });
+                diagnostics.push(Located {
+                    file: *file,
+                    diagnostic: Diagnostic::new(
+                        l.target.span,
+                        format!("`{target}` is not a known target"),
+                    ),
+                });
                 continue;
             }
-            let (kind, body) = match &l.implementation {
-                ast::LowerImpl::Body(b) => (DefKind::Lower { target }, Some(b)),
-                ast::LowerImpl::Portable => (DefKind::Adopt { target }, None),
-            };
+            let kind = DefKind::Lower { target };
+            let body = &l.body;
             let mut attach: Vec<(usize, Sig, Vec<(String, Elem)>)> = Vec::new();
-            match &l.signature {
-                Some(signature) => {
-                    let sig = match signature_of(&l.name.name, signature, &l.predicates) {
-                        Ok(sig) => sig,
-                        Err(diagnostic) => {
-                            diagnostics.push(Located { file: *file, diagnostic });
-                            continue;
-                        }
-                    };
-                    let matching: Vec<(usize, usize)> = named
-                        .iter()
-                        .filter_map(|family| {
-                            let members = families[*family].bodies.iter().chain(&families[*family].contracts);
-                            members.map(|id| id.0 as usize).find(|member| structures_overlap(&declared[*member].sig, &sig)).map(|member| (*family, member))
-                        })
-                        .collect();
-                    match matching.as_slice() {
+            {
+                let sig = match signature_of(&l.name.name, &l.signature, &l.predicates) {
+                    Ok(sig) => sig,
+                    Err(diagnostic) => {
+                        diagnostics.push(Located {
+                            file: *file,
+                            diagnostic,
+                        });
+                        continue;
+                    }
+                };
+                if let Err(diagnostic) =
+                    check_signature_target(&sig, Some(&l.target.name), l.name.span)
+                {
+                    diagnostics.push(Located {
+                        file: *file,
+                        diagnostic,
+                    });
+                    continue;
+                }
+                let matching: Vec<(usize, usize)> = named
+                    .iter()
+                    .filter_map(|family| {
+                        families[*family]
+                            .bodies
+                            .iter()
+                            .map(|id| id.0 as usize)
+                            .find(|member| {
+                                matches!(declared[*member].kind, DefKind::Body { target: None })
+                                    && structures_overlap(&declared[*member].sig, &sig)
+                            })
+                            .map(|member| (*family, member))
+                    })
+                    .collect();
+                match matching.as_slice() {
                         [] => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("no definition of `{}` has this parameter structure (kinds, ranks, element types); a lowering restates the contract it implements", l.name.name)) }),
                         [(family, member)] => {
                             let contract = &declared[*member];
@@ -416,54 +770,35 @@ pub(crate) fn resolve<'a>(files: &'a [(usize, Scope, ast::File)], diagnostics: &
                         }
                         _ => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("this lowering overlaps several disjoint contract families of `{}`; restate one family's parameter structure", l.name.name)) }),
                     }
-                }
-                None => {
-                    if body.is_some() {
-                        diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, "a lowering with a body restates the signature it implements") });
-                        continue;
-                    }
-                    for family in &named {
-                        let Some(member) = families[*family].bodies.first().or(families[*family].contracts.first()) else { continue };
-                        let mut sig = declared[member.0 as usize].sig.clone();
-                        sig.predicates.clear();
-                        let mut failed = false;
-                        for e in &l.predicates {
-                            if let Err(diagnostic) = predicates_of(e, &sig.shape_params, &mut sig.predicates) {
-                                diagnostics.push(Located { file: *file, diagnostic });
-                                failed = true;
-                            }
-                        }
-                        if !failed {
-                            attach.push((*family, sig, Vec::new()));
-                        }
-                    }
-                }
             }
             for (family, sig, elem_bindings) in attach {
-                families[family].lowerings.push(DefId(declared.len() as u32));
-                declared.push(Declared { sig, kind: kind.clone(), family, admit: false, export: false, elem_bindings, body, file: *file, scope: scope.clone(), span: l.span, name_span: l.name.span });
+                families[family]
+                    .lowerings
+                    .push(DefId(declared.len() as u32));
+                declared.push(Declared {
+                    sig,
+                    kind: kind.clone(),
+                    family,
+                    admit: false,
+                    elem_bindings,
+                    body,
+                    file: *file,
+                    span: l.span,
+                    name_span: l.name.span,
+                });
             }
         }
     }
     // A lowering inherits the admitted contract of the family it implements.
     for i in 0..declared.len() {
-        if declared[i].kind.target().is_some() {
+        if matches!(declared[i].kind, DefKind::Lower { .. }) {
             let family = &families[declared[i].family];
-            declared[i].admit = family.bodies.iter().chain(&family.contracts).any(|id| declared[id.0 as usize].admit);
+            declared[i].admit = family.bodies.iter().any(|id| declared[id.0 as usize].admit);
         }
     }
-    Resolved { declared, families, by_name }
-}
-
-/// Every exported family needs an explicit lowering or adoption on every requested target.
-pub(crate) fn coverage(resolved: &Resolved, targets: &[String], diagnostics: &mut Vec<Located>) {
-    for family in resolved.families.iter().filter(|f| f.export) {
-        let Some(entry) = family.bodies.iter().chain(&family.contracts).map(|id| &resolved.declared[id.0 as usize]).find(|d| d.export) else { continue };
-        for target in targets {
-            let covered = family.lowerings.iter().any(|id| resolved.declared[id.0 as usize].kind.target() == Some(target.as_str()));
-            if !covered {
-                diagnostics.push(Located { file: entry.file, diagnostic: Diagnostic::new(entry.name_span, format!("exported `{}` has no `lower {} for {target}` (a body or `= portable`); an exported entry needs explicit coverage on every requested target", family.name, family.name)) });
-            }
-        }
+    Resolved {
+        declared,
+        families,
+        by_name,
     }
 }

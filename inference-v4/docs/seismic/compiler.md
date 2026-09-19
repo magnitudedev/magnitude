@@ -8,7 +8,7 @@ does not synthesize execution structure.
 
 | # | Stage | Input → output | Guarantees |
 | --- | --- | --- | --- |
-| 1 | Check | Sources → structured IR (SIR) | Names, contract families, lowering boundaries, typing of every value kind, shapes and bounds, modes and aliasing, slice opacity, region results, stages and ports, initialization, partial obligations, declared target coverage of exported entries. Every declared body is checked, selected or not. |
+| 1 | Check | Sources → structured IR (SIR) | Names, contract families, portable and target capabilities, typing of every value kind, shapes and bounds, modes and aliasing, slice opacity, region results, stages and ports, initialization, and partial obligations. Every declared body is checked, selected or not. |
 | 2 | Construct the family | SIR + entry + target + workload → family | Applicable candidates at each static call occurrence, guarded by their parent candidate; interned templates; numerical sites; normalized execution-unit sequences; obligations for anything construction could not analyze. |
 | 3 | Bind the backend | Family → site domains, hard constraints, legal intervals, local cost factors, seed | Deterministic. No ranking, no profitability filter. |
 | 4 | Select | Solver model → witness | One complete joint assignment, audited against the family and the exported model. |
@@ -33,7 +33,7 @@ target, and workload:
 | --- | --- |
 | Template | One definition specialized to concrete semantic shapes and elements, plus which shape parameters are bound to caller slices (structural) or to runtime-valued caller extents (dynamic). Shared by equal specializations. |
 | Occurrence | One static call in one parent candidate, or the entry. Holds every applicable candidate and every rejected definition with its reason. |
-| Candidate | One authored body at an occurrence, the adoption or lowering through which it applies, its numerical requirements, its child occurrences, sites, and sequences. |
+| Candidate | One applicable portable body, backend-specific body, or target lowering at an occurrence, with its numerical requirements, child occurrences, sites, and sequences. |
 | Site | One numerical decision owned by a candidate: a binder width, or the partition count of a `merge` axis. |
 | Sequence | The execution units of one block with at least two units, in authored order. |
 | Obligation | A supported-looking candidate that construction could not analyze. Reported; never silently dropped. |
@@ -49,9 +49,9 @@ element loops, tile allocations, loads, publications. It contains no alternative
 
 ## Applicability
 
-- A call resolves by name and argument binding to a contract family. Candidates are
-  the family's bodies for an ordinary helper, or the target's lowerings and adopted
-  portable bodies at a lowering boundary.
+- A call resolves by name and argument binding to a contract family. Its candidates are the
+  applicable portable bodies together with the selected target's lowerings, or the applicable
+  bodies of a backend-specific helper for that target.
 - A `where` predicate over static semantic shapes is decided at construction.
   A predicate over a structural extent becomes a numerical requirement on the
   bound site (multiple-of, at-least, at-most, equal, divides). A predicate over a
@@ -60,7 +60,8 @@ element loops, tile allocations, loads, publications. It contains no alternative
 - Zero candidates at an occurrence makes its parent candidate unselectable; at the
   entry it is missing coverage. One candidate is no categorical decision. Several
   are a solver decision. No declaration order, specificity, or priority applies.
-- Expansion is finite: a lowering cannot re-enter its own unresolved family.
+- Expansion is finite: a candidate cannot recursively re-enter an unresolved family without a
+  decreasing static measure.
 
 ## What the compiler may do
 
@@ -105,7 +106,8 @@ call boundary. Extracting part of a fusible run into a helper therefore removes 
 intervals that crossed the new call. This is a current limitation: the governing
 specification requires unit granularity to be invariant under helper extraction.
 
-Change the family: adding or removing an overload, lowering, or adoption; moving a
+Change the family: adding or removing a portable body, target lowering, or backend-specific
+helper; moving a
 producer; reordering independent statements; adding a `publish`, a stage, or a
 region boundary; creating another producer occurrence; giving a `let` a second
 consumer.
@@ -137,7 +139,7 @@ Errors name the definition, call path, region or site, the violated requirement,
 and the candidate or mapping involved. They never recommend a fallback.
 
 `select` reports, for one entry and workload: every occurrence with its candidates,
-the adoption path of each, requirements, and rejections with reasons; every site
+the definition origin and dependency path of each, requirements, and rejections with reasons; every site
 with its kind, extent, owner, domain, selected and seed value; every sequence with
 its units, completion boundaries, selected and seed cover; both estimates, the
 proved lower bound, the estimate model identity, the proof status, and unresolved

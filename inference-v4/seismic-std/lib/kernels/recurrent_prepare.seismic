@@ -1,0 +1,47 @@
+# Recurrent input preparation for one row. Per channel: convolve the window of the C - 1
+# previous inputs and the new one, apply silu, and shift the window. Per head: queries
+# (heads 0..NK) and keys (NK..2NK) are L2-normalized with epsilon, queries with gain
+# 1/sqrt(W); values pass through. Per value head: beta = sigmoid(beta_in) and
+# decay = exp(rate * softplus(alpha + dt_bias)).
+fn recurrent_prepare[NK, NV, W, C](projected: tensor[1, (2 * NK + NV) * W] A, conv: tensor[(2 * NK + NV) * W, C] CW,
+                                          window: tensor[C - 1, (2 * NK + NV) * W] A,
+                                          out next_window: tensor[C - 1, (2 * NK + NV) * W] A,
+                                          alpha: tensor[1, NV] A, beta_in: tensor[1, NV] A,
+                                          rate: tensor[NV] f32, dt_bias: tensor[NV] f32, eps: f32,
+                                          out qkv: tensor[2 * NK + NV, W] A, out beta: tensor[NV] A, out decay: tensor[NV] f32):
+    parallel [heads] in 0..(2 * NK + NV):
+        for h in heads:
+            let x = load(projected[0, h * W : (h + 1) * W])
+            let win = load(window[0 : C - 1, h * W : (h + 1) * W])
+            let wt = load(conv[h * W : (h + 1) * W, 0 : C])
+            let mut y = tile[W] f32
+            for i in owned(y):
+                let mut s = f32(wt[i, C - 1]) * f32(x[i])
+                for j in 0..C - 1:
+                    s = fma(f32(wt[i, j]), f32(win[j, i]), s)
+                y[i] = s / (1.0 + exp(-s))
+            let mut nw = tile[C - 1, W] f32
+            for j, i in owned(nw):
+                if j < C - 2:
+                    nw[j, i] = f32(win[j + 1, i])
+                else:
+                    nw[j, i] = f32(x[i])
+            publish nw to next_window[0 : C - 1, h * W : (h + 1) * W]
+            let mut inv = f32(1.0)
+            if h < 2 * NK:
+                let ss = sum_any_order(y * y)
+                inv = rsqrt(ss + eps)
+                if h < NK:
+                    inv = inv * rsqrt(f32(W))
+            publish y * inv to qkv[h]
+    parallel [value_heads] in 0..NV:
+        for hv in value_heads:
+            let mut b = tile[1] f32
+            let mut d = tile[1] f32
+            for i in owned(b):
+                b[i] = 1.0 / (1.0 + exp(-f32(beta_in[0, hv])))
+            for i in owned(d):
+                let sh = f32(alpha[0, hv]) + dt_bias[hv]
+                d[i] = exp(rate[hv] * (max(sh, 0.0) + log(1.0 + exp(-abs(sh)))))
+            publish b to beta[hv : hv + 1]
+            publish d to decay[hv : hv + 1]

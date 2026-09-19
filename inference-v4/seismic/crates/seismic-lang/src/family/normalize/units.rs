@@ -21,7 +21,7 @@
 //!   `if` / loop in its enclosing block. `ScopeStep::Region(id)` names the region, in
 //!   statement or expression position. Merge bodies have no scope step and no sequence.
 //! - `UnitKind::Call(occurrence)` is the unit of every `let`/assignment/expression/`yield`/
-//!   `return` statement whose own expressions contain a call, to a lowering boundary or a
+//!   `return` statement whose own expressions contain a call, to a linked function family or a
 //!   plain helper alike (helper extraction does not change unit structure); with several
 //!   calls in one statement it names the first in evaluation order. A `publish` stays
 //!   `Publish`. `Family::root_regions` tells a backend when a selected candidate of that
@@ -50,30 +50,52 @@ pub fn sequences(body: &Body) -> Vec<BlockUnits> {
     out
 }
 
-fn collect(body: &Body, block: &Block, scope: &mut Vec<ScopeStep>, pipeline: bool, out: &mut Vec<BlockUnits>) {
+fn collect(
+    body: &Body,
+    block: &Block,
+    scope: &mut Vec<ScopeStep>,
+    pipeline: bool,
+    out: &mut Vec<BlockUnits>,
+) {
     let units = units(body, block, pipeline);
     if units.len() >= 2 {
-        out.push(BlockUnits { scope: scope.clone(), units });
+        out.push(BlockUnits {
+            scope: scope.clone(),
+            units,
+        });
     }
     let mut stage = 0;
     for (ordinal, s) in block.iter().enumerate() {
-        let mut enter = |step: ScopeStep, inner: &Block, pipeline: bool, out: &mut Vec<BlockUnits>| {
-            scope.push(step);
-            collect(body, inner, scope, pipeline, out);
-            scope.pop();
-        };
+        let mut enter =
+            |step: ScopeStep, inner: &Block, pipeline: bool, out: &mut Vec<BlockUnits>| {
+                scope.push(step);
+                collect(body, inner, scope, pipeline, out);
+                scope.pop();
+            };
         for r in walk::expression_regions(s) {
-            enter(ScopeStep::Region(r.id), &r.body, r.mode == RegionMode::Pipeline, out);
+            enter(
+                ScopeStep::Region(r.id),
+                &r.body,
+                r.mode == RegionMode::Pipeline,
+                out,
+            );
         }
         match &s.kind {
-            StmtKind::Region(r) => enter(ScopeStep::Region(r.id), &r.body, r.mode == RegionMode::Pipeline, out),
+            StmtKind::Region(r) => enter(
+                ScopeStep::Region(r.id),
+                &r.body,
+                r.mode == RegionMode::Pipeline,
+                out,
+            ),
             StmtKind::Stages(stages) => {
                 for st in stages {
                     enter(ScopeStep::Stage(stage), &st.body, false, out);
                     stage += 1;
                 }
             }
-            StmtKind::Range { body: inner, .. } | StmtKind::Coordinates { body: inner, .. } | StmtKind::Members { body: inner, .. } => {
+            StmtKind::Range { body: inner, .. }
+            | StmtKind::Coordinates { body: inner, .. }
+            | StmtKind::Members { body: inner, .. } => {
                 enter(ScopeStep::Loop(ordinal), inner, false, out)
             }
             StmtKind::If { then, els, .. } => {
@@ -105,7 +127,9 @@ fn units(body: &Body, block: &Block, pipeline: bool) -> Vec<Unit> {
     let mut head: Vec<usize> = (0..block.len()).collect();
     let mut start: Vec<usize> = (0..block.len()).collect();
     for i in (0..block.len()).rev() {
-        let Some(consumer) = consumer(body, block, i) else { continue };
+        let Some(consumer) = consumer(body, block, i) else {
+            continue;
+        };
         let h = head[consumer];
         if kinds[h].len() != 1 || start[h] != i + 1 {
             continue;
@@ -122,7 +146,11 @@ fn units(body: &Body, block: &Block, pipeline: bool) -> Vec<Unit> {
             continue;
         }
         for (kind, completion_after) in kinds[i].drain(..) {
-            out.push(Unit { statements: start[i]..i + 1, kind, completion_after });
+            out.push(Unit {
+                statements: start[i]..i + 1,
+                kind,
+                completion_after,
+            });
         }
     }
     out
@@ -130,13 +158,21 @@ fn units(body: &Body, block: &Block, pipeline: bool) -> Vec<Unit> {
 
 /// The statement of `block` that is the only consumer of the pure tile-valued `let` at `i`.
 fn consumer(body: &Body, block: &Block, i: usize) -> Option<usize> {
-    let StmtKind::Bind { pattern: Pattern::Var(var), value } = &block[i].kind else { return None };
+    let StmtKind::Bind {
+        pattern: Pattern::Var(var),
+        value,
+    } = &block[i].kind
+    else {
+        return None;
+    };
     if body.vars[*var].kind != VarKind::Value || !matches!(value.ty, Ty::Tile(_)) || !pure(value) {
         return None;
     }
     let uses = |s: &Stmt, nested: bool| {
         let mut n = 0;
-        walk::stmt(s, nested, &mut |e| n += usize::from(matches!(e.kind, ExprKind::Var(v) if v == *var)));
+        walk::stmt(s, nested, &mut |e| {
+            n += usize::from(matches!(e.kind, ExprKind::Var(v) if v == *var))
+        });
         n
     };
     let later = &block[i + 1..];
@@ -146,7 +182,12 @@ fn consumer(body: &Body, block: &Block, i: usize) -> Option<usize> {
     let j = later.iter().position(|s| uses(s, false) == 1)?;
     matches!(
         later[j].kind,
-        StmtKind::Bind { .. } | StmtKind::Assign { .. } | StmtKind::Publish { .. } | StmtKind::Expr(_) | StmtKind::Yield(_) | StmtKind::Return(_)
+        StmtKind::Bind { .. }
+            | StmtKind::Assign { .. }
+            | StmtKind::Publish { .. }
+            | StmtKind::Expr(_)
+            | StmtKind::Yield(_)
+            | StmtKind::Return(_)
     )
     .then_some(i + 1 + j)
 }
@@ -163,7 +204,13 @@ fn classify(s: &Stmt) -> UnitKind {
         });
         found
     };
-    let tile = |elementwise: bool| if elementwise { UnitKind::Elementwise } else { UnitKind::Local };
+    let tile = |elementwise: bool| {
+        if elementwise {
+            UnitKind::Elementwise
+        } else {
+            UnitKind::Local
+        }
+    };
     match &s.kind {
         StmtKind::Region(r) => UnitKind::Region(r.id),
         StmtKind::Publish { .. } => UnitKind::Publish,
@@ -174,8 +221,14 @@ fn classify(s: &Stmt) -> UnitKind {
         StmtKind::Assign { target, value, .. } => {
             call().unwrap_or_else(|| tile(matches!(target.ty, Ty::Tile(_)) && elementwise(value)))
         }
-        StmtKind::Expr(_) | StmtKind::Yield(_) | StmtKind::Return(_) => call().unwrap_or(UnitKind::Local),
-        StmtKind::Stages(_) | StmtKind::Range { .. } | StmtKind::Coordinates { .. } | StmtKind::Members { .. } | StmtKind::If { .. } => UnitKind::Local,
+        StmtKind::Expr(_) | StmtKind::Yield(_) | StmtKind::Return(_) => {
+            call().unwrap_or(UnitKind::Local)
+        }
+        StmtKind::Stages(_)
+        | StmtKind::Range { .. }
+        | StmtKind::Coordinates { .. }
+        | StmtKind::Members { .. }
+        | StmtKind::If { .. } => UnitKind::Local,
     }
 }
 
@@ -184,7 +237,11 @@ fn pure(e: &Expr) -> bool {
     walk::expr(e, false, &mut |e| {
         pure &= !matches!(
             e.kind,
-            ExprKind::Call { .. } | ExprKind::Region(_) | ExprKind::Intrinsic { .. } | ExprKind::Atomic { .. } | ExprKind::TileAlloc
+            ExprKind::Call { .. }
+                | ExprKind::Region(_)
+                | ExprKind::Intrinsic { .. }
+                | ExprKind::Atomic { .. }
+                | ExprKind::TileAlloc
         )
     });
     pure
@@ -210,17 +267,26 @@ fn operand(e: &Expr, axes: &[Extent]) -> bool {
     match &e.kind {
         ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Member { .. } => true,
         ExprKind::Index { base, indices } => {
-            matches!(base.kind, ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Member { .. } | ExprKind::Index { .. })
-                && indices.iter().all(|index| match index {
-                    Index::Point(p) => scalar(p),
-                    Index::Range { start, end } => [start, end].into_iter().flatten().all(scalar),
-                    Index::Coord(_) | Index::Slice(_) => true,
-                })
+            matches!(
+                base.kind,
+                ExprKind::Var(_)
+                    | ExprKind::Field { .. }
+                    | ExprKind::Member { .. }
+                    | ExprKind::Index { .. }
+            ) && indices.iter().all(|index| match index {
+                Index::Point(p) => scalar(p),
+                Index::Range { start, end } => [start, end].into_iter().flatten().all(scalar),
+                Index::Coord(_) | Index::Slice(_) => true,
+            })
         }
-        ExprKind::Decode(inner) | ExprKind::Cast { expr: inner, .. } | ExprKind::Unary { expr: inner, .. } => operand(inner, axes),
+        ExprKind::Decode(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Unary { expr: inner, .. } => operand(inner, axes),
         ExprKind::Binary { lhs, rhs, .. } => operand(lhs, axes) && operand(rhs, axes),
         ExprKind::Math { args, .. } => args.iter().all(|a| operand(a, axes)),
-        ExprKind::Select { cond, then, els } => operand(cond, axes) && operand(then, axes) && operand(els, axes),
+        ExprKind::Select { cond, then, els } => {
+            operand(cond, axes) && operand(then, axes) && operand(els, axes)
+        }
         _ => false,
     }
 }
@@ -231,7 +297,11 @@ fn scalar(e: &Expr) -> bool {
     walk::expr(e, false, &mut |e| {
         plain &= !matches!(
             e.kind,
-            ExprKind::Reduce { .. } | ExprKind::Call { .. } | ExprKind::Region(_) | ExprKind::Intrinsic { .. } | ExprKind::Atomic { .. }
+            ExprKind::Reduce { .. }
+                | ExprKind::Call { .. }
+                | ExprKind::Region(_)
+                | ExprKind::Intrinsic { .. }
+                | ExprKind::Atomic { .. }
         )
     });
     plain

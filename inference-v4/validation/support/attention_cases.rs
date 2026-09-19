@@ -1,5 +1,4 @@
 //! Standard streaming attention compared to an independent f64 softmax reference.
-use seismic_lang::Scope;
 use seismic_lang::{
     interp::TensorData,
     lower::Options,
@@ -14,12 +13,12 @@ pub fn exercise(
 ) {
     let portable = [
         (
-            "attention.seismic.portable",
-            include_str!("../../seismic-std/lib/kernels/attention.seismic.portable"),
+            "attention.seismic",
+            include_str!("../../seismic-std/lib/kernels/attention.seismic"),
         ),
         (
-            "matmul.seismic.portable",
-            include_str!("../../seismic-std/lib/constructs/matmul.seismic.portable"),
+            "matmul.seismic",
+            include_str!("../../seismic-std/lib/constructs/matmul.seismic"),
         ),
     ];
     let mut files = portable
@@ -27,21 +26,19 @@ pub fn exercise(
         .map(|(name, text)| SourceFile {
             path: name.into(),
             text: text.into(),
-            scope: Scope::Portable,
         })
         .collect::<Vec<_>>();
     let lowering = match backend {
-        "cpu" => include_str!("../../seismic-std/lib/constructs/matmul.seismic.cpu"),
-        "cuda" => include_str!("../../seismic-std/lib/constructs/matmul.seismic.cuda"),
-        "metal" => include_str!("../../seismic-std/lib/constructs/matmul.seismic.metal"),
+        "cpu" => include_str!("../../seismic-std/lib/constructs/matmul-cpu.seismic"),
+        "cuda" => include_str!("../../seismic-std/lib/constructs/matmul-cuda.seismic"),
+        "metal" => include_str!("../../seismic-std/lib/constructs/matmul-metal.seismic"),
         _ => panic!("unsupported test backend"),
     };
     files.push(SourceFile {
-        path: format!("matmul.seismic.{backend}").into(),
+        path: format!("matmul-{backend}.seismic").into(),
         text: lowering.into(),
-        scope: Scope::Backend(backend.into()),
     });
-    let p = compile(&files, &[backend.into()]).unwrap_or_else(|e| panic!("{e:?}"));
+    let p = compile(&files).unwrap_or_else(|e| panic!("{e:?}"));
     let shapes = HashMap::from([
         ("Q".into(), 3),
         ("T".into(), 19),

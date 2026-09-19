@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  seismic check <file|dir>... [--targets metal,...]
+  seismic check <file|dir>...
   seismic print <file|dir>...
   seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--numerics exact|admitted] [--target cpu|cuda|metal] [--strategy exact|greedy]
   seismic emit <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--numerics exact|admitted] [--target cpu|cuda|metal] [--strategy exact|greedy]
@@ -32,7 +32,6 @@ pub const TARGETS: &[&str] = &["metal", "cpu", "cuda"];
 
 pub struct Options {
     pub paths: Vec<PathBuf>,
-    pub targets: Vec<String>,
     /// The backend `select`, `emit` and `analyze-search` run on.
     pub target: String,
     pub function: Option<String>,
@@ -43,7 +42,9 @@ pub struct Options {
 
 impl Options {
     pub fn entry(&self) -> Result<&str, String> {
-        self.function.as_deref().ok_or_else(|| "--fn is required".to_string())
+        self.function
+            .as_deref()
+            .ok_or_else(|| "--fn is required".to_string())
     }
 }
 
@@ -75,7 +76,13 @@ fn main() -> ExitCode {
 
 /// Parse `args`, accepting only the flags in `allowed`.
 pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
-    let mut o = Options { paths: Vec::new(), targets: vec![TARGET.into()], target: TARGET.into(), function: None, workload: Workload::default(), strategy: Default::default() };
+    let mut o = Options {
+        paths: Vec::new(),
+        target: TARGET.into(),
+        function: None,
+        workload: Workload::default(),
+        strategy: Default::default(),
+    };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         if !arg.starts_with("--") {
@@ -83,39 +90,50 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
             continue;
         }
         if !allowed.contains(&arg.as_str()) {
-            return Err(format!("unsupported option `{arg}`; implementation choices are compiler-owned"));
+            return Err(format!(
+                "unsupported option `{arg}`; implementation choices are compiler-owned"
+            ));
         }
-        let value = rest.next().ok_or_else(|| format!("{arg} requires a value"))?;
+        let value = rest
+            .next()
+            .ok_or_else(|| format!("{arg} requires a value"))?;
         match arg.as_str() {
-            "--targets" => {
-                o.targets = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                if o.targets.is_empty() {
-                    return Err("--targets requires at least one target".into());
-                }
-            }
             "--target" => {
                 if !TARGETS.contains(&value.as_str()) {
-                    return Err(format!("unknown target `{value}`; expected one of {}", TARGETS.join(", ")));
+                    return Err(format!(
+                        "unknown target `{value}`; expected one of {}",
+                        TARGETS.join(", ")
+                    ));
                 }
                 o.target = value.clone();
-                o.targets = vec![value.clone()];
             }
             "--fn" => o.function = Some(value.clone()),
             "--shape" => {
                 for binding in value.split(',') {
-                    let (name, extent) = binding.split_once('=').ok_or_else(|| format!("bad shape binding `{binding}`; expected K=V"))?;
-                    let extent: i64 = extent.trim().parse().map_err(|_| format!("bad shape value `{extent}`"))?;
+                    let (name, extent) = binding
+                        .split_once('=')
+                        .ok_or_else(|| format!("bad shape binding `{binding}`; expected K=V"))?;
+                    let extent: i64 = extent
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("bad shape value `{extent}`"))?;
                     if extent < 0 {
                         return Err(format!("shape `{name}` must be nonnegative"));
                     }
-                    if o.workload.shapes.insert(name.trim().to_string(), extent).is_some() {
+                    if o.workload
+                        .shapes
+                        .insert(name.trim().to_string(), extent)
+                        .is_some()
+                    {
                         return Err(format!("duplicate shape binding {name}"));
                     }
                 }
             }
             "--element" => {
                 for binding in value.split(',') {
-                    let (name, element) = binding.split_once('=').ok_or_else(|| format!("bad element binding `{binding}`; expected NAME=TYPE"))?;
+                    let (name, element) = binding.split_once('=').ok_or_else(|| {
+                        format!("bad element binding `{binding}`; expected NAME=TYPE")
+                    })?;
                     let element = element.trim();
                     let element = if let Some(dtype) = DType::from_name(element) {
                         Elem::Dtype(dtype)
@@ -124,7 +142,11 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                     } else {
                         return Err(format!("unknown concrete element type {element}"));
                     };
-                    if o.workload.elems.insert(name.trim().to_string(), element).is_some() {
+                    if o.workload
+                        .elems
+                        .insert(name.trim().to_string(), element)
+                        .is_some()
+                    {
                         return Err(format!("duplicate element binding {name}"));
                     }
                 }
@@ -133,14 +155,22 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 o.strategy = match value.as_str() {
                     "exact" => seismic_compiler::selection::Strategy::Exact,
                     "greedy" => seismic_compiler::selection::Strategy::Greedy,
-                    other => return Err(format!("bad --strategy `{other}`; expected exact or greedy")),
+                    other => {
+                        return Err(format!(
+                            "bad --strategy `{other}`; expected exact or greedy"
+                        ))
+                    }
                 }
             }
             "--numerics" => {
                 o.workload.numerics = match value.as_str() {
                     "exact" => Numerics::Exact,
                     "admitted" => Numerics::Admitted,
-                    other => return Err(format!("bad --numerics `{other}`; expected exact or admitted")),
+                    other => {
+                        return Err(format!(
+                            "bad --numerics `{other}`; expected exact or admitted"
+                        ))
+                    }
                 }
             }
             other => return Err(format!("option `{other}` has no parser")),
@@ -155,7 +185,7 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
 /// Compile every collected file as one closed program; diagnostics are rendered in full.
 pub fn load_program(o: &Options) -> Result<(usize, Program), String> {
     let files = collect_files(&o.paths)?;
-    let program = compile(&files, &o.targets).map_err(|diagnostics| {
+    let program = compile(&files).map_err(|diagnostics| {
         let mut out: Vec<String> = diagnostics.iter().map(|d| d.render()).collect();
         out.push(format!("{} error(s)", diagnostics.len()));
         out.join("\n")
@@ -164,14 +194,12 @@ pub fn load_program(o: &Options) -> Result<(usize, Program), String> {
 }
 
 fn check(args: &[String]) -> Result<(), String> {
-    let o = options(args, &["--targets"])?;
+    let o = options(args, &[])?;
     let (files, program) = load_program(&o)?;
     println!(
-        "ok: {files} file(s), {} definition(s), {} contract family(ies), {} export(s), targets {}",
+        "ok: {files} file(s), {} definition(s), {} linked function family(ies)",
         program.definitions.len(),
         program.families.len(),
-        program.families.iter().filter(|f| f.export).count(),
-        o.targets.join(","),
     );
     Ok(())
 }

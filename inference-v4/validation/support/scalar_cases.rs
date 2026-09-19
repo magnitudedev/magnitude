@@ -2,18 +2,13 @@
 use seismic_lang::{
     lowered_ir::LoweredIr,
     program::{compile, SourceFile},
-    Scope,
 };
 use std::collections::HashMap;
 pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend: &str) {
-    let program = compile(
-        &[SourceFile {
-            path: "scalar-semantics.seismic.portable".into(),
-            scope: Scope::Portable,
-            text: include_str!("../programs/scalar-semantics.seismic.portable").into(),
-        }],
-        &[],
-    )
+    let program = compile(&[SourceFile {
+        path: "scalar-semantics.seismic".into(),
+        text: include_str!("../programs/scalar-semantics.seismic").into(),
+    }])
     .unwrap_or_else(|e| panic!("{e:?}"));
     let lower =
         |name| seismic_lang::lower::lower(&program, name, backend, &HashMap::new()).unwrap();

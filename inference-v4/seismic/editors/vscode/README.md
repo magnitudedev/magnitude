@@ -1,13 +1,13 @@
 # Seismic for VS Code
 
 Local syntax highlighting, comment toggling, bracket matching, indentation, and
-folding for `.seismic` and `.seismic.*` files. No compiler or language server required.
+folding for `.seismic` files. No compiler or language server required.
 
 From this directory, package and install:
 
 ```sh
 npx --yes @vscode/vsce package --allow-missing-repository --skip-license
-code --install-extension seismic-language-0.0.1.vsix
+code --install-extension seismic-language-0.0.2.vsix
 ```
 
 Alternatively, use **Extensions: Install from VSIX...** in VS Code's command

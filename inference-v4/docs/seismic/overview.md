@@ -63,7 +63,7 @@ contract of the implemented system.
 
 | Owner | Establishes | Does not |
 | --- | --- | --- |
-| Kernel or library author | Algorithm, regions, producers, state, stages, merges, numerical contract, alternative bodies, target adoption | Declare widths, candidate lists, or hardware constants |
+| Kernel or library author | Algorithm, regions, producers, state, stages, merges, numerical contract, alternative portable bodies, target lowerings, backend-specific helpers | Declare widths, candidate lists, or hardware constants |
 | Lowering author | A target implementation within the ownership its signature grants | Restructure the caller or widen its scope |
 | Checker | Types, shapes, bounds, modes, aliasing, slice opacity, region results, stages, partial obligations, target coverage declarations | Prove bodies equivalent |
 | Family construction | Applicable candidates per occurrence, numerical sites, execution-unit sequences, obligations | Enumerate compositions; drop what it cannot analyze |
@@ -93,8 +93,8 @@ scheduling, and serving belong to the host application.
 ## Flow
 
 ```text
-sources (portable + target files)
-    -> checked closed program: structured IR, contract families, lowering boundaries
+plain `.seismic` sources (portable functions, target lowerings, backend-specific helpers)
+    -> checked closed program: structured IR and contract families
     -> joint family for (entry, target, workload)
     -> backend: site domains, limits, intervals, cost factors, seed
     -> budgeted joint selection -> audited witness
@@ -112,7 +112,7 @@ finite-precision behavior.
 | Outcome | Meaning |
 | --- | --- |
 | Invalid source | Type, effect, ownership, or declaration error. |
-| Missing target coverage | No adopted implementation covers a reached call. |
+| Missing target coverage | No applicable portable body, target lowering, or backend-specific helper has a complete supported dependency tree for a reached call. |
 | Unsupported structural mapping | The backend has no mapping for a meaningful structure. |
 | Incompatible composition | Required interfaces or hard capacities cannot agree. |
 | Infeasible | The exported family is proved to have no solution. |

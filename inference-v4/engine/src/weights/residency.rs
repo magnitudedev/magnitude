@@ -8,9 +8,11 @@ use seismic_lang::{
     program::{compile, SourceFile},
     sir::Program,
     types::{DType, Elem},
-    Scope,
 };
-use seismic_runtime::{Buffer, Device, plan::{CompiledPlan, PlanCompiler, Settings}};
+use seismic_runtime::{
+    plan::{CompiledPlan, PlanCompiler, Settings},
+    Buffer, Device,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     rc::Rc,
@@ -59,32 +61,26 @@ pub struct Importer {
 }
 impl Importer {
     pub fn new(device: Rc<Device>, settings: Settings) -> Result<Self, Error> {
-        let program = compile(
-            &[
-                SourceFile {
-                    path: "gguf_import.seismic.portable".into(),
-                    scope: Scope::Portable,
-                    text: include_str!(
-                        "../../../seismic-std/lib/kernels/gguf_import.seismic.portable"
-                    )
-                    .into(),
-                },
-                SourceFile {
-                    path: "weight_import.seismic.portable".into(),
-                    scope: Scope::Portable,
-                    text: include_str!(
-                        "../../../seismic-std/lib/kernels/weight_import.seismic.portable"
-                    )
-                    .into(),
-                },
-            ],
-            // Coverage is checked for the target the importer selects on.
-            &[device.backend().to_string()],
-        )
-        .map_err(|errors| invalid(format!(
-            "weight import program: {}",
-            errors.iter().map(|e| e.render()).collect::<Vec<_>>().join("\n")
-        )))?;
+        let program = compile(&[
+            SourceFile {
+                path: "gguf_import.seismic".into(),
+                text: include_str!("../../../seismic-std/lib/kernels/gguf_import.seismic").into(),
+            },
+            SourceFile {
+                path: "weight_import.seismic".into(),
+                text: include_str!("../../../seismic-std/lib/kernels/weight_import.seismic").into(),
+            },
+        ])
+        .map_err(|errors| {
+            invalid(format!(
+                "weight import program: {}",
+                errors
+                    .iter()
+                    .map(|e| e.render())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        })?;
         Ok(Self {
             device,
             settings,
@@ -127,9 +123,11 @@ impl Importer {
                 let (entry, representation) = block_import(*encoding)
                     .ok_or_else(|| invalid("dense encoding cannot use block import"))?;
                 let repr = seismic_lang::repr::lookup(representation).unwrap();
-                if descriptor.shape.last().is_none_or(|n| {
-                    !n.is_multiple_of(u64::from(repr.storage_group()))
-                }) {
+                if descriptor
+                    .shape
+                    .last()
+                    .is_none_or(|n| !n.is_multiple_of(u64::from(repr.storage_group())))
+                {
                     return Err(invalid("resident packed row geometry is invalid"));
                 }
                 let blocks = count / encoding.block_elements() as usize;
@@ -154,22 +152,27 @@ impl Importer {
                 let input = self.device.buffer_from(&bytes).map_err(invalid)?;
                 let key = (*encoding, blocks);
                 if !self.block_kernels.contains_key(&key) {
-                    let plan = PlanCompiler::new(&self.device, &self.program, self.settings.clone()).compile_entry(
-                        entry,
-                        &HashMap::from([(
-                            "B".into(),
-                            i64::try_from(blocks)
-                                .map_err(|_| invalid("block count exceeds index range"))?,
-                        )]),
-                        &HashMap::new(),
-                    )
-                    .map_err(invalid)?;
+                    let plan =
+                        PlanCompiler::new(&self.device, &self.program, self.settings.clone())
+                            .compile_entry(
+                                entry,
+                                &HashMap::from([(
+                                    "B".into(),
+                                    i64::try_from(blocks)
+                                        .map_err(|_| invalid("block count exceeds index range"))?,
+                                )]),
+                                &HashMap::new(),
+                            )
+                            .map_err(invalid)?;
                     self.block_kernels.insert(key, plan);
                 }
                 let mut buffers = vec![input.clone(), input];
                 let mut planes = BTreeMap::new();
                 for plane in repr.planes() {
-                    let size = plane.bytes(count as u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid("packed plane byte size overflow"))?;
+                    let size = plane
+                        .bytes(count as u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| invalid("packed plane byte size overflow"))?;
                     let buffer = self.device.buffer(size).map_err(invalid)?;
                     buffers.push(buffer.clone());
                     planes.insert(plane.name.into(), buffer);
@@ -189,42 +192,45 @@ impl Importer {
                     ));
                 }
                 let input = self.device.buffer_from(&tensor.read()?).map_err(invalid)?;
-                let output =
-                    if tensor.dtype == target && descriptor.transform == Transform::Identity {
-                        input
-                    } else {
-                        let key = (tensor.dtype, target, count);
-                        if !self.kernels.contains_key(&key) {
-                            let entry = "import_weight";
-                            let plan = PlanCompiler::new(&self.device, &self.program, self.settings.clone()).compile_entry(
-                                entry,
-                                &HashMap::from([(
-                                    "N".into(),
-                                    i64::try_from(count)
-                                        .map_err(|_| invalid("weight exceeds index domain"))?,
-                                )]),
-                                &HashMap::from([
-                                    ("T".into(), Elem::Dtype(tensor.dtype)),
-                                    ("U".into(), Elem::Dtype(target)),
-                                ]),
-                            )
-                            .map_err(invalid)?;
-                            self.kernels.insert(key, plan);
-                        }
-                        let bytes = count
-                            .checked_mul(target.bytes() as usize)
-                            .ok_or_else(|| invalid("resident weight size overflow"))?;
-                        let output = self.device.buffer(bytes).map_err(invalid)?;
-                        self.kernels
-                            .get_mut(&key)
-                            .unwrap()
-                            .execute_buffers(
-                                &[input, output.clone()],
-                                &[f64::from(descriptor.transform == Transform::NegativeExp)],
-                            )
-                            .map_err(invalid)?;
-                        output
-                    };
+                let output = if tensor.dtype == target
+                    && descriptor.transform == Transform::Identity
+                {
+                    input
+                } else {
+                    let key = (tensor.dtype, target, count);
+                    if !self.kernels.contains_key(&key) {
+                        let entry = "import_weight";
+                        let plan =
+                            PlanCompiler::new(&self.device, &self.program, self.settings.clone())
+                                .compile_entry(
+                                    entry,
+                                    &HashMap::from([(
+                                        "N".into(),
+                                        i64::try_from(count)
+                                            .map_err(|_| invalid("weight exceeds index domain"))?,
+                                    )]),
+                                    &HashMap::from([
+                                        ("T".into(), Elem::Dtype(tensor.dtype)),
+                                        ("U".into(), Elem::Dtype(target)),
+                                    ]),
+                                )
+                                .map_err(invalid)?;
+                        self.kernels.insert(key, plan);
+                    }
+                    let bytes = count
+                        .checked_mul(target.bytes() as usize)
+                        .ok_or_else(|| invalid("resident weight size overflow"))?;
+                    let output = self.device.buffer(bytes).map_err(invalid)?;
+                    self.kernels
+                        .get_mut(&key)
+                        .unwrap()
+                        .execute_buffers(
+                            &[input, output.clone()],
+                            &[f64::from(descriptor.transform == Transform::NegativeExp)],
+                        )
+                        .map_err(invalid)?;
+                    output
+                };
                 (Elem::Dtype(target), BTreeMap::from([("".into(), output)]))
             }
             Stored::AffinePlanes {

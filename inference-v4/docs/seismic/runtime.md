@@ -55,7 +55,7 @@ The plan compiler holds one closed checked program and one device.
   share one compilation. Buffer contents, scalar values, and bounded index arguments
   are never identity, so changing control inputs or the decode position reuses the
   compiled kernel and never retunes.
-- An unknown exported entry is an error at request time.
+- An unknown linked function is an error when requested as an entry.
 - Selection and native compilation run at the first preparation of an entry, under
   the search budget in the compiler's settings, with the backend of the plan's device
   (`Device::select`) built from the device's queried facts. The budget is the only tuning

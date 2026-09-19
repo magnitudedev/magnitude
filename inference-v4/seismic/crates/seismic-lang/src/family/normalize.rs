@@ -1,11 +1,13 @@
 //! Execution-unit normalization, witness validation, and the family queries that
 //! selection, backends and instantiation share.
 
-use super::{CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, SiteKind, Witness};
+use super::{
+    CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, SiteKind, Witness,
+};
 use crate::sir::{Body, Program, SliceParent, StmtKind};
+use crate::sym::Sym;
 use crate::syntax::ast::RegionMode;
 use crate::types::{Elem, Extent, RegionId, SliceId};
-use crate::sym::Sym;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod units;
@@ -41,7 +43,9 @@ impl Requirement {
             Requirement::Multiple { unit, .. } => *unit != 0 && value % unit == 0,
             Requirement::AtLeast { value: bound, .. } => value >= *bound,
             Requirement::AtMost { value: bound, .. } => value <= *bound,
-            Requirement::Equal { value: required, .. } => value == *required,
+            Requirement::Equal {
+                value: required, ..
+            } => value == *required,
             Requirement::Divides { extent, .. } => value != 0 && extent % value == 0,
         }
     }
@@ -54,10 +58,19 @@ impl Family {
         let mut out = Vec::new();
         let mut pending = vec![OccurrenceId(0)];
         while let Some(id) = pending.pop() {
-            let Some(occurrence) = self.occurrences.get(id.0 as usize) else { continue };
-            let Some(&choice) = witness.choices.get(&id) else { continue };
-            let Some(candidate) = occurrence.candidates.get(choice as usize) else { continue };
-            out.push(CandidateRef { occurrence: id, candidate: choice });
+            let Some(occurrence) = self.occurrences.get(id.0 as usize) else {
+                continue;
+            };
+            let Some(&choice) = witness.choices.get(&id) else {
+                continue;
+            };
+            let Some(candidate) = occurrence.candidates.get(choice as usize) else {
+                continue;
+            };
+            out.push(CandidateRef {
+                occurrence: id,
+                candidate: choice,
+            });
             pending.extend(candidate.children.iter().rev());
         }
         out
@@ -77,7 +90,11 @@ impl Family {
     /// The site bound to structural shape parameter `param` of the candidate's template.
     /// It belongs to an ancestor candidate.
     pub fn structural_site(&self, candidate: CandidateRef, param: &str) -> Option<SiteId> {
-        self.candidate(candidate).structural.iter().find(|(name, _)| name == param).map(|(_, site)| site.0)
+        self.candidate(candidate)
+            .structural
+            .iter()
+            .find(|(name, _)| name == param)
+            .map(|(_, site)| site.0)
     }
 
     /// For each dynamic shape parameter of the candidate's template, the caller-side extent
@@ -87,14 +104,18 @@ impl Family {
     pub fn dynamic_args(&self, program: &Program, candidate: CandidateRef) -> Vec<(String, Sym)> {
         let occurrence = self.occurrence(candidate.occurrence);
         let template = self.template(self.candidate(candidate).template);
-        let (Some(parent), Some(call)) = (occurrence.parent, occurrence.call) else { return Vec::new() };
+        let (Some(parent), Some(call)) = (occurrence.parent, occurrence.call) else {
+            return Vec::new();
+        };
         let caller = program.definition(self.template(self.candidate(parent).template).definition);
-        let binding = caller
-            .body
-            .as_ref()
-            .and_then(|body| body.calls.get(call.0 as usize))
-            .and_then(|site| site.bindings.iter().find(|b| b.definition == template.definition));
-        let Some(binding) = binding else { return Vec::new() };
+        let binding = caller.body.calls.get(call.0 as usize).and_then(|site| {
+            site.bindings
+                .iter()
+                .find(|b| b.definition == template.definition)
+        });
+        let Some(binding) = binding else {
+            return Vec::new();
+        };
         binding
             .shape_args
             .iter()
@@ -108,13 +129,25 @@ impl Family {
     /// result, in authored order (one element for a single-region kernel). `None` for any
     /// other body shape. A backend may treat a `UnitKind::Call` unit like these `Region`
     /// units when every candidate of the occurrence answers `Some`.
-    pub fn root_regions(&self, program: &Program, candidate: CandidateRef) -> Option<Vec<RegionId>> {
-        let body = program.definition(self.template(self.candidate(candidate).template).definition).body.as_ref()?;
+    pub fn root_regions(
+        &self,
+        program: &Program,
+        candidate: CandidateRef,
+    ) -> Option<Vec<RegionId>> {
+        let body = &program
+            .definition(self.template(self.candidate(candidate).template).definition)
+            .body;
         let regions: Option<Vec<RegionId>> = body
             .block
             .iter()
             .map(|s| match &s.kind {
-                StmtKind::Region(r) if r.mode == RegionMode::Parallel && r.merge.is_none() && r.result.is_none() => Some(r.id),
+                StmtKind::Region(r)
+                    if r.mode == RegionMode::Parallel
+                        && r.merge.is_none()
+                        && r.result.is_none() =>
+                {
+                    Some(r.id)
+                }
                 _ => None,
             })
             .collect();
@@ -122,30 +155,52 @@ impl Family {
     }
 
     /// The site governing `slice` of the candidate's body (`Rebind` chains resolved).
-    pub fn slice_site(&self, program: &Program, candidate: CandidateRef, slice: SliceId) -> Option<SiteId> {
+    pub fn slice_site(
+        &self,
+        program: &Program,
+        candidate: CandidateRef,
+        slice: SliceId,
+    ) -> Option<SiteId> {
         let c = self.candidate(candidate);
-        let body = program.definition(self.template(c.template).definition).body.as_ref()?;
+        let body = &program
+            .definition(self.template(c.template).definition)
+            .body;
         let owner = owning_slice(body, slice)?;
-        c.sites.iter().copied().find(|id| match &self.sites[id.0 as usize].kind {
-            SiteKind::Width { slice, .. } | SiteKind::Parts { slice, .. } => *slice == owner,
-        })
+        c.sites
+            .iter()
+            .copied()
+            .find(|id| match &self.sites[id.0 as usize].kind {
+                SiteKind::Width { slice, .. } | SiteKind::Parts { slice, .. } => *slice == owner,
+            })
     }
 
     /// The site governing an axis extent seen from the candidate's body: a slice of the
     /// body, or a shape parameter bound structurally by an ancestor. `None` for a
     /// semantic extent.
-    pub fn extent_site(&self, program: &Program, candidate: CandidateRef, extent: &Extent) -> Option<SiteId> {
+    pub fn extent_site(
+        &self,
+        program: &Program,
+        candidate: CandidateRef,
+        extent: &Extent,
+    ) -> Option<SiteId> {
         match extent {
             Extent::Structural(slice) => self.slice_site(program, candidate, *slice),
-            Extent::Semantic(sym) => {
-                self.candidate(candidate).structural.iter().find(|(name, _)| *sym == Sym::param(name)).map(|(_, site)| site.0)
-            }
+            Extent::Semantic(sym) => self
+                .candidate(candidate)
+                .structural
+                .iter()
+                .find(|(name, _)| *sym == Sym::param(name))
+                .map(|(_, site)| site.0),
         }
     }
 }
 
 fn describe(family: &Family, id: OccurrenceId) -> String {
-    format!("occurrence {} (family #{})", id.0, family.occurrence(id).family)
+    format!(
+        "occurrence {} (family #{})",
+        id.0,
+        family.occurrence(id).family
+    )
 }
 
 pub fn validate(family: &Family, witness: &Witness) -> Result<(), String> {
@@ -156,11 +211,21 @@ pub fn validate(family: &Family, witness: &Witness) -> Result<(), String> {
     let mut candidates = Vec::new();
     let mut pending = vec![OccurrenceId(0)];
     while let Some(id) = pending.pop() {
-        let occurrence = family.occurrences.get(id.0 as usize).ok_or_else(|| format!("family references missing occurrence {}", id.0))?;
+        let occurrence = family
+            .occurrences
+            .get(id.0 as usize)
+            .ok_or_else(|| format!("family references missing occurrence {}", id.0))?;
         occurrences.insert(id);
-        let choice = *witness.choices.get(&id).ok_or_else(|| format!("{} is active and has no choice", describe(family, id)))?;
+        let choice = *witness
+            .choices
+            .get(&id)
+            .ok_or_else(|| format!("{} is active and has no choice", describe(family, id)))?;
         let candidate = occurrence.candidates.get(choice as usize).ok_or_else(|| {
-            format!("{}: choice {choice} is out of range of its {} candidates", describe(family, id), occurrence.candidates.len())
+            format!(
+                "{}: choice {choice} is out of range of its {} candidates",
+                describe(family, id),
+                occurrence.candidates.len()
+            )
         })?;
         candidates.push(candidate);
         pending.extend(candidate.children.iter().rev());
@@ -169,12 +234,24 @@ pub fn validate(family: &Family, witness: &Witness) -> Result<(), String> {
         return Err(format!("occurrence {} is inactive and has a choice", id.0));
     }
 
-    let sites: BTreeSet<SiteId> = candidates.iter().flat_map(|c| c.sites.iter().copied()).collect();
+    let sites: BTreeSet<SiteId> = candidates
+        .iter()
+        .flat_map(|c| c.sites.iter().copied())
+        .collect();
     for id in &sites {
-        let site = family.sites.get(id.0 as usize).ok_or_else(|| format!("family references missing site {}", id.0))?;
-        let value = *witness.sites.get(id).ok_or_else(|| format!("site {} is active and has no value", id.0))?;
+        let site = family
+            .sites
+            .get(id.0 as usize)
+            .ok_or_else(|| format!("family references missing site {}", id.0))?;
+        let value = *witness
+            .sites
+            .get(id)
+            .ok_or_else(|| format!("site {} is active and has no value", id.0))?;
         if !(1..=site.extent).contains(&value) {
-            return Err(format!("site {}: value {value} is outside 1..={}", id.0, site.extent));
+            return Err(format!(
+                "site {}: value {value} is outside 1..={}",
+                id.0, site.extent
+            ));
         }
     }
     if let Some(id) = witness.sites.keys().find(|id| !sites.contains(id)) {
@@ -182,24 +259,46 @@ pub fn validate(family: &Family, witness: &Witness) -> Result<(), String> {
     }
     for requirement in candidates.iter().flat_map(|c| &c.requirements) {
         let site = requirement.site();
-        let value = *witness.sites.get(&site).ok_or_else(|| format!("{requirement:?} of an active candidate names inactive site {}", site.0))?;
+        let value = *witness.sites.get(&site).ok_or_else(|| {
+            format!(
+                "{requirement:?} of an active candidate names inactive site {}",
+                site.0
+            )
+        })?;
         if !requirement.holds(value) {
-            return Err(format!("site {} = {value} violates {requirement:?}", site.0));
+            return Err(format!(
+                "site {} = {value} violates {requirement:?}",
+                site.0
+            ));
         }
     }
 
     for (refinement, refined) in &family.refinements {
-        if let (Some(inner), Some(outer)) = (witness.sites.get(refinement), witness.sites.get(refined)) {
+        if let (Some(inner), Some(outer)) =
+            (witness.sites.get(refinement), witness.sites.get(refined))
+        {
             if *inner < 1 || outer % inner != 0 {
-                return Err(format!("site {} = {inner} refines site {} = {outer} and does not divide it", refinement.0, refined.0));
+                return Err(format!(
+                    "site {} = {inner} refines site {} = {outer} and does not divide it",
+                    refinement.0, refined.0
+                ));
             }
         }
     }
 
-    let sequences: BTreeSet<SequenceId> = candidates.iter().flat_map(|c| c.sequences.iter().copied()).collect();
+    let sequences: BTreeSet<SequenceId> = candidates
+        .iter()
+        .flat_map(|c| c.sequences.iter().copied())
+        .collect();
     for id in &sequences {
-        let sequence = family.sequences.get(id.0 as usize).ok_or_else(|| format!("family references missing sequence {}", id.0))?;
-        let cover = witness.covers.get(id).ok_or_else(|| format!("sequence {} is active and has no cover", id.0))?;
+        let sequence = family
+            .sequences
+            .get(id.0 as usize)
+            .ok_or_else(|| format!("family references missing sequence {}", id.0))?;
+        let cover = witness
+            .covers
+            .get(id)
+            .ok_or_else(|| format!("sequence {} is active and has no cover", id.0))?;
         let mut next = 0u32;
         for &(start, end) in cover {
             if start != next || end <= start {
@@ -208,7 +307,11 @@ pub fn validate(family: &Family, witness: &Witness) -> Result<(), String> {
             next = end;
         }
         if next as usize != sequence.units.len() {
-            return Err(format!("sequence {}: cover ends at unit {next} of {}", id.0, sequence.units.len()));
+            return Err(format!(
+                "sequence {}: cover ends at unit {next} of {}",
+                id.0,
+                sequence.units.len()
+            ));
         }
     }
     if let Some(id) = witness.covers.keys().find(|id| !sequences.contains(id)) {

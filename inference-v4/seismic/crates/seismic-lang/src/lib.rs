@@ -21,20 +21,3 @@ pub mod syntax;
 pub mod types;
 
 pub use span::{Diagnostic, Span};
-
-/// The scope a file's extension selects.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Scope {
-    Portable,
-    Backend(String),
-}
-
-/// Parse a file name of the form `<name>.seismic.<scope>`.
-pub fn scope_of_path(path: &str) -> Option<Scope> {
-    let file = path.rsplit('/').next()?;
-    let (_, rest) = file.split_once(".seismic.")?;
-    if rest.is_empty() || rest.contains('.') {
-        return None;
-    }
-    Some(if rest == "portable" { Scope::Portable } else { Scope::Backend(rest.to_string()) })
-}

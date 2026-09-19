@@ -1,0 +1,9 @@
+# Persist one prepared decode row after its fresh-value attention consumption.
+# Destination admission and logical sequence advancement belong to the engine.
+# Only the destination row of each history is written, so both histories are `inout`.
+fn kv_append[T, KV, W](key: tensor[1, KV, W] A, value: tensor[1, KV, W] A,
+                             inout history_key: tensor[T, KV, W] A, inout history_value: tensor[T, KV, W] A,
+                             destination: index[T]):
+    parallel [heads] in 0..KV:
+        publish load(key[0, heads]) to history_key[destination, heads]
+        publish load(value[0, heads]) to history_value[destination, heads]

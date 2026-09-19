@@ -5,7 +5,6 @@ use seismic_compiler::tuner::{source::Binding, Input};
 use seismic_lang::{
     program::{self, SourceFile},
     types::{DType, Elem},
-    Scope,
 };
 use serde_json::json;
 use std::{collections::HashMap, time::Instant};
@@ -57,24 +56,23 @@ fn run() -> Result<(), String> {
     for (path, text) in [
         (
             "dense_suffix",
-            include_str!("../../../../engine/lib/dense_suffix.seismic.portable"),
+            include_str!("../../../../engine/lib/dense_suffix.seismic"),
         ),
         (
             "attention_step",
-            include_str!("../../../../engine/lib/attention_step.seismic.portable"),
+            include_str!("../../../../engine/lib/attention_step.seismic"),
         ),
         (
             "recurrent_step",
-            include_str!("../../../../engine/lib/recurrent_step.seismic.portable"),
+            include_str!("../../../../engine/lib/recurrent_step.seismic"),
         ),
     ] {
         sources.push(SourceFile {
-            path: format!("qwen35/{path}.seismic.portable").into(),
+            path: format!("qwen35/{path}.seismic").into(),
             text: text.into(),
-            scope: Scope::Portable,
         });
     }
-    let program = program::compile(&sources, &["cpu".into(), "cuda".into(), "metal".into()])
+    let program = program::compile(&sources)
         .map_err(|e| e.iter().map(|e| e.render()).collect::<Vec<_>>().join("\n"))?;
     println!(
         "{}",

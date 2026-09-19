@@ -162,7 +162,7 @@ nobody authored. A feasible witness is executable; execution never waits for a p
 | Outcome | Meaning | Not to be read as |
 | --- | --- | --- |
 | Invalid source or contract | Type, numerical, effect, ownership, or declaration error | — |
-| Missing target coverage | No adopted implementation for a reached call on this target and workload | A reason to interpret or fall back |
+| Missing target coverage | No applicable portable body, matching target lowering, or backend-specific helper has complete coverage for a reached call on this target and workload | A reason to interpret or fall back |
 | Unsupported structural mapping | The backend has no mapping for this structure, or no domain value satisfies a site's requirements | Infeasibility of the family |
 | Incompatible composition | Interfaces disagree, or a hard capacity cannot be met on a path selection cannot avoid | A cost |
 | No feasible configuration, proved | The exported family has no solution | A statement about one body or grouping |
@@ -194,8 +194,8 @@ search.
 
 Selection identity is `(entry, shapes, elements)` on one device. Buffer contents,
 scalar arguments, and bounded index values such as the decode position are not
-part of it, so decode steps do not retune. Adding or removing an overload, lowering,
-or adoption changes the family and invalidates earlier witnesses.
+part of it, so decode steps do not retune. Adding or removing a portable body, target
+lowering, or backend-specific helper changes the family and invalidates earlier witnesses.
 
 ## Search analysis
 

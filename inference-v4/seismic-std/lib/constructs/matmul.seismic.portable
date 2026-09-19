@@ -1,9 +1,0 @@
-# into[i, j] = fma-chain over k of a[i, k] * b[j, k], seeded by into[i, j], ascending k.
-# Packed operands decode to F32 at consumption. Successive calls over ordered windows of K
-# continue the same chain, so windowing never changes a result bit.
-fn matmul[M, N, K](a: tile[M, K] T, b: tile[N, K] U, inout into: tile[M, N] f32):
-    for i, j in owned(into):
-        var s = into[i, j]
-        for k in axis(a, 1):
-            s = fma(f32(a[i, k]), f32(b[j, k]), s)
-        into[i, j] = s

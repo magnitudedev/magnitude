@@ -1,0 +1,11 @@
+fn qwen_embedding[V, D](table: tensor[V, D] EW, out embedded: tensor[1, D] A,
+    out out: tensor[1, D] f32, token: index[V]):
+    embedding_row(table, token, embedded)
+    cast_rows(embedded, out)
+
+
+fn qwen_readout[V, D](hidden: tensor[1, D] f32, norm: tensor[D] NW,
+    weight: tensor[V, D] OW, out normalized: tensor[1, D] A, out logits: tensor[1, V] f32,
+    epsilon: f32):
+    rms_norm(hidden, norm, normalized, epsilon)
+    linear(normalized, weight, logits)

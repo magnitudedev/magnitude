@@ -1,0 +1,142 @@
+# V3 stable ascending top-k: larger expert IDs win cutoff ties; selected routes
+# are published in ascending (probability, ID) order.
+fn route_topk[M, E, K](logits: tensor[M, E] f32, out routes: tensor[M, K] i32,
+                       out scores: tensor[M, K] f32, normalize: i32):
+    parallel [rows] in 0..M:
+        for row in rows:
+            let values = load(logits[row])
+            let maximum = reduce(values, 0, max)
+            let mut probabilities = exp(values - maximum)
+            let total = reduce(probabilities, 0, sum)
+            probabilities = probabilities / total
+            let mut selected = tile[K] f32
+            let mut indices = tile[K] i32
+            for i in owned(selected):
+                selected[i] = 0.0
+                indices[i] = 0
+            for rank in 0..K:
+                let best = reduce(probabilities, 0, max)
+                let mut candidates = tile[E] i32
+                for i in owned(candidates):
+                    candidates[i] = -1
+                    if probabilities[i] == best:
+                        candidates[i] = coord(i)
+                let winner = reduce(candidates, 0, max)
+                for i in owned(selected):
+                    if coord(i) == K - 1 - rank:
+                        selected[i] = best
+                        indices[i] = winner
+                for i in owned(probabilities):
+                    if coord(i) == winner:
+                        probabilities[i] = -inf
+            let mut denominator = f32(1.0)
+            if normalize != 0:
+                denominator = reduce(selected, 0, sum)
+            selected = selected / denominator
+            publish indices to routes[row]
+            publish selected to scores[row]
+
+
+# The selected bank rows remain packed until the matmul lowering consumes them.
+# Each (row, choice) owner contracts its expert's rows for one slice of outputs;
+# every output is the standard ordered F32 FMA chain over H.
+fn routed_input[M, E, K, H, F](x: tensor[M, H] A, routes: tensor[M, K] i32,
+                              weight: tensor[E, F, H] W, out out: tensor[M, K, F] A):
+    parallel [rows, choices, cols] in (0..M, 0..K, 0..F):
+        for row in rows:
+            let xt = load(x[row:row + 1])
+            for choice in choices:
+                let route = load(routes[row, choice:choice + 1])
+                let expert = route[0]
+                let mut acc = zeros_like(out[row, choice:choice + 1, cols], dtype=f32)
+                let wt = load(weight[expert, cols])
+                matmul(xt, wt, into=acc)
+                publish acc to out[row, choice:choice + 1, cols]
+
+# Unlike the dense shared expert, routed SiLU has no separate compact publication.
+fn routed_activation[M, K, F](gate: tensor[M, K, F] A, up: tensor[M, K, F] A,
+                              out out: tensor[M, K, F] A):
+    parallel [rows, choices] in (0..M, 0..K):
+        for row in rows:
+            for choice in choices:
+                let g = f32(gate[row, choice])
+                let u = f32(up[row, choice])
+                let product = (g / (1.0 + exp(-g))) * u
+                publish product to out[row, choice]
+
+fn routed_output[M, E, K, H, F](x: tensor[M, K, F] A, routes: tensor[M, K] i32,
+                               weight: tensor[E, H, F] W, out out: tensor[M, K, H] A):
+    parallel [rows, choices, cols] in (0..M, 0..K, 0..H):
+        for row in rows:
+            for choice in choices:
+                let route = load(routes[row, choice:choice + 1])
+                let expert = route[0]
+                let mut acc = zeros_like(out[row, choice:choice + 1, cols], dtype=f32)
+                let xt = load(x[row, choice:choice + 1])
+                let wt = load(weight[expert, cols])
+                matmul(xt, wt, into=acc)
+                publish acc to out[row, choice:choice + 1, cols]
+
+fn shared_coefficient[M, H](x: tensor[M, H] A, weight: tensor[H] W, out out: tensor[M, 1] A):
+    parallel [rows] in 0..M:
+        let b = f32(weight)
+        for row in rows:
+            let a = f32(x[row])
+            let dot = reduce(a * b, 0, sum)
+            let mut result = tile[1] f32
+            for i in owned(result):
+                result[i] = 1.0 / (1.0 + exp(-dot))
+            publish result to out[row]
+
+# The gated shared expert is rounded to activation precision before the F32 merge.
+# `residual` and `out` may be the same rows; each row is read before it is published.
+fn routed_merge[M, K, H](experts: tensor[M, K, H] A, scores: tensor[M, K] f32,
+                        shared: tensor[M, H] A, coefficient: tensor[M, 1] A,
+                        residual: tensor[M, H] f32, out out: tensor[M, H] f32) alias(residual, out):
+    parallel [rows] in 0..M:
+        for row in rows:
+            let probabilities = load(scores[row])
+            let sh = load(shared[row])
+            let co = load(coefficient[row])
+            let res = load(residual[row])
+            let mut selected = tile[H] f32
+            for i in owned(selected):
+                selected[i] = 0.0
+            for choice in 0..K:
+                let projected = load(experts[row, choice])
+                for i in owned(selected):
+                    selected[i] = selected[i] + probabilities[choice] * f32(projected[i])
+            let mut gated_shared = tile[H] A
+            for i in owned(gated_shared):
+                gated_shared[i] = f32(sh[i]) * f32(co[0])
+            for i in owned(selected):
+                selected[i] = res[i] + (selected[i] + f32(gated_shared[i]))
+            publish selected to out[row]
+
+# The engine binds `residual` and `out` to the same hidden rows.
+fn qwen_routed_suffix[M, H, E, K, F, S](residual: tensor[M, H] f32, norm: tensor[H] NW,
+    router: tensor[E, H] RW, shared_router: tensor[H] SRW,
+    expert_gate: tensor[E, F, H] EGW, expert_up: tensor[E, F, H] EUW,
+    expert_down: tensor[E, H, F] EDW,
+    shared_gate: tensor[S, H] SGW, shared_up: tensor[S, H] SUW, shared_down: tensor[H, S] SDW,
+    out normalized: tensor[M, H] A, out logits: tensor[M, E] f32,
+    out routes: tensor[M, K] i32, out scores: tensor[M, K] f32,
+    out gate: tensor[M, K, F] A, out up: tensor[M, K, F] A, out product: tensor[M, K, F] A,
+    out projected: tensor[M, K, H] A,
+    out sg: tensor[M, S] A, out su: tensor[M, S] A, out sa: tensor[M, S] A, out sp: tensor[M, S] A,
+    out shared: tensor[M, H] A, out coefficient: tensor[M, 1] A, out out: tensor[M, H] f32,
+    eps: f32, normalize: i32) alias(residual, out):
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, router, logits)
+    route_topk(logits, routes, scores, normalize)
+    routed_input(normalized, routes, expert_gate, gate)
+    routed_input(normalized, routes, expert_up, up)
+    routed_activation(gate, up, product)
+    routed_output(product, routes, expert_down, projected)
+    linear(normalized, shared_gate, sg)
+    linear(normalized, shared_up, su)
+    silu(sg, sa)
+    multiply(sa, su, sp)
+    linear(sp, shared_down, shared)
+    shared_coefficient(normalized, shared_router, coefficient)
+    routed_merge(projected, scores, shared, coefficient, residual, out)

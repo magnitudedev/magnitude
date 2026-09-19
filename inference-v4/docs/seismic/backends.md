@@ -12,7 +12,7 @@ witness. Equal inputs give equal outputs.
 
 | Hook | Returns | Obligations |
 | --- | --- | --- |
-| `target` | The target name family construction uses for lowering boundaries | — |
+| `target` | The target name family construction uses to include matching lowerings and backend-specific helpers alongside portable bodies | — |
 | `estimate_model` | The identity of the estimate model behind the cost factors | Changes whenever the factors' meaning changes |
 | `bind_structure` | The finite value domain of every site | Binds the prescribed structural mapping for every candidate body. A reachable structure with no mapping fails as *unsupported structural mapping*; it is never dropped. Domains are defined by a stated rule that does not consult the estimate. |
 | `constraints` | Hard legality relations over site values, each guarded by the candidates that activate it, with a reason | Only real limits: capacity, alignment, participant counts. A guessed resource preference is not a constraint. A limit that no site can repair on a path selection cannot avoid is reported as *incompatible composition*. |
@@ -205,7 +205,7 @@ clocks: 200 invocations per command buffer, best of several).
   elements through device and tile storage, which Apple's compiler does not vectorize. One
   row of `rms_norm` at 2560 elements runs 12.4 µs as emitted and 3.0 µs with a blocked
   cover (lane `e / slots`, contiguous slots); interleaved runs of 8 or 16 elements 8.0 and
-  7.4 µs. Not adopted: a lane-local reduction is admitted only under the interleaved cover
+  7.4 µs. Not used: a lane-local reduction is admitted only under the interleaved cover
   (all elements of one output share a lane when the inner extent is a whole number of
   subgroups), every tile of one ownership group must share one cover (slots are addressed
   without translation), and a blocked cover by capacity leaves most lanes idle on a short
@@ -225,9 +225,9 @@ clocks: 200 invocations per command buffer, best of several).
 
 ### Seed policy
 
-- **Choices:** occurrences in pre-order. Each takes its first candidate — those
-  adopted through a Metal lowering body first, then the rest, each in declaration
-  order — under which every required site keeps a non-empty admissible domain and
+- **Choices:** occurrences in pre-order. Each takes its first candidate, in family
+  declaration order across applicable portable bodies, Metal lowerings, and Metal-specific
+  helpers, under which every required site keeps a non-empty admissible domain and
   the remaining occurrences can be completed the same way; otherwise the next
   candidate, with backtracking.
 - **Sites:** binders of a root `parallel` launch take the smallest admissible widths

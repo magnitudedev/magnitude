@@ -2,7 +2,7 @@
   "name": "seismic-language",
   "displayName": "Seismic",
   "description": "Local syntax highlighting for Seismic source files.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "seismic-local",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages"],
@@ -10,8 +10,7 @@
     "languages": [{
       "id": "seismic",
       "aliases": ["Seismic", "seismic"],
-      "extensions": [".seismic", ".seismic.portable", ".seismic.cpu", ".seismic.metal", ".seismic.cuda"],
-      "filenamePatterns": ["*.seismic.*"],
+      "extensions": [".seismic"],
       "configuration": "./language-configuration.json"
     }],
     "grammars": [{

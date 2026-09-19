@@ -1,7 +1,10 @@
 //! Resident bindings for checked numerical compositions. Model policy chooses
 //! parameters; this owner validates their contracts and retains scratch/code.
 use crate::weights::residency::ResidentWeight;
-use seismic_lang::{sir::Param, types::{DType, Elem, Extent, Shaped, Ty}};
+use seismic_lang::{
+    sir::Param,
+    types::{DType, Elem, Extent, Shaped, Ty},
+};
 use seismic_runtime::{
     plan::{Bindings, CompiledPlan, PlanCompiler, StepObservation, Submission},
     Buffer, Device, Error,
@@ -27,16 +30,23 @@ pub struct IntegerRange {
     pub max: i128,
 }
 impl IntegerRange {
-    pub fn contains(&self, value: i128) -> bool { self.min <= value && value <= self.max }
+    pub fn contains(&self, value: i128) -> bool {
+        self.min <= value && value <= self.max
+    }
 }
 /// Entry parameters carry only semantic extents; a slice width has no caller value.
 fn extents(tensor: &Shaped, shapes: &HashMap<String, i64>) -> Result<Vec<usize>, String> {
-    tensor.axes.iter().map(|axis| match axis {
-        Extent::Semantic(extent) => extent.eval(&|p| shapes.get(p).copied())
-            .and_then(|v| usize::try_from(v).ok())
-            .ok_or_else(|| "unresolved entry tensor shape".to_string()),
-        Extent::Structural(_) => Err("entry tensor has a structural extent".into()),
-    }).collect()
+    tensor
+        .axes
+        .iter()
+        .map(|axis| match axis {
+            Extent::Semantic(extent) => extent
+                .eval(&|p| shapes.get(p).copied())
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| "unresolved entry tensor shape".to_string()),
+            Extent::Structural(_) => Err("entry tensor has a structural extent".into()),
+        })
+        .collect()
 }
 fn tensor<'a>(params: &'a [Param], name: &str) -> Option<&'a Shaped> {
     params.iter().find_map(|p| match &p.ty {
@@ -67,11 +77,18 @@ impl Composition {
             scalars,
         } = spec;
         let program = compiler.program();
-        let family = program.export(&entry).ok_or("unknown composition")?;
-        // Every definition of an exported family shares one contract; the first
-        // body or bodyless contract states the entry ABI.
+        let family = program.resolve_family(&entry)?;
+        // Every implementation in a linked family shares one contract; the first
+        // function body states the entry ABI.
         let params = &program
-            .definition(*family.bodies.iter().chain(&family.contracts).next().ok_or("composition has no contract")?)
+            .definition(
+                *family
+                    .bodies
+                    .iter()
+                    .chain(&family.lowerings)
+                    .next()
+                    .ok_or("composition has no implementation")?,
+            )
             .params;
         for (name, weight) in &weights {
             if !weight.belongs_to(compiler.device()) {
@@ -85,7 +102,10 @@ impl Composition {
             else {
                 return Err(format!("weight {name} is not a tensor").into());
             };
-            let expected = extents(t, &shapes)?.into_iter().map(|v| v as u64).collect::<Vec<_>>();
+            let expected = extents(t, &shapes)?
+                .into_iter()
+                .map(|v| v as u64)
+                .collect::<Vec<_>>();
             if expected != weight.descriptor().shape {
                 return Err(format!("weight {name} shape differs from composition").into());
             }
@@ -95,7 +115,8 @@ impl Composition {
                         if &previous != weight.element() {
                             return Err(format!(
                                 "weight {name} disagrees on element parameter {p}"
-                            ).into());
+                            )
+                            .into());
                         }
                     }
                 }
@@ -128,7 +149,10 @@ impl Composition {
             }
         }
         for name in scalars.keys() {
-            if !params.iter().any(|p| &p.name == name && matches!(p.ty, Ty::Scalar(_))) {
+            if !params
+                .iter()
+                .any(|p| &p.name == name && matches!(p.ty, Ty::Scalar(_)))
+            {
                 return Err(format!("invalid scalar {name}").into());
             }
         }
@@ -139,15 +163,23 @@ impl Composition {
             .collect::<HashSet<_>>();
         let mut control_types = HashMap::new();
         for Param { name, ty, .. } in params {
-            if !external.contains(name) { continue; }
-            let Ty::Tensor(tensor) = ty else { continue; };
+            if !external.contains(name) {
+                continue;
+            }
+            let Ty::Tensor(tensor) = ty else {
+                continue;
+            };
             let element = match &tensor.elem {
                 Elem::Param(parameter) => elements.get(parameter).ok_or("unbound control dtype")?,
                 element => element,
             };
-            let Elem::Dtype(dtype @ (DType::I32 | DType::U32)) = element else { continue; };
-            let count = extents(tensor, &shapes)?.into_iter()
-                .try_fold(1usize, |n, extent| n.checked_mul(extent)).ok_or("control tensor extent overflow")?;
+            let Elem::Dtype(dtype @ (DType::I32 | DType::U32)) = element else {
+                continue;
+            };
+            let count = extents(tensor, &shapes)?
+                .into_iter()
+                .try_fold(1usize, |n, extent| n.checked_mul(extent))
+                .ok_or("control tensor extent overflow")?;
             control_types.insert(name.clone(), (*dtype, count));
         }
         let mut scratch = HashMap::new();
@@ -163,7 +195,8 @@ impl Composition {
                 let Elem::Dtype(dtype) = element else {
                     return Err("composition scratch must be dense".into());
                 };
-                let bytes = extents(t, &shapes)?.into_iter()
+                let bytes = extents(t, &shapes)?
+                    .into_iter()
                     .try_fold(dtype.bytes() as usize, |n, d| n.checked_mul(d))
                     .ok_or("scratch allocation overflow")?;
                 scratch.insert(name.clone(), compiler.device().buffer(bytes)?);
@@ -193,36 +226,50 @@ impl Composition {
             if extent == 0 || !spec.shapes.contains_key(name) {
                 return Err("specialization requires positive declared dimensions".into());
             }
-            spec.shapes.insert(name.into(), i64::try_from(extent)
-                .map_err(|_| "specialized dimension overflow")?);
+            spec.shapes.insert(
+                name.into(),
+                i64::try_from(extent).map_err(|_| "specialized dimension overflow")?,
+            );
         }
         let mut composition = Self::compile(compiler, spec)?;
         composition.control_domains = self.control_domains.clone();
         Ok(composition)
     }
     pub(crate) fn control_inputs(self, names: &[&str]) -> Result<Self, String> {
-        if names.iter().any(|name| !self.external.contains(*name)) { return Err("control input is not an external tensor".into()); }
+        if names.iter().any(|name| !self.external.contains(*name)) {
+            return Err("control input is not an external tensor".into());
+        }
         Ok(self)
     }
     /// Admit changing integer controls only under one checked finite domain,
     /// established on every invocation before any numerical work is bound.
-    pub(crate) fn control_domain(mut self, name: &str, range: IntegerRange) -> Result<Self, String> {
+    pub(crate) fn control_domain(
+        mut self,
+        name: &str,
+        range: IntegerRange,
+    ) -> Result<Self, String> {
         if !self.control_types.contains_key(name) {
             return Err("varying control domain requires an external integer tensor".into());
         }
         self.control_domains.insert(name.into(), range);
         Ok(self)
     }
-    pub(crate) fn shares_compilation(&self, other: &Self) -> bool { self.plan.shares_compilation(&other.plan) }
+    pub(crate) fn shares_compilation(&self, other: &Self) -> bool {
+        self.plan.shares_compilation(&other.plan)
+    }
     pub fn kernel_count(&self) -> usize {
         self.plan.kernel_count()
     }
     /// What selection decided, once this composition's kernel exists. Reading it
     /// never triggers selection or native compilation.
     pub fn selection(&self) -> Result<Option<seismic_runtime::Selection>, String> {
-        if self.plan.kernel_count() == 0 { return Ok(None); }
+        if self.plan.kernel_count() == 0 {
+            return Ok(None);
+        }
         let kernel = self.plan.kernel()?;
-        let kernel = kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+        let kernel = kernel
+            .try_borrow()
+            .map_err(|_| "shared kernel is already executing")?;
         Ok(Some(kernel.selection().clone()))
     }
     pub fn execute(
@@ -257,7 +304,10 @@ impl Composition {
         tensors: &HashMap<String, Buffer>,
         scalars: &HashMap<String, f64>,
     ) -> Result<Submission, String> {
-        if tensors.values().any(|buffer| !buffer.belongs_to(&self.device)) {
+        if tensors
+            .values()
+            .any(|buffer| !buffer.belongs_to(&self.device))
+        {
             return Err("composition tensor belongs to another resource domain".into());
         }
         if tensors.len() != self.external.len()
@@ -282,13 +332,23 @@ impl Composition {
         for (name, range) in &self.control_domains {
             let (dtype, elements) = self.control_types[name];
             let buffer = tensors.get(name).ok_or("unbound integer control")?;
-            let mut bytes = vec![0; elements.checked_mul(dtype.bytes() as usize).ok_or("control extent overflow")?];
+            let mut bytes = vec![
+                0;
+                elements
+                    .checked_mul(dtype.bytes() as usize)
+                    .ok_or("control extent overflow")?
+            ];
             buffer.read(&mut bytes)?;
             for bytes in bytes.chunks_exact(4) {
                 let raw: [u8; 4] = bytes.try_into().expect("integer control width");
-                let value = if dtype == DType::I32 { i128::from(i32::from_le_bytes(raw)) }
-                    else { i128::from(u32::from_le_bytes(raw)) };
-                if !range.contains(value) { return Err("invocation does not establish its integer input domain".into()); }
+                let value = if dtype == DType::I32 {
+                    i128::from(i32::from_le_bytes(raw))
+                } else {
+                    i128::from(u32::from_le_bytes(raw))
+                };
+                if !range.contains(value) {
+                    return Err("invocation does not establish its integer input domain".into());
+                }
             }
         }
         self.plan.prepare(&invocation)

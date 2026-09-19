@@ -38,7 +38,7 @@ From this directory. Run one Cargo process at a time.
 Check every library source for Metal:
 
 ```sh
-cargo run -p seismic-cli -- check seismic-std/lib engine/lib --targets metal
+cargo run -p seismic-cli -- check seismic-std/lib engine/lib
 ```
 
 Inspect a selection (occurrences, candidates, sites, covers, seed and selected

@@ -2,8 +2,8 @@
 //! runs every fixture under two partitionings; Metal goes through joint selection and
 //! the ordinary runtime. Neither path accepts an implementation choice from a test.
 #![allow(dead_code)]
-pub use seismic_lang::interp::{Arg, Interpreter, TensorData};
 pub use seismic_lang::family::Workload;
+pub use seismic_lang::interp::{Arg, Interpreter, TensorData};
 use seismic_lang::{
     interp::Uniform,
     sir::{Definition, Program},
@@ -23,14 +23,19 @@ pub fn interpreter(program: &Program, width: i64) -> Interpreter<'_> {
     vm.partitioner = Box::new(Uniform(width));
     vm
 }
-/// The definition stating an entry's ABI: the family's first body or contract.
+/// The definition stating an entry's ABI: the family's first implementation.
 pub fn entry<'a>(program: &'a Program, name: &str) -> &'a Definition {
     let family = program
-        .families
-        .iter()
-        .find(|f| f.name == name)
-        .unwrap_or_else(|| panic!("no function {name}"));
-    program.definition(*family.bodies.iter().chain(&family.contracts).next().unwrap())
+        .resolve_family(name)
+        .unwrap_or_else(|error| panic!("{error}"));
+    program.definition(
+        *family
+            .bodies
+            .iter()
+            .chain(&family.lowerings)
+            .next()
+            .unwrap(),
+    )
 }
 pub fn extents(tensor: &Shaped, shapes: &HashMap<String, i64>) -> Vec<usize> {
     tensor
@@ -49,13 +54,24 @@ pub fn element(tensor: &TensorData) -> Elem {
     }
 }
 /// Element parameters are whatever the bound tensors are; disagreement is a test bug.
-fn elements<'t>(definition: &Definition, tensor: impl Fn(&str, usize) -> &'t TensorData) -> HashMap<String, Elem> {
+fn elements<'t>(
+    definition: &Definition,
+    tensor: impl Fn(&str, usize) -> &'t TensorData,
+) -> HashMap<String, Elem> {
     let mut elements = HashMap::new();
     for (ordinal, param) in definition.params.iter().enumerate() {
-        if let Ty::Tensor(Shaped { elem: Elem::Param(p), .. }) = &param.ty {
+        if let Ty::Tensor(Shaped {
+            elem: Elem::Param(p),
+            ..
+        }) = &param.ty
+        {
             let bound = element(tensor(&param.name, ordinal));
             if let Some(previous) = elements.insert(p.clone(), bound.clone()) {
-                assert_eq!(previous, bound, "{}: element parameter {p}", definition.name);
+                assert_eq!(
+                    previous, bound,
+                    "{}: element parameter {p}",
+                    definition.name
+                );
             }
         }
     }
@@ -64,16 +80,21 @@ fn elements<'t>(definition: &Definition, tensor: impl Fn(&str, usize) -> &'t Ten
 pub fn workload(shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>) -> Workload {
     Workload {
         shapes: shapes.iter().map(|(n, v)| (n.clone(), *v)).collect(),
-        elems: elements.iter().map(|(n, e)| (n.clone(), e.clone())).collect(),
+        elems: elements
+            .iter()
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect(),
         ..Workload::default()
     }
 }
 /// Positional interpreter call; tensors may alias by naming one id twice.
 pub fn run(vm: &mut Interpreter<'_>, name: &str, args: &[Arg], shapes: &HashMap<String, i64>) {
     let tensors = &vm.tensors;
-    let elements = elements(entry(vm.program, name), |parameter, ordinal| match &args[ordinal] {
-        Arg::Tensor(id) => &tensors[*id],
-        Arg::Scalar(_) => panic!("{name}.{parameter} is a tensor"),
+    let elements = elements(entry(vm.program, name), |parameter, ordinal| {
+        match &args[ordinal] {
+            Arg::Tensor(id) => &tensors[*id],
+            Arg::Scalar(_) => panic!("{name}.{parameter} is a tensor"),
+        }
     });
     vm.run(name, args, &workload(shapes, &elements))
         .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -89,7 +110,9 @@ pub fn allocate(
         .params
         .iter()
         .filter_map(|param| {
-            let Ty::Tensor(tensor) = &param.ty else { return None };
+            let Ty::Tensor(tensor) = &param.ty else {
+                return None;
+            };
             let dtype = match &tensor.elem {
                 Elem::Dtype(d) => *d,
                 Elem::Param(p) => dtype(p),
@@ -97,7 +120,10 @@ pub fn allocate(
             };
             let shape = extents(tensor, shapes);
             let count = shape.iter().product();
-            Some((param.name.clone(), TensorData::dense(dtype, shape, vec![0.; count])))
+            Some((
+                param.name.clone(),
+                TensorData::dense(dtype, shape, vec![0.; count]),
+            ))
         })
         .collect()
 }
@@ -111,7 +137,9 @@ pub fn fill(tensor: &mut TensorData, values: impl IntoIterator<Item = f64>) {
     assert_eq!(count, tensor.shape().iter().product::<usize>());
 }
 pub fn values(tensor: &TensorData) -> Vec<f32> {
-    (0..tensor.shape().iter().product()).map(|flat| tensor.get(flat) as f32).collect()
+    (0..tensor.shape().iter().product())
+        .map(|flat| tensor.get(flat) as f32)
+        .collect()
 }
 
 struct Bound<'a> {
@@ -173,20 +201,28 @@ impl Backend<'_> {
             Backend::Metal(compiler) => {
                 let mut plan = compiler.compile_entry(name, shapes, &elements).unwrap();
                 let device = compiler.device();
-                let mut bound = Bound { buffers: HashMap::new(), scalars };
+                let mut bound = Bound {
+                    buffers: HashMap::new(),
+                    scalars,
+                };
                 for (parameter, tensor) in tensors.iter() {
                     let planes = match tensor {
                         TensorData::Dense { .. } => vec![""],
-                        TensorData::Packed { repr, .. } => repr.planes().iter().map(|p| p.name).collect(),
+                        TensorData::Packed { repr, .. } => {
+                            repr.planes().iter().map(|p| p.name).collect()
+                        }
                     };
                     let buffers = planes
                         .into_iter()
                         .zip(tensor.device_bytes())
-                        .map(|(plane, bytes)| (plane.to_string(), device.buffer_from(&bytes).unwrap()))
+                        .map(|(plane, bytes)| {
+                            (plane.to_string(), device.buffer_from(&bytes).unwrap())
+                        })
                         .collect();
                     bound.buffers.insert(parameter.clone(), buffers);
                 }
-                plan.execute(&bound).unwrap_or_else(|e| panic!("{name} on metal: {e}"));
+                plan.execute(&bound)
+                    .unwrap_or_else(|e| panic!("{name} on metal: {e}"));
                 for (parameter, tensor) in tensors.iter_mut() {
                     if matches!(tensor, TensorData::Dense { .. }) {
                         let buffer = &bound.buffers[parameter][""];
@@ -197,7 +233,13 @@ impl Backend<'_> {
                 }
                 let kernel = plan.kernel().unwrap();
                 let selection = kernel.borrow().selection().clone();
-                Some((selection, Workload { numerics: compiler.settings().numerics, ..workload(shapes, &elements) }))
+                Some((
+                    selection,
+                    Workload {
+                        numerics: compiler.settings().numerics,
+                        ..workload(shapes, &elements)
+                    },
+                ))
             }
         }
     }

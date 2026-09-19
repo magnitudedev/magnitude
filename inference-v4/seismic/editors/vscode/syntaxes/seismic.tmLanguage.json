@@ -5,19 +5,27 @@
   "patterns": [
     { "name": "comment.line.number-sign.seismic", "match": "#.*$" },
     {
-      "match": "\\b(fn|construct|lower)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "\\b(fn|lower)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": { "name": "storage.type.function.seismic" },
         "2": { "name": "entity.name.function.seismic" }
       }
     },
-    { "name": "keyword.control.seismic", "match": "\\b(?:fn|construct|lower|portable|for|in|if|else)\\b" },
+    {
+      "name": "keyword.control.seismic",
+      "match": "\\b(?:fn|lower|admit|where|for|in|if|else|let|mut|parallel|ordered|pipeline|stage|yield|return|merge|publish)\\b"
+    },
+    { "name": "storage.modifier.seismic", "match": "\\b(?:out|inout)\\b" },
+    { "name": "keyword.other.seismic", "match": "\\b(?:alias|to|identity)\\b" },
     { "name": "keyword.operator.word.seismic", "match": "\\b(?:and|or|not)\\b" },
     { "name": "constant.language.seismic", "match": "\\b(?:true|false|inf)\\b" },
-    { "name": "storage.type.seismic", "match": "\\b(?:tile|tensor|index|f32|bf16|f16|i32|u32|bool)\\b" },
+    { "name": "support.type.backend.seismic", "match": "\\b(?:cpu|cuda|metal)(?=\\s*\\.)" },
+    { "name": "support.constant.backend.seismic", "match": "(?<=\\bfor\\s)(?:cpu|cuda|metal)\\b" },
+    { "name": "storage.type.seismic", "match": "\\b(?:tile|tensor|view|index|void|f32|bf16|f16|i32|u32|bool)\\b" },
+    { "name": "entity.name.type.parameter.seismic", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" },
     { "name": "constant.numeric.seismic", "match": "\\b(?:0[xX][0-9a-fA-F_]+|[0-9][0-9_]*(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\b" },
     { "name": "entity.name.function.call.seismic", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()" },
-    { "name": "keyword.operator.seismic", "match": "(?:->|<<|>>|==|!=|<=|>=|[+*/%&|^~<>=-])" },
+    { "name": "keyword.operator.seismic", "match": "(?:->|\\.\\.|<<|>>|==|!=|<=|>=|\\+=|-=|\\*=|[+*/%&|^~<>=-])" },
     { "name": "punctuation.section.brackets.seismic", "match": "[\\[\\]()]" },
     { "name": "punctuation.separator.seismic", "match": "[:,;.]" }
   ]

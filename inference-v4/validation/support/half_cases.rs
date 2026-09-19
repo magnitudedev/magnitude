@@ -4,7 +4,6 @@
 use seismic_lang::{
     lowered_ir::LoweredIr,
     program::{compile, SourceFile},
-    Scope,
 };
 use std::collections::HashMap;
 fn half_value(bits: u16) -> f32 {
@@ -25,14 +24,10 @@ fn half_value(bits: u16) -> f32 {
 }
 pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) {
     let text="fn encode[N](x: tensor[N] f32, out: tensor[N] f16):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n\nfn decode[N](x: tensor[N] f16, out: tensor[N] f32):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n";
-    let program = compile(
-        &[SourceFile {
-            path: "half.seismic.portable".into(),
-            scope: Scope::Portable,
-            text: text.into(),
-        }],
-        &[],
-    )
+    let program = compile(&[SourceFile {
+        path: "half.seismic".into(),
+        text: text.into(),
+    }])
     .unwrap();
     let input = (0..=u16::MAX)
         .flat_map(u16::to_le_bytes)

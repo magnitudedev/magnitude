@@ -7,7 +7,9 @@
 use super::{Constraint, Factor, Interval, SelectionError};
 use magnitude_solver::model::{Constraint as Rel, Cost, Literal};
 use magnitude_solver::{Domain, Model, ModelBuilder, VarId};
-use seismic_lang::family::{CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, Witness};
+use seismic_lang::family::{
+    CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, Witness,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -48,7 +50,9 @@ fn defect(message: impl Into<String>) -> SelectionError {
 
 pub(super) fn solver_error(error: magnitude_solver::Error) -> SelectionError {
     match error {
-        magnitude_solver::Error::Overflow(m) => SelectionError::AnalysisUnavailable(format!("estimate overflow: {m}")),
+        magnitude_solver::Error::Overflow(m) => {
+            SelectionError::AnalysisUnavailable(format!("estimate overflow: {m}"))
+        }
         other => defect(format!("solver: {other}")),
     }
 }
@@ -82,18 +86,39 @@ struct Builder<'f> {
 }
 
 impl<'f> Builder<'f> {
-    fn variable(&mut self, name: String, domain: Domain, inactive: i64, activity: &[Literal]) -> VarId {
+    fn variable(
+        &mut self,
+        name: String,
+        domain: Domain,
+        inactive: i64,
+        activity: &[Literal],
+    ) -> VarId {
         let var = self.b.variable(name, domain);
         self.inactive.push(inactive);
         for active in activity {
-            self.b.constraint(Rel::InactiveValue { active: *active, variable: var, inactive });
+            self.b.constraint(Rel::InactiveValue {
+                active: *active,
+                variable: var,
+                inactive,
+            });
         }
         var
     }
 
     fn checked(&self, c: CandidateRef) -> Result<(), SelectionError> {
-        let known = self.family.occurrences.get(c.occurrence.0 as usize).is_some_and(|o| (c.candidate as usize) < o.candidates.len());
-        if known { Ok(()) } else { Err(defect(format!("unknown candidate {}.{}", c.occurrence.0, c.candidate))) }
+        let known = self
+            .family
+            .occurrences
+            .get(c.occurrence.0 as usize)
+            .is_some_and(|o| (c.candidate as usize) < o.candidates.len());
+        if known {
+            Ok(())
+        } else {
+            Err(defect(format!(
+                "unknown candidate {}.{}",
+                c.occurrence.0, c.candidate
+            )))
+        }
     }
 
     /// Choice literals whose conjunction is "`c` and all its ancestors are selected".
@@ -115,11 +140,18 @@ impl<'f> Builder<'f> {
     }
 
     fn site(&self, id: SiteId) -> Result<Slot, SelectionError> {
-        self.sites.get(id.0 as usize).cloned().ok_or_else(|| defect(format!("unknown site {}", id.0)))
+        self.sites
+            .get(id.0 as usize)
+            .cloned()
+            .ok_or_else(|| defect(format!("unknown site {}", id.0)))
     }
 
     fn site_activity(&self, id: SiteId) -> Result<Vec<Literal>, SelectionError> {
-        let site = self.family.sites.get(id.0 as usize).ok_or_else(|| defect(format!("unknown site {}", id.0)))?;
+        let site = self
+            .family
+            .sites
+            .get(id.0 as usize)
+            .ok_or_else(|| defect(format!("unknown site {}", id.0)))?;
         Ok(self.activity(site.owner))
     }
 
@@ -127,7 +159,13 @@ impl<'f> Builder<'f> {
     fn never(&mut self, guards: Vec<Literal>) {
         let var = self.b.variable("never", Domain::singleton(0));
         self.inactive.push(0);
-        self.b.guarded_constraint(guards, Rel::InDomain { variable: var, domain: Domain::singleton(1) });
+        self.b.guarded_constraint(
+            guards,
+            Rel::InDomain {
+                variable: var,
+                domain: Domain::singleton(1),
+            },
+        );
     }
 
     /// Product of the scope's domains; `None` when a scope site has no admissible value.
@@ -137,7 +175,11 @@ impl<'f> Builder<'f> {
         // Per scope position: constant, or index into `vars`.
         let mut positions = Vec::with_capacity(scope.len());
         for id in scope {
-            match &self.sites.get(id.0 as usize).ok_or_else(|| defect(format!("unknown site {}", id.0)))? {
+            match &self
+                .sites
+                .get(id.0 as usize)
+                .ok_or_else(|| defect(format!("unknown site {}", id.0)))?
+            {
                 Slot::Dead => return Ok(None),
                 Slot::Const(v) => positions.push(Err(*v)),
                 Slot::Var { var, values } => match vars.iter().position(|v| v == var) {
@@ -150,15 +192,26 @@ impl<'f> Builder<'f> {
                 },
             }
         }
-        let count = domains.iter().try_fold(1usize, |n, d| n.checked_mul(d.len())).filter(|n| *n <= TABLE_LIMIT);
+        let count = domains
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(d.len()))
+            .filter(|n| *n <= TABLE_LIMIT);
         let Some(count) = count else {
-            return Err(SelectionError::AnalysisUnavailable(format!("{what}: scope product exceeds {TABLE_LIMIT} tuples")));
+            return Err(SelectionError::AnalysisUnavailable(format!(
+                "{what}: scope product exceeds {TABLE_LIMIT} tuples"
+            )));
         };
         let mut rows = Vec::with_capacity(count);
         let mut index = vec![0usize; domains.len()];
         loop {
             let tuple: Vec<i64> = index.iter().zip(&domains).map(|(i, d)| d[*i]).collect();
-            let args = positions.iter().map(|p| match p { Ok(i) => tuple[*i], Err(v) => *v }).collect();
+            let args = positions
+                .iter()
+                .map(|p| match p {
+                    Ok(i) => tuple[*i],
+                    Err(v) => *v,
+                })
+                .collect();
             rows.push((tuple, args));
             let mut axis = domains.len();
             loop {
@@ -177,17 +230,37 @@ impl<'f> Builder<'f> {
 }
 
 impl<'f> Export<'f> {
-    pub fn build(family: &'f Family, domains: &BTreeMap<SiteId, Vec<i64>>, constraints: &[Constraint], intervals: &[Interval], factors: &[Factor]) -> Result<Export<'f>, SelectionError> {
+    pub fn build(
+        family: &'f Family,
+        domains: &BTreeMap<SiteId, Vec<i64>>,
+        constraints: &[Constraint],
+        intervals: &[Interval],
+        factors: &[Factor],
+    ) -> Result<Export<'f>, SelectionError> {
         match family.occurrences.first() {
-            None => return Err(SelectionError::InvalidSource(format!("entry `{}` has no occurrence", family.entry))),
+            None => {
+                return Err(SelectionError::InvalidSource(format!(
+                    "entry `{}` has no occurrence",
+                    family.entry
+                )))
+            }
             Some(root) if root.candidates.is_empty() => {
-                return Err(SelectionError::MissingCoverage(format!("entry `{}` has no implementation adopted for target `{}`", family.entry, family.target)))
+                return Err(SelectionError::MissingCoverage(format!(
+                    "entry `{}` has no applicable implementation for target `{}`",
+                    family.entry, family.target
+                )))
             }
             Some(_) => (),
         }
         let mut b = ModelBuilder::new();
         b.units("ns");
-        let mut x = Builder { family, b, choices: vec![None; family.occurrences.len()], sites: Vec::new(), inactive: Vec::new() };
+        let mut x = Builder {
+            family,
+            b,
+            choices: vec![None; family.occurrences.len()],
+            sites: Vec::new(),
+            inactive: Vec::new(),
+        };
 
         // Implementation choices. Activity needs ancestors' variables, so allocate first.
         for (i, o) in family.occurrences.iter().enumerate() {
@@ -198,7 +271,8 @@ impl<'f> Export<'f> {
                 x.checked(p)?;
             }
             if o.candidates.len() > 1 {
-                let domain = Domain::interval(0, o.candidates.len() as i64 - 1).map_err(solver_error)?;
+                let domain =
+                    Domain::interval(0, o.candidates.len() as i64 - 1).map_err(solver_error)?;
                 x.choices[i] = Some(x.b.variable(format!("choice{i}"), domain));
                 x.inactive.push(0);
             }
@@ -209,7 +283,11 @@ impl<'f> Export<'f> {
             match x.choices[i] {
                 Some(var) => {
                     for active in activity {
-                        x.b.constraint(Rel::InactiveValue { active, variable: var, inactive: 0 });
+                        x.b.constraint(Rel::InactiveValue {
+                            active,
+                            variable: var,
+                            inactive: 0,
+                        });
                     }
                 }
                 None if o.candidates.is_empty() => x.never(activity),
@@ -223,9 +301,19 @@ impl<'f> Export<'f> {
                 return Err(defect(format!("site {} stored at index {i}", site.id.0)));
             }
             x.checked(site.owner)?;
-            let backend = domains.get(&site.id).ok_or_else(|| defect(format!("backend bound no domain for site {i}")))?;
+            let backend = domains
+                .get(&site.id)
+                .ok_or_else(|| defect(format!("backend bound no domain for site {i}")))?;
             let own = &family.candidate(site.owner).requirements;
-            let mut values: Vec<i64> = backend.iter().copied().filter(|v| own.iter().filter(|r| required_site(r) == site.id).all(|r| admits(r, *v))).collect();
+            let mut values: Vec<i64> = backend
+                .iter()
+                .copied()
+                .filter(|v| {
+                    own.iter()
+                        .filter(|r| required_site(r) == site.id)
+                        .all(|r| admits(r, *v))
+                })
+                .collect();
             values.sort_unstable();
             values.dedup();
             let activity = x.activity(site.owner);
@@ -237,7 +325,12 @@ impl<'f> Export<'f> {
                 [v] => Slot::Const(*v),
                 [first, ..] => {
                     let first = *first;
-                    let var = x.variable(format!("site{i}"), Domain::set(values.iter().copied()), first, &activity);
+                    let var = x.variable(
+                        format!("site{i}"),
+                        Domain::set(values.iter().copied()),
+                        first,
+                        &activity,
+                    );
                     Slot::Var { var, values }
                 }
             };
@@ -247,10 +340,19 @@ impl<'f> Export<'f> {
         // Requirements a candidate places on a site it does not own (structural parameters).
         for o in &family.occurrences {
             for (k, candidate) in o.candidates.iter().enumerate() {
-                let me = CandidateRef { occurrence: o.id, candidate: k as u32 };
+                let me = CandidateRef {
+                    occurrence: o.id,
+                    candidate: k as u32,
+                };
                 for r in &candidate.requirements {
                     let id = required_site(r);
-                    if family.sites.get(id.0 as usize).ok_or_else(|| defect(format!("requirement on unknown site {}", id.0)))?.owner == me {
+                    if family
+                        .sites
+                        .get(id.0 as usize)
+                        .ok_or_else(|| defect(format!("requirement on unknown site {}", id.0)))?
+                        .owner
+                        == me
+                    {
                         continue;
                     }
                     let mut guards = x.activity(me);
@@ -263,11 +365,18 @@ impl<'f> Export<'f> {
                             }
                         }
                         Slot::Var { var, values } => {
-                            let allowed: Vec<i64> = values.iter().copied().filter(|v| admits(r, *v)).collect();
+                            let allowed: Vec<i64> =
+                                values.iter().copied().filter(|v| admits(r, *v)).collect();
                             if allowed.is_empty() {
                                 x.never(guards);
                             } else if allowed.len() < values.len() {
-                                x.b.guarded_constraint(guards, Rel::InDomain { variable: var, domain: Domain::set(allowed) });
+                                x.b.guarded_constraint(
+                                    guards,
+                                    Rel::InDomain {
+                                        variable: var,
+                                        domain: Domain::set(allowed),
+                                    },
+                                );
                             }
                         }
                     }
@@ -277,15 +386,36 @@ impl<'f> Export<'f> {
 
         // Fusion intervals and the exact cover of every active sequence.
         let mut selections = Vec::with_capacity(intervals.len());
-        let mut containing: Vec<Vec<Vec<VarId>>> = family.sequences.iter().map(|s| vec![Vec::new(); s.units.len()]).collect();
+        let mut containing: Vec<Vec<Vec<VarId>>> = family
+            .sequences
+            .iter()
+            .map(|s| vec![Vec::new(); s.units.len()])
+            .collect();
         let mut seen = BTreeMap::new();
         for (i, interval) in intervals.iter().enumerate() {
-            let sequence = family.sequences.get(interval.sequence.0 as usize).ok_or_else(|| defect(format!("interval {i} names unknown sequence {}", interval.sequence.0)))?;
+            let sequence = family
+                .sequences
+                .get(interval.sequence.0 as usize)
+                .ok_or_else(|| {
+                    defect(format!(
+                        "interval {i} names unknown sequence {}",
+                        interval.sequence.0
+                    ))
+                })?;
             if interval.start >= interval.end || interval.end as usize > sequence.units.len() {
-                return Err(defect(format!("interval {i} [{}, {}) is outside sequence {}", interval.start, interval.end, sequence.id.0)));
+                return Err(defect(format!(
+                    "interval {i} [{}, {}) is outside sequence {}",
+                    interval.start, interval.end, sequence.id.0
+                )));
             }
-            if seen.insert((interval.sequence, interval.start, interval.end), i).is_some() {
-                return Err(defect(format!("sequence {} interval [{}, {}) has two realizations", sequence.id.0, interval.start, interval.end)));
+            if seen
+                .insert((interval.sequence, interval.start, interval.end), i)
+                .is_some()
+            {
+                return Err(defect(format!(
+                    "sequence {} interval [{}, {}) has two realizations",
+                    sequence.id.0, interval.start, interval.end
+                )));
             }
             x.checked(sequence.owner)?;
             let activity = x.activity(sequence.owner);
@@ -297,7 +427,10 @@ impl<'f> Export<'f> {
             for required in &interval.requires {
                 x.checked(*required)?;
                 for consequence in x.activity(*required) {
-                    x.b.constraint(Rel::Implies { premise: selected, consequence });
+                    x.b.constraint(Rel::Implies {
+                        premise: selected,
+                        consequence,
+                    });
                 }
             }
             for (left, right) in &interval.equal_sites {
@@ -311,9 +444,16 @@ impl<'f> Export<'f> {
                             x.never(guards);
                         }
                     }
-                    (Slot::Var { var, values }, Slot::Const(v)) | (Slot::Const(v), Slot::Var { var, values }) => {
+                    (Slot::Var { var, values }, Slot::Const(v))
+                    | (Slot::Const(v), Slot::Var { var, values }) => {
                         if values.contains(&v) {
-                            x.b.guarded_constraint(guards, Rel::InDomain { variable: var, domain: Domain::singleton(v) });
+                            x.b.guarded_constraint(
+                                guards,
+                                Rel::InDomain {
+                                    variable: var,
+                                    domain: Domain::singleton(v),
+                                },
+                            );
                         } else {
                             x.never(guards);
                         }
@@ -329,7 +469,10 @@ impl<'f> Export<'f> {
         }
         for ((i, sequence), units) in family.sequences.iter().enumerate().zip(containing) {
             if sequence.id.0 as usize != i {
-                return Err(defect(format!("sequence {} is not stored at its index", sequence.id.0)));
+                return Err(defect(format!(
+                    "sequence {} is not stored at its index",
+                    sequence.id.0
+                )));
             }
             x.checked(sequence.owner)?;
             let activity = x.activity(sequence.owner);
@@ -345,7 +488,9 @@ impl<'f> Export<'f> {
         // Backend legality, tabulated over exactly its scope.
         for constraint in constraints {
             let what = format!("constraint `{}`", constraint.reason);
-            let Some(table) = x.rows(&constraint.scope, &what)? else { continue };
+            let Some(table) = x.rows(&constraint.scope, &what)? else {
+                continue;
+            };
             let mut guards = Vec::new();
             for c in &constraint.guard {
                 x.checked(*c)?;
@@ -355,18 +500,31 @@ impl<'f> Export<'f> {
                 guards.extend(x.site_activity(*id)?);
             }
             let total = table.rows.len();
-            let tuples: Vec<Vec<i64>> = table.rows.into_iter().filter(|(_, args)| (constraint.holds)(args)).map(|(tuple, _)| tuple).collect();
+            let tuples: Vec<Vec<i64>> = table
+                .rows
+                .into_iter()
+                .filter(|(_, args)| (constraint.holds)(args))
+                .map(|(tuple, _)| tuple)
+                .collect();
             if tuples.is_empty() {
                 x.never(guards);
             } else if tuples.len() < total {
-                x.b.guarded_constraint(guards, Rel::Table { variables: table.vars, tuples });
+                x.b.guarded_constraint(
+                    guards,
+                    Rel::Table {
+                        variables: table.vars,
+                        tuples,
+                    },
+                );
             }
         }
 
         // Local cost factors, each over exactly its scope.
         for factor in factors {
             let what = format!("factor `{}`", factor.label);
-            let Some(table) = x.rows(&factor.scope, &what)? else { continue };
+            let Some(table) = x.rows(&factor.scope, &what)? else {
+                continue;
+            };
             let mut guards = Vec::new();
             for c in &factor.guard {
                 x.checked(*c)?;
@@ -376,24 +534,44 @@ impl<'f> Export<'f> {
                 guards.extend(x.site_activity(*id)?);
             }
             for r in &factor.intervals {
-                let (z, ..) = selections.get(r.0 as usize).ok_or_else(|| defect(format!("{what} names unknown interval {}", r.0)))?;
+                let (z, ..) = selections
+                    .get(r.0 as usize)
+                    .ok_or_else(|| defect(format!("{what} names unknown interval {}", r.0)))?;
                 guards.push(Literal::new(*z, 1));
             }
             let mut entries = Vec::with_capacity(table.rows.len());
             for (tuple, args) in table.rows {
-                let cost = (factor.cost)(&args).map_err(|e| SelectionError::AnalysisUnavailable(format!("{what} at {args:?}: {e}")))?;
+                let cost = (factor.cost)(&args).map_err(|e| {
+                    SelectionError::AnalysisUnavailable(format!("{what} at {args:?}: {e}"))
+                })?;
                 entries.push((tuple, cost));
             }
             let cost = match entries.as_slice() {
                 [(tuple, cost)] if tuple.is_empty() => Cost::Constant(*cost),
-                _ => Cost::Table { variables: table.vars, entries },
+                _ => Cost::Table {
+                    variables: table.vars,
+                    entries,
+                },
             };
             x.b.guarded_cost(guards, cost);
         }
 
-        let Builder { b, choices, sites, inactive, .. } = x;
+        let Builder {
+            b,
+            choices,
+            sites,
+            inactive,
+            ..
+        } = x;
         let model = Arc::new(b.build().map_err(solver_error)?);
-        Ok(Export { model, family, choices, sites, intervals: selections, inactive })
+        Ok(Export {
+            model,
+            family,
+            choices,
+            sites,
+            intervals: selections,
+            inactive,
+        })
     }
 
     pub fn family(&self) -> &'f Family {
@@ -411,7 +589,10 @@ impl<'f> Export<'f> {
 
     /// Every interval the backend offers for `sequence`, as `(start, end)`.
     pub fn offered(&self, sequence: SequenceId) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.intervals.iter().filter(move |(_, s, ..)| *s == sequence).map(|(_, _, start, end)| (*start, *end))
+        self.intervals
+            .iter()
+            .filter(move |(_, s, ..)| *s == sequence)
+            .map(|(_, _, start, end)| (*start, *end))
     }
 
     /// The witness a full solver assignment denotes: only active decisions appear.
@@ -424,7 +605,9 @@ impl<'f> Export<'f> {
                 Some(var) => values[var.0] as u32,
                 None => 0,
             };
-            let Some(candidate) = occurrence.candidates.get(choice as usize) else { continue };
+            let Some(candidate) = occurrence.candidates.get(choice as usize) else {
+                continue;
+            };
             witness.choices.insert(id, choice);
             for site in &candidate.sites {
                 match &self.sites[site.0 as usize] {
@@ -438,7 +621,12 @@ impl<'f> Export<'f> {
                 }
             }
             for sequence in &candidate.sequences {
-                let mut cover: Vec<(u32, u32)> = self.intervals.iter().filter(|(z, s, ..)| s == sequence && values[z.0] == 1).map(|(_, _, start, end)| (*start, *end)).collect();
+                let mut cover: Vec<(u32, u32)> = self
+                    .intervals
+                    .iter()
+                    .filter(|(z, s, ..)| s == sequence && values[z.0] == 1)
+                    .map(|(_, _, start, end)| (*start, *end))
+                    .collect();
                 cover.sort_unstable();
                 witness.covers.insert(*sequence, cover);
             }
@@ -456,36 +644,59 @@ impl<'f> Export<'f> {
         let mut pending = vec![OccurrenceId(0)];
         while let Some(id) = pending.pop() {
             let occurrence = self.family.occurrence(id);
-            let choice = *witness.choices.get(&id).ok_or_else(|| format!("active occurrence {} has no choice", id.0))?;
-            let candidate = occurrence.candidates.get(choice as usize).ok_or_else(|| format!("occurrence {} has no candidate {choice}", id.0))?;
+            let choice = *witness
+                .choices
+                .get(&id)
+                .ok_or_else(|| format!("active occurrence {} has no choice", id.0))?;
+            let candidate = occurrence
+                .candidates
+                .get(choice as usize)
+                .ok_or_else(|| format!("occurrence {} has no candidate {choice}", id.0))?;
             choices += 1;
             if let Some(var) = self.choices[id.0 as usize] {
                 values[var.0] = choice as i64;
             }
             for site in &candidate.sites {
-                let value = *witness.sites.get(site).ok_or_else(|| format!("active site {} has no value", site.0))?;
+                let value = *witness
+                    .sites
+                    .get(site)
+                    .ok_or_else(|| format!("active site {} has no value", site.0))?;
                 sites += 1;
                 match &self.sites[site.0 as usize] {
-                    Slot::Var { var, values: domain } if domain.contains(&value) => values[var.0] = value,
+                    Slot::Var {
+                        var,
+                        values: domain,
+                    } if domain.contains(&value) => values[var.0] = value,
                     Slot::Const(v) if *v == value => (),
                     _ => return Err(format!("site {} does not admit {value}", site.0)),
                 }
             }
             for sequence in &candidate.sequences {
-                let cover = witness.covers.get(sequence).ok_or_else(|| format!("active sequence {} has no cover", sequence.0))?;
+                let cover = witness
+                    .covers
+                    .get(sequence)
+                    .ok_or_else(|| format!("active sequence {} has no cover", sequence.0))?;
                 covers += 1;
                 for (start, end) in cover {
                     let (z, ..) = self
                         .intervals
                         .iter()
                         .find(|(_, s, a, b)| s == sequence && a == start && b == end)
-                        .ok_or_else(|| format!("sequence {} has no legal interval [{start}, {end})", sequence.0))?;
+                        .ok_or_else(|| {
+                            format!(
+                                "sequence {} has no legal interval [{start}, {end})",
+                                sequence.0
+                            )
+                        })?;
                     values[z.0] = 1;
                 }
             }
             pending.extend(candidate.children.iter().copied());
         }
-        if choices != witness.choices.len() || sites != witness.sites.len() || covers != witness.covers.len() {
+        if choices != witness.choices.len()
+            || sites != witness.sites.len()
+            || covers != witness.covers.len()
+        {
             return Err("witness assigns inactive occurrences, sites or sequences".into());
         }
         Ok(values)

@@ -3,162 +3,150 @@
 use seismic_lang::{
     program::{compile, SourceFile},
     sir::Program,
-    Scope,
 };
+
 pub fn sources() -> Vec<SourceFile> {
-    let embedded: &[(&str, &str, Scope)] = &[
-        ("lib/kernels/gelu.seismic.portable", include_str!("../lib/kernels/gelu.seismic.portable"), Scope::Portable),
-        ("lib/kernels/layer_norm.seismic.portable", include_str!("../lib/kernels/layer_norm.seismic.portable"), Scope::Portable),
-        ("lib/kernels/linear_bias.seismic.portable", include_str!("../lib/kernels/linear_bias.seismic.portable"), Scope::Portable),
-        ("lib/kernels/sampling.seismic.portable", include_str!("../lib/kernels/sampling.seismic.portable"), Scope::Portable),
-        ("lib/kernels/gguf_import.seismic.portable",include_str!("../lib/kernels/gguf_import.seismic.portable"),Scope::Portable),
+    let embedded: &[(&str, &str)] = &[
         (
-            "lib/kernels/embedding_row.seismic.portable",
-            include_str!("../lib/kernels/embedding_row.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/gelu.seismic",
+            include_str!("../lib/kernels/gelu.seismic"),
         ),
         (
-            "lib/kernels/kv_append.seismic.portable",
-            include_str!("../lib/kernels/kv_append.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/layer_norm.seismic",
+            include_str!("../lib/kernels/layer_norm.seismic"),
         ),
         (
-            "lib/kernels/rotary_prepare.seismic.portable",
-            include_str!("../lib/kernels/rotary_prepare.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/linear_bias.seismic",
+            include_str!("../lib/kernels/linear_bias.seismic"),
         ),
         (
-            "lib/constructs/matmul.seismic.cpu",
-            include_str!("../lib/constructs/matmul.seismic.cpu"),
-            Scope::Backend("cpu".into()),
+            "lib/kernels/sampling.seismic",
+            include_str!("../lib/kernels/sampling.seismic"),
         ),
         (
-            "lib/constructs/matmul.seismic.cuda",
-            include_str!("../lib/constructs/matmul.seismic.cuda"),
-            Scope::Backend("cuda".into()),
+            "lib/kernels/gguf_import.seismic",
+            include_str!("../lib/kernels/gguf_import.seismic"),
         ),
         (
-            "lib/constructs/matmul.seismic.metal",
-            include_str!("../lib/constructs/matmul.seismic.metal"),
-            Scope::Backend("metal".into()),
+            "lib/kernels/embedding_row.seismic",
+            include_str!("../lib/kernels/embedding_row.seismic"),
         ),
         (
-            "lib/constructs/matmul.seismic.portable",
-            include_str!("../lib/constructs/matmul.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/kv_append.seismic",
+            include_str!("../lib/kernels/kv_append.seismic"),
         ),
         (
-            "lib/kernels/argmax.seismic.portable",
-            include_str!("../lib/kernels/argmax.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/rotary_prepare.seismic",
+            include_str!("../lib/kernels/rotary_prepare.seismic"),
         ),
         (
-            "lib/kernels/attention.seismic.portable",
-            include_str!("../lib/kernels/attention.seismic.portable"),
-            Scope::Portable,
+            "lib/constructs/matmul-cpu.seismic",
+            include_str!("../lib/constructs/matmul-cpu.seismic"),
         ),
         (
-            "lib/kernels/attention_gate.seismic.portable",
-            include_str!("../lib/kernels/attention_gate.seismic.portable"),
-            Scope::Portable,
+            "lib/constructs/matmul-cuda.seismic",
+            include_str!("../lib/constructs/matmul-cuda.seismic"),
         ),
         (
-            "lib/kernels/attention_prepare.seismic.portable",
-            include_str!("../lib/kernels/attention_prepare.seismic.portable"),
-            Scope::Portable,
+            "lib/constructs/matmul-metal.seismic",
+            include_str!("../lib/constructs/matmul-metal.seismic"),
         ),
         (
-            "lib/kernels/delta_step.seismic.portable",
-            include_str!("../lib/kernels/delta_step.seismic.portable"),
-            Scope::Portable,
+            "lib/constructs/matmul.seismic",
+            include_str!("../lib/constructs/matmul.seismic"),
         ),
         (
-            "lib/kernels/elementwise.seismic.portable",
-            include_str!("../lib/kernels/elementwise.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/argmax.seismic",
+            include_str!("../lib/kernels/argmax.seismic"),
         ),
         (
-            "lib/kernels/embedding.seismic.portable",
-            include_str!("../lib/kernels/embedding.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/attention.seismic",
+            include_str!("../lib/kernels/attention.seismic"),
         ),
         (
-            "lib/kernels/gate_projection_add.seismic.portable",
-            include_str!("../lib/kernels/gate_projection_add.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/attention_gate.seismic",
+            include_str!("../lib/kernels/attention_gate.seismic"),
         ),
         (
-            "lib/kernels/gated_norm.seismic.portable",
-            include_str!("../lib/kernels/gated_norm.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/attention_prepare.seismic",
+            include_str!("../lib/kernels/attention_prepare.seismic"),
         ),
         (
-            "lib/kernels/gated_projection.seismic.portable",
-            include_str!("../lib/kernels/gated_projection.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/delta_step.seismic",
+            include_str!("../lib/kernels/delta_step.seismic"),
         ),
         (
-            "lib/kernels/linear.seismic.portable",
-            include_str!("../lib/kernels/linear.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/elementwise.seismic",
+            include_str!("../lib/kernels/elementwise.seismic"),
         ),
         (
-            "lib/kernels/logits.seismic.portable",
-            include_str!("../lib/kernels/logits.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/embedding.seismic",
+            include_str!("../lib/kernels/embedding.seismic"),
         ),
         (
-            "lib/kernels/norm_gated_projection.seismic.portable",
-            include_str!("../lib/kernels/norm_gated_projection.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/gate_projection_add.seismic",
+            include_str!("../lib/kernels/gate_projection_add.seismic"),
         ),
         (
-            "lib/kernels/norm_logits.seismic.portable",
-            include_str!("../lib/kernels/norm_logits.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/gated_norm.seismic",
+            include_str!("../lib/kernels/gated_norm.seismic"),
         ),
         (
-            "lib/kernels/norm_projection.seismic.portable",
-            include_str!("../lib/kernels/norm_projection.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/gated_projection.seismic",
+            include_str!("../lib/kernels/gated_projection.seismic"),
         ),
         (
-            "lib/kernels/projection.seismic.portable",
-            include_str!("../lib/kernels/projection.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/linear.seismic",
+            include_str!("../lib/kernels/linear.seismic"),
         ),
         (
-            "lib/kernels/projection_add.seismic.portable",
-            include_str!("../lib/kernels/projection_add.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/logits.seismic",
+            include_str!("../lib/kernels/logits.seismic"),
         ),
         (
-            "lib/kernels/recurrent_prepare.seismic.portable",
-            include_str!("../lib/kernels/recurrent_prepare.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/norm_gated_projection.seismic",
+            include_str!("../lib/kernels/norm_gated_projection.seismic"),
         ),
         (
-            "lib/kernels/rms_norm.seismic.portable",
-            include_str!("../lib/kernels/rms_norm.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/norm_logits.seismic",
+            include_str!("../lib/kernels/norm_logits.seismic"),
         ),
         (
-            "lib/kernels/weight_import.seismic.portable",
-            include_str!("../lib/kernels/weight_import.seismic.portable"),
-            Scope::Portable,
+            "lib/kernels/norm_projection.seismic",
+            include_str!("../lib/kernels/norm_projection.seismic"),
+        ),
+        (
+            "lib/kernels/projection.seismic",
+            include_str!("../lib/kernels/projection.seismic"),
+        ),
+        (
+            "lib/kernels/projection_add.seismic",
+            include_str!("../lib/kernels/projection_add.seismic"),
+        ),
+        (
+            "lib/kernels/recurrent_prepare.seismic",
+            include_str!("../lib/kernels/recurrent_prepare.seismic"),
+        ),
+        (
+            "lib/kernels/rms_norm.seismic",
+            include_str!("../lib/kernels/rms_norm.seismic"),
+        ),
+        (
+            "lib/kernels/weight_import.seismic",
+            include_str!("../lib/kernels/weight_import.seismic"),
         ),
     ];
     embedded
         .iter()
-        .map(|(path, text, scope)| SourceFile {
+        .map(|(path, text)| SourceFile {
             path: (*path).into(),
             text: (*text).into(),
-            scope: scope.clone(),
         })
         .collect()
 }
+
 pub fn program() -> Result<Program, String> {
-    compile(&sources(), &["cpu".into(), "cuda".into(), "metal".into()]).map_err(|errors| {
+    compile(&sources()).map_err(|errors| {
         errors
             .iter()
             .map(|e| e.render())
@@ -166,6 +154,7 @@ pub fn program() -> Result<Program, String> {
             .join("\n")
     })
 }
+
 #[cfg(test)]
 mod tests {
     #[test]

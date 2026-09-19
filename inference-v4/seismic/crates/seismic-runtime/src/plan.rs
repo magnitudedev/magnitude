@@ -7,13 +7,12 @@ use crate::{Buffer, Device, ExecutionObservation, Kernel};
 #[cfg(target_os = "macos")]
 use crate::{DeviceTimingScope, Executable};
 use seismic_compiler::selection::{Budget, Strategy};
-use seismic_lang::{family::{Numerics, Workload}, sir::Program};
 use seismic_lang::types::Elem;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    rc::Rc,
+use seismic_lang::{
+    family::{Numerics, Workload},
+    sir::Program,
 };
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 pub trait Bindings {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
     fn scalar(&self, name: &str) -> Option<f64>;
@@ -29,14 +28,23 @@ pub struct CompiledPlan {
     enclosing: Rc<Enclosing>,
 }
 impl CompiledPlan {
-    pub fn shares_compilation(&self, other: &Self) -> bool { Rc::ptr_eq(&self.enclosing, &other.enclosing) }
-    pub fn step_count(&self) -> usize { 1 }
+    pub fn shares_compilation(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.enclosing, &other.enclosing)
+    }
+    pub fn step_count(&self) -> usize {
+        1
+    }
     /// Kernels natively compiled so far; selection runs at the first preparation.
-    pub fn kernel_count(&self) -> usize { usize::from(self.enclosing.kernel.borrow().is_some()) }
+    pub fn kernel_count(&self) -> usize {
+        usize::from(self.enclosing.kernel.borrow().is_some())
+    }
     pub fn execute(&mut self, bindings: &dyn Bindings) -> Result<(), String> {
         self.prepare(bindings)?.execute_sequential()
     }
-    pub fn execute_observed(&mut self, bindings: &dyn Bindings) -> Result<Vec<StepObservation>, String> {
+    pub fn execute_observed(
+        &mut self,
+        bindings: &dyn Bindings,
+    ) -> Result<Vec<StepObservation>, String> {
         self.prepare(bindings)?.execute_steps_observed()
     }
     pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
@@ -50,7 +58,9 @@ impl CompiledPlan {
     pub fn execute_buffers(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
         let kernel = self.enclosing.kernel()?;
         let mut submission = {
-            let abi = kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+            let abi = kernel
+                .try_borrow()
+                .map_err(|_| "shared kernel is already executing")?;
             if buffers.len() != abi.buffers().len() || scalars.len() != abi.scalars().len() {
                 return Err("entry binding count differs from its logical ABI".into());
             }
@@ -58,7 +68,12 @@ impl CompiledPlan {
                 invocations: vec![BoundInvocation {
                     entry: self.enclosing.entry.clone(),
                     kernel: kernel.clone(),
-                    buffers: abi.buffers().iter().zip(buffers).map(|(s, b)| b.view(0..s.bytes)).collect::<Result<_, _>>()?,
+                    buffers: abi
+                        .buffers()
+                        .iter()
+                        .zip(buffers)
+                        .map(|(s, b)| b.view(0..s.bytes))
+                        .collect::<Result<_, _>>()?,
                     scalars: scalars.to_vec(),
                 }],
             }
@@ -126,7 +141,11 @@ impl Submission {
         let kernels = self
             .invocations
             .iter()
-            .map(|i| i.kernel.try_borrow().map_err(|_| "shared kernel is already executing".to_string()))
+            .map(|i| {
+                i.kernel
+                    .try_borrow()
+                    .map_err(|_| "shared kernel is already executing".to_string())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         for (kernel, bound) in kernels.iter().zip(&self.invocations) {
             kernel
@@ -141,19 +160,34 @@ impl Submission {
             });
         }
         // A CPU or CUDA batch runs in source order; each kernel reports its own interval.
-        let sequential = |kernels: Vec<std::cell::Ref<'_, Kernel>>| -> Result<ExecutionObservation, String> {
-            drop(kernels);
-            let (mut seconds, mut scope) = (0.0, None);
-            for bound in &self.invocations {
-                let mut kernel = bound.kernel.try_borrow_mut().map_err(|_| "shared kernel is already executing")?;
-                let observed = kernel.execute_observed(&bound.buffers, &bound.scalars).map_err(|e| format!("{}: {e}", bound.entry))?;
-                seconds += observed.device_seconds.ok_or("an observed execution reported no device time")?;
-                scope = observed.device_scope;
-            }
-            Ok(ExecutionObservation { host_seconds: start.elapsed().as_secs_f64(), device_seconds: Some(seconds), device_scope: scope })
-        };
+        let sequential =
+            |kernels: Vec<std::cell::Ref<'_, Kernel>>| -> Result<ExecutionObservation, String> {
+                drop(kernels);
+                let (mut seconds, mut scope) = (0.0, None);
+                for bound in &self.invocations {
+                    let mut kernel = bound
+                        .kernel
+                        .try_borrow_mut()
+                        .map_err(|_| "shared kernel is already executing")?;
+                    let observed = kernel
+                        .execute_observed(&bound.buffers, &bound.scalars)
+                        .map_err(|e| format!("{}: {e}", bound.entry))?;
+                    seconds += observed
+                        .device_seconds
+                        .ok_or("an observed execution reported no device time")?;
+                    scope = observed.device_scope;
+                }
+                Ok(ExecutionObservation {
+                    host_seconds: start.elapsed().as_secs_f64(),
+                    device_seconds: Some(seconds),
+                    device_scope: scope,
+                })
+            };
         #[cfg(target_os = "macos")]
-        let one_command_buffer = matches!(kernels.first().map(|kernel| &kernel.executable), Some(Executable::Metal { .. }));
+        let one_command_buffer = matches!(
+            kernels.first().map(|kernel| &kernel.executable),
+            Some(Executable::Metal { .. })
+        );
         #[cfg(not(target_os = "macos"))]
         let one_command_buffer = false;
         if !one_command_buffer {
@@ -163,7 +197,9 @@ impl Submission {
         return Err("no batched backend exists on this host".into());
         #[cfg(target_os = "macos")]
         {
-            let Some(Executable::Metal { device, .. }) = kernels.first().map(|kernel| &kernel.executable) else {
+            let Some(Executable::Metal { device, .. }) =
+                kernels.first().map(|kernel| &kernel.executable)
+            else {
                 return Err("a batched Metal submission lost its first kernel".into());
             };
             let invocations = kernels
@@ -171,11 +207,18 @@ impl Submission {
                 .zip(&self.invocations)
                 .map(|(kernel, bound)| {
                     let Executable::Metal { pipeline, .. } = &kernel.executable else {
-                        return Err(format!("{}: a batched Metal submission holds a kernel of another backend", bound.entry));
+                        return Err(format!(
+                            "{}: a batched Metal submission holds a kernel of another backend",
+                            bound.entry
+                        ));
                     };
                     Ok(seismic_metal::runtime::Invocation {
                         pipeline,
-                        buffers: bound.buffers.iter().map(Buffer::metal).collect::<Result<_, _>>()?,
+                        buffers: bound
+                            .buffers
+                            .iter()
+                            .map(Buffer::metal)
+                            .collect::<Result<_, _>>()?,
                         scalars: pipeline.emitted.encode_scalars(&bound.scalars)?,
                     })
                 })
@@ -215,10 +258,22 @@ impl Enclosing {
         if let Some(kernel) = self.kernel.borrow().as_ref() {
             return Ok(kernel.clone());
         }
-        let selected = self.device.select(&self.program, &self.entry, &self.workload, Budget { strategy: self.settings.strategy, ..self.settings.budget })
+        let selected = self
+            .device
+            .select(
+                &self.program,
+                &self.entry,
+                &self.workload,
+                Budget {
+                    strategy: self.settings.strategy,
+                    ..self.settings.budget
+                },
+            )
             .map_err(|e| format!("{}: {e}", self.entry))?;
         let kernel = Rc::new(RefCell::new(
-            self.device.compile_selected(selected).map_err(|e| format!("{}: {e}", self.entry))?,
+            self.device
+                .compile_selected(selected)
+                .map_err(|e| format!("{}: {e}", self.entry))?,
         ));
         *self.kernel.borrow_mut() = Some(kernel.clone());
         Ok(kernel)
@@ -226,7 +281,9 @@ impl Enclosing {
     fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
         let kernel = self.kernel()?;
         let (buffers, scalars) = {
-            let abi = kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+            let abi = kernel
+                .try_borrow()
+                .map_err(|_| "shared kernel is already executing")?;
             let buffers = abi
                 .buffers()
                 .iter()
@@ -240,7 +297,11 @@ impl Enclosing {
             let scalars = abi
                 .scalars()
                 .iter()
-                .map(|s| bindings.scalar(&s.name).ok_or_else(|| format!("unbound scalar {}", s.name)))
+                .map(|s| {
+                    bindings
+                        .scalar(&s.name)
+                        .ok_or_else(|| format!("unbound scalar {}", s.name))
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             (buffers, scalars)
         };
@@ -255,7 +316,7 @@ impl Enclosing {
     }
 }
 
-/// Compiles exported entries through joint selection only.
+/// Compiles linked entries through joint selection only.
 pub struct PlanCompiler<'a> {
     device: &'a Device,
     program: Rc<Program>,
@@ -264,7 +325,12 @@ pub struct PlanCompiler<'a> {
 }
 impl<'a> PlanCompiler<'a> {
     pub fn new(device: &'a Device, program: &'a Program, settings: Settings) -> Self {
-        Self { device, program: Rc::new(program.clone()), settings, entries: Vec::new() }
+        Self {
+            device,
+            program: Rc::new(program.clone()),
+            settings,
+            entries: Vec::new(),
+        }
     }
     pub fn settings(&self) -> Settings {
         self.settings
@@ -278,15 +344,22 @@ impl<'a> PlanCompiler<'a> {
     ) -> Result<CompiledPlan, String> {
         let workload = Workload {
             shapes: shapes.iter().map(|(n, v)| (n.clone(), *v)).collect(),
-            elems: elements.iter().map(|(n, e)| (n.clone(), e.clone())).collect(),
+            elems: elements
+                .iter()
+                .map(|(n, e)| (n.clone(), e.clone()))
+                .collect(),
             numerics: self.settings.numerics,
         };
-        if let Some(enclosing) = self.entries.iter().find(|e| e.entry == entry && e.workload == workload) {
-            return Ok(CompiledPlan { enclosing: enclosing.clone() });
+        if let Some(enclosing) = self
+            .entries
+            .iter()
+            .find(|e| e.entry == entry && e.workload == workload)
+        {
+            return Ok(CompiledPlan {
+                enclosing: enclosing.clone(),
+            });
         }
-        if self.program.export(entry).is_none() {
-            return Err(format!("unknown exported entry {entry}"));
-        }
+        self.program.resolve_family(entry)?;
         let enclosing = Rc::new(Enclosing {
             device: self.device.clone(),
             program: self.program.clone(),
@@ -305,6 +378,9 @@ impl<'a> PlanCompiler<'a> {
         self.device
     }
     pub fn kernel_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.kernel.borrow().is_some()).count()
+        self.entries
+            .iter()
+            .filter(|e| e.kernel.borrow().is_some())
+            .count()
     }
 }

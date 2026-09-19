@@ -66,7 +66,8 @@ pub struct Family {
     /// Interned specialized bodies. Two occurrences of one definition under equal
     /// bindings share a template and keep separate choices, sites and costs.
     pub templates: Vec<Template>,
-    /// `occurrences[0]` is the entry: its candidates are the target's lowerings/adoptions.
+    /// `occurrences[0]` is the entry: its candidates are all applicable portable bodies,
+    /// same-target function bodies, and same-target lowerings.
     pub occurrences: Vec<Occurrence>,
     pub sites: Vec<Site>,
     /// `(refinement, refined)`: the width site of a binder over an enclosing slice of the same
@@ -114,7 +115,7 @@ pub struct Occurrence {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub template: TemplateId,
-    /// Through which adoption/lowering declaration this body became a candidate.
+    /// The function or lowering declaration that contributes this candidate.
     pub via: DefId,
     /// Caller slice bound to each structural shape parameter of the template.
     pub structural: Vec<(String, SiteRef)>,
@@ -133,12 +134,27 @@ pub struct SiteRef(pub SiteId);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Requirement {
     /// Site value is a multiple of `unit` (atom / packet alignment from a `where`).
-    Multiple { site: SiteId, unit: i64 },
-    AtLeast { site: SiteId, value: i64 },
-    AtMost { site: SiteId, value: i64 },
-    Equal { site: SiteId, value: i64 },
+    Multiple {
+        site: SiteId,
+        unit: i64,
+    },
+    AtLeast {
+        site: SiteId,
+        value: i64,
+    },
+    AtMost {
+        site: SiteId,
+        value: i64,
+    },
+    Equal {
+        site: SiteId,
+        value: i64,
+    },
     /// `full(P)`: the site value divides the slice's parent extent.
-    Divides { site: SiteId, extent: i64 },
+    Divides {
+        site: SiteId,
+        extent: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -194,7 +210,7 @@ pub enum UnitKind {
     Elementwise,
     /// Reduction, scalar work, or other local computation that is not elementwise.
     Local,
-    /// Call occurrence: a statement calling a lowering boundary or a plain helper.
+    /// Static call occurrence whose implementation is selected from its linked family.
     Call(OccurrenceId),
     Publish,
     Region(RegionId),
@@ -253,10 +269,12 @@ impl Family {
 }
 
 /// Program handle used by consumers that need definition bodies for a template.
-pub fn body<'a>(program: &'a Program, family: &Family, template: TemplateId) -> &'a super::sir::Body {
-    program
+pub fn body<'a>(
+    program: &'a Program,
+    family: &Family,
+    template: TemplateId,
+) -> &'a super::sir::Body {
+    &program
         .definition(family.template(template).definition)
         .body
-        .as_ref()
-        .expect("a template is always built from a definition with a body")
 }

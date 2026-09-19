@@ -5,15 +5,15 @@
 //!
 //! Nothing here or in a backend hook ranks alternatives by profitability outside the
 //! solver objective, and nothing after selection changes the witness.
+mod analyze;
 mod backend;
 mod export;
 mod greedy;
-mod search;
-mod analyze;
 /// Target-neutral halves of the backend hooks (domains, intervals, limits, factors, seed).
 pub mod mapping;
 /// Derived quantities over numerical site values.
 pub mod quantity;
+mod search;
 /// The shared structural walk of candidate bodies, parameterized by a backend `Accounting`.
 pub mod structure;
 
@@ -106,7 +106,7 @@ pub struct SearchStats {
 pub enum SelectionError {
     /// Type, effect, ownership or declaration error in the linked program.
     InvalidSource(String),
-    /// No explicitly adopted implementation covers a reached call on this target.
+    /// No applicable implementation covers a reached call on this target.
     MissingCoverage(String),
     /// The backend has no mapping for an otherwise meaningful structure.
     UnsupportedMapping(String),
@@ -129,10 +129,18 @@ impl std::fmt::Display for SelectionError {
         match self {
             SelectionError::InvalidSource(m) => write!(f, "invalid source: {m}"),
             SelectionError::MissingCoverage(m) => write!(f, "missing target coverage: {m}"),
-            SelectionError::UnsupportedMapping(m) => write!(f, "unsupported structural mapping: {m}"),
-            SelectionError::IncompatibleComposition(m) => write!(f, "incompatible composition: {m}"),
-            SelectionError::Infeasible => write!(f, "no feasible configuration in the stated family"),
-            SelectionError::ConstructionIncomplete(o) => write!(f, "construction incomplete: {}", o.join("; ")),
+            SelectionError::UnsupportedMapping(m) => {
+                write!(f, "unsupported structural mapping: {m}")
+            }
+            SelectionError::IncompatibleComposition(m) => {
+                write!(f, "incompatible composition: {m}")
+            }
+            SelectionError::Infeasible => {
+                write!(f, "no feasible configuration in the stated family")
+            }
+            SelectionError::ConstructionIncomplete(o) => {
+                write!(f, "construction incomplete: {}", o.join("; "))
+            }
             SelectionError::SelectionIncomplete(m) => write!(f, "selection incomplete: {m}"),
             SelectionError::AnalysisUnavailable(m) => write!(f, "analysis unavailable: {m}"),
             SelectionError::Reconstruction(m) => write!(f, "reconstruction defect: {m}"),

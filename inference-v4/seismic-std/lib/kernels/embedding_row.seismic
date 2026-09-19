@@ -1,0 +1,8 @@
+# The compact embedding publication precedes the model's F32 residual cast.
+fn embedding_row[V, K](table: tensor[V, K] T, token: index[V], out out: tensor[1, K] A):
+    parallel [cols] in 0..K:
+        publish f32(table[token, cols]) to out[0, cols]
+
+fn cast_rows[M, K](input: tensor[M, K] T, out out: tensor[M, K] U) alias(input, out):
+    parallel [rows] in 0..M:
+        publish load(input[rows]) to out[rows]

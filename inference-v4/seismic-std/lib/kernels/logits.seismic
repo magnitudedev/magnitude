@@ -1,0 +1,7 @@
+# One activation row against a packed readout matrix, kept in f32 for sampling.
+fn logits[N, K](x: tensor[1, K] bf16, w: tensor[N, K] q4g64, out out: tensor[1, N] f32):
+    parallel [cols] in 0..N:
+        let mut acc = zeros_like(out[:, cols], dtype=f32)
+        ordered [k] in 0..K:
+            matmul(load(x[:, k]), load(w[cols, k]), into=acc)
+        publish acc to out[:, cols]
