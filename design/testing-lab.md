@@ -183,6 +183,20 @@ uses the original installed loader context. Runtime inspection composes only int
 admitted base/selected-pack archives, requires matching native identities, and rejects path
 collisions. Missing admitted runtime inputs block complete closure rather than borrowing a
 developer installation. The fixture is scoped to inspection and cannot qualify runtime execution.
+ELF owned search preserves the distinction between inherited RPATH and direct-only RUNPATH.
+Origin-relative paths must remain inside the package; empty, ambient and unqualified token paths
+fail. Search expansion alone cannot qualify resolved dependencies or system-library availability.
+ELF traversal tracks inherited search context per object, verifies owned files and target
+architecture, and records external dependencies only through an explicit system resolver that
+verifies loader resolution and package ownership. A pathname dependency cannot fall back to an
+OS basename lookup when its owned file is missing. Fixture resolvers do not qualify native hosts.
+System resolution admits explicitly allowed names only, requires a unique architecture-matching
+loader-cache record, checks canonical OS-directory ownership and ELF architecture, and records
+the installed DEB/RPM owner. Ambiguous cache or hardware-capability choices block rather than
+guessing loader precedence. Package ownership alone does not prove symbol-version compatibility.
+Version requirements are matched by exact ABI identity against the resolved provider’s version
+definitions, including owned dependencies. Missing or truncated version reports fail; a newer-looking
+version number cannot substitute for an absent required identity.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
