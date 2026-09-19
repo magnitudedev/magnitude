@@ -148,6 +148,10 @@ and validates the saved reply, evidence lengths and hashes again. It never acqui
 executor or downloads execution inputs. Missing, malformed or oversized saved documents fail;
 they cannot fall back to another execution. Recovery retains the original attempt deadline and
 authority checks, and cannot resurrect a revoked or completed attempt.
+Developers retrieve evidence through an authenticated run-scoped endpoint. It authorizes the
+run owner and requires the digest to occur in the completed result; knowledge of a hash alone
+cannot grant access through that endpoint. The CLI verifies bounded downloads
+before publishing a local file and refuses to overwrite an existing destination.
 The outward runner validates allocation ownership and trust before issuing a guest credential,
 delivers it through a provider bootstrap, and waits for the immutable receipt within the
 allocation deadline. Credential revocation runs on success, failure, timeout and cancellation.

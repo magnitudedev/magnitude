@@ -1,7 +1,7 @@
 import { expect, test } from "vitest"
 import { FileSystem, FetchHttpClient, HttpApp, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer } from "@effect/platform-bun"
-import { Context, DateTime, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
+import { ConfigProvider, Context, DateTime, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { join } from "node:path"
 import { Database, initializeDatabase } from "../src/database"
 import { Allocating, LeaseStore } from "../src/lease"
@@ -20,12 +20,14 @@ import { ProcessExecutorLive } from "../src/process"
 import { snapshotArtifacts } from "../src/artifact-input"
 import releasePlan from "../../release/release-plan.json"
 import { temporaryDatabase } from "./postgres"
+import { cli } from "../src/cli"
 
 test("PostgreSQL fences stale workers, rolls back transactions and serializes Spark reservations", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-postgres-" })
   const database = yield* temporaryDatabase
-  const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, fileArtifactStore(join(root, "objects")).pipe(Layer.provide(BunContext.layer)))))
+  const objects = fileArtifactStore(join(root, "objects")).pipe(Layer.provide(BunContext.layer))
+  const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, objects)))
   const layers = Layer.mergeAll(database, inputs, LeaseStoreLive.pipe(Layer.provide(database)), runStoreLayer(500).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)))
   yield* Effect.gen(function* () {
     yield* initializeDatabase
@@ -97,9 +99,12 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     const assignment = assigned[0]!.value
     expect(assignment.claim.runId).toBe(workRun.state.runId)
     yield* work.heartbeat(assignment.claim, 30)
+    const evidenceBytes = new TextEncoder().encode("private test trace")
+    const evidenceDigest = sha256(evidenceBytes)
+    yield* fs.writeFile(join(root, "objects", evidenceDigest), evidenceBytes)
     const targetResult: TargetResult = { cleanupErrors: [], cases: assignment.target.cases.map(c => ({
       targetId: assignment.claim.targetId, caseId: c.id, harness: c.harness,
-      startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), evidence: [],
+      startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), evidence: [{ path: "evidence/trace.zip", sha256: evidenceDigest, bytes: evidenceBytes.length }],
       outcome: { status: "blocked", detail: "Database fixture; no product execution" },
     })) }
     expect(yield* work.finish(assignment.claim, { ...targetResult, cases: targetResult.cases.slice(1) }).pipe(Effect.either)).toMatchObject({ _tag: "Left", left: { _tag: "InvalidResult" } })
@@ -123,7 +128,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     expect((yield* db.query("SELECT * FROM lab_attempts WHERE run_id=$1", [retryRun.state.runId])).length).toBe(2)
     const auth = bearerAuthenticator([{ token: Redacted.make("a".repeat(40)), principal: yield* Schema.decodeUnknown(Principal)({ owner: "developer", trust: "developer" }) },
       { token: Redacted.make("b".repeat(40)), principal: yield* Schema.decodeUnknown(Principal)({ owner: "outsider", trust: "untrusted-ci" }) }])
-    const http = yield* Effect.acquireRelease(Effect.sync(() => HttpApp.toWebHandlerLayer(api, Layer.mergeAll(database, inputs,
+    const http = yield* Effect.acquireRelease(Effect.sync(() => HttpApp.toWebHandlerLayer(api, Layer.mergeAll(database, inputs, objects,
       runStoreLayer(500).pipe(Layer.provide(database)), auth))), http => Effect.promise(() => http.dispose()))
     const fetch = (path: string, token: string) => Effect.promise(() => http.handler(new Request(`http://localhost${path}`, { headers: { authorization: `Bearer ${token}` } })))
     expect((yield* fetch("/v1/targets", "incorrect")).status).toBe(401)
@@ -133,13 +138,29 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     expect(response.status).toBe(200)
     const body = yield* Effect.promise(() => response.json())
     expect(body).toMatchObject({ runId, cases: expect.any(Array) })
-    const apiServices = Layer.mergeAll(database, inputs, runStoreLayer(500).pipe(Layer.provide(database)), auth)
+    const evidenceUrl = `/v1/runs/${assignment.claim.runId}/evidence/${evidenceDigest}`
+    const trace = yield* fetch(evidenceUrl, "a".repeat(40))
+    expect(trace.status).toBe(200)
+    expect(yield* Effect.promise(() => trace.text())).toBe("private test trace")
+    expect((yield* fetch(evidenceUrl, "b".repeat(40))).status).toBe(403)
+    expect((yield* fetch(`/v1/runs/${runId}/evidence/${evidenceDigest}`, "a".repeat(40))).status).toBe(404)
+    expect((yield* fetch(`/v1/runs/${assignment.claim.runId}/evidence/${sha256("absent")}`, "a".repeat(40))).status).toBe(404)
+    const apiServices = Layer.mergeAll(database, inputs, objects, runStoreLayer(500).pipe(Layer.provide(database)), auth)
     const serverContext = yield* Layer.build(BunHttpServer.layer({ hostname: "127.0.0.1", port: 0 }))
     const server = Context.get(serverContext, HttpServer.HttpServer)
     yield* server.serve(api.pipe(Effect.provide(apiServices))).pipe(Effect.provide(serverContext))
     if (server.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected TCP test server")
+    const downloaded = join(root, "downloads", "trace.zip")
+    const download = cli(["evidence", "--run", assignment.claim.runId, "--digest", evidenceDigest, "--output", downloaded]).pipe(
+      Effect.withConfigProvider(ConfigProvider.fromMap(new Map([["LAB_URL", `http://127.0.0.1:${server.address.port}`], ["LAB_TOKEN", "a".repeat(40)]]))),
+    )
+    yield* download
+    expect(yield* fs.readFileString(downloaded)).toBe("private test trace")
+    expect((yield* download.pipe(Effect.either))._tag).toBe("Left")
+    expect(yield* fs.readDirectory(join(root, "downloads"))).toEqual(["trace.zip"])
     yield* Effect.gen(function* () {
       const client = yield* LabClient
+      expect(Buffer.concat(Array.from(yield* client.evidence(assignment.claim.runId, evidenceDigest).pipe(Stream.runCollect))).toString()).toBe("private test trace")
       expect((yield* client.identity()).owner).toBe("developer")
       expect((yield* client.targets()).length).toBe(44)
       expect((yield* client.plan(request)).targets.length).toBe(1)

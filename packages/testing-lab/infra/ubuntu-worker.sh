@@ -43,7 +43,7 @@ subprocess.run(['sudo','-n','-u',account.pw_name,'--','tar','-xf',str(root/'down
 subprocess.run(['sudo','-n','-u',account.pw_name,'--','tar','-xzf',str(root/'download-runtime'),'-C',str(root)],check=True)
 workspace=root/'runtime'
 rust_version=tomllib.loads((workspace/'inference/rust-toolchain.toml').read_text())['toolchain']['channel']
-path=f'{root}/node-bin/bin:{root}/tooling/node_modules/.bin:{workspace}/packages/testing-lab/tools/node_modules/.bin:{home}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+path=f'{home}/.local/bin:{root}/node-bin/bin:{root}/tooling/node_modules/.bin:{home}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 environment=[f'HOME={home}',f'USER={account.pw_name}',f'LOGNAME={account.pw_name}',f'PATH={path}',
  f'CARGO_HOME={home}/.cargo',f'RUSTUP_HOME={home}/.rustup',f'LAB_BUN_VERSION={config["bunVersion"]}',f'LAB_RUST_VERSION={rust_version}']
 (root/'download-rustup').rename(root/'rustup-init')
@@ -56,8 +56,13 @@ test "$(bun --version)" = "$LAB_BUN_VERSION"
 bun install --frozen-lockfile --ignore-scripts
 bun packages/version/scripts/generate-version.ts
 npm ci --prefix packages/testing-lab/tools --no-audit --no-fund
-test "$(command -v pi)" = "$PWD/packages/testing-lab/tools/node_modules/.bin/pi"
-test "$(command -v opencode)" = "$PWD/packages/testing-lab/tools/node_modules/.bin/opencode"
+# The application intentionally excludes project-local node_modules/.bin from discovery.
+# Expose this user's pinned installations through their normal executable directory.
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/packages/testing-lab/tools/node_modules/.bin/pi" "$HOME/.local/bin/pi"
+ln -s "$PWD/packages/testing-lab/tools/node_modules/.bin/opencode" "$HOME/.local/bin/opencode"
+test "$(command -v pi)" = "$HOME/.local/bin/pi"
+test "$(command -v opencode)" = "$HOME/.local/bin/opencode"
 pi --version
 opencode --version
 bun -e 'await import("./packages/testing-lab/src/outward-worker.ts")'
@@ -67,8 +72,8 @@ launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 077',
  'export CARGO_HOME='+shlex.quote(str(home/'.cargo')),
  'export RUSTUP_HOME='+shlex.quote(str(home/'.rustup')),
  'export LAB_TERMINAL_NODE_EXECUTABLE='+shlex.quote(str(root/'node-bin/bin/node')),
- 'export LAB_PI_EXECUTABLE='+shlex.quote(str(workspace/'packages/testing-lab/tools/node_modules/.bin/pi')),
- 'export LAB_OPENCODE_EXECUTABLE='+shlex.quote(str(workspace/'packages/testing-lab/tools/node_modules/.bin/opencode')),
+ 'export LAB_PI_EXECUTABLE='+shlex.quote(str(home/'.local/bin/pi')),
+ 'export LAB_OPENCODE_EXECUTABLE='+shlex.quote(str(home/'.local/bin/opencode')),
  'cd '+shlex.quote(str(workspace)),
  'exec xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- /bin/bash /opt/magnitude-lab-display-worker',''])
 pathlib.Path('/opt/magnitude-lab-worker').write_text(launcher)

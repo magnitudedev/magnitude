@@ -3,8 +3,11 @@
 This package is under active implementation. The coordinator protocol, persistence, source
 transport, provider allocation adapters and initial functional drivers exist. The Azure-hosted
 coordinator's HTTPS API has been verified with Entra authentication and private PostgreSQL.
-Complete scheduled worker acceptance, remaining case implementations, image qualification,
-and a real CI workflow run are still required before the full target matrix can execute.
+The ordinary artifact-only CLI path has passed 23 Ubuntu 24.04 Intel CPU checks covering
+installation, app model acquisition, Pi connections, real endpoint generation and bundled CLI
+behavior, with JSON/JUnit, authenticated evidence download and verified worker cleanup.
+Separate source producers/clean consumers, remaining cases, other image qualification and a
+real CI workflow run are still required before the full target matrix can execute.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
@@ -16,6 +19,7 @@ bun lab run --source . --profile pr --concurrency 4 --budget 150
 bun lab run --artifacts ./dist/release-manifest.json --target macos-15-arm64-metal-apple-silicon
 bun lab status --run run-<uuid>
 bun lab results --run run-<uuid>
+bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-trace.zip
 bun lab cancel --run run-<uuid>
 ```
 
@@ -24,6 +28,11 @@ from `/v1/me`, snapshots dirty source and initialized submodules, queries which 
 are missing, uploads only those objects, registers the immutable input and submits the run.
 No commit or push is required. Interrupting the waiting CLI leaves the remote run running;
 use `cancel` for cancellation. `--no-wait` returns after submission.
+
+Completed reports identify evidence by path, digest and length. `evidence` downloads one such
+object through the authenticated run API, checks its SHA-256, and publishes the local file only
+after verification. Its destination must not already exist. Evidence access requires ownership
+of the run and membership in that run's completed report; knowing an object hash is insufficient.
 
 `--artifacts` accepts a release manifest with its application artifacts in the same directory.
 Every declared application artifact is copied into local content-addressed storage and checked

@@ -2,6 +2,7 @@ import { HttpClient, HttpClientRequest } from "@effect/platform"
 import { Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { Digest, InfrastructureFailure, Input, ObjectBatch, Principal, RunId, RunPlan, RunRequest, RunResult, Target } from "./domain"
 import { RunRecord } from "./run-store"
+import { verifiedArtifactContent } from "./artifact-store"
 
 export class LabApiError extends Schema.TaggedError<LabApiError>()("LabApiError", {
   status: Schema.Int, message: Schema.String,
@@ -17,6 +18,7 @@ export interface LabClient {
   readonly get: (id: RunId) => Effect.Effect<RunRecord, LabApiError>
   readonly cancel: (id: RunId) => Effect.Effect<RunRecord, LabApiError>
   readonly result: (id: RunId) => Effect.Effect<Option.Option<RunResult>, LabApiError>
+  readonly evidence: (id: RunId, digest: Digest) => Stream.Stream<Uint8Array, LabApiError>
 }
 export const LabClient = Context.GenericTag<LabClient>("@magnitudedev/testing-lab/LabClient")
 export const labClientLayer = (origin: string, token: Effect.Effect<Redacted.Redacted<string>, LabApiError>) => Layer.effect(LabClient, Effect.gen(function* () {
@@ -68,6 +70,11 @@ export const labClientLayer = (origin: string, token: Effect.Effect<Redacted.Red
     submit: request => read(RunRecord, "/v1/runs", Option.some(request), true),
     get: id => read(RunRecord, `/v1/runs/${encodeURIComponent(id)}`),
     cancel: id => read(RunRecord, `/v1/runs/${encodeURIComponent(id)}/cancel`, Option.none(), true),
+    evidence: (id, digest) => Stream.unwrap(send(`/v1/runs/${encodeURIComponent(id)}/evidence/${digest}`, Option.none()).pipe(Effect.map(response =>
+      verifiedArtifactContent(digest, response.stream.pipe(Stream.mapError(() => new InfrastructureFailure({ operation: "evidence-download", message: "Evidence download interrupted" }))), 256 * 1024 * 1024).pipe(
+        Stream.mapError(error => new LabApiError({ status: 0, message: error.message })),
+        Stream.timeoutFail(() => new LabApiError({ status: 0, message: "Evidence download stalled" }), "2 minutes"),
+      )))),
     result: id => Effect.gen(function* () {
       const response = yield* send(`/v1/runs/${encodeURIComponent(id)}/results`, Option.none())
       if (response.status === 202) return Option.none()

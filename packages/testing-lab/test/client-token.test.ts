@@ -1,8 +1,21 @@
 import { HttpClient, HttpClientResponse } from "@effect/platform"
-import { Effect, Layer, Redacted, TestClock, TestContext } from "effect"
+import { Effect, Layer, Redacted, Stream, TestClock, TestContext } from "effect"
 import { expect, test } from "vitest"
 import { githubClientToken } from "../src/client-token"
 import { LabClient, labClientLayer } from "../src/client"
+import { RunId } from "../src/domain"
+import { sha256 } from "../src/snapshot"
+
+test("evidence downloads reject corrupt bytes even when the server returns success", async () => {
+  const transport = Layer.succeed(HttpClient.HttpClient, HttpClient.make(request => Effect.succeed(
+    HttpClientResponse.fromWeb(request, new Response("corrupt trace")),
+  )))
+  const result = await Effect.runPromise(Effect.flatMap(LabClient, client => client.evidence(
+    RunId.make("run-00000000-0000-0000-0000-000000000001"), sha256("expected trace"),
+  ).pipe(Stream.runDrain)).pipe(Effect.either,
+    Effect.provide(labClientLayer("https://lab.example", Effect.succeed(Redacted.make("fixture"))).pipe(Layer.provide(transport)))))
+  expect(result).toMatchObject({ _tag: "Left", left: { message: "Object SHA-256 does not match its content address" } })
+})
 
 const token = (exp: number, generation: number) => `${Buffer.from('{}').toString('base64url')}.${Buffer.from(JSON.stringify({ exp, generation })).toString('base64url')}.signature`
 test("renews cached GitHub credentials before subsequent coordinator requests", async () => {

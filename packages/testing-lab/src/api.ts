@@ -5,6 +5,7 @@ import { Digest, InfrastructureFailure, Input, ObjectBatch, Principal, RunId, Ru
 import { planRun, targets } from "./catalog"
 import { RunRecord, RunStore } from "./run-store"
 import { InputRegistry } from "./inputs"
+import { ArtifactStore, verifiedArtifactContent } from "./artifact-store"
 
 export class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthorized", {}) {}
 export class Forbidden extends Schema.TaggedError<Forbidden>()("Forbidden", {}) {}
@@ -92,6 +93,16 @@ export const api = HttpRouter.empty.pipe(
     const result = yield* store.result(id)
     return Option.isSome(result) ? yield* HttpServerResponse.schemaJson(RunResult)(result.value)
       : HttpServerResponse.unsafeJson({ status: "pending" }, { status: 202 })
+  })),
+  HttpRouter.get("/v1/runs/:id/evidence/:digest", Effect.gen(function* () {
+    const { id, store } = yield* ownedRun
+    const digest = yield* Schema.decodeUnknown(Digest)((yield* HttpRouter.params).digest)
+    const result = yield* store.result(id)
+    const evidence = Option.isSome(result) ? result.value.cases.flatMap(test => test.evidence).find(item => item.sha256 === digest) : undefined
+    if (!evidence) return HttpServerResponse.empty({ status: 404 })
+    return HttpServerResponse.stream(verifiedArtifactContent(digest, (yield* ArtifactStore).get(digest), evidence.bytes), {
+      contentType: "application/octet-stream",
+    })
   })),
   HttpRouter.post("/v1/runs/:id/cancel", Effect.gen(function* () {
     const { id, store } = yield* ownedRun

@@ -1,7 +1,7 @@
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { homedir } from "node:os"
 import { configuredClientToken } from "./client-token"
 import { LabClient, labClientLayer } from "./client"
@@ -27,6 +27,7 @@ const help = `Magnitude testing lab
   bun lab run --artifacts ./dist/release-manifest.json --profile quick
   bun lab status --run run-<uuid>
   bun lab results --run run-<uuid>
+  bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-trace.zip
   bun lab cancel --run run-<uuid>
 
 Use --update-from old/release-manifest.json to supply the previous installed version for update tests.
@@ -50,7 +51,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
   const command = args[0] ?? "help"
   const options = new Map<string, string>()
   const boolean = new Set(["no-wait", "allow-spark"])
-  const allowed = new Set(["request", "source", "artifacts", "update-from", "target", "profile", "suite", "harness", "json", "junit", "budget", "concurrency", "deadline", "mode", "objects", "run", ...boolean])
+  const allowed = new Set(["request", "source", "artifacts", "update-from", "target", "profile", "suite", "harness", "json", "junit", "budget", "concurrency", "deadline", "mode", "objects", "run", "digest", "output", ...boolean])
   for (let i = 1; i < args.length; i++) {
     const flag = args[i]!
     if (!flag.startsWith("--") || !allowed.has(flag.slice(2))) return yield* new InvalidInput({ message: `Unknown argument: ${flag}` })
@@ -61,6 +62,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
     options.set(name, value)
   }
   if (options.has("update-from") && command !== "run") return yield* new InvalidInput({ message: "--update-from is only valid for run" })
+  if ((options.has("digest") || options.has("output")) && command !== "evidence") return yield* new InvalidInput({ message: "--digest and --output are only valid for evidence" })
   if (command === "run" && options.has("source") === options.has("artifacts")) return yield* new InvalidInput({ message: "Specify exactly one of --source or --artifacts" })
   if ((options.has("json") || options.has("junit")) && (!["run", "results"].includes(command) || options.has("no-wait"))) return yield* new InvalidInput({ message: "Reports require a completed run or results command without --no-wait" })
   return { command, options }
@@ -100,6 +102,20 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
   if (command === "help" || command === "--help") return yield* Console.log(help)
   if (command === "serve") return yield* serveConfiguredCoordinator
   if (command === "targets") return yield* print(Schema.Array(Target), targets)
+  if (command === "evidence") {
+    const id = yield* Schema.decodeUnknown(RunId)(yield* required("run"))
+    const digest = yield* Schema.decodeUnknown(Digest)(yield* required("digest"))
+    const destination = resolve(yield* required("output"))
+    return yield* remote(Effect.scoped(Effect.gen(function* () {
+      yield* fs.makeDirectory(dirname(destination), { recursive: true })
+      const temporary = `${destination}.download-${crypto.randomUUID()}`
+      yield* Effect.addFinalizer(() => fs.remove(temporary, { force: true }).pipe(Effect.orDie))
+      yield* Stream.run((yield* LabClient).evidence(id, digest), fs.sink(temporary, { flag: "wx", mode: 0o600 }))
+      // Publish only a fully verified file, and never overwrite an existing destination.
+      yield* fs.link(temporary, destination)
+      yield* Console.log(destination)
+    })))
+  }
   if (command === "plan") {
     const request = yield* fs.readFileString(yield* required("request")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(RunRequest))))
     return yield* print(RunPlan, yield* planRun(request))
