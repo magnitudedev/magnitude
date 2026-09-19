@@ -18,6 +18,7 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
     if (spec.args[0] === "export") return { exitCode: 0, stderr: "", stdout: json({ info: { id: session }, messages: [{ info: {
       role: "assistant", providerID: variant === "provider" ? "other" : "magnitude", modelID: "fixture-model",
     } }] }) }
+    if (variant === "setup") return { exitCode: 1, stdout: "Hermes is not configured; run hermes setup", stderr: "" }
     const events = kind === "opencode" ? [
       { type: "step_start", sessionID: session, part: { type: "step-start" } },
       { type: "tool_use", sessionID: session, part: { type: "tool", tool: "read", state: { status: variant === "tool" ? "error" : "completed" } } },
@@ -38,9 +39,10 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
     const result = yield* client.prompt("Read the fixture then say HELLO", Option.some("fixture-session")).pipe(Effect.either)
     expect(result._tag).toBe(variant === "pass" ? "Right" : "Left")
     if (result._tag === "Right") expect(result.right.text).toBe("HELLO")
+    if (kind === "hermes" && variant === "setup" && result._tag === "Left") expect(result.left.message).toContain("run hermes setup")
   }).pipe(Effect.provideService(ProcessExecutor, executor))
 })).pipe(Effect.provide(BunContext.layer)))
 
 test.each(["opencode", "hermes"] as const)("%s validates terminal output, selected model, tools and resumed session", async kind => {
-  for (const variant of ["pass", "session", "provider", "tool", "truncated", "exit"]) await check(kind, variant)
+  for (const variant of ["pass", "session", "provider", "tool", "truncated", "exit", "setup"]) await check(kind, variant)
 })

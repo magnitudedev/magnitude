@@ -79,6 +79,8 @@ CPU fallback fails a Metal/CUDA target. Host identity is collected from native O
 interfaces before test execution; a Windows Server build cannot qualify a Windows client target.
 Unavailable GPU memory totals remain unknown, not fabricated. Device discovery alone cannot
 qualify generation. Generation checks output/protocol/tool behavior, not speed.
+Tool-result acceptance supplies a newly generated result that was absent from the original
+prompt and arguments; echoing known input cannot prove that the model consumed the tool result.
 
 ## Ownership and recovery
 

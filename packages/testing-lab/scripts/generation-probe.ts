@@ -14,10 +14,14 @@ const run = Effect.gen(function* () {
   const executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
   const cached = yield* Config.boolean("LAB_PROBE_CACHED").pipe(Config.withDefault(false))
+  const toolCases = yield* Config.integer("LAB_PROBE_TOOL_CASES").pipe(Config.withDefault(1),
+    Effect.flatMap(Schema.decodeUnknown(Schema.Int.pipe(Schema.between(1, 20)))))
   const fs = yield* FileSystem.FileSystem
+  const state = yield* fs.makeTempDirectoryScoped({ ...(process.platform === "win32" ? {} : { directory: "/tmp" }), prefix: "ml-generation-" })
   const checks: { name: string; passed: boolean; detail: string }[] = []
   let appVersion = "unknown"
   const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  environment.MAGNITUDE_DESKTOP_STATE_DIR = state
   const program = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     const endpoint = yield* EndpointTests
@@ -35,7 +39,8 @@ const run = Effect.gen(function* () {
     checks.push({ name: "Load through the packaged app", passed: true, detail: model })
     const steps: ReadonlyArray<readonly [string, Effect.Effect<Generation | void, AssertionFailure>]> = [
       ["Endpoint discovery", endpoint.discover], ["Nonstreamed generation", endpoint.generate], ["Streaming generation", endpoint.stream],
-      ["Tool call and follow-up", endpoint.tools], ["Invalid requests and subsequent generation", endpoint.invalid], ["Cancellation and subsequent generation", endpoint.cancelAndRetry],
+      ...Array.from({ length: toolCases }, (_, index) => [toolCases === 1 ? "Tool call and follow-up" : `Tool call and follow-up ${index + 1}/${toolCases}`, endpoint.tools] as const),
+      ["Invalid requests and subsequent generation", endpoint.invalid], ["Cancellation and subsequent generation", endpoint.cancelAndRetry],
     ]
     for (const [name, test] of steps) {
       const result = yield* test.pipe(Effect.either)
@@ -56,4 +61,4 @@ const run = Effect.gen(function* () {
   if (result._tag === "Left") return yield* result.left
   if (checks.some(c => !c.passed)) return yield* new AssertionFailure({ message: "One or more packaged generation checks failed; see generation-report.json" })
 })
-BunRuntime.runMain(run.pipe(Effect.provide(BunContext.layer)))
+BunRuntime.runMain(run.pipe(Effect.scoped, Effect.provide(BunContext.layer)))

@@ -64,7 +64,12 @@ export const endpointTests = (origin: string, model: string) => Layer.effect(End
   const check = (value: Generation) => value.text.includes("HELLO") ? Effect.succeed(value) : Effect.fail(assertion("Generation did not follow the basic instruction"))
   const chat = (input: unknown) => bounded(Effect.gen(function* () {
     const response = yield* request(input)
-    if (response.status !== 200) return yield* assertion(`Generation returned HTTP ${response.status}`)
+    if (response.status !== 200) {
+      const detail = yield* response.stream.pipe(Stream.decodeText(), Stream.runFoldEffect("", (all, part) => all.length + part.length > 16 * 1024
+        ? Effect.fail(assertion("Error response exceeded its diagnostic bound")) : Effect.succeed(all + part)),
+        Effect.catchAll(() => Effect.succeed("Error response unavailable or larger than 16 Ki characters")))
+      return yield* assertion(`Generation returned HTTP ${response.status}: ${detail.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")}`)
+    }
     const value = yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknown(Completion)), Effect.mapError(() => assertion("Invalid nonstreamed completion or missing token usage")))
     if (value.model !== model || value.choices.length !== 1 || value.choices[0]!.index !== 0) return yield* assertion("Completion did not use the requested model and single choice")
     return value
@@ -95,18 +100,20 @@ export const endpointTests = (origin: string, model: string) => Layer.effect(End
     })),
     generate, stream,
     tools: bounded(Effect.gen(function* () {
-      const nonce = crypto.randomUUID()
-      const conversation = [{ role: "user", content: `Call lab_echo with value ${nonce}, then repeat the returned value exactly.` }]
-      const completion = yield* chat({ ...body, messages: conversation, tools: [{ type: "function", function: { name: "lab_echo", description: "Echo a test value", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false } } }], tool_choice: { type: "function", function: { name: "lab_echo" } } })
+      const key = crypto.randomUUID(), result = crypto.randomUUID()
+      const conversation = [{ role: "user", content: `Call lab_lookup with key ${key}, then repeat the returned value exactly.` }]
+      const completion = yield* chat({ ...body, messages: conversation, tools: [{ type: "function", function: { name: "lab_lookup", description: "Look up a stored value by key", parameters: { type: "object", properties: { key: { type: "string" } }, required: ["key"], additionalProperties: false } } }], tool_choice: { type: "function", function: { name: "lab_lookup" } } }).pipe(
+        Effect.mapError(error => assertion(`Tool invocation: ${error.message}`)))
       const choice = completion.choices[0]!
       const calls = Option.getOrElse(choice.message.tool_calls, () => [])
-      if (choice.finish_reason !== "tool_calls" || calls.length !== 1 || calls[0]!.function.name !== "lab_echo") return yield* assertion("Model did not produce the requested tool call")
-      const args = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ value: Schema.String })))(calls[0]!.function.arguments).pipe(Effect.mapError(() => assertion("Tool arguments were not valid JSON")))
-      if (args.value !== nonce) return yield* assertion("Model changed the tool's input value")
+      if (choice.finish_reason !== "tool_calls" || calls.length !== 1 || calls[0]!.function.name !== "lab_lookup") return yield* assertion("Model did not produce the requested tool call")
+      const args = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ key: Schema.String })))(calls[0]!.function.arguments).pipe(Effect.mapError(() => assertion("Tool arguments were not valid JSON")))
+      if (args.key !== key) return yield* assertion("Model changed the tool's input key")
       const message = yield* Schema.encode(Message)(choice.message).pipe(Effect.orDie)
-      const followup = yield* chat({ ...body, messages: [...conversation, message, { role: "tool", tool_call_id: calls[0]!.id, content: nonce }] })
+      const followup = yield* chat({ ...body, messages: [...conversation, message, { role: "tool", tool_call_id: calls[0]!.id, content: result }] }).pipe(
+        Effect.mapError(error => assertion(`Tool result follow-up: ${error.message}`)))
       const answer = followup.choices[0]!
-      if (answer.finish_reason !== "stop" || !answer.message.content?.includes(nonce)) return yield* assertion("Generation did not consume the actual tool result")
+      if (answer.finish_reason !== "stop" || !answer.message.content?.includes(result)) return yield* assertion("Generation did not consume the actual tool result")
       return Generation.make({ requestId: followup.id, model, text: answer.message.content, chunks: 1 })
     })),
     invalid: bounded(Effect.gen(function* () {

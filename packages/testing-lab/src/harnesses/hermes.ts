@@ -32,7 +32,7 @@ export const hermes = (config: typeof HermesConfig.Type) => Effect.gen(function*
       { cwd: Option.some(config.cwd), env: config.environment, inheritEnv: false, timeoutMs: 300_000, maxOutputBytes: 16 * 1024 * 1024 })
     yield* fs.writeFileString(join(config.evidence, `${label}.jsonl`), output.stdout)
     yield* fs.writeFileString(join(config.evidence, `${label}.stderr.log`), output.stderr)
-    if (output.exitCode !== 0) return yield* fail(`Hermes exited ${output.exitCode}: ${output.stderr.slice(-1200)}`)
+    if (output.exitCode !== 0) return yield* fail(`Hermes exited ${output.exitCode}: ${(output.stderr || output.stdout).slice(-1200)}`)
     const events = yield* Effect.forEach(output.stdout.split("\n").filter(line => line.trim()), line => Schema.decodeUnknown(Schema.parseJson(Event))(line).pipe(
       Effect.mapError(() => fail("Hermes emitted an invalid JSON event"))))
     const first = events[0], last = events.at(-1)
