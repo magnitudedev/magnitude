@@ -10,7 +10,7 @@ export interface CliTests {
   readonly version: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly inspect: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly modelLifecycle: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
-  readonly connections: (harness: typeof Harness.Type) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly connections: (harness: typeof Harness.Type, inspect: (connected: boolean) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly invalid: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly nativeRuntime: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
 }
@@ -58,14 +58,19 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
         Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
       // Residency is not generation success: the caller must follow this with EndpointTests.generate.
     }),
-    connections: harness => Effect.gen(function* () {
+    connections: (harness, inspect) => Effect.gen(function* () {
       yield* successful(["connections", "add", harness, "--set-model", config.model])
+      yield* inspect(true)
       yield* successful(["connections", "sync", harness])
+      yield* inspect(true)
       const connected = yield* successful(["connections", "list"])
       yield* assert(connected.split("\n").some(line => line.includes(harness) && /\bConnected\b/.test(line)), `CLI did not observe ${harness} connected`)
       yield* successful(["connections", "remove", harness])
+      yield* inspect(false)
       const removed = yield* successful(["connections", "list"])
       yield* assert(removed.split("\n").some(line => line.includes(harness) && /\bDisconnected\b/.test(line)), `CLI did not observe ${harness} disconnected`)
+      yield* successful(["connections", "add", harness, "--set-model", config.model])
+      yield* inspect(true)
     }),
     invalid: Effect.gen(function* () {
       for (const args of [["lab-nonexistent-command"], ["catalog", "show", "lab-invalid-model"]]) {

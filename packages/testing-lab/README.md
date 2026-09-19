@@ -360,3 +360,30 @@ remain available after the process exits.
 The combined A4/A6 packaged macOS 15 ARM64 probe passed with zero cleanup
 errors at `/tmp/ml-app-lifecycle-fixed-20260918/report.json`; all four launch
 traces were saved and no probe application process remained.
+
+C4 now runs the bundled CLI connection lifecycle for the selected harnesses and
+inspects actual configuration after add, sync, remove and reconnect. It shares
+the isolated unrelated-provider fixture with A5. The real macOS 15 ARM64 bundled
+CLI passed for Pi, OpenCode and Hermes with preserved unrelated configuration and
+the expected endpoint. Evidence: `/tmp/ml-cli-connections-model-20260918/cli-connections-report.json`
+and its `cli-evidence` directory. `scripts/cli-connections-probe.ts` requires an
+installed model in its isolated profile because CLI model selection validates that
+prerequisite. These connection checks do not qualify harness generation.
+
+The harness-error scenario faults only an existing isolated configuration file,
+requires a visible error and file-specific repair guidance, checks that malformed
+bytes remain untouched, restores the original bytes even if the assertion fails,
+and reconnects through the app. `scripts/connections-probe.ts` includes this path
+for Pi, OpenCode and Hermes. A7 now combines this path with occupied-port service failure and recovery after
+relaunch. It requires an installed test model, because harness connection configuration
+requires model availability.
+The independent live Mac error checks passed Pi and Hermes but found missing
+file-specific repair guidance for OpenCode. The failing trace is preserved at
+`/tmp/ml-connection-errors-all-20260918/evidence/ui-trace.zip`. This is a
+recorded acceptance failure, not a qualified A7 result.
+
+The real occupied-port service failure/recovery probe passed at
+`/tmp/ml-service-error-20260918/report.json` with zero cleanup errors. A7 is wired
+to the worker, but full A7 acceptance is not claimed: OpenCode's diagnostic remains
+a known failure, and the combined worker scenario has not yet been qualified on
+the complete target matrix. No test fault terminates an existing port owner.

@@ -6,6 +6,7 @@ import { DesktopDriver, playwrightDesktop } from "../src/desktop-driver"
 import { bundledCliTests, CliTests } from "../src/suites/cli"
 import { EndpointTests, endpointTests } from "../src/suites/endpoint"
 import { ProcessExecutorLive } from "../src/process"
+import { connectionFixture } from "../src/harnesses/connection-fixture"
 import { assertRuntime } from "../src/runtime"
 import { AssertionFailure } from "../src/domain"
 
@@ -21,6 +22,8 @@ const run = Effect.gen(function* () {
   const environment: Record<string, string> = { ...Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LOCALAPPDATA", "APPDATA", "SystemRoot", "TEMP"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : [])),
     MAGNITUDE_DEV_DATA_DIR: join(root, "profile"), MAGNITUDE_DEV_PORT: "11279", MAGNITUDE_SHELL_ENV_INHERITED: "1" }
   environment.PATH = toolsPath + (process.platform === "win32" ? ";" : ":") + (environment.PATH ?? "")
+  const connectionFixtures = yield* Effect.forEach(["pi", "opencode", "hermes"] as const, harness =>
+    connectionFixture(join(root, "profile", "harness-home"), harness, "http://127.0.0.1:11279/inference/v1"))
   const checks: { name: string; passed: boolean; detail: string }[] = []
   const program = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
@@ -31,8 +34,8 @@ const run = Effect.gen(function* () {
     yield* desktop.search(model)
     yield* desktop.load(model)
     const steps = [ ["Version", tests.version], ["Help, hardware, service", tests.inspect], ["Cached pull, stop, reload", tests.modelLifecycle],
-      ["Generation after CLI reload", endpoint.generate.pipe(Effect.asVoid)], ["Pi connection lifecycle", tests.connections("pi")],
-      ["OpenCode connection lifecycle", tests.connections("opencode")], ["Hermes connection lifecycle", tests.connections("hermes")],
+      ["Generation after CLI reload", endpoint.generate.pipe(Effect.asVoid)], ["Pi connection lifecycle", tests.connections("pi", connectionFixtures[0]!.inspect)],
+      ["OpenCode connection lifecycle", tests.connections("opencode", connectionFixtures[1]!.inspect)], ["Hermes connection lifecycle", tests.connections("hermes", connectionFixtures[2]!.inspect)],
       ["Invalid inputs", tests.invalid], ["Embedded runtime without developer PATH", tests.nativeRuntime] ] as const
     for (const [name, test] of steps) {
       const result = yield* test.pipe(Effect.either)

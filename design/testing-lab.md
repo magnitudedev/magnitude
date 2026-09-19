@@ -47,7 +47,10 @@ bundled CLI. No mocked model response, developer binary or hosted provider can s
 
 The nine suites are package, install, app, endpoint, harness, recovery, CLI, update and uninstall.
 Pi, OpenCode and Hermes are the initial harnesses. Configuration must be produced through the
-product's Connections surface. Endpoint and harness tests attest the requested backend/device;
+product's Connections surface. Bundled CLI connection acceptance additionally exercises
+add, sync, removal and reconnection, inspecting the actual harness configuration after each
+mutation. Command success alone cannot establish endpoint correctness or preservation of
+unrelated provider settings. Endpoint and harness tests attest the requested backend/device;
 CPU fallback fails a Metal/CUDA target. Host identity is collected from native OS and device
 interfaces before test execution; a Windows Server build cannot qualify a Windows client target.
 Unavailable GPU memory totals remain unknown, not fabricated. Device discovery alone cannot
@@ -89,6 +92,10 @@ isolated profile; a page reload cannot satisfy it. Each launch preserves its own
 process log, and the previous process is released before the next launches. Application quit
 must traverse normal shutdown and terminate the main process with a successful exit code;
 window hiding and forced cleanup cannot satisfy quit acceptance.
+Error scenarios preserve malformed harness files and restore the original fixture bytes
+even after failed assertions. Visible error messages and file-specific repair guidance
+may occupy separate elements. Service failure injection owns only an isolated loopback
+listener; recovery requires successful startup after that listener is released.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
 Finalized UI traces and command logs are published as content-addressed evidence before worker

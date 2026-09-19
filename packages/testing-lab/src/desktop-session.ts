@@ -19,6 +19,7 @@ export const desktopSession = (config: DesktopLaunch, onCleanupError: (detail: s
     yield* ScopedRef.set(current, acquire)
     return Option.getOrThrow(yield* ScopedRef.get(current))
   })
-  const restart = ScopedRef.set(current, Effect.succeed(Option.none<DesktopDriver>())).pipe(Effect.zipRight(driver))
-  return { driver, restart }
+  const stop = ScopedRef.set(current, Effect.succeed(Option.none<DesktopDriver>()))
+  const restart = stop.pipe(Effect.zipRight(driver))
+  return { driver, restart, stop }
 })

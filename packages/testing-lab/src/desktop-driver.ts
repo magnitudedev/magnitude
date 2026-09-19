@@ -12,12 +12,14 @@ export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
   readonly host: () => Effect.Effect<string, AssertionFailure>
+  readonly serviceFailure: () => Effect.Effect<string, AssertionFailure>
   readonly ready: () => Effect.Effect<void, AssertionFailure>
   readonly search: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly details: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly download: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly load: (modelId: string) => Effect.Effect<void, AssertionFailure>
   readonly connect: (harnessId: string) => Effect.Effect<void, AssertionFailure>
+  readonly connectionFailure: (harness: string, fileName: string) => Effect.Effect<string, AssertionFailure>
   readonly disconnect: (harnessId: string) => Effect.Effect<void, AssertionFailure>
   readonly theme: (theme: "light" | "dark" | "system") => Effect.Effect<void, AssertionFailure>
   readonly verifyTheme: (theme: "light" | "dark" | "system") => Effect.Effect<void, AssertionFailure>
@@ -82,6 +84,15 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       if (!info.version || info.version === "unknown") throw new Error("Native host did not report the running application version")
       return info.version
     })).pipe(Effect.timeoutFail({ duration: "15 seconds", onTimeout: () => new AssertionFailure({ message: "Native host bridge did not respond within 15 seconds" }) })),
+    serviceFailure: () => navigate("status").pipe(Effect.zipRight(action("Observe failed service startup", async () => {
+      const status = page.getByTestId(automation.page("status"))
+      const alert = status.getByRole("alert").first()
+      await alert.waitFor({ timeout: 180_000 })
+      await status.getByTestId(automation.serviceReady).waitFor({ state: "hidden" })
+      const message = await alert.innerText()
+      if (!message.trim()) throw new Error("Service failure displayed an empty diagnostic")
+      return message
+    }))),
     ready: () => navigate("status").pipe(Effect.zipRight(action("Wait for packaged service readiness", () => page.getByTestId(automation.serviceReady).waitFor({ timeout: 180_000 })))),
     search: name => navigate("catalog").pipe(Effect.zipRight(action("Search model catalog", async () => {
       await page.getByTestId(automation.modelSearch).fill(name)
@@ -120,6 +131,17 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       await harness.getByTestId(automation.harnessConnect).click()
       await harness.and(page.locator('[data-connected="true"]')).waitFor()
       await harness.getByTestId(automation.harnessConnect).and(page.locator(':enabled')).waitFor()
+    }))),
+    connectionFailure: (name, fileName) => navigate("connections").pipe(Effect.zipRight(action(`Observe ${name} configuration error`, async () => {
+      await page.getByTestId(automation.harness(name)).getByTestId(automation.harnessConnect).click()
+      // Alert and repair guidance may be separate UI elements; only the affected file is stable.
+      const alert = page.getByTestId(automation.page("connections")).getByRole("alert").first()
+      const guidance = page.getByTestId(automation.harness(name)).getByText(fileName, { exact: false })
+      await alert.waitFor()
+      await guidance.waitFor()
+      const message = await alert.innerText()
+      if (!message.trim()) throw new Error("Connection failure displayed an empty alert")
+      return `${message}\n${await guidance.innerText()}`
     }))),
     disconnect: name => navigate("connections").pipe(Effect.zipRight(action(`Disconnect ${name} through the app`, async () => {
       const harness = page.getByTestId(automation.harness(name))

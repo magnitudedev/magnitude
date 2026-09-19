@@ -6,6 +6,8 @@ import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
+import { occupyServicePort } from "./port-fault"
+import { exerciseConnectionError } from "./harnesses/connection-error"
 import { desktopSession } from "./desktop-session"
 import { DesktopDriver } from "./desktop-driver"
 import { AssertionFailure, Evidence, InfrastructureFailure } from "./domain"
@@ -88,7 +90,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const selection = assignment.plan.request.selection
     const harnesses: readonly Harness[] = selection.kind === "custom" && selection.harnesses.length > 0 ? selection.harnesses
       : selection.kind === "profile" && selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"]
-    const connections = assignment.target.cases.some(test => test.id === "A5")
+    const connections = assignment.target.cases.some(test => test.id === "A5" || test.id === "C4" || test.id === "A7")
       ? yield* Effect.forEach(harnesses, harness => connectionFixture(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), harness, `http://127.0.0.1:${config.port}/inference/v1`)) : []
     const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs)))
@@ -175,6 +177,28 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           yield* (yield* (yield* session).restart).ready()
           break
         }
+        case "A7": {
+          const running = yield* session
+          yield* running.stop
+          const serviceError = yield* Effect.scoped(Effect.gen(function* () {
+            yield* occupyServicePort(config.port)
+            const failed = yield* desktop
+            const message = yield* failed.serviceFailure()
+            yield* failed.screenshot("service-failure")
+            yield* running.stop
+            return message
+          }))
+          yield* (yield* desktop).ready()
+          const driver = yield* desktop
+          for (const fixture of connections) {
+            yield* fixture.exercise.pipe(Effect.provideService(DesktopDriver, driver))
+            yield* exerciseConnectionError(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), fixture.harness).pipe(
+              Effect.provideService(DesktopDriver, driver), Effect.provideService(FileSystem.FileSystem, fs))
+            yield* fixture.inspect(true)
+          }
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("service-error.json", Schema.Struct({ message: Schema.String }), { message: serviceError })] })
+        }
         case "E1": yield* (yield* desktop).search(config.model); yield* (yield* desktop).load(config.model); yield* (yield* endpoint).discover; break
         case "E2":
         case "E3":
@@ -199,6 +223,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "C1": yield* (yield* cli).version; break
         case "C2": yield* (yield* desktop).ready(); yield* (yield* cli).inspect; break
         case "C3": yield* (yield* cli).modelLifecycle; break
+        case "C4": {
+          const tests = yield* cli
+          for (const fixture of connections) yield* tests.connections(fixture.harness, fixture.inspect)
+          break
+        }
         case "C6": yield* (yield* cli).nativeRuntime; break
         default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
@@ -244,7 +273,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     for (const name of relaunches) {
       for (const file of ["ui-trace.zip", "desktop.log"]) {
         if (yield* fs.exists(join(desktopEvidence, name, file))) {
-          for (const caseId of ["A4", "A6"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+          for (const caseId of ["A4", "A6", "A7"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
         }
       }
     }

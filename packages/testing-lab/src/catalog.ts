@@ -47,7 +47,7 @@ const prefixes: Readonly<Record<Suite, string>> = { package: "P", install: "I", 
 const prerequisites: Readonly<Record<string, readonly string[]>> = {
   P2: ["P1"], P3: ["P2", "I3"], P4: ["P2"], P5: ["P2"],
   I1: ["P2"], I2: ["I1"], I3: ["I2"], I4: ["I3"], I5: ["I1"],
-  A1: ["I3"], A2: ["A1"], A3: ["A2"], A4: ["A1"], A5: ["A3"], A6: ["A1"], A7: ["A1"],
+  A1: ["I3"], A2: ["A1"], A3: ["A2"], A4: ["A1"], A5: ["A3"], A6: ["A1"], A7: ["A3"],
   E1: ["A3"], E2: ["E1", "E6"], E3: ["E1", "E6"], E4: ["E1", "E6"], E5: ["E1"], E6: ["E1"],
   H1: ["A5", "E6"], H2: ["H1"], H3: ["H2"], H4: ["H3"], H5: ["H2"], H6: ["H4"], H7: ["H2"],
   R1: ["E3"], R2: ["A3"], R3: ["E2"], R4: ["E2"], R5: ["E2"], R6: ["I3"],

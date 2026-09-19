@@ -1,9 +1,11 @@
 import { FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Schema } from "effect"
+import { Cause, Config, Effect, Exit, Schema } from "effect"
 import { join } from "node:path"
 import { DesktopDriver, playwrightDesktop } from "../src/desktop-driver"
 import { connectionFixture } from "../src/harnesses/connection-fixture"
+import { exerciseConnectionError } from "../src/harnesses/connection-error"
+import { AssertionFailure, Harness } from "../src/domain"
 import { assertRuntime } from "../src/runtime"
 
 BunRuntime.runMain(Effect.gen(function* () {
@@ -18,12 +20,27 @@ BunRuntime.runMain(Effect.gen(function* () {
   environment.PATH = `${toolsPath}:${environment.PATH ?? ""}`
   environment.MAGNITUDE_DESKTOP_STATE_DIR = state
   const fixtures = yield* Effect.forEach(["pi", "opencode", "hermes"] as const, harness => connectionFixture(join(root, "profile", "harness-home"), harness, `http://127.0.0.1:${port}/inference/v1`))
+  const checks: { harness: typeof Harness.Type; passed: boolean; detail: string }[] = []
+  const cleanupErrors: string[] = []
   const result = yield* Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.host()
     yield* desktop.ready()
-    for (const fixture of fixtures) yield* fixture.exercise
-  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment })), Effect.either)
-  yield* fs.writeFileString(join(root, "connections-report.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, detail: Schema.String })))({ passed: result._tag === "Right", detail: result._tag === "Right" ? "Pi, OpenCode and Hermes connect, refresh, disconnect, reconnect preserved unrelated providers and used the test endpoint" : String(result.left) }))
-  if (result._tag === "Left") return yield* result.left
+    for (const fixture of fixtures) {
+      const check = yield* Effect.gen(function* () {
+        yield* fixture.exercise
+        yield* exerciseConnectionError(join(root, "profile", "harness-home"), fixture.harness)
+        yield* fixture.inspect(true)
+      }).pipe(Effect.exit)
+      checks.push({ harness: fixture.harness, passed: Exit.isSuccess(check), detail: Exit.isSuccess(check)
+        ? "Connection lifecycle and malformed-file recovery passed" : Cause.pretty(check.cause) })
+    }
+  }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port, environment }, undefined, detail => { cleanupErrors.push(detail) })), Effect.exit)
+  const passed = Exit.isSuccess(result) && cleanupErrors.length === 0 && checks.length === fixtures.length && checks.every(check => check.passed)
+  const report = Schema.Struct({ passed: Schema.Boolean, checks: Schema.Array(Schema.Struct({ harness: Harness, passed: Schema.Boolean, detail: Schema.String })),
+    setupFailure: Schema.String, cleanupErrors: Schema.Array(Schema.String) })
+  yield* fs.writeFileString(join(root, "connections-report.json"), yield* Schema.encode(Schema.parseJson(report))({
+    passed, checks, setupFailure: Exit.isFailure(result) ? Cause.pretty(result.cause) : "", cleanupErrors,
+  }))
+  if (!passed) return yield* new AssertionFailure({ message: "Harness connection checks failed; inspect connections-report.json" })
 }).pipe(Effect.scoped, Effect.provide(BunContext.layer)))

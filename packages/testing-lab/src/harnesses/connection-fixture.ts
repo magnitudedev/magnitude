@@ -3,7 +3,7 @@ import { Effect, Schema } from "effect"
 import { dirname, join } from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import { parse } from "yaml"
-import { AssertionFailure, Digest, Harness } from "../domain"
+import { AssertionFailure, Digest, Harness, InfrastructureFailure } from "../domain"
 import { DesktopDriver } from "../desktop-driver"
 import { sha256 } from "../snapshot"
 
@@ -36,6 +36,7 @@ export const connectionFixture = (isolatedHome: string, harness: typeof Harness.
       : (yield* object(magnitude.options)).baseURL
     if (actual !== endpoint) return yield* fail(`${harness} connection points at a different endpoint`)
   })
+  const checkedInspect = (connected: boolean) => inspect(connected).pipe(Effect.mapError(error => error._tag === "AssertionFailure" ? error : new InfrastructureFailure({ operation: "connection-config", message: error.message })))
   const exercise = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.connect(harness)
@@ -49,5 +50,5 @@ export const connectionFixture = (isolatedHome: string, harness: typeof Harness.
     yield* inspect(true)
     return ConnectionReceipt.make({ harness, endpoint, configurationDigest: sha256(yield* fs.readFile(file)) })
   })
-  return { exercise, inspect }
+  return { harness, exercise, inspect: checkedInspect }
 })
