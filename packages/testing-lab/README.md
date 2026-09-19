@@ -402,3 +402,31 @@ has a new identity. The real macOS 15 ARM64 diagnostic passed six start requests
 across three app lifetimes at `/tmp/ml-service-ownership-20260918/ownership-report.json`.
 All observed app/service PIDs were gone after cleanup. This does not qualify other
 OS targets or unobserved auxiliary processes.
+
+Installation ownership now supports explicit remove/reinstall through a serialized
+lifecycle, avoiding duplicate uninstall during final cleanup. The native macOS 15
+ARM64 uninstall/reinstall diagnostic passed at
+`/tmp/ml-uninstall-reinstall-20260918/uninstall-report.json`: app and CLI removed,
+isolated user data retained, theme preserved after reinstall, service ready, and
+final cleanup removed the replacement app. `scripts/uninstall-probe.ts` uses the
+same native installer and lifecycle as the worker. Payload verification detects
+dangling CLI symlinks as leftovers. This is partial uninstall qualification:
+startup registration and X2 remain unfinished; scheduled X4 stays blocked by X2.
+
+X1 is connected to explicit native removal and publishes a removal receipt. Linux
+checks the package database and desktop launcher; Windows checks the uninstall
+registry key, Start menu shortcut and user PATH registration. Inspection errors
+fail verification rather than implying absence. Mac payload removal has native
+probe evidence; Linux/Windows registration checks currently have fixture coverage
+and still require native qualification. Explicit X1 removal is tested to avoid a
+second uninstall during worker cleanup.
+
+X3 captures the complete stopped application's isolated profile before native removal
+and compares it afterward: file hashes, directory entries and symbolic links. It does
+not follow links outside the profile or put file contents into evidence. X4 reinstalls
+the same candidate, verifies its running version and retained appearance, and waits
+for service readiness. Its X2 prerequisite remains enforced. The native macOS probe at
+`/tmp/ml-retained-profile-20260918/uninstall-report.json` passed full-profile retention
+and reinstall, with no cleanup errors. This is not login-startup or cross-platform
+qualification. Isolated product profiles intentionally disable login startup; that
+case needs its own disposable native-user execution path.

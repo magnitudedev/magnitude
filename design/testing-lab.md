@@ -72,6 +72,15 @@ hashes are verified before acceptance. Transfers expose only the owner-authorize
 Workers receive only scoped run credentials when needed; untrusted source never receives provider credentials or office-network access.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
+Installed-package ownership follows explicit present/absent transitions. Removal updates
+ownership only after the native uninstaller succeeds; reinstall acquires new ownership.
+Final cleanup removes only the currently owned installation. Dangling package launcher
+symlinks count as removal failures even when their targets no longer exist.
+User-data retention compares the stopped application's complete isolated profile before and
+after native removal, including file contents, directories and symbolic links without following
+links outside the profile. Evidence contains hashes rather than file contents. Reinstall must
+consume the same candidate and retain an application setting across the removal boundary.
+
 Every rented resource is tagged with lab/run/lease identity and an absolute expiry. Cancellation,
 timeouts and failures release owned resources; reconciliation also inventories providers to find
 allocations lost between provisioning and persistence. Cleanup failures remain visible independently

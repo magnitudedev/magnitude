@@ -6,6 +6,9 @@ import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
+import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
+import { installationSession } from "./installation-session"
+import { captureRetainedProfile, RetainedProfile, verifyRetainedProfile } from "./retained-profile"
 import { ApplicationIdentity } from "./application-identity"
 import { verifyServiceOwnership } from "./suites/service"
 import { occupyServicePort } from "./port-fault"
@@ -96,12 +99,9 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       ? yield* Effect.forEach(harnesses, harness => connectionFixture(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), harness, `http://127.0.0.1:${config.port}/inference/v1`)) : []
     const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),
       Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs)))
-    const installed = yield* Effect.cached(Effect.gen(function* () {
-      const packageFile = yield* candidate
-      return yield* Effect.acquireRelease(installer.install(packageFile), app => installer.uninstall(app).pipe(
-        Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Uninstall: ${error.message}`) })),
-      )).pipe(Effect.provideService(Scope.Scope, scope))
-    }))
+    const installation = yield* Effect.cached(candidate.pipe(Effect.flatMap(value => installationSession(value,
+      detail => { cleanupErrors.push(`Uninstall: ${detail}`) }).pipe(Effect.provideService(Installer, installer), Effect.provideService(Scope.Scope, scope)))))
+    const installed = installation.pipe(Effect.flatMap(value => value.get))
     const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
       return yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
@@ -109,6 +109,14 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
     }))
     const desktop = session.pipe(Effect.flatMap(value => value.driver))
+    const retentionSelected = assignment.target.cases.some(test => test.id === "X3" || test.id === "X4")
+    const retainedProfile = yield* Effect.cached(Effect.gen(function* () {
+      const driver = yield* desktop
+      yield* driver.theme("dark")
+      yield* driver.quit()
+      yield* (yield* session).stop
+      return yield* captureRetainedProfile(environment.MAGNITUDE_DEV_DATA_DIR).pipe(Effect.provideService(FileSystem.FileSystem, fs))
+    }))
     const cli = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
       const context = yield* Layer.buildWithScope(bundledCliTests({ executable: app.cli, version: (yield* manifest).release.version, model: config.model,
@@ -242,6 +250,29 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           break
         }
         case "C6": yield* (yield* cli).nativeRuntime; break
+        case "X1": {
+          const app = yield* installed
+          if (retentionSelected) yield* retainedProfile
+          yield* (yield* session).stop
+          yield* (yield* installation).remove
+          const receipt = yield* verifyNativeRemoval(app, config.environment).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("X1-native-removal.json", RemovalReceipt, receipt)] })
+        }
+        case "X3": {
+          const receipt = yield* verifyRetainedProfile(environment.MAGNITUDE_DEV_DATA_DIR, yield* retainedProfile).pipe(Effect.provideService(FileSystem.FileSystem, fs))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("X3-retained-profile.json", RetainedProfile, receipt)] })
+        }
+        case "X4": {
+          yield* installed
+          const driver = yield* desktop
+          if ((yield* driver.host()) !== (yield* manifest).release.version) return yield* new AssertionFailure({ message: "Reinstalled application version differs from admitted candidate" })
+          yield* driver.verifyTheme("dark")
+          yield* driver.ready()
+          break
+        }
         default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
       return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, hostEvidence] })
@@ -286,7 +317,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     for (const name of relaunches) {
       for (const file of ["ui-trace.zip", "desktop.log"]) {
         if (yield* fs.exists(join(desktopEvidence, name, file))) {
-          for (const caseId of ["A4", "A6", "A7", "R6"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+          for (const caseId of ["A4", "A6", "A7", "R6", "X1", "X4"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
         }
       }
     }
