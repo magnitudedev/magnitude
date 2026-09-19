@@ -298,7 +298,9 @@ cannot qualify the target model's backend. Native completion diagnostics preserv
 device locations; the lab must still validate runtime-module identity and request correlation.
 The shared backend case combines these checks on one public generation and preserves the native
 receipt even when allocation or module validation fails. CPU acceptance requires positive host
-model allocation with no target-model accelerator allocation. GPU acceptance requires positive
+or explicitly identified CPU-device model allocation with no target-model accelerator allocation.
+CPU-device allocations may coexist with accelerator allocations but cannot qualify GPU execution.
+GPU acceptance requires positive
 target-model allocation on the requested backend and hardware. Physical identifiers must match
 host discovery exactly. Metal's absent physical identifier is accepted only for native index zero
 on a host with exactly one enumerated Metal device; multiple-device ambiguity fails explicitly.

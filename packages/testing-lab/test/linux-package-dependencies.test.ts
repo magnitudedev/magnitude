@@ -21,6 +21,8 @@ test("Linux package inspection covers installed and admitted runtime bytes and r
   const native = new Uint8Array(64), view = new DataView(native.buffer)
   native.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]); view.setUint16(18, 62, true)
   for (const name of ["magnitude", "bridge.node"]) yield* fs.writeFile(join(application, name), native)
+  const launcher = join(application, "launch")
+  yield* fs.writeFileString(launcher, '#!/bin/sh\nexec "$(dirname "$0")/magnitude" "$@"\n')
   const payload = new TextEncoder().encode("verified fixture archive")
   const release = yield* Schema.decodeUnknown(ReleaseManifestSchema)({ schemaVersion: 2, version: "0.1.3", acnRevision: 1,
     rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.3", sourceCommit: "a".repeat(40), artifacts: [
@@ -29,7 +31,7 @@ test("Linux package inspection covers installed and admitted runtime bytes and r
         sha256: sha256(payload), nativeBuild: "fixture", backendModuleAbi: "fixture" },
     ] })
   const target = targets.find(target => target.id === "ubuntu-24.04-x64-cpu-intel")!
-  const app = InstalledApplication.make({ root: application, executable: join(application, "magnitude"), cli: join(application, "magnitude"),
+  const app = InstalledApplication.make({ root: application, executable: launcher, cli: join(application, "magnitude"),
     packageVersion: "0.1.3", candidate: { version: "0.1.3", target, artifact: release.artifacts[0]!, path: join(root, "app.deb") } })
   let missing = false
   const inspected: string[] = []
@@ -63,7 +65,7 @@ test("Linux package inspection covers installed and admitted runtime bytes and r
     expect(rejected._tag).toBe("Left")
     if (rejected._tag === "Left") expect(rejected.left.message).toContain("not an admitted OS dependency: libmissing.so")
     missing = false
-    yield* fs.writeFileString(app.executable, "not a native executable")
+    yield* fs.writeFileString(join(application, "magnitude"), "not a native executable")
     const invalidEntrypoint = yield* run.pipe(Effect.either)
     expect(invalidEntrypoint._tag).toBe("Left")
     if (invalidEntrypoint._tag === "Left") expect(invalidEntrypoint.left.message).toContain("Declared executable is absent from native inventory")

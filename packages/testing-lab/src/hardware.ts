@@ -30,7 +30,9 @@ export const attestGeneration = (target: Target, host: HostObservation, expected
   if (observation.model !== expectedModel || observation.allocations.length === 0) {
     return yield* new AssertionFailure({ message: "Generation has no allocation evidence for the expected model" })
   }
+  // GGML reports CPU buffers as device allocations too. Only non-CPU devices are accelerators.
   const devices = observation.allocations.filter(allocation => allocation.kind === "device")
+    .filter(allocation => allocation.backend.toLowerCase() !== "cpu")
   if (target.backend === "cpu") {
     if (devices.length > 0) {
       return yield* new AssertionFailure({ message: "CPU-only generation used accelerator model allocations" })

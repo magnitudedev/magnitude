@@ -208,6 +208,14 @@ existing DEB and RPM formats. The exported installer, service and CPU inference 
 independently admitted by hash and length; the producer VM, NIC and disk were removed. Building
 an RPM on Ubuntu does not qualify installation on Fedora or Red Hat.
 
+A separate clean Ubuntu consumer passed 25 functional checks on those same artifacts: native
+installation, packaged UI/model download, settings persistence, CPU-attested generation, streaming,
+tool-result follow-up, cancellation/reload/restart, bundled CLI and native removal. The dependency
+audit exposed two lab assumptions: the launcher is a shell script, and Electron also needs the
+OS-owned `libudev`. After correction, that audit passed on another fresh consumer, including
+native symbol-version and package-owner checks. These are separate recorded attempts, not one
+all-green run. Linux signatures, harnesses, updates and the other distro targets remain unqualified.
+
 Scheduled source execution still builds on the allocated target before installation. Separate
 producer/consumer orchestration, shared producer deduplication and native Windows toolchain
 configuration remain required for full remote verification. The shared worker already serves

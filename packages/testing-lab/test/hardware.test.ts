@@ -21,6 +21,19 @@ test("hardware support alone cannot certify CUDA generation or mask CPU fallback
     expect(await Effect.runPromise(attestGeneration(a10, host, "fixture-model", altered).pipe(Effect.either))).toMatchObject({ _tag: "Left" })
   }
 })
+test("CPU device allocations qualify CPU execution without hiding accelerator fallback or mixed backends", async () => {
+  const cpu = targets.find(t => t.os === "ubuntu" && t.backend === "cpu" && t.hardware === "amd")!
+  const cpuDevice = { ...allocation, backend: "CPU", physical_id: null, model_bytes: 2959104000 }
+  const observed = { ...generation, allocations: [cpuDevice, { kind: "host" as const, model_bytes: 2904582144 }] }
+  await Effect.runPromise(attestGeneration(cpu, host, "fixture-model", observed))
+  await Effect.runPromise(attestGeneration(cpu, host, "fixture-model", { ...generation, allocations: [cpuDevice] }))
+  await Effect.runPromise(attestGeneration(a10, host, "fixture-model", { ...observed, allocations: [...observed.allocations, allocation] }))
+  for (const invalid of [
+    attestGeneration(a10, host, "fixture-model", observed),
+    attestGeneration(cpu, host, "fixture-model", { ...observed, allocations: [...observed.allocations, allocation] }),
+    attestGeneration(cpu, host, "fixture-model", { ...generation, allocations: [{ ...cpuDevice, backend: "unknown" }] }),
+  ]) expect((await Effect.runPromise(invalid.pipe(Effect.either)))._tag).toBe("Left")
+})
 test("RTX PRO 6000 requires the actual Blackwell Server Edition device", async () => {
   const target = targets.find(t => t.os === "ubuntu" && t.backend === "cuda" && t.hardware === "rtx-pro-6000")!
   expect(await Effect.runPromise(attestHost(target, { ...host, gpus: [{ ...host.gpus[0]!, name: "Quadro RTX 6000" }] }).pipe(Effect.either))).toMatchObject({ _tag: "Left" })
