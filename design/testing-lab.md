@@ -17,7 +17,9 @@ A run binds an immutable source snapshot or existing artifact manifest, explicit
 selection, isolation mode and resource limits. Source includes tracked changes, nonignored new
 files and recursive submodule working trees. Concurrent mutation invalidates a snapshot. Every
 download and extracted file is integrity checked; extraction cannot escape its owned directory.
-Existing artifacts are never rebuilt or relabelled as a successful compilation.
+Existing artifacts are copied into content-addressed storage and verified against their declared
+hashes and lengths before submission. Subsequent edits to local packages cannot alter an admitted
+input. Existing artifacts are never rebuilt or relabelled as a successful compilation.
 
 `iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
 and consumer state. Neither mode may touch a developer's normal application data. Local execution
@@ -37,7 +39,10 @@ bundled CLI. No mocked model response, developer binary or hosted provider can s
 The nine suites are package, install, app, endpoint, harness, recovery, CLI, update and uninstall.
 Pi, OpenCode and Hermes are the initial harnesses. Configuration must be produced through the
 product's Connections surface. Endpoint and harness tests attest the requested backend/device;
-CPU fallback fails a Metal/CUDA target. Generation checks output/protocol/tool behavior, not speed.
+CPU fallback fails a Metal/CUDA target. Host identity is collected from native OS and device
+interfaces before test execution; a Windows Server build cannot qualify a Windows client target.
+Unavailable GPU memory totals remain unknown, not fabricated. Device discovery alone cannot
+qualify generation. Generation checks output/protocol/tool behavior, not speed.
 
 ## Ownership and recovery
 

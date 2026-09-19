@@ -2,7 +2,7 @@
 
 This package is under active implementation. The coordinator protocol, persistence, source
 transport, provider allocation adapters and initial functional drivers exist. A deployed
-scheduler, complete case implementations, image qualification, artifact-mode CLI, and CI
+scheduler, complete case implementations, image qualification, and CI
 workflow are still required before the full target matrix can execute.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
@@ -12,6 +12,7 @@ mean its provider image or backend has been qualified.
 ```sh
 bun lab run --source . --target macos-26-arm64-metal-apple-silicon
 bun lab run --source . --profile pr --concurrency 4 --budget 150
+bun lab run --artifacts ./dist/release-manifest.json --target macos-15-arm64-metal-apple-silicon
 bun lab status --run run-<uuid>
 bun lab results --run run-<uuid>
 bun lab cancel --run run-<uuid>
@@ -22,6 +23,11 @@ from `/v1/me`, snapshots dirty source and initialized submodules, queries which 
 are missing, uploads only those objects, registers the immutable input and submits the run.
 No commit or push is required. Interrupting the waiting CLI leaves the remote run running;
 use `cancel` for cancellation. `--no-wait` returns after submission.
+
+`--artifacts` accepts a release manifest with its application artifacts in the same directory.
+Every declared application artifact is copied into local content-addressed storage and checked
+against its SHA-256 and byte count before remote submission. The uploaded manifest preserves
+release identity and plugin metadata; this mode does not rebuild or publish packages.
 
 `iterate` and `verify` are protocol selections. Warm worker reuse for `iterate` has not yet
 been connected. Never present an iteration result as a fresh installer qualification.
@@ -147,3 +153,19 @@ model pull/stop/load, real generation after reload, Pi/OpenCode/Hermes add/sync/
 inputs and native SQLite/Bun without developer tools on PATH. All nine checks passed locally.
 It additionally requires `LAB_PROBE_BUNDLED_CLI`, `LAB_PROBE_VERSION`, and `LAB_PROBE_TOOLS_PATH`.
 Public shell registration, interruption and full service lifecycle remain separate work.
+
+Native host inspection is available with `LAB_INSPECT_TARGET=<target-id> bun
+packages/testing-lab/scripts/inspect-host.ts`. It checks the selected OS version, CPU
+architecture/vendor, and required GPU model. macOS uses native Metal device registry IDs
+through a Swift tooling probe (Command Line Tools required on the runner); Windows uses CIM
+and NVIDIA queries; Linux uses distribution metadata, lscpu and NVIDIA queries. DGX OS
+prefers the installed OTA version over the factory image version. Native Mac execution is
+verified; Windows/Linux collectors still require qualification on their actual workers.
+This observation does not prove that inference used the selected backend.
+
+The initial guest-side artifact worker connects manifest integrity, host inspection, exact
+installer download, native installation, packaged launch/readiness, bundled CLI checks and
+scoped uninstall. Unconnected cases return blocked outcomes. The scheduler transport has
+not yet been wired to this worker, and source builds still need their worker path.
+`artifact-worker-probe.ts` is an explicitly limited five-case install/CLI diagnostic, not a
+full-profile run; it has passed against the local macOS 15 DMG with verified removal.

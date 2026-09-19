@@ -92,8 +92,10 @@ export const planRun = (request: RunRequest) => Effect.gen(function* () {
     }
     for (const id of chosen) include(id)
     const harnesses: readonly Harness[] = selection.kind === "custom" ? selection.harnesses : selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"]
-    const expanded = cases.filter(c => chosen.has(c.id)).flatMap(c => c.suite === "harness"
-      ? harnesses.map(h => ({ ...c, harness: Option.some(h) })) : [c])
+    const expanded = cases.filter(c => chosen.has(c.id)).map(c => request.input.kind === "artifacts" && c.id === "P1"
+      ? { ...c, title: "Record supplied artifact provenance without compiling" }
+      : request.input.kind === "artifacts" && c.id === "P2" ? { ...c, title: "Verify supplied final package bytes without rebuilding" } : c)
+      .flatMap(c => c.suite === "harness" ? harnesses.map(h => ({ ...c, harness: Option.some(h) })) : [c])
     return { target: t, cases: expanded, blockers: t.provider === "spark" && (!request.allowSpark || request.trust === "untrusted-ci")
       ? ["Spark requires explicit permission for this run and trusted source"] : [] }
   })

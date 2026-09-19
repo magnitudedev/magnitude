@@ -17,6 +17,8 @@ import { InputRegistry, InputRegistryLive } from "../src/inputs"
 import { fileArtifactStore } from "../src/artifact-store"
 import { sha256 } from "../src/snapshot"
 import { ProcessExecutorLive } from "../src/process"
+import { snapshotArtifacts } from "../src/artifact-input"
+import releasePlan from "../../release/release-plan.json"
 import { temporaryDatabase } from "./postgres"
 
 test("PostgreSQL fences stale workers, rolls back transactions and serializes Spark reservations", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -151,6 +153,25 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
       expect(yield* client.missing([uploadedInput.digest])).toEqual([])
       yield* client.registerInput(uploadedInput)
       expect(yield* client.upload(sha256("wrong"), Stream.make(new TextEncoder().encode("different"))).pipe(Effect.either)).toMatchObject({ _tag: "Left" })
+      const packageBytes = "private unpublished package"
+      const artifactDirectory = join(root, "local-artifacts")
+      yield* fs.makeDirectory(artifactDirectory)
+      yield* fs.writeFileString(join(artifactDirectory, "Magnitude.dmg"), packageBytes)
+      yield* fs.writeFileString(join(artifactDirectory, "release.json"), yield* Schema.encode(Schema.parseJson(Schema.Unknown))({
+        schemaVersion: 2, version: "0.1.3", acnRevision: 1, rpc: releasePlan.rpc, plugins: [],
+        tag: "@magnitudedev/cli@0.1.3", sourceCommit: "a".repeat(40), artifacts: [{ id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64",
+          filename: "Magnitude.dmg", bytes: Buffer.byteLength(packageBytes), sha256: sha256(packageBytes) }],
+      }))
+      const prepared = yield* snapshotArtifacts(join(artifactDirectory, "release.json"), join(root, "local-objects"))
+      const artifactInput = { kind: "artifacts" as const, digest: prepared.digest }
+      yield* client.upload(prepared.digest, Stream.make(new TextEncoder().encode(prepared.json)))
+      expect(yield* client.registerInput(artifactInput).pipe(Effect.either)).toMatchObject({ _tag: "Left", left: { status: 403 } })
+      yield* client.upload(sha256(packageBytes), Stream.make(new TextEncoder().encode(packageBytes)))
+      yield* client.registerInput(artifactInput)
+      const artifactRun = yield* client.submit({ ...request, input: artifactInput,
+        idempotencyKey: RunRequest.fields.idempotencyKey.make("http-artifact-request") })
+      expect((yield* client.get(artifactRun.state.runId)).state.plan.request.input).toEqual(artifactInput)
+      yield* client.cancel(artifactRun.state.runId)
       const submission = yield* client.submit({ ...request, idempotencyKey: RunRequest.fields.idempotencyKey.make("http-client-request") })
       expect((yield* client.result(submission.state.runId))._tag).toBe("None")
       expect((yield* client.cancel(submission.state.runId)).state._tag).toBe("Cancelling")

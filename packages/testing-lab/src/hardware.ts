@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect"
 import { Architecture, AssertionFailure, Backend, Target } from "./domain"
 
 export const ObservedGpu = Schema.Struct({ name: Schema.NonEmptyString, backend: Schema.Literal("cuda", "metal"),
-  uuid: Schema.NonEmptyString, driver: Schema.String, memoryBytes: Schema.Int.pipe(Schema.nonNegative()) })
+  uuid: Schema.NonEmptyString, driver: Schema.String, memoryBytes: Schema.NullOr(Schema.Int.pipe(Schema.nonNegative())) })
 export const HostObservation = Schema.Struct({ os: Target.fields.os, version: Schema.NonEmptyString, build: Schema.String,
   arch: Architecture, cpuVendor: Schema.String, cpuName: Schema.String, machineModel: Schema.String,
   gpus: Schema.Array(ObservedGpu), memoryBytes: Schema.Int.pipe(Schema.positive()) })

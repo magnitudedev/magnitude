@@ -9,6 +9,7 @@ import { Digest, InfrastructureFailure, InvalidInput, RunId, RunPlan, RunRequest
 import { ProcessExecutorLive } from "./process"
 import { manifestJson, snapshotSource } from "./snapshot"
 import { assertRuntime } from "./runtime"
+import { snapshotArtifacts } from "./artifact-input"
 import { RunRecord } from "./run-store"
 
 const help = `Magnitude testing lab
@@ -17,10 +18,12 @@ const help = `Magnitude testing lab
   bun lab plan --request run.json
   bun lab run --source . --target macos-26-arm64-metal-apple-silicon
   bun lab run --source . --profile pr --budget 150 --concurrency 4
+  bun lab run --artifacts ./dist/release-manifest.json --profile quick
   bun lab status --run run-<uuid>
   bun lab results --run run-<uuid>
   bun lab cancel --run run-<uuid>
 
+Use --artifacts instead of --source to verify packages beside a release manifest.
 Run uploads dirty tracked files and nonignored new files without a commit or push.
 LAB_URL and LAB_TOKEN select the authenticated coordinator. Token identity determines
 ownership and trust. --mode iterate|verify defaults to verify. --no-wait submits and
@@ -31,7 +34,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
   const command = args[0] ?? "help"
   const options = new Map<string, string>()
   const boolean = new Set(["no-wait", "allow-spark"])
-  const allowed = new Set(["request", "source", "target", "profile", "budget", "concurrency", "deadline", "mode", "objects", "run", ...boolean])
+  const allowed = new Set(["request", "source", "artifacts", "target", "profile", "budget", "concurrency", "deadline", "mode", "objects", "run", ...boolean])
   for (let i = 1; i < args.length; i++) {
     const flag = args[i]!
     if (!flag.startsWith("--") || !allowed.has(flag.slice(2))) return yield* new InvalidInput({ message: `Unknown argument: ${flag}` })
@@ -41,6 +44,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
     if (!value || value.startsWith("--")) return yield* new InvalidInput({ message: `Missing value: ${flag}` })
     options.set(name, value)
   }
+  if (command === "run" && options.has("source") === options.has("artifacts")) return yield* new InvalidInput({ message: "Specify exactly one of --source or --artifacts" })
   return { command, options }
 })
 const print = <A, I>(schema: Schema.Schema<A, I>, value: A) => Schema.encode(Schema.parseJson(schema))(value).pipe(Effect.flatMap(Console.log))
@@ -73,26 +77,30 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     }))
   }
   if (command !== "run") return yield* new InvalidInput({ message: `Unknown command: ${command}` })
-  const source = resolve(yield* required("source"))
   const objects = resolve(options.get("objects") ?? join(homedir(), ".cache", "magnitude-lab", "objects"))
+  const prepared = options.has("artifacts")
+    ? { kind: "artifacts" as const, ...yield* snapshotArtifacts(options.get("artifacts")!, objects) }
+    : yield* snapshotSource(resolve(options.get("source")!), objects).pipe(Effect.map(snapshot => ({
+      kind: "source" as const, digest: snapshot.digest, json: manifestJson(snapshot.manifest),
+      digests: [...new Set(snapshot.manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : []))],
+    })))
   return yield* remote(Effect.gen(function* () {
     const client = yield* LabClient
     const identity = yield* client.identity()
-    const snapshot = yield* snapshotSource(source, objects)
     const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: crypto.randomUUID(), ...identity,
-      input: { kind: "source", digest: snapshot.digest }, selection: { kind: "profile", profile: options.get("profile") ?? "quick", ...(options.has("target") ? { target: options.get("target") } : {}) },
+      input: { kind: prepared.kind, digest: prepared.digest }, selection: { kind: "profile", profile: options.get("profile") ?? "quick", ...(options.has("target") ? { target: options.get("target") } : {}) },
       mode: options.get("mode") ?? "verify", allowSpark: options.has("allow-spark"),
       limits: { concurrency: Number(options.get("concurrency") ?? 1), deadlineMinutes: Number(options.get("deadline") ?? 60), budgetUsd: Number(options.get("budget") ?? 25), idleMinutes: 15 },
     })
     const plan = yield* client.plan(request)
-    yield* Console.error(`Planned ${plan.targets.length} targets; reserved estimate $${plan.estimatedComputeUsd}; source ${snapshot.digest}`)
+    yield* Console.error(`Planned ${plan.targets.length} targets; reserved estimate $${plan.estimatedComputeUsd}; ${prepared.kind} ${prepared.digest}`)
     if (plan.estimatedComputeUsd > request.limits.budgetUsd) return yield* new InvalidInput({ message: "Plan exceeds --budget; no input uploaded or run submitted" })
-    const digests = [...new Set(snapshot.manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : []))]
+    const digests = prepared.digests
     const missing: Digest[] = []
     for (let start = 0; start < digests.length; start += 1000) missing.push(...yield* client.missing(digests.slice(start, start + 1000)))
     yield* Console.error(`Uploading ${missing.length} changed objects; ${digests.length - missing.length} already available`)
-    yield* Effect.forEach(missing, digest => client.upload(digest, fs.stream(join(objects, digest)).pipe(Stream.mapError(() => new InfrastructureFailure({ operation: "source-upload", message: "Cannot read source object" })))), { concurrency: 4, discard: true })
-    yield* client.upload(snapshot.digest, Stream.make(new TextEncoder().encode(manifestJson(snapshot.manifest))))
+    yield* Effect.forEach(missing, digest => client.upload(digest, fs.stream(join(objects, digest)).pipe(Stream.mapError(() => new InfrastructureFailure({ operation: "input-upload", message: "Cannot read input object" })))), { concurrency: 4, discard: true })
+    yield* client.upload(prepared.digest, Stream.make(new TextEncoder().encode(prepared.json)))
     yield* client.registerInput(request.input)
     const run = yield* client.submit(request)
     yield* print(RunRecord, run)
