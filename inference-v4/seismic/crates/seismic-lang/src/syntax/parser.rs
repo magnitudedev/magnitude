@@ -225,7 +225,7 @@ impl Parser {
             }
             match self.peek() {
                 Tok::Eof => break,
-                Tok::Kw(Kw::Admit | Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
+                Tok::Kw(Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Kw(Kw::Lower) => decls.push(Decl::Lower(self.lower_decl()?)),
                 Tok::Indent => {
                     return Err(self.error(
@@ -245,7 +245,6 @@ impl Parser {
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
         let start = self.span();
-        let admit = self.eat_kw(Kw::Admit);
         self.expect_kw(Kw::Fn)?;
         let name = self.expect_name()?;
         let mut continued = false;
@@ -260,7 +259,6 @@ impl Parser {
         self.expect_op(Op::Colon)?;
         let body = self.body(continued)?;
         Ok(FnDecl {
-            admit,
             signature,
             name,
             target,
@@ -1094,7 +1092,7 @@ mod tests {
         let Decl::Fn(f) = &rms.decls[0] else {
             panic!("expected fn")
         };
-        assert!(!f.admit && f.target.is_none());
+        assert!(f.target.is_none());
         assert_eq!(
             f.signature
                 .params
@@ -1169,10 +1167,10 @@ mod tests {
     #[test]
     fn modes_aliases_and_contextual_words() {
         let file = round_trip(
-            "admit fn f(out out: tensor[M] f32, out: tensor[M] f32, inout inout: tile[M] T, to: f32) alias(out, inout), alias(to, out) -> f32:\n    publish to to out[:]\n    return to\n",
+            "fn f(out out: tensor[M] f32, out: tensor[M] f32, inout inout: tile[M] T, to: f32) alias(out, inout), alias(to, out) -> f32:\n    publish to to out[:]\n    return to\n",
         );
         let f = only_fn(&file);
-        assert!(f.admit && f.target.is_none());
+        assert!(f.target.is_none());
         let params: Vec<_> = f
             .signature
             .params

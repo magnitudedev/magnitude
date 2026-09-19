@@ -135,7 +135,7 @@ fn sum_squares[N](x: tensor[N] f32, out y: tensor[1] f32):
 ";
 
     const MERGE_SUM: &str = "\
-admit fn merge_sum[K](x: tensor[K] f32, out y: tensor[1] f32):
+fn merge_sum[K](x: tensor[K] f32, out y: tensor[1] f32):
     let total = parallel [part] in 0..K:
         yield reduce(f32(x[part]), 0, sum)
     merge (left, right) identity f32(0.0):
@@ -144,7 +144,7 @@ admit fn merge_sum[K](x: tensor[K] f32, out y: tensor[1] f32):
 ";
 
     const SCAN: &str = "\
-admit fn scan[N](x: tensor[N] f32, out before: tensor[N] f32, out after: tensor[N] f32, out last: tensor[2] f32):
+fn scan[N](x: tensor[N] f32, out before: tensor[N] f32, out after: tensor[N] f32, out last: tensor[2] f32):
     let partials = parallel [p] in 0..N:
         yield reduce(f32(x[p]), 0, sum)
     let mut (m, s) = (f32(-inf), f32(0.0))

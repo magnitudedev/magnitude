@@ -18,7 +18,7 @@
 //!   reduction      lane-local when admitted and the output exceeds one subgroup; else
 //!                  collective (per-lane partial, then one subgroup reduction) when admitted,
 //!                  which requires a contract that permits reassociation (`unordered=true` in
-//!                  an `admit fn`) over a lane-distributed input; else ordered (authored
+//!                  a body with `unordered=true`) over a lane-distributed input; else ordered (authored
 //!                  ascending order, bit-exact); else the first admitted algorithm
 //!   allocation     always a new slot: no reuse, hence no optional barrier
 //!   transfer       the widest exact packed vector the transfer admits
@@ -31,6 +31,22 @@ use seismic_lang::exec::ir::{LoadMode, StmtKind};
 use seismic_lang::exec::lowered_ir::LoweredIr;
 use seismic_realization::dispatch::TilePlacement;
 
+fn reduction_algorithm(
+    domain: &crate::reduction::ReductionDomain,
+    allow_numerical_effects: bool,
+) -> Result<Algorithm, String> {
+    let admitted = domain.algorithms();
+    if domain.output_capacity() > SUBGROUP as u64 && admitted.contains(&Algorithm::LaneLocal) {
+        Ok(Algorithm::LaneLocal)
+    } else if allow_numerical_effects && admitted.contains(&Algorithm::Collective) {
+        Ok(Algorithm::Collective)
+    } else if admitted.contains(&Algorithm::Ordered) {
+        Ok(Algorithm::Ordered)
+    } else {
+        admitted.first().copied().ok_or_else(|| "reduction admits no algorithm".to_string())
+    }
+}
+
 /// Largest piece count of any root `parallel` statement.
 fn max_pieces(lowered: &LoweredIr) -> Result<u64, SelectionError> {
     let mut most = 1u64;
@@ -42,7 +58,11 @@ fn max_pieces(lowered: &LoweredIr) -> Result<u64, SelectionError> {
     Ok(most)
 }
 
-pub(super) fn realize(limits: &Limits, lowered: &LoweredIr) -> Result<Execution, SelectionError> {
+pub(super) fn realize(
+    limits: &Limits,
+    lowered: &LoweredIr,
+    allow_numerical_effects: bool,
+) -> Result<Execution, SelectionError> {
     let mut selected = lowered.clone();
     seismic_compiler::load_rule(&mut selected).map_err(|reason| SelectionError::UnsupportedMapping(format!("`{}`: {reason}", lowered.name)))?;
     let lowered = &selected;
@@ -88,20 +108,7 @@ pub(super) fn realize(limits: &Limits, lowered: &LoweredIr) -> Result<Execution,
                 None => Err(format!("tile `{}` admits no storage placement", decision.name)),
             }
         },
-        &mut |decision| {
-            let admitted = decision.domain.algorithms();
-            if decision.domain.output_capacity() > SUBGROUP as u64 && admitted.contains(&Algorithm::LaneLocal) {
-                Ok(Algorithm::LaneLocal)
-            } else if admitted.contains(&Algorithm::Collective) {
-                // Admitted only when the authored contract permits reassociation
-                // (`unordered=true` inside an `admit fn`) and the input is lane-distributed.
-                Ok(Algorithm::Collective)
-            } else if admitted.contains(&Algorithm::Ordered) {
-                Ok(Algorithm::Ordered)
-            } else {
-                admitted.first().copied().ok_or_else(|| "reduction admits no algorithm".to_string())
-            }
-        },
+        &mut |decision| reduction_algorithm(&decision.domain, allow_numerical_effects),
         &mut |choice| Ok(choice.new_slot),
         &mut |choice| Ok(choice.maximum.max(1)),
         &mut |_| Ok(1),
@@ -129,4 +136,26 @@ pub(super) fn realize(limits: &Limits, lowered: &LoweredIr) -> Result<Execution,
         }
     }
     Ok(execution)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic_lang::types::DType;
+
+    #[test]
+    fn strict_precision_keeps_unordered_sum_on_the_reference_order() {
+        let domain = crate::reduction::ReductionDomain::new(
+            &[32],
+            0,
+            DType::F32,
+            false,
+            TilePlacement::Distributed,
+            32,
+        )
+        .unwrap();
+        assert!(domain.algorithms().contains(&Algorithm::Collective));
+        assert_eq!(reduction_algorithm(&domain, false).unwrap(), Algorithm::Ordered);
+        assert_eq!(reduction_algorithm(&domain, true).unwrap(), Algorithm::Collective);
+    }
 }

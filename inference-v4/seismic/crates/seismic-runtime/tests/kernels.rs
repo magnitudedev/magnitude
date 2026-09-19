@@ -1,7 +1,8 @@
 //! Gate G3: every linked seismic-std kernel the Qwen path uses, selected and run on
 //! Metal, agrees with the reference interpreter. The same case table runs on the CPU device
-//! under exact numerics, where every output must be bit-identical to the interpreter.
-use seismic_lang::family::{Numerics, Workload};
+//! under exact precision, where every output must be bit-identical to the interpreter.
+use seismic_lang::family::Workload;
+use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData, Uniform};
 use seismic_lang::repr;
 use seismic_lang::sir::{Definition, Program};
@@ -22,9 +23,9 @@ struct Case {
     contents: &'static [(&'static str, &'static [f64])],
     /// GGUF import: `data` is random raw words and `halves` is the f16 view of the same bytes.
     raw: bool,
-    /// Every output compares exactly even under admitted numerics.
+    /// Every output compares exactly even under unconstrained exploration.
     exact: bool,
-    modes: &'static [Numerics],
+    modes: &'static [PrecisionPolicy],
 }
 
 const fn case(
@@ -42,7 +43,7 @@ const fn case(
         contents: &[],
         raw: false,
         exact: false,
-        modes: &[Numerics::Admitted],
+        modes: &[PrecisionPolicy::Unconstrained],
     }
 }
 
@@ -252,7 +253,7 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-const BOTH: &[Numerics] = &[Numerics::Admitted, Numerics::Exact];
+const BOTH: &[PrecisionPolicy] = &[PrecisionPolicy::Unconstrained, PrecisionPolicy::Exact];
 
 /// Every packed representation through `linear` and `embedding_row`, the GGUF and dense
 /// weight imports, and the k-quants at Qwen3.5-4B projection geometry.
@@ -314,7 +315,7 @@ fn packed_cases() -> Vec<Case> {
             )
         });
     }
-    const EXACT: &[Numerics] = &[Numerics::Exact];
+    const EXACT: &[PrecisionPolicy] = &[PrecisionPolicy::Exact];
     for (name, n, k) in [
         ("q4k", 9216, 2560),
         ("q5k", 9216, 2560),
@@ -373,7 +374,7 @@ fn run(
     program: &Program,
     device: &Device,
     case: &Case,
-    numerics: Numerics,
+    precision: PrecisionPolicy,
     seed: u64,
 ) -> Result<f64, String> {
     let definition = abi(program, case.entry)?;
@@ -388,7 +389,7 @@ fn run(
             .iter()
             .map(|(n, e)| Ok((n.to_string(), element(e)?)))
             .collect::<Result<_, String>>()?,
-        numerics,
+        precision: precision.clone(),
     };
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
     let mut tensors: Vec<(String, bool, TensorData)> = Vec::new();
@@ -488,7 +489,7 @@ fn run(
         device,
         program,
         Settings {
-            numerics,
+            precision: precision.clone(),
             ..Settings::default()
         },
     )
@@ -528,41 +529,30 @@ fn run(
         actual.load_device_bytes(&bytes);
         let expected = &interpreter.tensors[index];
         let strict =
-            dtype.is_int() || *dtype == DType::Bool || case.exact || numerics == Numerics::Exact;
-        let mut wrong = Vec::new();
-        for flat in 0..data.len() {
+            dtype.is_int() || *dtype == DType::Bool || case.exact || precision == PrecisionPolicy::Exact;
+        let tolerance = if strict {
+            Tolerance::EXACT
+        } else {
+            Tolerance { absolute: Limit::new(2e-4)?, relative: Limit::new(2e-3)?, relative_floor: Limit::ZERO, ulps: None }
+        };
+        let reference: Vec<f64> = (0..data.len()).map(|flat| expected.get(flat)).collect();
+        let candidate: Vec<f64> = (0..data.len()).map(|flat| actual.get(flat)).collect();
+        let comparison = compare_dense(&reference, &candidate, *dtype, Some(tolerance), SpecialPolicy::PRESERVE)?;
+        worst = worst.max(comparison.metrics.maximum_absolute);
+        if comparison.beyond_tolerance != 0 {
+            let flat = comparison.worst_element.unwrap_or(0);
             let (want, got) = (expected.get(flat), actual.get(flat));
-            if (want.is_nan() && got.is_nan()) || want == got {
-                continue;
-            }
-            let diff = (want - got).abs();
-            let tolerance = if strict {
-                0.0
-            } else {
-                2e-4 + 2e-3 * want.abs()
-            };
-            if !(diff <= tolerance) {
-                wrong.push((flat, want, got));
-            }
-            worst = worst.max(if diff.is_nan() { f64::INFINITY } else { diff });
-        }
-        if let Some((flat, want, got)) = wrong.first() {
-            let at: Vec<String> = wrong
-                .iter()
-                .take(12)
-                .map(|(f, _, _)| f.to_string())
-                .collect();
             return Err(format!(
-                "mismatch: {name} {}/{} elements, max diff {worst:e}, first [{flat}] expected {want} {} {got}; at {}",
-                wrong.len(), data.len(), device.backend(), at.join(",")
+                "mismatch: {name} {}/{} elements, max abs {:.3e}, max rel {:.3e}, max ulps {}, worst [{flat}] expected {want} {} {got}",
+                comparison.beyond_tolerance, data.len(), comparison.metrics.maximum_absolute, comparison.metrics.maximum_relative, comparison.metrics.maximum_ulps, device.backend()
             ));
         }
     }
     Ok(worst)
 }
 
-/// Run the case table on `device`. `numerics` overrides each case's own modes.
-fn sweep(device: &Device, numerics: Option<Numerics>) {
+/// Run the case table on `device`. `precision` overrides each case's own modes.
+fn sweep(device: &Device, precision: Option<PrecisionPolicy>) {
     let program = seismic_std::program().expect("seismic-std checks");
     // `KERNELS=<substring>` restricts the sweep to matching labels; `KERNELS_SKIP` excludes them.
     let (filter, skip) = (
@@ -581,16 +571,16 @@ fn sweep(device: &Device, numerics: Option<Numerics>) {
         .iter()
         .enumerate()
         .flat_map(|(seed, case)| {
-            let modes: Vec<Numerics> =
-                numerics.map_or_else(|| case.modes.to_vec(), |only| vec![only]);
+            let modes: Vec<PrecisionPolicy> =
+                precision.clone().map_or_else(|| case.modes.to_vec(), |only| vec![only]);
             modes
                 .into_iter()
-                .map(move |numerics| (seed, case, numerics))
+                .map(move |precision| (seed, case, precision))
         })
-        .map(|(seed, case, numerics)| {
+        .map(|(seed, case, precision)| {
             let start = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&program, device, case, numerics, seed as u64)
+                run(&program, device, case, precision.clone(), seed as u64)
             }))
             .unwrap_or_else(|panic| {
                 let text = panic
@@ -603,16 +593,16 @@ fn sweep(device: &Device, numerics: Option<Numerics>) {
                 ))
             });
             eprintln!(
-                "{} {numerics:?}: {:.1}s",
+                "{} {precision:?}: {:.1}s",
                 case.label,
                 start.elapsed().as_secs_f64()
             );
-            (format!("{} [{numerics:?}]", case.label), outcome)
+            (format!("{} [{precision:?}]", case.label), outcome)
         })
         .collect();
     println!(
         "\n{:<36} outcome on {}",
-        "kernel [numerics]",
+        "kernel [precision]",
         device.backend()
     );
     for (label, outcome) in &outcomes {
@@ -641,9 +631,9 @@ fn metal_matches_interpreter() {
     sweep(&Device::metal().expect("Metal device"), None);
 }
 
-/// Exact numerics on the CPU: every case is bit-identical to the interpreter. Cases whose
+/// Exact precision on the CPU: every case is bit-identical to the interpreter. Cases whose
 /// Metal selection uses Metal lowerings select portable bodies here.
 #[test]
 fn cpu_matches_interpreter() {
-    sweep(&Device::cpu().expect("CPU device"), Some(Numerics::Exact));
+    sweep(&Device::cpu().expect("CPU device"), Some(PrecisionPolicy::Exact));
 }

@@ -14,7 +14,15 @@ const FLAGS: &[&str] = &[
     "--fn",
     "--shape",
     "--element",
-    "--numerics",
+    "--precision",
+    "--atol",
+    "--rtol",
+    "--relative-floor",
+    "--ulps",
+    "--evidence",
+    "--output-tolerance",
+    "--input-range",
+    "--allow-special-changes",
     "--target",
     "--strategy",
 ];
@@ -329,7 +337,8 @@ fn report<E>(
                 .join(",");
             say!(
                 out,
-                "  {mark} candidate {ordinal}: {} via {}, template {} [{bound}]",
+                "  {mark} candidate {ordinal}{}: {} via {}, template {} [{bound}]",
+                if candidate.reference { " [reference]" } else { " [alternative]" },
                 definition(program, template.definition),
                 definition(program, candidate.via),
                 candidate.template.0
@@ -345,6 +354,9 @@ fn report<E>(
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+            }
+            if !candidate.numerical_effects.is_empty() {
+                say!(out, "      numerical effects {:?}", candidate.numerical_effects);
             }
         }
         if occurrence.candidates.is_empty() {
@@ -429,6 +441,40 @@ fn report<E>(
     say!(out, "  seed estimate     {}", selected.seed_estimate);
     say!(out, "  selected estimate {}", selected.estimate);
     say!(out, "  proved lower bound {}", selected.lower_bound);
+    say!(out, "numerical evidence: {:?}", selected.numerical_assessment.evidence);
+    if let Some(policy) = &selected.numerical_assessment.validated_policy {
+        say!(out, "  validated policy: {policy:?}");
+    }
+    for output in &selected.numerical_assessment.outputs {
+        let metrics = output.metrics;
+        say!(
+            out,
+            "  output `{}` {:?}: max_abs={:.9e}, max_rel={:.9e}, max_ulps={}, differing={}/{}, special mismatches nan={} inf={} signed_zero={} subnormal={}, worst={:?}",
+            output.output,
+            output.dtype,
+            metrics.maximum_absolute,
+            metrics.maximum_relative,
+            metrics.maximum_ulps,
+            metrics.differing,
+            metrics.compared,
+            metrics.nan_mismatches,
+            metrics.infinity_mismatches,
+            metrics.signed_zero_mismatches,
+            metrics.subnormal_mismatches,
+            output.worst_element,
+        );
+        for attribution in &output.attribution {
+            say!(out, "    {attribution}");
+        }
+    }
+    if let Some(qualification) = &selected.qualification {
+        say!(out, "  qualification environment: {}", qualification.numerical_environment);
+        say!(out, "  qualification corpus: {}", qualification.corpus);
+        say!(out, "  qualification method: {}", qualification.method);
+    }
+    for reason in &selected.numerical_assessment.reasons {
+        say!(out, "  {reason}");
+    }
     say!(out,"proof status: {}", match selected.status {
         ProofStatus::Feasible => "feasible (checked complete execution; search ended by budget or with open obligations)",
         ProofStatus::ModelOptimal => "model-optimal over the stated family under the stated estimate model",

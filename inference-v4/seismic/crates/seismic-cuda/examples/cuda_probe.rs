@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
     let workload = Workload {
         shapes: pairs(&args[2])?.into_iter().map(|(n, v)| Ok((n, v.parse::<i64>().map_err(|e| e.to_string())?))).collect::<Result<_, String>>()?,
         elems: pairs(&args[3])?.into_iter().map(|(n, e)| Ok((n, cases::element(&e)?))).collect::<Result<_, String>>()?,
-        numerics: cases::numerics()?,
+        precision: cases::precision()?,
     };
     let scalars: HashMap<String, f64> = pairs(args.get(4).map_or("", String::as_str))?.into_iter().map(|(n, v)| Ok((n, v.parse::<f64>().map_err(|e| e.to_string())?))).collect::<Result<_, String>>()?;
     let repeats: usize = args.get(5).map_or(Ok(10), |r| r.parse()).map_err(|e| format!("repeats: {e}"))?;

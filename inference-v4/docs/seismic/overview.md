@@ -38,10 +38,10 @@ contract of the implemented system.
    the family. Native source is generated once, for the selected witness. No
    compile-and-benchmark loop exists.
 
-6. **Numerics and effects are preserved.** Casts, FMA, accumulation dtype,
-   publication rounding, reduction order, producer multiplicity, state order, and
-   observable writes are exactly what the selected bodies say. Selection cannot
-   change them.
+6. **Precision is a hard selection contract.** The first portable body defines the
+   numerical reference. Alternative bodies expose numerical effects; exact, proven,
+   or whole-witness-qualified evidence determines whether the caller's output policy
+   admits them. Performance is optimized only within that admissible family.
 
 7. **The compiler is generic.** No model names, model dimensions, or pattern
    recognition of particular kernels exist in the compiler or a backend. Model
@@ -63,12 +63,13 @@ contract of the implemented system.
 
 | Owner | Establishes | Does not |
 | --- | --- | --- |
-| Kernel or library author | Algorithm, regions, producers, state, stages, merges, numerical contract, alternative portable bodies, target lowerings, backend-specific helpers | Declare widths, candidate lists, or hardware constants |
+| Kernel or library author | Algorithm, regions, producers, state, stages, merges, alternative portable bodies, target lowerings, backend-specific helpers | Declare tolerances, evidence, widths, candidate lists, or hardware constants |
 | Lowering author | A target implementation within the ownership its signature grants | Restructure the caller or widen its scope |
 | Checker | Types, shapes, bounds, modes, aliasing, slice opacity, region results, stages, partial obligations, target coverage declarations | Prove bodies equivalent |
 | Family construction | Applicable candidates per occurrence, numerical sites, execution-unit sequences, obligations | Enumerate compositions; drop what it cannot analyze |
 | Backend mapping | Site domains, hard limits, legal intervals, local cost factors, a constructive seed, deterministic realization | Rank, filter by profitability, or search |
-| Solver | The joint assignment under a budget, with decomposition and proof reuse | Invent calls, stages, groupings, or sites |
+| Numerical assessment | Exact reference status, conservative proof bounds, or matching whole-witness qualification | Treat unknown as zero or infer application tolerance |
+| Solver | The joint assignment under a budget, with precision as hard constraints and performance as the objective | Invent calls, stages, groupings, sites, or acceptable error |
 | Instantiation and emission | Exactly the witness | Any second tiling, fusion, staging, or placement policy |
 | Runtime | Native compilation of a checked selection, binding, validation, submission, completion | Select, substitute, or fall back |
 
@@ -103,9 +104,9 @@ plain `.seismic` sources (portable functions, target lowerings, backend-specific
     -> emission -> native compilation -> bound, validated invocation
 ```
 
-The reference interpreter executes the same structured IR under any caller-supplied
-partition and defines the semantics every backend must reproduce, including
-finite-precision behavior.
+The reference interpreter executes the first portable bodies and defines finite-precision
+reference behavior. A production backend must reproduce it exactly or carry evidence accepted by
+the caller's precision policy.
 
 ## Outcomes
 
@@ -117,18 +118,21 @@ finite-precision behavior.
 | Incompatible composition | Required interfaces or hard capacities cannot agree. |
 | Infeasible | The exported family is proved to have no solution. |
 | Selection incomplete | The budget ended without a checked configuration. |
-| Analysis unavailable | A required quantity or estimate has no supported derivation. |
+| Analysis unavailable | A required quantity, estimate, or numerical proof has no supported derivation. |
+| Missing qualification | Qualified evidence was requested but no matching whole-witness record exists. |
 | Reconstruction defect | A witness, seed, or instantiation disagreed with the family. Compiler defect. |
 | Selected, feasible | Complete checked execution; estimated performance only. |
 | Selected, model-optimal | Additionally optimal over the stated family and estimate model. |
 
 ## Current scope
 
-- Metal is the only backend. Qwen3.5-4B prefill and decode run through this pipeline.
+- Metal, CPU, and CUDA are backends on the structured pipeline.
 - Width domains offer only divisors of static extents, so tail pieces do not occur.
 - `pipeline` has one mapping: synchronous, same participant, ring depth one.
 - A region result cannot cross a launch.
 - The estimate model is unqualified. No performance claim follows from a selection.
+- Static numerical proof coverage is conservative; unproved alternatives require matching
+  whole-witness qualification or remain available only to unconstrained exploration.
 
 ## Further reading
 

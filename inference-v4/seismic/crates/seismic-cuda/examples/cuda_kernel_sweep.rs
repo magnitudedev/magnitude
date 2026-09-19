@@ -1,7 +1,7 @@
 //! Native check (needs an NVIDIA driver and device): every std kernel case, selected on
 //! the CUDA backend with the queried device limits, realized to PTX, compiled by the
 //! driver and executed through this crate's runtime, against the reference interpreter
-//! on the same host. Exact numerics by default (`NUMERICS=admitted` to change).
+//! on the same host. Exact precision by default (`PRECISION=unconstrained` to explore).
 //!
 //! Integer and boolean outputs compare exactly. Float outputs are expected bit-exact; the
 //! bound `2e-4 + 2e-3 * |reference|` admits the documented difference of the bundled PTX
@@ -13,7 +13,7 @@ mod cases;
 use seismic_compiler::selection::{select, Budget};
 use seismic_cuda::mapping::Cuda;
 use seismic_cuda::{Buffer, Device};
-use seismic_lang::family::Numerics;
+use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData, Uniform};
 use seismic_lang::repr;
 use seismic_lang::sir::Program;
@@ -28,9 +28,9 @@ struct Agreement {
     launches: usize,
 }
 
-fn run(program: &Program, device: &Device, backend: &Cuda, case: &cases::Case, numerics: Numerics, seed: u64) -> Result<Agreement, String> {
+fn run(program: &Program, device: &Device, backend: &Cuda, case: &cases::Case, precision: PrecisionPolicy, seed: u64) -> Result<Agreement, String> {
     let definition = cases::abi(program, case.entry)?;
-    let workload = cases::workload(case, numerics)?;
+    let workload = cases::workload(case, precision)?;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
     let mut tensors: Vec<(String, bool, TensorData)> = Vec::new();
     let mut args = Vec::new();
@@ -121,23 +121,16 @@ fn run(program: &Program, device: &Device, backend: &Cuda, case: &cases::Case, n
         actual.load_device_bytes(&bytes);
         let expected = &interpreter.tensors[index];
         let strict = dtype.is_int() || *dtype == DType::Bool;
-        let mut wrong = Vec::new();
         agreement.elements += data.len();
-        for flat in 0..data.len() {
-            let (want, got) = (expected.get(flat), actual.get(flat));
-            if (want.is_nan() && got.is_nan()) || want == got {
-                continue;
-            }
-            agreement.differing += 1;
-            let diff = (want - got).abs();
-            let tolerance = if strict { 0.0 } else { 2e-4 + 2e-3 * want.abs() };
-            if !(diff <= tolerance) {
-                wrong.push((flat, want, got));
-            }
-            agreement.worst = agreement.worst.max(if diff.is_nan() { f64::INFINITY } else { diff });
-        }
-        if let Some((flat, want, got)) = wrong.first() {
-            return Err(format!("mismatch: {name} {}/{} elements beyond tolerance, max diff {:e}, first [{flat}] expected {want} CUDA {got}", wrong.len(), data.len(), agreement.worst));
+        let tolerance = if strict { Tolerance::EXACT } else { Tolerance { absolute: Limit::new(2e-4)?, relative: Limit::new(2e-3)?, relative_floor: Limit::ZERO, ulps: None } };
+        let reference: Vec<f64> = (0..data.len()).map(|flat| expected.get(flat)).collect();
+        let candidate: Vec<f64> = (0..data.len()).map(|flat| actual.get(flat)).collect();
+        let comparison = compare_dense(&reference, &candidate, *dtype, Some(tolerance), SpecialPolicy::PRESERVE)?;
+        agreement.differing += comparison.metrics.differing as usize;
+        agreement.worst = agreement.worst.max(comparison.metrics.maximum_absolute);
+        if comparison.beyond_tolerance != 0 {
+            let flat = comparison.worst_element.unwrap_or(0);
+            return Err(format!("mismatch: {name} {}/{} elements beyond tolerance, max abs {:.3e}, max rel {:.3e}, max ulps {}, worst [{flat}] expected {} CUDA {}", comparison.beyond_tolerance, data.len(), comparison.metrics.maximum_absolute, comparison.metrics.maximum_relative, comparison.metrics.maximum_ulps, expected.get(flat), actual.get(flat)));
         }
     }
     Ok(agreement)
@@ -145,7 +138,7 @@ fn run(program: &Program, device: &Device, backend: &Cuda, case: &cases::Case, n
 
 fn main() -> Result<(), String> {
     let program = cases::program()?;
-    let numerics = cases::numerics()?;
+    let precision = cases::precision()?;
     let device = Device::open(0)?;
     println!("device: {:?}", device.info);
     let backend = Cuda::from_device(&device.info).map_err(|e| e.to_string())?;
@@ -154,9 +147,9 @@ fn main() -> Result<(), String> {
     let mut failed = 0usize;
     let mut worst = 0.0f64;
     let mut diagnostics = Vec::new();
-    println!("\n{:<30} outcome ({numerics:?} numerics)", "kernel");
+    println!("\n{:<30} outcome ({precision:?} precision)", "kernel");
     for (seed, case) in all.iter().enumerate() {
-        match cases::guarded(|| run(&program, &device, &backend, case, numerics, seed as u64)) {
+        match cases::guarded(|| run(&program, &device, &backend, case, precision.clone(), seed as u64)) {
             Ok(a) if a.differing == 0 => println!("{:<30} ok    bit-exact ({} elements, {} launch(es))", case.label, a.elements, a.launches),
             Ok(a) => {
                 worst = worst.max(a.worst);

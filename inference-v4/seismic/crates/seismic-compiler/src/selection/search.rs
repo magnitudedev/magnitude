@@ -2,10 +2,11 @@
 //! budget by the budget's strategy (exact search then neighborhood improvement, or greedy
 //! coordinate sweeps), reconstruct exactly the chosen witness.
 use super::export::{solver_error, Export};
-use super::{greedy, Backend, Interval, Phase, ProofStatus, SearchStats, Selected, SelectionError, Timings};
+use super::{greedy, Backend, Interval, Phase, ProofStatus, Qualification, SearchStats, Selected, SelectionError, Timings};
 use magnitude_solver::{Algorithm, FeasibleSolution, Limits, Model, NeighborhoodOptions, Options, Outcome, Search};
 use seismic_lang::family::{self, Family, SiteId, Witness, Workload};
 use seismic_lang::instantiate::instantiate;
+use seismic_lang::precision::NumericalAssessment;
 use seismic_lang::sir::Program;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ pub fn select<B: Backend>(program: &Program, entry: &str, workload: &Workload, b
     let constructed = started.elapsed();
     let mut chosen = select_family(program, &family, backend, budget, &|w| family.validate(w))?;
     chosen.timings.family = constructed;
-    finish(program, family, backend, chosen)
+    finish(program, family, backend, chosen, None)
 }
 
 /// Validate and realize a supplied complete witness without search (qualified-witness
@@ -52,12 +53,48 @@ pub fn replay<B: Backend>(program: &Program, entry: &str, workload: &Workload, b
     let started = Instant::now();
     let family = construct(program, entry, workload, backend)?;
     let mut timings = Timings { family: started.elapsed(), ..Timings::default() };
-    let (export, ..) = exported(program, &family, backend, &mut timings)?;
+    let (export, ..) = exported(program, &family, backend, &mut timings, None)?;
     let (_, estimate) = audit(&export, &|w| family.validate(w), witness).map_err(|why| SelectionError::Reconstruction(format!("replayed witness rejected: {why}")))?;
     let stats = SearchStats { variables: export.model.variables().len(), factors: export.model.factors().len(), ..SearchStats::default() };
     drop(export);
     let chosen = Chosen { witness: witness.clone(), estimate, seed: witness.clone(), seed_estimate: estimate, lower_bound: 0, status: ProofStatus::Feasible, timings, stats };
-    finish(program, family, backend, chosen)
+    finish(program, family, backend, chosen, None)
+}
+
+/// Select the cheapest matching, numerically accepted whole-witness qualification. This does not
+/// infer a bound for a new configuration: every candidate result is replayed and audited exactly.
+pub fn select_qualified<B: Backend>(program: &Program, entry: &str, workload: &Workload, backend: &B, budget: Budget, qualifications: &[Qualification]) -> Result<Selected<B::Execution>, SelectionError> {
+    let identity = program.identity();
+    let numerical_environment = backend.numerical_environment();
+    let mut accepted: Vec<&Qualification> = qualifications.iter().filter(|qualification| {
+        qualification.program == identity
+            && qualification.target == backend.target()
+            && qualification.numerical_environment == numerical_environment
+            && qualification.entry == entry
+            && qualification.shapes == workload.shapes
+            && qualification.elems == workload.elems
+            && qualification.assessment.satisfies(&workload.precision)
+    }).collect();
+    accepted.sort_by(|left, right| left.corpus.cmp(&right.corpus).then_with(|| left.method.cmp(&right.method)));
+    let mut best = Some(select(program, entry, workload, backend, budget)?);
+    for qualification in accepted {
+        let started = Instant::now();
+        let mut family = construct(program, entry, workload, backend)?;
+        family.allow_numerical_effects = true;
+        let mut timings = Timings { family: started.elapsed(), ..Timings::default() };
+        let (export, ..) = exported(program, &family, backend, &mut timings, Some(&qualification.witness))?;
+        let (_, estimate) = audit(&export, &|w| family.validate(w), &qualification.witness)
+            .map_err(|why| SelectionError::Reconstruction(format!("qualified witness rejected: {why}")))?;
+        let stats = SearchStats { variables: export.model.variables().len(), factors: export.model.factors().len(), ..SearchStats::default() };
+        drop(export);
+        let chosen = Chosen { witness: qualification.witness.clone(), estimate, seed: qualification.witness.clone(), seed_estimate: estimate, lower_bound: 0, status: ProofStatus::Feasible, timings, stats };
+        let selected = finish(program, family, backend, chosen, Some(qualification))?;
+        if best.as_ref().is_none_or(|current: &Selected<B::Execution>| selected.estimate < current.estimate) {
+            best = Some(selected);
+        }
+    }
+    let identity = identity.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    best.ok_or_else(|| SelectionError::MissingQualification(format!("no accepted record or reference path matches program {identity}, entry `{entry}` and target `{}`", backend.target())))
 }
 
 fn construct<B: Backend>(program: &Program, entry: &str, workload: &Workload, backend: &B) -> Result<Family, SelectionError> {
@@ -66,7 +103,7 @@ fn construct<B: Backend>(program: &Program, entry: &str, workload: &Workload, ba
 
 /// The backend hooks and the solver export, each timed; the domains and intervals the seed reads.
 #[allow(clippy::type_complexity)]
-fn exported<'f, B: Backend>(program: &Program, family: &'f Family, backend: &B, timings: &mut Timings) -> Result<(Export<'f>, BTreeMap<SiteId, Vec<i64>>, Vec<Interval>), SelectionError> {
+fn exported<'f, B: Backend>(program: &Program, family: &'f Family, backend: &B, timings: &mut Timings, qualified: Option<&Witness>) -> Result<(Export<'f>, BTreeMap<SiteId, Vec<i64>>, Vec<Interval>), SelectionError> {
     let started = Instant::now();
     let domains = backend.bind_structure(program, family)?;
     let constraints = backend.constraints(program, family)?;
@@ -74,12 +111,12 @@ fn exported<'f, B: Backend>(program: &Program, family: &'f Family, backend: &B, 
     let factors = backend.factors(program, family, &intervals)?;
     timings.backend_hooks = started.elapsed();
     let started = Instant::now();
-    let export = Export::build(family, &domains, &constraints, &intervals, &factors)?;
+    let export = Export::build(family, &domains, &constraints, &intervals, &factors, qualified)?;
     timings.export = started.elapsed();
     Ok((export, domains, intervals))
 }
 
-fn finish<B: Backend>(program: &Program, family: Family, backend: &B, chosen: Chosen) -> Result<Selected<B::Execution>, SelectionError> {
+fn finish<B: Backend>(program: &Program, family: Family, backend: &B, chosen: Chosen, qualified: Option<&Qualification>) -> Result<Selected<B::Execution>, SelectionError> {
     let mut timings = chosen.timings;
     let started = Instant::now();
     let lowered = instantiate(program, &family, &chosen.witness).map_err(SelectionError::Reconstruction)?;
@@ -88,6 +125,18 @@ fn finish<B: Backend>(program: &Program, family: Family, backend: &B, chosen: Ch
     let execution = backend.realize(lowered, &family, &chosen.witness)?;
     timings.realize = started.elapsed();
     let unresolved = family.obligations.iter().map(|o| format!("occurrence {} definition {}: {}", o.occurrence.0, o.definition.0, o.reason)).collect();
+    let numerical_deviations: Vec<String> = family.occurrences.iter().filter_map(|occurrence| {
+        let selected = *chosen.witness.choices.get(&occurrence.id)?;
+        let candidate = occurrence.candidates.get(selected as usize)?;
+        let active_effect = !candidate.reference
+            || (family.allow_numerical_effects && !candidate.numerical_effects.is_empty());
+        active_effect.then(|| format!("occurrence {} selected definition {} with effects {:?}", occurrence.id.0, candidate.via.0, candidate.numerical_effects))
+    }).collect();
+    let numerical_assessment = qualified.map(|record| record.assessment.clone()).unwrap_or_else(|| if numerical_deviations.is_empty() {
+        NumericalAssessment::exact()
+    } else {
+        NumericalAssessment::unknown(numerical_deviations.join("; "))
+    });
     Ok(Selected {
         execution,
         witness: chosen.witness,
@@ -96,6 +145,8 @@ fn finish<B: Backend>(program: &Program, family: Family, backend: &B, chosen: Ch
         seed_estimate: chosen.seed_estimate,
         status: chosen.status,
         estimate_model: backend.estimate_model(),
+        numerical_assessment,
+        qualification: qualified.map(Qualification::identity),
         lower_bound: chosen.lower_bound,
         unresolved,
         timings,
@@ -121,7 +172,7 @@ struct Chosen {
 /// witness validation.
 fn select_family<B: Backend>(program: &Program, family: &Family, backend: &B, budget: Budget, check: &dyn Fn(&Witness) -> Result<(), String>) -> Result<Chosen, SelectionError> {
     let mut timings = Timings::default();
-    let (export, domains, intervals) = exported(program, family, backend, &mut timings)?;
+    let (export, domains, intervals) = exported(program, family, backend, &mut timings, None)?;
     let started = Instant::now();
     let seed = backend.seed(program, family, &domains, &intervals)?;
     let seeded = audit(&export, check, &seed);
@@ -250,10 +301,13 @@ mod tests {
     impl Backend for Mock {
         type Execution = ();
         fn target(&self) -> &'static str {
-            "mock"
+            "cpu"
         }
         fn estimate_model(&self) -> String {
             "mock-v0".into()
+        }
+        fn numerical_environment(&self) -> String {
+            "mock-environment-v0".into()
         }
         fn bind_structure(&self, _: &Program, _: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError> {
             Ok(self.domains.clone())
@@ -287,6 +341,8 @@ mod tests {
         Candidate {
             template: TemplateId(0),
             via: DefId(0),
+            reference: true,
+            numerical_effects: Vec::new(),
             structural: Vec::new(),
             requirements: Vec::new(),
             children: children.into_iter().map(OccurrenceId).collect(),
@@ -304,7 +360,7 @@ mod tests {
     }
 
     fn family(occurrences: Vec<Occurrence>, sites: Vec<Site>, sequences: Vec<Sequence>) -> Family {
-        Family { entry: "entry".into(), target: "mock".into(), workload: Workload::default(), templates: Vec::new(), occurrences, sites, refinements: Vec::new(), sequences, obligations: Vec::new() }
+        Family { entry: "entry".into(), target: "mock".into(), workload: Workload::default(), allow_numerical_effects: false, templates: Vec::new(), occurrences, sites, refinements: Vec::new(), sequences, obligations: Vec::new() }
     }
 
     fn factor(guard: Vec<CandidateRef>, intervals: Vec<u32>, scope: Vec<u32>, cost: impl Fn(&[i64]) -> u64 + Send + Sync + 'static) -> Factor {
@@ -374,9 +430,93 @@ mod tests {
 
         // True independence is visible: no factor spans more than one occurrence's own
         // choice and site.
-        let export = Export::build(&family, &domains, &[], &[], &twenty_factors()).expect("export");
+        let export = Export::build(&family, &domains, &[], &[], &twenty_factors(), None).expect("export");
         assert!(export.model.factors().iter().all(|f| f.scope().len() <= 2));
         assert_eq!(analyze(&family).independent_components, TWENTY as usize);
+    }
+
+    #[test]
+    fn precision_is_a_hard_candidate_constraint_and_qualification_is_witness_scoped() {
+        let mut reference = candidate(vec![], vec![], vec![]);
+        reference.reference = true;
+        let mut alternative = candidate(vec![], vec![], vec![]);
+        alternative.reference = false;
+        let mut exact = family(vec![occurrence(0, None, vec![reference.clone(), alternative.clone()])], vec![], vec![]);
+        let factors = || vec![factor(vec![cand(0, 0)], vec![], vec![], |_| 100), factor(vec![cand(0, 1)], vec![], vec![], |_| 10)];
+        let seed = Witness { choices: [(OccurrenceId(0), 0)].into(), ..Witness::default() };
+        let backend = Mock { domains: BTreeMap::new(), constraints: Vec::new, intervals: Vec::new(), factors, seed: seed.clone() };
+
+        let chosen = run(&exact, &backend).expect("exact reference is feasible");
+        assert_eq!(chosen.witness.choices[&OccurrenceId(0)], 0);
+
+        exact.workload.precision = seismic_lang::precision::PrecisionPolicy::Unconstrained;
+        let chosen = run(&exact, &backend).expect("exploration admits the alternative");
+        assert_eq!(chosen.witness.choices[&OccurrenceId(0)], 1);
+
+        exact.workload.precision = seismic_lang::precision::PrecisionPolicy::Exact;
+        let qualified = Witness { choices: [(OccurrenceId(0), 1)].into(), ..Witness::default() };
+        let export = Export::build(&exact, &BTreeMap::new(), &[], &[], &(backend.factors)(), Some(&qualified)).expect("qualified export");
+        let assignment = export.assignment(&qualified).expect("qualified alternative is admitted only for this witness");
+        assert!(!export.model.validate_assignment(&assignment).expect("valid model").infeasible);
+    }
+
+    #[test]
+    fn changing_the_precision_threshold_changes_the_selected_qualified_witness() {
+        use seismic_lang::precision::{qualify_f32, EvidenceRequirement, Limit, PrecisionPolicy, Tolerance};
+        use seismic_lang::program::{compile, SourceFile};
+
+        let source = SourceFile {
+            path: "precision.seismic".into(),
+            text: "fn copy[N](x: tensor[N] f32, out y: tensor[N] f32):\n    publish x to y\n\nlower copy[N](x: tensor[N] f32, out y: tensor[N] f32) for cpu:\n    publish x to y\n".into(),
+        };
+        let program = compile(&[source]).unwrap();
+        let factors = || vec![
+            factor(vec![cand(0, 0)], vec![], vec![], |_| 100),
+            factor(vec![cand(0, 1)], vec![], vec![], |_| 10),
+        ];
+        let reference = Witness { choices: [(OccurrenceId(0), 0)].into(), ..Witness::default() };
+        let backend = Mock { domains: BTreeMap::new(), constraints: Vec::new, intervals: Vec::new(), factors, seed: reference };
+        let loose = PrecisionPolicy::Bounded {
+            default: Tolerance {
+                absolute: Limit::new(0.01).unwrap(),
+                relative: Limit::new(0.1).unwrap(),
+                relative_floor: Limit::new(0.001).unwrap(),
+                ulps: None,
+            },
+            outputs: BTreeMap::new(),
+            evidence: EvidenceRequirement::Qualified,
+            specials: Default::default(),
+            inputs: BTreeMap::new(),
+        };
+        let workload = Workload { shapes: [("N".into(), 1)].into(), elems: BTreeMap::new(), precision: loose.clone() };
+        let alternative = Witness { choices: [(OccurrenceId(0), 1)].into(), ..Witness::default() };
+        let assessment = qualify_f32("y", &[1.0], &[1.05], loose, vec!["mock alternative".into()]).unwrap();
+        let qualification = Qualification::new(
+            &program,
+            &backend,
+            "copy",
+            &workload,
+            alternative,
+            assessment,
+            "threshold-test",
+            "common-comparator-v1",
+        ).unwrap();
+
+        let selected = select_qualified(&program, "copy", &workload, &backend, Budget::default(), &[qualification.clone()]).unwrap();
+        assert_eq!(selected.witness.choices[&OccurrenceId(0)], 1);
+        assert_eq!(selected.numerical_assessment.evidence, seismic_lang::precision::EvidenceClass::Qualified);
+
+        let mut strict = workload.clone();
+        strict.precision = PrecisionPolicy::Bounded {
+            default: Tolerance { absolute: Limit::new(0.001).unwrap(), relative: Limit::ZERO, relative_floor: Limit::ZERO, ulps: None },
+            outputs: BTreeMap::new(),
+            evidence: EvidenceRequirement::Qualified,
+            specials: Default::default(),
+            inputs: BTreeMap::new(),
+        };
+        let selected = select_qualified(&program, "copy", &strict, &backend, Budget::default(), &[qualification]).unwrap();
+        assert_eq!(selected.witness.choices[&OccurrenceId(0)], 0);
+        assert_eq!(selected.numerical_assessment.evidence, seismic_lang::precision::EvidenceClass::Exact);
     }
 
     // Root owns site 0 and a two-unit sequence [local, call]. The call's fast body (0) owns

@@ -562,8 +562,9 @@ pub fn factors<A: Accounting>(
 }
 
 /// Seed policy: deterministic feasibility construction, never profitability ranking.
-/// Choices: occurrences in pre-order; each takes its first candidate (target lowerings first,
-/// then the remaining applicable bodies, each in declaration order) under
+/// Choices: occurrences in pre-order; each takes its first numerically authorized candidate
+/// (target lowerings first when numerical effects are authorized, then the remaining applicable
+/// bodies, each in declaration order) under
 /// which every site named by the requirements of the candidates chosen so far plus its own
 /// keeps a non-empty `domain ∩ requirements`, and whose remaining occurrences can be
 /// completed the same way; otherwise the next candidate is tried (backtracking).
@@ -635,6 +636,11 @@ pub fn seed<A: Accounting>(
                 occurrence: id,
                 candidate,
             }) {
+                if !self.family.allow_numerical_effects
+                    && self.family.candidate(candidate).requires_numerical_evidence()
+                {
+                    continue;
+                }
                 if !self.admissible(chosen, candidate) {
                     continue;
                 }

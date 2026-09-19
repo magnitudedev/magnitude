@@ -10,6 +10,7 @@ use magnitude_solver::{Domain, Model, ModelBuilder, VarId};
 use seismic_lang::family::{
     CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, Witness,
 };
+use seismic_lang::precision::PrecisionPolicy;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -236,6 +237,7 @@ impl<'f> Export<'f> {
         constraints: &[Constraint],
         intervals: &[Interval],
         factors: &[Factor],
+        qualified: Option<&Witness>,
     ) -> Result<Export<'f>, SelectionError> {
         match family.occurrences.first() {
             None => {
@@ -275,6 +277,24 @@ impl<'f> Export<'f> {
                     Domain::interval(0, o.candidates.len() as i64 - 1).map_err(solver_error)?;
                 x.choices[i] = Some(x.b.variable(format!("choice{i}"), domain));
                 x.inactive.push(0);
+            }
+        }
+
+        // Precision is a hard constraint. Production policies admit the portable reference
+        // path and alternatives named by one accepted whole-witness qualification.
+        if !matches!(family.workload.precision, PrecisionPolicy::Unconstrained) {
+            for occurrence in &family.occurrences {
+                for (ordinal, candidate) in occurrence.candidates.iter().enumerate() {
+                    let qualified_choice = qualified
+                        .and_then(|witness| witness.choices.get(&occurrence.id))
+                        == Some(&(ordinal as u32));
+                    if candidate.requires_numerical_evidence() && !qualified_choice {
+                        x.never(x.activity(CandidateRef {
+                            occurrence: occurrence.id,
+                            candidate: ordinal as u32,
+                        }));
+                    }
+                }
             }
         }
         for (i, o) in family.occurrences.iter().enumerate() {

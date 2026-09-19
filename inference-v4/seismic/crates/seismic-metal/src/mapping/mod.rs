@@ -74,6 +74,7 @@ impl Limits {
 pub struct Metal {
     limits: Limits,
     estimate: EstimateModel,
+    numerical_environment: String,
 }
 
 impl Metal {
@@ -85,12 +86,27 @@ impl Metal {
             )));
         }
         estimate.validate().map_err(SelectionError::AnalysisUnavailable)?;
-        Ok(Metal { limits, estimate })
+        let numerical_environment = format!(
+            "seismic-metal-v1:synthetic:threads={}:threadgroup={}:private={}",
+            limits.max_threads_per_threadgroup,
+            limits.max_threadgroup_bytes,
+            limits.max_private_bytes
+        );
+        Ok(Metal { limits, estimate, numerical_environment })
     }
 
     #[cfg(target_os = "macos")]
     pub fn from_device(device: &crate::runtime::DeviceInfo) -> Result<Self, SelectionError> {
-        Metal::new(Limits::from_device(device), EstimateModel::from_device(device))
+        let mut backend = Metal::new(Limits::from_device(device), EstimateModel::from_device(device))?;
+        backend.numerical_environment = format!(
+            "seismic-metal-v1:name={}:unified={}:threads={}:threadgroup={}:private={}",
+            device.name,
+            device.unified_memory,
+            backend.limits.max_threads_per_threadgroup,
+            backend.limits.max_threadgroup_bytes,
+            backend.limits.max_private_bytes
+        );
+        Ok(backend)
     }
 }
 
@@ -344,6 +360,10 @@ impl Backend for Metal {
         IDENTITY.into()
     }
 
+    fn numerical_environment(&self) -> String {
+        self.numerical_environment.clone()
+    }
+
     fn bind_structure(&self, program: &Program, family: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError> {
         self.analysis(program, family)?;
         mapping::domains(program, family)
@@ -380,8 +400,8 @@ impl Backend for Metal {
         mapping::seed(program, family, TARGET, &analysis, domains, intervals, concurrent, self.legalities(&analysis)?)
     }
 
-    fn realize(&self, lowered: LoweredIr, _family: &Family, _witness: &Witness) -> Result<Execution, SelectionError> {
-        realize::realize(&self.limits, &lowered)
+    fn realize(&self, lowered: LoweredIr, family: &Family, _witness: &Witness) -> Result<Execution, SelectionError> {
+        realize::realize(&self.limits, &lowered, family.allow_numerical_effects)
     }
 }
 
@@ -444,7 +464,7 @@ mod tests {
             shapes: Default::default(),
         };
         let limits = Limits { max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768, max_private_bytes: PRIVATE_BYTES };
-        let execution = realize::realize(&limits, &lowered).unwrap();
+        let execution = realize::realize(&limits, &lowered, false).unwrap();
         assert!(crate::msl::emit_execution(&execution).unwrap().source.contains("kernel void"));
     }
 }

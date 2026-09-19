@@ -9,9 +9,9 @@ does not synthesize execution structure.
 | # | Stage | Input → output | Guarantees |
 | --- | --- | --- | --- |
 | 1 | Check | Sources → structured IR (SIR) | Names, contract families, portable and target capabilities, typing of every value kind, shapes and bounds, modes and aliasing, slice opacity, region results, stages and ports, initialization, and partial obligations. Every declared body is checked, selected or not. |
-| 2 | Construct the family | SIR + entry + target + workload → family | Applicable candidates at each static call occurrence, guarded by their parent candidate; interned templates; numerical sites; normalized execution-unit sequences; obligations for anything construction could not analyze. |
+| 2 | Construct the family | SIR + entry + target + workload → family | Applicable candidates at each static call occurrence, guarded by their parent candidate; portable-reference identity and numerical effects; interned templates; numerical sites; normalized execution-unit sequences; obligations for anything construction could not analyze. |
 | 3 | Bind the backend | Family → site domains, hard constraints, legal intervals, local cost factors, seed | Deterministic. No ranking, no profitability filter. |
-| 4 | Select | Solver model → witness | One complete joint assignment, audited against the family and the exported model. |
+| 4 | Select | Solver model + precision evidence → witness | One complete joint assignment satisfying hard numerical constraints, audited against the family and the exported model. |
 | 5 | Instantiate and verify | Witness → concrete execution IR | Exactly the selected bodies, covers, and numbers. The result passes execution-IR verification. |
 | 6 | Realize and emit | Execution IR → realized execution → target source | Deterministic mapping rules; hard limits rechecked on the realized execution. Emission makes no decision. |
 | 7 | Compile and bind | Target source → native kernel | See [Runtime](runtime.md). |
@@ -33,7 +33,7 @@ target, and workload:
 | --- | --- |
 | Template | One definition specialized to concrete semantic shapes and elements, plus which shape parameters are bound to caller slices (structural) or to runtime-valued caller extents (dynamic). Shared by equal specializations. |
 | Occurrence | One static call in one parent candidate, or the entry. Holds every applicable candidate and every rejected definition with its reason. |
-| Candidate | One applicable portable body, backend-specific body, or target lowering at an occurrence, with its numerical requirements, child occurrences, sites, and sequences. |
+| Candidate | One applicable portable body, backend-specific body, or target lowering at an occurrence, with reference identity, numerical effects, structural requirements, child occurrences, sites, and sequences. |
 | Site | One numerical decision owned by a candidate: a binder width, or the partition count of a `merge` axis. |
 | Sequence | The execution units of one block with at least two units, in authored order. |
 | Obligation | A supported-looking candidate that construction could not analyze. Reported; never silently dropped. |
@@ -92,6 +92,8 @@ remove a transfer the solver evaluated.
 - Search representation conversions, memory placement, allocation reuse that adds a
   barrier, or a schedule.
 - Insert implicit dtype conversions to make an overload match.
+- Treat a numerical effect as equivalent to the reference without exact, proven, or matching
+  whole-witness-qualified evidence.
 
 ## Source stability
 

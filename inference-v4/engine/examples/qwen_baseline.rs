@@ -30,12 +30,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if args.len() != 6 && args.len() != 7 {
-        return Err("usage: qwen_baseline ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON [exact|admitted] [--device cpu|cuda|metal] [--strategy exact|greedy]".into());
+        return Err("usage: qwen_baseline ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON [exact|unconstrained] [--device cpu|cuda|metal] [--strategy exact|greedy]".into());
     }
-    let numerics = match args.get(6).map(String::as_str) {
-        None | Some("admitted") => seismic_lang::family::Numerics::Admitted,
-        Some("exact") => seismic_lang::family::Numerics::Exact,
-        Some(other) => return Err(format!("unknown numerics `{other}`").into()),
+    let precision = match args.get(6).map(String::as_str) {
+        None | Some("exact") => seismic_lang::precision::PrecisionPolicy::Exact,
+        Some("unconstrained") => seismic_lang::precision::PrecisionPolicy::Unconstrained,
+        Some(other) => return Err(format!("unknown precision `{other}`").into()),
     };
     let device = Rc::new(Device::open(&target)?);
     let device_name = match device.facts() {
@@ -47,10 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parse = |s: &str| s.split(',').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
     let prompt = parse(&args[3])?;
     let continuation = parse(&args[4])?;
-    let settings = Settings { numerics, strategy, ..Settings::default() };
+    let settings = Settings { precision: precision.clone(), strategy, ..Settings::default() };
     let result = (|| {
         eprintln!("loading artifact and selecting numerical imports");
-        let mut baseline = Baseline::load(Path::new(&args[1]), device, settings, args[2].parse().map_err(|e| format!("context: {e}"))?)?;
+        let mut baseline = Baseline::load(Path::new(&args[1]), device, settings.clone(), args[2].parse().map_err(|e| format!("context: {e}"))?)?;
         eprintln!("starting cold automatic full-model forward");
         baseline.measure(&prompt, &continuation)
     })();
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "result": record,
         "device": device_name,
         "backend": target,
-        "numerics": format!("{numerics:?}"),
+        "precision": format!("{precision:?}"),
         "strategy": format!("{strategy:?}"),
         "budget": {"work": settings.budget.work, "seconds": settings.budget.time.map(|t| t.as_secs_f64())},
     });

@@ -53,6 +53,11 @@ pub trait Backend {
     /// Identity of the estimate model behind `factors`.
     fn estimate_model(&self) -> String;
 
+    /// Identity of the native numerical environment for evidence reuse. This includes the
+    /// target's relevant device/compiler facts and is deliberately independent of the
+    /// performance estimate identity.
+    fn numerical_environment(&self) -> String;
+
     /// Bind prescribed structural mappings for every candidate body. Fails with
     /// `UnsupportedMapping` when a reachable structure has no mapping; returns the finite
     /// value domain of every site.

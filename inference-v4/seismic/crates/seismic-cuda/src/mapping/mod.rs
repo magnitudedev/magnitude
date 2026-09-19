@@ -78,6 +78,7 @@ impl Limits {
 pub struct Cuda {
     limits: Limits,
     estimate: EstimateModel,
+    numerical_environment: String,
 }
 
 impl Cuda {
@@ -89,13 +90,32 @@ impl Cuda {
             )));
         }
         estimate.validate().map_err(SelectionError::AnalysisUnavailable)?;
-        Ok(Cuda { limits, estimate })
+        let numerical_environment = format!(
+            "seismic-cuda-v1:synthetic:warp={}:threads={}:grid={}:scratch={}",
+            limits.warp_size,
+            limits.max_threads_per_block,
+            limits.max_grid_x,
+            limits.max_scratch_bytes
+        );
+        Ok(Cuda { limits, estimate, numerical_environment })
     }
 
     /// Queried limits; the driver exposes no throughput facts, so the estimate keeps its
     /// unmeasured defaults.
     pub fn from_device(device: &crate::DeviceInfo) -> Result<Self, SelectionError> {
-        Cuda::new(Limits::from_device(device), EstimateModel::default())
+        let mut backend = Cuda::new(Limits::from_device(device), EstimateModel::default())?;
+        backend.numerical_environment = format!(
+            "seismic-cuda-v1:name={}:cc={}.{}:driver={}:warp={}:threads={}:grid={}:scratch={}",
+            device.name,
+            device.compute_capability.0,
+            device.compute_capability.1,
+            device.driver_version,
+            backend.limits.warp_size,
+            backend.limits.max_threads_per_block,
+            backend.limits.max_grid_x,
+            backend.limits.max_scratch_bytes
+        );
+        Ok(backend)
     }
 
     pub fn limits(&self) -> &Limits {
@@ -232,6 +252,10 @@ impl Backend for Cuda {
 
     fn estimate_model(&self) -> String {
         IDENTITY.into()
+    }
+
+    fn numerical_environment(&self) -> String {
+        self.numerical_environment.clone()
     }
 
     fn bind_structure(&self, program: &Program, family: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError> {

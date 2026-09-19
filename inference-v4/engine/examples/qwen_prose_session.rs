@@ -1,11 +1,11 @@
 //! Long-context session measurement with ordinary automatic selection: the session-bench
 //! prose fixture prefilled in fixed chunks, then greedy decode. Only the search budget's
-//! strategy and the numerics mode are supplied; no implementation flags exist.
+//! strategy and precision policy are supplied; no implementation flags exist.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use seismic_engine::models::qwen35::session::Session;
     use seismic_runtime::{plan::Settings, Device, Strategy};
     use std::{path::Path, rc::Rc};
-    const USAGE: &str = "usage: qwen_prose_session ARTIFACT OUTPUT_JSON [--device metal|cpu|cuda] [--strategy exact|greedy] [--numerics admitted|exact] [--context-tokens 16384] [--prefill-chunk 512] [--decode 256] [--fixture PATH]";
+    const USAGE: &str = "usage: qwen_prose_session ARTIFACT OUTPUT_JSON [--device metal|cpu|cuda] [--strategy exact|greedy] [--precision exact|unconstrained] [--context-tokens 16384] [--prefill-chunk 512] [--decode 256] [--fixture PATH]";
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut option = |name: &str| -> Result<Option<String>, String> {
         let Some(at) = args.iter().position(|a| a == name) else { return Ok(None) };
@@ -19,10 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("greedy") => Strategy::Greedy,
         Some(other) => return Err(format!("unknown strategy `{other}`").into()),
     };
-    let numerics = match option("--numerics")?.as_deref() {
-        None | Some("admitted") => seismic_lang::family::Numerics::Admitted,
-        Some("exact") => seismic_lang::family::Numerics::Exact,
-        Some(other) => return Err(format!("unknown numerics `{other}`").into()),
+    let precision = match option("--precision")?.as_deref() {
+        None | Some("exact") => seismic_lang::precision::PrecisionPolicy::Exact,
+        Some("unconstrained") => seismic_lang::precision::PrecisionPolicy::Unconstrained,
+        Some(other) => return Err(format!("unknown precision `{other}`").into()),
     };
     let number = |value: Option<String>, default: usize| value.map_or(Ok(default), |v| v.parse::<usize>().map_err(|e| format!("`{v}`: {e}")));
     let context = number(option("--context-tokens")?, 16384)?;
@@ -40,11 +40,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seismic_runtime::DeviceFacts::Cpu(facts) => format!("host CPU, {} workers", facts.workers),
         seismic_runtime::DeviceFacts::Cuda(facts) => facts.name,
     };
-    let settings = Settings { numerics, strategy, ..Settings::default() };
+    let settings = Settings { precision: precision.clone(), strategy, ..Settings::default() };
     let result = (|| {
         let text = std::fs::read(&fixture).map_err(|e| format!("{fixture}: {e}"))?;
         eprintln!("loading artifact and selecting numerical imports");
-        let mut session = Session::load(Path::new(artifact), device, settings, context)?;
+        let mut session = Session::load(Path::new(artifact), device, settings.clone(), context)?;
         eprintln!("starting cold chunked prefill");
         session.measure(&text, chunk, decode)
     })();
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "result": record,
         "device": device_name,
         "backend": target,
-        "numerics": format!("{numerics:?}"),
+        "precision": format!("{precision:?}"),
         "strategy": format!("{strategy:?}"),
         "fixture": fixture,
         "budget": {"work": settings.budget.work, "seconds": settings.budget.time.map(|t| t.as_secs_f64())},

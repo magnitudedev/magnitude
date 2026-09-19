@@ -12,6 +12,7 @@ pub mod interp;
 pub mod intrinsics;
 pub mod layout;
 pub mod numeric;
+pub mod precision;
 pub mod program;
 pub mod repr;
 pub mod sir;

@@ -12,6 +12,8 @@
 
 use super::sir::{CallId, DefId, Program};
 use super::types::{Elem, RegionId, SliceId};
+use crate::precision::PrecisionPolicy;
+use crate::precision::NumericalEffect;
 use std::collections::BTreeMap;
 
 mod construct;
@@ -19,27 +21,12 @@ mod normalize;
 
 pub use construct::construct;
 
-/// Which numerical latitude selection may use.
-///
-/// `Exact` removes the latitude admitted contracts grant: within any contract family whose
-/// definitions are `admit`, a candidate is inapplicable if it is a target `Lower` body (a
-/// lowering of an admitted contract may reassociate) or its body contains a
-/// `Reduce { unordered: true }` anywhere; the rejection reason is "exact numerics
-/// requested". Everything else is unchanged, including coverage: a library keeps an ordered
-/// portable body in every admitted family or exact selection reports missing coverage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum Numerics {
-    #[default]
-    Admitted,
-    Exact,
-}
-
 /// Concrete semantic specialization of an entry. Every field is part of selection identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Workload {
     pub shapes: BTreeMap<String, i64>,
     pub elems: BTreeMap<String, Elem>,
-    pub numerics: Numerics,
+    pub precision: PrecisionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,6 +50,10 @@ pub struct Family {
     pub entry: String,
     pub target: String,
     pub workload: Workload,
+    /// Whether realization may exercise numerical freedoms (for unconstrained exploration or
+    /// one accepted qualified witness). Strict construction keeps conditional freedoms such as
+    /// unordered reduction on their reference-preserving form.
+    pub allow_numerical_effects: bool,
     /// Interned specialized bodies. Two occurrences of one definition under equal
     /// bindings share a template and keep separate choices, sites and costs.
     pub templates: Vec<Template>,
@@ -117,6 +108,10 @@ pub struct Candidate {
     pub template: TemplateId,
     /// The function or lowering declaration that contributes this candidate.
     pub via: DefId,
+    /// Whether this is the portable semantic reference body of the function family.
+    pub reference: bool,
+    /// Numerical freedoms requiring evidence when this is not the reference computation.
+    pub numerical_effects: Vec<NumericalEffect>,
     /// Caller slice bound to each structural shape parameter of the template.
     pub structural: Vec<(String, SiteRef)>,
     /// Applicability that depends on numbers: holds for the selected site values or the
@@ -125,6 +120,22 @@ pub struct Candidate {
     pub children: Vec<OccurrenceId>,
     pub sites: Vec<SiteId>,
     pub sequences: Vec<SequenceId>,
+}
+
+impl Candidate {
+    /// Whether selecting this implementation requires non-reference evidence. Reassociation is
+    /// conditional: strict realization can retain authored order, so it is not evidence-requiring
+    /// by itself. Approximate primitives and backend intrinsics execute different operations.
+    pub fn requires_numerical_evidence(&self) -> bool {
+        !self.reference
+            || self.numerical_effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    NumericalEffect::ApproximateTranscendental(_)
+                        | NumericalEffect::BackendIntrinsic { .. }
+                )
+            })
+    }
 }
 
 /// A site visible from a candidate: its own, or one owned by an ancestor candidate.

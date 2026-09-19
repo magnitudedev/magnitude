@@ -284,7 +284,12 @@ impl Accounting for MetalAccounting {
                 // The collective is qualified for 32-bit elements only (`ReductionDomain`).
                 let wide = matches!(bound.dtype(&shaped.elem), Some(DType::F32 | DType::I32 | DType::U32));
                 let inner = Quantity::product(shaped.axes.iter().skip(axis + 1).map(|a| bound.axis(a)));
-                fold(n, bound.elements(result), inner, unordered && wide)
+                fold(
+                    n,
+                    bound.elements(result),
+                    inner,
+                    unordered && wide && bound.allow_numerical_effects(),
+                )
             }
         }
     }

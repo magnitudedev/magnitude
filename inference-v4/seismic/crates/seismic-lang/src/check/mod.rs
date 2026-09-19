@@ -102,7 +102,6 @@ pub(crate) struct Checker<'a> {
     pub def: usize,
     pub sig: &'a Sig,
     pub kind: DefKind,
-    pub admit: bool,
     /// The target whose forms this body may name: a backend-specific function or lowering target.
     pub target: Option<String>,
     pub vars: Vec<Var>,
@@ -146,7 +145,6 @@ impl<'a> Checker<'a> {
             def,
             sig: &declared.sig,
             kind: declared.kind.clone(),
-            admit: declared.admit,
             target,
             vars: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -430,14 +428,18 @@ impl<'a> Checker<'a> {
 
     // ---- partial-domain obligations ----
 
-    /// Whether partial values are ordinary here: inside an `admit fn` or a `merge` body.
+    /// Partial values are ordinary while a structural merge combines them or while code
+    /// traverses the exact result partition they belong to. This is structural authority,
+    /// independent of numerical precision.
     pub fn partial_free(&self) -> bool {
-        self.admit || self.frames.iter().any(|f| f.kind == FrameKind::Merge)
+        self.frames.iter().any(|frame| {
+            matches!(frame.kind, FrameKind::Merge | FrameKind::Region { origin: Some(_), .. })
+        })
     }
 
     pub fn forbid_partial(&mut self, e: &sir::Expr, use_: &str) {
         if e.partial && !self.partial_free() {
-            self.error(e.span, format!("partial-domain value used as {use_}: outside an `admit fn` a value yielded per slice or reduced over a structural axis may only be forwarded, stored in results, combined by `merge`, accumulated into `let mut` state by `+`, `max`, `min` inside a traversal of the same result, or passed to an `admit fn`"));
+            self.error(e.span, format!("partial-domain value used as {use_}: a value yielded per slice or reduced over a structural axis may only be forwarded, stored in results, combined by `merge`, or accumulated into `let mut` state by `+`, `max`, or `min` inside a traversal of the same result"));
         }
     }
 
@@ -793,7 +795,6 @@ pub(crate) fn check_program(
             aliases: declared.sig.aliases.clone(),
             result: declared.sig.result.clone(),
             predicates: declared.sig.predicates.clone(),
-            admit: declared.admit,
             body: checked.body,
             file: declared.file,
             span: declared.span,
@@ -999,8 +1000,8 @@ mod tests {
     }
 
     #[test]
-    fn concrete_lowering_requires_caller_elem_and_unordered_needs_admit() {
-        let source = "fn mm[M, K](a: tile[M, K] T, inout into: tile[M] f32):\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] bf16, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] T, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nadmit fn g[M, K](x: tensor[M, K] A, out y: tensor[M] f32):\n    let mut acc = reduce(f32(x), 1, sum, unordered=true)\n    mm(load(x), acc)\n    publish acc to y\n";
+    fn concrete_lowering_requires_caller_elem_and_unordered_is_numerical_policy() {
+        let source = "fn mm[M, K](a: tile[M, K] T, inout into: tile[M] f32):\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] bf16, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] T, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nfn g[M, K](x: tensor[M, K] A, out y: tensor[M] f32):\n    let mut acc = reduce(f32(x), 1, sum, unordered=true)\n    mm(load(x), acc)\n    publish acc to y\n";
         let program = check(&[("case.seismic", source)]).unwrap_or_else(|e| panic!("{e}"));
         let g = program
             .definitions
@@ -1027,8 +1028,8 @@ mod tests {
             generic.elem_args,
             vec![("T".to_string(), crate::types::Elem::Param("A".to_string()))]
         );
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[1] f32):\n    publish reduce(f32(x), 0, sum, unordered=true) to y[0]\n", "reassociation needs an admitted numerical contract");
-        rejected("admit fn f[N](x: tensor[N] f32, out y: tensor[1] i32):\n    publish reduce(f32(x), 0, argmax, unordered=true) to y[0]\n", "never accepts `unordered`");
+        check(&[("unordered.seismic", "fn f[N](x: tensor[N] f32, out y: tensor[1] f32):\n    publish reduce(f32(x), 0, sum, unordered=true) to y[0]\n")]).expect("unordered sum is a selectable numerical alternative");
+        rejected("fn f[N](x: tensor[N] f32, out y: tensor[1] i32):\n    publish reduce(f32(x), 0, argmax, unordered=true) to y[0]\n", "never accepts `unordered`");
     }
 
     #[test]

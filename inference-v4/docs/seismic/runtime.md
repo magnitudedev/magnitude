@@ -17,7 +17,8 @@ error.
 
 **The only input to native compilation is a checked feasible `Selected`:** the
 realized execution together with its family, witness, seed, estimates, proof
-status, estimate model identity, proved lower bound, and unresolved obligations.
+status, estimate model identity, numerical assessment and qualification identity,
+proved lower bound, and unresolved obligations.
 
 - `Device::compile_selected` emits and natively compiles exactly that execution,
   once. It does not select, re-lower, or replace any part of the witness.
@@ -32,7 +33,8 @@ status, estimate model identity, proved lower bound, and unresolved obligations.
   compilation.
 
 Every kernel retains what selection decided: entry, witness, seed, both estimates,
-proof status, estimate model, lower bound, unresolved obligations
+proof status, estimate model, numerical assessment, selected qualification identity,
+lower bound, unresolved obligations
 (`Kernel::selection`). Estimates are in the units of the named model and are not
 measurements.
 
@@ -40,7 +42,7 @@ measurements.
 
 ```mermaid
 flowchart LR
-    P[Program + entry + shapes + elements] --> S[Selected]
+    P[Program + entry + shapes + elements + precision] --> S[Selected]
     S --> N[Native kernel]
     N --> B[Bound invocation]
     B --> X[Submitted execution]
@@ -51,7 +53,7 @@ flowchart LR
 
 The plan compiler holds one closed checked program and one device.
 
-- **Identity is exactly `(entry, shapes, elements)`.** Requests with equal identity
+- **Identity is `(entry, shapes, elements, precision policy, qualification catalog)`.** Requests with equal identity
   share one compilation. Buffer contents, scalar values, and bounded index arguments
   are never identity, so changing control inputs or the decode position reuses the
   compiled kernel and never retunes.
@@ -59,10 +61,12 @@ The plan compiler holds one closed checked program and one device.
 - Selection and native compilation run at the first preparation of an entry, under
   the search budget in the compiler's settings, with the backend of the plan's device
   (`Device::select`) built from the device's queried facts. The budget is the only tuning
-  input a host supplies. `Settings.strategy` (`Exact` by default, `Greedy` as a
+  input a host supplies. `Settings.precision` is a hard numerical contract and
+  `Settings.qualifications` is the immutable whole-witness evidence catalog.
+  `Settings.strategy` (`Exact` by default, `Greedy` as a
   diagnostic; see [Tuning](tuning.md)) replaces the budget's strategy for every entry.
 - Every kernel retains a `Selection` record (`Kernel::selection`): witness, seed,
-  estimates, proof status, the specialization's shapes and elements, the selection
+  estimates, proof status, numerical assessment and qualification identity, the specialization's shapes and elements, the selection
   phase timings and search statistics, and the wall time of `emit` (Metal; the CPU and
   CUDA backends do not separate emission) and `native_compile` measured in
   `Device::compile_selected`.
@@ -174,7 +178,7 @@ by itself accept a sequence advance or publish a token. The engine's
 ## Acceptance
 
 - Warm steps perform no selection and no native compilation.
-- Two requests with equal `(entry, shapes, elements)` share one compilation.
+- Two requests with equal `(entry, shapes, elements, precision policy, qualification catalog)` share one compilation.
 - An aliasing violation is rejected before submission.
 - Every compiled kernel reports the witness, status, and estimate model it was
   compiled from.

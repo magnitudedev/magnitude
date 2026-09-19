@@ -9,7 +9,8 @@ use crate::{DeviceTimingScope, Executable};
 use seismic_compiler::selection::{Budget, Strategy};
 use seismic_lang::types::Elem;
 use seismic_lang::{
-    family::{Numerics, Workload},
+    family::Workload,
+    precision::PrecisionPolicy,
     sir::Program,
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
@@ -235,13 +236,16 @@ impl Submission {
 
 /// Explicit search budget. Implementation choices are compiler-owned; the backend and its
 /// capacities come from the device the plan compiles for.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Settings {
     pub budget: Budget,
     /// How the seed is improved; replaces `budget.strategy` for every entry of the plan.
     pub strategy: Strategy,
-    /// Numerical latitude of selection; part of every compiled entry's workload identity.
-    pub numerics: Numerics,
+    /// Observable numerical contract; part of every compiled entry's workload identity.
+    pub precision: PrecisionPolicy,
+    /// Whole-witness numerical evidence available to constrained selection. Records that do
+    /// not exactly match this program, specialization and device environment are ignored.
+    pub qualifications: Vec<seismic_compiler::selection::Qualification>,
 }
 struct Enclosing {
     device: Device,
@@ -260,7 +264,7 @@ impl Enclosing {
         }
         let selected = self
             .device
-            .select(
+            .select_with_qualifications(
                 &self.program,
                 &self.entry,
                 &self.workload,
@@ -268,6 +272,7 @@ impl Enclosing {
                     strategy: self.settings.strategy,
                     ..self.settings.budget
                 },
+                &self.settings.qualifications,
             )
             .map_err(|e| format!("{}: {e}", self.entry))?;
         let kernel = Rc::new(RefCell::new(
@@ -333,9 +338,11 @@ impl<'a> PlanCompiler<'a> {
         }
     }
     pub fn settings(&self) -> Settings {
-        self.settings
+        self.settings.clone()
     }
-    /// Compilation identity is exactly `(entry, shapes, elements, numerics)`.
+    /// Compilation identity is `(entry, shapes, elements, precision, qualification catalog)`;
+    /// one compiler owns an immutable settings snapshot, so cached entries cannot observe a
+    /// catalog change.
     pub fn compile_entry(
         &mut self,
         entry: &str,
@@ -348,7 +355,7 @@ impl<'a> PlanCompiler<'a> {
                 .iter()
                 .map(|(n, e)| (n.clone(), e.clone()))
                 .collect(),
-            numerics: self.settings.numerics,
+            precision: self.settings.precision.clone(),
         };
         if let Some(enclosing) = self
             .entries
@@ -365,7 +372,7 @@ impl<'a> PlanCompiler<'a> {
             program: self.program.clone(),
             entry: entry.into(),
             workload,
-            settings: self.settings,
+            settings: self.settings.clone(),
             kernel: RefCell::new(None),
         });
         self.entries.push(enclosing.clone());

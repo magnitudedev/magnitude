@@ -9,14 +9,14 @@ use seismic_cuda::mapping::{Cuda, EstimateModel, Limits};
 
 fn main() -> Result<(), String> {
     let program = cases::program()?;
-    let numerics = cases::numerics()?;
+    let precision = cases::precision()?;
     let backend = Cuda::new(Limits::gb10(), EstimateModel::default()).map_err(|e| e.to_string())?;
     let mut failed = 0usize;
     let all = cases::selected();
-    println!("{:<30} outcome ({numerics:?} numerics, limits {:?})", "kernel", backend.limits());
+    println!("{:<30} outcome ({precision:?} precision, limits {:?})", "kernel", backend.limits());
     for case in &all {
         let outcome = cases::guarded(|| {
-            let workload = cases::workload(case, numerics)?;
+        let workload = cases::workload(case, precision.clone())?;
             let selected = select(&program, case.entry, &workload, &backend, Budget::default()).map_err(|e| e.to_string())?;
             let texts = selected.execution.ptx();
             // `PTX_DIR=<dir>` keeps every launch's text for inspection.

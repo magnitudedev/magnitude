@@ -6,11 +6,12 @@
 
 use super::normalize::{owning_slice, sequences, BlockUnits};
 use super::{
-    Candidate, CandidateRef, Family, Numerics, Obligation, Occurrence, OccurrenceId, Requirement,
+    Candidate, CandidateRef, Family, Obligation, Occurrence, OccurrenceId, Requirement,
     Sequence, SequenceId, Site, SiteId, SiteKind, SiteRef, Template, TemplateId, UnitKind,
     Workload,
 };
 use crate::repr;
+use crate::precision::NumericalEffect;
 use crate::sir::{
     Body, CallId, CallSite, DefId, DefKind, Definition, ExprKind, Index, Predicate, Program,
     SliceParent,
@@ -39,7 +40,6 @@ pub fn construct(
     let mut builder = Builder {
         program,
         target,
-        numerics: workload.numerics,
         templates: Vec::new(),
         interned: HashMap::new(),
         sites: Vec::new(),
@@ -64,6 +64,7 @@ pub fn construct(
         entry: entry.to_string(),
         target: target.to_string(),
         workload: workload.clone(),
+        allow_numerical_effects: matches!(workload.precision, crate::precision::PrecisionPolicy::Unconstrained),
         templates: Vec::new(),
         occurrences: Vec::new(),
         sites: Vec::new(),
@@ -145,6 +146,8 @@ struct CandidateNode {
     template: TemplateId,
     definition: DefId,
     via: DefId,
+    reference: bool,
+    numerical_effects: Vec<NumericalEffect>,
     structural: Vec<(String, SiteId)>,
     requirements: Vec<Requirement>,
     children: Vec<OccurrenceNode>,
@@ -178,7 +181,6 @@ type TemplateKey = (
 struct Builder<'a> {
     program: &'a Program,
     target: &'a str,
-    numerics: Numerics,
     templates: Vec<Template>,
     interned: HashMap<TemplateKey, TemplateId>,
     /// Provisional sites, including those of candidates removed later.
@@ -201,14 +203,14 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Whether the contract family is an admitted numerical contract.
-    fn admitted(&self, family: usize) -> bool {
+    /// Portable semantic reference of one linked function family.
+    fn reference(&self, family: usize) -> Option<DefId> {
         let contract = &self.program.families[family];
         contract
             .bodies
             .iter()
-            .chain(&contract.lowerings)
-            .any(|id| self.program.definition(*id).admit)
+            .copied()
+            .find(|id| matches!(self.program.definition(*id).kind, DefKind::Body { target: None }))
     }
 
     fn coverage(&self, node: &OccurrenceNode) -> String {
@@ -284,21 +286,25 @@ impl<'a> Builder<'a> {
         source: &Source,
     ) -> Attempt<CandidateNode> {
         let body = &def.body;
-        if self.numerics == Numerics::Exact && self.admitted(def.family) {
-            let mut unordered = false;
-            walk::block(&body.block, true, &mut |e| {
-                unordered |= matches!(
-                    e.kind,
-                    ExprKind::Reduce {
-                        unordered: true,
-                        ..
-                    }
-                )
-            });
-            if unordered || matches!(def.kind, DefKind::Lower { .. }) {
-                return Ok(Err(Reject::inapplicable("exact numerics requested".into())));
-            }
+        let reference = self.reference(def.family) == Some(via);
+        let mut numerical_effects = Vec::new();
+        if !reference {
+            numerical_effects.push(NumericalEffect::AlternativeImplementation);
         }
+        walk::block(&body.block, true, &mut |expr| {
+            let effect = match &expr.kind {
+                ExprKind::Reduce { unordered: true, .. } => Some(NumericalEffect::ReassociatedReduction),
+                ExprKind::Math { op: crate::sir::Math::ExpFast, .. } => Some(NumericalEffect::ApproximateTranscendental("exp".into())),
+                ExprKind::Intrinsic { op, .. } => Some(NumericalEffect::BackendIntrinsic {
+                    target: def.kind.target().unwrap_or("unknown").to_string(),
+                    operation: format!("{op:?}"),
+                }),
+                _ => None,
+            };
+            if let Some(effect) = effect.filter(|effect| !numerical_effects.contains(effect)) {
+                numerical_effects.push(effect);
+            }
+        });
         let binding = match self.bind(def, source) {
             Ok(binding) => binding,
             Err(reject) => return Ok(Err(reject)),
@@ -320,7 +326,7 @@ impl<'a> Builder<'a> {
             ));
         }
         self.path.push(template);
-        let expanded = self.expand(def, body, via, template, binding, requirements);
+        let expanded = self.expand(def, body, via, reference, numerical_effects, template, binding, requirements);
         self.path.pop();
         expanded
     }
@@ -495,6 +501,8 @@ impl<'a> Builder<'a> {
         def: &'a Definition,
         body: &'a Body,
         via: DefId,
+        reference: bool,
+        numerical_effects: Vec<NumericalEffect>,
         template: TemplateId,
         binding: Binding,
         mut requirements: Vec<Requirement>,
@@ -616,6 +624,8 @@ impl<'a> Builder<'a> {
             template,
             definition: def.id,
             via,
+            reference,
+            numerical_effects,
             structural,
             requirements,
             children,
@@ -727,6 +737,8 @@ impl<'a> Builder<'a> {
             candidates.push(Candidate {
                 template: node.template,
                 via: node.via,
+                reference: node.reference,
+                numerical_effects: node.numerical_effects,
                 structural,
                 requirements,
                 children: node.children.iter().map(|child| child.id).collect(),

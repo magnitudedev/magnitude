@@ -73,7 +73,7 @@ impl Harness<'_> {
         let interpreted = started.elapsed();
         let initial = tensors.clone();
         let mut actual = tensors;
-        let (selection, workload) = Backend::Metal(PlanCompiler::new(self.device, self.program, Settings { numerics: family::Numerics::Exact, ..Settings::default() }))
+        let (selection, workload) = Backend::Metal(PlanCompiler::new(self.device, self.program, Settings { precision: seismic_lang::precision::PrecisionPolicy::Exact, ..Settings::default() }))
             .run(entry, &shapes, &mut actual, &scalars)
             .unwrap();
         println!("== {case}: {entry} {shapes:?} (interpreter {interpreted:.1?})");
@@ -240,7 +240,7 @@ fn real_geometry_entries_match_the_interpreter_on_metal() {
     for r in &h.rows {
         println!("{:<18} {:<18} {:<5} {:>9} {:>12.4e} {:>12.4e} {:>10} {:>10}", r.case, r.tensor, r.dtype.name(), r.count, r.max_abs, r.max_rel, r.beyond, r.beyond_compact);
     }
-    // Metal selects under `Numerics::Exact`, so every tensor is held to the strict bound.
+    // Metal selects under exact precision, so every tensor is held to the strict bound.
     let failed = h.rows.iter().filter(|r| r.beyond > 0).map(|r| format!("{} {}", r.case, r.tensor)).collect::<Vec<_>>();
     assert!(failed.is_empty(), "beyond tolerance (2e-4 + 2e-3*|ref|): {failed:?}");
 }

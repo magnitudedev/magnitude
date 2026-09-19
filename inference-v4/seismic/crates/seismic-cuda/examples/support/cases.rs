@@ -1,7 +1,8 @@
 //! Kernel cases of the CUDA sweeps: the std kernel table of `seismic-runtime/tests/kernels.rs`
 //! (copied so this crate does not depend on the runtime crate), minus the real-geometry
 //! k-quant `linear` cases, which exist to exercise Metal lowerings at Qwen dimensions.
-use seismic_lang::family::{Numerics, Workload};
+use seismic_lang::family::Workload;
+use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::repr;
 use seismic_lang::sir::{Definition, Program};
 use seismic_lang::types::{DType, Elem};
@@ -299,7 +300,7 @@ pub fn element(name: &str) -> Result<Elem, String> {
     }
 }
 
-pub fn workload(case: &Case, numerics: Numerics) -> Result<Workload, String> {
+pub fn workload(case: &Case, precision: PrecisionPolicy) -> Result<Workload, String> {
     Ok(Workload {
         shapes: case
             .shapes
@@ -311,7 +312,7 @@ pub fn workload(case: &Case, numerics: Numerics) -> Result<Workload, String> {
             .iter()
             .map(|(n, e)| Ok((n.to_string(), element(e)?)))
             .collect::<Result<_, String>>()?,
-        numerics,
+        precision,
     })
 }
 
@@ -339,12 +340,12 @@ pub fn program() -> Result<Program, String> {
     })
 }
 
-/// `NUMERICS=admitted` switches the sweep from the default exact contracts.
-pub fn numerics() -> Result<Numerics, String> {
-    match std::env::var("NUMERICS").as_deref() {
-        Err(_) | Ok("exact") => Ok(Numerics::Exact),
-        Ok("admitted") => Ok(Numerics::Admitted),
-        Ok(other) => Err(format!("NUMERICS={other}: expected `exact` or `admitted`")),
+/// `PRECISION=unconstrained` enables exploration instead of the default exact policy.
+pub fn precision() -> Result<PrecisionPolicy, String> {
+    match std::env::var("PRECISION").as_deref() {
+        Err(_) | Ok("exact") => Ok(PrecisionPolicy::Exact),
+        Ok("unconstrained") => Ok(PrecisionPolicy::Unconstrained),
+        Ok(other) => Err(format!("PRECISION={other}: expected `exact` or `unconstrained`")),
     }
 }
 

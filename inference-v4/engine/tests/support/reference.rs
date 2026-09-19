@@ -236,7 +236,7 @@ impl Backend<'_> {
                 Some((
                     selection,
                     Workload {
-                        numerics: compiler.settings().numerics,
+                        precision: compiler.settings().precision,
                         ..workload(shapes, &elements)
                     },
                 ))

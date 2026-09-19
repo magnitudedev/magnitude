@@ -12,9 +12,9 @@ mod error;
 pub use error::Error;
 pub mod memory;
 pub mod plan;
-use seismic_compiler::selection::{self, Budget, ProofStatus, Selected};
+use seismic_compiler::selection::{self, Backend, Budget, ProofStatus, Selected};
 /// What a `Selection` record and `plan::Settings` are made of.
-pub use seismic_compiler::selection::{Phase, SearchStats, Strategy, Timings};
+pub use seismic_compiler::selection::{Phase, Qualification, QualificationIdentity, SearchStats, Strategy, Timings};
 use seismic_lang::family::Workload;
 use seismic_lang::sir::Program;
 use seismic_lang::abi::ScalarParameter;
@@ -145,6 +145,8 @@ pub struct Selection {
     pub seed_estimate: u64,
     pub status: ProofStatus,
     pub estimate_model: String,
+    pub numerical_assessment: seismic_lang::precision::NumericalAssessment,
+    pub qualification: Option<QualificationIdentity>,
     pub lower_bound: u64,
     pub unresolved: Vec<String>,
     /// Static shape and element bindings of the compiled specialization (its identity).
@@ -243,20 +245,50 @@ impl Device {
     /// Joint selection for this device's backend, built from the device's queried facts.
     /// The budget is the only tuning input.
     pub fn select(&self, program: &Program, entry: &str, workload: &Workload, budget: Budget) -> Result<SelectedExecution, String> {
+        self.select_with_qualifications(program, entry, workload, budget, &[])
+    }
+
+    /// Joint selection with an explicit catalog of whole-witness numerical evidence.
+    /// Records are matched by program, specialization, backend numerical environment and
+    /// requested policy; unrelated records are ignored and every accepted witness is audited.
+    pub fn select_with_qualifications(
+        &self,
+        program: &Program,
+        entry: &str,
+        workload: &Workload,
+        budget: Budget,
+        qualifications: &[Qualification],
+    ) -> Result<SelectedExecution, String> {
         Ok(match self.facts() {
             #[cfg(target_os = "macos")]
             DeviceFacts::Metal(info) => {
                 let backend = seismic_metal::mapping::Metal::from_device(&info).map_err(|e| e.to_string())?;
-                selection::select(program, entry, workload, &backend, budget).map_err(|e| e.to_string())?.into()
+                selection::select_qualified(program, entry, workload, &backend, budget, qualifications).map_err(|e| e.to_string())?.into()
             }
             DeviceFacts::Cpu(info) => {
                 let backend = seismic_cpu::mapping::Cpu::host(info.workers).map_err(|e| e.to_string())?;
-                selection::select(program, entry, workload, &backend, budget).map_err(|e| e.to_string())?.into()
+                selection::select_qualified(program, entry, workload, &backend, budget, qualifications).map_err(|e| e.to_string())?.into()
             }
             DeviceFacts::Cuda(info) => {
                 let backend = seismic_cuda::mapping::Cuda::from_device(&info).map_err(|e| e.to_string())?;
-                selection::select(program, entry, workload, &backend, budget).map_err(|e| e.to_string())?.into()
+                selection::select_qualified(program, entry, workload, &backend, budget, qualifications).map_err(|e| e.to_string())?.into()
             }
+        })
+    }
+
+    /// Stable identity against which numerical evidence for this native environment is bound.
+    pub fn numerical_environment(&self) -> Result<String, String> {
+        Ok(match self.facts() {
+            #[cfg(target_os = "macos")]
+            DeviceFacts::Metal(info) => seismic_metal::mapping::Metal::from_device(&info)
+                .map_err(|e| e.to_string())?
+                .numerical_environment(),
+            DeviceFacts::Cpu(info) => seismic_cpu::mapping::Cpu::host(info.workers)
+                .map_err(|e| e.to_string())?
+                .numerical_environment(),
+            DeviceFacts::Cuda(info) => seismic_cuda::mapping::Cuda::from_device(&info)
+                .map_err(|e| e.to_string())?
+                .numerical_environment(),
         })
     }
     /// Emit and natively compile exactly the selected execution. Nothing here selects,
@@ -264,10 +296,10 @@ impl Device {
     /// this device's is an error.
     pub fn compile_selected(&self, selected: impl Into<SelectedExecution>) -> Result<Kernel, String> {
         fn retained<E>(selected: Selected<E>) -> (E, Selection) {
-            let Selected { execution, family, witness, estimate, seed, seed_estimate, status, estimate_model, lower_bound, unresolved, timings, search } = selected;
+            let Selected { execution, family, witness, estimate, seed, seed_estimate, status, estimate_model, numerical_assessment, qualification, lower_bound, unresolved, timings, search } = selected;
             let shapes = family.workload.shapes.iter().map(|(name, value)| (name.clone(), *value)).collect();
             let elements = family.workload.elems.iter().map(|(name, element)| (name.clone(), element.to_string())).collect();
-            (execution, Selection { entry: family.entry.clone(), witness, seed, estimate, seed_estimate, status, estimate_model, lower_bound, unresolved, shapes, elements, timings, search, emit: None, native_compile: Default::default() })
+            (execution, Selection { entry: family.entry.clone(), witness, seed, estimate, seed_estimate, status, estimate_model, numerical_assessment, qualification, lower_bound, unresolved, shapes, elements, timings, search, emit: None, native_compile: Default::default() })
         }
         let started = std::time::Instant::now();
         match (&self.0, selected.into()) {

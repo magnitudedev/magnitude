@@ -649,10 +649,6 @@ impl<'a> Checker<'a> {
             self.error(span, "`argmax` has one defined winner (ties go to the smaller index) and never accepts `unordered`");
             return None;
         }
-        if unordered && !self.admit {
-            self.error(span, "`unordered=true` permits reassociating the reduction; reassociation needs an admitted numerical contract (`admit fn`)");
-            return None;
-        }
         self.forbid_partial(&t, "a reduction operand");
         // Over a structural axis the value is one aggregate per tuned piece.
         let partial = match &s.axes[axis] {
@@ -1447,7 +1443,6 @@ impl<'a> Checker<'a> {
             return None;
         };
         let first_sig = &resolved.declared[*first].sig;
-        let callee_admit = resolved.declared[*first].admit;
         let result = match Self::substitute_ty(&first_sig.result, first_binding) {
             Ok(ty) => ty,
             Err(reason) => {
@@ -1471,12 +1466,7 @@ impl<'a> Checker<'a> {
             .collect();
         for (mode, ordinal) in modes {
             let arg = args[ordinal].clone();
-            if !callee_admit {
-                self.forbid_partial(
-                    &arg,
-                    &format!("an argument of `{}`, which is not an `admit fn`", name.name),
-                );
-            }
+            self.forbid_partial(&arg, &format!("an argument of `{}`", name.name));
             if mode == Mode::In {
                 continue;
             }
@@ -1498,9 +1488,7 @@ impl<'a> Checker<'a> {
                     continue;
                 };
                 match extent {
-                    Extent::Structural(_) => {
-                        partial |= !callee_admit && summary.reduces.contains(p)
-                    }
+                    Extent::Structural(_) => partial |= summary.reduces.contains(p),
                     Extent::Semantic(sym) => {
                         if let Some(own) =
                             single_param(sym).filter(|q| self.sig.shape_params.contains(q))

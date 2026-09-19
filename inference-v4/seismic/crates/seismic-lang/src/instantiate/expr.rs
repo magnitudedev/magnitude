@@ -371,8 +371,8 @@ impl<'a> Instantiation<'a> {
     }
 
     /// The fourth argument of the execution IR's reduction is its numerical contract: `true`
-    /// keeps the authored ascending order, `false` (only from `unordered=true` inside an
-    /// `admit fn`) permits the backend to reassociate.
+    /// keeps the authored ascending order, `false` (from `unordered=true`) permits the backend
+    /// to reassociate when the compilation precision policy admits the selected body.
     fn reduce(&mut self, operand: Expr, axis: usize, op: sir::ReduceOp, unordered: bool, span: Span, out: &mut Vec<Stmt>) -> Result<Expr, String> {
         // The backend reduces tile variables only.
         let operand = if matches!(operand.kind, ExprKind::Var(_)) { operand } else { self.copy(operand, out)? };

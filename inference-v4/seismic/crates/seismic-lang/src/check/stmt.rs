@@ -565,7 +565,7 @@ impl<'a> Checker<'a> {
 
     /// `s = s + p`, `s = max(s, p)`, `s = min(s, p)`: with `p` a forwarded partial of the
     /// result being traversed this is the one admitted accumulation of partials into state
-    /// outside an `admit fn`. `None` when `value` does not have this form.
+    /// outside a structural merge. `None` when `value` does not have this form.
     fn accumulation(&mut self, value: &ast::Expr, place: &Expr) -> Option<Option<Expr>> {
         let ExprKind::Var(state) = place.kind else {
             return None;
@@ -1297,8 +1297,8 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            if e.partial && !self.admit {
-                self.error(e.span, "a partial-domain value cannot be returned as a whole-domain result; combine it with `merge`, an ordered traversal, or an `admit fn`");
+            if e.partial {
+                self.error(e.span, "a partial-domain value cannot be returned as a whole-domain result; combine it with `merge` or an ordered traversal");
             }
         }
         if let Some(function) = self.yields.first_mut() {

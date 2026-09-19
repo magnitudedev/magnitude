@@ -31,6 +31,19 @@ pub struct Program {
 }
 
 impl Program {
+    /// Stable identity of the checked source set for numerical qualification records.
+    pub fn identity(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for (path, text) in &self.files {
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path.as_bytes());
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        hash.finalize().into()
+    }
+
     pub fn definition(&self, id: DefId) -> &Definition {
         &self.definitions[id.0 as usize]
     }
@@ -114,7 +127,6 @@ pub struct Definition {
     pub result: Ty,
     /// Applicability: every predicate must hold.
     pub predicates: Vec<Predicate>,
-    pub admit: bool,
     pub body: Body,
     /// Index into `Program::files`.
     pub file: usize,
@@ -462,8 +474,7 @@ pub enum ExprKind {
         then: Box<Expr>,
         els: Box<Expr>,
     },
-    /// `unordered` (`reduce(t, axis, sum, unordered=true)`, legal only inside an `admit fn`)
-    /// permits reassociation: a backend may combine lane partials. The reference
+    /// `unordered` (`reduce(t, axis, sum, unordered=true)`) permits reassociation: a backend may combine lane partials. The reference
     /// interpreter always accumulates in ascending index order.
     Reduce {
         value: Box<Expr>,

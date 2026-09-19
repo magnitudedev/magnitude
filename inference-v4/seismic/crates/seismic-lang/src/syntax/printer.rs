@@ -71,9 +71,6 @@ impl Printer {
     fn decl(&mut self, decl: &Decl) {
         match decl {
             Decl::Fn(f) => {
-                if f.admit {
-                    self.out.push_str("admit ");
-                }
                 let _ = write!(self.out, "fn {}", f.name.name);
                 self.signature(&f.signature);
                 if let Some(target) = &f.target {

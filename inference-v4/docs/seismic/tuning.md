@@ -75,6 +75,11 @@ Hard limits are constraints, never costs. Preferences are costs, never constrain
 No factor may return zero for a quantity it cannot derive; it fails, and selection
 reports *analysis unavailable*.
 
+Numerical precision is also a hard constraint. Exact selection admits the reference path. A
+bounded policy additionally admits only alternatives with sufficient static proof or a matching
+whole-witness qualification. Numerical error is never an objective term: the solver cannot trade a
+policy violation for lower estimated time.
+
 ## Seed
 
 The backend supplies one constructive complete witness. It is a starting result,
@@ -82,6 +87,11 @@ not a default implementation and not a rule that excludes other bodies. The seed
 audited against the joint family like any witness. An audited seed is the baseline
 result: a searched witness replaces it only when its estimate is strictly lower.
 The seed and its estimate are retained in the result for comparison.
+
+Seed construction obeys the same numerical admissibility relation as solver export. A strict
+request cannot seed an unqualified lowering or approximate primitive; unconstrained exploration
+may prefer target lowerings. A disagreement is a defective seed policy, never a reason to weaken
+precision.
 
 The seed is not injected into the solver. Search starts from the model alone, so
 the seed bounds the result from above but does not steer the search.
@@ -157,6 +167,11 @@ Model-optimal is a statement about a model. It proves nothing about physical
 optimality, about values outside the backend's site domains, or about candidates
 nobody authored. A feasible witness is executable; execution never waits for a proof.
 
+Performance proof status and numerical evidence are independent. Every selected result separately
+retains an `Exact`, `Proven`, `Qualified`, or `Unknown` numerical assessment. `Unknown` is valid only
+for explicitly unconstrained exploration. Model-optimal therefore means optimal within the
+numerically admissible family, not permission to weaken the requested policy.
+
 ## Outcomes
 
 | Outcome | Meaning | Not to be read as |
@@ -192,10 +207,13 @@ search.
 
 ## Reuse
 
-Selection identity is `(entry, shapes, elements)` on one device. Buffer contents,
+Selection identity is `(entry, shapes, elements, precision policy, qualification catalog)` on one device. Buffer contents,
 scalar arguments, and bounded index values such as the decode position are not
 part of it, so decode steps do not retune. Adding or removing a portable body, target
 lowering, or backend-specific helper changes the family and invalidates earlier witnesses.
+Qualification reuse additionally requires equal program identity, complete witness,
+specialization, target numerical environment, input domain/corpus, and evidence method. A replayed
+qualification is audited against the current family; it is never repaired or transferred.
 
 ## Search analysis
 
@@ -214,3 +232,5 @@ prediction of solve work. The command predicts no times.
 - An unsatisfiable hard constraint yields *infeasible*; an invalid seed yields a
   reconstruction defect.
 - The selected witness reproduces the solver's assignment and cost exactly.
+- Performance optimization ranges only over witnesses admitted by the precision policy.
+- Qualification of one complete witness cannot authorize another witness or device environment.

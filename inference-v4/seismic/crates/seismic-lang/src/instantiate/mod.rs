@@ -224,7 +224,7 @@ fn rms_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, out y: tensor[R, W] V,
 ";
 
     const SUM_SQUARES: &str = "\
-admit fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
+fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
     parallel [rows] in 0..R:
         for row in rows:
             let total = parallel [part] in 0..W:

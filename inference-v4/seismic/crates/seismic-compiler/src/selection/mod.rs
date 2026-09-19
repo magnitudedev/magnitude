@@ -19,9 +19,12 @@ pub mod structure;
 
 pub use analyze::{analyze, analyze_with, SearchAnalysis};
 pub use backend::{Backend, Constraint, Factor, Interval, IntervalRef};
-pub use search::{replay, select, Budget, Strategy};
+pub use search::{replay, select, select_qualified, Budget, Strategy};
 
 use seismic_lang::family::{Family, Witness};
+use seismic_lang::precision::NumericalAssessment;
+use seismic_lang::types::Elem;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,12 +50,106 @@ pub struct Selected<E> {
     pub status: ProofStatus,
     /// Identity of the estimate model, e.g. `metal-estimate-unqualified-v0`.
     pub estimate_model: String,
+    /// Numerical status of the complete selected witness under the requested precision policy.
+    pub numerical_assessment: NumericalAssessment,
+    /// Identity of the whole-witness qualification selected for execution, when any.
+    pub qualification: Option<QualificationIdentity>,
     /// Lower bound proved by the solver over the exported family, in the same units.
     pub lower_bound: u64,
     pub unresolved: Vec<String>,
     /// Wall time of every selection phase of this entry.
     pub timings: Timings,
     pub search: SearchStats,
+}
+
+/// Numerical evidence for one complete witness. Bounds belong to the composition as a whole;
+/// they are never copied to another witness or specialization.
+#[derive(Clone, Debug)]
+pub struct Qualification {
+    pub program: [u8; 32],
+    pub target: String,
+    pub numerical_environment: String,
+    pub estimate_model: String,
+    pub entry: String,
+    pub shapes: BTreeMap<String, i64>,
+    pub elems: BTreeMap<String, Elem>,
+    pub witness: Witness,
+    pub assessment: NumericalAssessment,
+    pub corpus: String,
+    pub method: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualificationIdentity {
+    pub numerical_environment: String,
+    pub corpus: String,
+    pub method: String,
+}
+
+impl Qualification {
+    /// Create a policy-bound record for one complete witness. Replay still validates the
+    /// witness structurally when the record is consumed.
+    pub fn new<B: Backend>(
+        program: &seismic_lang::sir::Program,
+        backend: &B,
+        entry: impl Into<String>,
+        workload: &seismic_lang::family::Workload,
+        witness: Witness,
+        assessment: NumericalAssessment,
+        corpus: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Result<Self, String> {
+        if assessment.evidence != seismic_lang::precision::EvidenceClass::Qualified {
+            return Err("qualification records require qualified numerical evidence".into());
+        }
+        if !assessment.satisfies(&workload.precision) {
+            return Err("qualified outputs do not satisfy the workload precision policy".into());
+        }
+        let entry = entry.into();
+        let family = seismic_lang::family::construct(program, &entry, backend.target(), workload)?;
+        family.validate(&witness)?;
+        let root = family.occurrences.first().ok_or("qualification entry has no root occurrence")?;
+        let reference = root.candidates.iter().find(|candidate| candidate.reference)
+            .ok_or("qualification entry has no portable reference body")?;
+        let definition = program.definition(reference.via);
+        let mut expected: std::collections::BTreeSet<String> = definition.params.iter()
+            .filter(|parameter| !matches!(parameter.mode, seismic_lang::syntax::ast::Mode::In))
+            .map(|parameter| parameter.name.clone())
+            .collect();
+        if !matches!(definition.result, seismic_lang::types::Ty::Void) {
+            expected.insert("$return".into());
+        }
+        let observed: std::collections::BTreeSet<String> = assessment.outputs.iter()
+            .map(|output| output.output.clone())
+            .collect();
+        if observed != expected || assessment.outputs.len() != expected.len() {
+            return Err(format!(
+                "qualification outputs differ from entry outputs: expected {:?}, observed {:?}",
+                expected, observed
+            ));
+        }
+        Ok(Self {
+            program: program.identity(),
+            target: backend.target().into(),
+            numerical_environment: backend.numerical_environment(),
+            estimate_model: backend.estimate_model(),
+            entry,
+            shapes: workload.shapes.clone(),
+            elems: workload.elems.clone(),
+            witness,
+            assessment,
+            corpus: corpus.into(),
+            method: method.into(),
+        })
+    }
+
+    pub fn identity(&self) -> QualificationIdentity {
+        QualificationIdentity {
+            numerical_environment: self.numerical_environment.clone(),
+            corpus: self.corpus.clone(),
+            method: self.method.clone(),
+        }
+    }
 }
 
 /// Wall time per selection phase. `search` is the solver (or the greedy sweeps); it
@@ -120,6 +217,8 @@ pub enum SelectionError {
     SelectionIncomplete(String),
     /// A required quantity or estimate has no supported derivation.
     AnalysisUnavailable(String),
+    /// A bounded request permits qualification, but no matching accepted witness exists.
+    MissingQualification(String),
     /// Reconstruction disagreed with the witness: a compiler defect.
     Reconstruction(String),
 }
@@ -143,6 +242,7 @@ impl std::fmt::Display for SelectionError {
             }
             SelectionError::SelectionIncomplete(m) => write!(f, "selection incomplete: {m}"),
             SelectionError::AnalysisUnavailable(m) => write!(f, "analysis unavailable: {m}"),
+            SelectionError::MissingQualification(m) => write!(f, "missing numerical qualification: {m}"),
             SelectionError::Reconstruction(m) => write!(f, "reconstruction defect: {m}"),
         }
     }

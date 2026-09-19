@@ -148,16 +148,16 @@ fn main() -> Result<(), String> {
         }
     }
     let bound = Bound { buffers, scalars };
-    let numerics = if rest.get(5).is_some_and(|mode| mode == "exact") {
-        seismic_lang::family::Numerics::Exact
+    let precision = if rest.get(5).is_some_and(|mode| mode == "unconstrained") {
+        seismic_lang::precision::PrecisionPolicy::Unconstrained
     } else {
-        seismic_lang::family::Numerics::Admitted
+        seismic_lang::precision::PrecisionPolicy::Exact
     };
     let mut plan = PlanCompiler::new(
         &device,
         &program,
         Settings {
-            numerics,
+            precision,
             ..Settings::default()
         },
     )

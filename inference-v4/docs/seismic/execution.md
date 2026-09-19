@@ -9,22 +9,17 @@ execution.** Source rules are in [Language](language.md); target rules are in
 
 The reference interpreter executes the structured IR directly and is the semantic
 oracle. It accepts any legal partition from its caller: a width per static binder.
-A conforming program produces the same results under every partition, up to the
-numerical permission of its admitted functions. Every backend execution must agree
-with the interpreter, including rounding at each operation's dtype, publication
-rounding, accumulation dtype, FMA, and reduction order.
+A conforming reference program produces the same results under every legal partition.
+Every production backend execution must satisfy the caller's entry precision policy
+against the reference interpreter, including its requirements for rounding, exceptional
+values and observable outputs.
 
-Reduction order has one authored exception. `reduce(t, axis, sum|max|min,
-unordered=true)`, legal only inside an `admit fn`, permits a backend to reassociate
-that reduction; the interpreter still accumulates in ascending order. The execution IR
-carries the permission on the reduction (`ordered = not unordered`), and a backend may
-use a reassociating algorithm only there. Two library contracts package the
-permission: `sum_any_order` (an ordered and a reassociating body) and
-`matmul_any_order` (a contraction whose association, and the distribution of a packed
-operand's affine decode over the sum, are unspecified). A caller opts in by calling
-them; an overload family whose bodies differ in this way is itself declared `admit`
-(`linear`). Agreement with the interpreter is then up to F32 summation rounding on
-those paths and exact everywhere else.
+`reduce(t, axis, sum|max|min, unordered=true)` permits a backend to reassociate that
+reduction; the interpreter still accumulates in ascending order. The execution IR carries
+the effect (`ordered = not unordered`), and a backend may use a reassociating algorithm
+only there. The containing alternative remains numerically unknown until compiler proof
+or whole-witness qualification establishes a bound accepted by the compilation policy.
+The same rule applies to approximate transcendental operations and target intrinsics.
 
 ## Regions
 
@@ -73,12 +68,10 @@ piece counts, alive until the last consumer.
 ## Partial values
 
 A value yielded from a region, or reduced over a structural axis, depends on the
-partition until it is combined. Outside an admitted function it may only be
-forwarded, stored in results, combined by a `merge` clause, accumulated into state
-by `+`, `max`, or `min` within a traversal of the same result, or passed to an
-admitted function. Admission is a trust boundary, not a proof. Ordered
-accumulation into carried state across windows preserves the element order of the
-whole traversal and needs no admission.
+partition until it is combined. It may be forwarded, stored in results, combined by
+a `merge` clause, accumulated into state by `+`, `max`, or `min` within a traversal
+of the same result, or consumed while traversing that exact result partition. It cannot
+escape as a whole-domain result. This rule is structural and independent of precision.
 
 ## Execution units
 

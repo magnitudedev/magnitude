@@ -144,6 +144,15 @@ impl Backend for Cpu {
         IDENTITY.into()
     }
 
+    fn numerical_environment(&self) -> String {
+        format!(
+            "seismic-cpu-v1:{}:workers={}:scratch={}",
+            std::env::consts::ARCH,
+            self.limits.workers,
+            self.limits.max_scratch_bytes
+        )
+    }
+
     fn bind_structure(&self, program: &Program, family: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError> {
         self.analysis(program, family)?;
         mapping::domains(program, family)

@@ -143,10 +143,9 @@ impl Decl {
     }
 }
 
-/// `[admit] fn name[shape](params) [alias(..)] [-> result] [for target] [where pred]: body`
+/// `fn name[shape](params) [alias(..)] [-> result] [for target] [where pred]: body`
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
-    pub admit: bool,
     pub signature: Signature,
     pub name: Ident,
     /// `None` is a portable function; `Some` restricts the function to that backend.

@@ -7,7 +7,7 @@ From this directory, package and install:
 
 ```sh
 npx --yes @vscode/vsce package --allow-missing-repository --skip-license
-code --install-extension seismic-language-0.0.2.vsix
+code --install-extension seismic-language-0.0.3.vsix
 ```
 
 Alternatively, use **Extensions: Install from VSIX...** in VS Code's command

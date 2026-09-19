@@ -62,7 +62,7 @@ realization.
 | Load | Borrow where the borrow proof holds, else materialize: the greatest fixpoint of the proof starting from all-borrow. |
 | Tile storage | Threadgroup memory for a matrix-intrinsic operand, for a tile of at least 32 elements whose elements an owned loop reads at coordinates other than its own (its element loops then write it cooperatively, one share per lane, and a barrier publishes it), or when cooperation admits no private placement. Otherwise thread-private: lane-distributed from 32 elements upward (one element per lane) when admitted, else replicated. Cooperative covers partition a tile by its capacity (element `e` belongs to lane `e mod 32`), so a runtime extent is shared among the lanes like a fixed one. |
 | Fold ownership | Serial. SIMD-group collectives appear as authored intrinsics and in the collective reduction below. |
-| Reduction | Lane-local when admitted and the output exceeds one SIMD group; else collective (each lane folds its share, one SIMD-group reduction per output) when admitted; else ordered; else the first admitted algorithm. The collective is admitted only for a reduction whose authored contract permits reassociation (`unordered=true`, legal only inside an `admit fn`), over a lane-distributed input of a 32-bit element type. Every other reduction keeps the authored ascending order and is bit-exact against the interpreter. |
+| Reduction | Lane-local when structurally available and the output exceeds one SIMD group; else collective (each lane folds its share, one SIMD-group reduction per output) when available; else ordered; else the first available algorithm. A collective requires `unordered=true` over a lane-distributed 32-bit input. This is a numerical effect: the containing implementation still needs evidence accepted by the entry precision policy. Every ordered reduction keeps authored ascending order and is bit-exact against the interpreter. |
 | Allocation | Always a new slot. No reuse, hence no optional barrier. |
 | Transfer | The widest exact packed vector the transfer admits. |
 | Traversal | Unroll width one. |
@@ -384,7 +384,7 @@ formula (`Costs`), its seed piece target, and `realize`.
 ## Acceptance
 
 - For every supported kernel, the selected Metal execution agrees with the
-  reference interpreter, and the selected CPU execution under exact numerics is
+  reference interpreter, and the selected CPU execution under exact precision is
   bit-identical to it.
 - Calling any hook twice with equal inputs gives equal results.
 - The seed of every supported entry passes the joint audit.

@@ -210,6 +210,7 @@ pub struct Account<A: Accounting> {
 pub struct Bound<'a> {
     pub definition: &'a Definition,
     pub body: &'a Body,
+    allow_numerical_effects: bool,
     constants: Arc<BTreeMap<String, i64>>,
     /// Static `[lower, upper]` range of every non-constant name an extent may mention: shape
     /// parameters bound to caller slices (exact site widths), dynamic shape parameters,
@@ -321,6 +322,7 @@ impl<'a> Bound<'a> {
         let mut bound = Bound {
             definition,
             body,
+            allow_numerical_effects: family.allow_numerical_effects,
             constants: Arc::new(template.shapes.clone()),
             ranges: Arc::new(ranges),
             selected: selected_names,
@@ -481,6 +483,10 @@ impl<'a> Bound<'a> {
             return Err(SelectionError::AnalysisUnavailable(format!("`{}`: runtime range extent `{name}` selects from an axis of extent `{extent}` with no static upper bound", definition.name)));
         }
         Ok(bound)
+    }
+
+    pub fn allow_numerical_effects(&self) -> bool {
+        self.allow_numerical_effects
     }
 
     fn site(&self, slice: SliceId) -> Option<(SiteId, u64, bool)> {

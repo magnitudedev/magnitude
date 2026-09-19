@@ -4,12 +4,12 @@ Seismic is a language for **authored logical execution structure**. A kernel aut
 
 Every source file is named `<name>.seismic`. Filenames organize source but grant no target capabilities. Target restrictions follow from declarations and transitive dependencies (section 9). Indentation is significant (spaces only), `#` starts a comment, brackets suppress line breaks.
 
-Structural words are reserved everywhere and cannot be shadowed: `fn lower admit where for in if else and or not true false inf tile void let mut parallel ordered pipeline stage yield return merge publish`. The words `tensor view index out inout alias to identity` are contextual: ordinary names recognized only by position.
+Structural words are reserved everywhere and cannot be shadowed: `fn lower where for in if else and or not true false inf tile void let mut parallel ordered pipeline stage yield return merge publish`. The words `tensor view index out inout alias to identity` are contextual: ordinary names recognized only by position.
 
 ## 1. Declarations
 
 ```text
-[admit] fn name[Shape, ...](params) [-> result] [for target] [where predicate]:
+fn name[Shape, ...](params) [-> result] [for target] [where predicate]:
     body
 lower name[Shape, ...](params) [-> result] for target [where predicate]:
     body
@@ -28,13 +28,12 @@ fn row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32
     return result
 ```
 
-- **Implementation families.** Same-name portable definitions with compatible parameter structure are implementation alternatives wherever more than one applies. Disjoint definitions are legal. Overlapping definitions and lowerings must agree on result, modes, effects, ownership and numerical contract.
+- **Implementation families.** Same-name portable definitions with compatible parameter structure are implementation alternatives wherever more than one applies. The first applicable portable body is the reference computation. Disjoint definitions are legal. Overlapping definitions and lowerings must agree on result, modes, effects and ownership.
 - **Contract family.** A connected component of same-name overloads with overlapping applicability.
 - **Candidate selection.** For target `T`, a static call's candidates are all applicable portable bodies together with all applicable lowerings declared for `T`. Target lowerings do not hide or outrank portable bodies. Declaration order and predicate specificity do not choose a winner; the solver chooses among every complete candidate.
 - **Target coverage.** A lowering adds candidates only to its named target and creates no obligation for other targets. A portable body remains usable on every target that supports its complete dependency closure. Compilation fails only when no complete applicable implementation exists.
 - **Entry points.** Any linked function may be requested as a compilation root by the embedding API, manifest, CLI or test harness. Entry-point status is not source syntax. A name-only request must identify exactly one family; disjoint same-name families are an ambiguity error rather than a declaration-order choice.
 - **Target-specific functions.** A `fn ... for target` is available only to functions and lowerings for that target. It is not a lowering and cannot itself have lowerings.
-- **`admit`** marks a library-admitted numerical contract (section 8).
 - **Shape parameters** in `[...]` are semantic extents (`i32`, positive unless a `where` says otherwise). **Element parameters** are implicit: a capitalized name in element position that is not a dtype or representation (`T`, `A`, `GW`).
 - **`where` predicates**: conjunctions (`and`) of comparisons, `%` divisibility and equalities over shape parameters and integer literals, plus `full(X)` (R1 below). Nothing else.
 
@@ -119,7 +118,7 @@ merge (left, right) identity f32(0.0):
     yield left + right
 ```
 
-Canonical near-equal contiguous partition, adjacent pairs combined level by level, odd value forwarded. Empty domain gives `identity`; one part gives its partial. The partition count is the numerical site. Requires an admitted contract for the combination (section 8).
+Canonical near-equal contiguous partition, adjacent pairs combined level by level, odd value forwarded. Empty domain gives `identity`; one part gives its partial. The partition count is the numerical site. The numerical effect of the selected tree is assessed against the entry precision policy (section 8).
 
 ### Stages
 
@@ -158,7 +157,7 @@ Assigning a tile element (`t[i, j] = v`) or a whole tile rounds the value to the
 - `load(view)`: value snapshot in the view's representation. `decode(view)`: dense `f32` tile of a packed view. `zeros_like(v, dtype=f32)`, `ones_like`. `tile[shape] elem`: uninitialized local tile; every element must be assigned before it is read, yielded or published.
 - Indexing `t[a, b]`: point (scalar or index expression), slice binder, `:` (whole axis), `lo:hi` semantic range, tile coordinate. All points gives an element; otherwise a view. `t.T` transposes a rank-2 tile or view. `reshape(v, shape)` where element correspondence is provable.
 - A range `lo:hi` whose bounds are data-dependent is clamped to the axis at run time. Its extent is a runtime value: semantic, numerically usable, never a site. A helper may receive it as a runtime-valued shape parameter; an implementation whose `where` depends on such a parameter is inapplicable there. A data-dependent point index is bounds-checked at run time. Two ranges are the same runtime window when their bounds are the same values: bind a data-dependent bound once (`let lo = visible[row, 0]`) and use the binding in every range over it, so tiles over those windows share one extent and coordinates of one are provably coordinates of the other.
-- `reduce(tile, axis, sum|max|min|argmax)`: reduction along one axis of a dense tile. Over a semantic axis it accumulates in `f32` in ascending index order and is a complete value. Over a structural axis the result carries a partial obligation (section 8). `reduce(tile, axis, sum|max|min, unordered=true)` permits reassociation (a target may combine lane partials); it is legal only inside an `admit fn`, never for `argmax`, and the reference interpreter still accumulates in ascending order. A library offers such a permission as a separately named admitted contract with an ordered body and an unordered body (for example `sum_any_order`, `matmul_any_order`); callers opt in by calling it, and an authored alternative body of the caller keeps the exact contract selectable.
+- `reduce(tile, axis, sum|max|min|argmax)`: reduction along one axis of a dense tile. Over a semantic axis it accumulates in `f32` in ascending index order and is a complete value. Over a structural axis the result carries a partial obligation (section 8). `reduce(tile, axis, sum|max|min, unordered=true)` permits reassociation (a target may combine lane partials); it is legal in any function, never for `argmax`, and the reference interpreter still accumulates in ascending order. The containing implementation is selectable only when its composed numerical evidence satisfies the entry precision policy.
 - Math: `fma exp exp_fast rsqrt sqrt log sin cos abs max min`. On tiles they apply elementwise over identical axes, with scalar broadcast.
 - Calls `f(args, name=value)`; `f[R = 64](args)` binds a shape parameter the arguments do not determine. Named arguments bind declared parameters (`into=acc`).
 - `coord(i)`, `extent(v, axis)`.
@@ -177,11 +176,15 @@ Not yet supported in structured target code: `lanes` loops (participant distribu
 
 Units are formed per authored block; a statement calling a helper is one unit and the helper's body has its own units. Within a block, every single-consumer pure tile-valued `let` adjacent to its consumer is folded into it. The remaining statements of a block are its execution units: tile-valued bindings, state updates, calls, `publish`, and nested regions. The solver may group *contiguous* units for which the target supplies a legal fused realization. It never reorders, skips, duplicates or splits. Therefore: statement order of independent work is author-significant; naming a single-use expression is not; a multi-consumer `let` is one producer in every grouping.
 
-## 8. Numerical contracts
+## 8. Numerical precision and partial values
 
-Operation meaning (casts, FMA, accumulation dtype, publication rounding, reduction order) is exactly what the body says. Tuning may not change it. A value yielded from a region, or reduced over a structural axis, is **partial**: outside an `admit fn` it may only be forwarded, stored in results, combined by a `merge` clause, accumulated into `let mut` state by `+`, `max`, `min` inside a traversal of the same result, or passed to an `admit fn`. Inside an `admit fn` it is an ordinary value; the library author vouches that the combination is partition-independent under the intended numerical permission. Admission is a trust boundary, not a proof; inspection lists every admitted function on a selected path.
+The first applicable portable body defines the reference operation order, casts, FMA use, accumulation dtype and publication rounding. Other portable bodies and target lowerings are implementation candidates, not author assertions of equivalence. The compilation request supplies an exact or bounded output policy; the compiler accepts an alternative only with matching proven or whole-witness qualified evidence. Unconstrained exploration is explicit and produces an unqualified result. Kernel source contains no precision thresholds or fast-math permissions.
 
-Ordered accumulation into carried state across `ordered`/`pipeline` windows (for example `matmul(a, b, into=acc)`) preserves the element order of the whole traversal and needs no admission.
+`unordered=true`, `exp_fast`, target intrinsics, alternative bodies and lowerings are recorded as numerical effects. They do not grant themselves permission. Global backend fast-math flags remain disabled, and realization must reproduce the assessed witness.
+
+A value yielded from a region, or reduced over a structural axis, is **partial**. It may be forwarded, stored in results, combined by a `merge` clause, accumulated into `let mut` state by `+`, `max`, or `min` inside a traversal of the same result, or consumed while traversing that exact result partition. It cannot escape as a whole-domain value. This obligation is structural and never changes with numerical policy.
+
+Ordered accumulation into carried state across `ordered`/`pipeline` windows (for example `matmul(a, b, into=acc)`) preserves authored element order. Any alternative implementation is still assessed compositionally at the entry outputs.
 
 ## 9. Implementation and source rules
 

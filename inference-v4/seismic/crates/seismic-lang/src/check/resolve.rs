@@ -42,7 +42,6 @@ pub(crate) struct Declared<'a> {
     pub sig: Sig,
     pub kind: DefKind,
     pub family: usize,
-    pub admit: bool,
     pub elem_bindings: Vec<(String, Elem)>,
     pub body: &'a ast::Block,
     pub file: usize,
@@ -427,8 +426,8 @@ pub(crate) fn structures_overlap(a: &Sig, b: &Sig) -> bool {
             .all(|(p, q)| kinds_overlap(&p.ty, &q.ty))
 }
 
-/// Overlapping definitions agree on result, modes and numerical contract.
-fn contract_mismatch(a: &Sig, a_admit: bool, b: &Sig, b_admit: Option<bool>) -> Option<String> {
+/// Overlapping definitions agree on result, modes and shape/element relationships.
+fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
     if let Some((p, q)) = a
         .params
         .iter()
@@ -559,12 +558,6 @@ fn contract_mismatch(a: &Sig, a_admit: bool, b: &Sig, b_admit: Option<bool>) -> 
             a.name, a.result, b.result
         ));
     }
-    if b_admit.is_some_and(|b_admit| b_admit != a_admit) {
-        return Some(format!(
-            "overlapping definitions of `{}` must agree on `admit`",
-            a.name
-        ));
-    }
     None
 }
 
@@ -624,7 +617,6 @@ pub(crate) fn resolve<'a>(
                             target: f.target.as_ref().map(|t| t.name.clone()),
                         },
                         family: 0,
-                        admit: f.admit,
                         elem_bindings: Vec::new(),
                         body: &f.body,
                         file: *file,
@@ -665,12 +657,7 @@ pub(crate) fn resolve<'a>(
                     ),
                 });
             }
-            if let Some(message) = contract_mismatch(
-                &declared[j].sig,
-                declared[j].admit,
-                &declared[i].sig,
-                Some(declared[i].admit),
-            ) {
+            if let Some(message) = contract_mismatch(&declared[j].sig, &declared[i].sig) {
                 diagnostics.push(Located {
                     file: declared[i].file,
                     diagnostic: Diagnostic::new(declared[i].name_span, message),
@@ -762,7 +749,7 @@ pub(crate) fn resolve<'a>(
                         [] => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("no definition of `{}` has this parameter structure (kinds, ranks, element types); a lowering restates the contract it implements", l.name.name)) }),
                         [(family, member)] => {
                             let contract = &declared[*member];
-                            if let Some(message) = contract_mismatch(&contract.sig, contract.admit, &sig, None) {
+                            if let Some(message) = contract_mismatch(&contract.sig, &sig) {
                                 diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, message) });
                             }
                             let bindings = elem_bindings(&contract.sig, &sig);
@@ -779,7 +766,6 @@ pub(crate) fn resolve<'a>(
                     sig,
                     kind: kind.clone(),
                     family,
-                    admit: false,
                     elem_bindings,
                     body,
                     file: *file,
@@ -787,13 +773,6 @@ pub(crate) fn resolve<'a>(
                     name_span: l.name.span,
                 });
             }
-        }
-    }
-    // A lowering inherits the admitted contract of the family it implements.
-    for i in 0..declared.len() {
-        if matches!(declared[i].kind, DefKind::Lower { .. }) {
-            let family = &families[declared[i].family];
-            declared[i].admit = family.bodies.iter().any(|id| declared[id.0 as usize].admit);
         }
     }
     Resolved {
