@@ -12,3 +12,4 @@ cranelift-frontend = "=0.125.4"
 seismic-realization.workspace = true
 
 seismic-accounting.workspace = true
+magnitude-solver = { path = "../../../solver" }

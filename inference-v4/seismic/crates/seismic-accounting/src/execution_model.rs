@@ -11,6 +11,9 @@
 //! current finite-instance derivation is bounded by an explicit caller budget;
 //! it never truncates an execution and calls the truncated graph complete.
 use crate::schedule::{Model, Operation, Resource, Timebase};
+use crate::affine::Affine;
+mod domains;
+pub mod family;
 use crate::workload::{DerivationError, DerivationLimit, DerivationLimits, ScalarWorkload};
 use cranelift_codegen::ir::{
     self, Block, BlockCall, Inst, InstructionData as Data, Opcode, Type, Value,
@@ -153,7 +156,7 @@ pub struct Access {
     pub instruction: Inst,
     pub occurrence: u64,
     pub allocation: AllocationIdentity,
-    pub offset: u64,
+    pub offset: Affine,
     pub bytes: u32,
     pub write: bool,
     pub completion: usize,
@@ -469,29 +472,96 @@ pub fn derive_scalar(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Datum {
     Bits(u64),
+    Integer(Affine),
+    Parameter(usize),
+    Conditional { parameter: usize, yes: Box<Datum>, no: Box<Datum> },
+    Uninitialized,
     Pointer {
         allocation: AllocationIdentity,
-        offset: i64,
+        offset: Affine,
     },
     Unknown,
+}
+impl Datum {
+    fn initialized(&self) -> bool {
+        match self {
+            Self::Uninitialized => false,
+            Self::Conditional { yes, no, .. } => yes.initialized() && no.initialized(),
+            _ => true,
+        }
+    }
+    fn parameter(&self) -> Option<usize> {
+        match self {
+            Self::Parameter(parameter) | Self::Conditional { parameter, .. } => Some(*parameter),
+            _ => None,
+        }
+    }
+    fn bits(&self) -> Option<u64> {
+        match self { Self::Bits(value) => Some(*value), Self::Integer(value) => value.exact().map(|n| n as u64), _ => None }
+    }
+    fn resolve(&self, guard: &BTreeMap<usize, bool>) -> Self {
+        match self {
+            Self::Parameter(parameter) => guard.get(parameter).map_or_else(|| self.clone(), |value| Self::Bits(u64::from(*value))),
+            Self::Conditional { parameter, yes, no } => match guard.get(parameter) {
+                Some(true) => yes.resolve(guard), Some(false) => no.resolve(guard),
+                None => { let yes = yes.resolve(guard); let no = no.resolve(guard);
+                    if yes == no { yes } else { Self::Conditional { parameter:*parameter, yes:Box::new(yes), no:Box::new(no) } } }
+            },
+            _ => self.clone(),
+        }
+    }
+    fn select(parameter: usize, yes: Self, no: Self) -> Self {
+        if yes == no { yes } else { Self::Conditional { parameter, yes:Box::new(yes), no:Box::new(no) } }
+    }
+    fn byte(&self,index:u32)->Self {
+        match self {
+            Self::Bits(value)=>Self::Bits((value>>(index*8))&255),
+            Self::Integer(value)=>value.quotient(1u64<<(index*8)).and_then(|value|value.remainder(256)).map_or(Self::Unknown,Self::Integer),
+            Self::Parameter(parameter)=>if index==0 {Self::Parameter(*parameter)} else {Self::Bits(0)},
+            Self::Conditional {parameter,yes,no}=>Self::select(*parameter,yes.byte(index),no.byte(index)),
+            Self::Uninitialized=>Self::Uninitialized,
+            _=>Self::Unknown,
+        }
+    }
+    fn little_endian(bytes:&[Self])->Self {
+        if let Some(parameter)=bytes.iter().filter_map(Self::parameter).min() {
+            let select=|value| {
+                let guard=BTreeMap::from([(parameter,value)]);
+                Self::little_endian(&bytes.iter().map(|byte|byte.resolve(&guard)).collect::<Vec<_>>())
+            };
+            return Self::select(parameter,select(true),select(false));
+        }
+        if bytes.iter().any(|byte|matches!(byte,Self::Uninitialized)) {return Self::Uninitialized;}
+        let value=bytes.iter().enumerate().try_fold(Affine::constant(0),|sum,(index,byte)|sum.add(&byte.integer(types::I8,false)?.scale(1i128<<(index*8))?));
+        value.map_or(Self::Unknown,|value|value.exact().map_or_else(||Self::Integer(value.clone()),|value|Self::Bits(value as u64)))
+    }
+    fn integer(&self, ty: Type, signed: bool) -> Option<Affine> {
+        seismic_realization::integer::mask(ty)?;
+        match self {
+            Self::Bits(value) => Some(Affine::constant(if signed {
+                i128::from(seismic_realization::integer::signed(*value, ty)?)
+            } else { i128::from(seismic_realization::integer::unsigned(*value, ty)?) })),
+            Self::Integer(value) => value.interpreted(ty.bits(), signed),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 struct Binding {
     datum: Datum,
     ready: Vec<usize>,
 }
+#[derive(Clone)]
 struct Memory {
     capacities: BTreeMap<AllocationIdentity, u64>,
     bytes: BTreeMap<(AllocationIdentity, u64), Option<u8>>,
     pointers: Vec<Datum>,
+    symbolic: BTreeMap<(AllocationIdentity, Affine, u32), Datum>,
     scratch_bytes: u64,
 }
 impl Memory {
     fn new(program: &ScalarProgram, workload: &ScalarWorkload) -> Result<Self, String> {
         workload.validate()?;
-        if !workload.integer_domains.is_empty() {
-            return Err("scalar accounting does not yet support varying integer input domains".into());
-        }
         if workload.identity.is_empty() {
             return Err("scalar workload requires an identity".into());
         }
@@ -544,8 +614,7 @@ impl Memory {
             }
             pointers.push(Datum::Pointer {
                 allocation: AllocationIdentity::External(binding.allocation),
-                offset: i64::try_from(binding.offset)
-                    .map_err(|_| "buffer offset exceeds scalar address range")?,
+                offset: binding.offset.into(),
             });
         }
         capacities.insert(
@@ -558,99 +627,94 @@ impl Memory {
         for (i, &byte) in workload.scalars.iter().enumerate() {
             bytes.insert((AllocationIdentity::Scalars, i as u64), Some(byte));
         }
-        Ok(Self {
-            capacities,
-            bytes,
-            pointers,
-            scratch_bytes: program.scratch_bytes as u64,
-        })
+        let mut symbolic = BTreeMap::new();
+        for domain in &workload.integer_domains {
+            let (allocation, offset) = match domain.input {
+                crate::workload::IntegerInput::Scalar { slot } =>
+                    (AllocationIdentity::Scalars, (slot as u64).checked_mul(8).ok_or("scalar domain ABI overflow")?),
+                crate::workload::IntegerInput::Allocation { allocation, offset } =>
+                    (AllocationIdentity::External(allocation), offset),
+            };
+            let value = Affine::domain(domain.input, domain.range).ok_or("integer input domain exceeds exact arithmetic")?;
+            for byte in offset..offset + u64::from(domain.bytes) {
+                // Canonical ABI bytes do not establish an exact runtime value.
+                bytes.remove(&(allocation.clone(), byte));
+            }
+            symbolic.insert((allocation, offset.into(), u32::from(domain.bytes)), Datum::Integer(value));
+        }
+        Ok(Self { capacities, bytes, pointers, symbolic, scratch_bytes: program.scratch_bytes as u64 })
     }
     fn address(
-        &self,
-        datum: &Datum,
-        displacement: i32,
-        width: u32,
-    ) -> Result<(AllocationIdentity, u64), String> {
+        &self, datum: &Datum, displacement: i32, width: u32,
+    ) -> Result<(AllocationIdentity, Affine), DerivationError> {
         let Datum::Pointer { allocation, offset } = datum else {
-            return Err("memory address depends on an unresolved workload value".into());
+            return Err(DerivationError::Unsupported("memory address has unresolved allocation provenance".into()));
         };
-        let offset = offset
-            .checked_add(i64::from(displacement))
+        let offset = offset.add(&Affine::constant(i128::from(displacement)))
             .ok_or("memory address overflow")?;
-        let offset = u64::try_from(offset).map_err(|_| "negative scalar memory address")?;
-        let capacity = self
-            .capacities
-            .get(allocation)
-            .ok_or("unknown scalar allocation")?;
-        if offset
-            .checked_add(u64::from(width))
-            .is_none_or(|end| end > *capacity)
-        {
-            return Err("scalar workload executes an out-of-bounds access".into());
+        let (lo, hi) = offset.bounds().ok_or("memory address range overflow")?;
+        let capacity = *self.capacities.get(allocation).ok_or("unknown scalar allocation")?;
+        if lo < 0 || hi.checked_add(i128::from(width)).is_none_or(|end| end > i128::from(capacity)) {
+            return Err(DerivationError::Unsupported("the whole scalar workload domain does not establish an in-bounds access".into()));
         }
         Ok((allocation.clone(), offset))
     }
-    fn load(
-        &self,
-        allocation: &AllocationIdentity,
-        offset: u64,
-        width: u32,
-    ) -> Result<Datum, String> {
-        if *allocation == AllocationIdentity::BufferTable {
-            if width != 8 || !offset.is_multiple_of(8) {
-                return Err("invalid scalar buffer-table access".into());
-            }
-            return self
-                .pointers
-                .get((offset / 8) as usize)
-                .cloned()
-                .ok_or("buffer-table index out of bounds".into());
+    fn load(&self, allocation: &AllocationIdentity, offset: &Affine, width: u32) -> Result<Datum, DerivationError> {
+        let value=self.read(allocation,offset,width)?;
+        if !value.initialized() {
+            return Err(DerivationError::Unsupported("private scratch initialization is not established".into()));
         }
-        let mut result = 0;
-        let mut known = true;
-        for i in 0..width {
-            match self.bytes.get(&(allocation.clone(), offset + u64::from(i))) {
-                Some(Some(byte)) => result |= u64::from(*byte) << (8 * i),
-                Some(None) => known = false,
-                None if matches!(allocation, AllocationIdentity::Scratch(_)) => {
-                    return Err("scalar execution reads uninitialized private scratch".into());
-                }
-                None => known = false,
-            }
-        }
-        Ok(if known {
-            Datum::Bits(result)
-        } else {
-            Datum::Unknown
-        })
+        Ok(value)
     }
-    fn store(
-        &mut self,
-        allocation: &AllocationIdentity,
-        offset: u64,
-        width: u32,
-        datum: &Datum,
-    ) -> Result<(), String> {
-        if matches!(
-            allocation,
-            AllocationIdentity::BufferTable | AllocationIdentity::Scalars
-        ) {
+    fn read(&self, allocation: &AllocationIdentity, offset: &Affine, width: u32) -> Result<Datum, DerivationError> {
+        if *allocation == AllocationIdentity::BufferTable {
+            let offset = offset.exact().and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| DerivationError::Unsupported("buffer-table slot varies across the scalar workload domain".into()))?;
+            if width != 8 || !offset.is_multiple_of(8) { return Err("invalid scalar buffer-table access".into()); }
+            return self.pointers.get((offset / 8) as usize).cloned().ok_or_else(|| "buffer-table index out of bounds".into());
+        }
+        if let Some(value) = self.symbolic.get(&(allocation.clone(), offset.clone(), width)) {
+            return Ok(value.clone());
+        }
+        if width>8 {return Err("scalar memory value exceeds the admitted integer width".into());}
+        let mut bytes=Vec::new();
+        for index in 0..width {
+            let at=offset.add(&Affine::constant(i128::from(index))).ok_or("scalar byte address overflow")?;
+            let cell=self.symbolic.iter().find_map(|((object,start,length),value)| {
+                if object!=allocation {return None;}
+                let index=at.sub(start)?.exact().and_then(|index|u32::try_from(index).ok())?;
+                (index<*length).then(||value.byte(index))
+            });
+            if let Some(byte)=cell {bytes.push(byte);continue;}
+            let byte=at.exact().and_then(|at|u64::try_from(at).ok()).and_then(|at|self.bytes.get(&(allocation.clone(),at)));
+            bytes.push(match byte {
+                Some(Some(byte))=>Datum::Bits(u64::from(*byte)),
+                Some(None)=>Datum::Unknown,
+                None if matches!(allocation,AllocationIdentity::Scratch(_))=>Datum::Uninitialized,
+                None=>Datum::Unknown,
+            });
+        }
+        Ok(Datum::little_endian(&bytes))
+    }
+    fn store(&mut self, allocation: &AllocationIdentity, offset: &Affine, width: u32, datum: &Datum) -> Result<(), String> {
+        if matches!(allocation, AllocationIdentity::BufferTable | AllocationIdentity::Scalars) {
             return Err("scalar execution mutates a read-only ABI allocation".into());
         }
-        if matches!(datum, Datum::Pointer { .. }) {
-            return Err("scalar data store cannot publish an ABI pointer".into());
+        if matches!(datum, Datum::Pointer { .. }) { return Err("scalar data store cannot publish an ABI pointer".into()); }
+        self.bytes.retain(|(object, at), _| object != allocation || offset.disjoint(u64::from(width), &(*at).into(), 1) == Some(true));
+        self.symbolic.retain(|(object, at, bytes), _| object != allocation || offset.disjoint(u64::from(width), at, u64::from(*bytes)) == Some(true));
+        if let Some(offset) = offset.exact().and_then(|n| u64::try_from(n).ok()) {
+            for i in 0..width {
+                let byte = datum.bits().map(|bits| (bits >> (8 * i)) as u8);
+                self.bytes.insert((allocation.clone(), offset + u64::from(i)), byte);
+            }
         }
-        for i in 0..width {
-            let byte = if let Datum::Bits(bits) = datum {
-                Some((bits >> (8 * i)) as u8)
-            } else {
-                None
-            };
-            self.bytes
-                .insert((allocation.clone(), offset + u64::from(i)), byte);
-        }
+        // Unknown is retained too: a same-address reload has established
+        // initialization even when the data value is intentionally abstract.
+        self.symbolic.insert((allocation.clone(), offset.clone(), width), datum.clone());
         Ok(())
     }
+
 }
 
 struct Derivation<'a> {
@@ -747,7 +811,7 @@ impl Derivation<'_> {
                 Binding {
                     datum: Datum::Pointer {
                         allocation,
-                        offset: 0,
+                        offset: 0u64.into(),
                     },
                     ready: Vec::new(),
                 },
@@ -824,15 +888,12 @@ impl Derivation<'_> {
                         self.memory
                             .address(&address.datum, access.offset, access.bytes)?;
                     for before in &self.output.accesses {
-                        if before.allocation == allocation
-                            && (before.write || access.write)
-                            && before.offset < offset + u64::from(access.bytes)
-                            && offset < before.offset + u64::from(before.bytes)
-                        {
-                            if before.invocation != invocation {
-                                return Err("parallel scalar invocations have conflicting aliased accesses; this direct form has no inter-invocation ordering".into());
-                            }
-                            dependencies.insert(before.completion);
+                        if before.allocation != allocation || !(before.write || access.write) { continue; }
+                        match offset.disjoint(u64::from(access.bytes), &before.offset, u64::from(before.bytes)) {
+                            Some(true) => {},
+                            Some(false) if before.invocation == invocation => { dependencies.insert(before.completion); },
+                            Some(false) => return Err("parallel scalar invocations have conflicting aliased accesses; this direct form has no inter-invocation ordering".into()),
+                            None => return Err(DerivationError::Unsupported("scalar memory dependence varies across the declared workload domain".into())),
                         }
                     }
                     memory = Some((allocation, offset, access.bytes, access.write));
@@ -855,10 +916,10 @@ impl Derivation<'_> {
                 let datum = if let Some((allocation, offset, width, write)) = memory {
                     let datum = if write {
                         self.memory
-                            .store(&allocation, offset, width, &inputs[0].datum)?;
+                            .store(&allocation, &offset, width, &inputs[0].datum)?;
                         Datum::Unknown
                     } else {
-                        self.memory.load(&allocation, offset, width)?
+                        self.memory.load(&allocation, &offset, width)?
                     };
                     self.output.accesses.push(Access {
                         invocation,
@@ -895,12 +956,11 @@ impl Derivation<'_> {
                         break;
                     }
                     Data::Brif { blocks, .. } => {
-                        let Datum::Bits(condition) = inputs[0].datum else {
-                            return Err(format!(
+                        let Some(condition) = inputs[0].datum.bits() else {
+                            return Err(DerivationError::Unsupported(format!(
                                 "{}: workload does not determine a data-dependent branch",
                                 instruction.id
-                            )
-                            .into());
+                            )));
                         };
                         edge = Some((
                             blocks[usize::from(condition == 0)],
@@ -914,7 +974,7 @@ impl Derivation<'_> {
                         opcode: Opcode::Return,
                         ..
                     } => {
-                        if inputs.len() != 1 || inputs[0].datum != Datum::Bits(0) {
+                        if inputs.len() != 1 || inputs[0].datum.bits() != Some(0) {
                             return Err(
                                 "workload does not complete the scalar kernel successfully".into(),
                             );
@@ -1029,7 +1089,20 @@ impl Derivation<'_> {
 /// Propagation is only for workload/control specialization. Unknown tensor data
 /// stays unknown while its actual operation remains in the analysis. Missing
 /// timing remains explicit. Known-value propagation never removes instructions.
-fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, String> {
+fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, DerivationError> {
+    // A value crossing a choice join retains its original selector. Propagate
+    // through this instruction only, sharing the rest of the continuation.
+    if let Some(parameter) = inputs.iter().filter_map(|value| value.parameter()).min() {
+        let branch = |selected| -> Result<Datum, DerivationError> {
+            let guard = BTreeMap::from([(parameter, selected)]);
+            let values = inputs.iter().map(|value| value.resolve(&guard)).collect::<Vec<_>>();
+            evaluate(instruction, &values.iter().collect::<Vec<_>>())
+        };
+        return Ok(Datum::select(parameter, branch(true)?, branch(false)?));
+    }
+    if inputs.iter().any(|value| matches!(value, Datum::Uninitialized)) {
+        return Ok(Datum::Uninitialized);
+    }
     use Opcode as O;
     let op = instruction.opcode;
     let output = instruction
@@ -1037,14 +1110,8 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
         .first()
         .map(|(_, ty)| *ty)
         .unwrap_or(types::I64);
-    let bits = |v: &Datum| {
-        if let Datum::Bits(bits) = v {
-            Some(*bits)
-        } else {
-            None
-        }
-    };
-    let known = |value: u64| -> Result<Datum, String> {
+    let bits = Datum::bits;
+    let known = |value: u64| -> Result<Datum, DerivationError> {
         let bits_type = if output == types::F32 {
             types::I32
         } else {
@@ -1052,7 +1119,7 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
         };
         seismic_realization::integer::unsigned(value, bits_type)
             .map(Datum::Bits)
-            .ok_or_else(|| format!("unsupported scalar bit width: {output}"))
+            .ok_or_else(|| format!("unsupported scalar bit width: {output}").into())
     };
     match instruction.encoding {
         Data::UnaryIeee32 { imm, .. } => return known(u64::from(imm.bits())),
@@ -1104,13 +1171,11 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
         .or_else(|| inputs.get(1).map(|x| (*x).clone()));
     if matches!(op, O::Iadd | O::IaddImm) {
         let add = |pointer: &Datum, delta: &Datum| -> Result<Option<Datum>, String> {
-            if let (Datum::Pointer { allocation, offset }, Datum::Bits(delta)) = (pointer, delta) {
-                return Ok(Some(Datum::Pointer {
-                    allocation: allocation.clone(),
-                    offset: offset
-                        .checked_add(*delta as i64)
-                        .ok_or("scalar pointer overflow")?,
-                }));
+            if let Datum::Pointer { allocation, offset } = pointer {
+                if let Some(delta) = delta.integer(types::I64, true) {
+                    return Ok(Some(Datum::Pointer { allocation: allocation.clone(),
+                        offset: offset.add(&delta).ok_or("scalar pointer overflow")? }));
+                }
             }
             Ok(None)
         };
@@ -1123,6 +1188,9 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
     if op == O::Bitcast {
         return Ok(a.clone());
     }
+    if inputs.iter().any(|value| matches!(value, Datum::Integer(_))) {
+        if let Some(value) = domains::evaluate(instruction, inputs)? { return Ok(value); }
+    }
     match seismic_realization::integer::evaluate(&instruction.encoding, output, |index| {
         let input = instruction.inputs.get(index)?;
         Some((input.ty, inputs.get(index).and_then(|value| bits(value))))
@@ -1132,7 +1200,7 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
             return Ok(Datum::Unknown);
         }
         seismic_realization::integer::Evaluation::Unknown { may_trap: true } => {
-            return Err("workload does not establish the integer operation's validity".into());
+            return Err(DerivationError::Unsupported("workload does not establish the integer operation's validity".into()));
         }
         seismic_realization::integer::Evaluation::Trap(trap) => {
             return Err(match trap {
@@ -1184,7 +1252,5 @@ fn evaluate(instruction: &Instruction, inputs: &[&Datum]) -> Result<Datum, Strin
     ) {
         return Ok(Datum::Unknown);
     }
-    Err(format!(
-        "scalar value propagation lacks admitted opcode {op}"
-    ))
+    Err(format!("scalar value propagation lacks admitted opcode {op}").into())
 }

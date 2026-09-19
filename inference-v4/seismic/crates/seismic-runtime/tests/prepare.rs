@@ -1,6 +1,11 @@
-use seismic_lang::{program::{compile, SourceFile}, Scope};
-use seismic_realization::{Dispatch, LoadStrategy, ScalarOptions};
-use seismic_runtime::{Candidate, DeviceFacts, execution::Execution};
+use seismic_accounting::selection::IntegerRange;
+use seismic_compiler::tuner::Preparation;
+use seismic_cuda::tuning::{self, BlockChoice};
+use seismic_lang::{
+    program::{compile, SourceFile},
+    Scope,
+};
+use seismic_runtime::DeviceFacts;
 use std::collections::HashMap;
 
 fn phases() -> seismic_lang::lowered_ir::LoweredIr {
@@ -16,32 +21,67 @@ fn facts() -> DeviceFacts {
     // Pure preparation requires no driver. These explicit capacity facts make the
     // second phase's minimum block width different from the first phase's.
     DeviceFacts::Cuda(seismic_cuda::DeviceInfo {
-        name: "preparation fixture".into(), compute_capability: (8, 0), driver_version: 0,
-        max_threads_per_block: 64, max_grid_x: 4, warp_size: 32, multiprocessors: 2,
-        global_memory_bytes: 1 << 20, l2_cache_bytes: 0,
-        max_threads_per_multiprocessor: 128, registers_32bit_per_multiprocessor: 65536,
+        name: "preparation fixture".into(),
+        compute_capability: (8, 0),
+        driver_version: 0,
+        max_threads_per_block: 64,
+        max_grid_x: 4,
+        warp_size: 32,
+        multiprocessors: 2,
+        global_memory_bytes: 1 << 20,
+        l2_cache_bytes: 0,
+        max_threads_per_multiprocessor: 128,
+        registers_32bit_per_multiprocessor: 65536,
         shared_bytes_per_multiprocessor: 65536,
     })
 }
 
-fn candidate(threads_per_block: u32) -> Candidate {
-    Candidate::Cuda {
-        options: ScalarOptions { dispatch: Dispatch::ParallelRoot, loads: LoadStrategy::Materialize },
-        threads_per_block,
-    }
-}
-
 #[test]
-fn explicit_cuda_candidate_obeys_every_phase_choice_domain() {
+fn cuda_phase_family_establishes_each_dispatch_domain_before_selection() {
     let lowered = phases();
-    let facts = facts();
-    let Execution::Cuda(phases) = Execution::prepare(&lowered, candidate(32), &facts).unwrap() else { panic!("expected CUDA phases") };
-    assert_eq!(phases.len(), 2);
-    assert_eq!(phases.iter().map(|p| p.dispatch().threads_per_group).collect::<Vec<_>>(), [32, 32]);
-    assert_eq!(phases.iter().map(|p| p.dispatch().groups).collect::<Vec<_>>(), [1, 3]);
-    assert!(matches!(Execution::prepare(&lowered, candidate(16), &facts), Err(e) if e.contains("phase 1")));
-    assert!(Execution::prepare(&lowered, candidate(0), &facts).is_err());
-    assert!(Execution::prepare(&lowered, candidate(65), &facts).is_err());
-    let wrong = DeviceFacts::Cpu { architecture: std::env::consts::ARCH, operating_system: std::env::consts::OS };
-    assert!(Execution::prepare(&lowered, candidate(32), &wrong).is_err());
+    let DeviceFacts::Cuda(device) = facts() else {
+        unreachable!()
+    };
+    // Inspect the parallel execution family that automatic selection consumes.
+    // This test constructs no executable and does not bypass the runtime gate.
+    let Preparation::Choice { alternatives, .. } =
+        tuning::prepare(&lowered, &device, &[1]).unwrap()
+    else {
+        panic!("expected unresolved phase dimensions")
+    };
+    let family = alternatives
+        .owner::<IntegerRange<BlockChoice>>()
+        .unwrap()
+        .decision
+        .family();
+    assert_eq!(family.phase_count(), 2);
+    assert_eq!(family.block_interval(0).unwrap(), 2..=64);
+    assert_eq!(family.block_interval(1).unwrap(), 17..=64);
+    assert!(!family.block_interval(1).unwrap().contains(&16));
+    let Preparation::Execution(phases) =
+        tuning::prepare(&lowered, &device, &[1, 32 - 2, 32 - 17]).unwrap()
+    else {
+        panic!("expected fully selected phase geometry")
+    };
+    assert_eq!(
+        phases
+            .iter()
+            .map(|p| p.dispatch().threads_per_group)
+            .collect::<Vec<_>>(),
+        [32, 32]
+    );
+    assert_eq!(
+        phases
+            .iter()
+            .map(|p| p.dispatch().groups)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert!(tuning::prepare(&lowered, &device, &[1, 65 - 2]).is_err());
+    let mut invalid = device;
+    invalid.max_threads_per_block = 0;
+    assert!(tuning::prepare(&lowered, &invalid, &[]).is_err());
+    let mut wrong_backend = lowered;
+    wrong_backend.backend = "cpu".into();
+    assert!(tuning::prepare(&wrong_backend, &invalid, &[]).is_err());
 }

@@ -11,10 +11,9 @@ mod execution;
 mod access;
 mod memory;
 pub use access::AccessPattern;
-pub(crate) use execution::dispatch_demand;
+pub(crate) use execution::{grouping_traces, GroupingTraces};
 pub use execution::{execution, structured_execution, requirements, Hardware, Requirements, Service, Timing, Units};
-pub use execution::{invocation_account, invocation_relaxation, InvocationAccount, OperationCount};
-pub(crate) use execution::{include_preserved_demand, relaxed_demand};
+pub use execution::{invocation_account, InvocationAccount, OperationCount};
 
 #[derive(Clone, Debug)]
 pub struct LaunchStorage {

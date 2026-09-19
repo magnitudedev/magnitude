@@ -932,6 +932,15 @@ impl<'a> Interpreter<'a> {
                     other => return Err(format!("extent of {other:?}")),
                 }))
             }
+            Builtin::Select => {
+                let [condition, yes, no] = args else { return Err("eager value selection arity".into()); };
+                let Value::Bool(condition) = self.expr(condition, frame)? else {
+                    return Err("eager value selection requires a bool condition".into());
+                };
+                let yes = self.expr(yes, frame)?;
+                let no = self.expr(no, frame)?;
+                Ok(if condition { yes } else { no })
+            }
             Builtin::Fma => {
                 let d = scalar_dtype(&args[0].ty);
                 let a = self.scalar(&args[0], frame)?;

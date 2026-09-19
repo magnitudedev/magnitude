@@ -461,7 +461,7 @@ impl LaunchRecipe {
     ) -> Result<LaunchProgram, String> {
         use LaunchOperation as O;
         use LaunchValue as V;
-        if self.mapping.work_items().checked_mul(self.parts) != Some(dispatch.work_items) {
+        if dispatch.work_items != 0 && self.mapping.work_items().checked_mul(self.parts) != Some(dispatch.work_items) {
             return Err("launch recipe and dispatch describe different work domains".into());
         }
         let uint = |n| {

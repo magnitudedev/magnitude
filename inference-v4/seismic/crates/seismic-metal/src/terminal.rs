@@ -10,10 +10,11 @@ use std::fmt;
 mod simplify;
 pub(crate) mod synchronize;
 pub(crate) mod helper;
-mod rewrite;
+pub(crate) mod rewrite;
 mod validate;
 pub mod traversal;
 pub mod transfer;
+pub(crate) mod family;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -157,6 +158,9 @@ pub enum Expression {
     Cast(Type, Box<Expression>),
     Builtin(String, Vec<Expression>, Type),
     Select(Box<Expression>, Box<Expression>, Box<Expression>),
+    /// Eager scalar value selection: condition and both values execute with
+    /// identical participation. An unknown condition changes only the value.
+    EagerSelect(Box<Expression>, Box<Expression>, Box<Expression>),
     ShortCircuit {
         or: bool,
         left: Box<Expression>,
@@ -186,7 +190,7 @@ impl Expression {
             | Self::Helper(_, _, t)
             | Self::Unmapped(_, t) => *t,
             Self::Read { ty, .. } | Self::Parameter { ty, .. } | Self::VectorElement { ty, .. } => *ty,
-            Self::Select(_, a, _) => a.ty(),
+            Self::Select(_, a, _) | Self::EagerSelect(_, a, _) => a.ty(),
             Self::ShortCircuit { .. } => Type::Bool,
             Self::Bitcast(t, _) => *t,
         }
@@ -273,6 +277,7 @@ impl Expression {
                 format!("({left} {} {right})", if *or { "||" } else { "&&" })
             }
             Self::Select(c, a, b) => format!("({c} ? {a} : {b})"),
+            Self::EagerSelect(c, a, b) => format!("seismic_value_select({c}, {a}, {b})"),
             Self::Bitcast(t, e) => format!("as_type<{}>({e})", t.metal()),
             Self::Builtin(name, args, _) => format!(
                 "{name}({})",
@@ -293,6 +298,10 @@ impl Expression {
         }
     }
 }
+/// By-value arguments establish eager evaluation for every admitted scalar
+/// type, including bool and bfloat, without relying on Metal select overloads.
+pub(crate) const VALUE_SELECTION_SUPPORT: &str =
+    "template<typename T> inline T seismic_value_select(bool condition, T yes, T no) { return condition ? yes : no; }\n\n";
 impl fmt::Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.render())
@@ -465,6 +474,9 @@ impl Program {
     /// Missing hardware analysis is a separate accounting result, never opaque text.
     pub fn validate_typed(&self) -> Result<(), String> {
         validate::program(self)
+    }
+    pub(crate) fn validate_template(&self) -> Result<(), String> {
+        validate::template(self)
     }
     pub(crate) fn realize_launch(&mut self, index: usize) {
         simplify::launch(&mut self.launches[index]);

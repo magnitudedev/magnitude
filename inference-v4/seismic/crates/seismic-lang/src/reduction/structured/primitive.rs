@@ -94,7 +94,7 @@ pub fn retain(
     *body = result;
     Ok(())
 }
-fn expand(
+pub(crate) fn expand(
     source: &Expr,
     target: &Expr,
     c: Contract,
@@ -382,18 +382,22 @@ fn implementation(b: &mut Builder<'_>, state: &[Expr], c: Contract) -> Merge {
             } else {
                 binary(BinaryOp::Gt, z, a, DType::Bool, span)
             };
-            vec![stmt(
-                StmtKind::If {
-                    cond,
-                    then: (0..2)
-                        .map(|i| assign(i, point(&right[i], &coordinates, span)))
-                        .collect(),
-                    els: (0..2)
-                        .map(|i| assign(i, point(&left[i], &coordinates, span)))
-                        .collect(),
-                },
-                span,
-            )]
+            // Strict improvement retains the earlier index on ties and ignores
+            // unordered floating comparisons exactly as the reference fold.
+            // Both fields observe one comparison before either is published.
+            let choose_right = b.local(Ty::Scalar(DType::Bool));
+            let mut body = vec![stmt(StmtKind::Assign {
+                target: choose_right.clone(), op: AssignOp::Assign, value: cond,
+            }, span)];
+            body.extend((0..2).map(|field| {
+                let yes = point(&right[field], &coordinates, span);
+                let no = point(&left[field], &coordinates, span);
+                assign(field, Expr {
+                    ty: yes.ty.clone(), sym: None, span,
+                    kind: ExprKind::Builtin { name: Builtin::Select, args: vec![choose_right.clone(), yes, no] },
+                })
+            }));
+            body
         }
     };
     Merge {

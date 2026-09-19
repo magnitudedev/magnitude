@@ -1,10 +1,10 @@
 use seismic_lang::{
-    lower::lower,
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
-use std::collections::HashMap;
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 const SOURCE: &str = "
 fn truth(a: bool, b: bool, out: tensor[2] f32):
   for row in parallel:
@@ -32,7 +32,7 @@ fn eager_or(a: bool, source: tensor[1] f32, which: i32, out: tensor[1] f32):
       else: y[i] = 0.0
     store(y,out[row:row+1])
 ";
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let program = compile(
         &[SourceFile {
             path: "boolean.seismic.portable".into(),
@@ -42,15 +42,23 @@ fn exercise(device: Device, candidate: Candidate) {
         &[],
     )
     .unwrap();
-    let mut kernel = device
-        .compile(
-            &lower(&program, "truth", device.backend(), &HashMap::new()).unwrap(),
-            candidate.clone(),
-        )
-        .unwrap();
+    let input = seismic_runtime::tuner::Input::Portable {
+        program: &program,
+        entry: "truth",
+        shapes: &Default::default(),
+        elements: &Default::default(),
+        options: &Default::default(),
+    };
     let out = device.buffer(8).unwrap();
     for a in [false, true] {
         for b in [false, true] {
+            let mut kernel = automatic_hardware::compile(
+                &device,
+                input,
+                std::slice::from_ref(&out),
+                &[f64::from(a), f64::from(b)],
+            )
+            .unwrap();
             kernel
                 .execute(std::slice::from_ref(&out), &[f64::from(a), f64::from(b)])
                 .unwrap();
@@ -68,12 +76,21 @@ fn exercise(device: Device, candidate: Candidate) {
     }
     let source = device.buffer_from(&1f32.to_le_bytes()).unwrap();
     for (name, a) in [("eager_and", false), ("eager_or", true)] {
-        let mut kernel = device
-            .compile(
-                &lower(&program, name, device.backend(), &HashMap::new()).unwrap(),
-                candidate.clone(),
-            )
-            .unwrap();
+        let input = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: name,
+            shapes: &Default::default(),
+            elements: &Default::default(),
+            options: &Default::default(),
+        };
+        let mut kernel = automatic_hardware::compile_with_controls(
+            &device,
+            input,
+            &[source.clone(), out.clone()],
+            &[f64::from(a), 0.0],
+            &[0],
+        )
+        .unwrap();
         for which in [-1, 1, 0] {
             let result = kernel.execute(
                 &[source.clone(), out.clone()],
@@ -85,33 +102,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_boolean_logic() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_boolean_logic() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_boolean_logic() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

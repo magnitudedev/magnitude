@@ -5,7 +5,7 @@
 use super::*;
 use crate::{ast::BinaryOp, repr};
 
-pub(super) fn supported(ty: &Ty) -> bool {
+pub(crate) fn supported(ty: &Ty) -> bool {
     let Some(shape) = ty.shaped() else {
         return false;
     };
@@ -32,7 +32,7 @@ pub(super) fn supported(ty: &Ty) -> bool {
 
 /// Alignment follows captured value/view provenance, not the selected storage
 /// mode. Materialized packed snapshots retain their original packet prefix.
-pub(super) fn aligned(e: &Expr, vars: &[Var], known: &HashSet<VarId>) -> bool {
+pub(crate) fn aligned(e: &Expr, vars: &[Var], known: &HashSet<VarId>) -> bool {
     let Some(shape) = e.ty.shaped() else {
         return false;
     };
@@ -154,6 +154,27 @@ pub(crate) fn decode_segment(
         words,
         vars,
     )
+}
+
+/// Parameterized packet decode used by retained source families. The owner
+/// width remains a symbolic source numeric parameter; ownership is expressed
+/// through ordinary owner/local arithmetic over the dense output tile. This
+/// keeps specialized and indexed decoder arms distinct without enumerating
+/// numeric assignments.
+pub(crate) fn decode_segment_parameterized(
+    source: &Expr,
+    start: Sym,
+    length: Sym,
+    width: Sym,
+    decoder: repr::PacketDecoder,
+    coefficients: Option<&Coefficients>,
+    words: Option<&Words>,
+    vars: &mut Vec<Var>,
+) -> Result<(Expr, Vec<Stmt>), String> {
+    if let Some(width) = width.as_constant().and_then(|n| u32::try_from(n).ok()) {
+        return decode_region(source, start, length, width, decoder, coefficients, words, vars);
+    }
+    decode_region_parameterized(source, start, length, width, decoder, coefficients, words, vars)
 }
 
 /// Encoded words are retained without decoding or changing their bit pattern.
@@ -331,8 +352,8 @@ pub(crate) fn prepare_coefficients(
     );
     let mut producer = Vec::new();
     let mut body = Vec::new();
-    for (plane, cache) in
-        std::iter::once(("scale", &scale)).chain(bias.as_ref().map(|bias| ("bias", bias)))
+    for (is_bias, cache) in std::iter::once((false, &scale))
+        .chain(bias.as_ref().map(|bias| (true, bias)))
     {
         let allocation = b.expr(
             ExprKind::TileAlloc {
@@ -343,7 +364,7 @@ pub(crate) fn prepare_coefficients(
             None,
         );
         producer.push(b.assign(cache.clone(), allocation));
-        let read = b.cast(b.accessor(source, r, plane, source_at.clone())?, DType::F32);
+        let read = b.coefficient(source, r, is_bias, source_at.clone(), &mut body)?;
         body.push(b.assign(
             b.element(cache.clone(), coordinates.clone(), DType::F32),
             read,
@@ -473,16 +494,21 @@ fn decode_region(
 
     let mut coefficient_at = coordinates.clone();
     *coefficient_at.last_mut().unwrap() = packet.clone();
-    let coefficient_read = |b: &Builder<'_>, plane: &str| -> Result<Expr, String> {
-        if let Some(coefficients) = coefficients {
-            let cache = if plane == "scale" {
-                &coefficients.scale
-            } else {
-                coefficients
-                    .bias
-                    .as_ref()
-                    .ok_or("missing retained packet bias")?
-            };
+    let scale_read = if let Some(coefficients) = coefficients {
+        let mut at = coefficient_at.clone();
+        *at.last_mut().unwrap() = b.binary(
+            BinaryOp::Sub,
+            packet.clone(),
+            b.symbol(coefficients.origin.clone()),
+            DType::I32,
+        );
+        b.element(coefficients.scale.clone(), at, DType::F32)
+    } else {
+        b.coefficient(source, r, false, coefficient_at.clone(), &mut body)?
+    };
+    let scale = b.bind("packet_scale", scale_read, &mut body);
+    let bias = if r.has_bias() {
+        let read = if let Some(coefficients) = coefficients {
             let mut at = coefficient_at.clone();
             *at.last_mut().unwrap() = b.binary(
                 BinaryOp::Sub,
@@ -490,18 +516,14 @@ fn decode_region(
                 b.symbol(coefficients.origin.clone()),
                 DType::I32,
             );
-            Ok(b.element(cache.clone(), at, DType::F32))
-        } else {
-            Ok(b.cast(
-                b.accessor(source, r, plane, coefficient_at.clone())?,
+            b.element(
+                coefficients.bias.as_ref().ok_or("missing retained packet bias")?.clone(),
+                at,
                 DType::F32,
-            ))
-        }
-    };
-    let scale_read = coefficient_read(&b, "scale")?;
-    let scale = b.bind("packet_scale", scale_read, &mut body);
-    let bias = if r.has_bias() {
-        let read = coefficient_read(&b, "bias")?;
+            )
+        } else {
+            b.coefficient(source, r, true, coefficient_at.clone(), &mut body)?
+        };
         b.bind("packet_bias", read, &mut body)
     } else {
         b.float(0.0)
@@ -881,11 +903,413 @@ fn decode_region(
     Ok((cache, producer))
 }
 
+fn decode_region_parameterized(
+    source: &Expr,
+    offset: Sym,
+    length: Sym,
+    width: Sym,
+    decoder: repr::PacketDecoder,
+    coefficients: Option<&Coefficients>,
+    words: Option<&Words>,
+    vars: &mut Vec<Var>,
+) -> Result<(Expr, Vec<Stmt>), String> {
+    if !supported(&source.ty) {
+        return Err("packet decode requires an innermost word-aligned coefficient group".into());
+    }
+    let shape = source.ty.shaped().unwrap();
+    let Elem::Repr(name) = &shape.elem else { unreachable!() };
+    let packed_axis = shape
+        .packed_axis
+        .ok_or("packet decode requires a packed axis")?;
+    if packed_axis != shape.shape.len().saturating_sub(1) {
+        return Err("parameterized packet decode requires an innermost packed axis".into());
+    }
+    let r = repr::lookup(name).unwrap();
+    let group = Sym::constant(i64::from(r.group));
+    let span = source.span;
+    let mut b = Builder { vars, span };
+
+    // The cache is dense but keeps every non-packed source extent. Its packed
+    // axis is replaced with the retained segment length, which may remain a
+    // source numeric atom until materialization.
+    let mut cache_type = dense_type(&source.ty);
+    let Ty::Tile(cache_shape) = &mut cache_type else { unreachable!() };
+    cache_shape.shape[packed_axis] = length.clone();
+    let cache_shape = cache_shape.shape.clone();
+    let cache = b.local("decoded_packets_parameterized", cache_type, false);
+    let coordinates = cache_shape
+        .iter()
+        .map(|_| b.local("packet_index_parameterized", Ty::Scalar(DType::I32), true))
+        .collect::<Vec<_>>();
+    let output = coordinates[packed_axis].clone();
+
+    // Width controls the retained owner partition. Reconstructing the output
+    // coordinate from owner/local coordinates keeps that source parameter in
+    // the emitted IR without enumerating its numeric assignments.
+    let owner = b.binary(
+        BinaryOp::Div,
+        output.clone(),
+        b.symbol(width.clone()),
+        DType::I32,
+    );
+    let local = b.binary(
+        BinaryOp::Rem,
+        output.clone(),
+        b.symbol(width.clone()),
+        DType::I32,
+    );
+    let owner_base = b.binary(
+        BinaryOp::Mul,
+        owner,
+        b.symbol(width.clone()),
+        DType::I32,
+    );
+    let local_output = b.binary(BinaryOp::Add, owner_base, local, DType::I32);
+    let global = b.binary(
+        BinaryOp::Add,
+        b.symbol(offset.clone()),
+        local_output,
+        DType::I32,
+    );
+    let packet = b.binary(
+        BinaryOp::Div,
+        global.clone(),
+        b.symbol(group.clone()),
+        DType::I32,
+    );
+    let group_code = b.binary(
+        BinaryOp::Rem,
+        global.clone(),
+        b.symbol(group.clone()),
+        DType::I32,
+    );
+
+    let coefficient_at = {
+        let mut at = coordinates.clone();
+        *at.last_mut().unwrap() = packet.clone();
+        at
+    };
+    let mut body = Vec::new();
+    let scale_read = if let Some(coefficients) = coefficients {
+        let mut at = coefficient_at.clone();
+        *at.last_mut().unwrap() = b.binary(
+            BinaryOp::Sub,
+            packet.clone(),
+            b.symbol(coefficients.origin.clone()),
+            DType::I32,
+        );
+        b.element(coefficients.scale.clone(), at, DType::F32)
+    } else {
+        b.coefficient(source, r, false, coefficient_at.clone(), &mut body)?
+    };
+    let scale = b.bind(
+        "packet_scale_parameterized",
+        scale_read,
+        &mut body,
+    );
+    let bias = if r.has_bias() {
+        let bias_read = if let Some(coefficients) = coefficients {
+            let mut at = coefficient_at.clone();
+            *at.last_mut().unwrap() = b.binary(
+                BinaryOp::Sub,
+                packet.clone(),
+                b.symbol(coefficients.origin.clone()),
+                DType::I32,
+            );
+            b.element(
+                coefficients.bias.as_ref().ok_or("missing retained packet bias")?.clone(),
+                at,
+                DType::F32,
+            )
+        } else {
+            b.coefficient(source, r, true, coefficient_at.clone(), &mut body)?
+        };
+        b.bind(
+            "packet_bias_parameterized",
+            bias_read,
+            &mut body,
+        )
+    } else {
+        b.float(0.0)
+    };
+
+    let bit = b.binary(
+        BinaryOp::Mul,
+        group_code,
+        b.int(i64::from(r.bits)),
+        DType::I32,
+    );
+    let word_index = b.binary(BinaryOp::Div, bit.clone(), b.int(32), DType::I32);
+    let shift = b.cast(
+        b.binary(BinaryOp::Rem, bit, b.int(32), DType::I32),
+        DType::U32,
+    );
+    let read_word = |b: &Builder<'_>, index: Expr| -> Result<Expr, String> {
+        let mut at = coordinates.clone();
+        *at.last_mut().unwrap() = index;
+        if let Some(words) = words {
+            *at.last_mut().unwrap() = b.binary(
+                BinaryOp::Sub,
+                at.last().unwrap().clone(),
+                b.symbol(words.origin.clone()),
+                DType::I32,
+            );
+            Ok(b.element(words.values.clone(), at, DType::U32))
+        } else {
+            b.accessor(source, r, "words", at)
+        }
+    };
+    let first = read_word(&b, word_index.clone())?;
+    let shifted = b.bind(
+        "packet_raw_parameterized",
+        b.binary(BinaryOp::Shr, first, shift.clone(), DType::U32),
+        &mut body,
+    );
+    let raw = if r.bits == 32 {
+        shifted
+    } else {
+        let raw = b.local("packet_raw_value_parameterized", Ty::Scalar(DType::U32), false);
+        body.push(b.assign(raw.clone(), shifted));
+        let next = read_word(
+            &b,
+            b.binary(BinaryOp::Add, word_index, b.int(1), DType::I32),
+        )?;
+        let carried = b.binary(
+            BinaryOp::BitOr,
+            raw.clone(),
+            b.binary(
+                BinaryOp::Shl,
+                next,
+                b.binary(
+                    BinaryOp::Sub,
+                    b.uint(32),
+                    shift.clone(),
+                    DType::U32,
+                ),
+                DType::U32,
+            ),
+            DType::U32,
+        );
+        body.push(b.statement(StmtKind::If {
+            cond: b.binary(
+                BinaryOp::Gt,
+                shift,
+                b.uint(i64::from(32 - r.bits)),
+                DType::Bool,
+            ),
+            then: vec![b.assign(raw.clone(), carried)],
+            els: Vec::new(),
+        }));
+        raw
+    };
+    let raw = b.binary(
+        BinaryOp::BitAnd,
+        raw,
+        b.uint(i64::from(u32::MAX >> (32 - r.bits))),
+        DType::U32,
+    );
+    let decoded = b.decode_code(raw, r, &mut body)?;
+    let value = b.expr(
+        ExprKind::Builtin {
+            name: Builtin::Fma,
+            args: vec![decoded, scale, bias],
+        },
+        Ty::Scalar(DType::F32),
+        None,
+    );
+    let mut at = coordinates.clone();
+    at[packed_axis] = output;
+    body.push(b.assign(b.element(cache.clone(), at, DType::F32), value));
+
+    let domain = b.expr(
+        ExprKind::Index {
+            base: Box::new(cache.clone()),
+            indices: cache_shape
+                .iter()
+                .map(|_| Index::Slice {
+                    start: None,
+                    end: None,
+                })
+                .collect(),
+        },
+        Ty::Tile(Shaped::new(cache_shape.clone(), Elem::Dtype(DType::F32))),
+        None,
+    );
+    let allocation = b.expr(
+        ExprKind::TileAlloc {
+            shape: cache_shape.clone(),
+            dtype: Elem::Dtype(DType::F32),
+        },
+        cache.ty.clone(),
+        None,
+    );
+    let producer = vec![
+        b.assign(cache.clone(), allocation),
+        b.statement(StmtKind::Owned {
+            vars: coordinates
+                .iter()
+                .filter_map(|e| match e.kind {
+                    ExprKind::Var(id) => Some(id),
+                    _ => None,
+                })
+                .collect(),
+            tile: domain,
+            body,
+        }),
+    ];
+    // The categorical decoder arm is retained by the family branch. Both
+    // decoder forms use this exact bit extraction so they share semantics.
+    let _ = decoder;
+    Ok((cache, producer))
+}
+
 struct Builder<'a> {
     vars: &'a mut Vec<Var>,
     span: Span,
 }
 impl Builder<'_> {
+    /// Read a logical scale or bias value from the representation-owned
+    /// coefficient planes. Direct representations expose one dense plane;
+    /// hierarchical representations multiply a packed per-group field by its
+    /// larger-group factor plane. The extraction is ordinary IR so both
+    /// retained and direct packet paths account for the same operations.
+    fn coefficient(
+        &mut self,
+        source: &Expr,
+        r: &repr::Repr,
+        bias: bool,
+        at: Vec<Expr>,
+        body: &mut Vec<Stmt>,
+    ) -> Result<Expr, String> {
+        let Some(coefficient) = r.coefficient(bias) else {
+            return Err("representation has no requested packet coefficient".into());
+        };
+        match coefficient {
+            repr::Coefficient::Direct { plane } => {
+                Ok(self.cast(self.accessor(source, r, plane.name, at)?, DType::F32))
+            }
+            repr::Coefficient::Product {
+                factor,
+                coefficients,
+                field,
+                sign,
+            } => {
+                let packet = at.last().cloned().ok_or("packet coefficient has no packed axis")?;
+                let factor_stride = i64::from(factor.group / r.group.max(1));
+                let factor_index = self.binary(
+                    BinaryOp::Div,
+                    packet,
+                    self.int(factor_stride.max(1)),
+                    DType::I32,
+                );
+                let mut factor_at = at.clone();
+                *factor_at.last_mut().unwrap() = factor_index;
+                let factor = self.cast(
+                    self.accessor(source, r, factor.name, factor_at)?,
+                    DType::F32,
+                );
+                let fields = i64::from(coefficients.fields.max(1));
+                let entry = self.binary(
+                    BinaryOp::Add,
+                    self.binary(
+                        BinaryOp::Mul,
+                        at.last().unwrap().clone(),
+                        self.int(fields),
+                        DType::I32,
+                    ),
+                    self.int(i64::from(field)),
+                    DType::I32,
+                );
+                let value = self.packed_plane_entry(source, r, &coefficients, entry, at, body)?;
+                let value = self.cast(value, DType::F32);
+                let value = self.binary(BinaryOp::Mul, factor, value, DType::F32);
+                Ok(if sign == 1 {
+                    value
+                } else {
+                    self.binary(BinaryOp::Mul, value, self.float(f64::from(sign)), DType::F32)
+                })
+            }
+        }
+    }
+
+    /// Read and decode one packed coefficient-plane entry. A dynamic entry
+    /// may straddle two words; the second word is only accessed in the
+    /// boundary branch so a final entry never performs an invalid read.
+    fn packed_plane_entry(
+        &mut self,
+        source: &Expr,
+        r: &repr::Repr,
+        plane: &repr::Plane,
+        entry: Expr,
+        coordinates: Vec<Expr>,
+        body: &mut Vec<Stmt>,
+    ) -> Result<Expr, String> {
+        let repr::PlaneEncoding::Packed { bits, interpretation } = &plane.encoding else {
+            return Err("packed coefficient helper requires a packed plane".into());
+        };
+        let bit = self.binary(
+            BinaryOp::Mul,
+            entry,
+            self.int(i64::from(*bits)),
+            DType::I32,
+        );
+        let word = self.binary(BinaryOp::Div, bit.clone(), self.int(32), DType::I32);
+        let shift = self.cast(
+            self.binary(BinaryOp::Rem, bit, self.int(32), DType::I32),
+            DType::U32,
+        );
+        let read = |builder: &Builder<'_>, index: Expr| -> Result<Expr, String> {
+            let mut at = coordinates.clone();
+            *at.last_mut().unwrap() = index;
+            builder.accessor(source, r, plane.name, at)
+        };
+        let first = read(self, word.clone())?;
+        let shifted = self.bind(
+            "packet_coefficient_raw",
+            self.binary(BinaryOp::Shr, first, shift.clone(), DType::U32),
+            body,
+        );
+        let raw = if *bits == 32 {
+            shifted
+        } else {
+            let raw = self.local("packet_coefficient_value", Ty::Scalar(DType::U32), false);
+            body.push(self.assign(raw.clone(), shifted));
+            let next = read(
+                self,
+                self.binary(BinaryOp::Add, word, self.int(1), DType::I32),
+            )?;
+            let carried = self.binary(
+                BinaryOp::BitOr,
+                raw.clone(),
+                self.binary(
+                    BinaryOp::Shl,
+                    next,
+                    self.binary(BinaryOp::Sub, self.uint(32), shift.clone(), DType::U32),
+                    DType::U32,
+                ),
+                DType::U32,
+            );
+            body.push(self.statement(StmtKind::If {
+                cond: self.binary(
+                    BinaryOp::Gt,
+                    shift,
+                    self.uint(i64::from(32 - *bits)),
+                    DType::Bool,
+                ),
+                then: vec![self.assign(raw.clone(), carried)],
+                els: Vec::new(),
+            }));
+            raw
+        };
+        let raw = self.binary(
+            BinaryOp::BitAnd,
+            raw,
+            self.uint(i64::from(u32::MAX >> (32 - *bits))),
+            DType::U32,
+        );
+        self.decode_interpretation(raw, interpretation, *bits, body)
+    }
+
     /// Evaluate the representation's integer table with bit selections. All
     /// shift amounts are constants and unknown code data never controls a
     /// branch, so accounting follows the complete emitted instruction family.
@@ -942,13 +1366,14 @@ impl Builder<'_> {
         Ok(self.cast(self.cast(values.pop().unwrap(), DType::I32), DType::F32))
     }
 
-    fn decode_code(
+    fn decode_interpretation(
         &mut self,
         raw: Expr,
-        r: &repr::Repr,
+        interpretation: &repr::CodeInterpretation,
+        bits: u32,
         body: &mut Vec<Stmt>,
     ) -> Result<Expr, String> {
-        Ok(match &r.code {
+        Ok(match interpretation {
             repr::CodeInterpretation::Unsigned => self.cast(raw, DType::F32),
             repr::CodeInterpretation::Offset(zero) => self.cast(
                 self.binary(
@@ -966,18 +1391,27 @@ impl Builder<'_> {
                         self.binary(
                             BinaryOp::Shl,
                             raw,
-                            self.uint(i64::from(32 - r.bits)),
+                            self.uint(i64::from(32 - bits)),
                             DType::U32,
                         ),
                         DType::I32,
                     ),
-                    self.int(i64::from(32 - r.bits)),
+                    self.int(i64::from(32 - bits)),
                     DType::I32,
                 ),
                 DType::F32,
             ),
             repr::CodeInterpretation::Table(table) => self.table_code(raw, table, body)?,
         })
+    }
+
+    fn decode_code(
+        &mut self,
+        raw: Expr,
+        r: &repr::Repr,
+        body: &mut Vec<Stmt>,
+    ) -> Result<Expr, String> {
+        self.decode_interpretation(raw, &r.code, r.bits, body)
     }
 
     // The finite code ranges partition a coefficient group. A balanced branch

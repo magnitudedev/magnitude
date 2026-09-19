@@ -26,16 +26,28 @@ pub struct Buffer {
 }
 
 pub struct Pipeline {
-    states: Vec<(Launch, Retained<ProtocolObject<dyn MTLComputePipelineState>>)>,
+    states: Vec<CompiledLaunch>,
     pub emitted: Emitted,
     /// Buffers the realization needs and the caller does not supply, allocated at compile.
     scratch: Vec<Buffer>,
     identity: std::rc::Rc<()>,
     pub facts: Vec<PipelineFacts>,
 }
+struct CompiledLaunch {
+    index: usize,
+    launch: Launch,
+    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+impl Pipeline {
+    /// Selected native dispatches. Absent retained launch slots keep their
+    /// identities in the emitted artifact but do not create native pipelines.
+    pub fn phase_count(&self) -> usize { self.states.len() }
+}
 
 #[derive(Clone, Debug)]
 pub struct PipelineFacts {
+    /// Original retained launch slot; inactive slots have no native facts.
+    pub launch: usize,
     pub kernel: String,
     pub execution_width: u64,
     pub max_threads_per_group: u64,
@@ -92,6 +104,44 @@ impl Device {
     }
 
     pub fn compile(&self, emitted: Emitted) -> Result<Pipeline, String> {
+        emitted.scalar_layout()?;
+        let scalar_slot = emitted.buffers.len().checked_add(emitted.scratch.len()).ok_or("Metal argument slot overflow")?;
+        let status_slot = scalar_slot.checked_add(usize::from(!emitted.scalars.is_empty())).ok_or("Metal argument slot overflow")?;
+        if emitted.status_slot.is_some_and(|slot| slot != status_slot) {
+            return Err("Metal status binding differs from the selected invocation ABI".into());
+        }
+        if emitted.scratch.len() != emitted.scratch_bindings.len()
+            || emitted.scratch.iter().zip(&emitted.scratch_bindings).any(|(&bytes, binding)| bytes != binding.bytes) {
+            return Err("Metal scratch allocations differ from their selected bindings".into());
+        }
+        if emitted.buffers.iter().chain(&emitted.scratch_bindings).any(|binding| !binding.alignment.is_power_of_two()) {
+            return Err("Metal buffer bindings require nonzero power-of-two alignment".into());
+        }
+        if emitted.alias_pairs.iter().any(|&(left, right, _)| left >= emitted.buffers.len() || right >= emitted.buffers.len()) {
+            return Err("Metal alias condition names an absent invocation binding".into());
+        }
+        for launch in &emitted.launches {
+            if let Some(dispatch) = &launch.dispatch {
+                if *dispatch != seismic_realization::dispatch::GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, dispatch.items_per_group)?
+                    || launch.threadgroups != dispatch.groups || launch.threads_per_threadgroup != dispatch.threads_per_group {
+                    return Err("Metal launch differs from its selected dispatch geometry".into());
+                }
+            }
+            usize::try_from(launch.threadgroups).map_err(|_| "Metal grid exceeds native dimensions")?;
+            usize::try_from(launch.threads_per_threadgroup).map_err(|_| "Metal group exceeds native dimensions")?;
+        }
+        // Preserve every declared scratch slot, including empty split storage.
+        // Removing one would shift the scalar and status arguments of all launches.
+        let scratch = emitted.scratch_bindings.iter().map(|binding| {
+            let buffer = self.buffer(binding.bytes)?;
+            if buffer.allocation_alignment() < binding.alignment as u64 {
+                return Err("Metal scratch allocation violates its selected binding alignment".into());
+            }
+            Ok(buffer)
+        }).collect::<Result<Vec<_>, String>>()?;
+        if emitted.launches.iter().all(|launch| launch.threadgroups == 0) {
+            return Ok(Pipeline { states: Vec::new(), emitted, scratch, identity: self.identity.clone(), facts: Vec::new() });
+        }
         let source = NSString::from_str(&emitted.source);
         let options=MTLCompileOptions::new();
         // Keep the macOS 13 API floor. Default Metal fast math may erase
@@ -101,11 +151,13 @@ impl Device {
         let library = self.device.newLibraryWithSource_options_error(&source, Some(&options)).map_err(|e| format!("Metal compile failed: {}", e.localizedDescription()))?;
         let mut states = Vec::new();
         let mut facts = Vec::new();
-        for launch in &emitted.launches {
+        for (index, launch) in emitted.launches.iter().enumerate() {
+            if launch.threadgroups == 0 { continue; }
             let name = NSString::from_str(&launch.kernel);
             let function = library.newFunctionWithName(&name).ok_or_else(|| format!("kernel `{}` not found in compiled library", launch.kernel))?;
             let state = self.device.newComputePipelineStateWithFunction_error(&function).map_err(|e| format!("pipeline creation failed: {}", e.localizedDescription()))?;
             let physical = PipelineFacts {
+                launch: index,
                 kernel:launch.kernel.clone(),execution_width:state.threadExecutionWidth() as u64,
                 max_threads_per_group:state.maxTotalThreadsPerThreadgroup() as u64,
                 static_threadgroup_bytes:state.staticThreadgroupMemoryLength() as u64,
@@ -113,7 +165,8 @@ impl Device {
             if launch.threads_per_threadgroup==0 || launch.threads_per_threadgroup>physical.max_threads_per_group {
                 return Err(format!("{} requests {} threads but native pipeline permits {}",launch.kernel,launch.threads_per_threadgroup,physical.max_threads_per_group));
             }
-            if physical.static_threadgroup_bytes > self.device.maxThreadgroupMemoryLength() as u64 {
+            if launch.declared_threadgroup_bytes > self.device.maxThreadgroupMemoryLength() as u64
+                || physical.static_threadgroup_bytes > self.device.maxThreadgroupMemoryLength() as u64 {
                 return Err("native pipeline threadgroup storage exceeds device capacity".into());
             }
             if let Some(dispatch)=&launch.dispatch {
@@ -122,9 +175,8 @@ impl Device {
                 }
             }
             facts.push(physical);
-            states.push((launch.clone(), state));
+            states.push(CompiledLaunch { index, launch: launch.clone(), state });
         }
-        let scratch = emitted.scratch.iter().map(|n| self.buffer(*n)).collect::<Result<Vec<_>, _>>()?;
         Ok(Pipeline { states, emitted, scratch, identity:self.identity.clone(), facts })
     }
 
@@ -183,7 +235,7 @@ impl Device {
             }
             for (buffer, slot) in buffers.iter().zip(&pipeline.emitted.buffers) {
                 self.validate_buffer(buffer)?;
-                if !buffer.offset.is_multiple_of(slot.alignment) {
+                if buffer.allocation_alignment() < slot.alignment as u64 || !buffer.offset.is_multiple_of(slot.alignment) {
                     return Err("Metal resident view violates typed storage alignment".into());
                 }
                 if buffer.len() < slot.bytes {
@@ -203,6 +255,7 @@ impl Device {
                     pipeline.emitted.buffers[*b].bytes,
                 );
                 if std::ptr::eq(left.raw(), right.raw())
+                    && left_size != 0 && right_size != 0
                     && left.offset < right.offset + right_size
                     && right.offset < left.offset + left_size
                     && !(*exact_allowed && left.offset == right.offset && left_size == right_size)
@@ -212,12 +265,15 @@ impl Device {
             }
             pipeline.emitted.scalar_layout()?.validate_bytes(scalars)?;
             dispatch_count = dispatch_count
-                .checked_add(pipeline.states.len())
+                .checked_add(pipeline.phase_count())
                 .ok_or("Metal dispatch count overflow")?;
         }
         let dispatch_count = dispatch_count
             .checked_mul(repeat)
             .ok_or("Metal repetition overflow")?;
+        if dispatch_count == 0 {
+            return Ok(Observation { command_seconds: 0.0, dispatches: Vec::new() });
+        }
         let status = self.buffer_from(&[0; 4])?;
         let mut capture = if profile {
             Some(observation::Capture::new(self, dispatch_count)?)
@@ -245,9 +301,10 @@ impl Device {
                     buffers,
                     scalars,
                 } = invocation;
-                for (launch_index, (launch, state)) in pipeline.states.iter().enumerate() {
+                for compiled in &pipeline.states {
+                    let CompiledLaunch { index: launch_index, launch, state } = compiled;
                     let encoder = if let Some(capture) = &mut capture {
-                        capture.encoder(&command, invocation_index, launch_index, &launch.kernel)?
+                        capture.encoder(&command, invocation_index, *launch_index, &launch.kernel)?
                     } else {
                         shared_encoder.as_ref().unwrap().clone()
                     };

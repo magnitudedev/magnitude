@@ -209,7 +209,7 @@ fn expression(e: &E, aliases: &Aliases, out: &mut Accesses) {
             expression(b, aliases, out);
         }
         E::Unary(_, e, _) | E::Cast(_, e) | E::Bitcast(_, e) => expression(e, aliases, out),
-        E::Select(c, a, b) => {
+        E::Select(c, a, b) | E::EagerSelect(c, a, b) => {
             expression(c, aliases, out);
             expression(a, aliases, out);
             expression(b, aliases, out);

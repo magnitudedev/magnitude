@@ -3,7 +3,8 @@
 //! binding. Both storage and decode arithmetic therefore survive into emission.
 use super::*;
 mod packets;
-pub(crate) use packets::{decode_segment as decode_packet_segment, prepare_coefficients as prepare_packet_coefficients, prepare_words as prepare_packet_words};
+pub(crate) use packets::{decode_segment as decode_packet_segment, decode_segment_parameterized, prepare_coefficients as prepare_packet_coefficients, prepare_words as prepare_packet_words};
+pub(crate) use packets::{aligned as packet_aligned, supported as packet_supported};
 
 type Values = HashMap<VarId, Expr>;
 

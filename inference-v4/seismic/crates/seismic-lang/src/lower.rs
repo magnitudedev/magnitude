@@ -9,6 +9,7 @@ use crate::sym::{Atom, Sym};
 use crate::types::{Elem, Shaped, Ty};
 use std::collections::HashMap;
 pub mod alternatives;
+pub mod family;
 mod decomposition;
 mod grouping;
 mod projection;
@@ -482,6 +483,14 @@ impl<'a> Inliner<'a> {
                     view: self.inline_expr(&domain.view, env, vmap, vars, atom_map)?,
                     axis: domain.axis,
                 };
+                if self.calls == CallStage::Portable {
+                    return Ok(vec![Stmt { id: None, span, kind: StmtKind::LoadLoop {
+                        domain, offset: offset.map(|v| remap_var(v, vmap)), modes: None,
+                        vars: vs.iter().map(|v| remap_var(*v, vmap)).collect(), views,
+                        axes: axes.clone(), piece: remap_atom(piece, atom_map), capacity: None,
+                        body: self.inline_block(body, env, vmap, vars, atom_map, depth)?,
+                    } }]);
+                }
                 let extent = domain
                     .view
                     .ty
@@ -590,6 +599,11 @@ impl<'a> Inliner<'a> {
                 if let Some(mut reduction) = crate::reduction::structured::Reduction::from_expr(e) {
                     for e in reduction.operands_mut() {
                         *e = self.inline_expr(e, env, vmap, vars, atom_map)?;
+                    }
+                    if self.calls == CallStage::Portable {
+                        // Dependence analysis consumes the reduction contract;
+                        // callback implementation and tree are still unresolved.
+                        return Ok(vec![Stmt { id: None, span, kind: StmtKind::Reduction(Box::new(reduction)) }]);
                     }
                     if let ExprKind::Call {
                         shape_args,
@@ -1532,7 +1546,7 @@ impl<'a> Inliner<'a> {
         vars: &mut Vec<Var>,
         atom_map: &mut HashMap<String, Atom>,
     ) -> Result<Expr, String> {
-        let ty = subst_elem_ty(&subst_ty(&e.ty, env), &self.elements);
+        let mut ty = subst_elem_ty(&subst_ty(&e.ty, env), &self.elements);
         let sym = e.sym.as_ref().map(|s| subst_sym(s, env, atom_map));
         let span = e.span;
         let mut sub = |x: &Expr, this: &mut Self| this.inline_expr(x, env, vmap, vars, atom_map);
@@ -1680,6 +1694,18 @@ impl<'a> Inliner<'a> {
                     .collect::<Result<_, _>>()?,
             ),
         };
+        // A generic element read has a provisional scalar type before its
+        // storage element parameter is bound. Scalar types contain no element
+        // parameter for subst_elem_ty to replace, so derive the specialized
+        // index type from the now-specialized storage. Explicit casts and
+        // assignment conversions remain at their original use sites.
+        if let ExprKind::Index { base, .. } = &kind {
+            if matches!(ty, Ty::Scalar(_)) {
+                ty = Ty::Scalar(base.ty.shaped()
+                    .and_then(|shape| shape.elem.read_dtype())
+                    .ok_or("indexed element type remains unresolved after specialization")?);
+            }
+        }
         let expression = Expr {
             kind,
             ty,
@@ -1841,6 +1867,59 @@ fn select_producers(
             _ => {}
         }
     }
+    let mut producers = producer_candidates(block, vars);
+    // Sort by the source variable identity; HashMap iteration must never affect
+    // replay, candidate identity, or coverage of independent decisions.
+    let mut candidates: Vec<_> = producers.keys().copied().collect();
+    candidates.sort_unstable();
+    for variable in candidates {
+        let decision = Decision {
+            kind: DecisionKind::Producer {
+                variable,
+                name: vars[variable].name.clone(),
+                ty: vars[variable].ty.clone(),
+            },
+            alternatives: vec![Alternative::Materialize, Alternative::Recompute].into(),
+        };
+        match select(&decision)? {
+            Alternative::Materialize => {
+                producers.remove(&variable);
+            }
+            Alternative::Recompute => {}
+            other => return Err(format!("invalid producer alternative {other:?}")),
+        }
+    }
+    // Drop their definitions and rewrite the reads.
+    block.retain(|s| match &s.kind {
+        StmtKind::Owned { tile, .. } => {
+            !matches!(tile.kind, ExprKind::Var(a) if producers.contains_key(&a))
+        }
+        StmtKind::Assign { target, value, .. } => {
+            !(matches!(target.kind, ExprKind::Var(a) if producers.contains_key(&a))
+                && matches!(value.kind, ExprKind::TileAlloc { .. }))
+        }
+        _ => true,
+    });
+    for s in block.iter_mut() {
+        rewrite_reads_stmt(s, &producers, vars);
+    }
+    Ok(())
+}
+
+/// Complete local recomputation domain from pure producers and snapshot lifetimes.
+fn producer_candidates(block: &[Stmt], vars: &[Var]) -> HashMap<VarId, (Vec<VarId>, Expr)> {
+    let mut producers = pure_producer_candidates(block, vars);
+    let mut other_uses: HashMap<VarId, usize> = HashMap::new();
+    for statement in block {
+        count_non_element_uses(statement, &producers, &mut other_uses);
+    }
+    producers.retain(|variable, _| other_uses.get(variable).copied().unwrap_or(0) == 0);
+    producers
+}
+
+/// Reaching pure element definitions with stable source dependencies. Consumers
+/// establish separately whether their demanded values can be projected from it.
+fn pure_producer_candidates(block: &[Stmt], vars: &[Var]) -> HashMap<VarId, (Vec<VarId>, Expr)> {
     // Only a tile allocated in this block can be removed here. A write to a
     // loop-carried or enclosing tile escapes this block even without a local read.
     let allocated: std::collections::HashSet<VarId> = block
@@ -1930,54 +2009,7 @@ fn select_producers(
             producers.insert(a, (ivs.clone(), value));
         }
     }
-    if producers.is_empty() {
-        return Ok(());
-    }
-    // Keep only producers whose every other use is an element read.
-    let mut other_uses: HashMap<VarId, usize> = HashMap::new();
-    for s in block.iter() {
-        count_non_element_uses(s, &producers, &mut other_uses);
-    }
-    producers.retain(|a, _| other_uses.get(a).copied().unwrap_or(0) == 0);
-    if producers.is_empty() {
-        return Ok(());
-    }
-    // Sort by the source variable identity; HashMap iteration must never affect
-    // replay, candidate identity, or coverage of independent decisions.
-    let mut candidates: Vec<_> = producers.keys().copied().collect();
-    candidates.sort_unstable();
-    for variable in candidates {
-        let decision = Decision {
-            kind: DecisionKind::Producer {
-                variable,
-                name: vars[variable].name.clone(),
-                ty: vars[variable].ty.clone(),
-            },
-            alternatives: vec![Alternative::Materialize, Alternative::Recompute].into(),
-        };
-        match select(&decision)? {
-            Alternative::Materialize => {
-                producers.remove(&variable);
-            }
-            Alternative::Recompute => {}
-            other => return Err(format!("invalid producer alternative {other:?}")),
-        }
-    }
-    // Drop their definitions and rewrite the reads.
-    block.retain(|s| match &s.kind {
-        StmtKind::Owned { tile, .. } => {
-            !matches!(tile.kind, ExprKind::Var(a) if producers.contains_key(&a))
-        }
-        StmtKind::Assign { target, value, .. } => {
-            !(matches!(target.kind, ExprKind::Var(a) if producers.contains_key(&a))
-                && matches!(value.kind, ExprKind::TileAlloc { .. }))
-        }
-        _ => true,
-    });
-    for s in block.iter_mut() {
-        rewrite_reads_stmt(s, &producers, vars);
-    }
-    Ok(())
+    producers
 }
 
 #[derive(Default)]
@@ -2554,11 +2586,7 @@ pub(crate) fn subst_vars(
 /// Inline transparent helpers using their checked portable definitions for
 /// dependence analysis. This is a derived view of the same source, not a model.
 fn portable_body(program: &Program, f: &Function) -> Result<(Vec<Var>, Vec<Stmt>), String> {
-    let mut select = |d: &Decision| {
-        d.alternatives
-            .get(0)
-            .ok_or_else(|| "empty portable domain".to_owned())
-    };
+    let mut select = |_: &Decision| Err("portable semantic expansion attempted an implementation decision".to_owned());
     let mut ctx = Inliner {
         program,
         backend: "",

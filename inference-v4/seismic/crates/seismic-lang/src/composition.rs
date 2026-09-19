@@ -3,10 +3,13 @@ mod producers;
 mod regions;
 mod ranges;
 mod panels;
+pub(crate) use panels::family as matrix_panel_family;
 mod reductions;
+pub(crate) mod family;
 pub(crate) use reductions::read_only as parameter_read_only;
 mod representations;
-pub(crate) use representations::{select as select_representations, decode_packet_segment, prepare_packet_coefficients, prepare_packet_words};
+pub(crate) use representations::{select as select_representations, decode_packet_segment, decode_segment_parameterized, prepare_packet_coefficients, prepare_packet_words};
+pub(crate) use representations::{packet_aligned, packet_supported};
 use crate::{
     ast::AssignOp,
     ir::*,
@@ -1268,8 +1271,12 @@ fn index_substitutions(rename: &HashMap<VarId, VarId>, vars: &[Var]) -> Vec<(Ato
         .collect()
 }
 fn map_sym(s: &mut Sym, atoms: &[(Atom, Sym)]) {
+    let parameters = atoms.iter().filter_map(|(atom, value)| match atom {
+        Atom::Param(name) => Some((name.clone(), value.clone())), _ => None,
+    }).collect::<HashMap<_, _>>();
+    *s = crate::lower::subst_sym(s, &parameters, &HashMap::new());
     for (a, v) in atoms {
-        *s = s.subst(a, v)
+        if !matches!(a, Atom::Param(_)) { *s = s.subst(a, v); }
     }
 }
 fn map_ty(t: &mut Ty, atoms: &[(Atom, Sym)]) {
@@ -1327,16 +1334,24 @@ pub(crate) fn remap(s: &mut Stmt, rename: &HashMap<VarId, VarId>, atoms: &[(Atom
     }
     direct_exprs_mut(s, &mut |e| map_expr(e, rename, atoms));
     match &mut s.kind {
-        StmtKind::Range { lo, hi, .. } => {
+        StmtKind::Range { var, lo, hi, .. } => {
+            if let Some(mapped) = rename.get(var) { *var = *mapped; }
             map_sym(lo, atoms);
             map_sym(hi, atoms)
         }
-        StmtKind::Parallel { extents, .. } => {
+        StmtKind::Parallel { vars, extents, .. } => {
+            for variable in vars { if let Some(mapped) = rename.get(variable) { *variable = *mapped; } }
             for n in extents {
                 map_sym(n, atoms)
             }
         }
-        StmtKind::Lanes { extent, .. } => map_sym(extent, atoms),
+        StmtKind::Lanes { var, extent, .. } => { if let Some(mapped) = rename.get(var) { *var = *mapped; } map_sym(extent, atoms); },
+        StmtKind::Owned { vars, .. } | StmtKind::LoadLoop { vars, .. } => {
+            for variable in vars { if let Some(mapped) = rename.get(variable) { *variable = *mapped; } }
+            if let StmtKind::LoadLoop { offset: Some(offset), .. } = &mut s.kind {
+                if let Some(mapped) = rename.get(offset) { *offset = *mapped; }
+            }
+        },
         _ => {}
     }
     nested_mut(s, &mut |b| {

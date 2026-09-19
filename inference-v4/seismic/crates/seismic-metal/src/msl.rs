@@ -6,6 +6,8 @@
 //! Load realization is explicit, with borrowing admitted by shared lifetime rules.
 //! Dtype conversions preserve the checked numerical publication boundaries.
 
+pub(crate) mod parameters;
+
 use crate::collective::{
     Implementation as CollectiveImplementation, Site as CollectiveSite, StorageSpace,
 };
@@ -74,14 +76,17 @@ pub struct Launch {
 /// One axis of a tile: static capacity and a C expression for the runtime extent.
 #[derive(Clone, Debug, PartialEq)]
 struct Dim {
+    /// Finite construction envelope, never a selected physical stride.
     cap: i64,
+    physical: Sym,
+    physical_value: TE,
     ext: String,
     value: TE,
 }
 
 impl Dim {
     fn is_static(&self) -> bool {
-        self.ext == self.cap.to_string()
+        self.value == self.physical_value
     }
 }
 
@@ -93,8 +98,9 @@ struct ViewGeometry {
     shape: Vec<Sym>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Realization {
+    Choice { arms: Vec<(String, Box<Realization>)> },
     /// Captured logical tile geometry with no addressable element storage.
     Geometry {
         dims: Vec<Dim>,
@@ -128,7 +134,7 @@ enum Realization {
         name: String,
         dims: Vec<Dim>,
         dtype: DType,
-        slots: i64,
+        slots: TE,
     },
     Shared {
         name: String,
@@ -151,7 +157,7 @@ struct Printer<'a> {
     terminal: crate::terminal::Program,
     terminal_indents: Vec<Vec<usize>>,
     expressions: HashMap<String, TE>,
-    local_planes: HashMap<String, (TSpa, DType, u64)>,
+    local_planes: HashMap<String, (TSpa, DType, TE)>,
     f: &'a LoweredIr,
     execution: &'a Execution,
     cfg: &'a Config,
@@ -162,6 +168,7 @@ struct Printer<'a> {
     indent: usize,
     counter: usize,
     owned_ctx: Vec<(VarId, Vec<String>, Option<String>)>,
+    lane_domains: Vec<(Sym, i64)>,
     buffers: Vec<BufferSpec>,
     scalars: Vec<ScalarParameter>,
     shared_decls: Vec<(String, u64)>,
@@ -173,6 +180,9 @@ struct Printer<'a> {
     collective_ordinal: usize,
     /// Simdgroups per threadgroup for the kernel being emitted.
     simdgroups: i64,
+    grouping_parameters: bool,
+    parameters: &'a mut parameters::Operands,
+    active_implementations: std::collections::BTreeMap<String, bool>,
 }
 
 pub fn emit(f: &LoweredIr) -> Result<Emitted, String> {
@@ -208,26 +218,54 @@ pub fn prepare_execution(execution: &Execution) -> Result<&Emitted, String> {
         .map_err(Clone::clone)
 }
 fn build_execution(execution: &Execution) -> Result<Emitted, String> {
+    build_execution_mode(execution, false)
+}
+fn build_execution_mode(execution: &Execution, grouping_parameters: bool) -> Result<Emitted, String> {
+    build_execution_parameters(execution, grouping_parameters).map(|(emitted, _)| emitted)
+}
+fn build_execution_parameters(execution: &Execution, grouping_parameters: bool) -> Result<(Emitted, parameters::Operands), String> {
+    let mut parameters = parameters::Operands::default();
+    let mut parameter_names = HashMap::new();
+    let mut parameter_expressions = HashMap::new();
+    let mut numeric_names = HashMap::new();
+    for (name, value) in &execution.numeric_parameters {
+        let symbol = parameters::symbol(*value);
+        let expression = parameters.expression(symbol.clone(), *value).cast(TT::I32);
+        let (minimum, maximum) = value.bounds();
+        numeric_names.insert(name.clone(), if minimum == maximum { Sym::constant(minimum as i64) } else { Sym::param(&symbol) });
+        parameter_names.insert(name.clone(), symbol.clone());
+        parameter_expressions.insert(symbol, expression);
+    }
+    for (name, definition) in &execution.numeric_definitions {
+        let value = execution.numeric_parameters.get(name).ok_or("Metal numeric definition has no original binding")?;
+        if definition.params().iter().any(|name| !numeric_names.contains_key(name)) {
+            return Err("Metal numeric definition references an unregistered source parameter".into());
+        }
+        let definition = seismic_lang::lower::subst_sym(definition, &numeric_names, &HashMap::new());
+        parameters.define(*value, definition)?;
+    }
     let f = &execution.function;
     let phase_indices = execution.phases.iter()
         .map(|phase| phase.split.iter().map(|split| split.part).collect())
         .collect::<Vec<_>>();
-    seismic_lang::verify::executable_phases(f, &phase_indices)?;
+    if execution.implementation.is_some() { seismic_lang::verify::retained_phases(f, &phase_indices)?; }
+    else { seismic_lang::verify::executable_phases(f, &phase_indices)?; }
     let cfg = &execution.config;
     let mut emitted = Printer {
         terminal: Default::default(),
         terminal_indents: Vec::new(),
-        expressions: HashMap::new(),
+        expressions: parameter_expressions,
         local_planes: HashMap::new(),
         f,
         execution,
         cfg,
         out: String::new(),
         real: HashMap::new(),
-        names: HashMap::new(),
+        names: parameter_names,
         indent: 0,
         counter: 0,
         owned_ctx: Vec::new(),
+        lane_domains: Vec::new(),
         buffers: Vec::new(),
         scalars: Vec::new(),
         shared_decls: Vec::new(),
@@ -238,19 +276,23 @@ fn build_execution(execution: &Execution) -> Result<Emitted, String> {
         current_operation: None,
         collective_ordinal: 0,
         simdgroups: cfg.sg_per_tg,
+        grouping_parameters,
+        parameters: &mut parameters,
+        active_implementations: Default::default(),
     }
     .emit()?;
-    emitted.terminal.validate_typed()?;
+    if execution.implementation.is_some() { emitted.terminal.validate_template()?; }
+    else { emitted.terminal.validate_typed()?; }
     let planned = execution.memory.launches();
     if emitted.launches.len() != planned.len() {
         return Err("emitted launch count disagrees with allocation plan".into());
     }
     for (launch, plan) in emitted.launches.iter().zip(planned) {
-        if launch
+        if execution.implementation.is_none() && (launch
             .tiles
             .iter()
             .ne(plan.arrays.iter().map(|a| &a.declaration))
-            || launch.declared_threadgroup_bytes != plan.shared_bytes_per_group
+            || launch.declared_threadgroup_bytes != plan.shared_bytes_per_group)
         {
             let at = launch
                 .tiles
@@ -285,7 +327,126 @@ fn build_execution(execution: &Execution) -> Result<Emitted, String> {
     );
     emitted.alias_pairs.sort_unstable();
     emitted.alias_pairs.dedup();
-    Ok(emitted)
+    Ok((emitted, parameters))
+}
+
+/// Terminal grouping operands are introduced at the printer's semantic launch
+/// boundary. No selected kernel is inspected to discover replaceable constants.
+fn grouping_parameter(launch: usize) -> String { format!("seismic_family_grouping_{launch}__") }
+
+pub(crate) struct GroupingTemplate {
+    emitted: Emitted,
+    shared_per_item: Vec<u64>,
+    operands: parameters::Operands,
+    scratch: Vec<(crate::memory::ScratchAllocation, Option<seismic_accounting::algebra::Value>)>,
+}
+impl GroupingTemplate {
+    pub(crate) fn new(execution: &Execution) -> Result<Self, String> {
+        let (emitted, operands) = build_execution_parameters(execution, true)?;
+        let shared_per_item = execution.memory().launches().iter().map(|launch| {
+            let unit = GroupDispatch::new(1, SUBGROUP as u64, 1)?;
+            launch.slots.iter().try_fold(0u64, |bytes, slot| bytes.checked_add(slot.layout(&unit)?.shared_bytes_per_group).ok_or_else(|| "Metal template shared storage overflow".into()))
+        }).collect::<Result<Vec<_>, String>>()?;
+        let scratch = execution.memory().scratch().iter().map(|allocation| {
+            let parts = execution.launch_parameters.as_ref().and_then(|launches| launches.get(allocation.producer)).map(|launch| launch.parts);
+            (allocation.clone(), parts)
+        }).collect();
+        Ok(Self { emitted, shared_per_item, operands, scratch })
+    }
+    pub(crate) fn emitted(&self) -> &Emitted { &self.emitted }
+    pub(crate) fn operands(&self) -> &parameters::Operands { &self.operands }
+    pub(crate) fn shared_per_item(&self) -> &[u64] { &self.shared_per_item }
+    pub(crate) fn instantiate(&self, dispatches: &[GroupDispatch], values: &[i64]) -> Result<Emitted, String> {
+        self.instantiate_program(dispatches, &self.emitted.terminal, values)
+    }
+    pub(crate) fn instantiate_program(&self, dispatches: &[GroupDispatch], program: &crate::terminal::Program, values: &[i64]) -> Result<Emitted, String> {
+        let program = self.operands.instantiate(program, values)?;
+        self.materialize(dispatches, &program, Some(values))
+    }
+    fn materialize(&self, dispatches: &[GroupDispatch], program: &crate::terminal::Program, values: Option<&[i64]>) -> Result<Emitted, String> {
+        if dispatches.len() != self.emitted.launches.len() { return Err("Metal terminal template launch count differs from assignment".into()); }
+        if program.launches().len() != dispatches.len() { return Err("Metal terminal region count differs from its launches".into()); }
+        let mut emitted = self.emitted.clone();
+        emitted.terminal = program.clone();
+        if let Some(values) = values { emitted.source = self.operands.source(&emitted.source, values)?; }
+        for (index, body) in program.launches().iter().enumerate() {
+            let begin = format!("/*seismic_family_body_begin_{index}__*/\n");
+            let end = format!("/*seismic_family_body_end_{index}__*/\n");
+            let start = emitted.source.find(&begin).ok_or("missing retained terminal body boundary")?;
+            let finish = emitted.source[start + begin.len()..].find(&end)
+                .map(|offset| start + begin.len() + offset + end.len())
+                .ok_or("missing retained terminal body completion")?;
+            let mut source = String::new();
+            let mut indent = 1usize;
+            for site in body {
+                if matches!(site.statement, TS::End | TS::Else) { indent = indent.checked_sub(1).ok_or("terminal family scope underflow")?; }
+                source.push_str(&"  ".repeat(indent)); source.push_str(&site.statement.render()); source.push('\n');
+                if matches!(site.statement, TS::For { .. } | TS::If(_) | TS::Scope | TS::Else) { indent += 1; }
+            }
+            if indent != 1 { return Err("terminal family left an open scope".into()); }
+            emitted.source.replace_range(start..finish, &source);
+        }
+        for (index, (launch, dispatch)) in emitted.launches.iter_mut().zip(dispatches).enumerate() {
+            let original = launch.dispatch.as_ref().ok_or("Metal terminal template has no work domain")?;
+            if dispatch.work_items > original.work_items || dispatch.lanes_per_item != original.lanes_per_item {
+                return Err("selected dispatch exceeds the retained terminal occurrence domain".into());
+            }
+            let name = grouping_parameter(index);
+            let value = crate::terminal::Expression::Integer(i64::try_from(dispatch.items_per_group).map_err(|_| "grouping exceeds terminal integer")?, crate::terminal::Type::U32);
+            for site in &mut emitted.terminal.launches[index] {
+                site.statement = crate::terminal::rewrite::statement(&site.statement, &name, &value);
+            }
+            emitted.source = emitted.source.replace(&name, &value.render());
+            launch.threadgroups = dispatch.groups;
+            launch.threads_per_threadgroup = dispatch.threads_per_group;
+            let selected_shared = match values {
+                Some(values) => self.operands.shared_bytes(index, dispatch, values)?,
+                None => None,
+            };
+            launch.declared_threadgroup_bytes = match selected_shared {
+                Some(bytes) => bytes,
+                None => self.shared_per_item[index].checked_mul(dispatch.items_per_group).ok_or("Metal grouping storage overflow")?,
+            };
+            if let Some(values) = values {
+                if let Some(tiles) = self.operands.tiles(index, values)? { launch.tiles = tiles; }
+            }
+            launch.dispatch = Some(dispatch.clone());
+        }
+        if let Some(values) = values {
+            for (allocation, parts) in &self.scratch {
+                if allocation.parameter.is_some() { continue; }
+                let parts = match parts {
+                    Some(parts) => {
+                        let value = *values.get(parts.id().0).ok_or("selected split part count is missing")?;
+                        let value = u64::try_from(value).map_err(|_| "selected split part count is negative")?;
+                        if value < parts.bounds().0 || value > parts.bounds().1 { return Err("selected split part count is outside its retained domain".into()); }
+                        value
+                    },
+                    None => allocation.parts,
+                };
+                let work_items = dispatches.get(allocation.consumer).ok_or("selected split consumer is missing")?.work_items;
+                let bytes = work_items.checked_mul(parts)
+                    .and_then(|count| count.checked_mul(allocation.elements_per_item))
+                    .and_then(|count| count.checked_mul(u64::from(allocation.dtype.bytes())))
+                    .and_then(|bytes| usize::try_from(bytes).ok()).ok_or("selected split scratch size overflow")?;
+                *emitted.scratch.get_mut(allocation.index).ok_or("selected split scratch allocation is missing")? = bytes;
+                emitted.scratch_bindings.get_mut(allocation.index).ok_or("selected split scratch binding is missing")?.bytes = bytes;
+            }
+        }
+        if values.is_some() { emitted.terminal.validate_typed()?; }
+        else { emitted.terminal.validate_template()?; }
+        Ok(emitted)
+    }
+    /// A work-item trace uses the same unsimplified typed parameter body with
+    /// canonical work coordinates. Native reconstruction substitutes the actual
+    /// grouping, preserving the same operations and their source order.
+    pub(crate) fn canonical(&self) -> Result<Emitted, String> {
+        let dispatches = self.emitted.launches.iter().map(|launch| {
+            let dispatch = launch.dispatch.as_ref().ok_or("template launch has no dispatch")?;
+            GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, 1)
+        }).collect::<Result<Vec<_>, String>>()?;
+        self.materialize(&dispatches, &self.emitted.terminal, None)
+    }
 }
 
 fn ctype(d: DType) -> &'static str {
@@ -297,6 +458,13 @@ fn ctype(d: DType) -> &'static str {
         DType::U32 => "uint",
         DType::Bool => "bool",
     }
+}
+
+/// Canonical native name of a typed scalar binding. Retained source predicates
+/// use the same identity as ordinary scalar emission; callers never rediscover
+/// parameters by scanning or parsing emitted source text.
+pub(crate) fn variable_symbol(variable: &seismic_lang::ir::Var, id: VarId) -> String {
+    format!("{}_{}", sanitize(&variable.name), id)
 }
 
 fn scalar_dtype(t: &Ty) -> Option<DType> {
@@ -422,11 +590,30 @@ impl Printer<'_> {
         };
         Ok(Dim {
             cap,
+            physical: self.execution.storage.capacity_expression(s),
+            physical_value: self.target_sym(&self.execution.storage.capacity_expression(s))?,
             ext,
             value: self.target_sym(s)?,
         })
     }
 
+    fn physical_count(dims: &[Dim]) -> TE {
+        dims.iter().fold(TE::integer(1), |count, dim| TE::binary(BinaryOp::Mul, count, dim.physical_value.clone(), TT::I32))
+    }
+    fn physical_strides(dims: &[Dim]) -> Vec<Sym> {
+        let mut strides = vec![Sym::constant(1); dims.len()];
+        let mut stride = Sym::constant(1);
+        for index in (0..dims.len()).rev() { strides[index] = stride.clone(); stride = stride.mul(&dims[index].physical); }
+        strides
+    }
+    fn nonzero_divisor(value: TE) -> TE {
+        TE::Select(Box::new(TE::binary(BinaryOp::Lt, value.clone(), TE::integer(1), TT::Bool)), Box::new(TE::integer(1)), Box::new(value))
+    }
+    fn physical_slots(dims: &[Dim]) -> TE {
+        let count = Self::physical_count(dims);
+        TE::binary(BinaryOp::Add, TE::binary(BinaryOp::Div, count.clone(), TE::integer(SUBGROUP), TT::I32),
+            TE::binary(BinaryOp::Ne, TE::binary(BinaryOp::Rem, count, TE::integer(SUBGROUP), TT::I32), TE::integer(0), TT::Bool).cast(TT::I32), TT::I32)
+    }
     /// All value identities are established before printing.
     fn vars(&self) -> &[Var] {
         &self.f.vars
@@ -439,6 +626,7 @@ impl Printer<'_> {
     fn emit(mut self) -> Result<Emitted, String> {
         let mut header = String::new();
         header.push_str("#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\n#pragma clang fp contract(off)\nusing namespace metal;\n\n");
+        header.push_str(crate::terminal::VALUE_SELECTION_SUPPORT);
         header.push_str(&crate::support::render(self.execution.support()));
         let mut index = 0usize;
         let mut params_sig: Vec<String> = Vec::new();
@@ -629,17 +817,17 @@ impl Printer<'_> {
         let body = &self.f.body;
         let parameter_realizations = self.real.clone();
         let parameter_names = self.names.clone();
+        let parameter_expressions = self.expressions.clone();
         for (k, stmt) in body.iter().enumerate() {
             self.real = parameter_realizations.clone();
             self.names = parameter_names.clone();
-            self.expressions.clear();
+            self.expressions = parameter_expressions.clone();
             self.local_planes.clear();
             let mut split_tails = Vec::new();
             let phase = &self.execution.phases[k];
             let StmtKind::Parallel { vars, body, .. } = &stmt.kind else {
                 unreachable!()
             };
-            let split_here = phase.split.is_some();
             if let Some(split) = &phase.split {
                 let VarKind::Index(Atom::Param(atom)) = &self.f.vars[split.part].kind else {
                     unreachable!()
@@ -660,28 +848,33 @@ impl Printer<'_> {
             self.simdgroups = sg_per_tg;
             self.emit_storage(&phase.dispatch)?;
             self.emit_prologue(vars, &phase.dispatch)?;
-            if split_here {
+            self.implementation_phase(k, &mut |printer, _| {
+            if let Some(split) = &phase.split {
                 // Each part streams its slice and publishes its carried state to scratch.
                 // A second launch folds the parts together with the loop body's own merge
                 // rule and runs the tail, so the kernel text never mentions either.
-                let split = phase.split.as_ref().unwrap();
-                self.block(&body[..split.loop_at])?;
-                self.block(&split.validation_bindings)?;
-                for view in &split.original_views {
-                    self.view_of(view)?;
-                }
                 let carried = split.carried.clone();
-                self.block(&body[split.loop_at..split.loop_at + 1])?;
-                self.publish_partials(k, &carried, "item")?;
+                let emit_split = &mut |printer: &mut Self, _: usize| {
+                    printer.block(&body[..split.loop_at])?;
+                    printer.block(&split.validation_bindings)?;
+                    for view in &split.original_views { printer.view_of(view)?; }
+                    printer.block(&body[split.loop_at..split.loop_at + 1])?;
+                    printer.publish_partials(k, &carried, "item")
+                };
+                if let Some(retained) = &split.retained {
+                    printer.implementation_arms(&[retained.selector.clone()], emit_split)?;
+                    printer.block(&body[retained.ordinary_at..])?;
+                } else { emit_split(printer, 0)?; }
+                printer.block(&[])
+            } else { printer.block(body) }
+            })?;
+            if let Some(split) = &phase.split {
                 split_tails.push(SplitTail {
                     phase: k,
                     kernel: kernel.clone(),
-                    carried,
-                    body: body[split.loop_at + 1..].to_vec(),
+                    carried: split.carried.clone(),
+                    body: body[split.loop_at + 1..split.retained.as_ref().map_or(body.len(), |retained| retained.ordinary_at)].to_vec(),
                 });
-                self.block(&[])?;
-            } else {
-                self.block(body)?;
             }
             self.target(TS::Return(None));
             self.realize_kernel()?;
@@ -705,7 +898,9 @@ impl Printer<'_> {
             for (d, _) in self.shared_decls.drain(..) {
                 self.out.push_str(&format!("  {d}\n"));
             }
+            if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_begin_{}__*/\n", self.memory_launch)); }
             self.out.push_str(&kernel_out);
+            if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_end_{}__*/\n", self.memory_launch)); }
             self.out.push_str("}\n\n");
             let after_barrier = self.execution.memory.launches()[launches.len()]
                 .predecessor
@@ -733,7 +928,7 @@ impl Printer<'_> {
                 let dispatch = self.execution.phases[k].merge_dispatch.as_ref().unwrap();
                 self.real = parameter_realizations.clone();
                 self.names = parameter_names.clone();
-                self.expressions.clear();
+                self.expressions = parameter_expressions.clone();
                 self.local_planes.clear();
                 let kernel = format!("{first}_merge");
                 let mut kernel_out = String::new();
@@ -743,15 +938,17 @@ impl Printer<'_> {
                 self.simdgroups = sg_per_tg;
                 self.emit_storage(dispatch)?;
                 self.emit_prologue(vars, dispatch)?;
-                self.merge_partials(
-                    k,
-                    &carried,
-                    &self.execution.phases[k].split.as_ref().unwrap().merges,
-                    self.f.body[k]
-                        .id
-                        .ok_or("merge phase has no operation identity")?,
-                )?;
-                self.block(&tail)?;
+                let split = self.execution.phases[k].split.as_ref().unwrap();
+                let emit_merge = &mut |printer: &mut Self, _: usize| {
+                    printer.merge_partials(k, &carried, &split.merges,
+                        printer.f.body[k].id.ok_or("merge phase has no operation identity")?)?;
+                    printer.block(&tail)
+                };
+                self.implementation_phase(k, &mut |printer, _| {
+                    if let Some(retained) = &split.retained {
+                        printer.implementation_arms(&[retained.selector.clone()], emit_merge)
+                    } else { emit_merge(printer, 0) }
+                })?;
                 self.target(TS::Return(None));
                 self.realize_kernel()?;
                 self.indent = 0;
@@ -769,7 +966,9 @@ impl Printer<'_> {
                 for (d, _) in self.shared_decls.drain(..) {
                     self.out.push_str(&format!("  {d}\n"));
                 }
+                if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_begin_{}__*/\n", self.memory_launch)); }
                 self.out.push_str(&kernel_out);
+                if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_end_{}__*/\n", self.memory_launch)); }
                 self.out.push_str("}\n\n");
                 let after_barrier = self.execution.memory.launches()[launches.len()]
                     .predecessor
@@ -805,6 +1004,17 @@ impl Printer<'_> {
     }
 
     fn emit_prologue(&mut self, vars: &[VarId], dispatch: &GroupDispatch) -> Result<(), String> {
+        if let Some(launches) = &self.execution.launch_parameters {
+            let launch = launches.get(self.memory_launch).cloned().ok_or("missing retained launch mapping")?;
+            let names = vars.iter().map(|&variable| self.index_name(variable)).collect::<Vec<_>>();
+            let grouping = if self.grouping_parameters {
+                TE::variable(grouping_parameter(self.memory_launch), TT::U32)
+            } else { TE::Integer(dispatch.items_per_group as i64, TT::U32) };
+            for site in launch.program(self.memory_launch, grouping, &names, self.parameters)? {
+                self.target(site.statement);
+            }
+            return Ok(());
+        }
         use crate::support::{Helper, LaunchOperation as O, LaunchValue as V};
         use crate::terminal::{Expression as E, Statement as S, Type as T};
         let program = self.execution.memory.launches()[self.memory_launch]
@@ -826,6 +1036,7 @@ impl Printer<'_> {
         for (n, step) in program.steps.iter().enumerate() {
             let expression = match step.operation {
                 O::Add(a, b) => E::binary(BinaryOp::Add, value(a), value(b), T::U32),
+                O::Multiply(V::Group, _) if self.grouping_parameters => E::binary(BinaryOp::Mul, value(V::Group), E::variable(grouping_parameter(self.memory_launch), T::U32), T::U32),
                 O::Multiply(a, b) => E::binary(BinaryOp::Mul, value(a), value(b), T::U32),
                 O::Divide(a, b) => E::binary(BinaryOp::Div, value(a), value(b), T::U32),
                 O::Remainder(a, b) => E::binary(BinaryOp::Rem, value(a), value(b), T::U32),
@@ -902,7 +1113,214 @@ impl Printer<'_> {
         result
     }
 
+    /// Compile one operation under the layout bindings that operation consumes.
+    /// Only its header expressions participate; choices in nested bodies remain
+    /// local to those bodies and are emitted after the surrounding control once.
+    fn retained_statement(&mut self, statement: &Stmt) -> Result<(), String> {
+        if let StmtKind::If { cond: Expr { kind: ExprKind::Var(variable), .. }, then, els } = &statement.kind {
+            if let Some(family) = self.execution.implementation.clone() {
+                let symbol = variable_symbol(&self.vars()[*variable], *variable);
+                if let Some(negative) = family.source_negations.get(&symbol) {
+                    return self.implementation_arms(&[symbol, negative.clone()], &mut |printer, ordinal| {
+                        printer.block(if ordinal == 0 { then } else { els })
+                    });
+                }
+            }
+        }
+        let mut header = statement.clone();
+        match &mut header.kind {
+            StmtKind::Parallel { body, .. } | StmtKind::Owned { body, .. }
+            | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. }
+            | StmtKind::LoadLoop { body, .. } => body.clear(),
+            StmtKind::If { then, els, .. } => { then.clear(); els.clear(); },
+            _ => {},
+        }
+        let dependent = self.real.iter().filter(|(variable, _)| seismic_lang::effects::uses(&header, **variable))
+            .filter_map(|(&variable, value)| match value {
+                Realization::Choice { arms } => Some((variable, arms.clone())), _ => None,
+            }).min_by_key(|(variable, _)| *variable);
+        if let Some((variable, arms)) = dependent {
+            let predicates = arms.iter().map(|(predicate, _)| predicate.clone()).collect::<Vec<_>>();
+            return self.implementation_arms(&predicates, &mut |printer, ordinal| {
+                printer.real.insert(variable, (*arms[ordinal].1).clone());
+                printer.retained_statement(statement)
+            });
+        }
+        if let StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), .. }, value, .. } = &statement.kind {
+            if let Some(family) = self.execution.implementation.clone() {
+                if matches!(statement.kind, StmtKind::Assign { ref target, .. } if matches!(target.ty, Ty::Tile(_)))
+                    && !matches!(value.kind, ExprKind::Load { .. } | ExprKind::Builtin { name: Builtin::Reduce, .. }) {
+                    if let Some(choice) = family.storage.get(variable) {
+                        if self.implementation_value(choice).is_none() {
+                            let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                            return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
+                        }
+                    }
+                }
+                if let ExprKind::Builtin { name: Builtin::Reduce, args } = &value.kind {
+                    if !matches!(args.get(2).map(|argument| &argument.kind), Some(ExprKind::Int(3))) {
+                        if let Some(Expr { kind: ExprKind::Var(input), .. }) = args.first() {
+                            if matches!(self.real.get(input), Some(Realization::View { .. })) {
+                                if let Some(choice) = family.storage.get(input) {
+                                    if self.implementation_value(choice).is_none() {
+                                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                                        return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(choice) = statement.id.and_then(|operation| family.reductions.get(&(operation, *variable))) {
+                        if self.implementation_value(choice).is_none() {
+                            let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                            return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
+                        }
+                    }
+                }
+            }
+        }
+        self.stmt_selected(statement)
+    }
+    fn implementation_guards(&self) -> Vec<magnitude_solver::model::Literal> {
+        let Some(family) = &self.execution.implementation else { return Vec::new(); };
+        let predicates = family.predicates();
+        self.active_implementations.iter().filter_map(|(name, &active)| predicates.get(name)
+            .map(|&variable| magnitude_solver::model::Literal::new(variable, i64::from(active)))).collect()
+    }
+    fn require_native_zero(&self, expression: Sym) -> Result<(), String> {
+        if let Some(family) = &self.execution.implementation {
+            family.native_requirements.lock().map_err(|_| "retained native requirements were poisoned")?
+                .push((self.implementation_guards(), expression));
+        }
+        Ok(())
+    }
+    fn require_uniform_participation(&self) -> Result<(), String> {
+        if let Some(family) = &self.execution.implementation {
+            if self.owned_ctx.iter().any(|(_, _, slot)| slot.is_some()) {
+                family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(self.implementation_guards());
+            }
+            for (extent, run) in &self.lane_domains {
+                let expression = extent.rem(&Sym::constant(*run));
+                if expression.eval_interval(&|name| self.execution.numeric_parameters.get(name)
+                    .and_then(|value| Some((i64::try_from(value.bounds().0).ok()?, i64::try_from(value.bounds().1).ok()?)))).is_some() {
+                    self.require_native_zero(expression)?;
+                } else if expression.as_constant() != Some(0) {
+                    family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(self.implementation_guards());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn reduction_selection(&self, site: crate::reduction::Site) -> Result<Option<crate::reduction::Selected>, String> {
+        let Some(family) = &self.execution.implementation else { return self.execution.reductions.get(site).cloned().map(Some); };
+        let key = (site.operation, site.output);
+        let original = family.reduction_definitions.get(&key).ok_or("retained reduction lost its numerical contract")?;
+        let mut selected = original.clone();
+        let input = self.real.get(&selected.decision.input).ok_or("retained reduction input is unrealized")?;
+        let argmax = selected.decision.contract.operation == ReduceOp::Argmax;
+        selected.decision.materialize_input = !argmax && matches!(input, Realization::View { .. });
+        selected.decision.input_placement = match input {
+            Realization::Shared { .. } => Some(TilePlacement::GroupShared),
+            Realization::Distributed { .. } => Some(TilePlacement::Distributed),
+            Realization::Replicated { .. } => Some(TilePlacement::Replicated),
+            Realization::View { .. } if argmax => None,
+            Realization::View { .. } => family.storage.get(&selected.decision.input).and_then(|choice| self.implementation_value(choice)),
+            _ => return Err("retained reduction input has no addressable local binding".into()),
+        };
+        selected.decision.full_lanes = self.owned_ctx.iter().all(|(_, _, slot)| slot.is_none())
+            && self.lane_domains.iter().all(|(extent, run)| extent.as_constant().is_none_or(|extent| extent % run == 0));
+        let ordered = selected.decision.contract.ordered
+            || matches!(selected.decision.contract.input, DType::BF16 | DType::F16)
+            || selected.decision.contract.combination() == seismic_lang::reduction::Combination::SaturatingAdd;
+        selected.decision.domain = selected.decision.domain.placement_variant(selected.decision.input_placement.clone(), argmax,
+            selected.decision.full_lanes, selected.decision.contract.input, ordered)?;
+        selected.algorithm = self.implementation_value(family.reductions.get(&key).ok_or("retained reduction has no algorithm domain")?)
+            .ok_or("retained reduction algorithm remains unresolved in its local arm")?;
+        if !selected.decision.domain.algorithms().contains(&selected.algorithm)
+            || (!selected.decision.full_lanes && ((selected.decision.input_placement == Some(TilePlacement::Distributed)
+                && selected.algorithm != crate::reduction::Algorithm::LaneLocal)
+                || (selected.decision.materialize_input && selected.decision.input_placement == Some(TilePlacement::GroupShared)))) {
+            let predicates = family.predicates();
+            let guards = self.active_implementations.iter().filter_map(|(name, &active)| predicates.get(name)
+                .map(|&variable| magnitude_solver::model::Literal::new(variable, i64::from(active)))).collect();
+            family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(guards);
+            return Ok(None);
+        }
+        if selected.algorithm == crate::reduction::Algorithm::Collective
+            || (selected.decision.input_placement == Some(TilePlacement::Distributed) && selected.algorithm != crate::reduction::Algorithm::LaneLocal)
+            || (selected.decision.materialize_input && selected.decision.input_placement == Some(TilePlacement::GroupShared)) {
+            self.require_uniform_participation()?;
+        }
+        selected.output = selected.decision.domain.output(selected.algorithm, self.vars()[site.output].name.clone())?;
+        Ok(Some(selected))
+    }
+    fn record_reduction(&self, selected: &crate::reduction::Selected, axis: usize) -> Result<(), String> {
+        if let Some(family) = &self.execution.implementation {
+            let shape = self.vars()[selected.decision.input].ty.shaped().ok_or("retained reduction input has no shape")?.shape.iter()
+                .map(|extent| self.execution.storage.capacity_expression(extent)).collect();
+            family.reduction_bindings.lock().map_err(|_| "retained reduction bindings were poisoned")?
+                .entry((selected.decision.site.operation, selected.decision.site.output)).or_default().push(crate::family::layout::ReductionBinding {
+                    guards: self.implementation_guards(), selected: selected.clone(), shape, axis, lane_domains: self.lane_domains.clone() });
+        }
+        Ok(())
+    }
+    fn implementation_value<T: Clone>(&self, choice: &crate::family::layout::Choice<T>) -> Option<T> {
+        choice.arms.iter().find(|arm| self.active_implementations.get(&arm.predicate) == Some(&true)).map(|arm| arm.value.clone())
+            .or_else(|| (choice.arms.len() == 1).then(|| choice.arms[0].value.clone()))
+    }
+    fn implementation_phase(&mut self, phase: usize, emit: &mut dyn FnMut(&mut Self, usize) -> Result<(), String>) -> Result<(), String> {
+        let predicate = self.execution.implementation.as_ref().and_then(|family| family.phase_predicates.get(phase)).cloned().flatten();
+        if let Some(predicate) = predicate { self.implementation_arms(&[predicate], emit) }
+        else { emit(self, 0) }
+    }
+    fn implementation_arms(&mut self, predicates: &[String], emit: &mut dyn FnMut(&mut Self, usize) -> Result<(), String>) -> Result<(), String> {
+        if let Some(ordinal) = predicates.iter().position(|predicate| self.active_implementations.get(predicate) == Some(&true)) {
+            return emit(self, ordinal);
+        }
+        let original_real = self.real.clone();
+        let original_names = self.names.clone();
+        let original_expressions = self.expressions.clone();
+        let original_active = self.active_implementations.clone();
+        let mut results = Vec::new();
+        let mut names = original_names.clone();
+        let mut expressions = original_expressions.clone();
+        for (ordinal, predicate) in predicates.iter().enumerate() {
+            if original_active.get(predicate) == Some(&false) { continue; }
+            self.real = original_real.clone();
+            self.names = original_names.clone();
+            self.expressions = original_expressions.clone();
+            self.active_implementations = original_active.clone();
+            for candidate in predicates { self.active_implementations.insert(candidate.clone(), candidate == predicate); }
+            if self.execution.implementation.as_ref().is_some_and(|family|
+                !family.compatible_ownership(&self.active_implementations)) { continue; }
+            self.target(TS::If(TE::variable(predicate, TT::Bool)));
+            self.indent += 1;
+            emit(self, ordinal)?;
+            self.indent -= 1;
+            self.target(TS::End);
+            results.push((predicate.clone(), self.real.clone()));
+            names.extend(self.names.clone()); expressions.extend(self.expressions.clone());
+        }
+        self.active_implementations = original_active;
+        self.names = names;
+        self.expressions = expressions;
+        self.real = original_real;
+        let variables = results.iter().flat_map(|(_, bindings)| bindings.keys().copied()).collect::<std::collections::BTreeSet<_>>();
+        for variable in variables {
+            let arms = results.iter().filter_map(|(predicate, bindings)| bindings.get(&variable)
+                .map(|value| (predicate.clone(), Box::new(value.clone())))).collect::<Vec<_>>();
+            if arms.is_empty() { continue; }
+            let value = if arms.len() == results.len() && arms.iter().all(|(_, value)| **value == *arms[0].1) {
+                (*arms[0].1).clone()
+            } else { Realization::Choice { arms } };
+            self.real.insert(variable, value);
+        }
+        Ok(())
+    }
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        if self.execution.implementation.is_some() { self.retained_statement(s) } else { self.stmt_selected(s) }
+    }
+    fn stmt_selected(&mut self, s: &Stmt) -> Result<(), String> {
         let previous = (self.current_operation, self.collective_ordinal);
         self.current_operation = s.id;
         self.collective_ordinal = 0;
@@ -953,6 +1371,7 @@ impl Printer<'_> {
                     .checked_mul(*width)
                     .filter(|n| *n > 0)
                     .ok_or("invalid lane run extent")?;
+                let lane_domain = (extent.clone(), run);
                 let extent = self.target_sym(extent)?.cast(TT::I64);
                 let divisor = TE::Integer(run, TT::I64);
                 let runs = TE::binary(
@@ -1017,7 +1436,10 @@ impl Printer<'_> {
                     ty: TT::I32,
                     value: coordinate.cast(TT::I32),
                 });
-                self.block(body)?;
+                self.lane_domains.push(lane_domain);
+                let result = self.block(body);
+                self.lane_domains.pop();
+                result?;
                 self.indent -= 1;
                 self.target(TS::End);
                 self.indent -= 1;
@@ -1195,9 +1617,7 @@ impl Printer<'_> {
                             let realized = match r {
                                 Realization::Geometry { mut dims, .. } => {
                                     dims[*axis] = self.dim(&Sym::atom(piece.clone()))?;
-                                    let strides = row_major_syms(
-                                        &dims.iter().map(|d| d.cap).collect::<Vec<_>>(),
-                                    );
+                                    let strides = Self::physical_strides(&dims);
                                     Realization::Geometry { dims, strides }
                                 }
                                 Realization::View {
@@ -1283,14 +1703,13 @@ impl Printer<'_> {
                     Realization::Shared { dims, .. } => {
                         // Threadgroup memory: elements are spread over the lanes in the same
                         // order a distributed tile uses, then a barrier publishes them.
-                        let n_cap: i64 = dims.iter().map(|d| d.cap).product();
-                        let slots = n_cap / SUBGROUP + i64::from(n_cap % SUBGROUP != 0);
+                        let slots = Self::physical_slots(&dims);
                         let j = self.fresh("slot");
                         let e = self.fresh("e");
                         self.target(TS::For {
                             name: j.clone(),
                             start: TE::integer(0),
-                            end: TE::integer(slots),
+                            end: slots.clone(),
                             step: 1,
                         });
                         self.indent += 1;
@@ -1327,7 +1746,7 @@ impl Printer<'_> {
                         self.target(TS::For {
                             name: j.clone(),
                             start: TE::integer(0),
-                            end: TE::integer(slots),
+                            end: slots.clone(),
                             step: 1,
                         });
                         self.indent += 1;
@@ -1423,15 +1842,15 @@ impl Printer<'_> {
             }
             return TE::Integer(0, TT::Bool);
         }
-        let mut stride = n_cap;
+
         let mut guard = TE::binary(
             BinaryOp::Lt,
             TE::variable(e, TT::I32),
-            TE::integer(n_cap),
+            Self::physical_count(dims),
             TT::Bool,
         );
-        for (name, d) in names.iter().zip(dims) {
-            stride /= d.cap;
+        for (axis, (name, d)) in names.iter().zip(dims).enumerate() {
+            let stride = Self::nonzero_divisor(Self::physical_count(&dims[axis + 1..]));
             self.target(TS::Let {
                 name: name.clone(),
                 ty: TT::I32,
@@ -1440,10 +1859,10 @@ impl Printer<'_> {
                     TE::binary(
                         BinaryOp::Div,
                         TE::variable(e, TT::I32),
-                        TE::integer(stride),
+                        stride,
                         TT::I32,
                     ),
-                    TE::integer(d.cap),
+                    Self::nonzero_divisor(d.physical_value.clone()),
                     TT::I32,
                 ),
             });
@@ -1522,7 +1941,7 @@ impl Printer<'_> {
                         param: name,
                         elem: Elem::Dtype(dtype),
                         offset: Sym::constant(0),
-                        strides: row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>()),
+                        strides: Self::physical_strides(&dims),
                         shape: self.realized_shape(&dims),
                     })
                 }
@@ -1589,7 +2008,7 @@ impl Printer<'_> {
         dims.iter()
             .map(|d| {
                 if d.is_static() {
-                    Sym::constant(d.cap)
+                    d.physical.clone()
                 } else {
                     // Retain the captured dimension, not a checked atom that a
                     // later view evaluation can bind to a different occurrence.
@@ -1627,7 +2046,7 @@ impl Printer<'_> {
                         .ok_or("indexed view rank mismatch")?;
                     let atoms = checked.atoms();
                     if let [Atom::Param(atom)] = atoms.as_slice() {
-                        if *checked == Sym::param(atom) {
+                        if *checked == Sym::param(atom) && !self.execution.numeric_parameters.contains_key(atom) {
                             // The checked shape names the current evaluation.
                             // Captured bounds are symbolic too; a sibling branch
                             // must bind its own extent before allocating a tile.
@@ -1670,12 +2089,14 @@ impl Printer<'_> {
             .map(|(actual, checked)| {
                 Ok(Dim {
                     cap: self.cap(checked)?,
+                    physical: self.execution.storage.capacity_expression(checked),
+                    physical_value: self.target_sym(&self.execution.storage.capacity_expression(checked))?,
                     ext: self.sym(actual)?,
                     value: self.target_sym(actual)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+        let strides = Self::physical_strides(&dims);
         Ok(Realization::Geometry { dims, strides })
     }
 
@@ -1694,6 +2115,21 @@ impl Printer<'_> {
         strides: &[Sym],
         target: &[Sym],
     ) -> Result<Vec<Sym>, String> {
+        let row_major = |dimensions: &[Sym]| {
+            let mut result = vec![Sym::constant(1); dimensions.len()];
+            let mut stride = Sym::constant(1);
+            for axis in (0..dimensions.len()).rev() { result[axis] = stride.clone(); stride = stride.mul(&dimensions[axis]); }
+            result
+        };
+        let product = |dimensions: &[Sym]| dimensions.iter().fold(Sym::constant(1), |count, extent| count.mul(extent));
+        if shape.len() == strides.len() && product(shape) == product(target) {
+            let contiguous = row_major(shape);
+            if shape.iter().zip(strides).zip(&contiguous).all(|((extent, stride), expected)|
+                extent.as_constant() == Some(1) || stride == expected) {
+                return Ok(row_major(target));
+            }
+            if shape == target { return Ok(strides.to_vec()); }
+        }
         let resolve = |dims: &[Sym]| {
             dims.iter()
                 .map(|s| {
@@ -1727,27 +2163,20 @@ impl Printer<'_> {
                 Some(Realization::Replicated { dims, .. })
                 | Some(Realization::Distributed { dims, .. })
                 | Some(Realization::Shared { dims, .. }) => {
-                    let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+                    let strides = Self::physical_strides(&dims);
                     Ok((self.realized_shape(&dims), strides))
                 }
                 _ => Err("extent requires a realized shaped value".into()),
             },
             ExprKind::TileAlloc { shape, .. } => {
                 let dims = self.dims(shape)?;
-                let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+                let strides = Self::physical_strides(&dims);
                 Ok((self.realized_shape(&dims), strides))
             }
             ExprKind::Load { view: source, .. } => {
                 let (shape, _) = self.geometry_of(source)?;
-                let capacities = view
-                    .ty
-                    .shaped()
-                    .ok_or("load has no geometry")?
-                    .shape
-                    .iter()
-                    .map(|dim| self.cap(dim))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((shape, row_major_syms(&capacities)))
+                let dimensions = self.dims(&view.ty.shaped().ok_or("load has no geometry")?.shape)?;
+                Ok((shape, Self::physical_strides(&dimensions)))
             }
             ExprKind::Index { base, indices } => {
                 let (shape, strides) = self.geometry_of(base)?;
@@ -2041,11 +2470,22 @@ impl Printer<'_> {
         operation: OperationId,
     ) -> Result<(), String> {
         let root = crate::storage::tile_root(tile).ok_or("owned view has no allocation")?;
+        if matches!(self.real.get(&root), Some(Realization::Geometry { .. } | Realization::View { .. })) {
+            if let Some(family) = self.execution.implementation.clone() {
+                if let Some(choice) = family.owners.get(&root) {
+                    if self.implementation_value(choice).is_none() {
+                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                        return self.implementation_arms(&predicates, &mut |printer, _| printer.owned_view(vars, tile, body, operation));
+                    }
+                }
+            }
+        }
         let shared = match self.real.get(&root) {
             Some(Realization::Replicated { .. }) => false,
             Some(Realization::Shared { .. }) => true,
             Some(Realization::Geometry { .. } | Realization::View { .. }) => {
-                self.execution.storage.owned_cooperative(root)
+                self.execution.implementation.as_ref().and_then(|family| family.owners.get(&root))
+                    .and_then(|choice| self.implementation_value(choice)).unwrap_or_else(|| self.execution.storage.owned_cooperative(root))
             }
             _ => return Err("owned view requires addressable selected tile storage".into()),
         };
@@ -2057,14 +2497,14 @@ impl Printer<'_> {
             .map(|(actual, checked)| {
                 Ok(Dim {
                     cap: self.cap(checked)?,
+                    physical: self.execution.storage.capacity_expression(checked),
+                    physical_value: self.target_sym(&self.execution.storage.capacity_expression(checked))?,
                     ext: self.sym(actual)?,
                     value: self.target_sym(actual)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let count = dims
-            .iter()
-            .try_fold(1i64, |n, d| n.checked_mul(d.cap))
+        dims.iter().try_fold(1i64, |count, dimension| count.checked_mul(dimension.cap))
             .ok_or("owned view capacity overflow")?;
         if dims.len() != vars.len() {
             return Err("owned view coordinate rank differs".into());
@@ -2077,7 +2517,7 @@ impl Printer<'_> {
             } else {
                 TE::integer(0)
             },
-            end: TE::integer(count),
+            end: Self::physical_count(&dims),
             step: if shared { SUBGROUP } else { 1 },
         });
         self.indent += 1;
@@ -2085,7 +2525,16 @@ impl Printer<'_> {
         let guard = self.distributed_guard(&flat, &dims, &names);
         self.target(TS::If(guard));
         self.indent += 1;
-        self.block(body)?;
+        let slot = if shared {
+            let slot = self.fresh("view_slot");
+            self.target(TS::Let { name: slot.clone(), ty: TT::I32,
+                value: TE::binary(BinaryOp::Div, TE::variable(&flat, TT::I32), TE::integer(SUBGROUP), TT::I32) });
+            Some(slot)
+        } else { None };
+        self.owned_ctx.push((root, names, slot));
+        let result = self.block(body);
+        self.owned_ctx.pop();
+        result?;
         self.indent -= 1;
         self.target(TS::End);
         self.indent -= 1;
@@ -2098,6 +2547,39 @@ impl Printer<'_> {
     }
 
     fn emit_storage(&mut self, dispatch: &GroupDispatch) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            let memory_launch = self.memory_launch;
+            for (index, request) in family.allocations.iter().enumerate().filter(|(_, request)| request.launch == memory_launch) {
+                let own = request.owner.arms.iter().find(|arm| arm.value == index).ok_or("retained backing lacks its defining arm")?;
+                for placement in &request.placements {
+                    self.parameters.arrays.push(parameters::Array { launch: self.memory_launch, id: request.allocation.id,
+                        symbol: request.allocation.declaration.symbol.clone(), dtype: request.allocation.declaration.dtype,
+                        placement: placement.value.clone(), capacity: request.capacity,
+                        guards: vec![magnitude_solver::model::Literal::new(request.active, 1), magnitude_solver::model::Literal::new(placement.active, 1)] });
+                    let symbol = crate::family::layout::Family::backing_symbol(index, &placement.value);
+                    let guards = vec![magnitude_solver::model::Literal::new(request.active, 1), magnitude_solver::model::Literal::new(own.active, 1), magnitude_solver::model::Literal::new(placement.active, 1)];
+                    let allocation = parameters::Allocation { launch: self.memory_launch, symbol: symbol.clone(),
+                        dtype: request.allocation.declaration.dtype, placement: placement.value.clone(),
+                        capacity: request.backing_capacity, guards };
+                    if placement.value == TilePlacement::GroupShared {
+                        let capacity = self.parameters.expression(format!("seismic_family_capacity_{}__", request.backing_capacity.id().0), request.backing_capacity);
+                        self.shared_decls.push((format!("{}threadgroup {} {}[{} * {}];\n{}", allocation.boundary(false),
+                            ctype(allocation.dtype), symbol, capacity.render(), grouping_parameter(self.memory_launch), allocation.boundary(true)), 0));
+                    } else {
+                        for predicate in [format!("seismic_allocation_active_{}__", request.active.0), own.predicate.clone(), placement.predicate.clone()] {
+                            self.target(TS::If(TE::variable(predicate, TT::Bool))); self.indent += 1;
+                        }
+                        let declaration = TileDeclaration { symbol: symbol.clone(), dtype: allocation.dtype,
+                            placement: placement.value.clone(), capacity: request.backing_capacity.bounds().1 };
+                        let layout = declaration.layout(dispatch)?;
+                        self.target(TS::Array { name: symbol, ty: allocation.dtype.into(), elements: layout.private_elements_per_lane });
+                        for _ in 0..3 { self.indent -= 1; self.target(TS::End); }
+                    }
+                    self.parameters.allocations.push(allocation);
+                }
+            }
+            return Ok(());
+        }
         let slots = self.execution.memory.launches()[self.memory_launch]
             .slots
             .clone();
@@ -2109,7 +2591,9 @@ impl Printer<'_> {
                         "threadgroup {} {}[{}];",
                         ctype(declaration.dtype),
                         declaration.symbol,
-                        layout.shared_elements_per_item * dispatch.items_per_group
+                        if self.grouping_parameters {
+                            format!("{} * {}", layout.shared_elements_per_item, grouping_parameter(self.memory_launch))
+                        } else { (layout.shared_elements_per_item * dispatch.items_per_group).to_string() }
                     ),
                     layout.shared_bytes_per_group,
                 ));
@@ -2123,7 +2607,26 @@ impl Printer<'_> {
         }
         Ok(())
     }
+    fn allocation_placement(&self, request: &crate::family::layout::AllocationRequest) -> Option<TilePlacement> {
+        request.placements.iter().find(|arm| self.active_implementations.get(&arm.predicate) == Some(&true)).map(|arm| arm.value.clone())
+            .or_else(|| (request.placements.len() == 1).then(|| request.placements[0].value.clone()))
+            .or_else(|| self.execution.implementation.as_ref().and_then(|family| family.reductions.get(&(request.allocation.id.operation, request.allocation.id.variable)))
+                .and_then(|choice| self.implementation_value(choice)).map(|algorithm| if algorithm == crate::reduction::Algorithm::LaneLocal { TilePlacement::Distributed } else { TilePlacement::Replicated }))
+    }
     fn allocation(&mut self, id: AllocationId) -> Result<TileDeclaration, String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            let request = family.allocations.iter().find(|request| request.launch == self.memory_launch && request.allocation.id == id)
+                .ok_or("native allocation has no retained local request")?;
+            family.allocation_uses.lock().map_err(|_| "retained allocation uses were poisoned")?
+                .entry((self.memory_launch, id)).or_default().push(self.implementation_guards());
+            let placement = self.allocation_placement(request).ok_or("native allocation placement remains unresolved in its local arm")?;
+            let mut declaration = request.allocation.declaration.clone();
+            declaration.placement = placement;
+            declaration.capacity = request.capacity.bounds().1;
+            self.tile_declarations.push(declaration.clone());
+            self.barrier(BarrierSite { operation: id.operation, variable: id.variable, purpose: BarrierPurpose::Reuse(id.purpose) })?;
+            return Ok(declaration);
+        }
         let launch = self
             .execution
             .memory
@@ -2150,6 +2653,22 @@ impl Printer<'_> {
         Ok(declaration)
     }
     fn bind_allocation(&mut self, id: AllocationId, name: &str) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            let request = family.allocations.iter().find(|request| request.launch == self.memory_launch && request.allocation.id == id)
+                .ok_or("native pointer has no retained allocation request")?;
+            let placement = self.allocation_placement(request).ok_or("pointer placement is outside its guarded local definition")?;
+            let predicates = request.owner.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+            return self.implementation_arms(&predicates, &mut |printer, ordinal| {
+                let owner = request.owner.arms[ordinal].value;
+                let backing = &family.allocations[owner];
+                let shared = placement == TilePlacement::GroupShared;
+                let capacity = printer.parameters.expression(format!("seismic_family_capacity_{}__", backing.backing_capacity.id().0), backing.backing_capacity);
+                printer.target(TS::Pointer { name: name.into(), base: crate::family::layout::Family::backing_symbol(owner, &placement),
+                    index: if shared { TE::binary(BinaryOp::Mul, TE::variable("sg_id", TT::U32), capacity, TT::U32) } else { TE::Integer(0, TT::U32) },
+                    space: if shared { TSpa::Threadgroup } else { TSpa::Private }, ty: request.allocation.declaration.dtype.into() });
+                Ok(())
+            });
+        }
         let launch = &self.execution.memory.launches()[self.memory_launch];
         let allocation = launch
             .arrays
@@ -2183,6 +2702,34 @@ impl Printer<'_> {
     }
 
     fn barrier(&mut self, site: BarrierSite) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            if let BarrierPurpose::Reuse(purpose) = site.purpose {
+                if let Some(request) = family.allocations.iter().find(|request| request.launch == self.memory_launch
+                    && request.allocation.id == (AllocationId { operation: site.operation, variable: site.variable, purpose })) {
+                    let shared = request.placements.iter().find(|arm| arm.value == TilePlacement::GroupShared);
+                    if let Some(shared) = shared {
+                        if self.active_implementations.get(&shared.predicate) == Some(&false) { return Ok(()); }
+                        self.target(TS::If(TE::variable(&shared.predicate, TT::Bool))); self.indent += 1;
+                        self.target(TS::If(TE::variable(format!("seismic_reuse_{}__", request.shared_reuse.0), TT::Bool))); self.indent += 1;
+                        self.target(TS::Barrier);
+                        self.indent -= 1; self.target(TS::End); self.indent -= 1; self.target(TS::End);
+                    }
+                }
+                return Ok(());
+            }
+            if let Some(condition) = family.barrier_conditions.get(&(self.memory_launch, site)) {
+                let mut guard = self.implementation_guards();
+                guard.push(magnitude_solver::model::Literal::new(condition.active, 1));
+                family.barrier_uses.lock().map_err(|_| "retained publication uses were poisoned")?
+                    .entry((self.memory_launch, site)).or_default().push(guard.clone());
+                let original = self.active_implementations.insert(condition.predicate.clone(), true);
+                self.require_uniform_participation()?;
+                match original { Some(value) => { self.active_implementations.insert(condition.predicate.clone(), value); }, None => { self.active_implementations.remove(&condition.predicate); } }
+                self.target(TS::If(TE::variable(&condition.predicate, TT::Bool))); self.indent += 1;
+                self.target(TS::Barrier); self.indent -= 1; self.target(TS::End);
+            }
+            return Ok(());
+        }
         let launch = self
             .execution
             .memory
@@ -2190,7 +2737,7 @@ impl Printer<'_> {
             .get(self.memory_launch)
             .ok_or("memory launch is missing")?;
         if let Some(barrier) = launch.barriers.get(&site) {
-            if !self.emitted_barriers.insert(site) {
+            if !self.emitted_barriers.insert(site) && self.execution.implementation.is_none() {
                 return Err("duplicate emitted memory barrier".into());
             }
             match barrier.memory {
@@ -2204,6 +2751,7 @@ impl Printer<'_> {
         &mut self,
         operation: seismic_lang::intrinsics::Operation,
     ) -> Result<CollectiveImplementation, String> {
+        self.require_uniform_participation()?;
         let site = CollectiveSite {
             operation: self
                 .current_operation
@@ -2221,12 +2769,17 @@ impl Printer<'_> {
         if instruction.implementation.operation() != operation {
             return Err("collective operation differs from the prepared implementation".into());
         }
-        if !self.emitted_collectives.insert(site) {
+        if !self.emitted_collectives.insert(site) && self.execution.implementation.is_none() {
             return Err("duplicate collective emission".into());
         }
         Ok(instruction.implementation.clone())
     }
     fn finish_memory(&mut self) -> Result<Vec<TileDeclaration>, String> {
+        if self.execution.implementation.is_some() {
+            let declarations = self.execution.memory.launches()[self.memory_launch].arrays.iter().map(|array| array.declaration.clone()).collect();
+            self.tile_declarations.clear(); self.emitted_collectives.clear(); self.emitted_barriers.clear(); self.memory_launch += 1;
+            return Ok(declarations);
+        }
         let launch = self
             .execution
             .memory
@@ -2295,7 +2848,7 @@ impl Printer<'_> {
                 .try_into()
                 .map_err(|_| "negative simdgroup count")?,
         )?;
-        let layout = declaration.layout(&dispatch)?;
+        declaration.layout(&dispatch)?;
         self.bind_allocation(
             AllocationId {
                 operation,
@@ -2309,8 +2862,7 @@ impl Printer<'_> {
         } else if placement == TilePlacement::Replicated {
             Realization::Replicated { name, dims, dtype }
         } else {
-            let slots = i64::try_from(layout.private_elements_per_lane)
-                .map_err(|_| "private tile extent overflow")?;
+            let slots = Self::physical_slots(&dims);
             Realization::Distributed {
                 name,
                 dims,
@@ -2464,7 +3016,7 @@ impl Printer<'_> {
                         let exists = self.real.contains_key(v);
                         let name = match self.real.get(v) {
                             Some(Realization::Scalar { name }) => name.clone(),
-                            _ => format!("{}_{}", sanitize(&self.vars()[*v].name), v),
+                            _ => variable_symbol(&self.vars()[*v], *v),
                         };
                         if !exists {
                             if let VarKind::Index(Atom::Param(atom)) = &self.vars()[*v].kind {
@@ -2671,18 +3223,13 @@ impl Printer<'_> {
             Realization::Shared { name, dims, dtype } => (name, dims, *dtype, true, true),
             _ => return Err("tile value needs owned destination storage".into()),
         };
-        let count: i64 = dims.iter().map(|d| d.cap).product();
         let index = self.fresh("copy");
         let flat = self.fresh("element");
-        let slots = if distributed {
-            (count + SUBGROUP - 1) / SUBGROUP
-        } else {
-            count
-        };
+        let slots = if distributed { Self::physical_slots(dims) } else { Self::physical_count(dims) };
         self.target(TS::For {
             name: index.clone(),
             start: TE::integer(0),
-            end: TE::integer(slots),
+            end: slots.clone(),
             step: 1,
         });
         self.indent += 1;
@@ -2705,7 +3252,7 @@ impl Printer<'_> {
                 TE::variable(&index, TT::I32)
             },
         });
-        let strides = row_major_syms(&dims.iter().map(|d| d.cap).collect::<Vec<_>>());
+        let strides = Self::physical_strides(&dims);
         let (guard, _) = self.unflatten(&flat, dims, &strides, &Sym::constant(0));
         self.target(TS::If(guard));
         self.indent += 1;
@@ -2853,7 +3400,7 @@ impl Printer<'_> {
                     );
                     flat = TE::binary(
                         BinaryOp::Add,
-                        TE::binary(BinaryOp::Mul, flat, TE::Integer(dim.cap, TT::I64), TT::I64),
+                        TE::binary(BinaryOp::Mul, flat, dim.physical_value.clone().cast(TT::I64), TT::I64),
                         index,
                         TT::I64,
                     );
@@ -2872,23 +3419,32 @@ impl Printer<'_> {
             Realization::Distributed {
                 name, dims, dtype, ..
             } => {
-                for (ov, names, slot) in self.owned_ctx.iter().rev() {
+                let slot = self.owned_ctx.iter().rev().find_map(|(ov, names, slot)| {
                     let same_shape = match self.real.get(ov) {
                         Some(Realization::Distributed { dims: d, .. })
-                        | Some(Realization::Shared { dims: d, .. }) => *d == dims && slot.is_some(),
+                        | Some(Realization::Shared { dims: d, .. })
+                        | Some(Realization::Geometry { dims: d, .. }) => d.len() == dims.len()
+                            && d.iter().zip(&dims).all(|(a, b)| a.physical == b.physical),
+                        Some(Realization::View { .. }) => self.vars()[*ov].ty.shaped().is_some_and(|shape|
+                            shape.shape.len() == dims.len() && shape.shape.iter().zip(&dims).all(|(a, b)|
+                                self.execution.storage.capacity_expression(a) == b.physical)),
                         _ => false,
                     };
-                    let same_index = points.iter().zip(names).all(
+                    let same_index = points.len() == names.len() && points.len() == dims.len() && points.iter().zip(names).all(
                         |(p, n)| matches!(self.atom_of(p),Some(a) if self.names.get(&a)==Some(n)),
                     );
-                    if same_shape && same_index {
-                        return Ok(TE::Read {
-                            name,
-                            index: Box::new(TE::variable(slot.clone().unwrap(), TT::I32)),
-                            space: TSpa::Private,
-                            ty: dtype.into(),
-                        });
+                    (same_shape && same_index).then(|| slot.clone()).flatten()
+                });
+                if let Some(slot) = slot {
+                    // Ownership is determined by physical strides, not by the
+                    // names used to capture runtime extents. Keep logical
+                    // bounds checks even when a matching lane owns the slot.
+                    for (point, dim) in points.iter().zip(&dims) {
+                        self.target(TS::Evaluate(TE::Helper(crate::support::Helper::Index,
+                            vec![self.target_sym(point)?.cast(TT::I64), dim.value.clone().cast(TT::I64)], TT::I64)));
                     }
+                    return Ok(TE::Read { name, index: Box::new(TE::variable(slot, TT::I32)),
+                        space: TSpa::Private, ty: dtype.into() });
                 }
                 Err(format!(
                     "distributed tile {} is read outside its owner",
@@ -2927,7 +3483,7 @@ impl Printer<'_> {
             }
             let index = TE::Helper(
                 crate::support::Helper::Index,
-                vec![index.cast(TT::I64), TE::Integer(*count as i64, TT::I64)],
+                vec![index.cast(TT::I64), count.clone().cast(TT::I64)],
                 TT::I64,
             );
             return Ok(TE::Read {
@@ -3258,13 +3814,26 @@ impl Printer<'_> {
         mode: LoadMode,
         operation: OperationId,
     ) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            if let Some(choice) = family.load_sites.get(&(operation, v)) {
+                if let Some(mode) = self.implementation_value(choice) {
+                    return self.load_into_selected(v, view, mode, operation);
+                }
+                let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                return self.implementation_arms(&predicates, &mut |printer, ordinal|
+                    printer.load_into_selected(v, view, choice.arms[ordinal].value, operation));
+            }
+        }
+        self.load_into_selected(v, view, mode, operation)
+    }
+    fn load_into_selected(&mut self, v: VarId, view: &Expr, mode: LoadMode, operation: OperationId) -> Result<(), String> {
         let realized = self
             .view_of(view)
             .map_err(|e| format!("load into {}: {e}", self.vars()[v].name))?;
         if mode == LoadMode::Borrow {
-            if self.real.contains_key(&v) {
-                return Err("borrowed load must define fresh tile storage".into());
-            }
+            // Load normalization proves this occurrence's complete lifetime.
+            // A subsequent checked Borrow ends the old reference binding;
+            // it does not publish into the previously borrowed backing.
             self.real.insert(v, realized);
             return Ok(());
         }
@@ -3308,6 +3877,19 @@ impl Printer<'_> {
         mode: LoadMode,
         operation: OperationId,
     ) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            if let Some(choice) = family.load_sites.get(&(operation, v)) {
+                if let Some(mode) = self.implementation_value(choice) {
+                    return self.bind_stream_load_selected(v, realized, mode, operation);
+                }
+                let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                return self.implementation_arms(&predicates, &mut |printer, ordinal|
+                    printer.bind_stream_load_selected(v, realized.clone(), choice.arms[ordinal].value, operation));
+            }
+        }
+        self.bind_stream_load_selected(v, realized, mode, operation)
+    }
+    fn bind_stream_load_selected(&mut self, v: VarId, realized: Realization, mode: LoadMode, operation: OperationId) -> Result<(), String> {
         if matches!(realized, Realization::Geometry { .. }) || mode == LoadMode::Borrow {
             self.real.insert(v, realized);
             Ok(())
@@ -3352,8 +3934,9 @@ impl Printer<'_> {
             space = Some(actual);
             let name = format!("{base}_{}", part.plane.name);
             self.bind_allocation(id, &name)?;
-            self.local_planes
-                .insert(name, (actual, part.plane.dtype(), part.elements));
+            let physical = self.execution.storage.physical(v).and_then(|physical| physical.packets.as_ref())
+                .and_then(|packet| packet.planes.get(plane)).ok_or("encoded plane has no physical extent")?;
+            self.local_planes.insert(name, (actual, part.plane.dtype(), self.target_sym(&physical.elements)?));
         }
         let prefix = self.fresh("packet_prefix");
         self.names.insert(prefix.clone(), prefix.clone());
@@ -3370,15 +3953,8 @@ impl Printer<'_> {
             param: base,
             elem: elem.clone(),
             offset: Sym::param(&prefix),
-            strides: layout
-                .strides
-                .iter()
-                .map(|&n| {
-                    i64::try_from(n)
-                        .map(Sym::constant)
-                        .map_err(|_| "packet stride exceeds the target index domain")
-                })
-                .collect::<Result<_, _>>()?,
+            strides: self.execution.storage.physical(v).and_then(|physical| physical.packets.as_ref())
+                .ok_or("encoded snapshot has no physical row layout")?.strides.clone(),
             shape: shape.clone(),
         };
         self.copy_packets(&destination, &source, v, operation, publication)?;
@@ -3418,12 +3994,14 @@ impl Printer<'_> {
         if strides.len() != shape.len() || shape.is_empty() {
             return Err("encoded snapshot has inconsistent row metadata".into());
         }
-        if strides.last().and_then(Sym::as_constant) != Some(1)
-            || strides[..strides.len() - 1]
-                .iter()
-                .any(|s| s.as_constant().is_none_or(|n| n < 0 || n % group != 0))
-        {
+        if strides.last().and_then(Sym::as_constant) != Some(1) {
             return Err("encoded snapshot requires contiguous packet rows".into());
+        }
+        for stride in &strides[..strides.len() - 1] {
+            if self.execution.implementation.is_some() { self.require_native_zero(stride.rem(&Sym::constant(group)))?; }
+            else if stride.as_constant().is_none_or(|value| value < 0 || value % group != 0) {
+                return Err("encoded snapshot requires contiguous packet rows".into());
+            }
         }
         let layout = self
             .execution
@@ -3460,6 +4038,8 @@ impl Printer<'_> {
             .map(|(bound, extent)| {
                 Ok(Dim {
                     cap: self.cap(bound)?,
+                    physical: self.execution.storage.capacity_expression(bound),
+                    physical_value: self.target_sym(&self.execution.storage.capacity_expression(bound))?,
                     ext: self.sym(extent)?,
                     value: self.target_sym(extent)?,
                 })
@@ -3482,7 +4062,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: row.clone(),
                 start: TE::integer(0),
-                end: TE::integer(rows),
+                end: Self::physical_count(outer),
                 step: 1,
             });
             self.indent += 1;
@@ -3563,7 +4143,9 @@ impl Printer<'_> {
                 TE::binary(
                     BinaryOp::Mul,
                     TE::variable(&row, TT::I32),
-                    TE::integer(part.elements_per_row as i64),
+                    self.target_sym(&self.execution.storage.physical(v).and_then(|physical| physical.packets.as_ref())
+                        .and_then(|packet| packet.planes.iter().find(|plane| plane.plane.name == part.plane.name))
+                        .ok_or("encoded snapshot has no retained plane geometry")?.elements_per_row)?,
                     TT::I32,
                 ),
                 TE::variable(index, TT::I32),
@@ -3601,6 +4183,14 @@ impl Printer<'_> {
         operation: OperationId,
         purpose: Purpose,
     ) -> Result<(), String> {
+        if let Some(family) = self.execution.implementation.clone() {
+            if let Some(choice) = family.storage.get(&v) {
+                if self.implementation_value(choice).is_none() {
+                    let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                    return self.implementation_arms(&predicates, &mut |printer, _| printer.snapshot_into(v, realized.clone(), operation, purpose));
+                }
+            }
+        }
         let Realization::View {
             space,
             param,
@@ -3652,6 +4242,8 @@ impl Printer<'_> {
                 }
                 Ok(Dim {
                     cap,
+                    physical: self.execution.storage.capacity_expression(bound),
+                    physical_value: self.target_sym(&self.execution.storage.capacity_expression(bound))?,
                     ext: self.sym(extent)?,
                     value: self.target_sym(extent)?,
                 })
@@ -3666,7 +4258,6 @@ impl Printer<'_> {
                     | Realization::Shared { name, dims, .. } => (name, dims),
                     _ => unreachable!(),
                 };
-                let n_cap: i64 = dims.iter().map(|d| d.cap).product();
                 let c = self.fresh("c");
                 let first = if shared {
                     TE::variable("lane", TT::U32).cast(TT::I32)
@@ -3677,7 +4268,7 @@ impl Printer<'_> {
                 self.target(TS::For {
                     name: c.clone(),
                     start: first,
-                    end: TE::integer(n_cap),
+                    end: Self::physical_count(&dims),
                     step,
                 });
                 self.indent += 1;
@@ -3711,7 +4302,7 @@ impl Printer<'_> {
                 self.target(TS::For {
                     name: j.clone(),
                     start: TE::integer(0),
-                    end: TE::integer(slots),
+                    end: slots.clone(),
                     step: 1,
                 });
                 self.indent += 1;
@@ -3764,16 +4355,16 @@ impl Printer<'_> {
         if n_cap == 0 {
             return (TE::Integer(0, TT::Bool), offset.clone());
         }
-        let mut stride = n_cap;
+
         let mut guard = TE::binary(
             BinaryOp::Lt,
             TE::variable(flat, TT::I32),
-            TE::integer(n_cap),
+            Self::physical_count(dims),
             TT::Bool,
         );
         let mut off = offset.clone();
         for (k, d) in dims.iter().enumerate() {
-            stride /= d.cap;
+            let stride = Self::nonzero_divisor(Self::physical_count(&dims[k + 1..]));
             let idx = self.fresh("ix");
             self.target(TS::Let {
                 name: idx.clone(),
@@ -3783,10 +4374,10 @@ impl Printer<'_> {
                     TE::binary(
                         BinaryOp::Div,
                         TE::variable(flat, TT::I32),
-                        TE::integer(stride),
+                        stride,
                         TT::I32,
                     ),
-                    TE::integer(d.cap),
+                    Self::nonzero_divisor(d.physical_value.clone()),
                     TT::I32,
                 ),
             });
@@ -3894,7 +4485,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: index.clone(),
                 start: TE::integer(0),
-                end: TE::integer(slots),
+                end: slots.clone(),
                 step: 1,
             });
             self.indent += 1;
@@ -3918,7 +4509,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: index.clone(),
                 start: TE::variable("lane", TT::U32).cast(TT::I32),
-                end: TE::integer(dims.iter().map(|d| d.cap).product()),
+                end: Self::physical_count(&dims),
                 step: SUBGROUP,
             });
             self.indent += 1;
@@ -3928,23 +4519,21 @@ impl Printer<'_> {
         self.target(TS::If(TE::binary(BinaryOp::And, guard, valid, TT::Bool)));
         self.indent += 1;
         let value = if direct {
-            let mut stride = dims.iter().map(|d| d.cap).product::<i64>();
             let mut indices = Vec::new();
-            for dim in &dims {
+            for (axis, dim) in dims.iter().enumerate() {
                 let coordinate = self.fresh("store_coordinate");
                 let value = if dim.cap == 0 {
                     TE::integer(0)
                 } else {
-                    stride /= dim.cap;
                     TE::binary(
                         BinaryOp::Rem,
                         TE::binary(
                             BinaryOp::Div,
                             TE::variable(&flat, TT::I32),
-                            TE::integer(stride.max(1)),
+                            Self::nonzero_divisor(Self::physical_count(&dims[axis + 1..])),
                             TT::I32,
                         ),
-                        TE::integer(dim.cap),
+                        Self::nonzero_divisor(dim.physical_value.clone()),
                         TT::I32,
                     )
                 };
@@ -3999,7 +4588,10 @@ impl Printer<'_> {
         operation: OperationId,
     ) -> Result<(), String> {
         let previous = self.real.remove(&v);
-        self.reduce_new(v, args, operation)?;
+        let Some(()) = self.reduce_new(v, args, operation)? else {
+            if let Some(previous) = previous { self.real.insert(v, previous); }
+            return Ok(());
+        };
         if let Some(destination) = previous {
             let source = self
                 .real
@@ -4044,7 +4636,7 @@ impl Printer<'_> {
         v: VarId,
         args: &[Expr],
         operation: OperationId,
-    ) -> Result<(), String> {
+    ) -> Result<Option<()>, String> {
         let ExprKind::Var(tv) = args[0].kind else {
             return Err("reduce of a non-variable tile".into());
         };
@@ -4058,14 +4650,8 @@ impl Printer<'_> {
         if op == 3 {
             return self.argmax_into(v, tv, axis, operation);
         }
-        let selected = self
-            .execution
-            .reductions
-            .get(crate::reduction::Site {
-                output: v,
-                operation,
-            })?
-            .clone();
+        let Some(selected) = self.reduction_selection(crate::reduction::Site { output: v, operation })? else { return Ok(None); };
+        self.record_reduction(&selected, axis)?;
         let mut src = self
             .real
             .get(&tv)
@@ -4206,7 +4792,7 @@ impl Printer<'_> {
         {
             return Err("fold input placement disagrees with its selected contract".into());
         }
-        let reduction = crate::reduction::ReductionDomain::new(
+        let mut reduction = crate::reduction::ReductionDomain::new(
             &dims.iter().map(|d| d.cap).collect::<Vec<_>>(),
             axis,
             dtype,
@@ -4214,11 +4800,23 @@ impl Printer<'_> {
             placement.clone(),
             SUBGROUP as u64,
         )?;
+        if self.execution.implementation.is_some() {
+            reduction = reduction.placement_variant(Some(placement.clone()), false, selected.decision.full_lanes, dtype, ordered)?;
+            let inner = dims[axis + 1..].iter().fold(Sym::constant(1), |count, dim| count.mul(&dim.physical));
+            if selected.algorithm == crate::reduction::Algorithm::LaneLocal {
+                self.require_native_zero(inner.rem(&Sym::constant(SUBGROUP)))?;
+                self.require_native_zero(Sym::constant(1).quot(&inner.add(&Sym::constant(1))))?;
+            }
+            if selected.algorithm == crate::reduction::Algorithm::Collective {
+                self.require_native_zero(Sym::constant(1).quot(&inner.add(&Sym::constant(1))))?;
+                self.require_native_zero(Sym::constant(1).quot(&dims[axis].physical.add(&Sym::constant(1))))?;
+            }
+        }
         use crate::reduction::Algorithm;
         let out_cap = reduction.output_capacity() as i64;
         let scalar_result = reduction.scalar_output();
-        let inner_cap = reduction.inner_capacity() as i64;
-        let axis_cap = reduction.axis_capacity() as i64;
+        let inner_cap = Self::nonzero_divisor(Self::physical_count(&dims[axis + 1..]));
+        let axis_cap = Self::nonzero_divisor(dims[axis].physical_value.clone());
         let axis_ext = dims[axis].value.clone().cast(TT::I32);
         let algorithm = selected.algorithm;
         if reduction != selected.decision.domain {
@@ -4234,7 +4832,7 @@ impl Printer<'_> {
                 return Err("reduction output disagrees with allocation plan".into());
             }
         }
-        let output_slots = reduction.output_slots(algorithm)?;
+        reduction.output_slots(algorithm)?;
         let name = self.fresh("reduced");
         if scalar_result {
             self.real
@@ -4260,7 +4858,7 @@ impl Printer<'_> {
                         name: name.clone(),
                         dims: out_dims.clone(),
                         dtype,
-                        slots: output_slots as i64,
+                        slots: Self::physical_slots(&out_dims),
                     }
                 } else {
                     Realization::Replicated {
@@ -4272,7 +4870,7 @@ impl Printer<'_> {
             );
         }
         if out_cap == 0 {
-            return Ok(());
+            return Ok(Some(()));
         }
         let read = |source: &Realization, index: TE| -> TE {
             match source {
@@ -4304,19 +4902,19 @@ impl Printer<'_> {
                             TE::binary(
                                 BinaryOp::Div,
                                 output.clone(),
-                                TE::integer(inner_cap),
+                                inner_cap.clone(),
                                 TT::I32,
                             ),
-                            TE::integer(axis_cap),
+                            axis_cap.clone(),
                             TT::I32,
                         ),
                         k,
                         TT::I32,
                     ),
-                    TE::integer(inner_cap),
+                    inner_cap.clone(),
                     TT::I32,
                 ),
-                TE::binary(BinaryOp::Rem, output, TE::integer(inner_cap), TT::I32),
+                TE::binary(BinaryOp::Rem, output, inner_cap.clone(), TT::I32),
                 TT::I32,
             )
         };
@@ -4327,7 +4925,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: slot.clone(),
                 start: TE::integer(0),
-                end: TE::integer(output_slots as i64),
+                end: Self::physical_slots(&out_dims),
                 step: 1,
             });
             self.indent += 1;
@@ -4350,7 +4948,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: o.clone(),
                 start: TE::integer(0),
-                end: TE::integer(out_cap),
+                end: Self::physical_count(&out_dims),
                 step: 1,
             });
             self.indent += 1;
@@ -4377,7 +4975,7 @@ impl Printer<'_> {
                 self.target(TS::If(TE::binary(
                     BinaryOp::Lt,
                     TE::variable(&o, TT::I32),
-                    TE::integer(out_cap),
+                    Self::physical_count(&out_dims),
                     TT::Bool,
                 )));
                 self.indent += 1;
@@ -4427,7 +5025,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: j.clone(),
                 start: TE::integer(0),
-                end: TE::integer(*slots),
+                end: slots.clone(),
                 step: 1,
             });
             self.indent += 1;
@@ -4444,8 +5042,8 @@ impl Printer<'_> {
             );
             let axis = TE::binary(
                 BinaryOp::Rem,
-                TE::binary(BinaryOp::Div, e.clone(), TE::integer(inner_cap), TT::I32),
-                TE::integer(axis_cap),
+                TE::binary(BinaryOp::Div, e.clone(), inner_cap.clone(), TT::I32),
+                axis_cap.clone(),
                 TT::I32,
             );
             let output = TE::binary(
@@ -4454,14 +5052,14 @@ impl Printer<'_> {
                     BinaryOp::Mul,
                     TE::binary(
                         BinaryOp::Div,
-                        TE::binary(BinaryOp::Div, e.clone(), TE::integer(inner_cap), TT::I32),
-                        TE::integer(axis_cap),
+                        TE::binary(BinaryOp::Div, e.clone(), inner_cap.clone(), TT::I32),
+                        axis_cap.clone(),
                         TT::I32,
                     ),
-                    TE::integer(inner_cap),
+                    inner_cap.clone(),
                     TT::I32,
                 ),
-                TE::binary(BinaryOp::Rem, e.clone(), TE::integer(inner_cap), TT::I32),
+                TE::binary(BinaryOp::Rem, e.clone(), inner_cap.clone(), TT::I32),
                 TT::I32,
             );
             let guard = TE::binary(
@@ -4471,7 +5069,7 @@ impl Printer<'_> {
                     TE::binary(
                         BinaryOp::Lt,
                         e,
-                        TE::integer(reduction.input_capacity() as i64),
+                        Self::physical_count(&dims),
                         TT::Bool,
                     ),
                     TE::binary(BinaryOp::Lt, axis, axis_ext, TT::Bool),
@@ -4531,7 +5129,7 @@ impl Printer<'_> {
         }
         self.indent -= 1;
         self.target(TS::End);
-        Ok(())
+        Ok(Some(()))
     }
 
     /// `argmax` along an axis: the index of the largest value, ties to the smaller index.
@@ -4541,7 +5139,7 @@ impl Printer<'_> {
         tv: VarId,
         axis: usize,
         operation: OperationId,
-    ) -> Result<(), String> {
+    ) -> Result<Option<()>, String> {
         let src = self
             .real
             .get(&tv)
@@ -4560,14 +5158,8 @@ impl Printer<'_> {
             }
             other => return Err(format!("argmax of {other:?}")),
         };
-        let selected = self
-            .execution
-            .reductions
-            .get(crate::reduction::Site {
-                output: v,
-                operation,
-            })?
-            .clone();
+        let Some(selected) = self.reduction_selection(crate::reduction::Site { output: v, operation })? else { return Ok(None); };
+        self.record_reduction(&selected, axis)?;
         let placement = match &src {
             Realization::Replicated { .. } => Some(TilePlacement::Replicated),
             Realization::Distributed { .. } => Some(TilePlacement::Distributed),
@@ -4575,14 +5167,13 @@ impl Printer<'_> {
             Realization::View { .. } => None,
             _ => unreachable!(),
         };
-        let domain = crate::reduction::ReductionDomain::argmax(
-            &dims.iter().map(|d| d.cap).collect::<Vec<_>>(),
-            axis,
-            dtype,
-            placement.clone(),
-            selected.decision.full_lanes,
-            SUBGROUP as u64,
-        )?;
+        let domain = if self.execution.implementation.is_some() {
+            crate::reduction::ReductionDomain::new(&dims.iter().map(|dim| dim.cap).collect::<Vec<_>>(), axis, DType::I32, true,
+                TilePlacement::Replicated, SUBGROUP as u64)?.placement_variant(placement.clone(), true, selected.decision.full_lanes, dtype, true)?
+        } else {
+            crate::reduction::ReductionDomain::argmax(&dims.iter().map(|dim| dim.cap).collect::<Vec<_>>(), axis, dtype,
+                placement.clone(), selected.decision.full_lanes, SUBGROUP as u64)?
+        };
         if selected.decision.contract.operation != ReduceOp::Argmax
             || selected.decision.contract.input != dtype
             || selected.decision.input != tv
@@ -4590,6 +5181,9 @@ impl Printer<'_> {
             || selected.decision.domain != domain
         {
             return Err("argmax disagrees with its selected input/domain".into());
+        }
+        if self.execution.implementation.is_some() {
+            self.require_native_zero(Sym::constant(1).quot(&dims[axis].physical.add(&Sym::constant(1))))?;
         }
         let algorithm = selected.algorithm;
         use crate::reduction::Algorithm;
@@ -4639,10 +5233,10 @@ impl Printer<'_> {
             )?;
         }
         if out_cap == 0 {
-            return Ok(());
+            return Ok(Some(()));
         }
-        let inner_cap = domain.inner_capacity() as i64;
-        let axis_cap = domain.axis_capacity() as i64;
+        let inner_cap = Self::nonzero_divisor(Self::physical_count(&dims[axis + 1..]));
+        let axis_cap = Self::nonzero_divisor(dims[axis].physical_value.clone());
         let axis_ext = dims[axis].value.clone();
         let identity = selected.decision.contract.identity().value();
         let initial = if dtype.is_float() {
@@ -4667,25 +5261,25 @@ impl Printer<'_> {
                             integer(
                                 BinaryOp::Div,
                                 TE::variable(&o, TT::I32),
-                                TE::integer(inner_cap),
+                                inner_cap.clone(),
                             ),
-                            TE::integer(axis_cap),
+                            axis_cap.clone(),
                         ),
                         k,
                     ),
-                    TE::integer(inner_cap),
+                    inner_cap.clone(),
                 ),
                 integer(
                     BinaryOp::Rem,
                     TE::variable(&o, TT::I32),
-                    TE::integer(inner_cap),
+                    inner_cap.clone(),
                 ),
             )
         };
         self.target(TS::For {
             name: o.clone(),
             start: TE::integer(0),
-            end: TE::integer(out_cap),
+            end: Self::physical_count(&out_dims),
             step: 1,
         });
         self.indent += 1;
@@ -4769,12 +5363,11 @@ impl Printer<'_> {
             Realization::Distributed {
                 name: sn, slots, ..
             } => {
-                let n_cap: i64 = dims.iter().map(|d| d.cap).product();
                 let j = self.fresh("slot");
                 self.target(TS::For {
                     name: j.clone(),
                     start: TE::integer(0),
-                    end: TE::integer(*slots),
+                    end: slots.clone(),
                     step: 1,
                 });
                 self.indent += 1;
@@ -4801,9 +5394,9 @@ impl Printer<'_> {
                         integer(
                             BinaryOp::Div,
                             TE::variable(&e, TT::I32),
-                            TE::integer(inner_cap),
+                            inner_cap.clone(),
                         ),
-                        TE::integer(axis_cap),
+                        axis_cap.clone(),
                     ),
                 });
                 let output = integer(
@@ -4815,20 +5408,20 @@ impl Printer<'_> {
                             integer(
                                 BinaryOp::Div,
                                 TE::variable(&e, TT::I32),
-                                TE::integer(inner_cap),
+                                inner_cap.clone(),
                             ),
-                            TE::integer(axis_cap),
+                            axis_cap.clone(),
                         ),
-                        TE::integer(inner_cap),
+                        inner_cap.clone(),
                     ),
                     integer(
                         BinaryOp::Rem,
                         TE::variable(&e, TT::I32),
-                        TE::integer(inner_cap),
+                        inner_cap.clone(),
                     ),
                 );
                 let valid = Self::and(
-                    compare(BinaryOp::Lt, TE::variable(&e, TT::I32), TE::integer(n_cap)),
+                    compare(BinaryOp::Lt, TE::variable(&e, TT::I32), Self::physical_count(&dims)),
                     Self::and(
                         compare(BinaryOp::Lt, TE::variable(&k, TT::I32), axis_ext.clone()),
                         compare(BinaryOp::Eq, output, TE::variable(&o, TT::I32)),
@@ -4862,12 +5455,8 @@ impl Printer<'_> {
                     if d == axis {
                         points.push(Sym::param(&k));
                     } else {
-                        let outer: i64 = dims
-                            .iter()
-                            .enumerate()
-                            .skip(d + 1)
-                            .map(|(i, dd)| if i == axis { 1 } else { dd.cap })
-                            .product();
+                        let outer = dims.iter().enumerate().skip(d + 1).filter(|(index, _)| *index != axis)
+                            .fold(TE::integer(1), |count, (_, dim)| integer(BinaryOp::Mul, count, dim.physical_value.clone()));
                         let c = self.fresh("c");
                         self.names.insert(c.clone(), c.clone());
                         self.target(TS::Let {
@@ -4878,9 +5467,9 @@ impl Printer<'_> {
                                 integer(
                                     BinaryOp::Div,
                                     TE::variable(&o, TT::I32),
-                                    TE::integer(outer),
+                                    Self::nonzero_divisor(outer),
                                 ),
-                                TE::integer(dim.cap),
+                                Self::nonzero_divisor(dim.physical_value.clone()),
                             ),
                         });
                         points.push(Sym::param(&c));
@@ -4940,7 +5529,7 @@ impl Printer<'_> {
         }
         self.indent -= 1;
         self.target(TS::End);
-        Ok(())
+        Ok(Some(()))
     }
 
     fn and(left: TE, right: TE) -> TE {
@@ -5047,12 +5636,25 @@ impl Printer<'_> {
         carried: &[VarId],
         row: &str,
     ) -> Result<(), String> {
+        if carried.len() > 1 {
+            for variable in carried { self.publish_partials(phase, std::slice::from_ref(variable), row)?; }
+            return Ok(());
+        }
+        if let Some(&variable) = carried.first() {
+            if let Some(Realization::Choice { arms }) = self.real.get(&variable).cloned() {
+                let predicates = arms.iter().map(|(predicate, _)| predicate.clone()).collect::<Vec<_>>();
+                return self.implementation_arms(&predicates, &mut |printer, ordinal| {
+                    printer.real.insert(variable, (*arms[ordinal].1).clone());
+                    printer.publish_partials(phase, carried, row)
+                });
+            }
+        }
         let scratch: Vec<_> = self
             .execution
             .memory
             .scratch()
             .iter()
-            .filter(|s| s.phase == phase && s.parameter.is_none())
+            .filter(|s| s.phase == phase && s.parameter.is_none() && carried.contains(&s.variable))
             .cloned()
             .collect();
         if scratch.len() != carried.len() {
@@ -5062,18 +5664,18 @@ impl Printer<'_> {
             let (name, cap, slots, space, distributed) = match self.real.get(v) {
                 Some(Realization::Replicated { name, dims, .. }) => {
                     let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
-                    (name.clone(), cap, cap, TSpa::Private, false)
+                    (name.clone(), cap, Self::physical_count(dims), TSpa::Private, false)
                 }
                 Some(Realization::Shared { name, dims, .. }) => {
                     let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
-                    (name.clone(), cap, cap, TSpa::Threadgroup, false)
+                    (name.clone(), cap, Self::physical_count(dims), TSpa::Threadgroup, false)
                 }
                 Some(Realization::Distributed {
                     name, dims, slots, ..
                 }) => (
                     name.clone(),
                     dims.iter().map(|d| d.cap).product::<i64>().max(1),
-                    *slots,
+                    slots.clone(),
                     TSpa::Private,
                     true,
                 ),
@@ -5103,7 +5705,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: i.clone(),
                 start: TE::integer(0),
-                end: TE::integer(slots),
+                end: slots.clone(),
                 step: 1,
             });
             self.indent += 1;
@@ -5138,7 +5740,7 @@ impl Printer<'_> {
                     TE::binary(
                         BinaryOp::Mul,
                         TE::variable(row, TT::U32),
-                        TE::Integer(allocation.parts as i64, TT::U32),
+                        self.split_parts(phase, allocation.parts)?.cast(TT::U32),
                         TT::U32,
                     ),
                     TE::variable("part", TT::I32).cast(TT::U32),
@@ -5177,12 +5779,26 @@ impl Printer<'_> {
         merges: &[execution::Merge],
         operation: OperationId,
     ) -> Result<(), String> {
+        if carried.len() > 1 {
+            for (variable, merge) in carried.iter().zip(merges) { self.merge_partials(phase, std::slice::from_ref(variable), std::slice::from_ref(merge), operation)?; }
+            return Ok(());
+        }
+        if let Some(&variable) = carried.first() {
+            if let Some(family) = self.execution.implementation.clone() {
+                if let Some(choice) = family.storage.get(&variable) {
+                    if self.implementation_value(choice).is_none() {
+                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
+                        return self.implementation_arms(&predicates, &mut |printer, _| printer.merge_partials(phase, carried, merges, operation));
+                    }
+                }
+            }
+        }
         let scratch: Vec<_> = self
             .execution
             .memory
             .scratch()
             .iter()
-            .filter(|s| s.phase == phase && s.parameter.is_none())
+            .filter(|s| s.phase == phase && s.parameter.is_none() && carried.contains(&s.variable))
             .cloned()
             .collect();
         if carried.len() != scratch.len() || carried.len() != merges.len() {
@@ -5193,7 +5809,7 @@ impl Printer<'_> {
                 return Err("merge value disagrees with scratch plan".into());
             }
             let buf = format!("split_{}", allocation.index);
-            let parts = allocation.parts;
+            let parts = self.split_parts(phase, allocation.parts)?;
             let cap = allocation.elements_per_item;
             let Ty::Tile(shaped) = self.vars()[*v].ty.clone() else {
                 return Err("carried state is not a tile".into());
@@ -5226,7 +5842,7 @@ impl Printer<'_> {
             let base = TE::binary(
                 BinaryOp::Mul,
                 TE::variable("item", TT::U32),
-                TE::Integer(parts as i64, TT::U32),
+                parts.clone().cast(TT::U32),
                 TT::U32,
             );
             self.target(TS::Write {
@@ -5245,7 +5861,7 @@ impl Printer<'_> {
             self.target(TS::For {
                 name: p.clone(),
                 start: TE::integer(1),
-                end: TE::integer(parts as i64),
+                end: parts.cast(TT::I32),
                 step: 1,
             });
             self.indent += 1;
@@ -5293,6 +5909,13 @@ impl Printer<'_> {
             })?;
         }
         Ok(())
+    }
+
+    fn split_parts(&self, phase: usize, fallback: u64) -> Result<TE, String> {
+        match self.execution.phases[phase].split.as_ref().and_then(|split| split.retained.as_ref()) {
+            Some(retained) => self.target_sym(&Sym::param(&retained.parts_symbol)),
+            None => Ok(TE::integer(fallback as i64)),
+        }
     }
 
     fn intrinsic_stmt(
@@ -5354,7 +5977,7 @@ impl Printer<'_> {
                                     .into(),
                             );
                         }
-                        let ld = Sym::constant(dims[1].cap);
+                        let ld = dims[1].physical.clone();
                         (name, row.mul(&ld).add(&col), ld, false, TSpa::Threadgroup)
                     }
                     Realization::View {
@@ -5663,6 +6286,16 @@ impl Printer<'_> {
                 let left = self.target_expr(lhs)?;
                 let right = self.target_expr(rhs)?;
                 Self::arithmetic(*op, left, right, ty)
+            }
+            ExprKind::Builtin { name: Builtin::Select, args } => {
+                let [condition, yes, no] = args.as_slice() else { return Err("eager value selection arity".into()); };
+                let condition = self.target_expr(condition)?;
+                let yes = self.target_expr(yes)?;
+                let no = self.target_expr(no)?;
+                if condition.ty() != TT::Bool || yes.ty() != no.ty() || yes.ty() != ty {
+                    return Err("eager value selection type mismatch".into());
+                }
+                E::EagerSelect(Box::new(condition), Box::new(yes), Box::new(no))
             }
             ExprKind::Builtin { name, args }
                 if matches!(

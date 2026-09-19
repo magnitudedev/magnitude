@@ -2,7 +2,6 @@
 //! instruction service; no measurement or device-name inference supplies it.
 use seismic_accounting::{
     schedule::{CapacityUnit, Resource, Timebase},
-    selection::Budget,
     workload::DerivationLimits,
 };
 use seismic_runtime::{
@@ -18,10 +17,7 @@ fn settings(hardware: Hardware, form: Form) -> Settings {
             instructions: 10_000_000,
             operations: 1_000_000,
         },
-        search: Budget {
-            nodes: 20_000,
-            schedule_assignments: 1_000_000,
-        },
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 1_000_000, ..Default::default() }, ..Default::default() },
     }
 }
 

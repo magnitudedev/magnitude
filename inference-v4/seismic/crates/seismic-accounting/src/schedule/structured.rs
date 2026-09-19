@@ -3,12 +3,10 @@
 //! start-time variable per instance. A compact witness is not an optimum unless
 //! its completion meets the derived lower bound.
 use super::*;
-mod refinement;
 mod periodic;
 mod profile;
 mod overlap;
 mod windows;
-pub(crate) use refinement::{Refinement, Outcome as RefinementOutcome};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order { Serial, Parallel }
@@ -122,6 +120,17 @@ impl Plan {
     }
 }
 impl Witness {
+    /// Reconstruct a joint shared-model assignment in original occurrence order.
+    /// No child optimum is inferred: the witness retains only an independently
+    /// derived lower bound and the checked feasible completion.
+    pub fn from_schedule(model: Arc<Structured>, schedule: Schedule) -> Result<Self, String> {
+        let flat = Arc::new(model.expand(schedule.starts.len() as u64).map_err(|e| e.to_string())?);
+        flat.check_execution_upper(&schedule)?;
+        let lower_bound = flat.lower_bound()?;
+        model.witness(Arc::new(Plan::Flat(super::Solution {
+            model: flat, schedule, lower_bound, search_work: 0,
+        })))
+    }
     fn peak(&self) -> Result<Vec<u64>, String> {
         let summary = self.model.summary()?;
         if summary.plan == self.plan { return Ok(summary.peak); }
@@ -216,6 +225,25 @@ struct Summary {
 }
 impl Structured {
     fn with_root(&self, root: Arc<Node>) -> Self { Self { root, ..self.clone() } }
+    /// A whole-body resident reservation larger than half the available pool
+    /// forces every pair of copies to be disjoint. Because copies are identical
+    /// and have no cross-occurrence edges, their ordering is immaterial: the
+    /// complete optimum is the sum of private body optima. Instruction demand
+    /// or the peak of a particular witness cannot establish this property.
+    fn resident_copies_are_serial(&self, body: &Node) -> Result<bool, String> {
+        let mut held = vec![0u64; self.resources.len()];
+        let mut node = body;
+        while let Node::Scope { reservations, body } = node {
+            for &(resource, units) in reservations {
+                let amount = held.get_mut(resource).ok_or("invalid resident resource")?;
+                *amount = amount.checked_add(units).ok_or("resident capacity overflow")?;
+            }
+            node = body;
+        }
+        Ok(self.resources.iter().zip(held).any(|(resource, units)| {
+            units <= resource.capacity && units > resource.capacity / 2
+        }))
+    }
     fn parallel_concurrency(&self, witness: &Witness, count: u64) -> Result<u64, String> {
         let mut concurrent = count.max(1);
         for (resource, peak) in self.resources.iter().zip(witness.peak()?) {

@@ -11,6 +11,43 @@ struct Projection {
     /// projection does not evaluate the original endpoint expressions again.
     view: Expr,
 }
+
+/// One local projection from an already-proven reaching pointwise definition.
+/// This performs no implementation selection and introduces no callee replay.
+pub(super) fn pointwise_projection(
+    view: &Expr, target: &Expr, variable: VarId, indices: &[VarId], value: &Expr, vars: &mut Vec<Var>,
+) -> Result<Option<Vec<Stmt>>, String> {
+    let Some(Elem::Dtype(dtype)) = vars[variable].ty.shaped().map(|shape| shape.elem.clone()) else { return Ok(None); };
+    let available = HashMap::from([(variable, Producer::Pointwise {
+        indices: indices.to_vec(), value: value.clone(), dtype, region: Vec::new(),
+    })]);
+    let mut no_calls = |_: &Expr, _: VarId, _: &Expr, _: &Expr, _: &mut Vec<Var>| {
+        Err("pointwise producer projection unexpectedly requires call specialization".to_owned())
+    };
+    let Some(projection) = project(view, target, &available, vars, &mut no_calls)? else { return Ok(None); };
+    let mut body = projection.body;
+    if body.iter().any(|statement| crate::effects::uses(statement, variable)) {
+        // Runtime view checks still need the producer's geometry after its
+        // element production is removed. Give those checks their own metadata
+        // binding; it has no data demand and cannot read an eliminated tile.
+        if crate::demand::data_variables(&body).contains(&variable) { return Ok(None); }
+        let metadata = vars.len();
+        let source = vars[variable].clone();
+        let shape = source.ty.shaped().ok_or("producer metadata has no shape")?.clone();
+        vars.push(Var { name: format!("producer_geometry_{metadata}"), ..source.clone() });
+        for statement in &mut body { super::remap(statement, &HashMap::from([(variable, metadata)]), &[]); }
+        body.insert(0, Stmt { id: None, span: source.span, kind: StmtKind::Assign {
+            target: variable_expr(metadata, &source), op: AssignOp::Assign,
+            value: Expr { kind: ExprKind::TileAlloc { shape: shape.shape, dtype: shape.elem },
+                ty: source.ty, sym: None, span: source.span },
+        } });
+    }
+    Ok(Some(body))
+}
+
+fn variable_expr(id: VarId, variable: &Var) -> Expr {
+    Expr { kind: ExprKind::Var(id), ty: variable.ty.clone(), sym: None, span: variable.span }
+}
 #[derive(Clone)]
 enum Producer {
     Load(Expr),

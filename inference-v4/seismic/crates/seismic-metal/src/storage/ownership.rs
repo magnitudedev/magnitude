@@ -23,6 +23,7 @@ impl Components {
         self.0[a.max(b)] = a.min(b);
     }
 }
+#[derive(Clone)]
 pub(super) struct Analysis {
     aliases: Components,
     groups: Components,
@@ -192,6 +193,19 @@ impl Analysis {
         result.cooperative = intrinsic.iter().map(|&v| result.groups.root(v)).collect();
         result
     }
+    /// Semantic classes shared by concrete selection and symbolic constraints.
+    pub fn group(&self, variable: VarId) -> usize { self.groups.root(variable) }
+    pub fn groups(&self) -> Vec<usize> {
+        let mut result = (0..self.groups.0.len()).map(|v| self.groups.root(v)).collect::<Vec<_>>();
+        result.sort_unstable(); result.dedup(); result
+    }
+    pub fn owner_variables(&self) -> impl Iterator<Item = VarId> + '_ { self.owners.iter().copied() }
+    pub fn read_owner_groups(&self, variable: VarId) -> Vec<usize> {
+        let mut result = self.read_owners.get(&self.aliases.root(variable)).into_iter().flatten()
+            .map(|&owner| self.groups.root(owner)).collect::<Vec<_>>();
+        result.sort_unstable(); result.dedup(); result
+    }
+    pub fn forced_groups(&self) -> impl Iterator<Item = usize> + '_ { self.cooperative.iter().copied() }
     pub fn requires_cooperation(&self, variable: VarId) -> bool {
         self.cooperative.contains(&self.groups.root(variable))
     }

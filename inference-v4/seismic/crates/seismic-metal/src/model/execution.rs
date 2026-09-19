@@ -19,6 +19,10 @@ mod repetition_tests;
 #[cfg(test)]
 mod symbolic_tests;
 mod ranges;
+mod grouping;
+mod family;
+mod parameters;
+pub(crate) use grouping::{derive as grouping_traces, Traces as GroupingTraces};
 mod facts;
 pub(super) mod affine;
 
@@ -57,55 +61,61 @@ pub struct Hardware {
     pub resident_shared_bytes: u64,
     pub timings: Vec<Timing>,
 }
-impl Hardware {
-    /// The same primitive service expansion supplies concrete operations and
-    /// relaxed mandatory demand. Missing mappings never acquire invented costs.
-    fn operation(&self, primitive: &Primitive, lanes: u64, access: Option<&AccessPattern>) -> Result<Option<Operation>, String> {
-        self.expand_operation(primitive, lanes, access, false)
+impl Timing {
+    /// Expand declared service using the same equations for concrete lane facts
+    /// and unresolved lane/transaction counts. Address analysis owns transaction
+    /// geometry; an unavailable count must remain an explicit analysis gap.
+    pub fn account<A: seismic_accounting::algebra::Algebra>(
+        &self,
+        algebra: &mut A,
+        lanes: A::Value,
+        mut transactions: impl FnMut(&mut A, u64) -> Result<A::Value, A::Error>,
+    ) -> Result<(A::Value, Vec<seismic_accounting::algebra::ResourceUse<A::Value>>), A::Error> {
+        let latency = algebra.constant(self.latency)?;
+        let mut uses = Vec::with_capacity(self.services.len());
+        for service in &self.services {
+            let units = match service.units {
+                Units::PerLane(scale) => {
+                    let scale = algebra.constant(scale)?;
+                    algebra.product(lanes, scale)?
+                }
+                Units::PerSubgroup(units) => algebra.constant(units)?,
+                Units::PerTransaction { bytes, units } => {
+                    let count = transactions(algebra, bytes)?;
+                    let scale = algebra.constant(units)?;
+                    algebra.product(count, scale)?
+                }
+            };
+            uses.push(seismic_accounting::algebra::ResourceUse {
+                resource: service.resource, offset: service.offset,
+                duration: algebra.constant(service.duration)?, units,
+            });
+        }
+        Ok((latency, uses))
     }
-    fn expand_operation(&self, primitive: &Primitive, lanes: u64, access: Option<&AccessPattern>, relaxed: bool) -> Result<Option<Operation>, String> {
+}
+impl Hardware {
+    /// Expand declared primitive service for concrete operations. Missing
+    /// mappings or access geometry never acquire invented costs.
+    fn operation(&self, primitive: &Primitive, lanes: u64, access: Option<&AccessPattern>) -> Result<Option<Operation>, String> {
         let Some(timing) = self.timings.iter().find(|t| &t.primitive == primitive) else {
             return Ok(None);
         };
-        let transactions = |bytes| access.and_then(|a| a.transactions(bytes)).or_else(|| {
-            if !relaxed || lanes == 0 { return None; }
-            // Even complete lane broadcast must request one element's entire
-            // payload. Unknown alignment can add transactions, never remove
-            // this floor. No assumption about lane-disjoint addresses or caches.
-            let width = match primitive {
-                Primitive::Read { ty, .. } | Primitive::Write { ty, .. } => ty.bytes(),
-                Primitive::VectorRead { ty, components, .. } => ty.bytes() * u64::from(*components),
-                _ => return None,
-            };
-            Some(width.div_ceil(bytes))
-        });
+        let transactions = |bytes| access.and_then(|a| a.transactions(bytes));
         if timing.services.iter().any(|service| matches!(service.units, Units::PerTransaction { bytes, .. }
             if transactions(bytes).is_none())) { return Ok(None); }
-        let reservations = timing
-            .services
-            .iter()
-            .map(|service| {
-                Ok(Reservation {
-                    resource: service.resource,
-                    offset: service.offset,
-                    duration: service.duration,
-                    units: match service.units {
-                        Units::PerLane(n) => {
-                            n.checked_mul(lanes).ok_or("Metal service count overflow")?
-                        }
-                        Units::PerSubgroup(n) => n,
-                        Units::PerTransaction { bytes, units } => transactions(bytes)
-                            .ok_or("unresolved Metal transaction geometry")?.checked_mul(units)
-                            .ok_or("Metal transaction service overflow")?,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let mut algebra = seismic_accounting::algebra::Concrete::<String>::default();
+        let (latency, uses) = timing.account(&mut algebra, lanes, |_, bytes| {
+            transactions(bytes).ok_or_else(|| "unresolved Metal transaction geometry".into())
+        })?;
+        let reservations = uses.into_iter().map(|r| Reservation {
+            resource: r.resource, offset: r.offset, duration: r.duration, units: r.units,
+        }).collect();
         Ok(Some(Operation {
             name: format!("{primitive:?}"),
             predecessors: Vec::new(),
             start_predecessors: Vec::new(),
-            latency: timing.latency,
+            latency,
             reservations,
         }))
     }
@@ -158,31 +168,6 @@ impl Hardware {
         Ok(())
     }
 }
-/// Necessary launch/group service across a retained dispatch domain. Each pair
-/// supplies an actual launch's work items and a legal upper envelope on grouping.
-/// Body work, residency lifetimes and inter-launch ordering are relaxed away.
-pub(crate) fn dispatch_demand(
-    hardware: &Hardware,
-    launches: impl IntoIterator<Item = (u64, u64)>,
-) -> Result<Option<schedule::Demand>, String> {
-    hardware.validate()?;
-    let (Some(launch), Some(group)) = (
-        hardware.operation(&Primitive::Launch, 1, None)?,
-        hardware.operation(&Primitive::Group, 1, None)?,
-    ) else {
-        return Ok(None);
-    };
-    let mut demand = schedule::Demand::new(hardware.timebase.clone(), hardware.resources.clone())?;
-    for (work_items, maximum_items) in launches {
-        if maximum_items == 0 {
-            return Err("Metal dispatch relaxation needs a nonempty grouping envelope".into());
-        }
-        demand.include(&launch, 1)?;
-        demand.include(&group, work_items.div_ceil(maximum_items))?;
-    }
-    Ok(Some(demand))
-}
-
 /// Dynamic terminal operations, grouped by their actual active lane count.
 /// These are emitted-operation counts, not native instruction or transaction counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,35 +207,6 @@ impl InvocationAccount {
         }
         Ok(Some(demand))
     }
-}
-
-/// Add only operations invariant under every remaining terminal refinement and
-/// legal regrouping of the same work items. A partial walk is a mandatory prefix,
-/// not a complete candidate estimate. Missing primitive mappings contribute no
-/// bound; they are not treated as zero-cost implementations by exact analysis.
-pub(crate) fn include_preserved_demand(
-    demand: &mut schedule::Demand,
-    account: &InvocationAccount,
-    hardware: &Hardware,
-    preserves: impl Fn(&Primitive) -> bool,
-) -> Result<(), String> {
-    for term in &account.operations {
-        if preserves(&term.primitive) {
-            if let Some(operation) = hardware.expand_operation(&term.primitive, term.lanes, term.access.as_ref(), true)? {
-                demand.include(&operation, term.instances)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Demand from the known mandatory portion only. Missing services weaken this
-/// relaxation; they still prevent exact schedule construction from completing.
-pub(crate) fn relaxed_demand(account: &InvocationAccount, hardware: &Hardware) -> Result<schedule::Demand, String> {
-    hardware.validate()?;
-    let mut demand = schedule::Demand::new(hardware.timebase.clone(), hardware.resources.clone())?;
-    include_preserved_demand(&mut demand, account, hardware, |_| true)?;
-    Ok(demand)
 }
 
 pub fn execution(
@@ -374,26 +330,6 @@ pub fn invocation_account(
     workload: &ScalarWorkload,
     limits: DerivationLimits,
 ) -> Result<InvocationAccount, DerivationError> {
-    count_invocation(execution, workload, limits, false)
-}
-
-/// Mandatory work for pruning. Repeated straight-line regions retain their
-/// multiplicity; loop-carried values and unresolved access geometry are forgotten.
-/// This account is not a feasible schedule or a replacement for exact derivation.
-pub fn invocation_relaxation(
-    execution: &crate::execution::Execution,
-    workload: &ScalarWorkload,
-    limits: DerivationLimits,
-) -> Result<InvocationAccount, DerivationError> {
-    count_invocation(execution, workload, limits, true)
-}
-
-fn count_invocation(
-    execution: &crate::execution::Execution,
-    workload: &ScalarWorkload,
-    limits: DerivationLimits,
-    symbolic: bool,
-) -> Result<InvocationAccount, DerivationError> {
     let account = InvocationAccount {
         operations: Vec::new(),
         unmapped: Vec::new(),
@@ -407,11 +343,6 @@ fn count_invocation(
         },
         limits,
     );
-    state.symbolic = symbolic;
-    // Pruning walks must use the same symbolic dispatch geometry as structured
-    // scheduling. Enumerating every group here defeats compact exact analysis
-    // before selection has even reached a completed realization.
-    state.structured_groups = symbolic;
     let exhausted = match state.invocation(execution, workload) {
         Ok(()) => None,
         Err(DerivationError::Exhausted(limit)) => Some(limit),
@@ -451,33 +382,25 @@ enum Sink<'a> {
         indices: std::collections::HashMap<(Primitive, u64, Option<AccessPattern>), usize>,
     },
 }
-enum Checkpoint {
-    Structured {
-        current: Vec<Arc<StructuredNode>>,
-        frames: Vec<Vec<Arc<StructuredNode>>>,
-        operations: usize,
-        unmapped: usize,
-        invariant_mapping_gap: bool,
-    },
-    Count {
-        account: InvocationAccount,
-        indices: std::collections::HashMap<(Primitive, u64, Option<AccessPattern>), usize>,
-    },
+struct Checkpoint {
+    current: Vec<Arc<StructuredNode>>,
+    frames: Vec<Vec<Arc<StructuredNode>>>,
+    operations: usize,
+    unmapped: usize,
+    invariant_mapping_gap: bool,
 }
 impl Sink<'_> {
     fn checkpoint(&self) -> Option<Checkpoint> {
         match self {
             Self::Structured { current, frames, operations, model, invariant_mapping_gap, .. } =>
-                Some(Checkpoint::Structured { current: current.clone(), frames: frames.clone(), operations: *operations,
+                Some(Checkpoint { current: current.clone(), frames: frames.clone(), operations: *operations,
                     unmapped: model.unmapped.len(), invariant_mapping_gap: *invariant_mapping_gap }),
-            Self::Count { account, indices } => Some(Checkpoint::Count { account: account.clone(), indices: indices.clone() }),
-            Self::Schedule { .. } => None,
+            Self::Count { .. } | Self::Schedule { .. } => None,
         }
     }
     fn has_refinable_gap(&self, checkpoint: &Option<Checkpoint>) -> bool {
         match (self, checkpoint) {
-            (Self::Structured { model, invariant_mapping_gap: false, .. }, Some(Checkpoint::Structured { unmapped, .. })) => model.unmapped.len() > *unmapped,
-            (Self::Count { account, .. }, Some(Checkpoint::Count { account: before, .. })) => account.unmapped.len() > before.unmapped.len(),
+            (Self::Structured { model, invariant_mapping_gap: false, .. }, Some(Checkpoint { unmapped, .. })) => model.unmapped.len() > *unmapped,
             _ => false,
         }
     }
@@ -487,13 +410,10 @@ impl Sink<'_> {
     fn restore(&mut self, checkpoint: Option<Checkpoint>) -> Result<(), String> {
         match (self, checkpoint) {
             (Self::Structured { current, frames, operations, model, invariant_mapping_gap, .. },
-                Some(Checkpoint::Structured { current: old_current, frames: old_frames, operations: old_operations, unmapped, invariant_mapping_gap: old_gap })) => {
+                Some(Checkpoint { current: old_current, frames: old_frames, operations: old_operations, unmapped, invariant_mapping_gap: old_gap })) => {
                     *current = old_current; *frames = old_frames; *operations = old_operations;
                     model.unmapped.truncate(unmapped); *invariant_mapping_gap = old_gap;
                 }
-            (Self::Count { account, indices }, Some(Checkpoint::Count { account: old_account, indices: old_indices })) => {
-                *account = old_account; *indices = old_indices;
-            }
             _ => return Err("missing dispatch refinement checkpoint".into()),
         }
         Ok(())
@@ -664,12 +584,10 @@ struct Derivation<'a> {
     sink: Sink<'a>,
     limits: DerivationLimits,
     visits: u64,
-    symbolic: bool,
     structured_loops: bool,
     structured_groups: bool,
     used_group_repetition: bool,
     used_repetition: bool,
-    multiplicity: u64,
     last: Option<usize>,
     scope: String,
     env: BTreeMap<String, Values>,
@@ -678,6 +596,9 @@ struct Derivation<'a> {
     next_coordinate: u64,
     expression_depth: usize,
     facts: std::collections::HashMap<Expression, Facts>,
+    /// Guarded facts of the current retained statement. These are premises,
+    /// separate from the disposable cache of evaluated expression facts.
+    assumptions: std::collections::HashMap<Expression, Facts>,
     returned_facts: Facts,
     memory: Memory,
     active: u32,
@@ -695,12 +616,10 @@ impl<'a> Derivation<'a> {
             sink,
             limits,
             visits: 0,
-            symbolic: false,
             structured_loops: false,
             structured_groups: false,
             used_group_repetition: false,
             used_repetition: false,
-            multiplicity: 1,
             last: None,
             scope: String::new(),
             env: BTreeMap::new(),
@@ -709,6 +628,7 @@ impl<'a> Derivation<'a> {
             next_coordinate: 1,
             expression_depth: 0,
             facts: Default::default(),
+            assumptions: Default::default(),
             returned_facts: Default::default(),
             memory: Memory::default(),
             active: u32::MAX,
@@ -768,11 +688,6 @@ impl<'a> Derivation<'a> {
                 let repeat_groups = end_group - group > 1;
                 let checkpoint = if repeat_groups { self.sink.checkpoint() } else { None };
                 self.used_group_repetition |= repeat_groups;
-                let previous_multiplicity = self.multiplicity;
-                if repeat_groups && matches!(self.sink, Sink::Count { .. }) {
-                    self.multiplicity = self.multiplicity.checked_mul(end_group - group)
-                        .ok_or("Metal group multiplicity overflow")?;
-                }
                 self.sink.begin_structure(); // scoped group admission and body
                 self.scope = format!("launch {launch} group {group}");
                 self.last = Some(start);
@@ -793,10 +708,6 @@ impl<'a> Derivation<'a> {
                     let Some((subgroup, end_subgroup)) = region else { break; };
                     let repeat_subgroups = end_subgroup - subgroup > 1;
                     let subgroup_checkpoint = if repeat_subgroups { self.sink.checkpoint() } else { None };
-                    let group_multiplicity = self.multiplicity;
-                    if repeat_subgroups && matches!(self.sink, Sink::Count { .. }) {
-                        self.multiplicity = self.multiplicity.checked_mul(end_subgroup - subgroup).ok_or("Metal subgroup multiplicity overflow")?;
-                    }
                     self.used_group_repetition |= repeat_subgroups;
                     self.sink.begin_structure(); // source order within subgroup
                     self.scope = format!("launch {launch} group {group} subgroup {subgroup}");
@@ -851,7 +762,6 @@ impl<'a> Derivation<'a> {
                         let middle = subgroup + (end_subgroup - subgroup) / 2;
                         pending_subgroups.push((middle, end_subgroup));
                         pending_subgroups.push((subgroup, middle));
-                        self.multiplicity = group_multiplicity;
                         continue;
                     }
                     if repeat_subgroups && matches!(self.sink, Sink::Structured { .. }) {
@@ -860,7 +770,6 @@ impl<'a> Derivation<'a> {
                     if matches!(self.sink, Sink::Schedule { .. }) {
                         subgroups.push(self.last.unwrap_or(begin));
                     }
-                    self.multiplicity = group_multiplicity;
                 }
                 self.sink.end_structure(StructuredOrder::Parallel, vec![], false)?;
                 let end = self.join(subgroups)?;
@@ -874,13 +783,11 @@ impl<'a> Derivation<'a> {
                     let middle = group + (end_group - group) / 2;
                     pending_groups.push((middle, end_group));
                     pending_groups.push((group, middle));
-                    self.multiplicity = previous_multiplicity;
                     continue;
                 }
                 if repeat_groups && matches!(self.sink, Sink::Structured { .. }) {
                     self.sink.repeat_group(end_group - group)?;
                 }
-                self.multiplicity = previous_multiplicity;
             }
             self.sink.end_structure(StructuredOrder::Parallel, vec![], false)?;
             predecessor = Some(self.join(groups)?);
@@ -938,7 +845,7 @@ impl<'a> Derivation<'a> {
                 };
                 let count = &mut account.operations[index].instances;
                 *count = count
-                    .checked_add(self.multiplicity)
+                    .checked_add(1)
                     .ok_or("Metal operation count overflow")?;
                 0
             }
@@ -1121,6 +1028,21 @@ impl<'a> Derivation<'a> {
                     }
                 })
             }
+            E::EagerSelect(c, a, b) => {
+                let condition = value!(c);
+                let yes = value!(a);
+                let yes_facts = self.expression_facts(a);
+                let no = value!(b);
+                let no_facts = self.expression_facts(b);
+                self.issue(Primitive::Select, lanes)?;
+                self.facts.insert(e.clone(), facts::eager_selection(condition, &yes_facts, &no_facts, self.active));
+                std::array::from_fn(|lane| match condition[lane] {
+                    Some(0) => no[lane],
+                    Some(_) => yes[lane],
+                    None if yes[lane] == no[lane] => yes[lane],
+                    None => None,
+                })
+            }
             E::Select(c, a, b) => {
                 let c = value!(c);
                 let outer = self.active;
@@ -1209,14 +1131,22 @@ impl<'a> Derivation<'a> {
                 let saved_ranges = std::mem::replace(&mut self.ranges, argument_ranges);
                 let saved_affine = std::mem::replace(&mut self.affine, argument_affine);
                 let saved_facts = std::mem::take(&mut self.facts);
+                let saved_assumptions = std::mem::take(&mut self.assumptions);
                 let saved_returned_facts = std::mem::take(&mut self.returned_facts);
                 let outer = (self.active, self.alive, self.returned);
                 self.alive = self.active;
                 self.returned = [None; 32];
                 let result = self.block(&body.statements, 0, body.statements.len())?;
+                let result = result.map_err(|reason| {
+                    let lane = outer.0.trailing_zeros() as usize;
+                    let bounds = body.parameters.iter().map(|name| ((*name).to_string(),
+                        self.ranges.get(*name).and_then(|values| values.get(lane).copied()).flatten())).collect::<Vec<_>>();
+                    format!("{helper:?} helper with argument bounds {bounds:?}: {reason}")
+                });
                 let values = self.returned;
                 let returned_facts = std::mem::replace(&mut self.returned_facts, saved_returned_facts);
                 self.facts = saved_facts;
+                self.assumptions = saved_assumptions;
                 self.facts.insert(e.clone(), returned_facts);
                 self.env = saved;
                 self.ranges = saved_ranges;
@@ -1264,6 +1194,7 @@ impl<'a> Derivation<'a> {
     }
     fn assign(&mut self, name: &str, values: Values) {
         self.facts.clear();
+        self.assumptions.clear();
         self.ranges.remove(name);
         self.affine.remove(name);
         let old = self.env.entry(name.into()).or_insert([None; 32]);
@@ -1402,7 +1333,7 @@ impl<'a> Derivation<'a> {
                     let outer = self.active;
                     let mut n = value!(start);
                     self.assign(name, n);
-                    if self.symbolic || self.structured_loops {
+                    if self.structured_loops {
                         let bounds = self.expression_ranges(upper);
                         let limit = bounds.iter().enumerate().filter(|(lane, _)| self.active & (1 << lane) != 0)
                             .try_fold(None, |previous, (_, range)| {
@@ -1436,35 +1367,20 @@ impl<'a> Derivation<'a> {
                                 });
                                 self.ranges.insert(name.clone(), std::array::from_fn(|lane| induction[lane].as_ref().and_then(|v| v.bounds())));
                                 self.affine.insert(name.clone(), induction);
-                                if self.structured_loops {
-                                    self.used_repetition = true;
-                                    self.sink.begin_structure();
-                                    value!(upper);
-                                    self.issue(Primitive::Binary { operation: BinaryOp::Lt, ty: Type::I32 }, lanes)?;
-                                    self.issue(Primitive::Branch, lanes)?;
-                                    if let Err(gap) = self.block(body, at + 1, close)? {
-                                        self.sink.end_repetition(count);
-                                        return Ok(Err(gap));
-                                    }
-                                    self.issue(Primitive::Binary { operation: BinaryOp::Add, ty: Type::I32 }, lanes)?;
-                                    self.sink.end_repetition(count);
-                                    value!(upper);
-                                    self.issue(Primitive::Binary { operation: BinaryOp::Lt, ty: Type::I32 }, lanes)?;
-                                    self.issue(Primitive::Branch, lanes)?;
-                                } else {
-                                let previous = self.multiplicity;
-                                self.multiplicity = previous.checked_mul(count).ok_or("Metal repetition overflow")?;
-                                let result = self.block(body, at + 1, close);
-                                self.multiplicity = previous;
-                                if let Err(gap) = result? { return Ok(Err(gap)); }
-                                self.multiplicity = previous.checked_mul(count + 1).ok_or("Metal repetition overflow")?;
+                                self.used_repetition = true;
+                                self.sink.begin_structure();
                                 value!(upper);
                                 self.issue(Primitive::Binary { operation: BinaryOp::Lt, ty: Type::I32 }, lanes)?;
                                 self.issue(Primitive::Branch, lanes)?;
-                                self.multiplicity = previous.checked_mul(count).ok_or("Metal repetition overflow")?;
-                                self.issue(Primitive::Binary { operation: BinaryOp::Add, ty: Type::I32 }, lanes)?;
-                                self.multiplicity = previous;
+                                if let Err(gap) = self.block(body, at + 1, close)? {
+                                    self.sink.end_repetition(count);
+                                    return Ok(Err(gap));
                                 }
+                                self.issue(Primitive::Binary { operation: BinaryOp::Add, ty: Type::I32 }, lanes)?;
+                                self.sink.end_repetition(count);
+                                value!(upper);
+                                self.issue(Primitive::Binary { operation: BinaryOp::Lt, ty: Type::I32 }, lanes)?;
+                                self.issue(Primitive::Branch, lanes)?;
                                 for value in &mut n {
                                     *value = value.map(|v| ((v as i32 as i64) + count as i64 * *step) as u32 as u64);
                                 }
@@ -1698,7 +1614,7 @@ fn reads_name(expression: &Expression, name: &str) -> bool {
         Expression::Variable(source, _) | Expression::Parameter { name: source, .. } => source == name,
         Expression::Binary(_, a, b, _) | Expression::ShortCircuit { left: a, right: b, .. } => reads_name(a, name) || reads_name(b, name),
         Expression::Unary(_, a, _) | Expression::Cast(_, a) | Expression::Bitcast(_, a) | Expression::Read { index: a, .. } => reads_name(a, name),
-        Expression::Select(c, a, b) => reads_name(c, name) || reads_name(a, name) || reads_name(b, name),
+        Expression::Select(c, a, b) | Expression::EagerSelect(c, a, b) => reads_name(c, name) || reads_name(a, name) || reads_name(b, name),
         Expression::Helper(_, args, _) | Expression::Builtin(_, args, _) => args.iter().any(|a| reads_name(a, name)),
         _ => false,
     }
@@ -1733,7 +1649,7 @@ fn repeated_iterations(name: &str, body: &[crate::terminal::Site], starts: Value
             E::Unary(_, a, _) | E::Cast(_, a) | E::Bitcast(_, a) | E::Read { index: a, .. } => eager(a),
             E::Builtin(_, args, _) => args.iter().all(eager),
             E::Helper(_, args, _) => args.iter().all(eager),
-            E::Select(c, a, b) => eager(c) && eager(a) && eager(b),
+            E::Select(c, a, b) | E::EagerSelect(c, a, b) => eager(c) && eager(a) && eager(b),
             E::ShortCircuit { left, right, .. } => eager(left) && eager(right),
             E::Unmapped(..) => false,
         }
@@ -2018,7 +1934,7 @@ pub fn requirements(execution: &crate::execution::Execution) -> Result<Requireme
                 expression(right, out)?;
                 add(out, Primitive::Branch);
             }
-            E::Select(c, a, b) => {
+            E::Select(c, a, b) | E::EagerSelect(c, a, b) => {
                 for e in [&**c, &**a, &**b] {
                     expression(e, out)?;
                 }

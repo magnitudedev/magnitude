@@ -3,6 +3,7 @@
 //! dispatch guards, status writes and scratch address arithmetic.
 mod plan;
 mod print;
+pub mod family;
 use cranelift_codegen::ir::{
     self, BlockArg, BlockCall, Inst, InstructionData as D, Opcode as O, Type, Value,
     condcodes::{FloatCC, IntCC},
@@ -13,32 +14,6 @@ pub use print::print;
 use seismic_realization::{Dispatch, ScalarProgram};
 use std::collections::HashMap;
 
-pub fn lower(
-    lowered: &seismic_lang::lowered_ir::LoweredIr,
-    dispatch: Dispatch,
-) -> Result<String, String> {
-    lower_candidate(
-        lowered,
-        seismic_realization::ScalarOptions {
-            dispatch,
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    )
-}
-pub fn lower_candidate(
-    lowered: &seismic_lang::lowered_ir::LoweredIr,
-    options: seismic_realization::ScalarOptions,
-) -> Result<String, String> {
-    if lowered.backend != "cuda" {
-        return Err("PTX planner requires CUDA lowering".into());
-    }
-    let program = seismic_compiler::scalar_candidate(
-        lowered,
-        cranelift_codegen::isa::CallConv::SystemV,
-        options,
-    )?;
-    Ok(print(&prepare(&program)?))
-}
 /// Pure IR planning: no driver, native compilation, resource query or measurement.
 pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
     let f = &program.function;

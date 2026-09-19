@@ -5,14 +5,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 mod demand;
-mod intervals;
 pub use demand::Demand;
+pub mod evaluation;
+pub mod export;
+pub mod independent;
+pub mod symbolic;
 pub mod static_order;
 pub mod structured;
-pub mod evaluation;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CapacityUnit {
     Slots,
     Bytes,
@@ -20,15 +21,13 @@ pub enum CapacityUnit {
     ServicePerTick(crate::resource::Unit),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Timebase {
     pub seconds_numerator: u64,
     pub seconds_denominator: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Resource {
     pub name: String,
     pub capacity: u64,
@@ -119,7 +118,7 @@ pub struct Solution {
     model: Arc<Model>,
     schedule: Schedule,
     lower_bound: u64,
-    assignments_examined: u64,
+    search_work: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchOutcome {
@@ -140,8 +139,8 @@ impl Solution {
     pub fn lower_bound(&self) -> u64 {
         self.lower_bound
     }
-    pub fn assignments_examined(&self) -> u64 {
-        self.assignments_examined
+    pub fn search_work(&self) -> u64 {
+        self.search_work
     }
     pub fn is_optimal(&self) -> bool {
         self.lower_bound == self.schedule.completion
@@ -430,11 +429,10 @@ impl Model {
         static_order::fits(self, starts)
     }
 
-    /// The budget counts explored start-time regions, including infeasible
-    /// regions. Each region retains intervals and propagates the execution's own
-    /// constraints; no tick-by-tick expansion or performance ranking is used.
-    pub fn solve(&self, assignment_budget: u64) -> Result<Solution, String> {
-        match self.search(assignment_budget)? {
+    /// The budget counts independent solver work, including propagation and
+    /// branch analysis. An incomplete feasible solution is diagnostic only.
+    pub fn solve(&self, work_budget: u64) -> Result<Solution, String> {
+        match self.search(work_budget)? {
             SearchOutcome::Feasible(solution) => Ok(solution),
             SearchOutcome::Incomplete { .. } => {
                 self.require_complete()?;
@@ -446,11 +444,11 @@ impl Model {
         }
     }
 
-    pub fn search(&self, assignment_budget: u64) -> Result<SearchOutcome, String> {
-        self.start_search()?.advance(assignment_budget)
+    pub fn search(&self, work_budget: u64) -> Result<SearchOutcome, String> {
+        self.start_search()?.advance(work_budget)
     }
 
-    /// Retain exact constraints and the unresolved interval frontier across
+    /// Retain exact constraints and the independent solver frontier across
     /// budgeted calls. Neither derivation nor explored assignments are replayed.
     pub fn start_search(&self) -> Result<Search, String> {
         let order = self.validate()?;
@@ -459,74 +457,80 @@ impl Model {
             return Ok(Search {
                 model: Arc::new(self.clone()),
                 state: None,
+                obligations: self.unmapped.iter().map(|reason| magnitude_solver::model::Obligation { kind: magnitude_solver::model::ObligationKind::Analysis, reason: reason.clone() }).collect(),
                 lower_bound,
             });
         }
-        let mut serial = Schedule {
-            starts: vec![0; self.operations.len()],
-            completion: 0,
+        let model = Arc::new(self.clone());
+        let (state, obligations) = match independent::IndependentSearch::from_model(
+            model.clone(), magnitude_solver::Options::default(),
+        ) {
+            Ok(state) => (Some(state), Vec::new()),
+            Err(independent::Error::Unsupported(reason)) => (None, vec![magnitude_solver::model::Obligation {
+                kind: magnitude_solver::model::ObligationKind::Analysis, reason,
+            }]),
+            Err(error) => return Err(error.to_string()),
         };
-        for &i in &order {
-            serial.starts[i] = serial.completion;
-            serial.completion = serial
-                .completion
-                .checked_add(self.operations[i].latency)
-                .ok_or("serial schedule overflow")?;
-        }
-        // A serial schedule is only an initial witness, not an admission rule.
-        // Remove every idle interval in which no positive-latency operation is
-        // active. No operation straddles a removed gap, so its reservations are
-        // unchanged; event order is preserved and resident lifetimes contract.
-        // The resulting integer schedule completes within the total operation
-        // latency. This also covers zero-latency events at the final endpoint.
-        let horizon = serial.completion;
-        let best = self.check_schedule(&serial).is_ok().then_some(serial);
-        Ok(Search {
-            model: Arc::new(self.clone()),
-            state: Some(intervals::State::new(
-                self,
-                order,
-                lower_bound,
-                horizon,
-                best,
-            )),
-            lower_bound,
-        })
+        Ok(Search { model, state, obligations, lower_bound })
     }
 }
 
 /// An analysis in progress bound privately to its immutable execution constraints.
 pub struct Search {
     model: Arc<Model>,
-    state: Option<intervals::State>,
+    state: Option<independent::IndependentSearch>,
+    obligations: Vec<magnitude_solver::model::Obligation>,
     lower_bound: u64,
 }
 impl Search {
     pub fn model(&self) -> &Model {
         &self.model
     }
+    pub fn obligations(&self) -> &[magnitude_solver::model::Obligation] { &self.obligations }
     pub fn advance(&mut self, region_budget: u64) -> Result<SearchOutcome, String> {
         let Some(state) = self.state.as_mut() else {
             return Ok(SearchOutcome::Incomplete {
                 lower_bound: self.lower_bound,
             });
         };
-        state.advance(&self.model, region_budget)?;
-        let Some(best) = state.best() else {
-            return Ok(if state.incomplete() {
-                SearchOutcome::Incomplete {
-                    lower_bound: state.lower_bound(),
+        match state
+            .advance(magnitude_solver::Limits {
+                work: region_budget,
+                time: None,
+                memory_bytes: None,
+            })
+            .map_err(|error| error.to_string())?
+        {
+            independent::IndependentOutcome::Optimal(solution) => {
+                Ok(SearchOutcome::Feasible(solution))
+            }
+            independent::IndependentOutcome::Infeasible => Ok(SearchOutcome::Infeasible),
+            independent::IndependentOutcome::Incomplete {
+                incumbent,
+                lower_bound,
+                reason,
+                ..
+            } => {
+                if let magnitude_solver::result::StopReason::Coverage(obligations) = reason { self.obligations = obligations; }
+                self.lower_bound = self.lower_bound.max(lower_bound);
+                match incumbent {
+                    Some(mut solution) => {
+                        solution.lower_bound = solution.lower_bound.max(self.lower_bound);
+                        if solution.lower_bound > solution.schedule.completion {
+                            return Err(
+                                "scheduling lower bound exceeds original-model witness".into()
+                            );
+                        }
+                        Ok(SearchOutcome::Feasible(solution))
+                    }
+                    None => Ok(SearchOutcome::Incomplete {
+                        lower_bound: self.lower_bound,
+                    }),
                 }
-            } else {
-                SearchOutcome::Infeasible
-            });
-        };
-        self.model.check_schedule(best)?;
-        Ok(SearchOutcome::Feasible(Solution {
-            model: Arc::clone(&self.model),
-            schedule: best.clone(),
-            lower_bound: state.lower_bound(),
-            assignments_examined: state.examined(),
-        }))
+            }
+        }
     }
 }
+
+/// Joint operation-local conditional activity export.
+pub mod guarded;

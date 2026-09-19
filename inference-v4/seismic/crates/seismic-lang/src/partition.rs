@@ -9,6 +9,7 @@ use crate::{
     types::{DType, Elem, Ty},
 };
 use std::collections::HashSet;
+pub mod parameterized;
 
 pub struct Partitioned {
     pub function: LoweredIr,
@@ -343,7 +344,8 @@ fn scalar(
         }
         ExprKind::Builtin {
             name:
-                Builtin::Fma
+                Builtin::Select
+                | Builtin::Fma
                 | Builtin::Exp
                 | Builtin::ExpFast
                 | Builtin::Rsqrt

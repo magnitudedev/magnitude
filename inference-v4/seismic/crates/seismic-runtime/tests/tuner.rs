@@ -2,7 +2,7 @@
 //! source -> choices -> derived model -> checked selection -> native artifact
 //! connection and applicability checks; they do not qualify physical machine timing.
 use seismic_accounting::{
-    execution_model::*, schedule::*, selection::Budget, workload::DerivationLimits,
+    execution_model::*, schedule::*, workload::DerivationLimits,
 };
 use seismic_lang::{
     Scope as LanguageScope,
@@ -27,11 +27,8 @@ use automatic_hardware::{cpu as contract, cuda as cuda_hardware};
 #[path = "support/automatic_hardware.rs"]
 mod automatic_hardware;
 
-fn budget() -> Budget {
-    Budget {
-        nodes: 100,
-        schedule_assignments: 100_000,
-    }
+fn settings() -> tuner::Settings {
+    seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() }
 }
 
 fn floating_literal_resume_identity(initial: u64, changed: u64) {
@@ -85,20 +82,17 @@ fn floating_literal_resume_identity(initial: u64, changed: u64) {
                 operations: 100,
             },
         };
-        let limited = Budget {
-            nodes: 0,
-            schedule_assignments: 0,
-        };
-        let Outcome::Incomplete(progress) = tuner::tune(&request, limited).unwrap() else {
+        let limited = seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 0, ..Default::default() }, ..Default::default() };
+        let Outcome::Incomplete(progress) = tuner::tune(&request, limited.clone()).unwrap() else {
             panic!("zero-node budget retains source without selecting an execution");
         };
-        let Outcome::Incomplete(progress) = tuner::resume(&request, progress, limited).unwrap()
+        let Outcome::Incomplete(progress) = tuner::resume(&request, progress, limited.limits.clone()).unwrap()
         else {
             panic!("identical floating literal must permit resumption");
         };
         request.input = changed_input;
         assert!(
-            matches!(tuner::resume(&request, progress, limited), Err(error) if error.contains("inputs changed")),
+            matches!(tuner::resume(&request, progress, limited.limits.clone()), Err(error) if error.contains("inputs changed")),
             "changed literal bits must invalidate retained choices"
         );
     }
@@ -115,62 +109,32 @@ fn source_identity_retains_identical_nan_and_distinguishes_payloads() {
 }
 
 #[test]
-fn model_construction_limits_are_resumable_without_changing_execution_identity() {
+fn construction_limits_require_a_new_export_while_search_limits_resume() {
     let program = compile(&[SourceFile {
-        path: "budget.seismic.portable".into(), scope: LanguageScope::Portable,
-        text: "fn copy(x:tensor[2] f32,out:tensor[2] f32):\n  values = load(x)\n  store(values,out)\n".into(),
+        path: "construction.seismic.portable".into(), scope: LanguageScope::Portable,
+        text: "fn write(out:tensor[1] f32):\n  out[0] = 2.0\n".into(),
     }], &[]).unwrap();
-    let lowered = seismic_lang::lower::lower(&program, "copy", "cpu", &HashMap::new()).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "write", "cpu", &HashMap::new()).unwrap();
     let hardware = Hardware::Cpu(contract(&lowered));
     let device = Device::cpu();
     let facts = device.facts();
-    let input = device
-        .buffer_from(&[1f32.to_le_bytes(), 2f32.to_le_bytes()].concat())
-        .unwrap();
-    let output = device.buffer(8).unwrap();
-    let workload = tuner::workload("copy", &[input, output], &[], &[]).unwrap();
-    for limits in [
-        DerivationLimits {
-            instructions: 1,
-            operations: 10_000,
-        },
-        DerivationLimits {
-            instructions: 10_000,
-            operations: 1,
-        },
-    ] {
-        let mut request = Request {
-            input: source_input(&program),
-            device: &facts,
-            form: Form::CpuScalar,
-            hardware: &hardware,
-            workload: &workload,
-            derivation_limits: limits,
-        };
-        let Outcome::Incomplete(progress) = tuner::tune(&request, budget()).unwrap() else {
-            panic!("model construction budget cannot establish an optimum or infeasibility");
-        };
-        assert!(progress.frontier().is_empty());
-        assert!(progress.feasible_upper().is_none());
-        assert!(progress.unresolved().derivations > 0);
-        assert_eq!(
-            progress.exhausted_derivations().count(),
-            progress.unresolved().derivations
-        );
-        request.derivation_limits = DerivationLimits {
-            instructions: 10_000,
-            operations: 10_000,
-        };
-        let Outcome::Optimal(resumed) = tuner::resume(&request, progress, budget()).unwrap() else {
-            panic!("larger construction limits should resolve the retained executions");
-        };
-        let Outcome::Optimal(uninterrupted) = tuner::tune(&request, budget()).unwrap() else {
-            panic!()
-        };
-        assert_eq!(resumed.modeled_cost(), uninterrupted.modeled_cost());
-        assert_eq!(resumed.selected_path(), uninterrupted.selected_path());
-        assert_eq!(resumed.objective().flat().unwrap().0, uninterrupted.objective().flat().unwrap().0);
-    }
+    let workload = tuner::workload("write", &[device.buffer(4).unwrap()], &[], &[]).unwrap();
+    let mut request = Request { input: source_input(&program), device: &facts,
+        form: Form::CpuScalar, hardware: &hardware, workload: &workload,
+        derivation_limits: DerivationLimits { instructions: 1, operations: 1 } };
+    let Outcome::Incomplete(progress) = tuner::tune(&request, settings()).unwrap() else {
+        panic!("construction exhaustion cannot establish an optimum or infeasibility");
+    };
+    assert!(progress.feasible_upper().is_none());
+    let model = progress.model().clone();
+    let Outcome::Incomplete(progress) = tuner::resume(&request, progress, settings().limits).unwrap() else { panic!(); };
+    assert!(std::sync::Arc::ptr_eq(&model, progress.model()));
+    request.derivation_limits = DerivationLimits { instructions: 10_000, operations: 10_000 };
+    assert!(matches!(tuner::resume(&request, progress, settings().limits), Err(e) if e.contains("construction limits")));
+    let Outcome::Optimal(selected) = tuner::tune(&request, settings()).unwrap() else {
+        panic!("new construction allowance requires a fresh complete export");
+    };
+    assert!(selected.modeled_cost().is_exact());
 }
 
 #[test]
@@ -215,7 +179,7 @@ fn source_to_native_keeps_checked_model_and_enforces_workload_conditions() {
             operations: 30_000,
         },
     };
-    let Outcome::Optimal(tuned) = tuner::tune(&request, budget()).unwrap() else {
+    let Outcome::Optimal(tuned) = tuner::tune(&request, settings()).unwrap() else {
         panic!("expected exact conditional optimum")
     };
     let ImplementationConditions::Cpu(conditions) = tuned.conditions().implementation() else {
@@ -311,19 +275,18 @@ fn nested_views_derive_canonical_alias_geometry_and_resume_binds_all_inputs() {
             operations: 30_000,
         },
     };
-    let mut limited = budget();
-    limited.nodes = 0;
-    let Outcome::Incomplete(progress) = tuner::tune(&request, limited).unwrap() else {
+    let mut limited = settings();
+    limited.limits.work = 0;
+    let Outcome::Incomplete(progress) = tuner::tune(&request, limited.clone()).unwrap() else {
         panic!()
     };
-    assert_eq!(
-        progress.frontier().iter().map(|r| r.len()).sum::<usize>(),
-        1
-    );
-    let Outcome::Optimal(tuned) = tuner::resume(&request, progress, budget()).unwrap() else {
+    assert!(progress.feasible_upper().is_none());
+    let retained_model = progress.model().clone();
+    assert!(!retained_model.variables.is_empty());
+    let Outcome::Optimal(tuned) = tuner::resume(&request, progress, settings().limits).unwrap() else {
         panic!()
     };
-    let Outcome::Incomplete(second) = tuner::tune(&request, limited).unwrap() else {
+    let Outcome::Incomplete(second) = tuner::tune(&request, limited.clone()).unwrap() else {
         panic!()
     };
     let mut changed = model.clone();
@@ -336,7 +299,7 @@ fn nested_views_derive_canonical_alias_geometry_and_resume_binds_all_inputs() {
         ..request
     };
     assert!(
-        matches!(tuner::resume(&altered,second,budget()),Err(error) if error.contains("inputs changed"))
+        matches!(tuner::resume(&altered,second,settings().limits),Err(error) if error.contains("inputs changed"))
     );
     assert!(tuned.modeled_cost().is_exact());
 }
@@ -390,7 +353,7 @@ fn cuda_uses_compiler_selection_and_rejects_a_different_native_device() {
             operations: 100_000,
         },
     };
-    let Outcome::Optimal(tuned) = tuner::tune(&request, budget()).unwrap() else {
+    let Outcome::Optimal(tuned) = tuner::tune(&request, settings()).unwrap() else {
         panic!("CUDA conditional optimum")
     };
     let Execution::Cuda(phases) = tuned.execution() else {
@@ -435,10 +398,7 @@ fn cuda_tuned_native_artifact_retains_conditions_and_enforces_bindings() {
     };
     let Outcome::Optimal(tuned) = tuner::tune(
         &request,
-        Budget {
-            nodes: 20_000,
-            schedule_assignments: 100_000,
-        },
+        seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() },
     )
     .unwrap() else {
         panic!("CUDA conditional optimum")
@@ -491,10 +451,7 @@ fn metal_tuned_native_artifact_preserves_publication_and_binding_conditions() {
     };
     let Outcome::Optimal(tuned) = tuner::tune(
         &request,
-        Budget {
-            nodes: 20_000,
-            schedule_assignments: 100_000,
-        },
+        seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() },
     )
     .unwrap() else {
         panic!("Metal conditional optimum")
@@ -573,11 +530,11 @@ fn runtime_rejects_preselected_frontends_and_fixed_decomposition() {
     let workload = tuner::workload("gate", &buffers, &[], &[]).unwrap();
     let mut request = Request { input: Input::Lowered(&lowered), device: &facts, form: Form::CpuScalar,
         hardware: &hardware, workload: &workload, derivation_limits: DerivationLimits { instructions: 1, operations: 1 } };
-    assert!(matches!(tuner::tune(&request, budget()), Err(e) if e.contains("requires portable source")));
+    assert!(matches!(tuner::tune(&request, settings()), Err(e) if e.contains("requires portable source")));
     let options = seismic_lang::lower::Options { piece: Some(1), ..Default::default() };
     let shapes = HashMap::new(); let elements = HashMap::new();
     request.input = Input::Portable { program: &program, entry: "copy", shapes: &shapes, elements: &elements, options: &options };
-    assert!(matches!(tuner::tune(&request, budget()), Err(e) if e.contains("fixed stream piece")));
+    assert!(matches!(tuner::tune(&request, settings()), Err(e) if e.contains("fixed stream piece")));
 }
 
 #[test]
@@ -594,13 +551,22 @@ fn automatic_selection_checks_control_contents_before_native_execution() {
     let out = device.buffer(4).unwrap();
     let buffers = vec![control.clone(), out.clone()];
     let mut workload = tuner::workload("control bytes", &buffers, &[], &[]).unwrap();
+    let uncaptured = Request {
+        input: source_input(&program), device: &facts, form: Form::CpuScalar,
+        hardware: &model, workload: &workload,
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 },
+    };
+    let Outcome::Incomplete(progress) = tuner::tune(&uncaptured, settings()).unwrap() else {
+        panic!("unknown branch analysis must remain incomplete, not infeasible");
+    };
+    assert!(progress.unsupported_analyses().any(|(_, reason)| reason.contains("data-dependent branch")));
     tuner::capture_contents(&mut workload, &buffers, &[0]).unwrap();
     let request = Request {
         input: source_input(&program), device: &facts, form: Form::CpuScalar,
         hardware: &model, workload: &workload,
         derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 },
     };
-    let Outcome::Optimal(tuned) = tuner::tune(&request, budget()).unwrap() else { panic!("control data must admit complete selection"); };
+    let Outcome::Optimal(tuned) = tuner::tune(&request, settings()).unwrap() else { panic!("control data must admit complete selection"); };
     let mut kernel = device.compile_tuned(tuned).unwrap();
     kernel.execute(&buffers, &[]).unwrap();
     let mut actual = [0; 4]; out.read(&mut actual).unwrap();
@@ -613,7 +579,7 @@ fn automatic_selection_checks_control_contents_before_native_execution() {
     let mut writable_workload = workload.clone();
     tuner::capture_contents(&mut writable_workload, &buffers, &[1]).unwrap();
     let writable_request = Request { workload: &writable_workload, ..request };
-    let Outcome::Optimal(tuned) = tuner::tune(&writable_request, budget()).unwrap() else { panic!("bounded writable case must complete analysis"); };
+    let Outcome::Optimal(tuned) = tuner::tune(&writable_request, settings()).unwrap() else { panic!("bounded writable case must complete analysis"); };
     let mut kernel = device.compile_tuned(tuned).unwrap();
     assert!(kernel.execute(&buffers, &[]).unwrap_err().contains("may be modified"));
 }
@@ -629,7 +595,7 @@ fn content_conditions_cannot_be_invalidated_inside_a_batch() {
     let device = Device::cpu();
     let settings = Settings {
         hardware: Hardware::Cpu(contract(&lowered)), form: Form::CpuScalar,
-        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: budget(),
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: settings(),
     };
     let mut compiler = PlanCompiler::new(&device, &program, settings);
     let plan = compiler.compile_entry("copy", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
@@ -660,7 +626,7 @@ fn completed_artifact_reuses_weaker_content_contract() {
     let lowered = seismic_lang::lower::lower(&program, "copy", "cpu", &HashMap::new()).unwrap();
     let device = Device::cpu();
     let settings = Settings { hardware: Hardware::Cpu(contract(&lowered)), form: Form::CpuScalar,
-        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: budget() };
+        derivation_limits: DerivationLimits { instructions: 100_000, operations: 100_000 }, search: settings() };
     let mut compiler = PlanCompiler::new(&device, &program, settings);
     let mut plan = compiler.compile_entry("copy", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
     struct Binding { input: seismic_runtime::Buffer, out: seismic_runtime::Buffer, known: bool, enabled: bool }
@@ -727,7 +693,7 @@ fn metal_automatic_selection_reuses_checked_indirect_input_domains() {
     let device = Device::metal().unwrap();
     let settings = Settings { hardware, form: Form::Metal,
         derivation_limits: DerivationLimits { instructions: 1_000_000, operations: 1_000_000 },
-        search: Budget { nodes: 20_000, schedule_assignments: 100_000 } };
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() } };
     let mut compiler = PlanCompiler::new(&device, &program, settings);
     let mut plan = compiler.compile_entry("gather", &HashMap::new(), &HashMap::new(), &Default::default()).unwrap();
     struct Inputs { table: Buffer, tokens: Buffer, out: Buffer, bias: f64 }

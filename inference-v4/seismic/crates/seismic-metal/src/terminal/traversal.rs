@@ -28,6 +28,19 @@ pub struct Selection {
     pub width: usize,
 }
 
+/// Coordinate construction shared by retained traversal accounting and native
+/// instantiation. Keep this typed expression intact until both consume it.
+pub(crate) fn coordinate(first: i64, step: i64, width: E, chunk: Option<E>, offset: E) -> E {
+    let ordinal = match chunk {
+        None => offset,
+        Some(chunk) => E::binary(B::Add,
+            E::binary(B::Mul, chunk.cast(T::I64), width, T::I64),
+            offset, T::I64),
+    };
+    E::binary(B::Add, E::Integer(first, T::I64),
+        E::binary(B::Mul, ordinal, E::Integer(step, T::I64), T::I64), T::I64).cast(T::I32)
+}
+
 pub fn choices(program: &Program) -> Result<Vec<Choice>, String> {
     let mut choices = Vec::new();
     for (launch, body) in program.launches().iter().enumerate() {
@@ -51,7 +64,7 @@ pub fn choices(program: &Program) -> Result<Vec<Choice>, String> {
     }
     Ok(choices)
 }
-fn iterations(body: &[Site], at: usize) -> Result<Option<usize>, String> {
+pub(crate) fn iterations(body: &[Site], at: usize) -> Result<Option<usize>, String> {
     let S::For {
         name,
         start: E::Integer(start, T::I32),
@@ -78,7 +91,7 @@ fn iterations(body: &[Site], at: usize) -> Result<Option<usize>, String> {
     }
     Ok(usize::try_from(count).ok())
 }
-fn close(body: &[Site], at: usize) -> Result<usize, String> {
+pub(crate) fn close(body: &[Site], at: usize) -> Result<usize, String> {
     let mut depth = 0;
     for (index, site) in body.iter().enumerate().skip(at + 1) {
         match site.statement {
@@ -186,28 +199,8 @@ pub(crate) fn apply(
                         }));
                     }
                     for offset in 0..width {
-                        let ordinal = if complete == 1 {
-                            E::Integer(offset as i64, T::I64)
-                        } else {
-                            E::binary(
-                                B::Add,
-                                E::binary(
-                                    B::Mul,
-                                    E::variable(&chunk, T::I32).cast(T::I64),
-                                    E::Integer(width as i64, T::I64),
-                                    T::I64,
-                                ),
-                                E::Integer(offset as i64, T::I64),
-                                T::I64,
-                            )
-                        };
-                        let value = E::binary(
-                            B::Add,
-                            E::Integer(*first, T::I64),
-                            E::binary(B::Mul, ordinal, E::Integer(*step, T::I64), T::I64),
-                            T::I64,
-                        )
-                        .cast(T::I32);
+                        let value = coordinate(*first, *step, E::Integer(width as i64, T::I64),
+                            (complete != 1).then(|| E::variable(&chunk, T::I32)), E::Integer(offset as i64, T::I64));
                         occurrence(value, &mut output);
                     }
                     if complete > 1 {
@@ -231,24 +224,4 @@ pub(crate) fn apply(
     }
     *body = expand(body, 0, body.len(), launch, &widths, &mut names)?;
     Ok(())
-}
-
-/// Operation classes preserved occurrence-for-occurrence by this traversal and
-/// its integer-only realization. Control, address arithmetic, integer casts and helper
-/// checks can disappear; their counts are deliberately not used for a region.
-pub(crate) fn preserves(primitive: &super::Primitive) -> bool {
-    use super::{Primitive as P, Space};
-    let floating = |ty: &T| matches!(ty, T::F16 | T::BF16 | T::F32);
-    match primitive {
-        P::VectorRead { .. } => true,
-        P::Read { space, .. } => *space != Space::Constant,
-        P::Write { .. } | P::Barrier | P::MatrixLoad { .. }
-        | P::MatrixStore { .. } | P::MatrixMultiplyAccumulate { .. } => true,
-        P::Binary { ty, .. } | P::Unary { ty, .. } => floating(ty),
-        // Explicit floating publication boundaries survive integer unrolling
-        // and regrouping, including BF16's required narrowing/widening pairs.
-        P::Cast { from, to } => floating(from) && floating(to),
-        P::Builtin { result, .. } => floating(result),
-        _ => false,
-    }
 }

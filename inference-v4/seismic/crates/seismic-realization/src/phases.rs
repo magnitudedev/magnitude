@@ -40,6 +40,14 @@ pub struct PhasePlan {
     pub phases: Vec<Phase>,
     pub retained: Vec<RetainedValue>,
     pub source_parameters: usize,
+    pub handoffs: Vec<PhaseHandoff>,
+}
+/// Invocation-owned restores and publications shared by every local
+/// implementation alternative of one source phase.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhaseHandoff {
+    pub restores: Vec<Stmt>,
+    pub publications: Vec<Stmt>,
 }
 
 /// Applicability never turns a missing realization into an infeasibility proof.
@@ -86,9 +94,30 @@ pub fn assess(source: &LoweredIr) -> Result<Applicability, String> {
 pub fn construct(source: &LoweredIr) -> Result<PhasePlan, String> {
     construct_checked(source).map_err(|error| error.to_string())
 }
+/// Compiler parameters have fixed values within one selected program and
+/// declared finite bounds while phase formation retains the whole family.
+pub fn construct_parameterized(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<PhasePlan, String> {
+    construct_retained(source, numeric, &BTreeSet::new())
+}
+/// Compiler predicates describe disjoint source alternatives within one
+/// retained template. Their conditional definitions remain visible to later
+/// regions guarded by the same original decisions. Concrete reconstruction
+/// verifies the selected source with the ordinary lexical scope rules.
+pub fn construct_retained(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<PhasePlan, String> {
+    construct_with_parameters(source, numeric, selectors).map_err(|error| error.to_string())
+}
 fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
-    let mut function = work_domains_checked(source)?;
-    let parameters = parameter_variables(&function)?;
+    construct_with_parameters(source, &BTreeMap::new(), &BTreeSet::new())
+}
+fn construct_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<PhasePlan, FormationError> {
+    let mut function = work_domains_with_parameters(source, numeric, selectors)?;
+    let mut parameters = parameter_variables(&function)?;
+    for &selector in selectors {
+        if function.vars.get(selector).is_none_or(|variable| variable.ty != Ty::Scalar(DType::Bool)) {
+            return Err("retained compiler selector requires a boolean binding".into());
+        }
+        parameters.insert(selector);
+    }
     let mut available = parameters.clone();
     let mut producers = BTreeMap::new();
     let mut phases = Vec::new();
@@ -118,6 +147,8 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
         bound.extend(vars);
         let mut scope = Scope {
             function: &function,
+            numeric,
+            selectors,
             inputs: BTreeSet::new(),
             symbols: BTreeSet::new(),
         };
@@ -194,6 +225,13 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
     let mut restores = vec![Vec::new(); phases.len()];
     let mut publications = vec![Vec::new(); phases.len()];
     for (variable, (producer, consumers)) in captures {
+        // Handoffs belong to the same original alternatives as the value they
+        // carry. Keep those paths before adding any synthetic extent/bridge
+        // bindings, whose identities have no independent source activity.
+        let paths: Vec<_> = function.body.iter().map(|root| {
+            let StmtKind::Parallel { body, .. } = &root.kind else { unreachable!() };
+            capture_paths(body, variable, &function.vars, selectors)
+        }).collect();
         let ty = function.vars[variable].ty.clone();
         let span = function.vars[variable].span;
         let logical = match &ty {
@@ -219,7 +257,10 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                 dimensions.push(None);
                 continue;
             }
-            let capacity = variable_capacity(variable, axis, &function, &mut BTreeSet::new())?;
+            let capacity = match extent.eval_interval(&|name| numeric.get(name).copied()) {
+                Some((minimum, maximum)) if minimum >= 0 => maximum,
+                _ => variable_capacity(variable, axis, &function, &mut BTreeSet::new())?,
+            };
             physical.shape[axis] = Sym::constant(capacity);
             let dimension = function.vars.len();
             function.vars.push(Var {
@@ -238,12 +279,12 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                 &writers,
             )?;
             for &phase in &consumers {
-                restores[phase].push(restore(
+                restores[phase].extend(guard_handoff(&paths[phase].reads, vec![restore(
                     dimension,
                     element(storage, &function.vars, span),
                     &function.vars,
                     span,
-                ));
+                )], &function.vars, span));
                 phases[phase].inputs.push(dimension);
             }
             for &phase in &writers {
@@ -259,7 +300,7 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                     sym: None,
                     span,
                 };
-                publications[phase].push(Stmt {
+                let definition = Stmt {
                     id: None,
                     span,
                     kind: StmtKind::Assign {
@@ -267,13 +308,13 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                         op: AssignOp::Assign,
                         value,
                     },
-                });
-                publications[phase].push(publish(
+                };
+                publications[phase].extend(guard_handoff(&paths[phase].writes, vec![definition, publish(
                     dimension,
                     element(storage, &function.vars, span),
                     &function.vars,
                     span,
-                ));
+                )], &function.vars, span));
                 phases[phase].outputs.push(dimension);
             }
             dimensions.push(Some(dimension));
@@ -300,8 +341,7 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
             });
             let memory = reference(storage, &function.vars, span);
             for &phase in &consumers {
-                restores[phase].push(restore(bridge, memory.clone(), &function.vars, span));
-                restores[phase].push(Stmt {
+                let allocation = Stmt {
                     id: None,
                     span,
                     kind: StmtKind::Assign {
@@ -322,17 +362,20 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                             span,
                         },
                     },
-                });
-                restores[phase].push(fragment_transfer(
+                };
+                restores[phase].extend(guard_handoff(&paths[phase].reads, vec![
+                    restore(bridge, memory.clone(), &function.vars, span),
+                    allocation,
+                    fragment_transfer(
                     seismic_lang::intrinsics::Operation::MatrixLoad,
                     variable,
                     bridge,
                     &function.vars,
                     span,
-                ));
+                )], &function.vars, span));
             }
             for &phase in &writers {
-                publications[phase].push(Stmt {
+                let allocation = Stmt {
                     id: None,
                     span,
                     kind: StmtKind::Assign {
@@ -348,15 +391,14 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
                             span,
                         },
                     },
-                });
-                publications[phase].push(fragment_transfer(
+                };
+                publications[phase].extend(guard_handoff(&paths[phase].writes, vec![allocation, fragment_transfer(
                     seismic_lang::intrinsics::Operation::MatrixStore,
                     variable,
                     bridge,
                     &function.vars,
                     span,
-                ));
-                publications[phase].push(publish(bridge, memory.clone(), &function.vars, span));
+                ), publish(bridge, memory.clone(), &function.vars, span)], &function.vars, span));
             }
             continue;
         }
@@ -382,12 +424,16 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
             }
         };
         for &phase in &consumers {
-            restores[phase].push(restore(variable, view.clone(), &function.vars, span));
+            restores[phase].extend(guard_handoff(&paths[phase].reads,
+                vec![restore(variable, view.clone(), &function.vars, span)], &function.vars, span));
         }
         for &phase in &writers {
-            publications[phase].push(publish(variable, view.clone(), &function.vars, span));
+            publications[phase].extend(guard_handoff(&paths[phase].writes,
+                vec![publish(variable, view.clone(), &function.vars, span)], &function.vars, span));
         }
     }
+    let handoffs = restores.iter().zip(&publications).map(|(restores, publications)|
+        PhaseHandoff { restores: restores.clone(), publications: publications.clone() }).collect();
     for (phase, root) in function.body.iter_mut().enumerate() {
         let StmtKind::Parallel { body, .. } = &mut root.kind else {
             unreachable!()
@@ -399,13 +445,117 @@ fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
     }
     // Each launch is independently scoped. Check the exact transformed phase
     // bodies, rather than trusting the capture bookkeeping alone.
-    verify(&function)?;
+    verify_with_parameters(&function, numeric, selectors)?;
     Ok(PhasePlan {
         function,
         phases,
         retained,
         source_parameters,
+        handoffs,
     })
+}
+
+type CompilerPath = Vec<(VarId, bool)>;
+
+#[derive(Default)]
+struct CapturePaths {
+    reads: Vec<CompilerPath>,
+    writes: Vec<CompilerPath>,
+}
+
+/// Project source activity without turning runtime control into a compiler
+/// choice. Inspect headers separately so an inner alternative does not make
+/// the enclosing path look unconditionally active.
+fn capture_paths(body: &[Stmt], variable: VarId, vars: &[Var], selectors: &BTreeSet<VarId>) -> CapturePaths {
+    fn visit(body: &[Stmt], variable: VarId, vars: &[Var], selectors: &BTreeSet<VarId>, path: &CompilerPath, out: &mut CapturePaths) {
+        for statement in body {
+            let mut header = statement.clone();
+            match &mut header.kind {
+                StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => body.clear(),
+                StmtKind::If { then, els, .. } => { then.clear(); els.clear(); }
+                StmtKind::Reduction(reduction) => {
+                    for implementation in reduction.implementations_mut() { implementation.body.clear(); }
+                }
+                StmtKind::Assign { .. } | StmtKind::Expr(_) => {}
+            }
+            let mut written = HashSet::new();
+            seismic_lang::rewrite::value_writes(&header, vars, &mut written);
+            if written.contains(&variable) { out.writes.push(path.clone()); }
+            // A complete scalar assignment establishes its value. A tile
+            // assignment also consumes the retained destination geometry.
+            let reads = match &header.kind {
+                StmtKind::Assign { target: Expr { kind: ExprKind::Var(v), .. }, op: AssignOp::Assign, value }
+                    if *v == variable && !matches!(vars[variable].ty, Ty::Tile(_)) => {
+                        seismic_lang::effects::uses(&Stmt { id: None, span: header.span, kind: StmtKind::Expr(value.clone()) }, variable)
+                    }
+                _ => seismic_lang::effects::uses(&header, variable),
+            };
+            if reads { out.reads.push(path.clone()); }
+            match &statement.kind {
+                StmtKind::If { cond, then, els } => {
+                    let selector = match cond.kind {
+                        ExprKind::Var(selector) if selectors.contains(&selector) => Some(selector),
+                        _ => None,
+                    };
+                    if let Some(selector) = selector {
+                        for (branch, truth) in [(then, true), (els, false)] {
+                            let mut nested = path.clone();
+                            match nested.binary_search_by_key(&selector, |&(v, _)| v) {
+                                Ok(index) if nested[index].1 != truth => continue,
+                                Ok(_) => {}
+                                Err(index) => nested.insert(index, (selector, truth)),
+                            }
+                            visit(branch, variable, vars, selectors, &nested, out);
+                        }
+                    } else {
+                        visit(then, variable, vars, selectors, path, out);
+                        visit(els, variable, vars, selectors, path, out);
+                    }
+                }
+                StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => visit(body, variable, vars, selectors, path, out),
+                StmtKind::Reduction(reduction) => {
+                    for body in reduction.bodies() { visit(body, variable, vars, selectors, path, out); }
+                }
+                StmtKind::Assign { .. } | StmtKind::Expr(_) => {}
+            }
+        }
+    }
+    let mut out = CapturePaths::default();
+    visit(body, variable, vars, selectors, &Vec::new(), &mut out);
+    out.reads.sort();
+    out.reads.dedup();
+    out.writes.sort();
+    out.writes.dedup();
+    out
+}
+
+/// A union of original paths executes one handoff, even when the source uses
+/// the value in multiple overlapping alternatives. Branches test the original
+/// selector identities, so selection removes inactive transfers with the source.
+fn guard_handoff(paths: &[CompilerPath], body: Vec<Stmt>, vars: &[Var], span: Span) -> Vec<Stmt> {
+    if paths.iter().any(Vec::is_empty) { return body; }
+    let Some(&(selector, _)) = paths.first().and_then(|path| path.first()) else { return Vec::new() };
+    let branch = |truth| {
+        let paths: Vec<_> = paths.iter().filter_map(|path| {
+            match path.binary_search_by_key(&selector, |&(v, _)| v) {
+                Ok(index) if path[index].1 != truth => None,
+                Ok(index) => {
+                    let mut path = path.clone();
+                    path.remove(index);
+                    Some(path)
+                }
+                Err(_) => Some(path.clone()),
+            }
+        }).collect();
+        guard_handoff(&paths, body.clone(), vars, span)
+    };
+    vec![Stmt { id: None, span, kind: StmtKind::If {
+        cond: reference(selector, vars, span), then: branch(true), els: branch(false),
+    } }]
 }
 
 fn fragment_transfer(
@@ -439,9 +589,19 @@ fn fragment_transfer(
 /// their evaluated coordinates as scalars, then reconstruct the same view in
 /// each consuming launch. In particular, a coordinate loaded from a mutable
 /// tensor is read once at the original view definition.
-fn close_views(function: &mut LoweredIr) -> Result<Vec<usize>, FormationError> {
-    let mut recipes: BTreeMap<VarId, Expr> = BTreeMap::new();
+struct ViewRecipe {
+    variable: VarId,
+    value: Expr,
+    path: CompilerPath,
+    /// Ordinary bool values evaluated in the producing serial phase. These
+    /// never join the original compiler selectors or change family coverage.
+    runtime: Vec<(VarId, bool)>,
+}
+
+fn close_views(function: &mut LoweredIr, selectors: &BTreeSet<VarId>) -> Result<Vec<usize>, FormationError> {
+    let mut recipes: Vec<ViewRecipe> = Vec::new();
     let original = function.body.clone();
+    let required = retained_views(&original, &function.vars)?;
     let mut prefixes = Vec::new();
     for phase in 0..function.body.len() {
         let StmtKind::Parallel {
@@ -452,15 +612,21 @@ fn close_views(function: &mut LoweredIr) -> Result<Vec<usize>, FormationError> {
         else {
             unreachable!()
         };
-        let mut prefix = Vec::new();
-        let mut symbols = control_symbols(body);
-        symbols.extend(extents.iter().flat_map(Sym::params));
-        let mut control_views = BTreeSet::new();
-        for symbol in &symbols {
+        let mut demands: BTreeMap<VarId, Vec<CompilerPath>> = BTreeMap::new();
+        for recipe in &recipes {
+            demands.entry(recipe.variable).or_insert_with(|| {
+                capture_paths(body, recipe.variable, &function.vars, selectors).reads
+            });
+        }
+        let mut symbols = control_paths(body, selectors);
+        for symbol in extents.iter().flat_map(Sym::params) {
+            symbols.entry(symbol).or_default().push(Vec::new());
+        }
+        for (symbol, paths) in &symbols {
             let owners = recipes
                 .iter()
-                .filter(|(_, recipe)| {
-                    recipe.ty.shaped().is_some_and(|shape| {
+                .filter(|recipe| {
+                    recipe.value.ty.shaped().is_some_and(|shape| {
                         shape
                             .shape
                             .iter()
@@ -468,67 +634,57 @@ fn close_views(function: &mut LoweredIr) -> Result<Vec<usize>, FormationError> {
                     })
                 })
                 .collect::<Vec<_>>();
-            if let Some((&variable, recipe)) = owners.first().copied() {
-                if owners.iter().any(|(_, other)| *other != recipe) {
+            if let Some(recipe) = owners.first().copied() {
+                // Several source versions of one view retain their source
+                // order. Distinct view identities must still agree on the
+                // meaning of a shared runtime geometry symbol.
+                if owners.iter().any(|other| other.variable != recipe.variable && other.value != recipe.value) {
                     return Err(FormationError::Unresolved(format!(
                         "runtime control symbol `{symbol}` has multiple captured geometry versions"
                     )));
                 }
-                control_views.insert(variable);
+                demands.entry(recipe.variable).or_default().extend(paths.iter().cloned());
             }
         }
-        for (&variable, recipe) in &recipes {
-            if control_views.contains(&variable)
-                || body
-                    .iter()
-                    .any(|s| seismic_lang::effects::uses(s, variable))
-            {
-                let span = function.vars[variable].span;
-                prefix.push(Stmt {
-                    id: None,
-                    span,
-                    kind: StmtKind::Assign {
-                        target: reference(variable, &function.vars, span),
-                        op: AssignOp::Assign,
-                        value: recipe.clone(),
-                    },
-                });
+        // Resolve dependencies backwards through their original definition
+        // order. An alias observes exactly the backing version available when
+        // it was defined, including when a later source assignment rebinds it.
+        let mut definitions = Vec::new();
+        for recipe in recipes.iter().rev() {
+            let mut paths: Vec<_> = demands.get(&recipe.variable).into_iter().flatten()
+                .filter_map(|path| intersect_paths(path, &recipe.path)).collect();
+            paths.sort();
+            paths.dedup();
+            if paths.is_empty() { continue; }
+            for variable in view_backings(&recipe.value) {
+                let demand = demands.entry(variable).or_default();
+                demand.extend(paths.iter().cloned());
+                demand.sort();
+                demand.dedup();
             }
+            let span = function.vars[recipe.variable].span;
+            let mut definition = vec![Stmt {
+                id: None, span, kind: StmtKind::Assign {
+                    target: reference(recipe.variable, &function.vars, span),
+                    op: AssignOp::Assign, value: recipe.value.clone(),
+                },
+            }];
+            for &(predicate, truth) in recipe.runtime.iter().rev() {
+                let (then, els) = if truth { (definition, Vec::new()) } else { (Vec::new(), definition) };
+                definition = vec![Stmt { id: None, span, kind: StmtKind::If {
+                    cond: reference(predicate, &function.vars, span), then, els,
+                } }];
+            }
+            definitions.push(guard_handoff(&paths, definition, &function.vars, span));
         }
+        let mut prefix: Vec<_> = definitions.into_iter().rev().flatten().collect();
         prefixes.push(prefix.len());
         if indices.is_empty() {
-            for mut statement in std::mem::take(body) {
-                if let StmtKind::Assign {
-                    target,
-                    op: AssignOp::Assign,
-                    value,
-                } = &mut statement.kind
-                {
-                    if let ExprKind::Var(variable) = target.kind {
-                        if matches!(target.ty, Ty::Tensor(_))
-                            && original[phase + 1..].iter().any(|s| {
-                                seismic_lang::effects::uses(s, variable)
-                                    || target.ty.shaped().is_some_and(|shape| {
-                                        let symbols = control_symbols(std::slice::from_ref(s));
-                                        shape
-                                            .shape
-                                            .iter()
-                                            .flat_map(Sym::params)
-                                            .any(|symbol| symbols.contains(&symbol))
-                                    })
-                            })
-                        {
-                            if recipes.contains_key(&variable) {
-                                return Err(FormationError::Unresolved("retained tensor view rebinding needs an explicit alias version".into()));
-                            }
-                            let recipe =
-                                freeze_view(value, &mut function.vars, &recipes, &mut prefix)?;
-                            recipes.insert(variable, recipe);
-                        }
-                    }
-                }
-                prefix.push(statement);
-            }
+            let mut defaults = Vec::new();
+            let frozen = freeze_views(std::mem::take(body), &Vec::new(), &[], &required,
+                &mut function.vars, &mut recipes, selectors, &mut defaults)?;
+            prefix.extend(defaults);
+            prefix.extend(frozen);
         } else {
             prefix.append(body);
         }
@@ -537,42 +693,207 @@ fn close_views(function: &mut LoweredIr) -> Result<Vec<usize>, FormationError> {
     Ok(prefixes)
 }
 
-fn control_symbols(body: &[Stmt]) -> BTreeSet<String> {
-    fn visit(body: &[Stmt], symbols: &mut BTreeSet<String>) {
+fn intersect_paths(left: &CompilerPath, right: &CompilerPath) -> Option<CompilerPath> {
+    let mut path = left.clone();
+    for &(selector, truth) in right {
+        match path.binary_search_by_key(&selector, |&(v, _)| v) {
+            Ok(index) if path[index].1 != truth => return None,
+            Ok(_) => {}
+            Err(index) => path.insert(index, (selector, truth)),
+        }
+    }
+    Some(path)
+}
+
+/// Only the backing chain belongs to a view recipe. Coordinate expressions
+/// execute at the source definition and are captured separately as values.
+fn view_backings(expr: &Expr) -> Vec<VarId> {
+    match &expr.kind {
+        ExprKind::Var(variable) => vec![*variable],
+        ExprKind::Index { base, .. } | ExprKind::Transpose(base) => view_backings(base),
+        ExprKind::Builtin { name: Builtin::Reshape, args } => args.first().map_or_else(Vec::new, view_backings),
+        _ => Vec::new(),
+    }
+}
+
+/// Close the set of escaping views over local backing definitions before
+/// freezing them, so a local alias chain can cross a launch as one snapshot.
+fn retained_views(body: &[Stmt], vars: &[Var]) -> Result<BTreeSet<VarId>, FormationError> {
+    fn definitions<'a>(body: &'a [Stmt], phase: usize, serial: bool, out: &mut Vec<(usize, VarId, &'a Expr, bool)>) {
         for statement in body {
             match &statement.kind {
-                StmtKind::Range { lo, hi, body, .. } => {
-                    symbols.extend(lo.params());
-                    symbols.extend(hi.params());
-                    visit(body, symbols);
-                }
-                StmtKind::Lanes { extent, body, .. } => {
-                    symbols.extend(extent.params());
-                    visit(body, symbols);
-                }
-                StmtKind::Parallel { extents, body, .. } => {
-                    symbols.extend(extents.iter().flat_map(Sym::params));
-                    visit(body, symbols);
-                }
-                StmtKind::Owned { body, .. } | StmtKind::LoadLoop { body, .. } => {
-                    visit(body, symbols)
+                StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), ty: Ty::Tensor(_), .. }, op: AssignOp::Assign, value } => {
+                    out.push((phase, *variable, value, serial));
                 }
                 StmtKind::If { then, els, .. } => {
-                    visit(then, symbols);
-                    visit(els, symbols);
+                    definitions(then, phase, serial, out);
+                    definitions(els, phase, serial, out);
                 }
+                StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => definitions(body, phase, false, out),
                 StmtKind::Reduction(reduction) => {
-                    for body in reduction.bodies() {
-                        visit(body, symbols);
-                    }
+                    for body in reduction.bodies() { definitions(body, phase, false, out); }
                 }
                 _ => {}
             }
         }
     }
-    let mut symbols = BTreeSet::new();
-    visit(body, &mut symbols);
-    symbols
+    let mut all = Vec::new();
+    for (phase, root) in body.iter().enumerate() {
+        let StmtKind::Parallel { vars, body, .. } = &root.kind else { unreachable!() };
+        // Parallel-local view assignments never publish a source binding.
+        // This includes reconstruction prefixes from an earlier domain pass.
+        if vars.is_empty() { definitions(body, phase, true, &mut all); }
+    }
+    let symbols: Vec<_> = body.iter().map(|root| control_symbols(std::slice::from_ref(root))).collect();
+    let mut required = BTreeSet::new();
+    for &(phase, variable, _, serial) in &all {
+        if body[phase + 1..].iter().enumerate().any(|(later, root)| {
+            seismic_lang::effects::uses(root, variable) || (serial && vars[variable].ty.shaped().is_some_and(|shape| {
+                shape.shape.iter().flat_map(Sym::params).any(|symbol| symbols[phase + 1 + later].contains(&symbol))
+            }))
+        }) { required.insert(variable); }
+    }
+    loop {
+        let mut dependencies = BTreeSet::new();
+        for &(_, variable, value, _) in &all {
+            if required.contains(&variable) {
+                dependencies.extend(view_backings(value).into_iter().filter(|&v| !matches!(vars[v].kind, VarKind::Param(_))));
+            }
+        }
+        let previous = required.len();
+        required.extend(dependencies);
+        if previous == required.len() { break; }
+    }
+    if all.iter().any(|(_, variable, _, serial)| required.contains(variable) && !serial) {
+        return Err(FormationError::Unresolved("retained tensor view definition inside an iteration requires an explicit escaping binding".into()));
+    }
+    Ok(required)
+}
+
+fn freeze_views(body: Vec<Stmt>, path: &CompilerPath, runtime: &[(VarId, bool)], required: &BTreeSet<VarId>, vars: &mut Vec<Var>, recipes: &mut Vec<ViewRecipe>, selectors: &BTreeSet<VarId>, defaults: &mut Vec<Stmt>) -> Result<Vec<Stmt>, FormationError> {
+    let mut frozen = Vec::new();
+    for mut statement in body {
+        match &mut statement.kind {
+            StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), ty: Ty::Tensor(_), .. }, op: AssignOp::Assign, value }
+                if required.contains(variable) => {
+                    let first = vars.len();
+                    let recipe = freeze_view(value, vars, recipes, &mut frozen)?;
+                    if !runtime.is_empty() {
+                        // A coordinate exists only when its original branch
+                        // executes. Give its private handoff slot a harmless
+                        // value on the other path; reconstruction remains
+                        // guarded and never observes that inactive coordinate.
+                        for coordinate in first..vars.len() {
+                            if matches!(vars[coordinate].ty, Ty::Scalar(DType::I32 | DType::U32)) {
+                                default_capture(coordinate, path, vars, defaults);
+                            }
+                        }
+                    }
+                    recipes.push(ViewRecipe { variable: *variable, value: recipe, path: path.clone(), runtime: runtime.to_vec() });
+                }
+            StmtKind::If { cond, then, els } => {
+                let selector = match cond.kind {
+                    ExprKind::Var(selector) if selectors.contains(&selector) => Some(selector),
+                    _ => None,
+                };
+                if let Some(selector) = selector {
+                    for (branch, truth) in [(then, true), (els, false)] {
+                        if let Some(path) = intersect_paths(path, &vec![(selector, truth)]) {
+                            *branch = freeze_views(std::mem::take(branch), &path, runtime, required, vars, recipes, selectors, defaults)?;
+                        }
+                    }
+                } else if contains_retained_view(then, required) || contains_retained_view(els, required) {
+                    let predicate = vars.len();
+                    vars.push(Var { name: format!("phase_predicate_{predicate}"), ty: Ty::Scalar(DType::Bool),
+                        span: cond.span, kind: VarKind::Local });
+                    default_capture(predicate, path, vars, defaults);
+                    let target = reference(predicate, vars, cond.span);
+                    let value = std::mem::replace(cond, target.clone());
+                    frozen.push(Stmt { id: None, span: value.span, kind: StmtKind::Assign {
+                        target, op: AssignOp::Assign, value,
+                    } });
+                    for (branch, truth) in [(then, true), (els, false)] {
+                        let mut nested = runtime.to_vec();
+                        nested.push((predicate, truth));
+                        *branch = freeze_views(std::mem::take(branch), path, &nested, required, vars, recipes, selectors, defaults)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        frozen.push(statement);
+    }
+    Ok(frozen)
+}
+
+fn contains_retained_view(body: &[Stmt], required: &BTreeSet<VarId>) -> bool {
+    body.iter().any(|statement| match &statement.kind {
+        StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), ty: Ty::Tensor(_), .. }, op: AssignOp::Assign, .. } => required.contains(variable),
+        StmtKind::If { then, els, .. } => contains_retained_view(then, required) || contains_retained_view(els, required),
+        _ => false,
+    })
+}
+
+/// Only compiler-generated scalar slots receive defaults. Original source
+/// predicates and coordinates are still evaluated at their original location,
+/// and compiler-inactive alternatives allocate no publication or restore.
+fn default_capture(variable: VarId, path: &CompilerPath, vars: &[Var], defaults: &mut Vec<Stmt>) {
+    let span = vars[variable].span;
+    let value = Expr {
+        kind: if vars[variable].ty == Ty::Scalar(DType::Bool) { ExprKind::Bool(false) } else { ExprKind::Int(0) },
+        ty: vars[variable].ty.clone(), sym: None, span,
+    };
+    defaults.extend(guard_handoff(std::slice::from_ref(path), vec![Stmt { id: None, span, kind: StmtKind::Assign {
+        target: reference(variable, vars, span), op: AssignOp::Assign, value,
+    } }], vars, span));
+}
+
+fn control_paths(body: &[Stmt], selectors: &BTreeSet<VarId>) -> BTreeMap<String, Vec<CompilerPath>> {
+    fn visit(body: &[Stmt], path: &CompilerPath, selectors: &BTreeSet<VarId>, out: &mut BTreeMap<String, Vec<CompilerPath>>) {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::Range { lo, hi, .. } => {
+                    for symbol in lo.params().into_iter().chain(hi.params()) { out.entry(symbol).or_default().push(path.clone()); }
+                }
+                StmtKind::Lanes { extent, .. } => {
+                    for symbol in extent.params() { out.entry(symbol).or_default().push(path.clone()); }
+                }
+                StmtKind::Parallel { extents, .. } => {
+                    for symbol in extents.iter().flat_map(Sym::params) { out.entry(symbol).or_default().push(path.clone()); }
+                }
+                _ => {}
+            }
+            match &statement.kind {
+                StmtKind::If { cond, then, els } => {
+                    let selector = match cond.kind {
+                        ExprKind::Var(selector) if selectors.contains(&selector) => Some(selector),
+                        _ => None,
+                    };
+                    if let Some(selector) = selector {
+                        for (branch, truth) in [(then, true), (els, false)] {
+                            if let Some(path) = intersect_paths(path, &vec![(selector, truth)]) { visit(branch, &path, selectors, out); }
+                        }
+                    } else { visit(then, path, selectors, out); visit(els, path, selectors, out); }
+                }
+                StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => visit(body, path, selectors, out),
+                StmtKind::Reduction(reduction) => {
+                    for body in reduction.bodies() { visit(body, path, selectors, out); }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut paths = BTreeMap::new();
+    visit(body, &Vec::new(), selectors, &mut paths);
+    paths
+}
+
+fn control_symbols(body: &[Stmt]) -> BTreeSet<String> {
+    control_paths(body, &BTreeSet::new()).into_keys().collect()
 }
 
 /// Physical work domains retain a structural capacity and guard their logical
@@ -581,10 +902,19 @@ fn control_symbols(body: &[Stmt]) -> BTreeSet<String> {
 pub fn work_domains(source: &LoweredIr) -> Result<LoweredIr, String> {
     work_domains_checked(source).map_err(|error| error.to_string())
 }
+pub fn work_domains_parameterized(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<LoweredIr, String> {
+    work_domains_retained(source, numeric, &BTreeSet::new())
+}
+pub fn work_domains_retained(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<LoweredIr, String> {
+    work_domains_with_parameters(source, numeric, selectors).map_err(|error| error.to_string())
+}
 fn work_domains_checked(source: &LoweredIr) -> Result<LoweredIr, FormationError> {
+    work_domains_with_parameters(source, &BTreeMap::new(), &BTreeSet::new())
+}
+fn work_domains_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<LoweredIr, FormationError> {
     let mut function = source.clone();
     seismic_lang::normalize::work_domain(&mut function.body);
-    let prefixes = close_views(&mut function)?;
+    let prefixes = close_views(&mut function, selectors)?;
     for phase in 0..function.body.len() {
         let StmtKind::Parallel { vars, extents, .. } = &function.body[phase].kind else {
             unreachable!()
@@ -596,7 +926,7 @@ fn work_domains_checked(source: &LoweredIr) -> Result<LoweredIr, FormationError>
                 bounded.push(Sym::constant(value));
                 continue;
             }
-            let capacity = extent_capacity(extent, &function)?;
+            let capacity = extent_capacity(extent, &function, numeric)?;
             bounded.push(Sym::constant(capacity));
             let span = function.vars[variable].span;
             let limit = Expr {
@@ -648,9 +978,10 @@ fn work_domains_checked(source: &LoweredIr) -> Result<LoweredIr, FormationError>
     }
     Ok(function)
 }
-fn extent_capacity(extent: &Sym, function: &LoweredIr) -> Result<i64, FormationError> {
+fn extent_capacity(extent: &Sym, function: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<i64, FormationError> {
     let mut intervals = BTreeMap::new();
     for symbol in extent.params() {
+        if let Some(&bounds) = numeric.get(&symbol) { intervals.insert(symbol, bounds); continue; }
         if let Some(&value) = function.shapes.get(&symbol) {
             intervals.insert(symbol, (value, value));
             continue;
@@ -706,14 +1037,14 @@ fn extent_capacity(extent: &Sym, function: &LoweredIr) -> Result<i64, FormationE
 fn freeze_view(
     expr: &mut Expr,
     vars: &mut Vec<Var>,
-    recipes: &BTreeMap<VarId, Expr>,
+    recipes: &[ViewRecipe],
     setup: &mut Vec<Stmt>,
 ) -> Result<Expr, FormationError> {
     let mut recipe = expr.clone();
     match (&mut expr.kind, &mut recipe.kind) {
         (ExprKind::Var(variable), _) => {
-            if let Some(recipe) = recipes.get(variable) {
-                return Ok(recipe.clone());
+            if recipes.iter().any(|recipe| recipe.variable == *variable) {
+                return Ok(recipe);
             }
             if !matches!(
                 vars.get(*variable)
@@ -859,7 +1190,14 @@ fn parameter_variables(function: &LoweredIr) -> Result<BTreeSet<VarId>, String> 
 /// Validate independent launch scope, variable types, condition types, and
 /// participation index bindings. Backend collective checks refine this contract.
 pub fn verify(function: &LoweredIr) -> Result<(), String> {
-    let parameters = parameter_variables(function)?;
+    verify_parameterized(function, &BTreeMap::new())
+}
+pub fn verify_parameterized(function: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<(), String> {
+    verify_with_parameters(function, numeric, &BTreeSet::new())
+}
+fn verify_with_parameters(function: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<(), String> {
+    let mut parameters = parameter_variables(function)?;
+    parameters.extend(selectors);
     for (phase, statement) in function.body.iter().enumerate() {
         let StmtKind::Parallel {
             vars,
@@ -875,6 +1213,8 @@ pub fn verify(function: &LoweredIr) -> Result<(), String> {
         let mut bound = parameters.clone();
         let mut scope = Scope {
             function,
+            numeric,
+            selectors,
             inputs: BTreeSet::new(),
             symbols: BTreeSet::new(),
         };
@@ -1132,12 +1472,15 @@ fn expression_capacity(
 
 struct Scope<'a> {
     function: &'a LoweredIr,
+    numeric: &'a BTreeMap<String, (i64, i64)>,
+    selectors: &'a BTreeSet<VarId>,
     inputs: BTreeSet<VarId>,
     symbols: BTreeSet<String>,
 }
 impl Scope<'_> {
     fn symbol_bound(&self, symbol: &str, bound: &BTreeSet<VarId>) -> bool {
         self.function.shapes.contains_key(symbol)
+            || self.numeric.contains_key(symbol)
             || self.function.index_params.iter().any(|(name, _)| name == symbol)
             || bound.iter().chain(&self.inputs).any(|&v| {
                 self.function.vars.get(v).is_some_and(|var| {
@@ -1255,8 +1598,14 @@ impl Scope<'_> {
                         return Err("execution condition must be boolean".into());
                     }
                     self.expr(cond, bound)?;
-                    self.body(then, &mut bound.clone())?;
-                    self.body(els, &mut bound.clone())?;
+                    let mut yes = bound.clone();
+                    let mut no = bound.clone();
+                    self.body(then, &mut yes)?;
+                    self.body(els, &mut no)?;
+                    if matches!(cond.kind, ExprKind::Var(variable) if self.selectors.contains(&variable)) {
+                        bound.extend(yes);
+                        bound.extend(no);
+                    }
                 }
                 StmtKind::Parallel {
                     vars,

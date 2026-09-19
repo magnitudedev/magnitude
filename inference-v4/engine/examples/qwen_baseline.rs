@@ -2,7 +2,7 @@
 //! inputs. No physical implementation, tiling, or candidate flags are accepted.
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use seismic_accounting::{selection::Budget, workload::DerivationLimits};
+    use seismic_accounting::{workload::DerivationLimits};
     use seismic_engine::models::qwen35::baseline::Baseline;
     use seismic_runtime::{Device, plan::Settings, tuner::{Form, Hardware}};
     use std::{path::Path, rc::Rc};
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings {
         hardware: Hardware::Metal(profile.hardware), form: Form::Metal,
         derivation_limits: DerivationLimits { instructions: 10_000_000, operations: 1_000_000 },
-        search: Budget { nodes: 100_000, schedule_assignments: 1_000_000 },
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 1_000_000, ..Default::default() }, ..Default::default() },
     };
     let result = (|| {
         eprintln!("loading artifact and selecting numerical imports");

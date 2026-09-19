@@ -54,3 +54,8 @@ inference-v4/validation/**/*.json
 inference-v4/validation/**/*.jsonl
 inference-v4/validation/**/*.ndjson
 inference-v4/validation/**/__pycache__/
+
+# Solver lab results, including generated Markdown reports, stay local.
+inference-v4/solver/lab/results/
+inference-v4/solver/lab/evidence/
+inference-v4/solver/lab/**/__pycache__/

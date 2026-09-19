@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magnitude-solver = { path = "../../../solver" }
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-accounting.workspace = true

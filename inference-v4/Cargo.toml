@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+  "solver",
+  "solver/lab",
   "engine",
   "templates",
   "seismic-std",

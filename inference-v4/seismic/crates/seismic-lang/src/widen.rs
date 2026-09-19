@@ -14,6 +14,7 @@ use crate::ir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind};
 use crate::sym::{Atom, Sym};
 use crate::types::{Shaped, Ty};
 use std::collections::HashSet;
+pub mod parameterized;
 
 /// How a body divides when one item covers several values of an index.
 #[derive(Clone, Debug)]

@@ -1,12 +1,14 @@
 //! Logical view geometry does not require storage for unused element data.
 use seismic_lang::{
-    Scope,
     lower::lower,
     lowered_ir::LoweredIr,
-    program::{SourceFile, compile},
+    program::{compile, SourceFile},
+    Scope,
 };
-use seismic_realization::{CallConv, LoadStrategy};
-use seismic_runtime::{Candidate, Device};
+use seismic_realization::CallConv;
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 
 const NO_STORAGE: &str = "
 fn evaluate():
@@ -36,8 +38,8 @@ fn evaluate(x:tensor[8] i32,bounds:tensor[2] i32,out:tensor[1] i32):
   store(result,out)
 ";
 
-fn function(source: &str, backend: &str) -> LoweredIr {
-    let program = compile(
+fn program(source: &str) -> seismic_lang::program::Program {
+    compile(
         &[SourceFile {
             path: "geometry_only.seismic.portable".into(),
             scope: Scope::Portable,
@@ -45,8 +47,10 @@ fn function(source: &str, backend: &str) -> LoweredIr {
         }],
         &[],
     )
-    .unwrap();
-    lower(&program, "evaluate", backend, &Default::default()).unwrap()
+    .unwrap()
+}
+fn function(source: &str, backend: &str) -> LoweredIr {
+    lower(&program(source), "evaluate", backend, &Default::default()).unwrap()
 }
 
 fn bytes(values: &[i32]) -> Vec<u8> {
@@ -56,19 +60,29 @@ fn bytes(values: &[i32]) -> Vec<u8> {
         .collect()
 }
 
-fn execute(device: &Device, candidate: &Candidate) {
+fn execute(device: &Device) {
     for (source, inputs, expected) in [
         (GEOMETRY, vec![], 1026),
         (SNAPSHOT, vec![vec![1; 8], vec![2, 7]], 5),
     ] {
-        let function = function(source, device.backend());
-        let mut kernel = device.compile(&function, candidate.clone()).unwrap();
+        let program = program(source);
+        let input = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "evaluate",
+            shapes: &Default::default(),
+            elements: &Default::default(),
+            options: &Default::default(),
+        };
         let mut buffers = inputs
             .iter()
             .map(|input| device.buffer_from(&bytes(input)).unwrap())
             .collect::<Vec<_>>();
         let output = device.buffer(4).unwrap();
         buffers.push(output.clone());
+        let controls: &[usize] = if source == SNAPSHOT { &[1] } else { &[] };
+        let mut kernel =
+            automatic_hardware::compile_with_controls(device, input, &buffers, &[], controls)
+                .unwrap();
         kernel.execute(&buffers, &[]).unwrap();
         let mut actual = [0; 4];
         output.read(&mut actual).unwrap();
@@ -83,12 +97,7 @@ fn cpu_geometry_only_tiles_omit_element_storage_and_preserve_snapshots() {
         let scalar = seismic_compiler::scalar(&function, CallConv::SystemV).unwrap();
         assert_eq!(scalar.scratch_bytes, scratch);
     }
-    execute(
-        &Device::cpu(),
-        &Candidate::Cpu {
-            loads: LoadStrategy::Materialize,
-        },
-    );
+    execute(&Device::cpu());
 }
 
 const INVALID_RESHAPE: &str = "
@@ -137,13 +146,11 @@ fn metal_geometry_only_tiles_have_no_allocation_or_placement() {
         )
         .unwrap();
         let emitted = seismic_metal::msl::emit_execution(&execution).unwrap();
-        assert!(
-            emitted
-                .launches
-                .iter()
-                .flat_map(|launch| &launch.tiles)
-                .all(|tile| tile.capacity <= 2)
-        );
+        assert!(emitted
+            .launches
+            .iter()
+            .flat_map(|launch| &launch.tiles)
+            .all(|tile| tile.capacity <= 2));
     }
     for source in [INVALID_RESHAPE, DEAD_PRODUCER_INVALID_RESHAPE] {
         let function = function(source, "metal");
@@ -164,23 +171,11 @@ fn metal_geometry_only_tiles_have_no_allocation_or_placement() {
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_geometry_only_snapshots_execute() {
-    execute(
-        &Device::metal().unwrap(),
-        &Candidate::Metal(Default::default()),
-    );
+    execute(&Device::metal().unwrap());
 }
 
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_geometry_only_snapshots_execute() {
-    execute(
-        &Device::cuda(0).unwrap(),
-        &Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::Sequential,
-                loads: LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    execute(&Device::cuda(0).unwrap());
 }

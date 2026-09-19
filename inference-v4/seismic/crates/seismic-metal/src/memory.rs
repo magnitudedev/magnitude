@@ -55,7 +55,7 @@ pub struct AllocationChoices {
     pub alternatives: Vec<usize>,
     pub new_slot: usize,
 }
-impl seismic_accounting::selection::Choices for AllocationChoices {
+impl seismic_accounting::choices::Choices for AllocationChoices {
     type Alternative = usize;
     fn len(&self) -> usize {
         self.alternatives.len()
@@ -262,6 +262,44 @@ impl MemoryPlan {
         }
         Self::new(self.launches, scratch)
     }
+    /// Substitute launch geometry into retained allocation identities and slot
+    /// assignments. Lifetime analysis, storage selection and allocation discovery
+    /// have already completed; geometry changes do not replay those passes.
+    pub(crate) fn redispatch(&self, phases: &[Phase]) -> Result<Self, String> {
+        let mut launches = self.launches.clone();
+        let mut index = 0usize;
+        for phase in phases {
+            for (dispatch, parts) in std::iter::once((&phase.dispatch, phase.parts as u64))
+                .chain(phase.merge_dispatch.iter().map(|dispatch| (dispatch, 1))) {
+                let launch = launches.get_mut(index).ok_or("retained allocation launch is missing")?;
+                launch.prologue = crate::support::LaunchRecipe::new(phase.mapping.clone(), parts)?;
+                launch.prologue.instantiate(dispatch)?;
+                let mut shared = 0u64;
+                let mut private = 0u64;
+                for slot in &launch.slots {
+                    let layout = slot.layout(dispatch)?;
+                    shared = shared.checked_add(layout.shared_bytes_per_group).ok_or("retained shared storage overflow")?;
+                    private = private.checked_add(layout.private_bytes_per_lane).ok_or("retained private storage overflow")?;
+                }
+                launch.shared_bytes_per_group = shared;
+                launch.declared_private_bytes_per_lane = private;
+                index += 1;
+            }
+        }
+        if index != launches.len() { return Err("retained allocation launch count changed".into()) }
+        let mut scratch = self.scratch.clone();
+        for allocation in &mut scratch {
+            if allocation.parameter.is_some() { continue; }
+            let phase = phases.get(allocation.phase).ok_or("retained scratch phase is missing")?;
+            allocation.work_items = phase.merge_dispatch.as_ref().map_or(0, |dispatch| dispatch.work_items);
+            allocation.parts = phase.parts as u64;
+            allocation.bytes = allocation.work_items.checked_mul(allocation.parts)
+                .and_then(|count| count.checked_mul(allocation.elements_per_item))
+                .and_then(|count| count.checked_mul(u64::from(allocation.dtype.bytes())))
+                .and_then(|bytes| usize::try_from(bytes).ok()).ok_or("retained scratch size overflow")?;
+        }
+        Self::new(launches, scratch)
+    }
     pub fn launches(&self) -> &[LaunchMemory] {
         &self.launches
     }
@@ -294,8 +332,20 @@ pub fn plan_selected(
     shared_limit: u64,
     select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
 ) -> Result<MemoryPlan, String> {
+    plan_mode(vars, body, phases, storage, reductions, shared_limit, select, false)
+}
+/// Discover every allocation request and synchronization site in the typed
+/// union. Storage alternatives and backing reuse are bound separately; this
+/// metadata is never submitted as a selected implementation.
+pub(crate) fn plan_template(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePlan,
+    reductions: &ReductionPlan) -> Result<MemoryPlan, String> {
+    plan_mode(vars, body, phases, storage, reductions, u64::MAX, &mut |choice| Ok(choice.new_slot), true)
+}
+fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePlan, reductions: &ReductionPlan,
+    shared_limit: u64, select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>, retained: bool) -> Result<MemoryPlan, String> {
     let lifetimes = lifetime::Analysis::new(body)?;
     struct Planner<'a> {
+        retained: bool,
         lifetimes: &'a lifetime::Analysis,
         select: &'a mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
         split_launch: bool,
@@ -401,7 +451,8 @@ pub fn plan_selected(
                 ExprKind::Builtin { name, args }
                     if matches!(
                         name,
-                        Builtin::Fma
+                        Builtin::Select
+                            | Builtin::Fma
                             | Builtin::Exp
                             | Builtin::ExpFast
                             | Builtin::Rsqrt
@@ -426,7 +477,7 @@ pub fn plan_selected(
             purpose: BarrierPurpose,
             memory: MemorySpace,
         ) -> Result<(), String> {
-            if self.partial_owned {
+            if self.partial_owned && !self.retained {
                 return Err(format!(
                     "memory barrier {purpose:?} at {operation:?} requires proven full-lane participation inside owned or conditional control"
                 ));
@@ -459,7 +510,7 @@ pub fn plan_selected(
             purpose: BarrierPurpose,
             placement: Option<TilePlacement>,
         ) -> Result<(), String> {
-            if placement == Some(TilePlacement::GroupShared) {
+            if self.retained || placement == Some(TilePlacement::GroupShared) {
                 self.barrier(operation, variable, purpose, MemorySpace::Threadgroup)?;
             }
             Ok(())
@@ -575,7 +626,7 @@ pub fn plan_selected(
                     for arg in args {
                         self.expression(arg, operation, ordinal, None)?;
                     }
-                    if self.partial_owned && op.collective() {
+                    if self.partial_owned && op.collective() && !self.retained {
                         return Err("subgroup intrinsic requires full-lane participation".into());
                     }
                     if matches!(
@@ -899,7 +950,10 @@ pub fn plan_selected(
                                     operation,
                                     output: var,
                                 })?;
-                                if selected.decision.materialize_input {
+                                let input_request = selected.decision.materialize_input || (self.retained
+                                    && selected.decision.contract.operation != ReduceOp::Argmax
+                                    && self.storage.declaration(selected.decision.input).is_ok());
+                                if input_request {
                                     self.snapshot(
                                         operation,
                                         selected.decision.input,
@@ -1212,6 +1266,7 @@ pub fn plan_selected(
         return Err("allocation plan phase/domain mismatch".into());
     }
     let mut planner = Planner {
+        retained,
         lifetimes: &lifetimes,
         select,
         split_launch: false,
@@ -1309,7 +1364,11 @@ pub fn plan_selected(
                     consumer: producer + 1,
                 });
             }
-            let (prefix, suffix) = body
+            let (split_body, ordinary) = match &split.retained {
+                Some(retained) => body.split_at_checked(retained.ordinary_at).ok_or("retained ordinary split position is invalid")?,
+                None => (body.as_slice(), &[][..]),
+            };
+            let (prefix, suffix) = split_body
                 .split_at_checked(split.loop_at)
                 .ok_or("allocation split position is invalid")?;
             let (stream, tail) = suffix
@@ -1318,6 +1377,7 @@ pub fn plan_selected(
             planner.body(prefix)?;
             planner.body(&split.validation_bindings)?;
             planner.body(std::slice::from_ref(stream))?;
+            planner.body(ordinary)?;
             launches.push(planner.finish(
                 &phase.dispatch,
                 shared_limit,

@@ -3,93 +3,17 @@
 //! The family varies independent launch groupings; other execution choices
 //! remain fixed. Constructing and selecting this family never emits target code.
 use crate::execution::Execution;
-use seismic_accounting::selection::Choices;
-use seismic_compiler::tuner::Preparation;
-use seismic_realization::dispatch::GroupDispatch;
+#[cfg(test)]
 use std::sync::Arc;
-
-/// Legal groupings derived for one actual launch, including padding constraints.
-#[derive(Clone)]
-pub struct GroupingChoices {
-    pub launch: usize,
-    alternatives: Vec<u64>,
-    family: Arc<GroupFamily>,
-    selected: Vec<u64>,
-}
-impl std::fmt::Debug for GroupingChoices {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GroupingChoices")
-            .field("launch", &self.launch)
-            .field("alternatives", &self.alternatives)
-            .field("selected", &self.selected)
-            .field("function", &self.family.execution.function().name)
-            .finish()
-    }
-}
-impl PartialEq for GroupingChoices {
-    fn eq(&self, other: &Self) -> bool {
-        self.launch == other.launch
-            && self.alternatives == other.alternatives
-            && self.selected == other.selected
-            && (Arc::ptr_eq(&self.family, &other.family)
-                || self.family.execution.same_implementation(&other.family.execution))
-    }
-}
-impl GroupingChoices {
-    pub fn family(&self) -> &GroupFamily {
-        &self.family
-    }
-    pub fn selected(&self) -> &[u64] {
-        &self.selected
-    }
-    pub fn values(&self) -> &[u64] {
-        &self.alternatives
-    }
-    pub fn index(&self, value: u64) -> Option<usize> {
-        self.alternatives.binary_search(&value).ok()
-    }
-    pub(crate) fn relax(&self, indices: std::ops::Range<usize>, hardware: &crate::model::Hardware, workload: &seismic_accounting::workload::ScalarWorkload, limits: seismic_accounting::workload::DerivationLimits) -> Result<Option<seismic_accounting::schedule::Demand>, String> {
-        if indices.is_empty() || indices.end > self.alternatives.len() { return Err("Metal grouping relaxation needs a nonempty subdomain".into()); }
-        let mut launches = Vec::new();
-        for (launch, dispatch) in self.family.launches.iter().enumerate() {
-            let maximum = if let Some(&selected) = self.selected.get(launch) { selected }
-            else if launch == self.launch { *self.alternatives[indices.clone()].iter().max().unwrap() }
-            else { *self.family.grouping_values(launch)?.last().ok_or("empty Metal grouping domain")? };
-            launches.push((dispatch.work_items, maximum));
-        }
-        let dispatch = crate::model::dispatch_demand(hardware, launches)?;
-        let mut demand = match dispatch {
-            Some(demand) => demand,
-            None => seismic_accounting::schedule::Demand::new(hardware.timebase.clone(), hardware.resources.clone())?,
-        };
-        let account = self.family.execution.relaxation(workload, limits)?;
-        // Regrouping changes launch geometry and shared-array base addresses,
-        // but each logical subgroup still performs the same selected body.
-        // Ignore integer/address/control work and keep the same conservative
-        // mandatory-work predicate used by terminal traversal refinement.
-        crate::model::include_preserved_demand(&mut demand, &account, hardware, crate::terminal::traversal::preserves)?;
-        Ok(Some(demand))
-    }
-    /// Apply one original-domain ordinal to this immutable prepared family.
-    pub fn refine(&self, index: usize) -> Result<Preparation<Execution>, String> {
-        if self.launch != self.selected.len() {
-            return Err("Metal grouping choice does not identify the unresolved launch".into());
-        }
-        let value = self.get(index).ok_or("Metal grouping choice is outside its domain")?;
-        let mut selected = self.selected.clone();
-        selected.push(value);
-        self.family.next(selected)
-    }
-}
-impl Choices for GroupingChoices {
-    type Alternative = u64;
-    fn len(&self) -> usize {
-        self.alternatives.len()
-    }
-    fn get(&self, index: usize) -> Option<u64> {
-        self.alternatives.get(index).copied()
-    }
-}
+pub mod symbolic;
+pub mod decomposition;
+pub(crate) mod grouping;
+pub mod export;
+pub mod implementation;
+mod folds;
+pub(crate) mod layout;
+pub(crate) mod source;
+use seismic_realization::dispatch::GroupDispatch;
 
 #[derive(Clone, Debug)]
 pub struct Constraint {
@@ -229,50 +153,12 @@ impl GroupFamily {
 
     /// Each launch has its own resource domain. Neither an earlier launch's
     /// shared arrays nor a common convenience grouping restricts this choice.
-    fn grouping_values(&self, launch: usize) -> Result<Vec<u64>, String> {
-        let maximum = *self
-            .maximum_by_launch
-            .get(launch)
-            .ok_or("unknown grouping launch")?;
-        let domain = &self.launches[launch];
-        let alternatives = (1..=maximum)
-            .filter(|&items| {
-                // Padding is a typed index-width constraint, not a failed compiler
-                // attempt used as a proxy for legality.
-                u128::from(domain.work_items).div_ceil(u128::from(items)) * u128::from(items)
-                    <= u128::from(u32::MAX)
-            })
-            .collect();
-        Ok(alternatives)
+    fn admits_grouping(&self, launch: usize, items: u64) -> Result<bool, String> {
+        let maximum = *self.maximum_by_launch.get(launch).ok_or("unknown grouping launch")?;
+        if items == 0 || items > maximum { return Ok(false); }
+        let work = u128::from(self.launches[launch].work_items);
+        Ok(work.div_ceil(u128::from(items)) * u128::from(items) <= u128::from(u32::MAX))
     }
-
-    /// Continue resolving launch geometry while retaining all prior execution
-    /// choices. Main and merge launches remain independent legal domains.
-    pub fn next(self: &Arc<Self>, selected: Vec<u64>) -> Result<Preparation<Execution>, String> {
-        if selected.len() > self.launches.len() {
-            return Err("unused Metal grouping decisions".into());
-        }
-        for (launch, value) in selected.iter().enumerate() {
-            if self.grouping_values(launch)?.binary_search(value).is_err() {
-                return Err(format!("grouping is outside launch {launch}'s resource domain"));
-            }
-        }
-        if selected.len() == self.launches.len() {
-            return Ok(Preparation::Execution(self.select_launches(&selected)?));
-        }
-        let launch = selected.len();
-        let alternatives = GroupingChoices {
-            launch,
-            alternatives: self.grouping_values(launch)?,
-            family: Arc::clone(self),
-            selected,
-        };
-        Ok(Preparation::Choice {
-            name: format!("Metal launch {launch} work items per threadgroup"),
-            alternatives: seismic_accounting::selection::Domain::new(alternatives)?,
-        })
-    }
-
     pub fn select_launches(&self, items: &[u64]) -> Result<Execution, String> {
         if items.len() != self.launches.len() {
             return Err("one grouping is required for every launch".into());
@@ -280,7 +166,7 @@ impl GroupFamily {
         let mut launches = Vec::new();
         let mut shared_bytes_per_group = Vec::new();
         for (index, (&items, domain)) in items.iter().zip(&self.launches).enumerate() {
-            if self.grouping_values(index)?.binary_search(&items).is_err() {
+            if !self.admits_grouping(index, items)? {
                 return Err(format!(
                     "grouping is outside launch {index}'s resource domain"
                 ));
@@ -322,26 +208,7 @@ impl GroupFamily {
                 phase.merge_dispatch = Some(launches.next().ok_or("merge dispatch missing")?);
             }
         }
-        let allocation_choices = execution
-            .memory
-            .launches()
-            .iter()
-            .flat_map(|l| l.arrays.iter().map(|a| (a.id, a.slot)))
-            .collect::<std::collections::HashMap<_, _>>();
-        execution.memory = crate::memory::plan_selected(
-            &execution.function.vars,
-            &execution.function.body,
-            &execution.phases,
-            &execution.storage,
-            &execution.reductions,
-            execution.config.max_threadgroup_bytes as u64,
-            &mut |choice| {
-                allocation_choices
-                    .get(&choice.allocation)
-                    .copied()
-                    .ok_or_else(|| "grouping changed an allocation identity".into())
-            },
-        )?.with_retained(&execution.retained, &execution.phases)?;
+        execution.memory = execution.memory.redispatch(&execution.phases)?;
         if execution
             .memory
             .launches()

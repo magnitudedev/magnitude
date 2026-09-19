@@ -10,4 +10,4 @@ seismic-lang.workspace = true
 cranelift-codegen = "=0.125.4"
 
 seismic-realization.workspace = true
-
+magnitude-solver = { path = "../../../solver" }

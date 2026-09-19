@@ -21,6 +21,21 @@ These results are not interchangeable. Replaying a prediction does not prove it.
 observed throughput is not a physical service ceiling. An optimum under a supplied model
 does not prove that model describes the device.
 
+Flat scheduling exclusively uses the independent solver through the accounting
+adapter. A checked upper witness or the sum-of-latencies finite-domain argument
+bounds its horizon. Operation dependencies, offset reservations, event lifetimes
+and common static orders survive translation, and every returned schedule is
+checked against the original model. The adapter does not by itself replace
+unresolved implementation-family construction or authorize native execution.
+
+The joint symbolic scheduling boundary collects conditional activities and all
+uses of each shared resource in one relation. Whole-duration resource uses retain
+the information needed for capacity-incompatibility deductions. Completion is
+the exact maximum of active events, rather than a sum of isolated child optima.
+Missing analysis and exhausted refinement remain typed obligations, distinct from
+solver-work exhaustion and proven infeasibility. The original model relationship
+and native qualification requirements remain attached to every result.
+
 ## Derivation flow
 
 ```mermaid
@@ -58,6 +73,24 @@ The walk retains per-lane integer intervals and affine relationships over
 independent dispatch, loop, and runtime-input coordinates. Arithmetic, supported
 quotient/remainder operations, helper arguments and returns, and derived pointers
 preserve those relationships when the target's integer widths exclude wrapping.
+Compile-time numeric operands retain their original solver identities and defining
+equations; a derived count is not treated as independent of its extent and step.
+Parameter guards refine only the analysis of their active region. Early-return
+continuations retain their arithmetic participation facts, and returned lanes
+remain absent through the end of the launch.
+Storage alternatives carry the same participant-ownership equations into model
+export and local emission. A contradictory conjunction of ownership facts has
+no emitted arm; an unfinished proof remains an analysis obligation. Distributed
+element ownership follows physical strides and lane coordinates. Independently
+captured logical extents still receive their own bounds checks.
+Facts preserved by every arm of a local choice survive its join without acquiring
+that unrelated choice as a precondition. Removing such a guard requires coverage
+of the choice's complete original ordinal domain; matching only some arms is
+insufficient. Branch-specific pointers and scalar definitions retain their guards.
+Later consumers apply their known guards before checking that coverage, so a fact
+defined under `a` or under `!a && b` is available when `b` holds. Conflicting
+compatible definitions remain unresolved, and only recorded complete choice
+domains can discharge the remaining guards.
 Shifts require counts valid for the operand width. Selected integer values retain
 the chosen lane facts; subgroup shuffles require a known participating source.
 Integer min/max and subgroup extrema retain interval bounds, and retain an affine
@@ -99,13 +132,10 @@ coordinate refinement: it remains an explicit gap and suppresses futile retries.
 No refinement changes the selected implementation or turns exhaustion into
 infeasibility.
 
-Pruning uses the same symbolic loop and dispatch coordinates, multiplying the
-mandatory work of a retained visit without constructing its dynamic instances.
-An incomplete walk contributes only the established mandatory prefix; unknown
-access geometry or missing services can weaken that lower bound. This account
-cannot supply a feasible schedule or finish an otherwise unresolved selection.
-The runtime backend composition forwards demand relaxations for both partial
-domains and completed executions on the normal source-to-native path.
+Diagnostic demand accounts can multiply the mandatory work of a retained visit
+without constructing its dynamic instances. An incomplete account cannot supply
+a feasible schedule or finish selection. Automatic selection exports the full
+family to the common model; the shared solver owns pruning and proof completion.
 
 ### Structured scheduling
 
@@ -126,43 +156,23 @@ shifts these margins by neighboring duration floors; parallel composition and
 repetition retain only margins valid for all counted work. These windows follow
 mandatory dependencies, not the timing of a selected feasible schedule.
 
-Mandatory serial boundaries admit independent scheduling subproblems. Their
-bounds and durations add; serial repetition solves its body once and scales the
-result. Refinement retains each bounded subproblem's exact scheduling frontier
-and checked starts. Inside a resident scope it subtracts the capacity held by
-that scope, cumulatively for nested scopes, then retains the full scope lifetime
-in the assembled witness. A fully held resource can be ignored only if the body
-never uses it; otherwise the scope stays in exact feasibility analysis. No
-zero-capacity hardware profile is manufactured.
+Structured regions append their constraints to the enclosing model. Serial
+boundaries retain completion dependencies; parallel occurrences share the
+resource constraints that govern their overlap. Resident capacity is held for
+the region's complete lifetime, including nested scopes. Accounting owns no
+child searches, scheduling frontiers or initiation-period search.
 
-Checked child schedules provide compact resource profiles containing both
-instruction reservations and resident lifetimes. Profiles coalesce adjacent
-intervals of equal occupancy and can represent uninterrupted repeated work
-without expanding every operation. Their explicit limit bounds retained
-intervals; a fragmented profile exceeding that limit remains unresolved.
-Parallel children may run together when their peak envelopes fit. For differing
-children whose envelopes conflict, a retained interval search instead chooses
-start offsets under their actual profiles, allowing staggered overlap. The
-assembled witness validates the child models, starts, completion, and combined
-capacity use. A changed child witness invalidates that offset frontier.
+Finite expansion preserves each occurrence's operations, dependencies and
+reservations. Compact repetition requires an equivalent relation supported by
+the common model. Reusing a definition does not require copies to choose the
+same internal schedule or share one execution cost. Missing compact coverage or
+an exhausted expansion budget stays explicit and cannot establish infeasibility.
 
-Parallel repetition reuses its common body's refined schedule. Peak envelopes
-admit concurrent waves; whole-body residency additionally bounds how many bodies
-can overlap. A retained initiation-period frontier can admit pipelined overlap
-using the body's compact profile. Complete-period occupancy and a residue sweep
-bound an infinite stream, hence any finite prefix, without expanding the repeated
-count. The profile is retained across advances and replaced when the body
-schedule changes. Period and child searches share the refinement budget;
-enclosing residency is held once rather than duplicated per child.
-
-These schedules are feasible upper witnesses. Restricting children to fixed
-internal schedules, or copies to waves or a common period, does not restrict the
-original model's legal interleavings. Even an exact optimum of the start-offset
-subproblem supplies only an upper bound for the original parallel region.
-Completion requires that upper to meet the independently derived lower bound.
-Missing mappings and optimistic-only models cannot supply executable witnesses.
-Bounded expansion into the flat exact oracle checks small cases; exceeding that
-bound is unfinished derivation, not infeasibility.
+Checked schedules and compact resource profiles remain useful witnesses and
+validators. Waves, common periods and fixed child schedules describe particular
+feasible schedules; optimizing them alone cannot prove an optimum over the
+unrestricted family. Native authorization requires the compiler session's
+global optimal outcome, original-model validation and checked reconstruction.
 
 ### Memory accesses and knowledge
 
@@ -175,12 +185,13 @@ across different absolute tensor positions.
 
 A symbolic access can reuse one such union when every active lane has the same
 affine translation coefficients and coordinate domains, and all resulting
-addresses stay within their backing bounds. Each admitted transaction granularity
-must divide both the allocation alignment and every byte-address translation
-coefficient. This establishes the geometry over the entire coordinate domain;
-the origin used to express the pattern is not a sampled execution. Differing
-lane translations, insufficient alignment, or unsupported expressions require
-refinement or leave the access unmapped.
+addresses stay within their backing bounds. Transaction counts must be invariant
+over every base residue allowed by the allocation alignment and translation
+coefficients. Divisible alignment establishes that directly; otherwise the
+interval endpoints define a finite set of residue boundaries on which to check
+the exact block union. This covers the entire coordinate domain without sampling
+its values. Differing lane translations, varying transaction counts, or unsupported
+expressions require refinement or leave the access unmapped.
 
 A declared hardware service may charge per distinct aligned transaction block
 intersected by one operation. Its resource names the modeled memory boundary,
@@ -309,6 +320,20 @@ Bounds compose through sound analysis operations: maximum of compatible floors, 
 over a complete alternative cover, and sums only where mandatory non-overlap or a valid
 joint constraint supports them. Omitted legal alternatives retain a trivial floor;
 analysis failure does not establish infeasibility.
+
+Primitive service equations have concrete and symbolic interpretations of the same
+backend definition. Lane counts, transaction counts, service ceilings, offsets and
+storage quantities can remain variables. Conditional resource uses retain their
+operation's presence and join the same cumulative resource boundary; an absent
+alternative consumes no capacity. Symbolic arithmetic rejects unrepresentable
+ranges explicitly rather than clipping the execution family.
+
+Fixed scheduling fragments use the same equations as standalone scheduling and
+can join this shared boundary under an explicit complete activation condition.
+They retain result/issue dependencies, offset services, event lifetimes and
+common static orders. Reconstruction checks each active fragment against its
+original model; the enclosing model checks interactions between fragments. No
+fragment supplies a separately optimized cost to replace those interactions.
 
 For an unresolved execution family, necessary demand must hold for every admitted
 member under its conditions. One candidate's expanded representation, retained

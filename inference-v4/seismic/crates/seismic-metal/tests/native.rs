@@ -140,90 +140,24 @@ fn runtime_stream_domains_and_piece_tails() {
 
 #[test]
 #[ignore = "requires a Metal device"]
-fn plan_reports_device_bounds_errors_and_resets_status_between_runs() {
-    use seismic_lang::{
-        program::{compile, SourceFile},
-        Scope,
-    };
-    use seismic_metal::{
-        plan_exec::{compile_plan, Bindings},
-        runtime::{Buffer, Device},
-    };
-    use std::collections::HashMap;
-    struct Inputs(HashMap<String, Buffer>);
-    impl Bindings for Inputs {
-        fn buffer(&self, root: &str, part: &str) -> Option<&Buffer> {
-            if part.is_empty() {
-                self.0.get(root)
-            } else {
-                None
-            }
-        }
-        fn scalar(&self, _: &str) -> Option<f64> {
-            None
-        }
-    }
-    let text="fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] += reduce(t, 0, sum) + x[visible[0]]\n  store(acc, out)\n\nfn composition(x: tensor[4] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  stream(x,visible,out)\n";
-    let p = compile(
-        &[SourceFile {
-            path: "plan.seismic.portable".into(),
-            text: text.into(),
-            scope: Scope::Portable,
-        }],
-        &[],
-    )
-    .unwrap();
-    let plan = seismic_lang::plan::plan(&p, "composition", &HashMap::new()).unwrap();
+fn composition_reports_device_bounds_errors_and_resets_status_between_runs() {
+    use seismic_lang::{program::{compile, SourceFile}, Scope};
+    use seismic_metal::{msl, runtime::Device};
+    let text = "fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] += reduce(t, 0, sum) + x[visible[0]]\n  store(acc, out)\n\nfn composition(x: tensor[4] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  stream(x,visible,out)\n";
+    let program = compile(&[SourceFile {
+        path: "composition.seismic.portable".into(), text: text.into(), scope: Scope::Portable,
+    }], &[]).unwrap();
+    let lowered = seismic_lang::lower::lower(&program, "composition", "metal", &Default::default()).unwrap();
     let device = Device::open().unwrap();
-    let compiled = compile_plan(
-        &device,
-        &p,
-        &plan,
-        seismic_metal::execution::Config::default(),
-    )
-    .unwrap();
-    let inputs = Inputs(HashMap::from([
-        (
-            "x".into(),
-            device
-                .buffer_from(
-                    &[1f32, 2., 3., 4.]
-                        .into_iter()
-                        .flat_map(f32::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap(),
-        ),
-        (
-            "visible".into(),
-            device
-                .buffer_from(
-                    &[-1i32, 5]
-                        .into_iter()
-                        .flat_map(i32::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap(),
-        ),
-        ("out".into(), device.buffer_from(&[0; 4]).unwrap()),
-    ]));
+    let compiled = device.compile(msl::emit_with(&lowered, Default::default()).unwrap()).unwrap();
+    let x = device.buffer_from(&[1f32, 2., 3., 4.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+    let visible = device.buffer_from(&[-1i32, 5].into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+    let out = device.buffer_from(&[0; 4]).unwrap();
     // Dynamic slices clamp; the explicit point access supplies the failure.
-    assert!(device
-        .run_plan(&compiled, &inputs)
-        .unwrap_err()
-        .contains("out-of-bounds"));
-    inputs.0["visible"].write(
-        &[0i32, 5]
-            .into_iter()
-            .flat_map(i32::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    device.run_plan(&compiled, &inputs).unwrap();
-    assert_eq!(inputs.0["out"].read(4), 11f32.to_le_bytes());
-    assert!(device
-        .run_plan_steps_repeated(&compiled, &inputs, 0..1, 0)
-        .is_err());
-    assert!(device.run_plan_steps(&compiled, &inputs, 0..2).is_err());
+    assert!(device.run(&compiled, &[&x, &visible, &out], &[], 1).unwrap_err().contains("out-of-bounds"));
+    visible.write(&[0i32, 5].into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>());
+    device.run(&compiled, &[&x, &visible, &out], &[], 1).unwrap();
+    assert_eq!(out.read(4), 11f32.to_le_bytes());
 }
 
 #[test]

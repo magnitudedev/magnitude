@@ -22,20 +22,55 @@ pub(super) fn exact(value: u64, ty: Type) -> Option<(i128, i128)> {
     };
     Some((value, value))
 }
+fn integer_width(ty: Type) -> Option<u32> {
+    match ty { Type::I32 | Type::U32 => Some(32), Type::I64 | Type::U64 => Some(64), _ => None }
+}
+/// On either side of the signed boundary an integer bitcast is an exact
+/// translation. A range crossing that boundary has no single affine image.
+pub(super) fn bitcast_offset(range: (i128, i128), from: Type, to: Type) -> Option<i128> {
+    let bits = integer_width(from)?;
+    if integer_width(to)? != bits { return None; }
+    fit(range, from)?;
+    if from == to { return Some(0); }
+    if matches!(from, Type::I32 | Type::I64) {
+        if range.0 >= 0 { Some(0) }
+        else if range.1 < 0 { Some(1i128 << bits) }
+        else { None }
+    } else {
+        let sign = 1i128 << (bits - 1);
+        if range.1 < sign { Some(0) }
+        else if range.0 >= sign { Some(-(1i128 << bits)) }
+        else { None }
+    }
+}
+fn bitcast(range: (i128, i128), from: Type, to: Type) -> Option<(i128, i128)> {
+    if integer_width(from)? != integer_width(to)? { return None; }
+    fit(range, from)?;
+    match bitcast_offset(range, from, to) {
+        Some(offset) => fit((range.0.checked_add(offset)?, range.1.checked_add(offset)?), to),
+        None => bounds(to),
+    }
+}
 impl Derivation<'_> {
     pub(super) fn expression_ranges(&self, e: &Expression) -> Ranges {
         if matches!(e.ty(), Type::F16 | Type::BF16 | Type::F32) { return [None; 32]; }
-        if let Some(facts) = self.facts.get(e) { return facts.ranges; }
         std::array::from_fn(|lane| self.interval(e, lane))
     }
     pub(super) fn interval(&self, e: &Expression, lane: usize) -> Option<(i128, i128)> {
-        if let Some(facts) = self.facts.get(e) { return facts.ranges[lane]; }
+        let observed = self.facts.get(e).and_then(|facts| facts.ranges[lane]);
+        let assumed = self.assumptions.get(e).and_then(|facts| facts.ranges[lane]);
+        match (observed, assumed) {
+            (Some((a, b)), Some((c, d))) => return fit((a.max(c), b.min(d)), e.ty()),
+            (Some(range), None) | (None, Some(range)) => return fit(range, e.ty()),
+            (None, None) => {},
+        }
         use Expression as E;
         let range = match e {
             E::Integer(n, ty) => exact(*n as u64, *ty)?,
             E::Variable(name, ty) | E::Parameter { name, ty } => self.ranges.get(name)
                 .and_then(|r| r[lane]).or_else(|| self.env.get(name).and_then(|v| v[lane]).and_then(|v| exact(v, *ty)))?,
             E::Cast(_, value) => self.interval(value, lane)?,
+            E::Bitcast(ty, value) => bitcast(self.interval(value, lane)?, value.ty(), *ty)?,
             E::VectorElement { name, component, ty } => self.env.get(&format!("{name}[{component}]"))
                 .and_then(|v| v[lane]).and_then(|v| exact(v, *ty))?,
             E::Unary(UnaryOp::Neg, value, _) => {
@@ -71,9 +106,12 @@ impl Derivation<'_> {
                         let values = [a.checked_mul(c)?, a.checked_mul(d)?, b.checked_mul(c)?, b.checked_mul(d)?];
                         (*values.iter().min()?, *values.iter().max()?)
                     }
-                    BinaryOp::Div if c == d && c > 0 && a >= 0 => (a / c, b / c),
-                    BinaryOp::Rem if c == d && c > 0 && a >= 0 => {
-                        if a / c == b / c { (a % c, b % c) } else { (0, c - 1) }
+                    BinaryOp::Div if c > 0 && a >= 0 => (a / d, b / c),
+                    BinaryOp::Rem if c > 0 && a >= 0 => {
+                        let first = a / d;
+                        let last = b / c;
+                        if first == last { (a.checked_sub(first.checked_mul(d)?)?, b.checked_sub(first.checked_mul(c)?)?) }
+                        else { (0, b.min(d - 1)) }
                     }
                     BinaryOp::And => boolean((a > 0 || b < 0) && (c > 0 || d < 0), (a == 0 && b == 0) || (c == 0 && d == 0))?,
                     BinaryOp::Or => boolean((a > 0 || b < 0) || (c > 0 || d < 0), a == 0 && b == 0 && c == 0 && d == 0)?,

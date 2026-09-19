@@ -4,9 +4,11 @@ use seismic_lang::{
     types::{DType, Elem},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let source = "fn leaf[N](x: tensor[N] T, out: tensor[N] U):\n  for row in parallel:\n    a = load(x[row:row+1])\n    y = tile[1] f32\n    for i in owned(y): y[i] = f32(a[i]) * 2.0\n    store(y,out[row:row+1])\n\nfn entry[N](x: tensor[N] T, out: tensor[N] f32):\n  leaf(x,out)\n";
     let source = format!("{source}\nfn composition(a: tensor[4] f16, b: tensor[4] bf16, out: tensor[8] f32):\n  leaf(a, out[0:4])\n  leaf(b, out[4:8])\n");
     let program = compile(
@@ -30,16 +32,13 @@ fn exercise(device: Device, candidate: Candidate) {
     .is_err());
     for dtype in [DType::F32, DType::BF16, DType::F16] {
         let elements = HashMap::from([("T".into(), Elem::Dtype(dtype))]);
-        let lowered = lower_specialized(
-            &program,
-            "entry",
-            device.backend(),
-            &shapes,
-            &elements,
-            &Options::default(),
-        )
-        .unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "entry",
+            shapes: &shapes,
+            elements: &elements,
+            options: &Options::default(),
+        };
         let bytes = match dtype {
             DType::F32 => [1f32, -2., 0.5, 4.]
                 .into_iter()
@@ -55,9 +54,12 @@ fn exercise(device: Device, candidate: Candidate) {
                 .collect(),
             _ => unreachable!(),
         };
-        assert_eq!(kernel.buffers()[0].bytes, bytes.len());
         let input = device.buffer_from(&bytes).unwrap();
         let output = device.buffer(16).unwrap();
+        let mut kernel =
+            automatic_hardware::compile(&device, invocation, &[input.clone(), output.clone()], &[])
+                .unwrap();
+        assert_eq!(kernel.buffers()[0].bytes, input.len());
         kernel.execute(&[input, output.clone()], &[]).unwrap();
         let mut got = [0u8; 16];
         output.read(&mut got).unwrap();
@@ -95,19 +97,16 @@ fn exercise(device: Device, candidate: Candidate) {
                 .collect(),
         ),
     ] {
-        let lowered = lower_specialized(
-            &program,
-            "leaf",
-            device.backend(),
-            &shapes,
-            &HashMap::from([
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "leaf",
+            shapes: &shapes,
+            elements: &HashMap::from([
                 ("T".into(), Elem::Dtype(DType::F32)),
                 ("U".into(), Elem::Dtype(dtype)),
             ]),
-            &Options::default(),
-        )
-        .unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+            options: &Options::default(),
+        };
         let input = device
             .buffer_from(
                 &[
@@ -122,6 +121,10 @@ fn exercise(device: Device, candidate: Candidate) {
             )
             .unwrap();
         let output = device.buffer(expected.len()).unwrap();
+        let mut kernel =
+            automatic_hardware::compile(&device, invocation, &[input.clone(), output.clone()], &[])
+                .unwrap();
+        assert_eq!(kernel.buffers()[0].bytes, input.len());
         kernel.execute(&[input, output.clone()], &[]).unwrap();
         let mut got = vec![0; expected.len()];
         output.read(&mut got).unwrap();
@@ -148,19 +151,32 @@ fn exercise(device: Device, candidate: Candidate) {
             None
         }
     }
-    let plan = seismic_lang::plan::plan(&program, "composition", &HashMap::new()).unwrap();
-    let mut compiled = seismic_runtime::plan::CompiledPlan::compile_diagnostic(
-        &device,
+    let lowered = lower_specialized(
         &program,
-        &plan,
+        "composition",
+        device.backend(),
+        &HashMap::new(),
+        &HashMap::new(),
         &Options::default(),
-        candidate,
     )
     .unwrap();
+    let mut compiler = seismic_runtime::plan::PlanCompiler::new(
+        &device,
+        &program,
+        automatic_hardware::settings(&device, &lowered),
+    );
+    let mut compiled = compiler
+        .compile_entry(
+            "composition",
+            &HashMap::new(),
+            &HashMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
     assert_eq!(
         compiled.kernel_count(),
-        1,
-        "the enclosing program compiles together while retaining each call's element types"
+        0,
+        "selection waits for actual bindings"
     );
     let a = device
         .buffer_from(
@@ -188,6 +204,11 @@ fn exercise(device: Device, candidate: Candidate) {
             ("out".into(), out.clone()),
         ])))
         .unwrap();
+    assert_eq!(
+        compiled.kernel_count(),
+        1,
+        "the enclosing program compiles together while retaining each call element type"
+    );
     let mut got = [0; 32];
     out.read(&mut got).unwrap();
     assert_eq!(
@@ -215,34 +236,17 @@ fn exercise(device: Device, candidate: Candidate) {
     }
 }
 #[test]
-fn cpu_generic_entry_and_nested_call() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
-}
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_generic_entry_and_nested_call() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+fn cpu_generic() {
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
-fn metal_generic_entry_and_nested_call() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+fn metal_generic() {
+    exercise(Device::metal().unwrap());
+}
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_generic() {
+    exercise(Device::cuda(0).unwrap());
 }

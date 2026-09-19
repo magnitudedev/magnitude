@@ -386,15 +386,30 @@ impl Sym {
     /// and negative terms. Every intermediate in the structural evaluation must
     /// fit i64; unknown bounds or a potentially zero divisor remain unsupported.
     pub fn eval_interval(&self, env: &dyn Fn(&str) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
-        fn atom(a: &Atom, env: &dyn Fn(&str) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+        self.eval_interval_with(env, &|_| None)
+    }
+
+    /// Intersect proven expression bounds at every node, including inside
+    /// quotient and remainder operands. Facts must hold throughout the domain
+    /// supplied by the caller; contradictory facts produce no enclosure.
+    pub fn eval_interval_with(&self, env: &dyn Fn(&str) -> Option<(i64, i64)>,
+        facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+        fn refine(expression: &Sym, mut range: (i64, i64), facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+            if let Some((lo, hi)) = facts(expression) {
+                range.0 = range.0.max(lo); range.1 = range.1.min(hi);
+            }
+            (range.0 <= range.1).then_some(range)
+        }
+        fn atom(a: &Atom, env: &dyn Fn(&str) -> Option<(i64, i64)>,
+            facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
             let range = match a {
                 Atom::Param(name) => env(name)?,
                 Atom::Quot(n, d) | Atom::Rem(n, d) => {
-                    let (nl, nh) = n.eval_interval(env)?;
-                    let (dl, dh) = d.eval_interval(env)?;
+                    let (nl, nh) = n.eval_interval_with(env, facts)?;
+                    let (dl, dh) = d.eval_interval_with(env, facts)?;
                     if nl < 0 || dl <= 0 { return None; }
                     if matches!(a, Atom::Quot(..)) { (nl / dh, nh / dl) }
-                    else if nl == nh && dl == dh { (nl % dl, nl % dl) }
+                    else if dl == dh && nl / dl == nh / dl { (nl % dl, nh % dl) }
                     else {
                         let mut step = 1;
                         if dl == dh {
@@ -406,13 +421,14 @@ impl Sym {
                     }
                 }
             };
+            let range = refine(&Sym::atom(a.clone()), range, facts)?;
             (range.0 >= 0 && range.0 <= range.1).then_some(range)
         }
         let (mut low, mut high) = (0i64, 0i64);
         for (monomial, coefficient) in &self.terms {
             let (mut lo, mut hi) = (*coefficient, *coefficient);
             for (a, power) in monomial {
-                let (al, ah) = atom(a, env)?;
+                let (al, ah) = atom(a, env, facts)?;
                 for _ in 0..*power {
                     let products = [lo.checked_mul(al)?, lo.checked_mul(ah)?, hi.checked_mul(al)?, hi.checked_mul(ah)?];
                     lo = *products.iter().min()?;
@@ -422,7 +438,7 @@ impl Sym {
             low = low.checked_add(lo)?;
             high = high.checked_add(hi)?;
         }
-        Some((low, high))
+        refine(self, (low, high), facts)
     }
 
     pub fn params(&self) -> Vec<String> {

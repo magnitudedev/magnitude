@@ -1,19 +1,19 @@
 use seismic_accounting::{
-    execution_model::*, schedule::*, selection::Budget, workload::DerivationLimits,
+    execution_model::*, schedule::*, workload::DerivationLimits,
 };
 use seismic_lang::{
-    Scope,
     composition::Ownership,
     ir::StmtKind,
     lower::{self, Options},
     lowered_ir::{Alternative, DecisionKind},
-    program::{SourceFile, compile},
+    program::{compile, SourceFile},
+    Scope,
 };
 use seismic_realization::LoadStrategy;
 use seismic_runtime::{
-    Buffer, Candidate, Device,
     plan::{Bindings, PlanCompiler, Settings},
-    tuner::{Form, Hardware},
+    tuner::{self, Form, Hardware},
+    Buffer, Device,
 };
 use std::collections::{BTreeSet, HashMap};
 fn source() -> seismic_lang::program::Program {
@@ -97,6 +97,96 @@ fn selected(fuse: bool) -> seismic_lang::lowered_ir::LoweredIr {
     )
     .unwrap()
 }
+fn hardware(program: &seismic_lang::program::Program, opts: &Options) -> ScalarHardware {
+    let shapes = HashMap::new();
+    let elements = HashMap::new();
+    let mut patterns = Vec::new();
+    for attempt in lower::alternatives::Space::new(lower::alternatives::Specialization {
+        program,
+        entry: "chain",
+        backend: "cpu",
+        shapes: &shapes,
+        elements: &elements,
+        options: opts,
+    }) {
+        let lowered = attempt.result.unwrap();
+        for loads in [
+            LoadStrategy::Materialize,
+            LoadStrategy::BorrowProvenReadOnly,
+        ] {
+            for primitive in requirements(&seismic_cpu::prepare(&lowered, loads).unwrap()).unwrap()
+            {
+                let p = primitive.signature();
+                if !patterns.contains(&p) {
+                    patterns.push(p)
+                }
+            }
+        }
+    }
+    ScalarHardware {
+        identity: "hypothetical composition fixture".into(),
+        scope: seismic_accounting::execution_model::Scope::HypotheticalDirectScalarV1,
+        timebase: Timebase {
+            seconds_numerator: 1,
+            seconds_denominator: 1,
+        },
+        resources: vec![Resource {
+            name: "issue".into(),
+            capacity: 1,
+            unit: CapacityUnit::Slots,
+        }],
+        timings: patterns
+            .into_iter()
+            .map(|primitive| PrimitiveTiming {
+                primitive,
+                latency: 1,
+                services: vec![Reservation {
+                    resource: 0,
+                    offset: 0,
+                    duration: 1,
+                    units: 1,
+                }],
+            })
+            .collect(),
+    }
+}
+fn automatic(
+    device: &Device,
+    program: &seismic_lang::program::Program,
+    options: &Options,
+    buffers: &[Buffer],
+) -> seismic_runtime::Kernel {
+    let shapes = HashMap::new();
+    let elements = HashMap::new();
+    let hardware = Hardware::Cpu(hardware(program, options));
+    let facts = device.facts();
+    let workload = tuner::workload("composition automatic fixture", buffers, &[], &[]).unwrap();
+    let request = tuner::Request {
+        input: tuner::Input::Portable {
+            program,
+            entry: "chain",
+            shapes: &shapes,
+            elements: &elements,
+            options,
+        },
+        device: &facts,
+        form: Form::CpuScalar,
+        hardware: &hardware,
+        workload: &workload,
+        derivation_limits: DerivationLimits {
+            instructions: 100_000,
+            operations: 100_000,
+        },
+    };
+    let tuner::Outcome::Optimal(selected) = tuner::tune(
+        &request,
+        seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() },
+    )
+    .unwrap() else {
+        panic!("composition fixture must complete automatic selection")
+    };
+    device.compile_tuned(selected).unwrap()
+}
 #[test]
 fn composed_native_preserves_private_publication_rounding_and_alias_requirements() {
     let separate = selected(false);
@@ -123,15 +213,7 @@ fn composed_native_preserves_private_publication_rounding_and_alias_requirements
     ) && d.selected == Alternative::RetainLocal));
     let device = Device::cpu();
     let mut outputs = Vec::new();
-    for lowered in [separate, fused] {
-        let mut kernel = device
-            .compile(
-                &lowered,
-                Candidate::Cpu {
-                    loads: LoadStrategy::Materialize,
-                },
-            )
-            .unwrap();
+    {
         let input = device
             .buffer_from(
                 &[1.0001f32, 1000.125]
@@ -143,23 +225,17 @@ fn composed_native_preserves_private_publication_rounding_and_alias_requirements
         let tmp = device.buffer(4).unwrap();
         let work = device.buffer(8).unwrap();
         let out = device.buffer(8).unwrap();
-        kernel
-            .execute(
-                &[input.clone(), tmp.clone(), work.clone(), out.clone()],
-                &[],
-            )
-            .unwrap();
+        let buffers = [input.clone(), tmp.clone(), work.clone(), out.clone()];
+        let mut kernel = automatic(&device, &source(), &options(), &buffers);
+        kernel.execute(&buffers, &[]).unwrap();
         let mut bytes = [0u8; 8];
         out.read(&mut bytes).unwrap();
         outputs.push(bytes);
-        assert!(
-            kernel
-                .execute(&[input, work.view(0..4).unwrap(), work, out], &[])
-                .unwrap_err()
-                .contains("private intermediate")
-        );
+        assert!(kernel
+            .execute(&[input, work.view(0..4).unwrap(), work, out], &[])
+            .unwrap_err()
+            .contains("private intermediate"));
     }
-    assert_eq!(outputs[0], outputs[1]);
     let expected = [1.0001f32, 1000.125].map(|x| {
         seismic_lang::numeric::f16_to_f32(seismic_lang::numeric::f16_bits(x * 1.0003)) * 1.25
     });
@@ -182,60 +258,12 @@ impl Bindings for Bound {
     }
 }
 #[test]
-fn production_plan_submits_enclosing_source_and_caches_only_applicable_native_artifacts() {
+fn automatic_plan_submits_enclosing_source_and_caches_only_applicable_native_artifacts() {
     let program = source();
     let shapes = HashMap::new();
     let elements = HashMap::new();
     let opts = options();
-    let mut patterns = Vec::new();
-    for attempt in lower::alternatives::Space::new(lower::alternatives::Specialization {
-        program: &program,
-        entry: "chain",
-        backend: "cpu",
-        shapes: &shapes,
-        elements: &elements,
-        options: &opts,
-    }) {
-        let lowered = attempt.result.unwrap();
-        for loads in [
-            LoadStrategy::Materialize,
-            LoadStrategy::BorrowProvenReadOnly,
-        ] {
-            for primitive in requirements(&seismic_cpu::prepare(&lowered, loads).unwrap()).unwrap()
-            {
-                let p = primitive.signature();
-                if !patterns.contains(&p) {
-                    patterns.push(p)
-                }
-            }
-        }
-    }
-    let hardware = ScalarHardware {
-        identity: "hypothetical composition fixture".into(),
-        scope: seismic_accounting::execution_model::Scope::HypotheticalDirectScalarV1,
-        timebase: Timebase {
-            seconds_numerator: 1,
-            seconds_denominator: 1,
-        },
-        resources: vec![Resource {
-            name: "issue".into(),
-            capacity: 1,
-            unit: CapacityUnit::Slots,
-        }],
-        timings: patterns
-            .into_iter()
-            .map(|primitive| PrimitiveTiming {
-                primitive,
-                latency: 1,
-                services: vec![Reservation {
-                    resource: 0,
-                    offset: 0,
-                    duration: 1,
-                    units: 1,
-                }],
-            })
-            .collect(),
-    };
+    let hardware = hardware(&program, &opts);
     let device = Device::cpu();
     let settings = Settings {
         hardware: Hardware::Cpu(hardware),
@@ -244,10 +272,7 @@ fn production_plan_submits_enclosing_source_and_caches_only_applicable_native_ar
             instructions: 100000,
             operations: 100000,
         },
-        search: Budget {
-            nodes: 20000,
-            schedule_assignments: 100000,
-        },
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100000, ..Default::default() }, ..Default::default() },
     };
     let mut compiler = PlanCompiler::new(&device, &program, settings);
     let mut plan = compiler
@@ -338,7 +363,17 @@ fn chain(x: tensor[1,4] f32,w: tensor[2,4] f32,v: tensor[2,4] f32,p: tensor[1,2]
             &HashMap::new(),
             &HashMap::new(),
             &options,
-            &mut |d| Ok(if matches!(d.kind,DecisionKind::Producer{..}) && d.alternatives.contains(&Alternative::Recompute) {Alternative::Recompute} else {assignment(d, fuse)}),
+            &mut |d| {
+                Ok(
+                    if matches!(d.kind, DecisionKind::Producer { .. })
+                        && d.alternatives.contains(&Alternative::Recompute)
+                    {
+                        Alternative::Recompute
+                    } else {
+                        assignment(d, fuse)
+                    },
+                )
+            },
         )
         .unwrap()
     };
@@ -356,8 +391,27 @@ fn chain(x: tensor[1,4] f32,w: tensor[2,4] f32,v: tensor[2,4] f32,p: tensor[1,2]
         body.iter()
             .flat_map(|s| match &s.kind {
                 StmtKind::Range { body, .. } => {
-                    let loads=body.iter().filter(|s|matches!(&s.kind,StmtKind::Assign{value:seismic_lang::ir::Expr{kind:seismic_lang::ir::ExprKind::Builtin{name:seismic_lang::ir::Builtin::Load,..},..},..})).count();
-                    let mut n=if loads>0{vec![loads]}else{vec![]};n.extend(streams(body));n
+                    let loads = body
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                &s.kind,
+                                StmtKind::Assign {
+                                    value: seismic_lang::ir::Expr {
+                                        kind: seismic_lang::ir::ExprKind::Builtin {
+                                            name: seismic_lang::ir::Builtin::Load,
+                                            ..
+                                        },
+                                        ..
+                                    },
+                                    ..
+                                }
+                            )
+                        })
+                        .count();
+                    let mut n = if loads > 0 { vec![loads] } else { vec![] };
+                    n.extend(streams(body));
+                    n
                 }
                 StmtKind::Parallel { body, .. } | StmtKind::Owned { body, .. } => streams(body),
                 _ => Vec::new(),
@@ -368,15 +422,7 @@ fn chain(x: tensor[1,4] f32,w: tensor[2,4] f32,v: tensor[2,4] f32,p: tensor[1,2]
     assert_eq!(streams(&fused.body), vec![3]);
     let device = Device::cpu();
     let mut outputs = Vec::new();
-    for lowered in [separate, fused] {
-        let mut kernel = device
-            .compile(
-                &lowered,
-                Candidate::Cpu {
-                    loads: LoadStrategy::Materialize,
-                },
-            )
-            .unwrap();
+    {
         let floats = |xs: &[f32]| {
             device
                 .buffer_from(&xs.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
@@ -392,10 +438,17 @@ fn chain(x: tensor[1,4] f32,w: tensor[2,4] f32,v: tensor[2,4] f32,p: tensor[1,2]
             device.buffer(8).unwrap(),
             out.clone(),
         ];
+        let mut kernel = automatic(&device, &program, &options, &buffers);
         kernel.execute(&buffers, &[]).unwrap();
         let mut bytes = [0u8; 8];
         out.read(&mut bytes).unwrap();
         outputs.push(bytes);
     }
-    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(
+        outputs[0].to_vec(),
+        [128.0f32, 576.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
 }

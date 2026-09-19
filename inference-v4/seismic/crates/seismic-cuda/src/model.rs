@@ -4,9 +4,8 @@
 //! is a virtual ISA: this module does not assert a native instruction mapping,
 //! register allocation, cache behavior, warp reconvergence, or block placement.
 //! Those premises are retained, never inferred from a device name or timings.
-mod affine;
 mod trace;
-pub use affine::Affine;
+pub use seismic_accounting::affine::Affine;
 
 use crate::{execution::Execution, ptx};
 use seismic_accounting::{
@@ -272,6 +271,37 @@ pub fn derive_sequence(
     workload: &ScalarWorkload,
     limits: DerivationLimits,
 ) -> Result<schedule::Model, DerivationError> {
+    derive_sequence_inner(executions, None, hardware, workload, limits).map(|family| family.model)
+}
+
+/// Original terminal operations plus their compile-time activation. Every phase
+/// consumes retained PTX parameter/CFG identities from the same exported family.
+pub struct DerivedFamily {
+    pub model: schedule::Model,
+    pub guards: Vec<BTreeMap<usize, bool>>,
+}
+pub fn derive_family_sequence(
+    executions: &[Execution],
+    templates: &[&ptx::family::TargetFamily],
+    hardware: &CudaHardware,
+    workload: &ScalarWorkload,
+    limits: DerivationLimits,
+) -> Result<DerivedFamily, DerivationError> {
+    if templates.len() != executions.len() || executions.iter().zip(templates).any(|(execution,template)| execution.target_plan() != template.plan()) {
+        return Err("CUDA accounting template does not match its retained terminal execution".into());
+    }
+    if templates.len()>1 && templates.iter().any(|template|template.parameter_scope().is_none()) {
+        return Err(DerivationError::Unsupported("CUDA phase templates need an explicit shared parameter-occurrence mapping".into()));
+    }
+    derive_sequence_inner(executions, Some(templates), hardware, workload, limits)
+}
+fn derive_sequence_inner(
+    executions: &[Execution],
+    templates: Option<&[&ptx::family::TargetFamily]>,
+    hardware: &CudaHardware,
+    workload: &ScalarWorkload,
+    limits: DerivationLimits,
+) -> Result<DerivedFamily, DerivationError> {
     let first = executions
         .first()
         .ok_or("CUDA analysis needs a nonempty phase sequence")?;
@@ -351,6 +381,7 @@ pub fn derive_sequence(
             });
     }
     let mut instructions = 0u64;
+    let mut guards = Vec::new();
     let mut symbolic = BTreeMap::new();
     let mut previous_completion = None;
     for (phase, execution) in executions.iter().enumerate() {
@@ -373,7 +404,12 @@ pub fn derive_sequence(
             &required,
             remaining,
         )?;
-        let mut traced = trace::derive(execution, hardware, &state, remaining, &symbolic)?;
+        let mut traced = if let Some(templates) = templates {
+            trace::derive_family(execution, hardware, &state, remaining, &symbolic, templates[phase].literals(), templates[phase].joins())?
+        } else {
+            trace::derive(execution, hardware, &state, remaining, &symbolic)?
+        };
+        guards.append(&mut traced.guards);
         instructions = instructions
             .checked_add(traced.instructions)
             .ok_or("CUDA sequence instruction count overflow")?;
@@ -469,7 +505,7 @@ pub fn derive_sequence(
         result.lifetimes.extend(part.lifetimes);
     }
     result.lower_bound()?;
-    Ok(result)
+    Ok(DerivedFamily { model: result, guards })
 }
 
 fn validate(
@@ -639,26 +675,7 @@ fn quantity(
             n.checked_add(u64::from(a.bytes))
                 .ok_or("requested byte overflow")
         })?,
-        Quantity::MemorySectors { bytes } => {
-            let mut coverage = BTreeSet::new();
-            for access in &event.accesses {
-                if access.alignment < bytes {
-                    return Err("memory sector geometry needs known allocation alignment".into());
-                }
-                // Exact offsets retain existing sector accounting. Affine
-                // address traces are admissible for address-independent services;
-                // sector-dependent hardware needs a separate uniformity proof.
-                let offset = access.offset.exact().and_then(|n| u64::try_from(n).ok())
-                    .ok_or_else(|| DerivationError::Unsupported("CUDA memory-sector coverage of varying addresses is not yet established".into()))?;
-                let end = offset
-                    .checked_add(u64::from(access.bytes))
-                    .ok_or("memory range overflow")?;
-                for sector in offset / bytes..end.div_ceil(bytes) {
-                    coverage.insert((access.allocation.clone(), sector));
-                }
-            }
-            coverage.len() as u64
-        }
+        Quantity::MemorySectors { bytes } => memory_sectors(&event.accesses, bytes)?,
         Quantity::BlockThreads => {
             if event.block.is_none() {
                 return Err("block demand outside block scope".into());
@@ -684,6 +701,49 @@ fn quantity(
         }
     })
 }
+/// Sector count is invariant under a shared sector-aligned translation. Keep
+/// that affine translation rather than substituting one runtime address. Distinct
+/// translated regions must remain disjoint throughout the invocation domain.
+fn memory_sectors(accesses: &[Access], bytes: u64) -> Result<u64, DerivationError> {
+    if !bytes.is_power_of_two() {return Err("CUDA sector granularity must be a power of two".into());}
+    struct Region { allocation: Allocation, anchor: Affine, relative: Vec<(i128,u32)> }
+    let mut regions: Vec<Region> = Vec::new();
+    for access in accesses {
+        if access.alignment < bytes {
+            return Err(DerivationError::Unsupported("CUDA sector coverage needs allocation alignment at the service granularity".into()));
+        }
+        let mut matched = false;
+        for region in &mut regions {
+            if region.allocation != access.allocation {continue;}
+            if let Some(delta) = access.offset.sub(&region.anchor).and_then(|difference|difference.exact()) {
+                region.relative.push((delta,access.bytes));matched=true;break;
+            }
+        }
+        if !matched {regions.push(Region {allocation:access.allocation.clone(),anchor:access.offset.clone(),relative:vec![(0,access.bytes)]});}
+    }
+    let mut covered: Vec<(Allocation,Affine,Affine,u64)> = Vec::new();
+    for region in regions {
+        let residue = region.anchor.residue(bytes).ok_or_else(|| DerivationError::Unsupported("CUDA sector alignment varies across its workload domain".into()))?;
+        let base = region.anchor.quotient(bytes).ok_or_else(|| DerivationError::Unsupported("CUDA sector coordinates are not affine over its workload domain".into()))?;
+        let mut sectors = BTreeSet::new();
+        for (offset,width) in region.relative {
+            if width==0 {return Err("CUDA sector access has zero width".into());}
+            let start = offset.checked_add(i128::from(residue)).ok_or("CUDA sector offset overflow")?;
+            let end = start.checked_add(i128::from(width)-1).ok_or("CUDA sector extent overflow")?;
+            for sector in start.div_euclid(i128::from(bytes))..=end.div_euclid(i128::from(bytes)) {sectors.insert(sector);}
+        }
+        let first = base.add(&Affine::constant(*sectors.first().ok_or("empty CUDA sector region")?)).ok_or("CUDA sector coordinate overflow")?;
+        let last = base.add(&Affine::constant(*sectors.last().ok_or("empty CUDA sector region")?)).ok_or("CUDA sector coordinate overflow")?;
+        for (allocation,before,after,_) in &covered {
+            if allocation!=&region.allocation {continue;}
+            let left = last.sub(before).and_then(|difference|difference.bounds()).is_some_and(|(_,hi)|hi<0);
+            let right = after.sub(&first).and_then(|difference|difference.bounds()).is_some_and(|(_,hi)|hi<0);
+            if !left && !right {return Err(DerivationError::Unsupported("CUDA independently varying sector regions lack a uniform overlap proof".into()));}
+        }
+        covered.push((region.allocation,first,last,u64::try_from(sectors.len()).map_err(|_|"CUDA sector count overflow")?));
+    }
+    covered.iter().try_fold(0u64,|count,(_,_,_,n)|count.checked_add(*n).ok_or_else(||DerivationError::Analysis("CUDA sector count overflow".into())))
+}
 pub(crate) fn virtual_register_bits(target: &ptx::TargetPlan) -> Result<u64, String> {
     target.registers().iter().try_fold(0u64, |n, r| {
         n.checked_add(match r.class {
@@ -698,50 +758,72 @@ fn amount(a: Amount, e: &Event, x: &Execution, c: &CudaHardware) -> Result<u64, 
     amount_from(a, &|q| quantity(q, e, x, c))
 }
 fn amount_from<E: From<String>>(
-    a: Amount,
+    amount: Amount,
     quantity: &impl Fn(Quantity) -> Result<u64, E>,
 ) -> Result<u64, E> {
-    quantity(a.quantity)?
-        .checked_mul(a.scale)
-        .ok_or_else(|| E::from("CUDA demand overflow".to_string()))
+    symbolic_amount(&mut seismic_accounting::algebra::Concrete::default(), amount, &mut |_, q| quantity(q))
 }
-fn ticks_from<E: From<String>>(
-    t: Ticks,
-    quantity: &impl Fn(Quantity) -> Result<u64, E>,
-) -> Result<u64, E> {
-    match t {
-        Ticks::Fixed(t) => Ok(t),
-        Ticks::Service {
-            demand,
-            per_tick,
-            base,
-        } => amount_from(demand, quantity)?
-            .div_ceil(per_tick)
-            .checked_add(base)
-            .ok_or_else(|| E::from("CUDA service time overflow".to_string())),
+
+fn symbolic_amount<A: seismic_accounting::algebra::ServiceAlgebra>(
+    algebra: &mut A,
+    amount: Amount,
+    quantity: &mut impl FnMut(&mut A, Quantity) -> Result<A::Value, A::Error>,
+) -> Result<A::Value, A::Error> {
+    let value = quantity(algebra, amount.quantity)?;
+    let scale = algebra.constant(amount.scale)?;
+    algebra.product(value, scale)
+}
+fn symbolic_ticks<A: seismic_accounting::algebra::ServiceAlgebra>(
+    algebra: &mut A,
+    ticks: Ticks,
+    quantity: &mut impl FnMut(&mut A, Quantity) -> Result<A::Value, A::Error>,
+) -> Result<A::Value, A::Error> {
+    match ticks {
+        Ticks::Fixed(ticks) => algebra.constant(ticks),
+        Ticks::Service { demand, per_tick, base } => {
+            let demand = symbolic_amount(algebra, demand, quantity)?;
+            let supply = algebra.constant(per_tick)?;
+            let service = algebra.ceil_div(demand, supply)?;
+            let base = algebra.constant(base)?;
+            algebra.sum(service, base)
+        }
+    }
+}
+impl PrimitiveTiming {
+    /// The sole interpretation of a primitive's declared service. The quantity
+    /// environment comes from the terminal trace or unresolved execution family;
+    /// neither interpretation supplies a separately authored kernel price.
+    pub fn account<A: seismic_accounting::algebra::ServiceAlgebra>(
+        &self,
+        algebra: &mut A,
+        mut quantity: impl FnMut(&mut A, Quantity) -> Result<A::Value, A::Error>,
+    ) -> Result<(A::Value, Vec<seismic_accounting::algebra::ResourceUse<A::Value>>), A::Error> {
+        let latency = symbolic_ticks(algebra, self.latency, &mut quantity)?;
+        let mut reservations = Vec::with_capacity(self.reservations.len());
+        for reservation in &self.reservations {
+            reservations.push(seismic_accounting::algebra::ResourceUse {
+                resource: reservation.resource,
+                offset: reservation.offset,
+                duration: symbolic_ticks(algebra, reservation.duration, &mut quantity)?,
+                units: symbolic_amount(algebra, reservation.units, &mut quantity)?,
+            });
+        }
+        Ok((latency, reservations))
     }
 }
 
-/// One primitive's hardware service, shared by concrete trace accounting and
-/// necessary-demand relaxation. Only the derived quantity environment differs.
 pub(crate) fn primitive_service<E: From<String>>(
     timing: &PrimitiveTiming,
     quantity: impl Fn(Quantity) -> Result<u64, E>,
 ) -> Result<(u64, Vec<schedule::Reservation>), E> {
-    let latency = ticks_from(timing.latency, &quantity)?;
-    let mut reservations = Vec::new();
-    for reservation in &timing.reservations {
-        let units = amount_from(reservation.units, &quantity)?;
-        let duration = ticks_from(reservation.duration, &quantity)?;
-        if units > 0 && duration > 0 {
-            reservations.push(schedule::Reservation {
-                resource: reservation.resource,
-                offset: reservation.offset,
-                duration,
-                units,
-            });
-        }
-    }
+    let (latency, uses) = timing.account(
+        &mut seismic_accounting::algebra::Concrete::default(),
+        |_, q| quantity(q),
+    )?;
+    let reservations = uses.into_iter().filter(|r| r.units > 0 && r.duration > 0)
+        .map(|r| schedule::Reservation {
+            resource: r.resource, offset: r.offset, duration: r.duration, units: r.units,
+        }).collect();
     Ok((latency, reservations))
 }
 

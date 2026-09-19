@@ -16,7 +16,7 @@ const LIMITS: workload::DerivationLimits = workload::DerivationLimits {
 };
 const BUDGET: selection::Budget = selection::Budget {
     nodes: 100,
-    schedule_assignments: 100_000,
+    schedule_work: 100_000,
 };
 
 fn lowered(source: &str) -> LoweredIr {
@@ -439,7 +439,7 @@ fn interrupted_two_phase_search_reuses_retained_families_and_finds_exact_optimum
         &request,
         selection::Budget {
             nodes: 1,
-            schedule_assignments: 0,
+            schedule_work: 0,
         },
     )
     .unwrap() else {
@@ -452,7 +452,7 @@ fn interrupted_two_phase_search_reuses_retained_families_and_finds_exact_optimum
         progress,
         selection::Budget {
             nodes: 1,
-            schedule_assignments: 0,
+            schedule_work: 0,
         },
     )
     .unwrap() else {
@@ -468,7 +468,7 @@ fn interrupted_two_phase_search_reuses_retained_families_and_finds_exact_optimum
         progress,
         selection::Budget {
             nodes: 100,
-            schedule_assignments: 100_000,
+            schedule_work: 100_000,
         },
     )
     .unwrap() else {
@@ -521,6 +521,14 @@ fn every_block_interval_relaxes_all_of_its_members() {
         .owner::<selection::IntegerRange<tuning::BlockChoice>>()
         .unwrap();
     assert_eq!(owner.decision.family().phase_count(), 1);
+    // Each member belongs to several intervals. Its concrete constraints and
+    // schedule are unchanged across those comparisons; solve each member once.
+    let members = (0..alternatives.len()).map(|index| {
+        let (_, selected) = leaves.iter().find(|(path, _)| path == &[1, index]).unwrap();
+        assert_eq!(owner.decision.family().target(0).unwrap(), selected[0].target_plan());
+        backend.analyze(selected, &invocation, LIMITS).unwrap()
+            .into_flat().unwrap().solve(100_000).unwrap()
+    }).collect::<Vec<_>>();
     for start in 0..alternatives.len() {
         for end in start + 1..=alternatives.len() {
             let lower = backend
@@ -531,17 +539,7 @@ fn every_block_interval_relaxes_all_of_its_members() {
                 .unwrap();
             assert!(lower > 0);
             for index in start..end {
-                let (_, selected) = leaves.iter().find(|(path, _)| path == &[1, index]).unwrap();
-                assert_eq!(
-                    owner.decision.family().target(0).unwrap(),
-                    selected[0].target_plan()
-                );
-                let solution = backend
-                    .analyze(selected, &invocation, LIMITS)
-                    .unwrap()
-                    .into_flat().unwrap()
-                    .solve(100_000)
-                    .unwrap();
+                let solution = &members[index];
                 assert!(
                     lower <= solution.schedule().completion,
                     "region {start}..{end} overstates member {index}"
@@ -649,7 +647,7 @@ fn phases_propagate_writes_through_aliased_parameter_names() {
     let hardware = profile(&phases, &device);
     let error = model::derive_sequence(&phases, &hardware, &invocation, LIMITS).unwrap_err();
     assert!(
-        error.to_string().contains("known integer or predicate"),
+        matches!(&error, workload::DerivationError::Unsupported(reason) if reason.contains("input-independent integer or predicate")),
         "{error}"
     );
     let phase_two = initial_one
@@ -774,4 +772,43 @@ fn malformed_ir_does_not_become_an_unresolved_cuda_alternative() {
         vars.push(usize::MAX);
     } else { panic!("parallel fixture root") }
     assert!(tuning::prepare(&function, &device(), &[1]).is_err());
+}
+
+#[test]
+fn unresolved_phase_dispatch_has_complete_symbolic_correspondence() {
+    use magnitude_solver::{model::{Constraint, Domain, ModelBuilder}, Limits, Options, Outcome, Search};
+    use std::sync::Arc;
+    let function = lowered(TWO_PHASES);
+    let device = device();
+    let Preparation::Choice { alternatives, .. } = tuning::prepare(&function, &device, &[1]).unwrap() else {
+        panic!("expected unresolved phase family")
+    };
+    let family = alternatives.owner::<selection::IntegerRange<tuning::BlockChoice>>().unwrap().decision.family();
+    assert_eq!(family.phase_count(), 2);
+    for first in 0..2usize {
+        for second in 0..2usize {
+            let mut builder = ModelBuilder::new();
+            let symbolic = family.append_dispatch(&mut builder, "CUDA").unwrap();
+            for (phase, selected) in symbolic.phases.iter().zip([first, second]) {
+                builder.constraint(Constraint::InDomain {
+                    variable: phase.items_per_group.id(),
+                    domain: Domain::singleton((selected + 1) as i64),
+                });
+            }
+            let mut search = Search::new(Arc::new(builder.build().unwrap()), Options::default()).unwrap();
+            let Outcome::Optimal(solution) = search.advance(Limits::default()).unwrap() else {
+                panic!("dispatch equations must cover every original phase assignment")
+            };
+            let reconstructed = symbolic.reconstruct(solution.values()).unwrap();
+            let Preparation::Execution(original) = tuning::prepare(&function, &device, &[1, first, second]).unwrap() else {
+                panic!("original family member")
+            };
+            for (original, reconstructed) in original.iter().zip(reconstructed) {
+                assert_eq!(original.target_plan(), reconstructed.target_plan());
+                assert_eq!(original.dispatch(), reconstructed.dispatch());
+                assert_eq!(original.storage(), reconstructed.storage());
+                assert_eq!(original.program().conditions, reconstructed.program().conditions);
+            }
+        }
+    }
 }

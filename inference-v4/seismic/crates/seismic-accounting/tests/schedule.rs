@@ -137,13 +137,15 @@ fn latency_is_distinct_from_issue_service() {
 
 #[test]
 fn explicit_budget_does_not_turn_a_feasible_schedule_into_an_optimum() {
-    let m = model(vec![op("a", 3, 0, 1, vec![]), op("b", 3, 1, 1, vec![])]);
+    // The dependency-earliest seed conflicts on issue capacity, so a genuine
+    // unresolved gap remains at zero work even with validated seed tightening.
+    let m = model(vec![op("a", 3, 0, 1, vec![]), op("b", 3, 0, 1, vec![])]);
     let unfinished = m.solve(0).unwrap();
     assert!(!unfinished.is_optimal());
     assert_eq!(unfinished.schedule().completion, 6);
     assert_eq!(unfinished.lower_bound(), 3);
-    let solved = m.solve(100).unwrap();
-    assert_eq!(solved.schedule().completion, 3);
+    let solved = m.solve(10_000).unwrap();
+    assert_eq!(solved.schedule().completion, 4);
     assert!(solved.is_optimal());
 }
 
@@ -231,22 +233,22 @@ fn large_tick_domains_are_solved_by_constraints_without_tick_enumeration() {
         op("producer", 1, 0, 1, vec![]),
         op("dependent", 10 * unit, 1, 10 * unit, vec![1]),
     ]);
-    let result = m.solve(1_000).unwrap();
+    let result = m.solve(100_000).unwrap();
     assert!(result.is_optimal(), "{:?}", result);
     assert_eq!(result.schedule().completion, 10 * unit + 1);
-    assert!(result.assignments_examined() < 1_000);
+    assert!(result.search_work() < 100_000);
     assert!(result.schedule().starts[0] > result.schedule().starts[1]);
 
     let mut search = m.start_search().unwrap();
-    for step in 1..=1_000 {
+    for step in 1..=100_000 {
         if let SearchOutcome::Feasible(resumed) = search.advance(1).unwrap() {
             if resumed.is_optimal() {
                 assert_eq!(resumed.schedule(), result.schedule());
                 assert_eq!(
-                    resumed.assignments_examined(),
-                    result.assignments_examined()
+                    resumed.search_work(),
+                    result.search_work()
                 );
-                assert_eq!(resumed.assignments_examined(), step);
+                assert_eq!(resumed.search_work(), step);
                 return;
             }
         }

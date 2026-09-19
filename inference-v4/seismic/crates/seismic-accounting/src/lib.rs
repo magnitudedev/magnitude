@@ -55,8 +55,9 @@ pub fn derive_specialized(
 }
 
 pub mod schedule;
+pub mod objective;
 
-pub mod selection;
+pub mod choices;
 
 pub mod execution_model;
 
@@ -64,3 +65,8 @@ pub mod execution_model;
 pub mod workload;
 
 pub mod authority;
+
+pub mod algebra;
+
+/// Exact finite invocation-domain expressions shared by target accounting.
+pub mod affine;

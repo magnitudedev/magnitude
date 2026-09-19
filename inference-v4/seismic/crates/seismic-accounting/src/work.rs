@@ -372,6 +372,11 @@ impl Walker<'_> {
                     self.expr(a, f, b, mult);
                 }
                 match name {
+                    Builtin::Select => {
+                        if let Some(dtype) = dtype(&e.ty, b) {
+                            self.term(WorkKind::Builtin { operation: *name, dtype }, mult.clone(), f, e);
+                        } else { self.account.unavailable.push("unresolved value-selection type".into()); }
+                    }
                     Builtin::Reshape | Builtin::Load | Builtin::Extent => {}
                     Builtin::Store => self.conversion(
                         dtype(&args[0].ty, b),

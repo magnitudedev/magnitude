@@ -1,59 +1,14 @@
 //! Conservative lifetime facts used to establish legality, never performance scores.
 use crate::ir::{Builtin, Expr, ExprKind, Index, Stmt, StmtKind, VarId};
+mod borrowing;
+pub(crate) use borrowing::LoadLifetimes;
 
 /// A load may borrow its tensor backing only when no tensor store or unknown
-/// effect can run before its final consumption in the defining lexical block.
+/// effect can change its backing before its final consumption.
 /// Tile assignment is by value, so assigning the loaded tile consumes a snapshot.
 /// Runtime bindings must separately uphold the checked parallel-independence facts.
 pub fn load_can_borrow(body: &[Stmt], var: VarId) -> bool {
-    fn definitions(body: &[Stmt], var: VarId) -> usize {
-        body.iter()
-            .map(|s| match &s.kind {
-                StmtKind::Assign { target, .. } => {
-                    usize::from(matches!(target.kind, ExprKind::Var(v) if v == var))
-                }
-                StmtKind::Parallel { body, .. }
-                | StmtKind::Owned { body, .. }
-                | StmtKind::Range { body, .. }
-                | StmtKind::LoadLoop { body, .. }
-                | StmtKind::Lanes { body, .. } => definitions(body, var),
-                StmtKind::If { then, els, .. } => definitions(then, var) + definitions(els, var),
-                _ => 0,
-            })
-            .sum()
-    }
-    fn find(body: &[Stmt], var: VarId) -> Option<bool> {
-        if let Some(definition) = body.iter().position(|s| matches!(&s.kind, StmtKind::Assign { target,value,.. }
-            if matches!(target.kind, ExprKind::Var(v) if v==var) && matches!(value.kind,ExprKind::Builtin {name:Builtin::Load,..} | ExprKind::Load {..}))) {
-            let last = body.iter().rposition(|s|uses(s,var)).unwrap_or(definition);
-            return Some(last <= definition || !body[definition+1..=last].iter().any(|s|tensor_effect(s)||tile_mutated(s,var)));
-        }
-        for (at, s) in body.iter().enumerate() {
-            let found = match &s.kind {
-                StmtKind::Parallel { body, .. }
-                | StmtKind::Owned { body, .. }
-                | StmtKind::Range { body, .. }
-                | StmtKind::LoadLoop { body, .. }
-                | StmtKind::Lanes { body, .. } => find(body, var),
-                StmtKind::If { then, els, .. } => {
-                    find(then, var).or_else(|| find(els, var))
-                }
-                _ => None,
-            };
-            if let Some(valid) = found {
-                // A lexical lifetime proof cannot admit a view escaping that scope.
-                return Some(
-                    valid
-                        && !body
-                            .iter()
-                            .enumerate()
-                            .any(|(i, s)| i != at && uses(s, var)),
-                );
-            }
-        }
-        None
-    }
-    definitions(body, var) == 1 && find(body, var) == Some(true)
+    LoadLifetimes::new(body).variable_can_borrow(var)
 }
 /// A streamed binding's snapshot may borrow only when the complete piece body
 /// preserves its backing memory and does not mutate the loaded tile.

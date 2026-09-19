@@ -2,9 +2,11 @@ use seismic_lang::{
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let source="fn signed[N](a: tensor[N] i32, b: tensor[N] i32, q: tensor[N] i32, r: tensor[N] i32):\n  for row in parallel:\n    at = load(a[row:row+1])\n    bt = load(b[row:row+1])\n    qt = tile[1] i32\n    rt = tile[1] i32\n    for i in owned(qt): qt[i] = at[i] / bt[i]; rt[i] = at[i] % bt[i]\n    store(qt,q[row:row+1])\n    store(rt,r[row:row+1])\n\nfn unsigned[N](a: tensor[N] u32, b: tensor[N] u32, q: tensor[N] u32, r: tensor[N] u32):\n  for row in parallel:\n    at = load(a[row:row+1])\n    bt = load(b[row:row+1])\n    qt = tile[1] u32\n    rt = tile[1] u32\n    for i in owned(qt): qt[i] = at[i] / bt[i]; rt[i] = at[i] % bt[i]\n    store(qt,q[row:row+1])\n    store(rt,r[row:row+1])\n";
     let program = compile(
         &[SourceFile {
@@ -37,25 +39,29 @@ fn exercise(device: Device, candidate: Candidate) {
             .flat_map(|n| n.to_le_bytes())
             .collect::<Vec<_>>()
     };
-    let lowered = seismic_lang::lower::lower(
-        &program,
-        "signed",
-        device.backend(),
-        &HashMap::from([("N".into(), a.len() as i64)]),
-    )
-    .unwrap();
-    let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+    let invocation = seismic_runtime::tuner::Input::Portable {
+        program: &program,
+        entry: "signed",
+        shapes: &HashMap::from([("N".into(), a.len() as i64)]),
+        elements: &Default::default(),
+        options: &Default::default(),
+    };
     let aa = device.buffer_from(&encode(&a)).unwrap();
     let bb = device.buffer_from(&encode(&b)).unwrap();
     let q = device.buffer(a.len() * 4).unwrap();
     let r = device.buffer(a.len() * 4).unwrap();
     let buffers = [aa.clone(), bb.clone(), q.clone(), r.clone()];
+    let mut kernel =
+        automatic_hardware::compile_with_controls(&device, invocation, &buffers, &[], &[0, 1])
+            .unwrap();
     kernel.execute(&buffers, &[]).unwrap();
     let mut got = vec![0; a.len() * 4];
     q.read(&mut got).unwrap();
     assert_eq!(got, encode(&quotient));
     r.read(&mut got).unwrap();
     assert_eq!(got, encode(&remainder));
+    // Division operands determine exceptional control. These explicit content
+    // conditions are checked again before submitting changed inputs.
     b[0] = 0;
     bb.write(&encode(&b)).unwrap();
     assert!(kernel.execute(&buffers, &[]).is_err());
@@ -68,6 +74,10 @@ fn exercise(device: Device, candidate: Candidate) {
     b[0] = 3;
     aa.write(&encode(&a)).unwrap();
     bb.write(&encode(&b)).unwrap();
+    // A different valid control binding requires a new automatic specialization.
+    let mut kernel =
+        automatic_hardware::compile_with_controls(&device, invocation, &buffers, &[], &[0, 1])
+            .unwrap();
     kernel.execute(&buffers, &[]).unwrap();
     let aa = [0u32, 1, u32::MAX, 1 << 31, 17, 77];
     let bb = [1u32, 3, 2, u32::MAX, 5, 9];
@@ -77,27 +87,25 @@ fn exercise(device: Device, candidate: Candidate) {
             .flat_map(|n| n.to_le_bytes())
             .collect::<Vec<_>>()
     };
-    let lowered = seismic_lang::lower::lower(
-        &program,
-        "unsigned",
-        device.backend(),
-        &HashMap::from([("N".into(), aa.len() as i64)]),
-    )
-    .unwrap();
-    let mut kernel = device.compile(&lowered, candidate).unwrap();
+    let invocation = seismic_runtime::tuner::Input::Portable {
+        program: &program,
+        entry: "unsigned",
+        shapes: &HashMap::from([("N".into(), aa.len() as i64)]),
+        elements: &Default::default(),
+        options: &Default::default(),
+    };
     let q = device.buffer(24).unwrap();
     let r = device.buffer(24).unwrap();
-    kernel
-        .execute(
-            &[
-                device.buffer_from(&encode(&aa)).unwrap(),
-                device.buffer_from(&encode(&bb)).unwrap(),
-                q.clone(),
-                r.clone(),
-            ],
-            &[],
-        )
-        .unwrap();
+    let buffers = [
+        device.buffer_from(&encode(&aa)).unwrap(),
+        device.buffer_from(&encode(&bb)).unwrap(),
+        q.clone(),
+        r.clone(),
+    ];
+    let mut kernel =
+        automatic_hardware::compile_with_controls(&device, invocation, &buffers, &[], &[0, 1])
+            .unwrap();
+    kernel.execute(&buffers, &[]).unwrap();
     let mut got = vec![0; 24];
     q.read(&mut got).unwrap();
     assert_eq!(
@@ -111,34 +119,17 @@ fn exercise(device: Device, candidate: Candidate) {
     );
 }
 #[test]
-fn cpu_integer_division() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    )
-}
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_integer_division() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    )
+fn cpu_integer() {
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
-fn metal_integer_division() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    )
+fn metal_integer() {
+    exercise(Device::metal().unwrap());
+}
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_integer() {
+    exercise(Device::cuda(0).unwrap());
 }

@@ -1,6 +1,7 @@
 //! Lowered IR for one backend, sharing the common typed IR nodes.
 //! Expansion decisions are retained with the function. Further execution choices
 //! are not yet closed here; this representation is not Tuned IR.
+pub mod numeric;
 use crate::ir::{Stmt, Var, VarId};
 use crate::sym::Sym;
 use crate::types::{Elem, Ty};
@@ -24,6 +25,22 @@ pub struct LoweredIr {
     pub selections: Vec<Selection>,
     /// Validated decisions that produced this expanded program.
     pub decisions: Vec<DecisionRecord>,
+}
+
+impl LoweredIr {
+    /// Substitute already selected compiler operands without transforming the
+    /// computation or changing retained variable and operation identities.
+    pub fn specialize_parameters(&mut self, parameters: &HashMap<String, Sym>) {
+        specialize_statements(&mut self.body, parameters);
+        for variable in &mut self.vars { variable.ty = crate::lower::subst_ty(&variable.ty, parameters); }
+        for (_, ty) in &mut self.params { *ty = crate::lower::subst_ty(ty, parameters); }
+        for (_, extent) in &mut self.index_params { *extent = crate::lower::subst_sym(extent, parameters, &HashMap::new()); }
+    }
+}
+
+pub fn specialize_statements(body: &mut [Stmt], parameters: &HashMap<String, Sym>) {
+    let atoms = parameters.iter().map(|(name, value)| (crate::sym::Atom::Param(name.clone()), value.clone())).collect::<Vec<_>>();
+    for statement in body { crate::composition::remap(statement, &HashMap::new(), &atoms); }
 }
 
 /// Parameter ordinals whose storage must be disjoint unless their exact typed
@@ -65,6 +82,7 @@ pub enum Alternatives {
     OutputWidths { maximum: i64 },
     PacketWidths { maximum: i64 },
     ReductionCuts { first: i64, last: i64 },
+    ReductionFrontiers { first: i64, last: i64 },
     ReductionSegments { maximum: i64 },
     UnrollWidths { maximum: i64 },
     MatrixPanelWidths { maximum: i64 },
@@ -156,11 +174,7 @@ impl FoldWindows {
         self.len() == 0
     }
     pub fn get(&self, index: usize) -> Option<i64> {
-        if index < self.small.len() {
-            return Some(self.small[index]);
-        }
-        let index = index - self.small.len();
-        (index < self.multiples).then(|| self.first + self.stride * index as i64)
+        numeric::NumericChoices::Windows(self).value(index)
     }
     pub fn contains(&self, width: i64) -> bool {
         self.small.binary_search(&width).is_ok()
@@ -189,29 +203,23 @@ impl Alternatives {
         if first < 1 || first > last || usize::try_from(last-first+1).is_err() {return Err("invalid reduction cut domain".into());}
         Ok(Self::ReductionCuts{first,last})
     }
+    pub fn reduction_frontiers(first: i64, last: i64) -> Result<Self,String> {
+        if first < 2 || first > last || usize::try_from(last-first+1).is_err() {return Err("invalid reduction frontier domain".into());}
+        Ok(Self::ReductionFrontiers{first,last})
+    }
     pub fn stream_capacities(maximum: i64) -> Result<Self, String> {
         if maximum <= 0 { return Err("stream domain must have a positive capacity".into()); }
         let count = usize::try_from(maximum).map_err(|_| "stream domain cardinality overflow")?;
         Ok(Self::StreamCapacities(StreamCapacities { maximum, count }))
     }
     pub fn len(&self) -> usize {
-        match self { Self::FoldWindows(w) => w.len(), Self::OutputWidths { maximum } | Self::PacketWidths { maximum } | Self::UnrollWidths { maximum } | Self::MatrixPanelWidths { maximum } => *maximum as usize, Self::ReductionSegments{maximum}=>*maximum as usize, Self::Explicit(v) => v.len(), Self::StreamCapacities(r) => r.count, Self::ReductionCuts{first,last} => (last-first+1) as usize }
+        match self { Self::FoldWindows(w) => w.len(), Self::OutputWidths { maximum } | Self::PacketWidths { maximum } | Self::UnrollWidths { maximum } | Self::MatrixPanelWidths { maximum } => *maximum as usize, Self::ReductionSegments{maximum}=>*maximum as usize, Self::Explicit(v) => v.len(), Self::StreamCapacities(r) => r.count, Self::ReductionCuts{first,last} | Self::ReductionFrontiers{first,last} => (last-first+1) as usize }
     }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     pub fn get(&self, index: usize) -> Option<Alternative> {
         match self {
-            Self::FoldWindows(w) => w.get(index).map(Alternative::PreparationWindow),
-            Self::Explicit(v) => v.get(index).cloned(),
-            Self::OutputWidths { maximum } if index < *maximum as usize => Some(Alternative::OutputWidth(index as i64 + 1)),
-            Self::MatrixPanelWidths { maximum } if index < *maximum as usize => Some(Alternative::MatrixPanelWidth(index as i64 + 1)),
-            Self::UnrollWidths { maximum } if index < *maximum as usize => Some(Alternative::UnrollWidth(index as i64 + 1)),
-            Self::PacketWidths { maximum } if index < *maximum as usize => Some(Alternative::PacketWidth(*maximum - index as i64)),
-            Self::ReductionSegments{maximum} if index<*maximum as usize=>Some(Alternative::ReductionSegment(*maximum-index as i64)),
-            // Whole-axis is the diagnostic baseline. Enumeration order is not
-            // a performance preference and the tuner must cover every value.
-            Self::StreamCapacities(r) if index < r.count => Some(Alternative::StreamCapacity(r.maximum - index as i64)),
-            Self::ReductionCuts{first,last} if index < (last-first+1) as usize => Some(Alternative::ReductionCut(first+index as i64)),
-            _ => None,
+            Self::Explicit(values) => values.get(index).cloned(),
+            _ => self.numeric()?.get(index),
         }
     }
     pub fn contains(&self, alternative: &Alternative) -> bool {
@@ -225,6 +233,7 @@ impl Alternatives {
             (Self::ReductionSegments{maximum},Alternative::ReductionSegment(n))=>(1..=*maximum).contains(n),
             (Self::StreamCapacities(r), Alternative::StreamCapacity(n)) => (1..=r.maximum).contains(n),
             (Self::ReductionCuts{first,last}, Alternative::ReductionCut(n)) => (*first..=*last).contains(n),
+            (Self::ReductionFrontiers{first,last}, Alternative::ReductionFrontier(n)) => (*first..=*last).contains(n),
             _ => false,
         }
     }
@@ -256,6 +265,7 @@ pub enum DecisionKind {
     ReductionSegments {extent:i64},
     Intermediate { variable: VarId, publication: usize },
     ReductionBranch { start: i64, end: i64, fields: Vec<Ty> },
+    ReductionFrontier { merge: usize, leaves: Sym, maximum: i64, fields: Vec<Ty> },
     Reduction { merge: String, extent: Sym, fields: Vec<Ty> },
     ParallelFusion { boundary: usize, other: usize, left_domain: Vec<Sym>, right_domain: Vec<Sym> },
     StreamFusion { first: usize, second: usize, extent: Sym },
@@ -314,6 +324,7 @@ pub enum Alternative {
     PacketWidth(i64),
     ReductionSegment(i64),
     ReductionCut(i64),
+    ReductionFrontier(i64),
     ReductionTree(crate::reduction::structured::Tree),
     ParallelFusion { shared_axes: usize, refine_consumer: bool },
     RetainLocal,

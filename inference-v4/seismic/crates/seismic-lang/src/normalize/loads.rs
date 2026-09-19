@@ -9,6 +9,65 @@ pub struct Site {
     pub selected: Option<LoadMode>,
 }
 
+/// All load ownership domains over one immutable normalized execution. This
+/// owner performs no implementation search and discovers no new sites while
+/// reconstructing an assignment. A previously selected operation is a singleton.
+#[derive(Clone, Debug)]
+pub struct Family {
+    function: LoweredIr,
+    sites: Vec<Site>,
+    domains: Vec<Vec<LoadMode>>,
+}
+impl Family {
+    pub fn new(mut function: LoweredIr) -> Result<Self, String> {
+        super::bind_values(&mut function.body, &mut function.vars);
+        let sites = sites(&function.body);
+        let domains = sites.iter().map(|site| {
+            if let Some(mode) = site.selected {
+                if mode == LoadMode::Borrow && !site.can_borrow {
+                    return Err(format!("selected load of variable {} violates its snapshot lifetime", site.variable));
+                }
+                Ok(vec![mode])
+            } else if site.can_borrow {
+                Ok(vec![LoadMode::Materialize, LoadMode::Borrow])
+            } else {
+                Ok(vec![LoadMode::Materialize])
+            }
+        }).collect::<Result<_, String>>()?;
+        Ok(Self { function, sites, domains })
+    }
+    /// Carry original ownership domains through a computation-preserving
+    /// phase transform. Improved local lifetime facts may admit more modes,
+    /// but do not introduce new source freedom or change original ordinals.
+    pub fn with_domains(function: LoweredIr, domains: Vec<Vec<LoadMode>>) -> Result<Self, String> {
+        let mut family = Self::new(function)?;
+        if domains.len() != family.sites.len() {
+            return Err("retained load domains do not cover exactly the transformed sites".into());
+        }
+        for (site, (supplied, legal)) in domains.iter().zip(&family.domains).enumerate() {
+            if supplied.is_empty() { return Err(format!("retained load site {site} has an empty original domain")); }
+            for (ordinal, mode) in supplied.iter().enumerate() {
+                if supplied[..ordinal].contains(mode) { return Err(format!("retained load site {site} repeats an original mode")); }
+                if !legal.contains(mode) { return Err(format!("retained load site {site} no longer admits its original mode {mode:?}")); }
+            }
+        }
+        family.domains = domains;
+        Ok(family)
+    }
+    pub fn function(&self) -> &LoweredIr { &self.function }
+    pub fn sites(&self) -> &[Site] { &self.sites }
+    pub fn domains(&self) -> &[Vec<LoadMode>] { &self.domains }
+    pub fn instantiate(&self, ordinals: &[usize]) -> Result<LoweredIr, String> {
+        if ordinals.len() != self.domains.len() { return Err("load assignment does not cover exactly the retained sites".into()); }
+        let modes = self.domains.iter().zip(ordinals).enumerate().map(|(site, (domain, &ordinal))| {
+            domain.get(ordinal).copied().ok_or_else(|| format!("load site {site} choice is outside its original domain"))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut selected = self.function.clone();
+        resolve(&mut selected.body, &modes)?;
+        Ok(selected)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub site: usize,
@@ -17,9 +76,12 @@ pub struct Decision {
 }
 
 pub fn sites(body: &[Stmt]) -> Vec<Site> {
-    fn visit(body: &[Stmt], root: &[Stmt], out: &mut Vec<Site>) {
+    fn visit(body: &[Stmt], lifetimes: &crate::effects::LoadLifetimes<'_>, out: &mut Vec<Site>) {
         for stmt in body {
             match &stmt.kind {
+                StmtKind::Reduction(reduction) => {
+                    for implementation in reduction.implementations() { visit(&implementation.body, lifetimes, out); }
+                }
                 StmtKind::Assign {
                     target,
                     op: AssignOp::Assign,
@@ -37,7 +99,7 @@ pub fn sites(body: &[Stmt]) -> Vec<Site> {
                         if let Some(selected) = selected {
                             out.push(Site {
                                 variable,
-                                can_borrow: crate::effects::load_can_borrow(root, variable),
+                                can_borrow: lifetimes.can_borrow(stmt),
                                 selected,
                             });
                         }
@@ -53,22 +115,23 @@ pub fn sites(body: &[Stmt]) -> Vec<Site> {
                             selected: modes.as_ref().and_then(|m| m.get(i)).copied(),
                         });
                     }
-                    visit(body, root, out);
+                    visit(body, lifetimes, out);
                 }
                 StmtKind::Parallel { body, .. }
                 | StmtKind::Owned { body, .. }
                 | StmtKind::Range { body, .. }
-                | StmtKind::Lanes { body, .. } => visit(body, root, out),
+                | StmtKind::Lanes { body, .. } => visit(body, lifetimes, out),
                 StmtKind::If { then, els, .. } => {
-                    visit(then, root, out);
-                    visit(els, root, out);
+                    visit(then, lifetimes, out);
+                    visit(els, lifetimes, out);
                 }
                 _ => {}
             }
         }
     }
     let mut out = Vec::new();
-    visit(body, body, &mut out);
+    let lifetimes = crate::effects::LoadLifetimes::new(body);
+    visit(body, &lifetimes, &mut out);
     out
 }
 
@@ -118,6 +181,9 @@ pub fn resolve(body: &mut [Stmt], modes: &[LoadMode]) -> Result<Vec<Decision>, S
     fn apply(body: &mut [Stmt], modes: &mut std::slice::Iter<'_, LoadMode>) {
         for stmt in body {
             match &mut stmt.kind {
+                StmtKind::Reduction(reduction) => {
+                    for implementation in reduction.implementations_mut() { apply(&mut implementation.body, modes); }
+                }
                 StmtKind::Assign {
                     target,
                     op: AssignOp::Assign,

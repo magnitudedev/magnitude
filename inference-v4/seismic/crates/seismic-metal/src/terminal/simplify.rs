@@ -41,6 +41,15 @@ pub(super) fn bounds_in(e: &E, facts: &Facts) -> Option<(i128, i128)> {
             }
             (lo, hi)
         }
+        E::EagerSelect(condition, yes, no) => {
+            // Both values must be total even when the condition is known.
+            let (cl, ch) = bounds(condition)?;
+            let (yl, yh) = bounds(yes)?;
+            let (nl, nh) = bounds(no)?;
+            if ch == 0 { (nl, nh) }
+            else if cl > 0 { (yl, yh) }
+            else { (yl.min(nl), yh.max(nh)) }
+        }
         E::Select(condition, yes, no) => {
             let (lo, hi) = bounds(condition)?;
             if hi == 0 { bounds(no)? }
@@ -360,6 +369,11 @@ fn expression_with(e: E, facts: &Facts) -> E {
             ty,
         },
         E::Select(c, a, b) => E::Select(
+            Box::new(expression(*c)),
+            Box::new(expression(*a)),
+            Box::new(expression(*b)),
+        ),
+        E::EagerSelect(c, a, b) => E::EagerSelect(
             Box::new(expression(*c)),
             Box::new(expression(*a)),
             Box::new(expression(*b)),

@@ -1,11 +1,11 @@
 use seismic_lang::{
-    lower::lower,
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
-use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
+fn exercise(device: Device) {
     let source="fn transpose_snapshot(x: tensor[1,2,64] f32, out: tensor[1,64,2] f32):\n  for row in parallel:\n    before = load(x[row])\n    zero = tile[2,64] f32\n    for i,j in owned(zero): zero[i,j]=0.0\n    store(zero,x[row])\n    result = tile[64,2] f32\n    for i,j in owned(result): result[i,j]=before.T[i,j]\n    store(result,out[row])\n";
     let program = compile(
         &[SourceFile {
@@ -16,19 +16,21 @@ fn exercise(device: Device, candidate: Candidate) {
         &[],
     )
     .unwrap();
-    let lowered = lower(
-        &program,
-        "transpose_snapshot",
-        device.backend(),
-        &HashMap::new(),
-    )
-    .unwrap();
-    let mut kernel = device.compile(&lowered, candidate).unwrap();
+    let invocation = seismic_runtime::tuner::Input::Portable {
+        program: &program,
+        entry: "transpose_snapshot",
+        shapes: &Default::default(),
+        elements: &Default::default(),
+        options: &Default::default(),
+    };
     let bytes = (0..128)
         .flat_map(|i| (i as f32 + 0.5).to_le_bytes())
         .collect::<Vec<_>>();
     let input = device.buffer_from(&bytes).unwrap();
     let out = device.buffer(bytes.len()).unwrap();
+    let mut kernel =
+        automatic_hardware::compile(&device, invocation, &[input.clone(), out.clone()], &[])
+            .unwrap();
     kernel.execute(&[input.clone(), out.clone()], &[]).unwrap();
     let mut actual = vec![0; bytes.len()];
     out.read(&mut actual).unwrap();
@@ -42,33 +44,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_transpose_snapshot() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_transpose_snapshot() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_transpose_snapshot() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

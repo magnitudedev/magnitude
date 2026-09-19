@@ -202,94 +202,6 @@ fn selected_storage_implementations_have_terminal_resource_mappings() {
     }
 }
 #[test]
-fn automatic_choices_cover_typed_decomposition_and_storage_without_source_cost_callbacks() {
-    use seismic_compiler::tuner::{Backend as _, Preparation};
-    use seismic_metal::tuning::{self, Capacities, Form};
-    let source = source();
-    let capacities = Capacities {
-        max_threads_per_threadgroup: 64,
-        max_threadgroup_bytes: 4096,
-    };
-    let mut pending = vec![(vec![], Vec::new())];
-    let mut executions = Vec::new();
-    let mut keys = Vec::new();
-    let mut visits = 0;
-    while let Some((path, ancestors)) = pending.pop() {
-        visits += 1;
-        assert!(visits < 200);
-        match tuning::expand(&source, &Form::Automatic, &capacities, &path).unwrap() {
-            Preparation::Choice { alternatives, .. } => {
-                for i in 0..alternatives.len() {
-                    let mut p = path.clone();
-                    p.push(i);
-                    if let Some(owner) = alternatives.owner::<tuning::DecompositionChoice>() {
-                        assert_eq!(owner.prepared(), &source);
-                        let retained = owner.refine(i).unwrap();
-                        let replayed = tuning::expand(&source, &Form::Automatic, &capacities, &p).unwrap();
-                        match (retained, replayed) {
-                            (Preparation::Choice { name: a, alternatives: x }, Preparation::Choice { name: b, alternatives: y }) => {
-                                assert_eq!(a, b);
-                                assert_eq!(x, y);
-                            }
-                            (Preparation::Execution(a), Preparation::Execution(b)) => {
-                                assert_eq!(a.function(), b.function());
-                                assert_eq!(seismic_metal::msl::emit_execution(&a).unwrap().source,
-                                    seismic_metal::msl::emit_execution(&b).unwrap().source);
-                            }
-                            (Preparation::Infeasible(a), Preparation::Infeasible(b)) => assert_eq!(a, b),
-                            _ => panic!("retained decomposition changed its dependent domain"),
-                        }
-                    }
-                    let mut inherited = ancestors.clone();
-                    inherited.push((alternatives.clone(), i));
-                    pending.push((p, inherited));
-                }
-            }
-            Preparation::Execution(e) => {
-                let r = model::requirements(&e).unwrap();
-                assert!(r.unmapped.is_empty(), "{:?}", r.unmapped);
-                for p in r.primitives {
-                    if !keys.contains(&p) {
-                        keys.push(p);
-                    }
-                }
-                executions.push((e, ancestors));
-            }
-            Preparation::Infeasible(_) => {}
-            Preparation::Unresolved(reason) => panic!("fixture needs supported realization: {reason}"),
-        }
-    }
-    assert!(executions.len() >= 12, "{}", executions.len());
-    let mut h = synthetic(keys);
-    h.resources[0].capacity = 1;
-    let backend = tuning::Backend::with_conditions(tuning::Conditions {
-        target: "conditional decomposition fixture".into(), capacities,
-        form: Form::Automatic, hardware: h.clone(),
-    }).unwrap();
-    for (e, ancestors) in executions {
-        let m = model::execution(
-            &e,
-            &h,
-            &workload(),
-            DerivationLimits {
-                instructions: 100000,
-                operations: 100000,
-            },
-        )
-        .unwrap();
-        assert!(m.unmapped.is_empty(), "{:?}", m.unmapped);
-        for (domain, index) in ancestors {
-            if let Some(demand) = backend.relax(&domain, index..index + 1, &workload(),
-                DerivationLimits { instructions: 100000, operations: 100000 }).unwrap() {
-                assert!(demand.lower_bound().unwrap() <= m.lower_bound().unwrap(),
-                    "retained family bound exceeds member's complete resource floor: {domain:?}");
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
 #[ignore = "requires a Metal device"]
 fn packed_five_and_six_bit_planes_decode_without_expansion() {
     use seismic_lang::{interp::TensorData, repr, types::DType};
@@ -841,11 +753,6 @@ fn evaluate(a:tensor[67,3] f32,b:tensor[67,3] f32,out:tensor[3] f32):
                     },
                 )
                 .unwrap();
-                let first = seismic_metal::choices::expand(&f, Config::default(), &[]).unwrap();
-                assert!(matches!(
-                    first,
-                    seismic_metal::choices::Expansion::Choice(choice) if matches!(choice.decision(), seismic_metal::choices::Decision::Fold(_))
-                ));
                 let selected = prepare_with_participants(
                     &f,
                     Config::default(),

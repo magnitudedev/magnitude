@@ -18,6 +18,7 @@ impl Value {
     }
     pub fn constant(base: i128) -> Self { Self { base, terms: BTreeMap::new() } }
     pub fn coordinate(id: u64, lo: i128, hi: i128) -> Self {
+        if lo == hi { return Self::constant(lo); }
         Self { base: 0, terms: BTreeMap::from([(id, (1, (lo, hi)))]) }
     }
     pub fn add(&self, other: Self) -> Option<Self> {
@@ -61,19 +62,35 @@ impl Value {
 impl Derivation<'_> {
     pub(super) fn expression_affine(&self, expression: &Expression) -> Values {
         if matches!(expression.ty(), Type::F16 | Type::BF16 | Type::F32) { return std::array::from_fn(|_| None); }
-        if let Some(facts) = self.facts.get(expression) { return facts.affine.clone(); }
         std::array::from_fn(|lane| self.affine_value(expression, lane))
     }
     pub(super) fn affine_value(&self, e: &Expression, lane: usize) -> Option<Value> {
-        if let Some(facts) = self.facts.get(e) { return facts.affine[lane].clone(); }
+        let observed = self.facts.get(e).and_then(|facts| facts.affine[lane].as_ref());
+        let assumed = self.assumptions.get(e).and_then(|facts| facts.affine[lane].as_ref());
+        // Keep the guarded expression's original coordinates intact. Different
+        // affine bases cannot be combined merely because their intervals overlap.
+        if let Some(value) = assumed {
+            if let Some(exact) = observed.filter(|value| value.terms.is_empty()) {
+                let (lo, hi) = value.bounds()?;
+                return (lo <= exact.base && exact.base <= hi).then(|| exact.clone());
+            }
+            return Some(value.clone());
+        }
+        if let Some(value) = observed { return Some(value.clone()); }
         use Expression as E;
         let result = match e {
             E::Variable(name, _) | E::Parameter { name, .. } if self.affine.get(name).and_then(|v| v[lane].as_ref()).is_some() => self.affine[name][lane].clone()?,
             E::Cast(_, value) => self.affine_value(value, lane)?,
+            E::Bitcast(ty, value) => {
+                let value_affine = self.affine_value(value, lane)?;
+                let offset = ranges::bitcast_offset(value_affine.bounds()?, value.ty(), *ty)?;
+                value_affine.add(Value::constant(offset))?
+            }
             E::Unary(UnaryOp::Neg, value, _) => self.affine_value(value, lane)?.scale(-1)?,
             E::Binary(op, left, right, _) if left.ty() == right.ty() => {
-                let a = self.affine_value(left, lane)?;
-                let b = self.affine_value(right, lane)?;
+                let (Some(a), Some(b)) = (self.affine_value(left, lane), self.affine_value(right, lane)) else {
+                    return self.constant_affine(e, lane);
+                };
                 match op {
                     BinaryOp::Add => a.add(b)?,
                     BinaryOp::Sub => a.add(b.scale(-1)?)?,
@@ -86,6 +103,15 @@ impl Derivation<'_> {
                         if a.bounds()?.0 < 0 { return None; }
                         if *op == BinaryOp::Div { Value { base: a.base.div_euclid(b.base), terms: a.terms.into_iter().map(|(id, (coefficient, domain))| (id, (coefficient / b.base, domain))).collect() } }
                         else { Value::constant(a.base.rem_euclid(b.base)) }
+                    }
+                    BinaryOp::Div | BinaryOp::Rem => {
+                        let (first, last) = self.interval(left, lane)?;
+                        let (minimum, maximum) = self.interval(right, lane)?;
+                        if first < 0 || minimum <= 0 { return None; }
+                        let quotient = first / maximum;
+                        if quotient != last / minimum { return self.constant_affine(e, lane); }
+                        if *op == BinaryOp::Div { Value::constant(quotient) }
+                        else { a.add(b.scale(-quotient)?)? }
                     }
                     _ => return self.constant_affine(e, lane),
                 }

@@ -142,10 +142,7 @@ fn import_only_settings() -> seismic_runtime::plan::Settings {
             instructions: 1,
             operations: 1,
         },
-        search: seismic_accounting::selection::Budget {
-            nodes: 1,
-            schedule_assignments: 1,
-        },
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 1, ..Default::default() }, ..Default::default() },
     }
 }
 

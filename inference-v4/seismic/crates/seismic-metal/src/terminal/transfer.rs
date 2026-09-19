@@ -19,6 +19,65 @@ impl Choice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection { pub choice: Choice, pub width: u8 }
 
+/// A local implementation region. Its alternatives replace only the retained
+/// source interval; surrounding computation is shared by every alternative.
+pub(crate) struct Region {
+    pub choice: Choice,
+    pub range: std::ops::Range<usize>,
+    pub alternatives: Vec<Vec<Site>>,
+}
+
+pub(crate) fn regions(program: &Program) -> Result<Vec<Vec<Region>>, String> {
+    let mut result = Vec::with_capacity(program.launches.len());
+    for (launch, body) in program.launches.iter().enumerate() {
+        let mut regions = Vec::new();
+        if body.iter().any(|site| matches!(site.statement, S::Unmapped(_))) {
+            result.push(regions);
+            continue;
+        }
+        // Legality facts belong to the retained launch, not to a width arm.
+        // Derive them once and share the exact local rewrite with apply().
+        let facts = copy_facts(body);
+        let original_names = binding_names(body);
+        for (site, statement) in body.iter().enumerate() {
+            let Some(copy) = recognized(body, site, &facts) else { continue; };
+            let choice = Choice { kind: Kind::CopyLoop, launch, site,
+                operation: statement.operation, maximum: (copy.end - copy.first).min(4) as u8 };
+            let range = site..copy.close + 1;
+            let alternatives = (1..=choice.maximum).map(|width|
+                copy_replacement(body, site, &copy, width, launch, &mut original_names.clone())).collect();
+            regions.push(Region { choice, range, alternatives });
+        }
+        for bundle in bundle::recognize(body) {
+            let site = bundle.sites[0];
+            let end = bundle.sites.last().copied().ok_or("empty retained read bundle")? + 1;
+            let choice = Choice { kind: Kind::ReadBundle, launch, site,
+                operation: body[site].operation, maximum: bundle.sites.len().min(4) as u8 };
+            let range = site..end;
+            let alternatives = (1..=choice.maximum).map(|width| {
+                let mut replacements = bundle::replacements(body, &bundle, width, launch, &mut original_names.clone());
+                range.clone().flat_map(|at| replacements.remove(&at).unwrap_or_else(|| vec![body[at].clone()])).collect()
+            }).collect();
+            regions.push(Region { choice, range, alternatives });
+        }
+        regions.sort_by_key(|region| region.range.start);
+        if regions.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
+            return Err("overlapping local transfer implementations need a shared region".into());
+        }
+        result.push(regions);
+    }
+    Ok(result)
+}
+
+fn binding_names(body: &[Site]) -> HashSet<String> {
+    body.iter().filter_map(|site| match &site.statement {
+        S::For { name, .. } | S::Let { name, .. } | S::Assign { name, .. }
+        | S::Array { name, .. } | S::Pointer { name, .. } | S::Fragment { name, .. }
+        | S::VectorRead { name, .. } => Some(name.clone()),
+        _ => None,
+    }).collect()
+}
+
 struct CopyLoop {
     close: usize, name: String, first: i64, end: i64,
     destination: String, destination_index: E, destination_type: T,
@@ -129,9 +188,7 @@ pub(crate) fn apply(body: &mut Vec<Site>, launch: usize, selections: &[Selection
         let maximum = (copy.end - copy.first).min(4) as u8;
         if selection.choice.operation != body[at].operation || selection.choice.maximum != maximum || selection.width == 0 || selection.width > maximum || selected.insert(at, (selection.width, copy)).is_some() { return Err("invalid terminal transfer selection".into()); }
     }
-    let mut names: HashSet<String> = body.iter().filter_map(|s| match &s.statement {
-        S::For { name, .. } | S::Let { name, .. } | S::Assign { name, .. } | S::Array { name, .. } | S::Pointer { name, .. } | S::Fragment { name, .. } | S::VectorRead { name, .. } => Some(name.clone()), _ => None,
-    }).collect();
+    let mut names = binding_names(body);
     let bundles: HashMap<_, _> = bundle::recognize(body).into_iter().map(|bundle| (bundle.sites[0], bundle)).collect();
     let mut replacements = HashMap::new();
     let mut selected_bundles = HashSet::new();
@@ -150,56 +207,56 @@ pub(crate) fn apply(body: &mut Vec<Site>, launch: usize, selections: &[Selection
             else { output.push(body[at].clone()); }
             at += 1; continue;
         };
-        let site = |statement| Site { operation: body[at].operation, statement };
-        let width = i64::from(*width);
-        let complete = copy.first + (copy.end - copy.first) / width * width;
-        let mut vector = format!("seismic_transfer_{launch}_{at}");
-        while !names.insert(vector.clone()) { vector.push('_'); }
-        let coordinate = |offset| E::binary(B::Add, E::variable(&copy.name, T::I32), E::integer(offset), T::I32);
-        let and = |left, right| E::ShortCircuit { or: false, left: Box::new(left), right: Box::new(right) };
-        let mut guard = E::Integer(1, T::Bool);
-        for offset in 0..width {
-            for condition in &copy.guards { guard = and(guard, substitute(condition, &copy.name, &coordinate(offset), None)); }
-        }
-        if let Some(count) = &copy.count {
-            // The original helper remains in the scalar fallback. Fast-path
-            // bounds use widened arithmetic and cannot overflow on count-width.
-            let count = count.clone().cast(T::I64);
-            let first = copy.index.clone().cast(T::I64);
-            let valid = and(E::binary(B::Ge, first.clone(), E::Integer(0, T::I64), T::Bool),
-                and(E::binary(B::Ge, count.clone(), E::Integer(width, T::I64), T::Bool), E::binary(B::Le, first, E::binary(B::Sub, count, E::Integer(width, T::I64), T::I64), T::Bool)));
-            guard = and(guard, valid);
-        }
-        output.push(site(S::For { name: copy.name.clone(), start: E::integer(copy.first), end: E::integer(complete), step: width }));
-        output.push(site(S::If(guard)));
-        output.push(site(S::VectorRead { name: vector.clone(), base: copy.source.clone(), index: copy.index.clone(), ty: copy.ty, components: width as u8 }));
-        for offset in 0..width {
-            output.push(site(S::Write { name: copy.destination.clone(), index: substitute(&copy.destination_index, &copy.name, &coordinate(offset), None), space: Space::Private, ty: copy.destination_type,
-                value: substitute(&copy.value, &copy.name, &coordinate(offset), Some(&E::VectorElement { name: vector.clone(), component: offset as u8, ty: copy.ty })) }));
-        }
-        output.push(site(S::Else));
-        for offset in 0..width {
-            for condition in &copy.guards { output.push(site(S::If(substitute(condition, &copy.name, &coordinate(offset), None)))); }
-            output.push(site(S::Write { name: copy.destination.clone(), index: substitute(&copy.destination_index, &copy.name, &coordinate(offset), None), space: Space::Private, ty: copy.destination_type, value: substitute(&copy.value, &copy.name, &coordinate(offset), None) }));
-            for _ in &copy.guards { output.push(site(S::End)); }
-        }
-        output.push(site(S::End)); output.push(site(S::End));
-        if complete < copy.end {
-            output.push(site(S::For { name: copy.name.clone(), start: E::integer(complete), end: E::integer(copy.end), step: 1 }));
-            output.extend_from_slice(&body[at + 1..=copy.close]);
-        }
+        output.extend(copy_replacement(body, at, copy, *width, launch, &mut names));
         at = copy.close + 1;
     }
     *body = output;
     Ok(())
 }
 
-/// Transfer refinement may combine device reads, alter checked-read admission,
-/// and add vector element extraction. Existing private/shared accesses, writes,
-/// floating arithmetic and collectives survive with their active multiplicity.
-/// Traversal refinement follows, so use only the intersection of both contracts.
-pub(crate) fn preserves(primitive: &super::Primitive) -> bool {
-    use super::{Primitive, Space};
-    super::traversal::preserves(primitive)
-        && !matches!(primitive, Primitive::Read { space: Space::Device, .. } | Primitive::VectorRead { .. })
+/// A replacement owns exactly the recognized source interval. This is shared
+/// by unresolved family construction and explicit selected reconstruction.
+fn copy_replacement(body: &[Site], at: usize, copy: &CopyLoop, width: u8,
+    launch: usize, names: &mut HashSet<String>) -> Vec<Site> {
+    if width == 1 { return body[at..=copy.close].to_vec(); }
+    let mut output = Vec::new();
+    let site = |statement| Site { operation: body[at].operation, statement };
+    let width = i64::from(width);
+    let complete = copy.first + (copy.end - copy.first) / width * width;
+    let mut vector = format!("seismic_transfer_{launch}_{at}");
+    while !names.insert(vector.clone()) { vector.push('_'); }
+    let coordinate = |offset| E::binary(B::Add, E::variable(&copy.name, T::I32), E::integer(offset), T::I32);
+    let and = |left, right| E::ShortCircuit { or: false, left: Box::new(left), right: Box::new(right) };
+    let mut guard = E::Integer(1, T::Bool);
+    for offset in 0..width {
+        for condition in &copy.guards { guard = and(guard, substitute(condition, &copy.name, &coordinate(offset), None)); }
+    }
+    if let Some(count) = &copy.count {
+        // The original helper remains in the scalar fallback. Fast-path
+        // bounds use widened arithmetic and cannot overflow on count-width.
+        let count = count.clone().cast(T::I64);
+        let first = copy.index.clone().cast(T::I64);
+        let valid = and(E::binary(B::Ge, first.clone(), E::Integer(0, T::I64), T::Bool),
+            and(E::binary(B::Ge, count.clone(), E::Integer(width, T::I64), T::Bool), E::binary(B::Le, first, E::binary(B::Sub, count, E::Integer(width, T::I64), T::I64), T::Bool)));
+        guard = and(guard, valid);
+    }
+    output.push(site(S::For { name: copy.name.clone(), start: E::integer(copy.first), end: E::integer(complete), step: width }));
+    output.push(site(S::If(guard)));
+    output.push(site(S::VectorRead { name: vector.clone(), base: copy.source.clone(), index: copy.index.clone(), ty: copy.ty, components: width as u8 }));
+    for offset in 0..width {
+        output.push(site(S::Write { name: copy.destination.clone(), index: substitute(&copy.destination_index, &copy.name, &coordinate(offset), None), space: Space::Private, ty: copy.destination_type,
+            value: substitute(&copy.value, &copy.name, &coordinate(offset), Some(&E::VectorElement { name: vector.clone(), component: offset as u8, ty: copy.ty })) }));
+    }
+    output.push(site(S::Else));
+    for offset in 0..width {
+        for condition in &copy.guards { output.push(site(S::If(substitute(condition, &copy.name, &coordinate(offset), None)))); }
+        output.push(site(S::Write { name: copy.destination.clone(), index: substitute(&copy.destination_index, &copy.name, &coordinate(offset), None), space: Space::Private, ty: copy.destination_type, value: substitute(&copy.value, &copy.name, &coordinate(offset), None) }));
+        for _ in &copy.guards { output.push(site(S::End)); }
+    }
+    output.push(site(S::End)); output.push(site(S::End));
+    if complete < copy.end {
+        output.push(site(S::For { name: copy.name.clone(), start: E::integer(complete), end: E::integer(copy.end), step: 1 }));
+        output.extend_from_slice(&body[at + 1..=copy.close]);
+    }
+    output
 }

@@ -1157,7 +1157,7 @@ fn copy_tile(
     let mut coordinates = Vec::new();
     let mut local = Vec::new();
     let mut global = Vec::new();
-    for &offset in offset {
+    for offset in offset {
         let id = vars.len();
         let atom = Atom::Param(format!("group_element#{id}"));
         vars.push(Var {
@@ -1169,7 +1169,7 @@ fn copy_tile(
         coordinates.push(id);
         local.push(Index::Point(symbol(Sym::atom(atom.clone()), span)));
         global.push(Index::Point(symbol(
-            Sym::atom(atom).add(&Sym::constant(offset)),
+            Sym::atom(atom).add(&Sym::constant(*offset)),
             span,
         )));
     }

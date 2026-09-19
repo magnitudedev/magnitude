@@ -28,10 +28,38 @@ pub fn executable_phases(function: &LoweredIr, indices: &[Vec<VarId>]) -> Result
     check(function, Stage::Executable, Some(indices))
         .map_err(|error| format!("{}: invalid Executable phase IR: {error}", function.name))
 }
+/// Check typed phase templates before compile-time alternatives and their
+/// binding joins are selected. This does not certify executable scope: source
+/// instantiation and selected target installation both require that separately.
+pub fn retained_phases(function: &LoweredIr, indices: &[Vec<VarId>]) -> Result<(), String> {
+    let mut definitions = HashSet::new();
+    fn collect(body: &[Stmt], definitions: &mut HashSet<VarId>) {
+        for statement in body {
+            match &statement.kind {
+                StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), .. }, .. } => { definitions.insert(*variable); },
+                StmtKind::If { then, els, .. } => { collect(then, definitions); collect(els, definitions); },
+                StmtKind::Parallel { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. }
+                | StmtKind::Owned { body, .. } | StmtKind::LoadLoop { body, .. } => collect(body, definitions),
+                _ => {},
+            }
+        }
+    }
+    collect(&function.body, &mut definitions);
+    check_mode(function, Stage::Executable, Some(indices), Some(&definitions))
+        .map_err(|error| format!("{}: invalid retained phase template: {error}", function.name))
+}
 fn check(
     function: &LoweredIr,
     stage: Stage,
     phase_indices: Option<&[Vec<VarId>]>,
+) -> Result<(), String> {
+    check_mode(function, stage, phase_indices, None)
+}
+fn check_mode(
+    function: &LoweredIr,
+    stage: Stage,
+    phase_indices: Option<&[Vec<VarId>]>,
+    retained_definitions: Option<&HashSet<VarId>>,
 ) -> Result<(), String> {
     function.ownership.validate(function)?;
     for decision in &function.decisions {
@@ -76,7 +104,7 @@ fn check(
     if parameters.len() != function.params.len() {
         return Err("entry parameter has no variable binding".into());
     }
-    let verifier = Verifier { function, stage };
+    let verifier = Verifier { function, stage, retained_definitions };
     if let Some(indices) = phase_indices {
         if indices.len() != function.body.len() {
             return Err("launch bindings disagree with the phase count".into());
@@ -99,6 +127,7 @@ fn check(
 struct Verifier<'a> {
     function: &'a LoweredIr,
     stage: Stage,
+    retained_definitions: Option<&'a HashSet<VarId>>,
 }
 impl Verifier<'_> {
     fn var(&self, id: VarId) -> Result<&Var, String> {
@@ -313,7 +342,7 @@ impl Verifier<'_> {
         match &expr.kind {
             ExprKind::Var(id) => {
                 self.reference(*id, &expr.ty)?;
-                if !bound.contains(id) {
+                if !bound.contains(id) && !self.retained_definitions.is_some_and(|definitions| definitions.contains(id)) {
                     return Err(format!(
                         "`{}` is used outside its defining scope",
                         self.var(*id)?.name
@@ -330,7 +359,7 @@ impl Verifier<'_> {
             }
             ExprKind::Load { view, .. } => {
                 self.expr(view, bound)?;
-                validate_load(&view.ty, &expr.ty)?;
+                validate_load(&view.ty, &expr.ty, true)?;
             }
             ExprKind::Index { base, indices } => {
                 self.expr(base, bound)?;
@@ -356,10 +385,19 @@ impl Verifier<'_> {
                         .filter(|i| matches!(i, Index::Point(_)))
                         .count();
                 if rank == 0 {
-                    if expr.ty
-                        != Ty::Scalar(source.elem.read_dtype().ok_or("unbound indexed element")?)
-                    {
-                        return Err("indexed scalar type differs from its storage".into());
+                    let dtype = source.elem.read_dtype().ok_or("unbound indexed element")?;
+                    // Reduction slices retain a zero-rank tile view for their
+                    // shaped callback ABI. A later index with no coordinates
+                    // reads its scalar; the view itself is not a scalar value.
+                    let scalar = expr.ty == Ty::Scalar(dtype);
+                    let tile = matches!(&expr.ty, Ty::Tile(shape)
+                        if shape.shape.is_empty() && shape.elem == Elem::Dtype(dtype)
+                            && shape.packed_axis.is_none());
+                    if !scalar && !tile {
+                        return Err(format!(
+                            "indexed scalar type {:?} differs from its storage {:?} at {:?}",
+                            expr.ty, base.ty, expr.span,
+                        ));
                     }
                 } else if expr.ty.rank() != Some(rank)
                     || expr.ty.shaped().is_none_or(|s| s.elem != source.elem)
@@ -434,6 +472,15 @@ impl Verifier<'_> {
                     }
                 }
                 match name {
+                    Builtin::Select => {
+                        let [condition, yes, no] = args.as_slice() else {
+                            return Err("eager value selection requires three arguments".into());
+                        };
+                        if condition.ty != Ty::Scalar(DType::Bool) || !matches!(yes.ty, Ty::Scalar(_))
+                            || yes.ty != no.ty || expr.ty != yes.ty {
+                            return Err("eager value selection requires a bool and equal scalar value types".into());
+                        }
+                    }
                     Builtin::Load => {
                         if self.stage == Stage::Executable {
                             return Err("unresolved snapshot load".into());
@@ -441,7 +488,7 @@ impl Verifier<'_> {
                         let [view] = args.as_slice() else {
                             return Err("load arity differs from its contract".into());
                         };
-                        validate_load(&view.ty, &expr.ty)?;
+                        validate_load(&view.ty, &expr.ty, false)?;
                     }
                     Builtin::Store => {
                         let [tile, view] = args.as_slice() else {
@@ -490,12 +537,15 @@ fn assignable(target: &Ty, value: &Ty) -> bool {
         _ => target == value,
     }
 }
-fn validate_load(source: &Ty, result: &Ty) -> Result<(), String> {
+fn validate_load(source: &Ty, result: &Ty, selected: bool) -> Result<(), String> {
     match (source, result) {
         (Ty::Tensor(a), Ty::Tile(b)) if a == b => Ok(()),
+        // Expanded reduction operands may snapshot an existing private tile
+        // view. Borrowing still requires the independent lifetime proof.
+        (Ty::Tile(a), Ty::Tile(b)) if selected && a == b => Ok(()),
         (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() => {
             for (a, b) in a.iter().zip(b) {
-                validate_load(a, b)?;
+                validate_load(a, b, selected)?;
             }
             Ok(())
         }

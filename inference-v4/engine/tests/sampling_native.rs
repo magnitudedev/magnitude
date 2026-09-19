@@ -1,7 +1,7 @@
 //! Functional automatic-selection test on an explicitly hypothetical machine.
 //! Its unit service costs are never a production profile or performance evidence.
 use seismic_accounting::{
-    execution_model::*, schedule::*, selection::Budget, workload::DerivationLimits,
+    execution_model::*, schedule::*, workload::DerivationLimits,
 };
 use seismic_engine::{
     generation::{
@@ -84,10 +84,7 @@ fn automatic_cpu_selection_executes_device_sampling() {
                 instructions: 100_000,
                 operations: 100_000,
             },
-            search: Budget {
-                nodes: 100,
-                schedule_assignments: 100_000,
-            },
+            search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() },
         },
     )
     .unwrap();

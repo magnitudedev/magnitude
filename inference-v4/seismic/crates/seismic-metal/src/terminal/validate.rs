@@ -15,7 +15,7 @@ fn expression(value: &E) -> bool {
         } => expression(a) && expression(b),
         E::Unary(_, value, _) | E::Cast(_, value) | E::Bitcast(_, value) => expression(value),
         E::Builtin(_, values, _) | E::Helper(_, values, _) => values.iter().all(expression),
-        E::Select(condition, yes, no) => expression(condition) && expression(yes) && expression(no),
+        E::Select(condition, yes, no) | E::EagerSelect(condition, yes, no) => expression(condition) && expression(yes) && expression(no),
         E::Read { index, .. } => expression(index),
         E::Unmapped(..) => false,
     }
@@ -119,7 +119,7 @@ fn typed(
                 return Err("short-circuit operands must be bool".into());
             }
         }
-        E::Select(condition, yes, no) => {
+        E::Select(condition, yes, no) | E::EagerSelect(condition, yes, no) => {
             check(condition)?;
             check(yes)?;
             check(no)?;
@@ -160,12 +160,32 @@ fn typed(
 }
 
 pub(super) fn program(program: &Program) -> Result<(), String> {
+    program_mode(program, false)
+}
+/// Compile-time alternatives have deferred binding joins and are not a native
+/// lexical program. Validate operation types and structured delimiters here;
+/// the selected program must still pass the full lexical validator above.
+pub(super) fn template(program: &Program) -> Result<(), String> {
+    program_mode(program, true)
+}
+fn program_mode(program: &Program, retained: bool) -> Result<(), String> {
     for (launch, sites) in program.launches.iter().enumerate() {
         let locals: HashSet<_> = sites
             .iter()
             .filter_map(|s| declared(&s.statement).map(|(name, _)| name.to_owned()))
             .collect();
         let mut scopes = vec![(Scope::Root, HashMap::new())];
+        let mut declarations = HashMap::<String, Option<Type>>::new();
+        if retained {
+            for site in sites {
+                if let Some((name, ty)) = declared(&site.statement) {
+                    if let Some(previous) = declarations.insert(name.to_owned(), ty) {
+                        if previous != ty { return Err(format!("retained Metal binding `{name}` changes type between alternatives")); }
+                    }
+                }
+            }
+        }
+        let retained_scope = retained.then(|| [(Scope::Root, declarations)]);
         for (index, site) in sites.iter().enumerate() {
             let context = |reason: String| {
                 format!(
@@ -176,10 +196,11 @@ pub(super) fn program(program: &Program) -> Result<(), String> {
             if !statement(&site.statement) {
                 return Err(context("untyped Metal operation".into()));
             }
-            let check = |value| typed(value, &scopes, &locals).map_err(&context);
+            let binding_scopes = retained_scope.as_ref().map_or(scopes.as_slice(), |scope| scope.as_slice());
+            let check = |value| typed(value, binding_scopes, &locals).map_err(&context);
             match &site.statement {
-                S::Write { name, .. } => { binding(name, &scopes, &locals).map_err(&context)?; }
-                S::Pointer { base, .. } | S::VectorRead { base, .. } => { binding(base, &scopes, &locals).map_err(&context)?; }
+                S::Write { name, .. } => { binding(name, binding_scopes, &locals).map_err(&context)?; }
+                S::Pointer { base, .. } | S::VectorRead { base, .. } => { binding(base, binding_scopes, &locals).map_err(&context)?; }
                 _ => {},
             }
             match &site.statement {
@@ -193,7 +214,7 @@ pub(super) fn program(program: &Program) -> Result<(), String> {
                 }
                 S::Assign { name, value } => {
                     check(value)?;
-                    let actual = scopes
+                    let actual = binding_scopes
                         .iter()
                         .rev()
                         .find_map(|(_, names)| names.get(name))
@@ -262,7 +283,7 @@ pub(super) fn program(program: &Program) -> Result<(), String> {
                     .unwrap()
                     .1
                     .insert(name.into(), ty)
-                    .is_some()
+                    .is_some() && !retained
                 {
                     return Err(context(format!("duplicate local `{name}` in one scope")));
                 }

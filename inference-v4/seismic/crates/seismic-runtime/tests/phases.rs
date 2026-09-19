@@ -2,7 +2,7 @@ use seismic_lang::{
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_accounting::{selection::Budget, workload::DerivationLimits};
+use seismic_accounting::{workload::DerivationLimits};
 use seismic_runtime::{Device, tuner::{self, Form, Hardware, Input, Outcome, Request}};
 #[path = "support/automatic_hardware.rs"]
 mod automatic_hardware;
@@ -60,7 +60,7 @@ fn exercise_case(device: &Device, source: &str) {
         device: &facts, form, hardware: &hardware, workload: &workload,
         derivation_limits: DerivationLimits { instructions: 1_000_000, operations: 1_000_000 },
     };
-    let Outcome::Optimal(tuned) = tuner::tune(&request, Budget { nodes: 20_000, schedule_assignments: 1_000_000 }).unwrap() else {
+    let Outcome::Optimal(tuned) = tuner::tune(&request, seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 1_000_000, ..Default::default() }, ..Default::default() }).unwrap() else {
         panic!("ordered phases require a completed automatic selection");
     };
     let objective = tuned.objective().clone();

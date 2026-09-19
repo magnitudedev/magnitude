@@ -1,13 +1,14 @@
 use seismic_lang::{
     interp::{Arg, Interpreter, TensorData},
-    lower::lower,
     program::{compile, SourceFile},
     types::DType,
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     for (dtype, name, values) in [
         (
             DType::U32,
@@ -30,8 +31,13 @@ fn exercise(device: Device, candidate: Candidate) {
             &[],
         )
         .unwrap();
-        let lowered = lower(&program, "shift", device.backend(), &HashMap::new()).unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "shift",
+            shapes: &Default::default(),
+            elements: &Default::default(),
+            options: &Default::default(),
+        };
         let input = device
             .buffer_from(
                 &values
@@ -41,6 +47,9 @@ fn exercise(device: Device, candidate: Candidate) {
             )
             .unwrap();
         let out = device.buffer(20).unwrap();
+        let mut kernel =
+            automatic_hardware::compile(&device, invocation, &[input.clone(), out.clone()], &[0.0])
+                .unwrap();
         for amount in [0, 1, 15, 31, -1, 32, 255, 3] {
             let mut interpreter = Interpreter::new(&program);
             let source = interpreter.add_tensor(TensorData::dense(
@@ -67,6 +76,15 @@ fn exercise(device: Device, candidate: Candidate) {
                 ],
                 &HashMap::new(),
             );
+            if (0..32).contains(&amount) {
+                kernel = automatic_hardware::compile(
+                    &device,
+                    invocation,
+                    &[input.clone(), out.clone()],
+                    &[f64::from(amount)],
+                )
+                .unwrap();
+            }
             let result = kernel.execute(&[input.clone(), out.clone()], &[amount as f64]);
             if !(0..32).contains(&amount) {
                 assert!(result.is_err());
@@ -93,33 +111,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_shifts() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_shifts() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_shifts() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

@@ -28,7 +28,7 @@ pub(crate) fn arguments(helper: crate::support::Helper, args: &[Expression], ele
 /// Single-expression helpers have no local lifetime or control to retain.
 /// Callers must establish that argument evaluation is pure and total before
 /// substitution can duplicate or omit it under the returned expression.
-pub(super) fn single_expression(helper: crate::support::Helper, args: &[Expression], element: Type) -> Option<Expression> {
+pub(crate) fn single_expression(helper: crate::support::Helper, args: &[Expression], element: Type) -> Option<Expression> {
     let definition = crate::support::Definition::new(helper);
     if definition.parameters.len() != args.len() || definition.parameters.iter().any(|(_, ty)| matches!(ty, crate::support::Type::DevicePointer | crate::support::Type::StatusPointer)) { return None; }
     let args: Vec<_> = definition.parameters.iter().zip(args).map(|((_, parameter), argument)| argument.clone().cast(ty(*parameter, element))).collect();

@@ -1,11 +1,12 @@
 use seismic_lang::{
-    lower::lower,
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let scoped = "fn evaluate(x: tensor[4] f32, out: tensor[2] f32, enabled: bool):\n  a = load(x)\n  acc = 10.0\n  if enabled:\n    acc += reduce(a,0,sum)\n    for i in owned(a): a[i] = a[i] + 1.0\n    acc += reduce(a,0,sum) * 2.0\n  y = tile[2] f32\n  for i in owned(y):\n    if i == 0: y[i] = acc\n    else: y[i] = reduce(a,0,sum)\n  store(y,out)\n";
     let nested = "fn evaluate(x: tensor[2,3] f32, out: tensor[1] f32):\n  a = load(x)\n  y = tile[1] f32\n  for i in owned(y): y[i] = reduce(reduce(a,1,sum),0,sum)\n  store(y,out)\n";
     let inline_load =
@@ -29,8 +30,13 @@ fn exercise(device: Device, candidate: Candidate) {
             &[],
         )
         .unwrap();
-        let lowered = lower(&program, "evaluate", device.backend(), &Default::default()).unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "evaluate",
+            shapes: &Default::default(),
+            elements: &Default::default(),
+            options: &Default::default(),
+        };
         let input = device
             .buffer_from(
                 &(1..=input_count)
@@ -39,6 +45,13 @@ fn exercise(device: Device, candidate: Candidate) {
             )
             .unwrap();
         let output = device.buffer(expected.len() * 4).unwrap();
+        let mut kernel = automatic_hardware::compile(
+            &device,
+            invocation,
+            &[input.clone(), output.clone()],
+            &scalars,
+        )
+        .unwrap();
         kernel.execute(&[input, output.clone()], &scalars).unwrap();
         let mut bytes = vec![0; expected.len() * 4];
         output.read(&mut bytes).unwrap();
@@ -52,48 +65,16 @@ fn exercise(device: Device, candidate: Candidate) {
 
 #[test]
 fn cpu_reduction_expressions() {
-    for loads in [
-        seismic_realization::LoadStrategy::Materialize,
-        seismic_realization::LoadStrategy::BorrowProvenReadOnly,
-    ] {
-        exercise(Device::cpu(), Candidate::Cpu { loads });
-    }
+    exercise(Device::cpu());
 }
-
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_reduction_expressions() {
-    for loads in [
-        seismic_realization::LoadStrategy::Materialize,
-        seismic_realization::LoadStrategy::BorrowProvenReadOnly,
-    ] {
-        exercise(
-            Device::metal().unwrap(),
-            Candidate::Metal(seismic_metal::execution::Config {
-                loads,
-                ..Default::default()
-            }),
-        );
-    }
+    exercise(Device::metal().unwrap());
 }
-
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_reduction_expressions() {
-    for loads in [
-        seismic_realization::LoadStrategy::Materialize,
-        seismic_realization::LoadStrategy::BorrowProvenReadOnly,
-    ] {
-        exercise(
-            Device::cuda(0).unwrap(),
-            Candidate::Cuda {
-                options: seismic_realization::ScalarOptions {
-                    dispatch: seismic_realization::Dispatch::Sequential,
-                    loads,
-                },
-                threads_per_block: 32,
-            },
-        );
-    }
+    exercise(Device::cuda(0).unwrap());
 }

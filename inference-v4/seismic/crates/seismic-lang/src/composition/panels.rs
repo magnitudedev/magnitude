@@ -263,7 +263,7 @@ fn reference(v: VarId, vars: &[Var], span: Span) -> Expr {
 fn condition(
     outer: VarId,
     slot: VarId,
-    width: i64,
+    width: &Sym,
     lo: i64,
     hi: i64,
     vars: &[Var],
@@ -298,7 +298,9 @@ fn condition(
         sym: None,
         span,
     };
-    let offset = binary(crate::ast::BinaryOp::Mul, cast(outer), integer(width));
+    let width = Expr { kind: ExprKind::Cast { dtype: DType::U32, expr: Box::new(symbolic(width.clone(), span)) },
+        ty: Ty::Scalar(DType::U32), sym: Some(width.clone()), span };
+    let offset = binary(crate::ast::BinaryOp::Mul, cast(outer), width);
     let offset = binary(crate::ast::BinaryOp::Add, offset, integer(lo));
     let offset = binary(crate::ast::BinaryOp::Add, offset, cast(slot));
     Expr {
@@ -354,16 +356,31 @@ fn panel_view(buffer: VarId, offset: Sym, original: Ty, vars: &[Var], span: Span
     }
 }
 fn materialize(panel: Panel, width: i64, vars: &mut Vec<Var>, span: Span) -> Result<Stmt, String> {
+    parameterize(panel, Sym::constant(width), vars, span)
+}
+
+/// The same panel transformation with an unresolved original width. Allocation
+/// shapes, preparation indices, padded guards and trip counts all use it.
+pub(crate) fn family(statement: &Stmt, vars: &mut Vec<Var>, width: Sym) -> Result<Option<(Decision, Stmt)>, String> {
+    let Some(panel) = admit(statement, vars) else { return Ok(None); };
+    let decision = Decision { kind: DecisionKind::MatrixPanel { iteration: panel.iteration,
+        iterations: panel.hi - panel.lo, operands: panel.producers.iter().map(|producer| producer.output).collect() },
+        alternatives: crate::lowered_ir::Alternatives::MatrixPanelWidths { maximum: panel.hi - panel.lo } };
+    let implementation = parameterize(panel, width, vars, statement.span)?;
+    Ok(Some((decision, implementation)))
+}
+
+fn parameterize(panel: Panel, width: Sym, vars: &mut Vec<Var>, span: Span) -> Result<Stmt, String> {
     let (outer, outer_index) = index("matrix_panel", vars, span);
     let (inner, inner_index) = index("matrix_panel_item", vars, span);
-    let base = outer_index.scale(width).add(&Sym::constant(panel.lo));
+    let base = outer_index.mul(&width).add(&Sym::constant(panel.lo));
     let mut body = Vec::new();
     let mut replacements = HashMap::new();
     for p in panel.producers {
         let Ty::Tile(mut shape) = vars[p.output].ty.clone() else {
             unreachable!()
         };
-        shape.shape.insert(0, Sym::constant(width));
+        shape.shape.insert(0, width.clone());
         let buffer = vars.len();
         vars.push(Var {
             name: format!("matrix_panel_{}_{buffer}", vars[p.output].name),
@@ -416,7 +433,7 @@ fn materialize(panel: Panel, width: i64, vars: &mut Vec<Var>, span: Span) -> Res
                     id: None,
                     span,
                     kind: StmtKind::If {
-                        cond: condition(outer, slot, width, panel.lo, panel.hi, vars, span),
+                        cond: condition(outer, slot, &width, panel.lo, panel.hi, vars, span),
                         then: definition,
                         els: vec![],
                     },
@@ -449,12 +466,12 @@ fn materialize(panel: Panel, width: i64, vars: &mut Vec<Var>, span: Span) -> Res
         kind: StmtKind::Range {
             var: inner,
             lo: Sym::constant(0),
-            hi: Sym::constant(width),
+            hi: width.clone(),
             body: vec![Stmt {
                 id: None,
                 span,
                 kind: StmtKind::If {
-                    cond: condition(outer, inner, width, panel.lo, panel.hi, vars, span),
+                    cond: condition(outer, inner, &width, panel.lo, panel.hi, vars, span),
                     then: remaining,
                     els: vec![],
                 },
@@ -467,7 +484,7 @@ fn materialize(panel: Panel, width: i64, vars: &mut Vec<Var>, span: Span) -> Res
         kind: StmtKind::Range {
             var: outer,
             lo: Sym::constant(0),
-            hi: Sym::constant((panel.hi - panel.lo + width - 1) / width),
+            hi: Sym::constant(panel.hi - panel.lo - 1).add(&width).quot(&width),
             body,
         },
     })

@@ -86,37 +86,6 @@ pub fn fits(model: &Model, starts: &[Option<u64>]) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Project the same common-order constraint onto interval assignments. A
-/// direction is removed only when some pair of roots cannot satisfy it anywhere
-/// in their intervals. Forced directions then apply to every dynamic visit.
-pub(super) fn interval_edges(
-    model: &Model,
-    starts: &[(u64, u64)],
-) -> Result<Option<Vec<(usize, usize)>>, String> {
-    if starts.len() != model.operations.len() {
-        return Err("static-order interval arity differs from model".into());
-    }
-    let mut result = Vec::new();
-    for constraint in &model.static_orders {
-        let Some(edges) = relations(constraint, |index| starts.get(index).copied())? else {
-            return Ok(None);
-        };
-        if topological(constraint.instructions.len(), &edges).is_none() {
-            return Ok(None);
-        }
-        for visit in &constraint.visits {
-            for &(before, after) in &edges {
-                for &a in &visit.roots[before] {
-                    for &b in &visit.roots[after] {
-                        result.push((a, b));
-                    }
-                }
-            }
-        }
-    }
-    Ok(Some(result))
-}
-
 /// Independently checks the complete timing witness before selecting its common
 /// static orders. Equal-time ties use source index solely for determinism.
 pub fn orders(model: &Model, schedule: &Schedule) -> Result<Vec<BlockOrder>, String> {

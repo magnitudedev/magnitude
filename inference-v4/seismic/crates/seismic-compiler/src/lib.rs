@@ -51,6 +51,15 @@ pub fn scalar_participants_resolved(
     lowered: &LoweredIr, call_conv: CallConv, dispatch: Dispatch,
     participation: seismic_realization::dispatch::Participation,
 ) -> Result<ScalarProgram, String> {
+    scalar_load_template(lowered, call_conv, dispatch, participation, Default::default(), Default::default()).map(|(program, _, _)| program)
+}
+
+pub(crate) fn scalar_load_template(
+    lowered: &LoweredIr, call_conv: CallConv, dispatch: Dispatch,
+    participation: seismic_realization::dispatch::Participation,
+    choices: std::collections::HashMap<seismic_lang::ir::VarId, usize>,
+    source_choices: std::collections::HashMap<seismic_lang::ir::VarId, usize>,
+) -> Result<(ScalarProgram, Vec<template::ParameterLiteral>, Vec<(ir::Inst, ir::Block)>), String> {
     let mut normalized = seismic_lang::reduction::structured::materialize(lowered)?;
     if let seismic_realization::dispatch::Participation::Subgroup { lanes } = participation {
         if lanes != 32 || dispatch != Dispatch::ParallelRoot { return Err("subgroup scalar form requires 32 lanes per parallel work item".into()); }
@@ -80,6 +89,8 @@ pub fn scalar_participants_resolved(
     builder.append_block_params_for_function_params(entry);
     let args = builder.block_params(entry).to_vec();
     let mut emitter = scalar::Emitter::new(lowered, builder, args[0], args[1], args[2], participation)?;
+    emitter.load_choices = choices;
+    emitter.source_choices = source_choices;
     let work_items = match dispatch {
         Dispatch::Sequential => {
             emitter.body(&lowered.body)?;
@@ -90,13 +101,15 @@ pub fn scalar_participants_resolved(
     let success = emitter.builder.ins().iconst(types::I32, 0);
     emitter.builder.ins().return_(&[success]);
     emitter.builder.seal_all_blocks();
-    let (buffers, scalars, scratch_bytes, imports, backend_calls, execution) = (
+    let (buffers, scalars, scratch_bytes, imports, backend_calls, execution, load_literals, choice_joins) = (
         emitter.buffers,
         emitter.scalars,
         emitter.scratch_bytes,
         emitter.imports,
         emitter.backend_calls,
         emitter.execution,
+        emitter.load_literals,
+        emitter.choice_joins,
     );
     emitter.builder.finalize();
     cranelift_codegen::verify_function(
@@ -104,7 +117,7 @@ pub fn scalar_participants_resolved(
         &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
     )
     .map_err(|e| format!("invalid scalar realization: {e}"))?;
-    Ok(ScalarProgram {
+    Ok((ScalarProgram {
         conditions: seismic_realization::InvocationConditions::from_lowered(lowered)?,
         function,
         public_buffer_count: buffers.len(),
@@ -121,7 +134,7 @@ pub fn scalar_participants_resolved(
         dispatch,
         loads,
         execution,
-    })
+    }, load_literals, choice_joins))
 }
 
 /// Lower serial setup and parallel domains through the shared phase plan. Values
@@ -186,3 +199,6 @@ pub fn scalar_sequence_participants_resolved(
 }
 
 pub mod tuner;
+
+/// Typed unresolved scalar ownership and literal substitution.
+pub mod template;

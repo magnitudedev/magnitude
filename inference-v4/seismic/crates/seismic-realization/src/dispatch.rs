@@ -1,6 +1,7 @@
 //! Dispatch and storage declarations shared by accounting and emission. These describe
 //! declared work/storage, not register allocation, occupancy or memory service.
 use seismic_lang::types::DType;
+pub mod geometry;
 
 /// Row-major coordinates assigned to a work item, with explicit tail extents.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,34 +24,19 @@ impl WorkMapping {
         if extents.len() != steps.len() {
             return Err("work mapping needs one step per axis".into());
         }
-        let mut axes = extents
+        let geometry = geometry::mapping(&mut geometry::Concrete, extents, steps)?;
+        let axes = extents
             .iter()
             .zip(steps)
-            .map(|(&extent, &step)| {
-                if step == 0 {
-                    return Err("work mapping step must be positive");
-                }
-                Ok(AxisMapping {
-                    logical_extent: extent,
-                    extent: extent.div_ceil(step),
-                    stride: 0,
-                    step,
-                })
+            .enumerate()
+            .map(|(index, (&logical_extent, &step))| AxisMapping {
+                logical_extent,
+                extent: geometry.counts[index],
+                stride: geometry.strides[index],
+                step,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        // Empty domains contain no coordinates; zero strides are never evaluated.
-        let work_items = if axes.iter().any(|axis| axis.extent == 0) {
-            0
-        } else {
-            let mut stride = 1u64;
-            for axis in axes.iter_mut().rev() {
-                axis.stride = stride;
-                stride = stride
-                    .checked_mul(axis.extent)
-                    .ok_or("work mapping extent product overflow")?;
-            }
-            stride
-        };
+            .collect();
+        let work_items = geometry.work_items;
         Ok(Self { axes, work_items })
     }
     pub fn axes(&self) -> &[AxisMapping] {
@@ -94,13 +80,14 @@ impl GroupDispatch {
         if lanes_per_item == 0 || items_per_group == 0 {
             return Err("dispatch widths must be positive".into());
         }
-        let threads_per_group = lanes_per_item
-            .checked_mul(items_per_group)
-            .ok_or("thread count overflow")?;
-        let groups = work_items.div_ceil(items_per_group);
-        groups
-            .checked_mul(threads_per_group)
-            .ok_or("dispatch lane count overflow")?;
+        let geometry = geometry::dispatch(
+            &mut geometry::Concrete,
+            work_items,
+            lanes_per_item,
+            items_per_group,
+        )?;
+        let threads_per_group = geometry.threads_per_group;
+        let groups = geometry.groups;
         Ok(Self {
             work_items,
             lanes_per_item,
@@ -149,26 +136,22 @@ impl TileDeclaration {
         if dispatch.lanes_per_item == 0 || dispatch.items_per_group == 0 {
             return Err("storage layout requires positive dispatch widths".into());
         }
-        let (private, shared) = match self.placement {
-            TilePlacement::Replicated => (self.capacity.max(1), 0),
-            TilePlacement::Distributed => {
-                (self.capacity.div_ceil(dispatch.lanes_per_item).max(1), 0)
-            }
-            TilePlacement::GroupShared => (0, self.capacity.max(1)),
-        };
-        let width = u64::from(self.dtype.bytes());
+        let layout = geometry::storage(
+            &mut geometry::Concrete,
+            self.capacity,
+            u64::from(self.dtype.bytes()),
+            &self.placement,
+            dispatch.lanes_per_item,
+            dispatch.items_per_group,
+        )?;
         Ok(TileLayout {
-            private_elements_per_lane: private,
-            shared_elements_per_item: shared,
-            private_bytes_per_lane: private
-                .checked_mul(width)
-                .ok_or("private tile byte overflow")?,
-            shared_bytes_per_group: shared
-                .checked_mul(width)
-                .and_then(|n| n.checked_mul(dispatch.items_per_group))
-                .ok_or("shared tile byte overflow")?,
+            private_elements_per_lane: layout.private_elements_per_lane,
+            shared_elements_per_item: layout.shared_elements_per_item,
+            private_bytes_per_lane: layout.private_bytes_per_lane,
+            shared_bytes_per_group: layout.shared_bytes_per_group,
         })
     }
+
     /// Declared array storage. This is not native register bytes or a lifetime peak.
     pub fn bytes(&self, dispatch: &GroupDispatch) -> Result<(u64, u64), String> {
         let layout = self.layout(dispatch)?;

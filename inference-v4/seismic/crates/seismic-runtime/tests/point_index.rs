@@ -1,11 +1,12 @@
 use seismic_lang::{
     interp::{Arg, Interpreter, TensorData},
-    lower::lower,
     program::{compile, SourceFile},
     types::DType,
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 use std::collections::HashMap;
 const SOURCE: &str = "
 fn row_read(x: tensor[3, 4] f32, which: i32, out: tensor[1, 4] f32):
@@ -19,7 +20,7 @@ fn element_read(x: tensor[12] f32, which: i32, out: tensor[1] f32):
     for i in owned(y): y[i] = x[which]
     store(y,out[row:row+1])
 ";
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let program = compile(
         &[SourceFile {
             path: "point.seismic.portable".into(),
@@ -33,8 +34,13 @@ fn exercise(device: Device, candidate: Candidate) {
         ("row_read", 4, 3, vec![3, 4]),
         ("element_read", 1, 12, vec![12]),
     ] {
-        let lowered = lower(&program, name, device.backend(), &HashMap::new()).unwrap();
-        let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: name,
+            shapes: &Default::default(),
+            elements: &Default::default(),
+            options: &Default::default(),
+        };
         let input = device
             .buffer_from(
                 &(0..12)
@@ -43,7 +49,19 @@ fn exercise(device: Device, candidate: Candidate) {
             )
             .unwrap();
         let output = device.buffer(width * 4).unwrap();
+        let mut kernel =
+            automatic_hardware::compile(&device, invocation, &[input.clone(), output.clone()], &[0.0])
+                .unwrap();
         for which in [1, -1, limit, 0, i32::MAX, limit - 1] {
+            if (0..limit).contains(&which) {
+                kernel = automatic_hardware::compile(
+                    &device,
+                    invocation,
+                    &[input.clone(), output.clone()],
+                    &[f64::from(which)],
+                )
+                .unwrap();
+            }
             let result = kernel.execute(&[input.clone(), output.clone()], &[f64::from(which)]);
             let mut interpreter = Interpreter::new(&program);
             let source = interpreter.add_tensor(TensorData::dense(
@@ -93,33 +111,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_point_index() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_point_index() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_point_index() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

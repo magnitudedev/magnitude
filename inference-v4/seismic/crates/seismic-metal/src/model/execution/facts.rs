@@ -12,6 +12,23 @@ fn extremum(a: (i128, i128), b: (i128, i128), maximum: bool) -> (i128, i128) {
     if maximum { (a.0.max(b.0), a.1.max(b.1)) } else { (a.0.min(b.0), a.1.min(b.1)) }
 }
 
+pub(super) fn eager_selection(condition: Values, yes: &Facts, no: &Facts, active: u32) -> Facts {
+    let mut result = Facts::default();
+    for lane in 0..32 {
+        if active & (1 << lane) == 0 { continue; }
+        let selected = match condition[lane] { Some(0) => Some(no), Some(_) => Some(yes), None => None };
+        if let Some(selected) = selected {
+            result.ranges[lane] = selected.ranges[lane];
+            result.affine[lane] = selected.affine[lane].clone();
+        } else {
+            result.ranges[lane] = yes.ranges[lane].zip(no.ranges[lane])
+                .map(|((yl, yh), (nl, nh))| (yl.min(nl), yh.max(nh)));
+            if yes.affine[lane] == no.affine[lane] { result.affine[lane] = yes.affine[lane].clone(); }
+        }
+    }
+    result
+}
+
 fn extremum_affine(a: &affine::Value, b: &affine::Value, maximum: bool) -> Option<affine::Value> {
     let (lo, hi) = a.add(b.scale(-1)?)?.bounds()?;
     if hi <= 0 { Some(if maximum { b } else { a }.clone()) }

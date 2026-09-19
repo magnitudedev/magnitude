@@ -401,7 +401,7 @@ impl Kernel {
             Executable::Cpu(_) => 1,
             Executable::Cuda(sequence) => sequence.phase_count(),
             #[cfg(target_os = "macos")]
-            Executable::Metal { pipeline, .. } => pipeline.emitted.launches.len(),
+            Executable::Metal { pipeline, .. } => pipeline.phase_count(),
         }
     }
     pub fn buffers(&self) -> &[BufferSpec] {

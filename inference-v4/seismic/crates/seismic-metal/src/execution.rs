@@ -28,7 +28,7 @@ pub struct FoldChoice {
     pub wavefront: bool,
     pub root_seed: bool,
 }
-impl seismic_accounting::selection::Choices for FoldChoice {
+impl seismic_accounting::choices::Choices for FoldChoice {
     type Alternative = FoldOwnership;
     fn len(&self) -> usize {
         if self.root_seed { if self.wavefront { 3 } else { 2 } } else if self.wavefront { 5 } else { 3 }
@@ -107,6 +107,28 @@ pub struct Split {
     /// Validate the original runtime domain before narrowing it into slices.
     pub original_views: Vec<Expr>,
     pub validation_bindings: Vec<Stmt>,
+    pub retained: Option<RetainedSplitPhase>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedSplitPhase {
+    pub parts_symbol: String,
+    pub selector: String,
+    /// Scope holding the ordinary widened program. Prefix, stream and merge
+    /// tail precede it and retain their original split identities.
+    pub ordinary_at: usize,
+}
+#[derive(Clone)]
+pub(crate) struct RetainedSplit {
+    pub parts_symbol: String,
+    pub selector: String,
+    pub maximum: i64,
+    pub ordinary: std::collections::BTreeMap<usize, RetainedOrdinary>,
+}
+#[derive(Clone)]
+pub(crate) struct RetainedOrdinary {
+    pub body: Vec<Stmt>,
+    pub aliases: Vec<(VarId, VarId)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,6 +316,10 @@ pub(crate) fn split_domain(function: &LoweredIr) -> Result<u64, String> {
 /// Owns the transformed IR. It cannot be changed independently of its mappings.
 #[derive(Clone)]
 pub struct Execution {
+    pub(crate) implementation: Option<std::sync::Arc<crate::family::layout::Family>>,
+    pub(crate) launch_parameters: Option<std::sync::Arc<Vec<crate::msl::parameters::Launch>>>,
+    pub(crate) numeric_parameters: std::collections::BTreeMap<String, seismic_accounting::algebra::Value>,
+    pub(crate) numeric_definitions: std::collections::BTreeMap<String, Sym>,
     pub(crate) terminal: std::sync::Arc<TerminalImplementation>,
     pub(crate) transfers: Vec<crate::terminal::transfer::Selection>,
     pub(crate) traversals: Vec<crate::terminal::traversal::Selection>,
@@ -311,30 +337,221 @@ pub struct Execution {
     pub(crate) partition_parameters: Vec<(usize, DType)>,
 }
 
-/// Emission and its workload-bound account belong to the same immutable
-/// terminal implementation. Identity refinements retain both; any code or
-/// dispatch change replaces this owner before either result can be reused.
+/// Emission belongs to one immutable terminal implementation. A code or
+/// dispatch change replaces this owner before the result can be reused.
 #[derive(Default)]
 pub(crate) struct TerminalImplementation {
     pub(crate) emission: std::sync::OnceLock<Result<crate::msl::Emitted, String>>,
-    account: RefinementAccountCache,
 }
 
 impl Execution {
+    /// Install the selected coordinates and work counts without repeating IR
+    /// normalization, widening, ownership, reduction or allocation planning.
+    pub(crate) fn install_mappings(&mut self, mappings: &[WorkMapping], values: &[i64]) -> Result<(), String> {
+        if mappings.len() != self.phases.len() { return Err("selected mapping count differs from retained phases".into()); }
+        let read = |value: seismic_accounting::algebra::Value| -> Result<u64, String> {
+            values.get(value.id().0).and_then(|&value| u64::try_from(value).ok())
+                .filter(|&selected| value.bounds().0 <= selected && selected <= value.bounds().1)
+                .ok_or_else(|| "missing or invalid original mapping operand".into())
+        };
+        let mut launch = 0usize;
+        for (phase, mapping) in self.phases.iter_mut().zip(mappings) {
+            let mut selected_work_items = None;
+            let mut selected_merge_items = None;
+            if let Some(parameters) = &self.launch_parameters {
+                let original = parameters.get(launch).ok_or("selected mapping has no original launch definition")?;
+                if original.axes.len() != mapping.axes().len() { return Err("selected mapping rank differs from its original definition".into()); }
+                for (original, selected) in original.axes.iter().zip(mapping.axes()) {
+                    if read(original.extent)? != selected.logical_extent || read(original.step)? != selected.step || read(original.count)? != selected.extent || read(original.stride)? != selected.stride {
+                        return Err("selected mapping disagrees with original symbolic coordinates".into());
+                    }
+                }
+                phase.parts = i64::try_from(read(original.parts)?).map_err(|_| "selected split exceeds integer range")?;
+                if phase.parts <= 0 || (phase.split.is_none() && phase.parts != 1) {
+                    return Err("selected split differs from retained phase topology".into());
+                }
+                selected_work_items = Some(read(original.work_items)?);
+                if phase.merge_dispatch.is_some() {
+                    let merge = parameters.get(launch + 1).ok_or("selected merge has no original launch definition")?;
+                    if read(merge.parts)? != 1 { return Err("selected merge must own one completed item".into()); }
+                    selected_merge_items = Some(read(merge.work_items)?);
+                }
+            } else if phase.mapping.axes().iter().map(|axis| axis.logical_extent)
+                .ne(mapping.axes().iter().map(|axis| axis.logical_extent)) {
+                return Err("selected mapping changed its original logical iteration domain".into());
+            }
+            let maximum_work_items = mapping.work_items().checked_mul(phase.parts as u64).ok_or("selected work domain overflow")?;
+            let work_items = selected_work_items.unwrap_or(maximum_work_items);
+            if work_items != 0 && work_items != maximum_work_items { return Err("selected launch work count differs from its selected coordinates".into()); }
+            phase.mapping = mapping.clone();
+            phase.dispatch = GroupDispatch::new(work_items, phase.dispatch.lanes_per_item, phase.dispatch.items_per_group)?;
+            if let Some(dispatch) = &mut phase.merge_dispatch {
+                let expected = if phase.parts > 1 && work_items != 0 { mapping.work_items() } else { 0 };
+                let merge_items = selected_merge_items.unwrap_or(expected);
+                if merge_items != expected { return Err("selected merge work count differs from its active split domain".into()); }
+                *dispatch = GroupDispatch::new(merge_items, dispatch.lanes_per_item, dispatch.items_per_group)?;
+            }
+            launch += 1 + usize::from(phase.merge_dispatch.is_some());
+        }
+        if self.launch_parameters.as_ref().is_some_and(|parameters| parameters.len() != launch) {
+            return Err("retained launch parameter count differs from selected phases".into());
+        }
+        self.memory = self.memory.redispatch(&self.phases)?;
+        self.invalidate_terminal();
+        Ok(())
+    }
+    /// Install dispatch equations already selected in the shared model. This
+    /// consumes the retained witness directly rather than deriving another
+    /// grouping family from a construction envelope during reconstruction.
+    pub(crate) fn install_dispatches(&mut self, dispatches: &[GroupDispatch]) -> Result<(), String> {
+        let mut index = 0usize;
+        for phase in &mut self.phases {
+            for dispatch in std::iter::once(&mut phase.dispatch).chain(phase.merge_dispatch.iter_mut()) {
+                let selected = dispatches.get(index).ok_or("selected dispatch is missing")?;
+                if selected.work_items != dispatch.work_items
+                    || selected.lanes_per_item != dispatch.lanes_per_item {
+                    return Err("selected dispatch changed retained work ownership".into());
+                }
+                if selected.threads_per_group > self.config.max_threads_per_threadgroup as u64 {
+                    return Err("selected dispatch exceeds target thread capacity".into());
+                }
+                *dispatch = selected.clone();
+                index += 1;
+            }
+        }
+        if index != dispatches.len() { return Err("selected dispatch has no retained launch".into()); }
+        self.config.sg_per_tg = dispatches.first().map_or(Ok(1), |dispatch|
+            i64::try_from(dispatch.items_per_group).map_err(|_| "selected grouping exceeds integer range"))?;
+        self.memory = self.memory.redispatch(&self.phases)?;
+        self.invalidate_terminal();
+        Ok(())
+    }
     pub(crate) fn invalidate_terminal(&mut self) {
         self.terminal = Default::default();
     }
-    pub(crate) fn relaxation(
-        &self,
-        workload: &seismic_accounting::workload::ScalarWorkload,
-        limits: seismic_accounting::workload::DerivationLimits,
-    ) -> Result<std::sync::Arc<crate::model::InvocationAccount>, String> {
-        self.terminal.account.derive(self, workload, limits)
+    /// Instantiate the retained backend computation from the same assignment
+    /// as its terminal program. No lowering, preparation or decision discovery
+    /// runs here; source choice, operation and storage identities are retained.
+    pub(crate) fn install_source(&mut self, source: &LoweredIr, decomposition: &crate::tuning::Decomposition,
+        values: &[i64]) -> Result<(), String> {
+        if source.name != self.function.name || source.backend != self.function.backend {
+            return Err("selected source differs from its retained Metal function".into());
+        }
+        let layout = self.implementation.as_ref().ok_or("selected Metal source has no retained implementation")?;
+        let selection = crate::family::source::Selection::new(&self.function, &self.numeric_parameters, layout, values)?;
+        let mut function = self.function.clone();
+        let mut phases = self.phases.clone();
+        if function.body.len() != phases.len() { return Err("selected source phase count differs from its retained mapping".into()); }
+        for (phase_index, (statement, phase)) in function.body.iter_mut().zip(&mut phases).enumerate() {
+            let StmtKind::Parallel { vars, extents, body } = &mut statement.kind else { return Err("selected Metal phase has no original work domain".into()); };
+            if vars.len() != phase.mapping.axes().len() { return Err("selected Metal phase rank differs from its mapping".into()); }
+            *extents = phase.mapping.axes().iter().map(|axis| i64::try_from(axis.logical_extent).map(Sym::constant)
+                .map_err(|_| "selected Metal work extent exceeds its index type".to_string())).collect::<Result<Vec<_>, _>>()?;
+            let expected_work = if selection.phase_active(phase_index)? {
+                phase.mapping.work_items().checked_mul(u64::try_from(phase.parts).map_err(|_| "selected phase has a negative split count")?)
+                    .ok_or("selected source work count overflow")?
+            } else { 0 };
+            if phase.dispatch.work_items != expected_work { return Err("selected source presence differs from its launch work count".into()); }
+            if phase.dispatch.work_items == 0 {
+                body.clear();
+                phase.split = None;
+                continue;
+            }
+            if let Some(split) = &mut phase.split {
+                if phase.parts != decomposition.split { return Err("selected phase split count differs from its original decomposition".into()); }
+                if let Some(retained) = &split.retained {
+                    if selection.predicate(&retained.selector)? != (phase.parts > 1) {
+                        return Err("selected split topology differs from its original compiler predicate".into());
+                    }
+                }
+                let ordinary_at = split.retained.as_ref().map_or(body.len(), |retained| retained.ordinary_at);
+                if split.loop_at >= ordinary_at || ordinary_at > body.len() { return Err("selected split lost its retained statement boundaries".into()); }
+                if phase.parts == 1 {
+                    if split.retained.is_none() { return Err("ordinary execution lacks its retained split alternative".into()); }
+                    *body = selection.body(&body[ordinary_at..])?;
+                    phase.split = None;
+                } else {
+                    let mut selected = selection.body(&body[..split.loop_at])?;
+                    let loop_at = selected.len();
+                    let stream = selection.body(&body[split.loop_at..=split.loop_at])?;
+                    if stream.len() != 1 || !matches!(stream[0].kind, StmtKind::LoadLoop { .. }) {
+                        return Err("selected split no longer contains its original stream".into());
+                    }
+                    selected.extend(stream);
+                    selected.extend(selection.body(&body[split.loop_at + 1..ordinary_at])?);
+                    *body = selected;
+                    split.loop_at = loop_at;
+                    split.retained = None;
+                    let mut inputs = selection.body(&split.validation_bindings)?;
+                    let validation_count = inputs.len();
+                    inputs.extend(split.original_views.iter().cloned().map(|view| Stmt { id: None, span: view.span, kind: StmtKind::Expr(view) }));
+                    seismic_lang::lowered_ir::specialize_statements(&mut inputs, &selection.parameters);
+                    split.original_views = inputs.split_off(validation_count).into_iter().map(|statement| {
+                        let StmtKind::Expr(view) = statement.kind else { unreachable!() }; view
+                    }).collect();
+                    split.validation_bindings = inputs;
+                }
+            } else { *body = selection.body(body)?; }
+        }
+        function.specialize_parameters(&selection.parameters);
+        if function.params.get(..source.params.len()) != Some(source.params.as_slice()) {
+            return Err("selected Metal function ABI differs from its original source".into());
+        }
+        function.selections = source.selections.clone();
+        function.decisions = source.decisions.clone();
+        function.shapes = source.shapes.clone();
+        self.function = function;
+        self.source = source.clone();
+        self.phases = phases;
+        self.config.split = decomposition.split;
+        self.config.per_item = decomposition.per_item;
+        self.config.tile_piece = decomposition.tile_piece;
+        self.invalidate_terminal();
+        Ok(())
+    }
+    /// Install the specialization of an already accounted typed terminal family.
+    /// Every geometry and backing quantity must match this selected execution.
+    pub(crate) fn install_terminal(&mut self, emitted: crate::msl::Emitted) -> Result<(), String> {
+        let indices = self.phases.iter().map(|phase| phase.split.iter().map(|split| split.part).collect()).collect::<Vec<_>>();
+        seismic_lang::verify::executable_phases(&self.function, &indices)?;
+        let dispatches = self.phases.iter().flat_map(|phase| std::iter::once(&phase.dispatch).chain(phase.merge_dispatch.as_ref())).collect::<Vec<_>>();
+        if emitted.launches.len() != dispatches.len() || emitted.launches.len() != self.memory.launches().len() { return Err("terminal family launch count differs from selected execution".into()); }
+        for ((launch, dispatch), memory) in emitted.launches.iter().zip(dispatches).zip(self.memory.launches()) {
+            if launch.dispatch.as_ref() != Some(dispatch) || launch.threadgroups != dispatch.groups || launch.threads_per_threadgroup != dispatch.threads_per_group
+                || launch.declared_threadgroup_bytes != memory.shared_bytes_per_group
+                || launch.tiles.iter().ne(memory.arrays.iter().map(|array| &array.declaration)) {
+                return Err("terminal family geometry or storage differs from selected execution".into());
+            }
+        }
+        if emitted.scratch.len() != self.memory.scratch().len() || emitted.scratch_bindings.len() != self.memory.scratch().len()
+            || self.memory.scratch().iter().enumerate().any(|(index, allocation)| {
+                emitted.scratch[index] != allocation.bytes || emitted.scratch_bindings[index].bytes != allocation.bytes
+                    || emitted.scratch_bindings[index].alignment != allocation.dtype.bytes() as usize
+            }) {
+            return Err("terminal family scratch ABI differs from selected execution".into());
+        }
+        emitted.terminal.validate_typed()?;
+        self.terminal = std::sync::Arc::new(TerminalImplementation { emission: std::sync::OnceLock::from(Ok(emitted)) });
+        Ok(())
     }
     /// Compare the actual prepared implementation independently of whether its
     /// lazy target emission has already been requested.
     pub(crate) fn same_implementation(&self, other: &Self) -> bool {
-        self.transfers == other.transfers && self.traversals == other.traversals
+        match (&self.implementation, &other.implementation) {
+            (Some(left), Some(right)) if !std::sync::Arc::ptr_eq(left, right) => return false,
+            (None, Some(_)) | (Some(_), None) => return false,
+            _ => {},
+        }
+        match (&self.launch_parameters, &other.launch_parameters) {
+            (Some(left), Some(right)) if !std::sync::Arc::ptr_eq(left, right) => return false,
+            (None, Some(_)) | (Some(_), None) => return false,
+            _ => {},
+        }
+        self.numeric_parameters.len() == other.numeric_parameters.len()
+            && self.numeric_definitions == other.numeric_definitions
+            && self.numeric_parameters.iter().all(|(name, value)| other.numeric_parameters.get(name)
+                .is_some_and(|other| value.id() == other.id() && value.bounds() == other.bounds()))
+            && self.transfers == other.transfers && self.traversals == other.traversals
             && self.function == other.function
             && self.source == other.source
             && self.config == other.config
@@ -558,13 +775,13 @@ pub fn prepare_with_transfers(
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Prepared {
-    function: LoweredIr,
-    source: LoweredIr,
-    config: Config,
-    phases: Vec<Phase>,
-    retained: Vec<seismic_realization::phases::RetainedValue>,
-    partition_parameters: Vec<(usize, DType)>,
-    private_values: Vec<usize>,
+    pub(crate) function: LoweredIr,
+    pub(crate) source: LoweredIr,
+    pub(crate) config: Config,
+    pub(crate) phases: Vec<Phase>,
+    pub(crate) retained: Vec<seismic_realization::phases::RetainedValue>,
+    pub(crate) partition_parameters: Vec<(usize, DType)>,
+    pub(crate) private_values: Vec<usize>,
 }
 
 /// Immutable existing execution boundaries. Later decisions retain their owning
@@ -587,36 +804,44 @@ pub(crate) enum Stage {
     ),
 }
 impl Stage {
-    pub(crate) fn refinement_account(
-        &self,
-        workload: &seismic_accounting::workload::ScalarWorkload,
-        limits: seismic_accounting::workload::DerivationLimits,
-    ) -> Result<Option<std::sync::Arc<crate::model::InvocationAccount>>, String> {
-        let execution = match self {
-            Self::Transfers(prepared) => &prepared.execution,
-            Self::Traversals(prepared) => &prepared.execution,
-            _ => return Ok(None),
+    /// Hand the fold boundary's immutable prepared computation to the retained
+    /// region constructor without repeating initial normalization or work mapping.
+    pub(crate) fn prepared_folds(&self) -> Option<&Prepared> {
+        match self { Self::Folds(prepared) => Some(prepared), _ => None }
+    }
+    /// Local definitions visible at this boundary. Independent folds, loads
+    /// and materializations do not depend on an earlier selected ordinal.
+    pub(crate) fn local_domains(&self) -> Result<Vec<crate::choices::Domain>, String> {
+        use crate::choices::{Decision, Domain};
+        use seismic_accounting::choices::Choices;
+        let definitions = match self {
+            Self::Folds(prepared) => {
+                let roots = seismic_lang::reduction::structured::participants::root_seed_candidates(&prepared.function, SUBGROUP as u32);
+                let waves = seismic_lang::reduction::structured::participants::wavefront_candidates(&prepared.function, SUBGROUP as u32);
+                seismic_lang::reduction::structured::participants::candidates(&prepared.function, SUBGROUP as u32)
+                    .into_iter().map(|site| Decision::Fold(FoldChoice { site, lanes: SUBGROUP as u32,
+                        wavefront: waves.contains(&site), root_seed: roots.contains(&site) })).collect()
+            }
+            Self::Loads(prepared) => seismic_lang::normalize::loads::sites(&prepared.function.body)
+                .into_iter().enumerate().filter(|(_,site)| site.selected.is_none() && site.can_borrow)
+                .map(|(site,definition)| Decision::Load(seismic_lang::normalize::loads::Choice {
+                    site, variable: definition.variable })).collect(),
+            Self::Storage(_) => self.storage_family()?.ok_or("storage stage lost its local family")?
+                .decisions().iter().cloned().map(Decision::Storage).collect(),
+            Self::Transfers(prepared) => prepared.choices.iter().cloned().map(Decision::Transfer).collect(),
+            Self::Traversals(prepared) => prepared.choices.iter().cloned().map(Decision::Traversal).collect(),
+            Self::Reductions(..) | Self::Allocations(..) => Vec::new(),
         };
-        execution.relaxation(workload, limits).map(Some)
+        let definitions = definitions.into_iter().map(|decision| Domain { decision }).collect::<Vec<_>>();
+        if definitions.iter().any(|domain| domain.len() == 0) { return Err("empty retained Metal implementation domain".into()); }
+        Ok(definitions)
     }
-
-    pub(crate) fn preserves(&self, primitive: &crate::terminal::Primitive) -> bool {
-        match self {
-            Self::Transfers(_) => crate::terminal::transfer::preserves(primitive),
-            Self::Traversals(_) => crate::terminal::traversal::preserves(primitive),
-            _ => false,
-        }
-    }
-    pub(crate) fn phases(&self) -> &[Phase] {
-        match self {
-            Self::Traversals(p) => p.execution.phases(),
-            Self::Transfers(p) => p.execution.phases(),
-            Self::Folds(p)
-            | Self::Loads(p)
-            | Self::Storage(p)
-            | Self::Reductions(p, _)
-            | Self::Allocations(p, _, _) => &p.phases,
-        }
+    pub(crate) fn storage_family(&self) -> Result<Option<std::sync::Arc<crate::storage::StorageFamily>>, String> {
+        let Stage::Storage(prepared) = self else { return Ok(None) };
+        let extra = prepared.phases.iter().filter_map(|phase| phase.split.as_ref().map(|split| split.validation_bindings.as_slice())).collect::<Vec<_>>();
+        let mut family = crate::storage::StorageFamily::derive(&prepared.function.vars, &prepared.function.body, &extra)?;
+        family.force_replicated(&prepared.private_values)?;
+        Ok(Some(std::sync::Arc::new(family)))
     }
     pub(crate) fn function(&self) -> &LoweredIr {
         match self {
@@ -646,34 +871,6 @@ pub(crate) struct PreparedTraversals {
     execution: Execution,
     choices: Vec<crate::terminal::traversal::Choice>,
 }
-/// An account belongs to one immutable prepared execution. Complete derivations
-/// survive smaller budgets; an exhausted prefix is recomputed for larger ones.
-/// This memo is deliberately outside execution identity and selection equality.
-#[derive(Default)]
-pub(crate) struct RefinementAccountCache(std::sync::Mutex<Option<RefinementAccount>>);
-impl RefinementAccountCache {
-    pub(crate) fn derive(
-        &self,
-        execution: &Execution,
-        workload: &seismic_accounting::workload::ScalarWorkload,
-        limits: seismic_accounting::workload::DerivationLimits,
-    ) -> Result<std::sync::Arc<crate::model::InvocationAccount>, String> {
-        let mut cache = self.0.lock().map_err(|_| "retained terminal account was poisoned")?;
-        if let Some(cached) = cache.as_ref() {
-            if &cached.workload == workload && (cached.account.exhausted.is_none()
-                || (limits.instructions <= cached.limits.instructions && limits.operations <= cached.limits.operations))
-            { return Ok(cached.account.clone()); }
-        }
-        let account = std::sync::Arc::new(crate::model::invocation_relaxation(execution, workload, limits).map_err(|error| error.to_string())?);
-        *cache = Some(RefinementAccount { workload: workload.clone(), limits, account: account.clone() });
-        Ok(account)
-    }
-}
-struct RefinementAccount {
-    workload: seismic_accounting::workload::ScalarWorkload,
-    limits: seismic_accounting::workload::DerivationLimits,
-    account: std::sync::Arc<crate::model::InvocationAccount>,
-}
 impl std::fmt::Debug for PreparedTraversals {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedTraversals").field("function", &self.execution.function.name).field("choices", &self.choices).finish()
@@ -693,6 +890,31 @@ pub(crate) fn prepare_initial(
     function: &LoweredIr,
     config: Config,
     mappings: Option<&[WorkMapping]>,
+) -> Result<Stage, String> {
+    prepare_with_parameters(function, config, mappings, &Default::default(), &Default::default(), None)
+}
+pub(crate) fn prepare_retained(
+    function: &LoweredIr,
+    config: Config,
+    mappings: &[WorkMapping],
+    parameters: &std::collections::BTreeMap<String, seismic_accounting::algebra::Value>,
+    selectors: &std::collections::BTreeSet<VarId>,
+    retained_split: Option<&RetainedSplit>,
+) -> Result<Stage, String> {
+    let numeric = parameters.iter().map(|(name, value)| {
+        let (minimum, maximum) = value.bounds();
+        Ok((name.clone(), (i64::try_from(minimum).map_err(|_| "Metal parameter minimum exceeds signed range")?,
+            i64::try_from(maximum).map_err(|_| "Metal parameter maximum exceeds signed range")?)))
+    }).collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    prepare_with_parameters(function, config, Some(mappings), &numeric, selectors, retained_split)
+}
+fn prepare_with_parameters(
+    function: &LoweredIr,
+    config: Config,
+    mappings: Option<&[WorkMapping]>,
+    numeric: &std::collections::BTreeMap<String, (i64, i64)>,
+    selectors: &std::collections::BTreeSet<VarId>,
+    retained_split: Option<&RetainedSplit>,
 ) -> Result<Stage, String> {
     if function.backend != "metal" {
         return Err("Metal execution requires Metal Lowered IR".into());
@@ -726,21 +948,23 @@ pub(crate) fn prepare_initial(
         function = partitioned.function;
         partition_parameters = partitioned.parameters;
     }
-    if config.split > 1 {
+    let maximum_parts = retained_split.map_or(config.split, |split| split.maximum);
+    if maximum_parts > 1 && retained_split.is_none() {
         function = seismic_lang::reduction::structured::materialize(&function)?;
     }
-    let phase_plan = seismic_realization::phases::construct(&function)?;
+    let phase_plan = seismic_realization::phases::construct_retained(&function, numeric, selectors)?;
+    let handoffs = phase_plan.handoffs;
     let retained = phase_plan.retained;
     function = phase_plan.function;
     if mappings.is_some_and(|m| m.len() != function.body.len()) {
         return Err("one work mapping is required per normalized phase".into());
     }
-    let splits = if config.split > 1 {
+    let splits = if maximum_parts > 1 {
         seismic_lang::split::split_candidates(&function.body, &function.vars)
     } else {
         Vec::new()
     };
-    if config.split > 1 && splits.is_empty() {
+    if maximum_parts > 1 && splits.is_empty() {
         return Err("requested split has no legal streamed reduction".into());
     }
     let mut split_by_phase = std::collections::HashMap::new();
@@ -782,14 +1006,41 @@ pub(crate) fn prepare_initial(
             span: split.lo.span,
             kind: VarKind::Index(atom.clone()),
         });
-        let loop_at = seismic_lang::split::narrow_range(
-            &split,
-            &mut function.body,
-            &mut function.vars,
-            part,
-            &atom,
-            config.split,
-        )?;
+        let loop_at = if let Some(retained) = retained_split {
+            seismic_lang::split::parameterized::narrow_range(
+                &split,
+                &mut function.body,
+                &mut function.vars,
+                part,
+                &atom,
+                &seismic_lang::sym::Sym::param(&retained.parts_symbol),
+            )?
+        } else {
+            seismic_lang::split::narrow_range(
+                &split,
+                &mut function.body,
+                &mut function.vars,
+                part,
+                &atom,
+                config.split,
+            )?
+        };
+        let retained = if let Some(retained) = retained_split {
+            let ordinary = retained.ordinary.get(&split.stmt).ok_or("split phase has no retained ordinary program")?;
+            let handoff = handoffs.get(split.stmt).ok_or("split phase lost its retained value handoff")?;
+            let mut ordinary_body = ordinary.body.clone();
+            let Some(Stmt { kind: StmtKind::If { then, els, .. }, .. }) = ordinary_body.last_mut() else {
+                return Err("ordinary split alternative lost its compiler guard".into());
+            };
+            if !then.is_empty() { return Err("ordinary split alternative has an unexpected split arm".into()); }
+            let mut completed = seismic_lang::widen::parameterized::remap_bindings(&handoff.restores, &ordinary.aliases);
+            completed.append(els);
+            completed.extend(seismic_lang::widen::parameterized::remap_bindings(&handoff.publications, &ordinary.aliases));
+            *els = completed;
+            let StmtKind::Parallel { body, .. } = &mut function.body[split.stmt].kind else { unreachable!() };
+            let ordinary_at = body.len(); body.extend(ordinary_body);
+            Some(RetainedSplitPhase { parts_symbol: retained.parts_symbol.clone(), selector: retained.selector.clone(), ordinary_at })
+        } else { None };
         split_by_phase.insert(
             split.stmt,
             Split {
@@ -799,6 +1050,7 @@ pub(crate) fn prepare_initial(
                 merges,
                 original_views,
                 validation_bindings: Vec::new(),
+                retained,
             },
         );
     }
@@ -845,7 +1097,7 @@ pub(crate) fn prepare_initial(
         let base_items = i64::try_from(mapping.work_items())
             .map_err(|_| "work item count exceeds signed domain")?;
         let mut split = split_by_phase.remove(&index);
-        let parts = if split.is_some() { config.split } else { 1 };
+        let parts = if split.is_some() { maximum_parts } else { 1 };
         let items = base_items
             .checked_mul(parts)
             .ok_or("split work item count overflow")?;
@@ -884,6 +1136,7 @@ pub(crate) fn prepare_initial(
         let positions = seismic_lang::normalize::bind_values(body, &mut function.vars);
         if let Some(split) = &mut split {
             split.loop_at = positions[split.loop_at];
+            if let Some(retained) = &mut split.retained { retained.ordinary_at = positions[retained.ordinary_at]; }
             for view in &mut split.original_views {
                 split
                     .validation_bindings
@@ -982,7 +1235,7 @@ pub(crate) fn advance(
                 let wavefront = wavefront_sites.contains(&site);
                 let choice = FoldChoice { site, lanes: SUBGROUP as u32, wavefront, root_seed: root_seed_sites.contains(&site) };
                 let selected = select_fold(&choice)?;
-                use seismic_accounting::selection::Choices;
+                use seismic_accounting::choices::Choices;
                 if !(0..choice.len()).any(|i| choice.get(i) == Some(selected)) {
                     return Err("participant ownership is outside this fold's selected tree".into());
                 }
@@ -1012,6 +1265,7 @@ pub(crate) fn advance(
                 let positions = seismic_lang::normalize::lift_owned_reductions(body);
                 if let Some(split) = &mut phase.split {
                     split.loop_at = positions[split.loop_at];
+                    if let Some(retained) = &mut split.retained { retained.ordinary_at = positions[retained.ordinary_at]; }
                 }
             }
             for (root, phase) in function.body.iter_mut().zip(&mut phases) {
@@ -1021,6 +1275,7 @@ pub(crate) fn advance(
                 let positions = seismic_lang::normalize::remove_empty_ranges(body);
                 if let Some(split) = &mut phase.split {
                     split.loop_at = positions[split.loop_at];
+                    if let Some(retained) = &mut split.retained { retained.ordinary_at = positions[retained.ordinary_at]; }
                 }
             }
             Advance::Stage(Stage::Loads(Arc::new(Prepared {
@@ -1140,6 +1395,10 @@ pub(crate) fn advance(
                 select_allocation,
             )?.with_retained(retained, phases)?;
             let execution = Execution {
+                implementation: None,
+                launch_parameters: None,
+                numeric_parameters: Default::default(),
+                numeric_definitions: Default::default(),
                 terminal: Default::default(),
                 transfers: Vec::new(),
                 traversals: Vec::new(),

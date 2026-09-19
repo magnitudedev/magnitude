@@ -3,6 +3,7 @@
 pub mod primitive;
 pub mod participants;
 mod retention;
+pub(crate) use retention::{ElementRetention, StateRetention};
 use crate::{
     ast::AssignOp,
     ir::{Builtin, Expr, ExprKind, Index, Stmt, StmtKind, Var, VarKind},
@@ -672,19 +673,19 @@ impl Reduction {
     }
 }
 
-struct Builder<'a> { vars: &'a mut Vec<Var>, span: Span }
+pub(crate) struct Builder<'a> { pub(crate) vars: &'a mut Vec<Var>, pub(crate) span: Span }
 impl Builder<'_> {
-    fn local(&mut self, ty: Ty) -> Expr {
+    pub(crate) fn local(&mut self, ty: Ty) -> Expr {
         let id = self.vars.len();
         self.vars.push(Var { name: format!("reduction_{id}"), ty: ty.clone(), span: self.span, kind: VarKind::Local });
         Expr { kind: ExprKind::Var(id), ty, sym: None, span: self.span }
     }
-    fn alloc(&mut self, ty: &Ty, body: &mut Vec<Stmt>) -> Expr {
+    pub(crate) fn alloc(&mut self, ty: &Ty, body: &mut Vec<Stmt>) -> Expr {
         let target = self.local(ty.clone());
         body.push(self.allocate(&target));
         target
     }
-    fn snapshot(&mut self, source: &Expr, body: &mut Vec<Stmt>) -> Expr {
+    pub(crate) fn snapshot(&mut self, source: &Expr, body: &mut Vec<Stmt>) -> Expr {
         // A tile value binding evaluates the source view before allocating its
         // snapshot. In particular, dynamic slice extents inherit their capacity
         // and current length from that view instead of an unbound shape atom.
@@ -694,12 +695,12 @@ impl Builder<'_> {
         }, self.span));
         target
     }
-    fn allocate(&self, target: &Expr) -> Stmt {
+    pub(crate) fn allocate(&self, target: &Expr) -> Stmt {
         let Ty::Tile(Shaped { shape, elem, .. }) = &target.ty else { unreachable!() };
         let value = Expr { kind: ExprKind::TileAlloc { shape: shape.clone(), dtype: elem.clone() }, ty: target.ty.clone(), sym: None, span: self.span };
         stmt(StmtKind::Assign { target: target.clone(), op: AssignOp::Assign, value }, self.span)
     }
-    fn index(&mut self) -> Expr {
+    pub(crate) fn index(&mut self) -> Expr {
         let mut index = self.local(Ty::Scalar(DType::I32));
         let ExprKind::Var(id) = index.kind else { unreachable!() };
         let atom = Atom::Param(format!("$reduction_{id}"));
@@ -707,7 +708,7 @@ impl Builder<'_> {
         index.sym = Some(Sym::atom(atom));
         index
     }
-    fn range(&self, index: &Expr, hi: Sym, body: Vec<Stmt>) -> Stmt {
+    pub(crate) fn range(&self, index: &Expr, hi: Sym, body: Vec<Stmt>) -> Stmt {
         let ExprKind::Var(var) = index.kind else { unreachable!() };
         stmt(StmtKind::Range { var, lo: Sym::constant(0), hi, body }, self.span)
     }
@@ -738,7 +739,7 @@ impl Builder<'_> {
         }, self.span));
         Ok(cache)
     }
-    fn copy(&mut self, target: &Expr, value: &Expr) -> Stmt {
+    pub(crate) fn copy(&mut self, target: &Expr, value: &Expr) -> Stmt {
         let shape = target.ty.shaped().unwrap();
         let indices: Vec<_> = shape.shape.iter().map(|_| self.index()).collect();
         let point = |e: &Expr, target: bool| {

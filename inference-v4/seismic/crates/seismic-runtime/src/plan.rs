@@ -219,7 +219,7 @@ pub struct Settings {
     pub hardware: crate::tuner::Hardware,
     pub form: crate::tuner::Form,
     pub derivation_limits: seismic_accounting::workload::DerivationLimits,
-    pub search: seismic_accounting::selection::Budget,
+    pub search: seismic_compiler::tuner::Settings,
 }
 struct Enclosing {
     device: Device,
@@ -330,27 +330,17 @@ impl Enclosing {
                 };
                 let outcome = match previous {
                     Some(progress) => {
-                        crate::tuner::resume(&request, progress, self.settings.search)?
+                        crate::tuner::resume(&request, progress, self.settings.search.limits.clone())?
                     }
-                    None => crate::tuner::tune(&request, self.settings.search)?,
+                    None => crate::tuner::tune(&request, self.settings.search.clone())?,
                 };
                 let selected = match outcome {
                     crate::tuner::Outcome::Optimal(selected) => selected,
                     crate::tuner::Outcome::Incomplete(progress) => {
-                        let unresolved = progress.unresolved();
-                        let exhausted = progress.exhausted_derivations().collect::<Vec<_>>();
-                        let missing = progress.missing_mappings().flat_map(|(_, reasons)| reasons.iter()).collect::<std::collections::BTreeSet<_>>();
-                        let unsupported = progress.unsupported_analyses().collect::<Vec<_>>();
                         let message = format!(
-                            "composition {} tuning incomplete after {} nodes: lower bound {}, feasible upper {:?}; {} choice regions, {} deferred model derivations, {} unfinished schedules, {} models with unavailable resource mappings; missing mappings: {missing:?}; exhausted limits: {exhausted:?}; unsupported analyses: {unsupported:?}",
-                            self.entry,
-                            progress.nodes_visited(),
-                            progress.lower_bound()?,
-                            progress.feasible_upper(),
-                            unresolved.choice_regions,
-                            unresolved.derivations,
-                            unresolved.schedules,
-                            unresolved.unmapped_models
+                            "composition {} tuning incomplete after {} solver work units: lower bound {}, feasible upper {:?}; {:?}",
+                            self.entry, progress.stats().work, progress.lower_bound(),
+                            progress.feasible_upper(), progress.reason()
                         );
                         self.pending.borrow_mut().push((workload, progress));
                         return Err(message);

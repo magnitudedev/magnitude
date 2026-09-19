@@ -221,15 +221,13 @@ pub(crate) fn validate_bindings(
 }
 
 use crate::{DeviceFacts, execution::Execution};
-pub use compiler::Input;
+pub use compiler::{Input, Settings};
+pub use magnitude_solver::{Algorithm, Limits, NeighborhoodOptions};
 use seismic_accounting::{
     execution_model::ScalarHardware,
-    schedule,
-    selection::{self, Objective},
-    workload::{DerivationError, DerivationLimits, ScalarWorkload},
+    workload::{DerivationLimits, ScalarWorkload},
 };
-use seismic_compiler::tuner::{self as compiler, Preparation};
-use seismic_lang::lowered_ir::LoweredIr;
+use seismic_compiler::tuner::{self as compiler, family};
 
 /// Backend input facts. Implementation structure and dependencies remain owned
 /// by the prepared execution; these inputs never supply an alternate program.
@@ -310,17 +308,6 @@ struct Composition {
     device: DeviceFacts,
     implementation: Implementation,
 }
-pub(crate) fn map_preparation<A>(
-    prepared: Preparation<A>,
-    wrap: impl FnOnce(A) -> Execution,
-) -> Preparation<Execution> {
-    match prepared {
-        Preparation::Choice { name, alternatives } => Preparation::Choice { name, alternatives },
-        Preparation::Execution(execution) => Preparation::Execution(wrap(execution)),
-        Preparation::Infeasible(v) => Preparation::Infeasible(v),
-        Preparation::Unresolved(reason) => Preparation::Unresolved(reason),
-    }
-}
 impl compiler::Backend for Composition {
     type Execution = Execution;
     type Conditions = Conditions;
@@ -351,118 +338,14 @@ impl compiler::Backend for Composition {
             Implementation::Metal(b) => b.description(),
         }
     }
-    fn prepare(
-        &self,
-        function: &LoweredIr,
-        path: &[usize],
-    ) -> Result<Preparation<Execution>, String> {
+    fn export(&self, input: Input<'_>, workload: &ScalarWorkload, limits: DerivationLimits)
+        -> Result<family::Export<Execution>, String> {
         Ok(match &self.implementation {
-            Implementation::Cpu(b) => map_preparation(b.prepare(function, path)?, Execution::Cpu),
-            Implementation::Cuda(b) => map_preparation(b.prepare(function, path)?, Execution::Cuda),
+            Implementation::Cpu(backend) => backend.export(input, workload, limits)?.map(Execution::Cpu),
+            Implementation::Cuda(backend) => backend.export(input, workload, limits)?.map(Execution::Cuda),
             #[cfg(target_os = "macos")]
-            Implementation::Metal(b) => {
-                map_preparation(b.prepare(function, path)?, Execution::Metal)
-            }
+            Implementation::Metal(backend) => backend.export(input, workload, limits)?.map(Execution::Metal),
         })
-    }
-    fn refine(
-        &self,
-        alternatives: &selection::Domain,
-        index: usize,
-    ) -> Result<Option<Preparation<Execution>>, String> {
-        match &self.implementation {
-            Implementation::Cpu(b) => Ok(b
-                .refine(alternatives, index)?
-                .map(|p| map_preparation(p, Execution::Cpu))),
-            Implementation::Cuda(b) => Ok(b
-                .refine(alternatives, index)?
-                .map(|p| map_preparation(p, Execution::Cuda))),
-            #[cfg(target_os = "macos")]
-            Implementation::Metal(b) => Ok(b
-                .refine(alternatives, index)?
-                .map(|p| map_preparation(p, Execution::Metal))),
-        }
-    }
-    fn analyze(
-        &self,
-        execution: &Execution,
-        workload: &ScalarWorkload,
-        limits: DerivationLimits,
-    ) -> Result<schedule::evaluation::Model, DerivationError> {
-        match (&self.implementation, execution) {
-            (Implementation::Cpu(b), Execution::Cpu(e)) => b.analyze(e, workload, limits),
-            (Implementation::Cuda(b), Execution::Cuda(e)) => b.analyze(e, workload, limits),
-            #[cfg(target_os = "macos")]
-            (Implementation::Metal(b), Execution::Metal(e)) => b.analyze(e, workload, limits),
-            _ => Err("execution and analysis backend differ".into()),
-        }
-    }
-    fn relax_execution(
-        &self,
-        execution: &Execution,
-        workload: &ScalarWorkload,
-        limits: DerivationLimits,
-    ) -> Result<Option<schedule::Demand>, String> {
-        match (&self.implementation, execution) {
-            (Implementation::Cpu(b), Execution::Cpu(e)) => b.relax_execution(e, workload, limits),
-            (Implementation::Cuda(b), Execution::Cuda(e)) => b.relax_execution(e, workload, limits),
-            #[cfg(target_os = "macos")]
-            (Implementation::Metal(b), Execution::Metal(e)) => b.relax_execution(e, workload, limits),
-            _ => Err("execution and relaxation backend differ".into()),
-        }
-    }
-    fn relax(
-        &self,
-        alternatives: &selection::Domain,
-        indices: std::ops::Range<usize>,
-        workload: &ScalarWorkload,
-        limits: DerivationLimits,
-    ) -> Result<Option<schedule::Demand>, String> {
-        match &self.implementation {
-            Implementation::Cpu(b) => b.relax(alternatives, indices, workload, limits),
-            Implementation::Cuda(b) => b.relax(alternatives, indices, workload, limits),
-            #[cfg(target_os = "macos")]
-            Implementation::Metal(b) => b.relax(alternatives, indices, workload, limits),
-        }
-    }
-    fn materialize(
-        &self,
-        execution: &Execution,
-        objective: &Objective,
-    ) -> Result<Execution, String> {
-        match (&self.implementation, execution) {
-            (Implementation::Cpu(b), Execution::Cpu(e)) => {
-                b.materialize(e, objective).map(Execution::Cpu)
-            }
-            (Implementation::Cuda(b), Execution::Cuda(e)) => {
-                b.materialize(e, objective).map(Execution::Cuda)
-            }
-            #[cfg(target_os = "macos")]
-            (Implementation::Metal(b), Execution::Metal(e)) => {
-                b.materialize(e, objective).map(Execution::Metal)
-            }
-            _ => Err("execution and materialization backend differ".into()),
-        }
-    }
-    fn check_materialization(
-        &self,
-        source: &Execution,
-        selected: &Execution,
-        objective: &Objective,
-    ) -> Result<(), String> {
-        match (&self.implementation, source, selected) {
-            (Implementation::Cpu(b), Execution::Cpu(source), Execution::Cpu(selected)) => {
-                b.check_materialization(source, selected, objective)
-            }
-            (Implementation::Cuda(b), Execution::Cuda(source), Execution::Cuda(selected)) => {
-                b.check_materialization(source, selected, objective)
-            }
-            #[cfg(target_os = "macos")]
-            (Implementation::Metal(b), Execution::Metal(source), Execution::Metal(selected)) => {
-                b.check_materialization(source, selected, objective)
-            }
-            _ => Err("source, selected execution and materialization backend differ".into()),
-        }
     }
 }
 impl Request<'_> {
@@ -508,17 +391,17 @@ impl Request<'_> {
         }
     }
 }
-pub fn tune(request: &Request<'_>, budget: selection::Budget) -> Result<Outcome, String> {
+pub fn tune(request: &Request<'_>, settings: Settings) -> Result<Outcome, String> {
     let backend = request.backend()?;
-    compiler::tune(&request.compiler(&backend), budget)
+    compiler::tune(&request.compiler(&backend), settings)
 }
 pub fn resume(
     request: &Request<'_>,
     progress: Progress,
-    budget: selection::Budget,
+    limits: Limits,
 ) -> Result<Outcome, String> {
     let backend = request.backend()?;
-    compiler::resume(&request.compiler(&backend), progress, budget)
+    compiler::resume(&request.compiler(&backend), progress, limits)
 }
 
 #[cfg(test)]

@@ -4,8 +4,7 @@ use crate::{
     execution::{Execution, Limits},
 };
 use seismic_lang::abi::ScalarParameter;
-use seismic_lang::lowered_ir::LoweredIr;
-use seismic_realization::{BufferSpec, Dispatch, ScalarProgram};
+use seismic_realization::{BufferSpec, ScalarProgram};
 use std::{
     ffi::{c_void, CStr},
     rc::Rc,
@@ -166,51 +165,6 @@ impl Device {
             info,
         })
     }
-    /// Compile one explicit scalar realization. Launch geometry is a supplied
-    /// candidate; this entry point does not pretend to perform automatic tuning.
-    pub fn compile(
-        &self,
-        lowered: &LoweredIr,
-        dispatch: Dispatch,
-        threads_per_block: u32,
-    ) -> Result<Kernel, String> {
-        self.compile_candidate(
-            lowered,
-            seismic_realization::ScalarOptions {
-                dispatch,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block,
-        )
-    }
-    pub fn compile_candidate(
-        &self,
-        lowered: &LoweredIr,
-        options: seismic_realization::ScalarOptions,
-        threads_per_block: u32,
-    ) -> Result<Kernel, String> {
-        if lowered.backend != "cuda" {
-            return Err("CUDA requires a CUDA-lowered function".into());
-        }
-        if threads_per_block == 0 || threads_per_block > self.info.max_threads_per_block {
-            return Err("CUDA block size exceeds device capability".into());
-        }
-        let mut executions=crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?;
-        if executions.len()!=1 {return Err("compile_candidate requires one selected launch; use compile_sequence".into());}
-        self.compile_execution(executions.remove(0))
-    }
-    pub fn compile_sequence(
-        &self,
-        lowered: &LoweredIr,
-        options: seismic_realization::ScalarOptions,
-        threads_per_block: u32,
-    ) -> Result<Sequence, String> {
-        if lowered.backend != "cuda" {
-            return Err("CUDA requires a CUDA-lowered function".into());
-        }
-        let phases=crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?;
-        self.compile_executions(phases)
-    }
     /// Consume the complete selected launch sequence, without re-preparing IR.
     pub fn compile_executions(&self, executions: Vec<Execution>) -> Result<Sequence, String> {
         if executions.is_empty() {
@@ -232,32 +186,6 @@ impl Device {
             .map(|execution| self.compile_execution(execution))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Sequence { phases, public_buffers, internal })
-    }
-    /// Compile exactly the execution path's native code without invocation storage.
-    pub fn compile_artifacts(
-        &self,
-        lowered: &LoweredIr,
-        options: seismic_realization::ScalarOptions,
-        threads_per_block: u32,
-    ) -> Result<Vec<NativeArtifact>, String> {
-        if lowered.backend != "cuda" {
-            return Err("CUDA requires a CUDA-lowered function".into());
-        }
-        crate::tuning::prepare_fixed(lowered,&self.info,options,threads_per_block)?
-            .into_iter().enumerate()
-            .map(|(source_statement, execution)| {
-                let code = self.compile_code(&execution)?;
-                Ok(NativeArtifact {
-                    source_statement,
-                    work_items: execution.program().work_items,
-                    threads_per_block: execution.dispatch().threads_per_group as u32,
-                    blocks: execution.dispatch().groups as u32,
-                    native: code.native,
-                    image: code.image,
-                    ptx: code.source,
-                })
-            })
-            .collect()
     }
     fn execution_limits(&self) -> Limits {
         Limits { max_threads_per_block: self.info.max_threads_per_block, max_grid_x: self.info.max_grid_x }
@@ -379,16 +307,6 @@ struct CompiledCode {
     native: NativeResources,
     source: String,
     image: NativeImage,
-}
-/// A native phase compiled without allocating any invocation buffers.
-pub struct NativeArtifact {
-    pub source_statement: usize,
-    pub work_items: u64,
-    pub threads_per_block: u32,
-    pub blocks: u32,
-    pub native: NativeResources,
-    pub image: NativeImage,
-    pub ptx: String,
 }
 /// Synchronous initial invocation owner. Launch returns only after completion;
 /// all submitted buffers, code and scratch therefore survive every device use.

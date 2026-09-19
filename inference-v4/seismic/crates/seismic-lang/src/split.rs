@@ -9,6 +9,8 @@ use crate::ir::{Expr, ExprKind, Index, Stmt, StmtKind, VarId, VarKind};
 use crate::sym::{Atom, Sym};
 use crate::types::Ty;
 
+pub mod parameterized;
+
 /// A streamed range with carried state requiring a merge proof before splitting.
 #[derive(Clone, Debug)]
 pub struct SplitCandidate {

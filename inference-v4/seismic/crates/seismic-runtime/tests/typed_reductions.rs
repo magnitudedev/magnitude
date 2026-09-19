@@ -1,11 +1,12 @@
 use seismic_lang::{
-    lower::lower,
     program::{compile, SourceFile},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     for (dtype, lo, hi, cases) in [
         (
             "i32",
@@ -80,9 +81,13 @@ fn exercise(device: Device, candidate: Candidate) {
                     expected as f64,
                     "reference {dtype} {operation} {values:?}"
                 );
-                let ir =
-                    lower(&program, "evaluate", device.backend(), &Default::default()).unwrap();
-                let mut kernel = device.compile(&ir, candidate.clone()).unwrap();
+                let invocation = seismic_runtime::tuner::Input::Portable {
+                    program: &program,
+                    entry: "evaluate",
+                    shapes: &Default::default(),
+                    elements: &Default::default(),
+                    options: &Default::default(),
+                };
                 let mut bytes: Vec<u8> = values
                     .iter()
                     .flat_map(|&v| {
@@ -98,6 +103,13 @@ fn exercise(device: Device, candidate: Candidate) {
                 }
                 let input = device.buffer_from(&bytes).unwrap();
                 let output = device.buffer(4).unwrap();
+                let mut kernel = automatic_hardware::compile(
+                    &device,
+                    invocation,
+                    &[input.clone(), output.clone()],
+                    &[],
+                )
+                .unwrap();
                 kernel.execute(&[input, output.clone()], &[]).unwrap();
                 let mut actual = vec![0; if dtype == "bool" { 1 } else { 4 }];
                 output.read(&mut actual).unwrap();
@@ -115,33 +127,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_typed_reductions() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_typed_reductions() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_typed_reductions() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

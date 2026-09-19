@@ -129,14 +129,14 @@ pub(super) fn materialize(
             &symbol(base.add(offset), span),
         );
     }
-    for (&var, &factor) in indices.iter().zip(factors).rev() {
+    for (&var, factor) in indices.iter().zip(factors).rev() {
         body = vec![Stmt {
             id: None,
             span,
             kind: StmtKind::Range {
                 var,
                 lo: Sym::constant(0),
-                hi: Sym::constant(factor),
+                hi: Sym::constant(*factor),
                 body,
             },
         }];

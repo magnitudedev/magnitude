@@ -1610,6 +1610,10 @@ impl<'a> Checker<'a> {
             Some(())
         };
         match b {
+            Builtin::Select => {
+                self.error(span, "value selection is an internal compiler operation");
+                None
+            }
             Builtin::Reshape => {
                 positional(self, args, 2, "reshape")?;
                 let source = self.expr(&args[0].value, None)?;
@@ -2200,6 +2204,7 @@ impl<'a> Checker<'a> {
 
 fn name_of(b: Builtin) -> &'static str {
     match b {
+        Builtin::Select => "select",
         Builtin::Reshape => "reshape",
         Builtin::Load => "load",
         Builtin::Store => "store",

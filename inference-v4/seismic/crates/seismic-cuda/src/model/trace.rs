@@ -1,7 +1,10 @@
 //! Abstract evaluation of terminal PTX, with symbolic allocation addresses.
 //! Unknown data stays unknown, including checked varying integer inputs.
-//! Trace-shaping predicates/addresses must be known.
+//! Runtime trace-shaping predicates and addresses must be established by the
+//! workload domain. Compile-time predicates retain guarded terminal regions.
 use super::*;
+mod family;
+pub(super) use family::{derive as derive_family, cohort};
 use ptx::{
     Address, AddressBase, Binary, Comparison, DataType, Item, Operand, Operation, ParameterRole,
     Space, Unary,
@@ -9,18 +12,34 @@ use ptx::{
 
 pub(super) struct Trace {
     pub events: Vec<Event>,
+    pub guards: Vec<Guard>,
     pub instructions: u64,
     pub external_values: BTreeMap<u64, BTreeMap<u64, u8>>,
     pub external_symbolic: SymbolicMemory,
 }
+pub(super) type Guard = BTreeMap<usize, bool>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Value {
     Bits(u64),
     Pointer(Allocation, Affine),
     Integer(Affine),
+    Choice { parameter: usize, yes: Box<Value>, no: Box<Value> },
     Unknown,
 }
 impl Value {
+    fn select(parameter: usize, yes: Value, no: Value) -> Value {
+        if yes == no { yes } else { Self::Choice { parameter, yes: Box::new(yes), no: Box::new(no) } }
+    }
+    fn resolve(&self, guard: &Guard) -> Value {
+        match self {
+            Self::Choice { parameter, yes, no } => match guard.get(parameter) {
+                Some(true) => yes.resolve(guard), Some(false) => no.resolve(guard),
+                None => Self::select(*parameter, yes.resolve(guard), no.resolve(guard)),
+            },
+            value => value.clone(),
+        }
+    }
     fn bits(&self) -> Result<u64, DerivationError> {
         match self {
             Self::Bits(v) => Ok(*v),
@@ -29,7 +48,7 @@ impl Value {
                     "CUDA trace needs a uniform integer or predicate".into(),
                 )
             }),
-            Self::Unknown => Err(DerivationError::Unsupported(
+            Self::Choice { .. } | Self::Unknown => Err(DerivationError::Unsupported(
                 "CUDA trace needs an input-independent integer or predicate".into(),
             )),
             Self::Pointer(..) => {
@@ -48,18 +67,20 @@ impl Value {
 #[derive(Clone)]
 struct Cell {
     value: Value,
-    writer: Option<usize>,
+    writer: Vec<usize>,
 }
+#[derive(Clone)]
 struct Lane {
     linear: u64,
     thread: u32,
     pc: Option<usize>,
     registers: Vec<Option<Cell>>,
     parameters: Vec<Option<Cell>>,
-    control: usize,
+    control: Vec<usize>,
     status: Option<u32>,
 }
 pub(super) type SymbolicMemory = BTreeMap<u64, BTreeMap<(Affine, u32), Value>>;
+#[derive(Clone)]
 struct Storage {
     bytes: u64,
     alignment: u64,
@@ -67,9 +88,10 @@ struct Storage {
     pointers: BTreeMap<u64, Value>,
     symbolic: BTreeMap<(Affine, u32), Value>,
 }
+#[derive(Clone)]
 struct Memory {
     allocations: BTreeMap<Allocation, Storage>,
-    accesses: Vec<(Access, usize)>,
+    accesses: Vec<(Access, usize, Guard)>,
 }
 
 impl Memory {
@@ -79,8 +101,16 @@ impl Memory {
         hardware: &CudaHardware,
         limits: DerivationLimits,
     ) -> Result<Self, DerivationError> {
+        Self::from_program(execution.program(),execution.storage(),workload,hardware,limits)
+    }
+    fn from_program(
+        program:&seismic_realization::ScalarProgram,
+        storage:&crate::execution::InvocationStorage,
+        workload:&ScalarWorkload,
+        hardware:&CudaHardware,
+        limits:DerivationLimits,
+    )->Result<Self,DerivationError> {
         workload.validate()?;
-        let program = execution.program();
         if workload.identity.is_empty() || workload.buffers.len() != program.buffers.len() {
             return Err("invalid CUDA workload shape".into());
         }
@@ -155,7 +185,7 @@ impl Memory {
         allocations.insert(
             Allocation::BufferTable,
             Storage {
-                bytes: execution.storage().buffer_table_bytes as u64,
+                bytes: storage.buffer_table_bytes as u64,
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers,
@@ -197,7 +227,7 @@ impl Memory {
         allocations.insert(
             Allocation::Scratch,
             Storage {
-                bytes: execution.storage().scratch_bytes as u64,
+                bytes: storage.scratch_bytes as u64,
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers: BTreeMap::new(),
@@ -207,7 +237,7 @@ impl Memory {
         allocations.insert(
             Allocation::Statuses,
             Storage {
-                bytes: execution.storage().status_bytes as u64,
+                bytes: storage.status_bytes as u64,
                 alignment: hardware.internal_alignment,
                 known: BTreeMap::new(),
                 pointers: BTreeMap::new(),
@@ -278,9 +308,10 @@ impl Memory {
             write,
         })
     }
-    fn dependencies(&self, access: &Access) -> Result<Vec<usize>, DerivationError> {
+    fn dependencies(&self, access: &Access, guard: &Guard) -> Result<Vec<usize>, DerivationError> {
         let mut dependencies = Vec::new();
-        for (prior, event) in &self.accesses {
+        for (prior, event, before) in &self.accesses {
+            if before.iter().any(|(parameter, value)| guard.get(parameter).is_some_and(|other| other != value)) { continue; }
             if access.allocation != prior.allocation || !(access.write || prior.write) {
                 continue;
             }
@@ -412,352 +443,7 @@ pub(super) fn derive(
     limits: DerivationLimits,
     inherited: &SymbolicMemory,
 ) -> Result<Trace, DerivationError> {
-    let plan = execution.target_plan();
-    let d = execution.dispatch();
-    let state_size = plan
-        .registers()
-        .len()
-        .checked_add(plan.parameters().len())
-        .and_then(|n| n.checked_mul(hardware.warp_width as usize))
-        .ok_or("CUDA trace state overflow")?;
-    if state_size as u64 > limits.instructions || d.dispatched_lanes() > limits.instructions {
-        return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
-            limits.instructions,
-        )));
-    }
-    if plan.body().len() > limits.operations {
-        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
-            limits.operations,
-        )));
-    }
-    let labels = plan
-        .body()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, item)| {
-            if let Item::Label(l) = item {
-                Some((*l, i))
-            } else {
-                None
-            }
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut memory = Memory::new(execution, workload, hardware, limits)?;
-    for (&allocation, values) in inherited {
-        memory
-            .allocations
-            .get_mut(&Allocation::External(allocation))
-            .ok_or("CUDA retained symbolic storage is missing")?
-            .symbolic
-            .extend(values.clone());
-    }
-    let mut events = Vec::new();
-    let launch = lifecycle(
-        &mut events,
-        Lifecycle::Launch,
-        None,
-        None,
-        Vec::new(),
-        limits,
-    )?;
-    let mut block_ends = Vec::new();
-    let mut instructions = 0u64;
-    let warps = d.threads_per_group.div_ceil(u64::from(hardware.warp_width));
-    for block in 0..d.groups {
-        let admission = lifecycle(
-            &mut events,
-            Lifecycle::BlockAdmission,
-            Some(block),
-            None,
-            vec![launch],
-            limits,
-        )?;
-        let mut warp_ends = Vec::new();
-        for local_warp in 0..warps {
-            let warp = block
-                .checked_mul(warps)
-                .and_then(|n| n.checked_add(local_warp))
-                .ok_or("warp index overflow")?;
-            let start = lifecycle(
-                &mut events,
-                Lifecycle::WarpStart,
-                Some(block),
-                Some(warp),
-                vec![admission],
-                limits,
-            )?;
-            let first = local_warp * u64::from(hardware.warp_width);
-            let last = (first + u64::from(hardware.warp_width)).min(d.threads_per_group);
-            let mut lanes = Vec::new();
-            for thread in first..last {
-                let linear = block * d.threads_per_group + thread;
-                let mut parameters = Vec::new();
-                for parameter in plan.parameters() {
-                    let value = match parameter.role {
-                        ParameterRole::Buffers => {
-                            Some(Value::Pointer(Allocation::BufferTable, 0u64.into()))
-                        }
-                        ParameterRole::Scalars => {
-                            Some(Value::Pointer(Allocation::Scalars, 0u64.into()))
-                        }
-                        ParameterRole::Scratch => {
-                            Some(Value::Pointer(Allocation::Scratch, 0u64.into()))
-                        }
-                        ParameterRole::Statuses => {
-                            Some(Value::Pointer(Allocation::Statuses, 0u64.into()))
-                        }
-                        ParameterRole::CallArgument(_) | ParameterRole::CallResult(_) => None,
-                    };
-                    parameters.push(value.map(|value| Cell {
-                        value,
-                        writer: None,
-                    }));
-                }
-                lanes.push(Lane {
-                    linear,
-                    thread: thread as u32,
-                    pc: Some(next(plan, 0)?),
-                    registers: vec![None; plan.registers().len()],
-                    parameters,
-                    control: start,
-                    status: None,
-                });
-            }
-            let mut previous = start;
-            let mut warp_events = Vec::new();
-            while let Some(pc) = lanes.iter().filter_map(|l| l.pc).min() {
-                let Item::Instruction(instruction) = &plan.body()[pc] else {
-                    unreachable!()
-                };
-                let cohort = lanes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, l)| (l.pc == Some(pc)).then_some(i))
-                    .collect::<Vec<_>>();
-                instructions = instructions
-                    .checked_add(cohort.len() as u64)
-                    .ok_or("CUDA instruction count overflow")?;
-                if instructions > limits.instructions {
-                    return Err(DerivationError::Exhausted(DerivationLimit::Instructions(
-                        limits.instructions,
-                    )));
-                }
-                if events.len() >= limits.operations {
-                    return Err(DerivationError::Exhausted(DerivationLimit::Operations(
-                        limits.operations,
-                    )));
-                }
-                let event_id = events.len();
-                let mut event = Event {
-                    requirement: Requirement::Instruction(instruction.operation.primitive()),
-                    block: Some(block),
-                    warp: Some(warp),
-                    position: Some(pc),
-                    origin: Some(instruction.origin),
-                    issued_lanes: Vec::new(),
-                    active_lanes: Vec::new(),
-                    accesses: Vec::new(),
-                    predecessors: Vec::new(),
-                    start_predecessors: vec![previous],
-                };
-                let mut active = Vec::new();
-                for &i in &cohort {
-                    let lane = &lanes[i];
-                    event.issued_lanes.push(lane.thread - first as u32);
-                    event.predecessors.push(lane.control);
-                    let enabled = if let Some(p) = instruction.predicate {
-                        let cell = lane.registers[p.register.0]
-                            .as_ref()
-                            .ok_or("undefined PTX predicate")?;
-                        event.predecessors.extend(cell.writer);
-                        cell.value.predicate()? != p.inverted
-                    } else {
-                        true
-                    };
-                    if enabled {
-                        active.push(i);
-                        event.active_lanes.push(lane.thread - first as u32);
-                    }
-                }
-                // A call's body is a separate, explicitly complete opaque-body event.
-                // Its memory/private/control internals are conditions of its mapping,
-                // not omitted or charged as one primitive by the trace.
-                let body_id = matches!(instruction.operation, Operation::Call { .. })
-                    .then_some(event_id + 1)
-                    .filter(|_| !active.is_empty());
-                let exchange = if let Operation::Shuffle {
-                    mode,
-                    source,
-                    lane: source_lane,
-                    ..
-                } = instruction.operation
-                {
-                    if active.len() != 32 || lanes.len() != 32 {
-                        return Err(
-                            "CUDA collective reaches an incomplete or divergent participant group"
-                                .into(),
-                        );
-                    }
-                    let mut values = Vec::with_capacity(32);
-                    for &i in &active {
-                        let source_lane =
-                            operand(source_lane, &lanes[i], block, d.threads_per_group)?.bits()?;
-                        if source_lane >= 32 {
-                            return Err("shuffle source lane exceeds its participant group".into());
-                        }
-                        let from = match mode {
-                            ptx::ShuffleMode::Butterfly => i ^ (source_lane as usize),
-                            ptx::ShuffleMode::Index => source_lane as usize,
-                        };
-                        let cell = lanes[from].registers[source.0]
-                            .as_ref()
-                            .ok_or("shuffle sources an undefined register")?;
-                        event.predecessors.extend(cell.writer);
-                        values.push(cell.value.clone());
-                    }
-                    Some(values)
-                } else {
-                    None
-                };
-                for &i in &active {
-                    let lane = &mut lanes[i];
-                    let effects = instruction.effects();
-                    for r in effects
-                        .register_reads
-                        .iter()
-                        .chain(&effects.register_writes)
-                    {
-                        if let Some(cell) = &lane.registers[r.0] {
-                            event.predecessors.extend(cell.writer);
-                        } else if effects.register_reads.contains(r) {
-                            return Err("PTX reads an undefined register".into());
-                        }
-                    }
-                    for p in effects
-                        .parameter_reads
-                        .iter()
-                        .chain(&effects.parameter_writes)
-                    {
-                        if let Some(cell) = &lane.parameters[p.0] {
-                            event.predecessors.extend(cell.writer);
-                        } else if effects.parameter_reads.contains(p) {
-                            return Err("PTX reads an undefined call parameter".into());
-                        }
-                    }
-                    if let (Some(values), Operation::Shuffle { destination, .. }) =
-                        (&exchange, &instruction.operation)
-                    {
-                        lane.registers[destination.0] = Some(Cell {
-                            value: values[i].clone(),
-                            writer: Some(event_id),
-                        });
-                        lane.pc = Some(next(plan, pc + 1)?);
-                        continue;
-                    }
-                    execute(
-                        instruction,
-                        lane,
-                        block,
-                        d.threads_per_group,
-                        plan,
-                        &labels,
-                        &mut memory,
-                        &mut event,
-                        event_id,
-                        body_id,
-                    )?;
-                }
-                for &i in &cohort {
-                    if !active.contains(&i) {
-                        lanes[i].pc = Some(next(plan, pc + 1)?);
-                    }
-                }
-                event.predecessors.sort_unstable();
-                event.predecessors.dedup();
-                for access in &event.accesses {
-                    memory.accesses.push((access.clone(), event_id));
-                }
-                events.push(event);
-                warp_events.push(event_id);
-                previous = event_id;
-                if let Some(body_id) = body_id {
-                    if events.len() >= limits.operations {
-                        return Err(DerivationError::Exhausted(DerivationLimit::Operations(
-                            limits.operations,
-                        )));
-                    }
-                    let Operation::Call { function, .. } = instruction.operation else {
-                        unreachable!()
-                    };
-                    let call = &events[event_id];
-                    let body = Event {
-                        requirement: Requirement::WholeBody(ptx::Helper::for_function(function)),
-                        block: Some(block),
-                        warp: Some(warp),
-                        position: Some(pc),
-                        origin: Some(instruction.origin),
-                        issued_lanes: call.active_lanes.clone(),
-                        active_lanes: call.active_lanes.clone(),
-                        accesses: Vec::new(),
-                        predecessors: vec![event_id],
-                        start_predecessors: vec![event_id],
-                    };
-                    events.push(body);
-                    warp_events.push(body_id);
-                    previous = body_id;
-                }
-            }
-            for lane in &lanes {
-                if lane.linear < d.participating_lanes() && lane.status != Some(0) {
-                    return Err("CUDA trace returns without successful invocation status".into());
-                }
-                if lane.linear >= d.participating_lanes() && lane.status.is_some() {
-                    return Err("padded CUDA lane wrote invocation status".into());
-                }
-            }
-            warp_ends.push(lifecycle(
-                &mut events,
-                Lifecycle::WarpCompletion,
-                Some(block),
-                Some(warp),
-                warp_events,
-                limits,
-            )?);
-        }
-        block_ends.push(lifecycle(
-            &mut events,
-            Lifecycle::BlockCompletion,
-            Some(block),
-            None,
-            warp_ends,
-            limits,
-        )?);
-    }
-    if block_ends.is_empty() {
-        block_ends.push(launch);
-    }
-    lifecycle(
-        &mut events,
-        Lifecycle::Completion,
-        None,
-        None,
-        block_ends,
-        limits,
-    )?;
-    let mut external_values = BTreeMap::new();
-    let mut external_symbolic = BTreeMap::new();
-    for (allocation, storage) in memory.allocations {
-        if let Allocation::External(id) = allocation {
-            external_values.insert(id, storage.known);
-            external_symbolic.insert(id, storage.symbolic);
-        }
-    }
-    Ok(Trace {
-        events,
-        instructions,
-        external_values,
-        external_symbolic,
-    })
+    derive_family(execution, hardware, workload, limits, inherited, &BTreeMap::new(), &BTreeMap::new())
 }
 
 fn operand(op: Operand, lane: &Lane, block: u64, width: u64) -> Result<Value, DerivationError> {
@@ -788,7 +474,7 @@ fn address(a: Address, lane: &Lane) -> Result<Value, DerivationError> {
         .value;
     let (allocation, offset) = match value {
         Value::Pointer(allocation, offset) => (allocation, offset),
-        Value::Unknown => {
+        Value::Choice { .. } | Value::Unknown => {
             return Err(DerivationError::Unsupported(
                 "CUDA trace needs an input-independent memory address".into(),
             ));
@@ -827,6 +513,7 @@ fn execute(
     event: &mut Event,
     event_id: usize,
     body_id: Option<usize>,
+    guard: &Guard,
 ) -> Result<(), DerivationError> {
     let pc = lane.pc.unwrap();
     let mut destination = None;
@@ -896,23 +583,8 @@ fn execute(
             ..
         } => {
             destination = Some(d);
-            value = match &lane.registers[predicate.0]
-                .as_ref()
-                .ok_or("undefined select predicate")?
-                .value
-            {
-                Value::Unknown => Value::Unknown,
-                p => operand(
-                    if p.predicate()? {
-                        when_true
-                    } else {
-                        when_false
-                    },
-                    lane,
-                    block,
-                    width,
-                )?,
-            };
+            let predicate = &lane.registers[predicate.0].as_ref().ok_or("undefined select predicate")?.value;
+            value = select(predicate, operand(when_true,lane,block,width)?, operand(when_false,lane,block,width)?)?;
         }
         Operation::Shuffle { .. } => return Err("shuffle needs participant-wide evaluation".into()),
         Operation::Fma { destination: d, .. } => {
@@ -947,7 +619,7 @@ fn execute(
                     lane.linear,
                     false,
                 )?;
-                event.predecessors.extend(memory.dependencies(&a)?);
+                event.predecessors.extend(memory.dependencies(&a, guard)?);
                 value = memory.load(&a);
                 event.accesses.push(a);
             }
@@ -969,7 +641,7 @@ fn execute(
                 }
                 lane.parameters[p.0] = Some(Cell {
                     value,
-                    writer: Some(event_id),
+                    writer: vec![event_id],
                 });
                 event
                     .accesses
@@ -991,7 +663,7 @@ fn execute(
                     lane.status =
                         Some(u32::try_from(value.bits()?).map_err(|_| "invalid CUDA status")?);
                 }
-                event.predecessors.extend(memory.dependencies(&a)?);
+                event.predecessors.extend(memory.dependencies(&a, guard)?);
                 // Also check other lanes of this same instruction before mutation.
                 for prior in &event.accesses {
                     if prior.lane == a.lane || prior.allocation != a.allocation {
@@ -1020,7 +692,7 @@ fn execute(
                 plan,
                 *labels.get(&target).ok_or("unknown PTX branch label")?,
             )?);
-            lane.control = event_id;
+            lane.control = vec![event_id];
             advance = false;
         }
         Operation::Return => {
@@ -1031,15 +703,15 @@ fn execute(
             let ready = body_id.ok_or("active call missing helper body")?;
             lane.parameters[result.0] = Some(Cell {
                 value: Value::Unknown,
-                writer: Some(ready),
+                writer: vec![ready],
             });
-            lane.control = ready;
+            lane.control = vec![ready];
         }
     }
     if let Some(d) = destination {
         lane.registers[d.0] = Some(Cell {
             value,
-            writer: Some(event_id),
+            writer: vec![event_id],
         });
     }
     if advance {
@@ -1049,9 +721,22 @@ fn execute(
         instruction.operation,
         Operation::Branch { .. } | Operation::Return
     ) {
-        lane.control = event_id;
+        lane.control = vec![event_id];
     }
     Ok(())
+}
+
+fn select(predicate: &Value, yes: Value, no: Value) -> Result<Value, DerivationError> {
+    if yes==no {return Ok(yes);}
+    match predicate {
+        Value::Unknown=>Ok(Value::Unknown),
+        Value::Choice {parameter,yes:a,no:b}=>{
+            let yes_guard=Guard::from([(*parameter,true)]);
+            let no_guard=Guard::from([(*parameter,false)]);
+            Ok(Value::select(*parameter,select(a,yes.resolve(&yes_guard),no.resolve(&yes_guard))?,select(b,yes.resolve(&no_guard),no.resolve(&no_guard))?))
+        },
+        value=>Ok(if value.predicate()? {yes} else {no}),
+    }
 }
 
 fn mask(t: DataType) -> u64 {
@@ -1072,6 +757,9 @@ fn is_signed(t: DataType) -> bool {
     matches!(t, DataType::S32 | DataType::S64)
 }
 fn truncate(v: Value, t: DataType) -> Value {
+    if let Value::Choice { parameter, yes, no } = v {
+        return Value::select(parameter, truncate(*yes, t), truncate(*no, t));
+    }
     match v {
         Value::Bits(v) => Value::Bits(v & mask(t)),
         p @ Value::Pointer(..) if t.bits() == 64 => p,
@@ -1171,6 +859,9 @@ fn symbolic_binary(op: Binary, t: DataType, a: &Value, b: &Value) -> Option<Affi
     result.interpreted(bits, is_signed(t))
 }
 fn unary(op: Unary, t: DataType, a: Value) -> Result<Value, DerivationError> {
+    if let Value::Choice { parameter, yes, no } = a {
+        return Ok(Value::select(parameter, unary(op,t,*yes)?, unary(op,t,*no)?));
+    }
     if op == Unary::Move {
         return Ok(truncate(a, t));
     }
@@ -1206,6 +897,14 @@ fn unary(op: Unary, t: DataType, a: Value) -> Result<Value, DerivationError> {
     })
 }
 fn binary(op: Binary, t: DataType, a: Value, b: Value) -> Result<Value, DerivationError> {
+    if let Value::Choice { parameter, yes, no } = a {
+        let mut yes_guard = Guard::new(); yes_guard.insert(parameter, true);
+        let mut no_guard = Guard::new(); no_guard.insert(parameter, false);
+        return Ok(Value::select(parameter, binary(op,t,*yes,b.resolve(&yes_guard))?, binary(op,t,*no,b.resolve(&no_guard))?));
+    }
+    if let Value::Choice { parameter, yes, no } = b {
+        return Ok(Value::select(parameter, binary(op,t,a.clone(),*yes)?, binary(op,t,a,*no)?));
+    }
     if let Value::Pointer(allocation, offset) = &a {
         if t.bits() == 64 && matches!(op, Binary::Add | Binary::Subtract) {
             let delta = integer(&b, DataType::S64).ok_or_else(|| {
@@ -1345,6 +1044,9 @@ mod tests {
     }
 }
 fn convert(to: DataType, from: DataType, value: Value) -> Result<Value, DerivationError> {
+    if let Value::Choice { parameter, yes, no } = value {
+        return Ok(Value::select(parameter, convert(to,from,*yes)?, convert(to,from,*no)?));
+    }
     if matches!(value, Value::Integer(_)) {
         return Ok(affine_value(integer(&value, from).and_then(|v| {
             if to == DataType::F32 {
@@ -1369,6 +1071,14 @@ fn convert(to: DataType, from: DataType, value: Value) -> Result<Value, Derivati
     ))
 }
 fn compare(c: Comparison, t: DataType, a: Value, b: Value) -> Result<Value, DerivationError> {
+    if let Value::Choice { parameter, yes, no } = a {
+        let mut yes_guard = Guard::new(); yes_guard.insert(parameter, true);
+        let mut no_guard = Guard::new(); no_guard.insert(parameter, false);
+        return Ok(Value::select(parameter, compare(c,t,*yes,b.resolve(&yes_guard))?, compare(c,t,*no,b.resolve(&no_guard))?));
+    }
+    if let Value::Choice { parameter, yes, no } = b {
+        return Ok(Value::select(parameter, compare(c,t,a.clone(),*yes)?, compare(c,t,a,*no)?));
+    }
     if matches!(a, Value::Integer(_)) || matches!(b, Value::Integer(_)) {
         let result = (|| {
             let (lo, hi) = integer(&a, t)?.sub(&integer(&b, t)?)?.bounds()?;

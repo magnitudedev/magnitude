@@ -34,3 +34,24 @@ impl ModelRelationship {
 pub enum NativeRelationship {
     Unestablished,
 }
+
+/// Which part of a scheduling assignment becomes executable code. Timing under
+/// a resource model is distinct from a compiler-controlled instruction order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstructionOrder {
+    FixedByRealization,
+    MaterializedFromWitness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimingSemantics {
+    /// Minimum feasible interleaving under the bound model; it does not assert
+    /// that the compiler controls hardware issue, placement or cache behavior.
+    IdealResourceFeasible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduleInterpretation {
+    pub instruction_order: InstructionOrder,
+    pub timing: TimingSemantics,
+}

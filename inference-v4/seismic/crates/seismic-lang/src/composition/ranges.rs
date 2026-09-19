@@ -56,7 +56,7 @@ pub(super) fn select(
 }
 
 type Joined = (Sym, Sym, Vec<Stmt>, Vec<(Atom, Sym)>);
-fn join(body: &[Stmt], vars: &[Var], first: usize, second: usize) -> Option<Joined> {
+pub(super) fn join(body: &[Stmt], vars: &[Var], first: usize, second: usize) -> Option<Joined> {
     let (
         StmtKind::Range {
             var: a,

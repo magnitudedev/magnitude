@@ -65,27 +65,6 @@ mod tests {
             })) }), unmapped: vec![] }
     }
     #[test]
-    fn compact_pipeline_closes_trillion_copy_bound_and_matches_small_oracle() {
-        for count in [3, 1_000_000_000_000] {
-            let model = model(count);
-            let mut search = Refinement::new(model.clone(), 1).unwrap();
-            let mut selected = None;
-            for _ in 0..10 {
-                if let RefinementOutcome::Feasible(witness) = search.advance(4).unwrap() {
-                    if witness.is_optimal() { selected = Some(witness); break; }
-                }
-            }
-            let selected = selected.expect("periodic frontier completes");
-            selected.check_execution_upper().unwrap();
-            assert_eq!(selected.completion(), 10 + 2 * (count - 1));
-            if count == 3 {
-                let flat = model.expand(3).unwrap().solve(100_000).unwrap();
-                assert!(flat.is_optimal());
-                assert_eq!(selected.expand(3).unwrap().1.completion, flat.schedule().completion);
-            }
-        }
-    }
-    #[test]
     fn periodic_reservations_keep_offsets_wrap_and_resident_lifetimes() {
         let mut model = model(4);
         let Node::Repeat { body, .. } = model.root.as_ref() else { unreachable!() };

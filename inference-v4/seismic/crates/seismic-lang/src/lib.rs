@@ -10,6 +10,7 @@ pub mod check;
 pub mod ir;
 pub mod interp;
 pub mod lower;
+pub use lower::family;
 pub mod lowered_ir;
 pub mod intrinsics;
 pub mod lexer;

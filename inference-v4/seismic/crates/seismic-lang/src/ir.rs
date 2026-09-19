@@ -154,6 +154,10 @@ pub enum Index {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
+    /// Compiler-internal scalar selection. All three arguments are evaluated;
+    /// a true condition returns the second value, otherwise the third value.
+    /// This is not source control flow and is deliberately absent from names.
+    Select,
     Reshape,
     Load,
     Store,

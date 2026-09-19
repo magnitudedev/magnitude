@@ -746,6 +746,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "magnitude-solver"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "magnitude-solver-lab"
+version = "0.1.0"
+dependencies = [
+ "magnitude-solver",
+ "seismic-compiler",
+ "seismic-lang",
+ "seismic-std",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "magnitude-templates"
 version = "0.1.0"
 dependencies = [
@@ -1091,6 +1111,7 @@ name = "seismic-accounting"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
+ "magnitude-solver",
  "seismic-lang",
  "seismic-realization",
  "serde",
@@ -1117,6 +1138,7 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
+ "magnitude-solver",
  "seismic-accounting",
  "seismic-lang",
  "seismic-realization",
@@ -1130,6 +1152,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "magnitude-solver",
  "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
@@ -1142,6 +1165,7 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "libloading",
+ "magnitude-solver",
  "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
@@ -1183,6 +1207,7 @@ dependencies = [
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
+ "magnitude-solver",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -1205,6 +1230,7 @@ dependencies = [
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
+ "magnitude-solver",
  "seismic-accounting",
  "seismic-compiler",
  "seismic-cpu",

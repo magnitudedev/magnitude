@@ -9,9 +9,11 @@ use seismic_lang::{
     types::{DType, Elem},
     Scope,
 };
-use seismic_runtime::{Candidate, Device};
+use seismic_runtime::Device;
+#[path = "support/automatic_hardware.rs"]
+mod automatic_hardware;
 use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(device: Device) {
     let text = "fn local[N](x: tensor[N] ACTIVATION, out: tensor[N] f32):\n  a = load(x)\n  compact = tile[N] ACTIVATION\n  for i in owned(compact): compact[i] = f32(a[i]) * 1.003\n  y = tile[N] f32\n  for i in owned(y): y[i] = f32(compact[i]) * 1031.0\n  store(y, out)\nfn wrapper[N](x: tensor[N] INPUT, out: tensor[N] f32):\n  local(x,out)\n";
     let program = compile(
         &[SourceFile {
@@ -59,26 +61,35 @@ fn exercise(device: Device, candidate: Candidate) {
         let mut candidate_count = 0;
         for attempt in space.by_ref() {
             let lowered = attempt.result.unwrap();
+            seismic_lang::verify::lowered(&lowered, seismic_lang::verify::Stage::Expanded).unwrap();
             candidate_count += 1;
-            let mut kernel = device.compile(&lowered, candidate.clone()).unwrap();
-            let inputbytes = input
-                .iter()
-                .flat_map(|v| {
-                    if dtype == DType::BF16 {
-                        ((v.to_bits() >> 16) as u16).to_le_bytes()
-                    } else {
-                        f16_bits(*v).to_le_bytes()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let x = device.buffer_from(&inputbytes).unwrap();
-            let out = device.buffer(16).unwrap();
-            kernel.execute(&[x, out.clone()], &[]).unwrap();
-            let mut bytes = [0; 16];
-            out.read(&mut bytes).unwrap();
-            for (b, e) in bytes.chunks_exact(4).zip(expected) {
-                assert_eq!(f32::from_le_bytes(b.try_into().unwrap()), e);
-            }
+        }
+        let invocation = seismic_runtime::tuner::Input::Portable {
+            program: &program,
+            entry: "local",
+            shapes: &shapes,
+            elements: &elements,
+            options: &options,
+        };
+        let inputbytes = input
+            .iter()
+            .flat_map(|v| {
+                if dtype == DType::BF16 {
+                    ((v.to_bits() >> 16) as u16).to_le_bytes()
+                } else {
+                    f16_bits(*v).to_le_bytes()
+                }
+            })
+            .collect::<Vec<_>>();
+        let x = device.buffer_from(&inputbytes).unwrap();
+        let out = device.buffer(16).unwrap();
+        let mut kernel =
+            automatic_hardware::compile(&device, invocation, &[x.clone(), out.clone()], &[]).unwrap();
+        kernel.execute(&[x, out.clone()], &[]).unwrap();
+        let mut bytes = [0; 16];
+        out.read(&mut bytes).unwrap();
+        for (b, e) in bytes.chunks_exact(4).zip(expected) {
+            assert_eq!(f32::from_le_bytes(b.try_into().unwrap()), e);
         }
         assert!(space.exhausted());
         assert_eq!(
@@ -98,33 +109,16 @@ fn exercise(device: Device, candidate: Candidate) {
 }
 #[test]
 fn cpu_generic_tile() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+    exercise(Device::cpu());
 }
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Metal hardware"]
 fn metal_generic_tile() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
+    exercise(Device::metal().unwrap());
 }
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_generic_tile() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::Sequential,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    exercise(Device::cuda(0).unwrap());
 }

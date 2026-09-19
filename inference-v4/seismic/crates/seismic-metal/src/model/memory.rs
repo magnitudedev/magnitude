@@ -6,10 +6,93 @@ use crate::{msl::Emitted, terminal::{Expression as E, Space, Statement as S, Typ
 use seismic_accounting::workload::{ScalarWorkload, IntegerDomain, IntegerInput};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A fact under a weaker guard already covers the same fact under a stronger
+/// guard. Keep the minimal defining conjunctions when unrelated choices join;
+/// otherwise every later choice duplicates all preceding conditional facts.
+pub(super) fn retain_alternative<T: PartialEq>(alternatives: &mut Vec<(Vec<magnitude_solver::model::Literal>, T)>,
+    mut guards: Vec<magnitude_solver::model::Literal>, value: T) {
+    guards.sort_by_key(|literal| (literal.variable, literal.value)); guards.dedup();
+    if guards.windows(2).any(|pair| pair[0].variable == pair[1].variable && pair[0].value != pair[1].value) { return; }
+    let subsumes = |left: &[magnitude_solver::model::Literal], right: &[magnitude_solver::model::Literal]|
+        left.iter().all(|literal| right.contains(literal));
+    if alternatives.iter().any(|(activation, previous)| *previous == value && subsumes(activation, &guards)) { return; }
+    alternatives.retain(|(activation, previous)| *previous != value || !subsumes(&guards, activation));
+    alternatives.push((guards, value));
+}
+
+
+/// Eliminate a completed local choice from facts that every one of its arms
+/// preserves. The caller supplies the exact original ordinal domain: seeing
+/// both zero and one alone never establishes coverage of a larger choice.
+pub(super) fn collapse_alternatives<T: PartialEq + Clone>(
+    alternatives: &mut Vec<(Vec<magnitude_solver::model::Literal>, T)>,
+    variable: magnitude_solver::model::VarId,
+    cardinality: usize,
+) {
+    if cardinality == 0 { return; }
+    let mut groups: Vec<(Vec<magnitude_solver::model::Literal>, T, BTreeSet<usize>)> = Vec::new();
+    for (guards, value) in alternatives.iter() {
+        let Some(position) = guards.iter().position(|literal| literal.variable == variable) else { continue; };
+        let Ok(ordinal) = usize::try_from(guards[position].value) else { continue; };
+        if ordinal >= cardinality { continue; }
+        let mut remaining = guards.clone();
+        remaining.remove(position);
+        if let Some((_, _, ordinals)) = groups.iter_mut().find(|(prior, previous, _)| *prior == remaining && previous == value) {
+            ordinals.insert(ordinal);
+        } else {
+            groups.push((remaining, value.clone(), BTreeSet::from([ordinal])));
+        }
+    }
+    for (guards, value, ordinals) in groups {
+        if ordinals.len() == cardinality { retain_alternative(alternatives, guards, value); }
+    }
+}
+
+/// Resolve a fact from its complete guarded cover in the current context.
+/// Cofactoring can expose a completed choice that was not collapsible at its
+/// original join: `a || (!a && b)` covers every arm of `a` once `b` is known.
+/// Only recorded complete ordinal domains may be eliminated; observing zero
+/// and one is not proof that a variable has a Boolean domain.
+pub(super) fn assumed_alternative<'a, T: PartialEq>(
+    alternatives: &'a [(Vec<magnitude_solver::model::Literal>, T)],
+    guards: &[magnitude_solver::model::Literal],
+    choices: &BTreeMap<magnitude_solver::model::VarId, usize>,
+) -> Option<&'a T> {
+    let mut remaining = Vec::new();
+    for (activation, value) in alternatives {
+        let mut residual = Vec::new();
+        let mut compatible = true;
+        for literal in activation {
+            match guards.iter().find(|known| known.variable == literal.variable) {
+                Some(known) if known.value != literal.value => { compatible = false; break; },
+                Some(_) => {},
+                None => residual.push(*literal),
+            }
+        }
+        if compatible { retain_alternative(&mut remaining, residual, value); }
+    }
+    loop {
+        if let Some((_, first)) = remaining.iter().find(|(activation, _)| activation.is_empty()) {
+            // A second compatible definition can still become active in a
+            // narrower context. Do not choose between conflicting facts.
+            return remaining.iter().all(|(_, value)| value == first).then_some(*first);
+        }
+        let previous = remaining.clone();
+        let variables = remaining.iter().flat_map(|(activation, _)| activation.iter().map(|literal| literal.variable))
+            .collect::<BTreeSet<_>>();
+        for variable in variables {
+            if let Some(&cardinality) = choices.get(&variable) {
+                collapse_alternatives(&mut remaining, variable, cardinality);
+            }
+        }
+        if remaining == previous { return None; }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Backing { Device(u64), Scratch(usize), Private(String), Shared(String) }
 impl Backing { fn device(&self) -> bool { matches!(self, Self::Device(_) | Self::Scratch(_)) } }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Pointer { backing: Backing, offsets: Values, symbolic: affine::Values, bounds: [(u64, u64); 32] }
 impl Pointer {
     pub fn offset_symbolic(&self, indices: Values, index_type: Type, width: u64, affine: affine::Values) -> Self {
@@ -31,6 +114,7 @@ impl Pointer {
         }) }
     }
 }
+#[derive(Clone)]
 struct Allocation {
     bytes: u64,
     alignment: u64,
@@ -40,9 +124,11 @@ struct Allocation {
     /// writes invalidate the entire value, just as they invalidate known bytes.
     symbolic: BTreeMap<u64, (Type, affine::Value)>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Memory {
     pub pointers: BTreeMap<String, Pointer>,
+    conditional_pointers: BTreeMap<String, Vec<(Vec<magnitude_solver::model::Literal>, Pointer)>>,
+    choice_cardinalities: BTreeMap<magnitude_solver::model::VarId, usize>,
     allocations: BTreeMap<Backing, Allocation>,
     bindings: BTreeMap<String, Pointer>,
     reads: Vec<(Backing, affine::Value, Type, affine::Value)>,
@@ -51,6 +137,81 @@ pub(super) struct Memory {
     serial_publication: bool,
 }
 impl Memory {
+    /// Bind a deferred native alias when its defining compile-time arm is
+    /// entered again by a consumer. These are original selection literals;
+    /// there is no second pointer or storage decision.
+    pub fn assume(&mut self, guards: &[magnitude_solver::model::Literal]) {
+        let mut resolved = Vec::new();
+        for (name, alternatives) in &self.conditional_pointers {
+            if let Some(pointer) = assumed_alternative(alternatives, guards, &self.choice_cardinalities) {
+                self.pointers.insert(name.clone(), pointer.clone());
+                resolved.push(name.clone());
+            }
+        }
+        // A definition is installed once in this branch. Re-entering a child
+        // region must not overwrite subsequent pointer assignments.
+        for name in resolved { self.conditional_pointers.remove(&name); }
+    }
+    pub fn restore_local(&mut self, name: &str, before: &Self) {
+        match before.pointers.get(name) {
+            Some(pointer) => { self.pointers.insert(name.into(), pointer.clone()); },
+            None => { self.pointers.remove(name); },
+        }
+        match before.conditional_pointers.get(name) {
+            Some(alternatives) => { self.conditional_pointers.insert(name.into(), alternatives.clone()); },
+            None => { self.conditional_pointers.remove(name); },
+        }
+    }
+    /// Preserve branch-local alias definitions after joining implementation
+    /// arms. A later consumer in the same arm sees its exact retained backing.
+    pub fn join_alternative(&mut self, other: &Self, guards: &[magnitude_solver::model::Literal]) {
+        for (name, pointer) in &other.pointers {
+            if self.pointers.get(name) == Some(pointer) { continue; }
+            let alternatives = self.conditional_pointers.entry(name.clone()).or_default();
+            retain_alternative(alternatives, guards.to_vec(), pointer.clone());
+        }
+        for (name, alternatives) in &other.conditional_pointers {
+            let output = self.conditional_pointers.entry(name.clone()).or_default();
+            for (activation, pointer) in alternatives {
+                let mut activation = activation.clone(); activation.extend_from_slice(guards);
+                retain_alternative(output, activation, pointer.clone());
+            }
+        }
+        for (backing, allocation) in &other.allocations {
+            self.allocations.entry(backing.clone()).or_insert_with(|| {
+                let mut allocation = allocation.clone();
+                allocation.known.clear(); allocation.symbolic.clear(); allocation
+            });
+        }
+    }
+    pub fn collapse_choice(&mut self, variable: magnitude_solver::model::VarId, cardinality: usize) {
+        self.choice_cardinalities.insert(variable, cardinality);
+        for alternatives in self.conditional_pointers.values_mut() {
+            collapse_alternatives(alternatives, variable, cardinality);
+        }
+    }
+    /// Join facts after compile-time implementation alternatives. A fact is
+    /// reusable only when every local implementation establishes the same one.
+    pub fn join(&mut self, other: &Self) {
+        self.choice_cardinalities.extend(other.choice_cardinalities.iter().map(|(&variable, &cardinality)| (variable, cardinality)));
+        self.pointers.retain(|name, value| other.pointers.get(name) == Some(value));
+        self.allocations.retain(|backing, allocation| {
+            let Some(right) = other.allocations.get(backing) else { return false; };
+            if allocation.bytes != right.bytes || allocation.alignment != right.alignment { return false; }
+            allocation.known.retain(|offset, value| right.known.get(offset) == Some(value));
+            allocation.symbolic.retain(|offset, value| right.symbolic.get(offset) == Some(value));
+            true
+        });
+        // Branch-local read coordinates need not have identical numbering.
+        // Subsequent reads can establish their identity afresh from storage.
+        self.reads.clear();
+        // Common aliases remain usable outside the choice. Guarded aliases are
+        // installed separately by the retained interpreter with their guards.
+        self.conditional_pointers.retain(|name, alternatives| {
+            alternatives.retain(|alternative| other.conditional_pointers.get(name).is_some_and(|right| right.contains(alternative)));
+            !alternatives.is_empty()
+        });
+    }
     /// A repeated region can retain operation counts without interpreting its
     /// loop-carried data. Forget values rather than treating one visit as the
     /// value produced by the last visit.
@@ -111,6 +272,7 @@ impl Memory {
     pub fn subgroup(&mut self) {
         self.allocations.retain(|backing, _| backing.device());
         self.pointers = self.bindings.clone();
+        self.conditional_pointers.clear();
         self.reads.clear();
     }
     pub fn array(&mut self, name: &str, width: u64, elements: u64, space: Space) -> Result<(), String> {
@@ -132,7 +294,7 @@ impl Memory {
             if active & (1 << i) != 0 {
                 let start = (*offset)?;
                 let end = start.checked_add(width)?;
-                if end > allocation.bytes { return None; }
+                if start < pointer.bounds[i].0 || end > pointer.bounds[i].1.min(allocation.bytes) { return None; }
                 intervals.push((start, end));
             }
         }
@@ -300,7 +462,7 @@ fn written_backings(emitted: &Emitted, workload: &ScalarWorkload) -> Vec<BTreeSe
             }
             E::Builtin(_, args, _) => { for arg in args { expr(arg, roots, all, written); } }
             E::Binary(_, a, b, _) | E::ShortCircuit { left: a, right: b, .. } => { expr(a, roots, all, written); expr(b, roots, all, written); }
-            E::Select(c, a, b) => { expr(c, roots, all, written); expr(a, roots, all, written); expr(b, roots, all, written); }
+            E::Select(c, a, b) | E::EagerSelect(c, a, b) => { expr(c, roots, all, written); expr(a, roots, all, written); expr(b, roots, all, written); }
             E::Cast(_, a) | E::Bitcast(_, a) | E::Unary(_, a, _) | E::Read { index: a, .. } => expr(a, roots, all, written),
             E::Unmapped(..) => written.extend(all.iter().cloned()),
             E::Integer(..) | E::Float(..) | E::Variable(..) | E::Parameter { .. } | E::VectorElement { .. } => {}

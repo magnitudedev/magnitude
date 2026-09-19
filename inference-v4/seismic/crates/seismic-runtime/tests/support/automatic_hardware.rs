@@ -66,16 +66,26 @@ pub fn cuda(
             // Populate the fixture hardware contract from backend IR only.
             // This does not compile or execute a candidate.
             let sequence = seismic_compiler::scalar_sequence(
-                lowered, seismic_realization::CallConv::SystemV,
+                lowered,
+                seismic_realization::CallConv::SystemV,
                 seismic_realization::ScalarOptions { dispatch, loads },
-            ).unwrap();
-            let phases = sequence.phases.into_iter().map(|phase| {
-                seismic_cuda::execution::Execution::new(phase.program, 1,
-                    seismic_cuda::execution::Limits {
-                        max_threads_per_block: device.max_threads_per_block,
-                        max_grid_x: device.max_grid_x,
-                    }).unwrap()
-            }).collect::<Vec<_>>();
+            )
+            .unwrap();
+            let phases = sequence
+                .phases
+                .into_iter()
+                .map(|phase| {
+                    seismic_cuda::execution::Execution::new(
+                        phase.program,
+                        1,
+                        seismic_cuda::execution::Limits {
+                            max_threads_per_block: device.max_threads_per_block,
+                            max_grid_x: device.max_grid_x,
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
             for phase in &phases {
                 for required in cuda::requirements(phase) {
                     if let cuda::Requirement::Instruction(primitive) = required {
@@ -178,4 +188,111 @@ pub fn metal(lowered: &seismic_lang::lowered_ir::LoweredIr) -> Hardware {
             })
             .collect(),
     })
+}
+
+/// Functional native tests use the same automatic-selection gate as callers.
+/// Bindings precede selection; no executable is built from an incomplete result.
+#[allow(dead_code)]
+pub fn compile(
+    device: &seismic_runtime::Device,
+    input: seismic_runtime::tuner::Input<'_>,
+    buffers: &[seismic_runtime::Buffer],
+    scalars: &[f64],
+) -> Result<seismic_runtime::Kernel, String> {
+    compile_with_controls(device, input, buffers, scalars, &[])
+}
+
+/// Content bindings are explicit control inputs of the test case, never inferred
+/// from a tensor's size, name or current values.
+#[allow(dead_code)]
+pub fn compile_with_controls(
+    device: &seismic_runtime::Device,
+    input: seismic_runtime::tuner::Input<'_>,
+    buffers: &[seismic_runtime::Buffer],
+    scalars: &[f64],
+    controls: &[usize],
+) -> Result<seismic_runtime::Kernel, String> {
+    use seismic_runtime::tuner::{self, Input, Outcome, Request};
+    let Input::Portable {
+        program,
+        entry,
+        shapes,
+        elements,
+        options,
+    } = input
+    else {
+        return Err("native test requires an unresolved portable source family".into());
+    };
+    // Only the fixture's instruction inventory and ABI use diagnostic lowering.
+    // The complete source request, with all admitted choices, goes to selection.
+    let lowered = seismic_lang::lower::lower_specialized(
+        program,
+        entry,
+        device.backend(),
+        shapes,
+        elements,
+        options,
+    )?;
+    let facts = device.facts();
+    let settings = settings(device, &lowered);
+    let parameters = lowered
+        .params
+        .iter()
+        .filter_map(|(name, ty)| match ty {
+            seismic_lang::types::Ty::Scalar(dtype) => Some(
+                seismic_lang::abi::ScalarParameter::from_lowered(&lowered, name, *dtype),
+            ),
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut workload = tuner::workload(
+        format!("automatic native {}", lowered.name),
+        buffers,
+        &parameters,
+        scalars,
+    )?;
+    tuner::capture_contents(&mut workload, buffers, controls)?;
+    let request = Request {
+        input,
+        device: &facts,
+        form: settings.form,
+        hardware: &settings.hardware,
+        workload: &workload,
+        derivation_limits: settings.derivation_limits,
+    };
+    match tuner::tune(&request, settings.search)? {
+        Outcome::Optimal(selected) => device.compile_tuned(selected),
+        Outcome::Incomplete(_) => Err(format!(
+            "automatic native selection remains incomplete for {}",
+            lowered.name
+        )),
+        Outcome::Infeasible => Err(format!(
+            "automatic native selection found no feasible execution for {}",
+            lowered.name
+        )),
+    }
+}
+
+#[allow(dead_code)]
+pub fn settings(
+    device: &seismic_runtime::Device,
+    lowered: &seismic_lang::lowered_ir::LoweredIr,
+) -> seismic_runtime::plan::Settings {
+    use seismic_runtime::tuner::Form;
+    let facts = device.facts();
+    let (form, hardware) = match &facts {
+        seismic_runtime::DeviceFacts::Cpu { .. } => (Form::CpuScalar, Hardware::Cpu(cpu(lowered))),
+        seismic_runtime::DeviceFacts::Cuda(_) => (Form::CudaScalar, cuda(lowered, &facts)),
+        #[cfg(target_os = "macos")]
+        seismic_runtime::DeviceFacts::Metal(_) => (Form::Metal, metal(lowered)),
+    };
+    seismic_runtime::plan::Settings {
+        form,
+        hardware,
+        derivation_limits: seismic_accounting::workload::DerivationLimits {
+            instructions: 1_000_000,
+            operations: 1_000_000,
+        },
+        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 100_000, ..Default::default() }, ..Default::default() },
+    }
 }

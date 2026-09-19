@@ -238,15 +238,6 @@ pub fn prepare_resolved(lowered: &LoweredIr) -> Result<seismic_realization::Scal
     seismic_compiler::scalar_resolved(lowered, host_call_conv()?, seismic_realization::Dispatch::Sequential)
 }
 
-pub fn compile(lowered: &LoweredIr) -> Result<Kernel, String> {
-    compile_candidate(lowered, seismic_realization::LoadStrategy::Materialize)
-}
-pub fn compile_candidate(
-    lowered: &LoweredIr,
-    loads: seismic_realization::LoadStrategy,
-) -> Result<Kernel, String> {
-    compile_execution(prepare(lowered, loads)?)
-}
 /// Compile an already selected scalar program; no source preparation occurs here.
 pub fn compile_execution(program: seismic_realization::ScalarProgram) -> Result<Kernel, String> {
     compile_execution_with(program, &codegen::Policy::host()?)
@@ -274,13 +265,6 @@ pub fn compile_execution_with(program: seismic_realization::ScalarProgram, polic
         scratch,
         artifact,
     })
-}
-/// Inspect the execution compiler without allocating invocation scratch.
-pub fn compile_artifact(
-    lowered: &LoweredIr,
-    loads: seismic_realization::LoadStrategy,
-) -> Result<NativeArtifact, String> {
-    Ok(compile_code(prepare(lowered, loads)?, &codegen::Policy::host()?)?.artifact)
 }
 fn compile_code(program: seismic_realization::ScalarProgram, policy: &codegen::Policy) -> Result<CompiledCode, String> {
     if program.dispatch != seismic_realization::Dispatch::Sequential
