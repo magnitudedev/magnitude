@@ -33,8 +33,9 @@ release identity and plugin metadata; this mode does not rebuild or publish pack
 been connected. Never present an iteration result as a fresh installer qualification.
 
 The API offers targets, planning, immutable object transfer/input registration, submission,
-status, results and cancellation. Authentication currently supports server-mapped credentials
-for private development deployments; production Entra/GitHub federation remains to be wired.
+status, results and cancellation. Authentication supports server-mapped credentials and
+Entra/GitHub OIDC. Live Entra acquisition and verification have passed; deployment and an
+actual GitHub workflow run remain unqualified.
 Owner/trust cannot be escalated by submitting different request fields. PostgreSQL owns run,
 work-attempt and lease state with fencing and bounded infrastructure retries. Test dependencies
 are ordered per harness; a failed prerequisite blocks dependent cases while independent checks
@@ -410,6 +411,24 @@ to the worker, but full A7 acceptance is not claimed: OpenCode's diagnostic rema
 a known failure, and the combined worker scenario has not yet been qualified on
 the complete target matrix. No test fault terminates an existing port owner.
 
+R2 removes the test model in a disposable guest, starts a new download through the UI, and
+waits for positive incomplete byte progress before interrupting external networking. It requires
+the app to show acquisition failure, restores networking, retries through the UI and independently
+stream-hashes every target and companion file against the admitted catalog. Successful recovery
+also requires backend-attested generation and unchanged app/service ownership. Preflight proves
+network isolation and restoration before removing the model. Partial receipts survive failures.
+Stable acquisition-state and progress attributes keep these checks independent of button copy,
+color and layout. The Electron fixture exercises presentation changes.
+
+The clean Azure Ubuntu 24.04 Intel run at `/tmp/ml-download-recovery-20260919/verified-result.json`
+passed all 14 selected cases, including R2 and R3. R2 observed 16,375 of 3,666,233,216 bytes
+before isolation, required the rendered download failure, retried through the UI, verified both
+model and projector hashes, and generated `HELLO` with the admitted CPU module. App/service
+ownership was unchanged. R3 then reloaded into a new worker and generated offline. Both native
+network fixtures passed; uninstall and cleanup reported no errors. The packages came from a
+separate, verified native source producer. This qualifies this Ubuntu/Intel scenario, not the
+remaining distro, GPU or operating-system matrix.
+
 R3 proves cached offline generation by establishing a fresh external TCP control, cutting the
 disposable user's external traffic, stopping/reloading the cached model through the bundled CLI,
 and attesting generation on a new native worker. It verifies the cut again after generation and
@@ -417,7 +436,8 @@ restores external connectivity while preserving app/service ownership. Failed ge
 releases isolation and records restoration; partial evidence and cleanup failures remain visible.
 
 Linux uses a private nftables `inet` table scoped to the qualified guest UID, preserving loopback
-and other users. Workers require `/usr/sbin/nft` and noninteractive sudo for it. The implementation
+and other users. TCP rejection uses a reset so established downloads fail promptly; other
+external protocols are rejected too. Workers require `/usr/sbin/nft` and noninteractive sudo for it. The implementation
 preflights both creation and idempotent removal; it never flushes a shared table. See the
 [nftables manual](https://netfilter.org/projects/nftables/manpage.html) for UID matching and table
 lifecycle. `network-fault-native.test.ts` requires `LAB_NATIVE_NETWORK_FAULT=1` on a disposable

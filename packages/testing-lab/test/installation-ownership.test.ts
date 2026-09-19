@@ -29,7 +29,7 @@ for (const mode of ["owned", "symlink", "foreign-entrypoint", "escaped-bundle", 
     return mode === "changed-owner" && observed > 1 ? { ...owner, serviceInstance: Schema.decodeUnknownSync(ApplicationIdentity.fields.serviceInstance)("replacement") } : owner
   }) }).pipe(Effect.provide(Layer.succeed(CliTests, {
     version: Effect.sync(() => { invoked++ }), ensureService: Effect.sync(() => { invoked++ }),
-    inspect: Effect.void, reloadModel: Effect.void, loadModel: Effect.void, failedModel: Effect.void, modelLifecycle: Effect.void, connections: () => Effect.void, invalid: Effect.void, nativeRuntime: Effect.void,
+    inspect: Effect.void, reloadModel: Effect.void, loadModel: Effect.void, removeModel: Effect.void, failedModel: Effect.void, modelLifecycle: Effect.void, connections: () => Effect.void, invalid: Effect.void, nativeRuntime: Effect.void,
   })), Effect.either)
   expect(result._tag).toBe(mode === "owned" || mode === "symlink" ? "Right" : "Left")
   expect(invoked).toBe(mode === "foreign-entrypoint" || mode === "escaped-bundle" ? 0 : 2)

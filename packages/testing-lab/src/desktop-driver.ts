@@ -1,3 +1,4 @@
+import { playwrightDownloads, type DesktopDownloads } from "./download-controls"
 import { playwrightUpdates, type DesktopUpdates } from "./update-controls"
 import { ApplicationIdentity, ReadyApplicationSnapshot } from "./application-identity"
 import { desktopAutomation as automation } from "../../../desktop/src/automation"
@@ -12,6 +13,7 @@ import { AssertionFailure, InfrastructureFailure } from "./domain"
 export const DesktopLaunch = Schema.Struct({ ...DesktopEnvironment.fields, executable: Schema.String, evidence: Schema.String })
 export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
+  readonly downloads: DesktopDownloads
   readonly updates: DesktopUpdates
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
   readonly identity: () => Effect.Effect<ApplicationIdentity, AssertionFailure>
@@ -81,6 +83,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     await page.getByTestId(automation.page(name)).waitFor()
   })
   const card = (id: string) => page.getByTestId(automation.model(id))
+  const downloads = playwrightDownloads(page)
   const updates = playwrightUpdates(page, navigate("settings"))
   const exited = Effect.async<void>(resume => {
     const child = nativeProcess!
@@ -92,6 +95,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     ? Effect.void : new AssertionFailure({ message: "Application did not exit cleanly through normal quit" })))
   return {
     updates,
+    downloads,
     // Finalize diagnostics before native replacement retires the Playwright connection.
     // The caller separately observes the replacement owner; this proves only the old process exit.
     restartForUpdate: () => saveTrace.pipe(Effect.zipRight(updates.action("restart")), Effect.zipRight(exited),
@@ -148,16 +152,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       await disclosure.and(page.locator('[aria-expanded="true"]')).waitFor()
       await page.locator(`[id="${controlled.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"]`).waitFor()
     }),
-    download: name => action("Download model through packaged UI", async () => {
-      const model = card(name)
-      await model.getByTestId(automation.modelDownload).click({ timeout: 120_000 })
-      const complete = model.and(page.locator('[data-model-installed="true"]'))
-      const failure = model.getByRole("alert")
-      await model.getByTestId(automation.modelDownloadProgress).or(complete).or(failure).first().waitFor({ timeout: 60_000 })
-      await complete.or(failure).first().waitFor({ timeout: 30 * 60_000 })
-      if (await failure.count()) throw new Error(await failure.allTextContents().then(messages => messages.join("; ")))
-      await complete.waitFor()
-    }),
+    download: name => downloads.begin(name).pipe(Effect.zipRight(downloads.complete(name))),
     load: name => action("Load model through packaged UI", async () => {
       const model = card(name)
       await model.getByTestId(automation.modelLoad).click()

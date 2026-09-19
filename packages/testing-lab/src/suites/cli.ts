@@ -11,6 +11,7 @@ export interface CliTests {
   readonly ensureService: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly inspect: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly reloadModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly removeModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly loadModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly failedModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly modelLifecycle: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
@@ -45,7 +46,7 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
     }).pipe(Effect.repeat({ until: ready => ready, schedule: Schedule.spaced("1 second") }),
       Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
   })
-  const reloadModel = Effect.gen(function* () {
+  const stopModel = Effect.gen(function* () {
     yield* successful(["models", "stop"])
     yield* Effect.gen(function* () {
       const status = yield* successful(["models", "status", config.model])
@@ -53,9 +54,13 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
       return /Runtime\s+Unloaded/.test(status)
     }).pipe(Effect.repeat({ until: stopped => stopped, schedule: Schedule.spaced("1 second") }),
       Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("CLI stop did not unload the model") }))
-    yield* loadModel
   })
+  const reloadModel = stopModel.pipe(Effect.zipRight(loadModel))
   return {
+    removeModel: stopModel.pipe(Effect.zipRight(successful(["catalog", "remove", config.model])), Effect.zipRight(
+      successful(["models", "status", config.model]).pipe(Effect.map(status => /Installation\s+Not installed/.test(status)),
+        Effect.repeat({ until: absent => absent, schedule: Schedule.spaced("1 second") }), Effect.asVoid,
+        Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("Removed model remained installed") })))),
     reloadModel,
     loadModel,
     failedModel: successful(["models", "status", config.model]).pipe(Effect.map(status => /Runtime\s+Failed/.test(status)),

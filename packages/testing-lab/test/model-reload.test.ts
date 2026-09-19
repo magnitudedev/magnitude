@@ -24,6 +24,29 @@ for (const fault of ["none", "stop", "load"] as const) test(`model reload observ
   expect(calls).toEqual(fault === "stop" ? ["stop", "status"] : ["stop", "status", "load", "status"])
 })).pipe(Effect.provide(BunContext.layer))))
 
+for (const failure of [false, true]) test(`model removal stops residency and observes absence: failure=${failure}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const evidence = yield* fs.makeTempDirectoryScoped({ prefix: "lab-model-remove-" })
+  const calls: string[] = []
+  let removed = false
+  const executor = Layer.succeed(ProcessExecutor, { run: spec => Effect.sync(() => {
+    const operation = spec.args[1]!
+    calls.push(operation)
+    if (operation === "remove") {
+      expect(spec.args).toEqual(["catalog", "remove", "model"])
+      expect(calls.slice(0, 2)).toEqual(["stop", "status"])
+      removed = true
+      if (failure) return { exitCode: 1, stderr: "Removal failed", stdout: "" }
+    }
+    return { exitCode: 0, stderr: "", stdout: operation === "status" ? removed ? "Installation Not installed" : "Runtime Unloaded" : "Requested" }
+  }) })
+  const result = yield* CliTests.pipe(Effect.flatMap(cli => cli.removeModel), Effect.provide(bundledCliTests({
+    executable: "/installed/magnitude", version: "0.1.3", model: "model", evidence, environment: {},
+  }).pipe(Layer.provide(executor))), Effect.either)
+  expect(result._tag).toBe(failure ? "Left" : "Right")
+  expect(calls).toEqual(failure ? ["stop", "status", "remove"] : ["stop", "status", "remove", "status"])
+})).pipe(Effect.provide(BunContext.layer))))
+
 test("worker recovery observes failure and loads explicitly without a stop command", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const evidence = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-reload-" })

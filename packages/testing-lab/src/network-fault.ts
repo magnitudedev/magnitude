@@ -35,7 +35,7 @@ export const networkReachable = (address: typeof NetworkProbeAddress.Type) => Ef
   return Effect.sync(() => { finished = true; socket.destroy() })
 })
 // One inet table covers IPv4 and IPv6. It never changes another table or host policy.
-export const isolationRules = (isolation: typeof NetworkIsolation.Type) => `table inet ${isolation.rule} {\n chain output {\n  type filter hook output priority -10; policy accept;\n  meta skuid ${isolation.uid} oifname != "lo" counter reject\n }\n}\n`
+export const isolationRules = (isolation: typeof NetworkIsolation.Type) => `table inet ${isolation.rule} {\n chain output {\n  type filter hook output priority -10; policy accept;\n  meta skuid ${isolation.uid} oifname != "lo" meta l4proto tcp counter reject with tcp reset\n  meta skuid ${isolation.uid} oifname != "lo" counter reject\n }\n}\n`
 export const linuxNetworkFault = Layer.effect(NetworkFault, Effect.gen(function* () {
   const executor = yield* ProcessExecutor
   const user = yield* Effect.serviceOption(DisposableDesktopUser)

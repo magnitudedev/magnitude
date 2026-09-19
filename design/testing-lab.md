@@ -297,6 +297,13 @@ guest user and affects that user's external traffic, not the host management age
 users. The fault owns its temporary rules; it never flushes shared firewall policy. Cleanup is
 registered before installation, restoration is checked after success or failure, and cleanup
 failures remain visible. A missing native isolation mechanism blocks the case.
+Interrupted model acquisition must observe positive incomplete transfer progress before the
+network cut and a rendered acquisition failure afterward. Recovery uses the UI retry, verifies
+every target and companion file against the admitted catalog's revision, size and digest, and
+attests generation while preserving app/service ownership. Removal and reacquisition are confined
+to a qualified disposable guest; fault preflight and restoration precede model removal. An already
+completed transfer cannot qualify interruption. Acquisition state and byte progress are semantic
+automation attributes, independent of labels, styling and placement.
 Resident-worker fault injection must verify the installed executable, inference-worker role and
 ancestry under the owning service before terminating that exact process. Recovery observes the
 failed model instance and explicitly reloads it; it never assumes automatic reload. A new native
