@@ -45,6 +45,7 @@ pub fn print(plan: &TargetPlan) -> String {
                 RegisterClass::Bits32 => "b32",
                 RegisterClass::Bits64 => "b64",
                 RegisterClass::Float32 => "f32",
+                RegisterClass::Float64 => "f64",
                 RegisterClass::Predicate => "pred",
             },
             register(plan, RegisterId(id))
@@ -322,6 +323,7 @@ fn operand(plan: &TargetPlan, op: Operand) -> String {
         Operand::Signed(n) => n.to_string(),
         Operand::Unsigned(n) => n.to_string(),
         Operand::Float32Bits(bits) => format!("0f{bits:08x}"),
+        Operand::Float64Bits(bits) => format!("0d{bits:016x}"),
         Operand::Special(s) => match s {
             SpecialRegister::LaneIndex => "%laneid",
             SpecialRegister::BlockIndexX => "%ctaid.x",

@@ -1,11 +1,11 @@
 //! IR-only legality of materialized tile placements. No source emission, native
 //! compilation, device query, timing or performance ranking is involved.
 mod ownership;
-pub mod family;
 use seismic_lang::{
-    ir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind},
+    exec::ir::{Expr, ExprKind, Index, Stmt, StmtKind, Var, VarId, VarKind},
+    exec::types::Ty,
     sym::{Atom, Sym},
-    types::{DType, Ty},
+    types::DType,
 };
 use seismic_realization::dispatch::{TileDeclaration, TilePlacement};
 
@@ -15,7 +15,7 @@ pub(crate) fn tile_root(expr: &Expr) -> Option<VarId> {
         ExprKind::Var(v) => Some(*v),
         ExprKind::Index { base, .. } | ExprKind::Transpose(base) => tile_root(base),
         ExprKind::Builtin {
-            name: seismic_lang::ir::Builtin::Reshape,
+            name: seismic_lang::exec::ir::Builtin::Reshape,
             args,
         } => args.first().and_then(tile_root),
         _ => None,
@@ -32,33 +32,54 @@ pub struct StorageDecision {
     pub dtype: DType,
     pub intrinsic_operand: bool,
     pub cross_lane_read: bool,
+    /// The tile belongs to the outer owner of a launch with inner owner regions: its one
+    /// placement is the threadgroup-wide array all inner owners share.
+    pub outer_owner: bool,
     /// Complete placements supported by these ownership requirements. Capacity
     /// feasibility and native model fidelity are separate constraints.
     pub alternatives: Vec<TilePlacement>,
 }
 
-impl StorageDecision {
-    /// Existing explicit diagnostic policy; this does not rank performance.
-    pub fn diagnostic(&self) -> TilePlacement {
-        let placement = if self.intrinsic_operand
-            || (self.cross_lane_read && self.capacity > crate::execution::SUBGROUP)
-        {
-            TilePlacement::GroupShared
-        } else if self.capacity <= crate::execution::SUBGROUP {
-            TilePlacement::Replicated
-        } else {
-            TilePlacement::Distributed
-        };
-        if self.alternatives.contains(&placement) {
-            placement
-        } else {
-            self.alternatives
-                .first()
-                .cloned()
-                .expect("storage domain is nonempty")
+/// Tiles bound in the outer owner of a launch that has inner owner regions (outside those
+/// regions). Storage rule: they are staged once per threadgroup and shared by its SIMD groups.
+pub(crate) fn outer_owner_tiles(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId> {
+    fn bound(body: &[Stmt], vars: &[Var], out: &mut std::collections::HashSet<VarId>) {
+        for statement in body {
+            match &statement.kind {
+                // Inner owner tiles belong to one SIMD group.
+                StmtKind::Parallel { .. } => {}
+                StmtKind::Assign { target, .. } => {
+                    if let ExprKind::Var(v) = target.kind {
+                        if matches!(vars[v].ty, Ty::Tile(_)) {
+                            out.insert(v);
+                        }
+                    }
+                }
+                StmtKind::LoadLoop { vars: bindings, body, .. } => {
+                    out.extend(bindings.iter().copied().filter(|v| matches!(vars[*v].ty, Ty::Tile(_))));
+                    bound(body, vars, out);
+                }
+                StmtKind::Owned { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } => bound(body, vars, out),
+                StmtKind::If { then, els, .. } => {
+                    bound(then, vars, out);
+                    bound(els, vars, out);
+                }
+                StmtKind::Expr(_) => {}
+            }
         }
     }
+    let mut out = std::collections::HashSet::new();
+    for root in body {
+        if let StmtKind::Parallel { body, .. } = &root.kind {
+            if matches!(crate::execution::inner_owners(body), Ok(Some(_))) {
+                bound(body, vars, &mut out);
+            }
+        }
+    }
+    out
+}
 
+impl StorageDecision {
     /// Resolve this ownership domain into the declaration consumed by emission
     /// and accounting. Selection does not print or compile a candidate.
     pub fn select(&self, placement: TilePlacement) -> Result<TileDeclaration, String> {
@@ -70,7 +91,7 @@ impl StorageDecision {
         }
         Ok(TileDeclaration {
             symbol: self.name.clone(),
-            dtype: self.dtype,
+            dtype: seismic_realization::dispatch::local_storage_dtype(self.dtype, self.intrinsic_operand),
             capacity: u64::try_from(self.capacity).map_err(|_| "negative tile capacity")?,
             placement,
         })
@@ -91,11 +112,13 @@ struct VariableStorage {
     intrinsic_operand: bool,
     cross_lane_read: bool,
     packed: bool,
+    outer_owner: bool,
 }
 impl StorageAnalysis {
     pub fn new(vars: &[Var], body: &[Stmt]) -> Self {
         let cross = analyze_usage(vars, body);
         let intrinsic = intrinsic_operands(body);
+        let outer = outer_owner_tiles(vars, body);
         Self {
             ownership: ownership::Analysis::new(vars, body, &intrinsic),
             variables: vars
@@ -110,6 +133,7 @@ impl StorageAnalysis {
                     intrinsic_operand: intrinsic.contains(&id),
                     cross_lane_read: cross.contains(&id),
                     packed:matches!(&v.ty,Ty::Tile(t) if matches!(t.elem,seismic_lang::types::Elem::Repr(_))),
+                    outer_owner: outer.contains(&id),
                 })
                 .collect(),
         }
@@ -129,6 +153,7 @@ impl StorageAnalysis {
             intrinsic_operand,
             cross_lane_read,
             packed,
+            outer_owner,
         } = self
             .variables
             .get(variable)
@@ -139,7 +164,11 @@ impl StorageAnalysis {
             ));
         }
         let mut alternatives = vec![TilePlacement::GroupShared];
-        if !intrinsic_operand {
+        if *outer_owner {
+            // Prescribed by structure: one array per threadgroup. A packed snapshot has no
+            // threadgroup-wide form.
+            alternatives = if *packed { Vec::new() } else { vec![TilePlacement::GroupWide] };
+        } else if !intrinsic_operand {
             if !self.ownership.requires_cooperation(variable) {
                 alternatives.insert(0, TilePlacement::Replicated);
             }
@@ -154,6 +183,7 @@ impl StorageAnalysis {
             dtype,
             intrinsic_operand: *intrinsic_operand,
             cross_lane_read: *cross_lane_read,
+            outer_owner: *outer_owner,
             alternatives,
         })
     }
@@ -163,11 +193,6 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
     fn visit(stmts: &[Stmt], operands: &mut std::collections::HashSet<VarId>) {
         for stmt in stmts {
             match &stmt.kind {
-                StmtKind::Reduction(r) => {
-                    for body in r.bodies() {
-                        visit(body, operands);
-                    }
-                }
                 StmtKind::Parallel { body, .. }
                 | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Owned { body, .. }
@@ -208,7 +233,7 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
                 } => {
                     if let Some(modes) = modes {
                         for ((var, view), mode) in vars.iter().zip(views).zip(modes) {
-                            if *mode == seismic_lang::ir::LoadMode::Borrow {
+                            if *mode == seismic_lang::exec::ir::LoadMode::Borrow {
                                 if let Some(root) = tile_root(view) {
                                     out.push((*var, root));
                                 }
@@ -222,7 +247,7 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
                         ExprKind::Var(var),
                         ExprKind::Load {
                             view,
-                            mode: seismic_lang::ir::LoadMode::Borrow,
+                            mode: seismic_lang::exec::ir::LoadMode::Borrow,
                         },
                     ) = (&target.kind, &value.kind)
                     {
@@ -303,7 +328,7 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
                 }
             }
             ExprKind::Builtin {
-                name: seismic_lang::ir::Builtin::Reshape,
+                name: seismic_lang::exec::ir::Builtin::Reshape,
                 args,
             } => {
                 if let Some(source) = args.first() {
@@ -324,7 +349,7 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
     ) {
         match &e.kind {
             ExprKind::Builtin {
-                name: seismic_lang::ir::Builtin::Extent,
+                name: seismic_lang::exec::ir::Builtin::Extent,
                 args,
             } => {
                 if let Some(view) = args.first() {
@@ -413,14 +438,6 @@ fn analyze_usage(vars: &[Var], body: &[Stmt]) -> std::collections::HashSet<VarId
     ) {
         for s in stmts {
             match &s.kind {
-                StmtKind::Reduction(r) => {
-                    for e in r.operands() {
-                        visit_expr(e, vars, owned, cross);
-                    }
-                    for body in r.bodies() {
-                        visit(body, vars, owned, cross);
-                    }
-                }
                 StmtKind::Owned {
                     vars: ids,
                     tile,
@@ -547,18 +564,19 @@ impl StoragePlan {
                     .all(|atom| compile_time(atom, parameters)),
             }
         }
-        seismic_lang::sym::Prover::new(&self.bounds)
-            .interval_over(extent, &|atom| !compile_time(atom, &self.parameters)).hi
+        // One elimination step replaces an index by its upper bound, which may itself be
+        // stated over an outer index (`row <= rows`, `rows <= pieces - 1`): eliminate to a
+        // fixpoint (a repeated expression ends a cyclic chain). An unbounded index stays symbolic.
+        let prover = seismic_lang::sym::Prover::new(&self.bounds);
+        let mut bound = extent.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        while seen.insert(bound.clone()) {
+            bound = prover.interval_over(&bound, &|atom| !compile_time(atom, &self.parameters)).hi;
+        }
+        bound
     }
     pub fn physical(&self, variable: VarId) -> Option<&PhysicalLayout> {
         self.physical.get(&variable)
-    }
-    pub fn with_declaration(mut self, variable: VarId, declaration: TileDeclaration) -> Self {
-        self.declarations.insert(variable, declaration);
-        self
-    }
-    pub fn declarations(&self) -> &std::collections::BTreeMap<VarId, TileDeclaration> {
-        &self.declarations
     }
     pub fn declaration(&self, variable: VarId) -> Result<&TileDeclaration, String> {
         self.declarations
@@ -572,65 +590,26 @@ impl StoragePlan {
 pub fn plan(
     vars: &[Var],
     body: &[Stmt],
-    extra: &[&[Stmt]],
     select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>,
 ) -> Result<StoragePlan, String> {
-    StorageFamily::derive(vars, body, extra)?.select(select)
+    StorageFamily::derive(vars, body)?.select(select)
 }
 
 /// All materialization requests and ownership relations, before any placement
-/// is selected. The same owner supplies concrete and shared-model realization.
-#[derive(Clone)]
-pub struct StorageFamily {
+/// is selected.
+struct StorageFamily {
     base: StoragePlan,
     analysis: StorageAnalysis,
     decisions: Vec<StorageDecision>,
-    parameters: std::collections::BTreeMap<String, seismic_accounting::algebra::Value>,
 }
 impl StorageFamily {
-    pub fn decisions(&self) -> &[StorageDecision] { &self.decisions }
-    pub fn physical(&self, variable: VarId) -> Option<&PhysicalLayout> { self.base.physical(variable) }
-    /// Typed union metadata for retained emission. Placements and envelope
-    /// capacities here are not a selected execution or an allocation account.
-    pub(crate) fn layout_template(&self) -> Result<StoragePlan, String> {
+    fn select(&self, select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>) -> Result<StoragePlan, String> {
         let mut result = self.base.clone();
-        for decision in &self.decisions {
-            let placement = decision.alternatives.iter().find(|placement| **placement == TilePlacement::GroupShared)
-                .or_else(|| decision.alternatives.first()).ok_or("empty storage placement domain")?;
-            result.declarations.insert(decision.variable, decision.select(placement.clone())?);
-        }
-        Ok(result)
-    }
-    pub(crate) fn force_replicated(&mut self, variables: &[VarId]) -> Result<(), String> {
-        for decision in &mut self.decisions {
-            if variables.contains(&decision.variable) {
-                decision.alternatives.retain(|placement| *placement == TilePlacement::Replicated);
-                if decision.alternatives.is_empty() { return Err("private fold storage has no replicated realization".into()); }
-            }
-        }
-        Ok(())
-    }
-    pub fn select(&self, select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>) -> Result<StoragePlan, String> {
-        if self.parameters.values().any(|value| { let (lo, hi) = value.bounds(); lo != hi }) {
-            return Err("parameterized storage requires its original numeric assignment".into());
-        }
-        let parameters = self.parameters.iter().map(|(name, value)| {
-            i64::try_from(value.bounds().0).map(|value| (name.clone(), value)).map_err(|_| "storage parameter exceeds i64".to_string())
-        }).collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-        self.select_parameters(&parameters, select)
-    }
-    fn select_parameters(&self, parameters: &std::collections::BTreeMap<String, i64>, select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>) -> Result<StoragePlan, String> {
-        let mut result = self.base.clone();
-        for (name, &(lo, hi)) in &self.base.parameters {
-            let value = *parameters.get(name).ok_or_else(|| format!("missing storage parameter `{name}`"))?;
-            if !(lo..=hi).contains(&value) { return Err(format!("storage parameter `{name}` is outside its original domain")); }
-            result.parameters.insert(name.clone(), (value, value));
-        }
         let mut ownership = self.analysis.ownership.selection();
         for original in &self.decisions {
             let mut decision = original.clone();
             let physical = &result.physical[&decision.variable];
-            let evaluate = |expression: &Sym| expression.eval(&|name| parameters.get(name).copied())
+            let evaluate = |expression: &Sym| expression.eval(&|_| None)
                 .filter(|value| *value >= 0).ok_or_else(|| format!("unresolved or negative selected storage extent `{expression}`"));
             decision.capacity = evaluate(&physical.capacity)?;
             if let Some(packet) = &physical.packets {
@@ -651,12 +630,8 @@ impl StorageFamily {
         result.owned_cooperative = ownership.owners();
         Ok(result)
     }
-    pub fn derive(vars: &[Var], body: &[Stmt], extra: &[&[Stmt]]) -> Result<Self, String> {
-        Self::derive_parameterized(vars, body, extra, &std::collections::BTreeMap::new())
-    }
-    pub fn derive_parameterized(vars: &[Var], body: &[Stmt], extra: &[&[Stmt]],
-        parameters: &std::collections::BTreeMap<String, seismic_accounting::algebra::Value>) -> Result<Self, String> {
-    use seismic_lang::ir::{Builtin, LoadMode};
+    fn derive(vars: &[Var], body: &[Stmt]) -> Result<Self, String> {
+    use seismic_lang::exec::ir::{Builtin, LoadMode};
     use std::collections::{BTreeSet, HashMap, HashSet};
     #[derive(Default)]
     struct Requests {
@@ -746,9 +721,6 @@ impl StorageFamily {
     }
     let mut requests = Requests::default();
     collect(body, vars, &mut requests);
-    for body in extra {
-        collect(body, vars, &mut requests);
-    }
     // Current sum/min/max implementations consume owned tile storage. Argmax
     // has a direct view implementation and does not require this declaration.
     requests.values.extend(
@@ -758,14 +730,7 @@ impl StorageFamily {
             .copied(),
     );
     let mut result = StoragePlan::default();
-    result.parameters = parameters.iter().map(|(name, value)| {
-        let (lo, hi) = value.bounds();
-        Ok((name.clone(), (i64::try_from(lo).map_err(|_| "storage parameter range exceeds i64")?,
-            i64::try_from(hi).map_err(|_| "storage parameter range exceeds i64")?)))
-    }).collect::<Result<_, String>>()?;
-    let demand_body = body.iter().chain(extra.iter().flat_map(|body| body.iter()))
-        .cloned().collect::<Vec<_>>();
-    result.data_variables = seismic_lang::demand::data_variables(&demand_body);
+    result.data_variables = seismic_lang::exec::demand::data_variables(body);
     requests.values.retain(|variable| result.requires_data(*variable));
     // A logical slice keeps its invocation extent; its backing axis supplies a
     // finite allocation bound. The same symbolic facts feed emission and
@@ -778,7 +743,28 @@ impl StorageFamily {
             ExprKind::Index { base, indices } => {
                 let rank = base.ty.shaped()?.shape.len();
                 let axis = (0..rank).filter(|axis| !matches!(indices.get(*axis), Some(Index::Point(_)))).nth(axis)?;
-                view_axis_bound(base, axis, parameters)
+                // A clamped runtime slice `lo:hi` is never longer than `hi - lo`; when that
+                // difference is static (`t:t + 1`) it bounds the snapshot, not the whole axis.
+                let length = match indices.get(axis) {
+                    Some(Index::Slice { start: Some(start), end: Some(end) }) => start.sym.as_ref().zip(end.sym.as_ref())
+                        .and_then(|(start, end)| end.sub(start).as_constant())
+                        .or_else(|| match (&start.kind, &end.kind) {
+                            // Runtime scalars carry no symbolic value: `v : v + c` of one variable,
+                            // both read while evaluating this one view.
+                            (ExprKind::Var(from), ExprKind::Binary { op: seismic_lang::syntax::ast::BinaryOp::Add, lhs, rhs }) => match (&lhs.kind, &rhs.kind) {
+                                (ExprKind::Var(v), ExprKind::Int(c)) | (ExprKind::Int(c), ExprKind::Var(v)) if v == from => Some(*c),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .filter(|n| *n >= 0),
+                    _ => None,
+                };
+                match (view_axis_bound(base, axis, parameters), length) {
+                    (Some(backing), Some(length)) => Some(match backing.as_constant() { Some(n) => Sym::constant(n.min(length)), None => Sym::constant(length) }),
+                    (None, Some(length)) => Some(Sym::constant(length)),
+                    (backing, None) => backing,
+                }
             }
             ExprKind::Transpose(base) => view_axis_bound(base, shaped.shape.len().checked_sub(axis + 1)?, parameters),
             ExprKind::Load { view, .. } => view_axis_bound(view, axis, parameters),
@@ -838,8 +824,24 @@ impl StorageFamily {
             _ => {}
         }
     }
-    fn body_bounds(body: &[Stmt], facts: &mut seismic_lang::sym::Facts, parameters: &std::collections::BTreeMap<String, (i64, i64)>) {
+    fn body_bounds(vars: &[Var], body: &[Stmt], facts: &mut seismic_lang::sym::Facts, parameters: &std::collections::BTreeMap<String, (i64, i64)>) {
+        // A loop index ranges over its loop's bounds. A view or tile whose extent is an
+        // expression of the index (`t[0:row + 1]`) takes its capacity from that range.
+        let index_range = |facts: &mut seismic_lang::sym::Facts, var: VarId, lo: Sym, hi: &Sym| {
+            if let Some(VarKind::Index(atom)) = vars.get(var).map(|v| &v.kind) {
+                facts.set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
+            }
+        };
         for s in body {
+            match &s.kind {
+                StmtKind::Range { var, lo, hi, .. } => index_range(facts, *var, lo.clone(), hi),
+                StmtKind::Parallel { vars: indices, extents, .. } => {
+                    for (var, extent) in indices.iter().zip(extents) {
+                        index_range(facts, *var, Sym::constant(0), extent);
+                    }
+                }
+                _ => {}
+            }
             match &s.kind {
                 StmtKind::Assign { target, value, .. } => {
                     expression_bounds(target, facts, parameters);
@@ -848,7 +850,7 @@ impl StorageFamily {
                 StmtKind::Expr(e) => expression_bounds(e, facts, parameters),
                 StmtKind::Owned { tile, body, .. } => {
                     expression_bounds(tile, facts, parameters);
-                    body_bounds(body, facts, parameters);
+                    body_bounds(vars, body, facts, parameters);
                 }
                 StmtKind::LoadLoop {
                     domain,
@@ -860,32 +862,26 @@ impl StorageFamily {
                     for e in views {
                         expression_bounds(e, facts, parameters);
                     }
-                    body_bounds(body, facts, parameters);
+                    body_bounds(vars, body, facts, parameters);
                 }
                 StmtKind::Parallel { body, .. }
                 | StmtKind::Range { body, .. }
-                | StmtKind::Lanes { body, .. } => body_bounds(body, facts, parameters),
+                | StmtKind::Lanes { body, .. } => body_bounds(vars, body, facts, parameters),
                 StmtKind::If { cond, then, els } => {
                     expression_bounds(cond, facts, parameters);
-                    body_bounds(then, facts, parameters);
-                    body_bounds(els, facts, parameters);
-                }
-                StmtKind::Reduction(_) => {
-                    unreachable!("reductions materialize before storage planning")
+                    body_bounds(vars, then, facts, parameters);
+                    body_bounds(vars, els, facts, parameters);
                 }
             }
         }
     }
-    body_bounds(body, &mut result.bounds, &result.parameters);
-    for body in extra {
-        body_bounds(body, &mut result.bounds, &result.parameters);
-    }
+    body_bounds(vars, body, &mut result.bounds, &result.parameters);
     for (atom, bound) in &requests.pieces {
         result
             .bounds
             .set_range(atom.clone(), Sym::constant(0), bound.clone());
     }
-    let analysis = StorageAnalysis::new(vars, &demand_body);
+    let analysis = StorageAnalysis::new(vars, body);
     let mut decisions = Vec::new();
     for variable in requests.values {
         let Ty::Tile(tile) = &vars[variable].ty else {
@@ -940,6 +936,6 @@ impl StorageFamily {
         result.physical.insert(variable, physical);
         decisions.push(decision);
     }
-    Ok(Self { base: result, analysis, decisions, parameters: parameters.clone() })
+    Ok(Self { base: result, analysis, decisions })
     }
 }

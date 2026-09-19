@@ -16,6 +16,7 @@ const CODEGEN_VERSION: &str = "cranelift-codegen/0.125.4";
 pub struct Policy {
     compiler: String,
     triple: String,
+    call_conv: isa::CallConv,
     shared: BTreeMap<String, String>,
     isa: BTreeMap<String, String>,
 }
@@ -44,6 +45,7 @@ impl Policy {
         Self {
             compiler: CODEGEN_VERSION.into(),
             triple: isa.triple().to_string(),
+            call_conv: isa.default_call_conv(),
             shared: isa
                 .flags()
                 .iter()
@@ -58,6 +60,10 @@ impl Policy {
     }
     pub fn compiler(&self) -> &str {
         &self.compiler
+    }
+    /// Calling convention of every compiled phase and math import.
+    pub fn call_conv(&self) -> isa::CallConv {
+        self.call_conv
     }
     pub fn triple(&self) -> &str {
         &self.triple
@@ -114,13 +120,14 @@ pub struct Import {
     pub operation: MathFunction,
     pub symbol: String,
     pub signature: ir::Signature,
-    /// Runtime implementation is the matching Rust standard-library f32 wrapper;
-    /// this is an ABI/semantic identity, not a hardware instruction contract.
+    /// This is an ABI/semantic identity, not a hardware instruction contract.
     pub implementation: MathRuntime,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathRuntime {
-    RustStandardLibraryF32,
+    /// The Rust standard-library binary64 function, rounded once to binary32: what the
+    /// reference interpreter computes.
+    RustStandardLibraryF64Rounded,
 }
 
 pub fn imports(program: &ScalarProgram) -> Result<Vec<Import>, String> {
@@ -154,7 +161,7 @@ pub fn imports(program: &ScalarProgram) -> Result<Vec<Import>, String> {
             operation,
             symbol: operation.symbol().into(),
             signature,
-            implementation: MathRuntime::RustStandardLibraryF32,
+            implementation: MathRuntime::RustStandardLibraryF64Rounded,
         });
     }
     for block in program.function.layout.blocks() {

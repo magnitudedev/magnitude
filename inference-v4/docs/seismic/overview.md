@@ -1,206 +1,144 @@
 # Seismic
 
 **Seismic is a kernel language, compiler, and runtime packaged as a Rust library.**
-It turns portable numerical programs into hardware-specific executions, with
-resource accounting and automatic optimization built into compilation.
+Authors write numerical kernels with their logical execution structure. The compiler
+selects among the authored implementations, contiguous fusion groups, and numerical
+dimensions, and realizes the selection through prescribed backend mappings. It never
+invents execution structure.
+
+The governing specification is
+`specs/26-09-18/seismic-structured-authoring-spec.md`. These documents state the
+contract of the implemented system.
 
 ## Principles
 
-1. **Seismic code is completely hardware-agnostic.** Hardware details and
-   backend-specific operations enter only at the lowering boundary. Ordinary code
-   cannot observe compiler-chosen partition sizes, piece counts, or physical mappings.
+1. **Structure is authored; numbers are selected.** An implementation fixes its
+   algorithm, independent domains, producer and state scopes, stage order, and
+   combination order. Authors never write widths, candidate lists, or hardware
+   constants. Portable code cannot observe a selected width, piece count, or
+   physical mapping.
 
-2. **Declare only what cannot be derived.** Authors specify computation and
-   precision. The system derives shapes, dependencies, implementation sizes,
-   resource requirements, and bindings wherever the semantics determine them.
+2. **Optimization is selection over a finite supplied family.** The decisions are:
+   one applicable implementation per active static call occurrence, one exact cover
+   of contiguous intervals per active sequence of execution units, and one value per
+   active numerical site. There is no search over graphs, producer placement,
+   reduction trees, layouts, storage placement, or schedules.
 
-3. **One unified system.** Execution, resource accounting, optimization, and code
-   generation share the same semantic and implementation definitions.
+3. **One authority.** The selected witness drives checking, the estimate, and
+   emission. Nothing downstream of selection chooses, repairs, or re-tiles. A
+   reconstruction that disagrees with the witness is a compiler defect, not an
+   infeasible candidate.
 
-4. **Correctness is built into the system.** Types, construction, transformations,
-   and validation enforce shapes, precision, ownership, and effects throughout
-   compilation and execution.
+4. **No hidden search and no hidden policy.** A backend hook is a deterministic
+   function of its inputs. Every performance preference lives in the solver
+   objective as an explicit local cost factor. Anything a backend fixes, it fixes
+   by one documented rule.
 
-5. **A minimal, compositional vocabulary.** Constructs have general meaning and
-   exist only for necessary semantics or expressiveness. Redundant source structure
-   must not be required to unlock performance: the compiler must derive efficient
-   execution from the existing semantic composition. Composition must preserve
-   optimization opportunities across function and library boundaries. Structured
-   lowerings must express efficient implementations of the admitted intrinsics;
-   documented semantics-preserving refactorings must retain those opportunities.
+5. **Select in IR, before native compilation.** Selection evaluates arithmetic over
+   the family. Native source is generated once, for the selected witness. No
+   compile-and-benchmark loop exists.
 
-6. **Optimize from resource relationships, with sound bounds.** Select the best
-   legal execution in the declared form under the applicable model. Performance
-   decisions follow from computation and hardware constraints, never heuristics
-   or manually tuned kernel parameters.
+6. **Numerics and effects are preserved.** Casts, FMA, accumulation dtype,
+   publication rounding, reduction order, producer multiplicity, state order, and
+   observable writes are exactly what the selected bodies say. Selection cannot
+   change them.
 
-7. **Fix the system, not the kernel.** When a natural program cannot be expressed
-   or compiled efficiently, improve the responsible abstraction, lowering, or
-   tooling. Authors should not need hidden matcher patterns or manually chosen
-   implementation sizes to obtain efficient compilation.
+7. **The compiler is generic.** No model names, model dimensions, or pattern
+   recognition of particular kernels exist in the compiler or a backend. Model
+   knowledge lives in authored sources and engine bindings.
 
-## Architecture
+8. **Unknown is not zero; unsupported is not infeasible.** Missing analysis, a missing
+   mapping, missing target coverage, proved infeasibility, and an exhausted budget
+   are distinct outcomes. None triggers a fallback.
 
-| Layer | Responsibility |
+9. **Honest results.** A selected execution is *feasible* unless the solver proved it
+   optimal over the stated family under the stated estimate model. Estimates are
+   labelled estimates; the current Metal estimate model is labelled unqualified.
+
+10. **Fix the system, not the kernel.** When a natural structure cannot be expressed
+    or realized, the owning layer changes: the language, a mapping, or a library
+    body. Sources do not work around compiler defects.
+
+## Responsibilities
+
+| Owner | Establishes | Does not |
+| --- | --- | --- |
+| Kernel or library author | Algorithm, regions, producers, state, stages, merges, numerical contract, alternative bodies, target adoption | Declare widths, candidate lists, or hardware constants |
+| Lowering author | A target implementation within the ownership its signature grants | Restructure the caller or widen its scope |
+| Checker | Types, shapes, bounds, modes, aliasing, slice opacity, region results, stages, partial obligations, target coverage declarations | Prove bodies equivalent |
+| Family construction | Applicable candidates per occurrence, numerical sites, execution-unit sequences, obligations | Enumerate compositions; drop what it cannot analyze |
+| Backend mapping | Site domains, hard limits, legal intervals, local cost factors, a constructive seed, deterministic realization | Rank, filter by profitability, or search |
+| Solver | The joint assignment under a budget, with decomposition and proof reuse | Invent calls, stages, groupings, or sites |
+| Instantiation and emission | Exactly the witness | Any second tiling, fusion, staging, or placement policy |
+| Runtime | Native compilation of a checked selection, binding, validation, submission, completion | Select, substitute, or fall back |
+
+## Packages
+
+| Package | Responsibility |
 | --- | --- |
-| **Toolchain — `seismic`** | Language, checking, canonicalization, lowering, resource analysis, optimization, backends, runtime, and CLI. Understands primitives and implementation contracts; remains independent of model families. |
-| **Standard library — `seismic-std`** | Reusable constructs, backend lowerings, and portable numerical kernels, authored in Seismic. |
-| **User libraries** | Application-owned numerical programs composed from the standard library and user-defined operations. Model topology belongs here. |
-| **Host application** | Model artifacts, I/O, residency policy, logical state, scheduling, and serving. Embeds Seismic and supplies programs, bindings, and a device. |
+| `seismic-lang` | Syntax, checker, structured IR, reference interpreter, joint family, instantiation to the execution IR; the symbolic prover, representations, intrinsics, ABI. |
+| `seismic-compiler` | Joint selection: solver export, seed validation, budgeted search, witness audit, replay, search analysis; the `Backend` contract; the target-neutral structural walk and mapping helpers every backend shares. |
+| `magnitude-solver` | Generic exact and neighborhood search with guards, residual decomposition, and proof reuse. Knows nothing about Seismic. |
+| `seismic-realization` | Target-neutral realization contracts shared by backends: invocation ABI and conditions, launch phases, tile placement, and the local storage type rule. |
+| `seismic-metal` | The Metal mapping, realized execution, MSL emission, device runtime. |
+| `seismic-runtime` | Devices, buffers, compilation of a selected execution, plan compiler, invocation validation. |
+| `seismic-cli` | `check`, `print`, `select`, `emit`, `analyze-search`, `bindings`. |
+| `seismic-std` | The standard kernel library and its Metal lowerings, authored in Seismic. |
+| `seismic-cpu` | The CPU mapping, scalar realized execution, Cranelift native compilation, worker threads and host buffers. |
+| `seismic-cuda` | The CUDA mapping, scalar realized execution printed as PTX, driver runtime (loaded dynamically). |
 
-```mermaid
-flowchart LR
-    U[User / model library] --> S[Standard library]
-    U --> T[Seismic toolchain]
-    S --> T
-    T --> B[Backend implementations]
-    B --> R[Prepared execution]
-    H[Host application] --> T
-    H -->|bind and submit| R
-```
+Model topology belongs to user libraries. Artifacts, residency, logical state,
+scheduling, and serving belong to the host application.
 
-## Language and vocabulary
-
-| Concept | Meaning |
-| --- | --- |
-| **Primitive** | Fundamental operation or decomposition with language-defined semantics and backend implementations. |
-| **Function / kernel** | Portable composition of existing operations; its body defines its computation. |
-| **Construct** | General semantic operation with a portable definition and specialized backend lowerings where needed. |
-| **Lowering** | Backend-scope implementation of a construct, with applicability derived from its types and constraints. |
-| **Intrinsic** | Backend operation defining instruction semantics, participation, hardware requirements, and emission. |
-
-The language provides typed tensors, logical tiles, scalars, views, bounded control
-flow, parallel and owned iteration, logical loads and stores, reductions, and atomic
-effects. Matrix multiplication and scan are reusable constructs; attention, norms,
-routing, and sampling are library compositions rather than model-specific compiler cases.
-
-Authors specify logical problem dimensions, dataflow, precision, and semantic
-decomposition, such as algorithmic windows with defined logical boundaries. The
-compiler derives physical partitioning and streaming without exposing its pieces
-to ordinary code. Logical tiles and whole-domain operations do not require whole-domain
-materialization. Fixed instruction geometry belongs at the backend lowering boundary.
-
-Lowering authors additionally express backend implementation strategy through
-intrinsics and structured staging, streaming, and participation. The
-[authoring contract](language.md#lowering-authoring-contract) defines what remains
-free for the compiler and how unsupported analysis is reported.
-
-## Semantics and correctness
-
-| Property | Architectural treatment |
-| --- | --- |
-| Shapes and access | Symbolic dimensions, view relationships, bounds, and initialization are checked. |
-| Precision | Operand and accumulation types, rounding/publication boundaries, and reassociation permissions are explicit. |
-| Packed representations | Storage, decoding, metadata, alignment, and coefficient precision share one definition. |
-| Ownership and effects | Aliasing, value versions, parallel independence, synchronization, and mutation survive transformations. |
-| Backend coverage | Lowering domains cover the supported construct domain; applicability and capability requirements are explicit. |
-| Runtime conditions | Binding-dependent requirements are validated at binding or represented as checks in the execution. |
-
-Types and construction enforce local invariants; compiler analyses and stage
-validation establish global properties. The portable interpreter defines reference
-execution. Backend implementations must preserve those semantics, including
-finite-precision behavior.
-
-## Composition and compilation
+## Flow
 
 ```text
-Source + libraries
-    → checked portable IR
-    → canonicalization and composition
-    → backend lowering with legal implementation choices
-    → joint resource analysis and optimization
-    → resolved execution
-    → target emission and native compilation
+sources (portable + target files)
+    -> checked closed program: structured IR, contract families, lowering boundaries
+    -> joint family for (entry, target, workload)
+    -> backend: site domains, limits, intervals, cost factors, seed
+    -> budgeted joint selection -> audited witness
+    -> instantiation: concrete execution IR, verified
+    -> backend realization: deterministic mapping rules
+    -> emission -> native compilation -> bound, validated invocation
 ```
 
-- **Canonicalization:** Normalize equivalent expressions through deterministic,
-  semantics-preserving rewrites and recognize reusable operations.
-- **Fusion and decomposition:** Optimize across operation boundaries while preserving
-  precision, effects, and publication. Account for intermediate storage and generated merges.
-- **Joint selection:** Choose implementations, sizes, layouts, storage, and schedules
-  for the enclosing execution. Independently optimal children need not compose optimally.
-- **Shared execution structure:** Accounting, optimization, emission, and inspection
-  consume the same implementation definitions and derived views across IR stages.
+The reference interpreter executes the same structured IR under any caller-supplied
+partition and defines the semantics every backend must reproduce, including
+finite-precision behavior.
 
-The [compiler contract](compiler.md#optimization-guarantees) separates intrinsic
-expressiveness, preservation of the legal execution family, completed selection,
-and native correspondence. Source validity alone establishes neither optimality
-nor hardware fidelity. Algorithms and their alternatives live in libraries;
-the compiler optimizes their supported execution forms.
+## Outcomes
 
-## Resource accounting and optimization
-
-**Performance is a consequence of work, movement, dependencies, and finite resources.**
-
-| Information | Role |
+| Outcome | Meaning |
 | --- | --- |
-| Computation semantics | Derive logical work, accessed regions, reuse opportunities, and necessary dependencies. |
-| Selected implementation | Derive instructions, transfers, live storage, synchronization, and launch structure. |
-| Hardware contract | Supply resource topology, capabilities, capacities, service behavior, and operating conditions. |
-| Resource constraints | Describe feasibility, contention, concurrency, and timing relationships. |
-| Sound relaxations | Bound the best possible duration across remaining legal implementations. |
+| Invalid source | Type, effect, ownership, or declaration error. |
+| Missing target coverage | No adopted implementation covers a reached call. |
+| Unsupported structural mapping | The backend has no mapping for a meaningful structure. |
+| Incompatible composition | Required interfaces or hard capacities cannot agree. |
+| Infeasible | The exported family is proved to have no solution. |
+| Selection incomplete | The budget ended without a checked configuration. |
+| Analysis unavailable | A required quantity or estimate has no supported derivation. |
+| Reconstruction defect | A witness, seed, or instantiation disagreed with the family. Compiler defect. |
+| Selected, feasible | Complete checked execution; estimated performance only. |
+| Selected, model-optimal | Additionally optimal over the stated family and estimate model. |
 
-The optimizer resolves typed choices using these relationships. Its goal is exact
-optimization over the declared execution form and model, with practical symbolic
-analysis and search. Candidate benchmarks and heuristic scores do not drive selection.
+## Current scope
 
-Performance reports expose the same analysis: work, bottlenecks, selected choices,
-bounds, predictions, observations, and remaining uncertainty. A physical lower bound,
-a model optimum, and measured performance have distinct meanings. Hardware and native
-mapping qualification connect the model to actual execution.
-
-## Backends
-
-| Backend | Execution route |
-| --- | --- |
-| **Metal** | Metal source compiled through OS facilities. |
-| **CUDA** | PTX compiled through the CUDA driver. |
-| **CPU** | Cranelift-generated code and admitted native microkernels, with feature-aware vector and worker execution. |
-| **Vulkan** | SPIR-V through the Vulkan runtime. |
-
-One portable library serves these targets. Backend definitions own instruction
-mappings and hardware mechanisms; lowerings express implementation strategies.
-CPU is a production execution target. Native compilation behavior, including
-allocation and spills, belongs in the backend's execution model and mapping contract.
-
-## Embedding and runtime
-
-| Boundary | Behavior |
-| --- | --- |
-| **Build** | Check and embed standard and application libraries; generate typed Rust bindings from program signatures. |
-| **Compile** | Specialize and optimize for the selected device, then emit and compile its execution. |
-| **Bind** | Validate shapes, representations, and allocation relationships; prepare immutable bindings. |
-| **Submit** | Bind dynamic inputs and reuse prepared storage and native submission plans. |
-| **Complete** | Preserve dependencies and retain resources through every submitted use; expose completion and failure accurately. |
-| **Cache** | Reuse analyses and executables under compatible program, workload, hardware, and compiler identities. |
-
-The runtime owns physical execution and allocation lifetimes. The host owns policy:
-what to load, which values remain resident, which requests run, and how logical state
-is published. Numerical model computation stays in Seismic programs.
-
-## Development and distribution
-
-- **Independent development:** Check, interpret, lower, run, and inspect a library
-  without building or linking an inference engine.
-- **Fast iteration:** Source overrides and targeted invalidation let kernel and
-  lowering edits affect only the relevant artifacts.
-- **Useful diagnostics:** Expose source locations, constraints, resolved IR, choices,
-  generated code, resource accounts, and bounded reproductions.
-- **Lightweight deployment:** Embed programs and use shipped code plus OS/driver
-  facilities. Customers do not need Python, LLVM, a runtime linker toolchain,
-  vendor compiler SDKs, or a repository checkout.
-- **Prepared warm execution:** Reuse compiled programs and bindings rather than
-  repeating compilation, optimization, or application-level graph traversal.
+- Metal is the only backend. Qwen3.5-4B prefill and decode run through this pipeline.
+- Width domains offer only divisors of static extents, so tail pieces do not occur.
+- `pipeline` has one mapping: synchronous, same participant, ring depth one.
+- A region result cannot cross a launch.
+- The estimate model is unqualified. No performance claim follows from a selection.
 
 ## Further reading
 
 | Document | Focus |
 | --- | --- |
-| [Language](language.md) | Authoring scopes, vocabulary, and library semantics |
-| [Compiler](compiler.md) | Compilation stages and ownership |
-| [Execution](execution.md) | Semantics, transformations, and legal execution forms |
-| [Accounting](accounting.md) | Resource relationships and hardware models |
-| [Tuning](tuning.md) | Optimization and search semantics |
-| [Backends](backends.md) | Emission and native mapping contracts |
-| [Runtime](runtime.md) | Artifacts, bindings, memory, and submission |
+| [Language](language.md) | Source surface and its rules |
+| [Compiler](compiler.md) | Stages, authoritative representations, permitted transformations |
+| [Execution](execution.md) | Region semantics as realized, execution units, instantiation rules |
+| [Tuning](tuning.md) | Joint selection, search, proof status, replay |
+| [Backends](backends.md) | The `Backend` contract and the Metal mapping |
+| [Runtime](runtime.md) | Executable boundary, binding, validation, reuse |
+| [Accounting](accounting.md) | Derived quantities, estimates, and their authority |
 | [Inference V4](../overview.md) | Enclosing inference-engine architecture |

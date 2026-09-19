@@ -52,7 +52,7 @@ impl LowBits {
         }
     }
     fn of(e: &E) -> Self {
-        use seismic_lang::ast::BinaryOp as B;
+        use seismic_lang::syntax::ast::BinaryOp as B;
         match e {
             E::Integer(n, ty) => Self::exact(*n as u64).typed(*ty),
             E::Cast(ty, e) | E::Bitcast(ty, e) => Self::of(e).typed(*ty),
@@ -356,12 +356,16 @@ pub(crate) fn coalesce(body: &mut Vec<Site>) -> Result<bool, String> {
             nodes.push(Node {
                 site,
                 accesses,
-                barrier: matches!(s, S::Barrier),
+                // A threadgroup barrier also orders the lanes of each SIMD group. It is never
+                // removed: it orders accesses of other SIMD groups, which this pass cannot see.
+                barrier: matches!(s, S::Barrier | S::GroupBarrier),
             });
         }
         let mut pending: Option<Accesses> = None;
         for (i, node) in nodes.iter().enumerate() {
-            if node.barrier {
+            if matches!(body[node.site].statement, S::GroupBarrier) {
+                pending = Some(Accesses::default());
+            } else if node.barrier {
                 let mut next = Accesses::default();
                 let mut later = false;
                 for following in &nodes[i + 1..] {
@@ -529,7 +533,7 @@ mod tests {
     }
     #[test]
     fn strided_columns_coalesce_but_overlapping_bytes_and_wrapping_indices_do_not() {
-        use seismic_lang::ast::BinaryOp as B;
+        use seismic_lang::syntax::ast::BinaryOp as B;
         let coordinate = |column| {
             E::Binary(
                 B::Add,

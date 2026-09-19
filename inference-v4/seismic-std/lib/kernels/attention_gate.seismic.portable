@@ -1,8 +1,11 @@
 # Attention output gate: y = attended * sigmoid(gate), flattened over heads.
-fn attention_gate[H, W](attended: tensor[1, H, W] bf16, gate: tensor[1, H * W] bf16, y: tensor[1, H * W] bf16):
-  for h in parallel:
-    a = load(attended[0, h])
-    g = load(gate[0, h * W : (h + 1) * W])
-    r = tile[W] f32
-    for i in owned(r): r[i] = f32(a[i]) / (1.0 + exp(-f32(g[i])))
-    store(r, y[0, h * W : (h + 1) * W])
+export fn attention_gate[H, W](attended: tensor[1, H, W] bf16, gate: tensor[1, H * W] bf16, out y: tensor[1, H * W] bf16):
+    parallel [heads] in 0..H:
+        for h in heads:
+            let a = f32(attended[0, h])
+            let g = f32(gate[0, h * W : (h + 1) * W])
+            publish a / (1.0 + exp(-g)) to y[0, h * W : (h + 1) * W]
+
+lower attention_gate for metal = portable
+lower attention_gate for cpu = portable
+lower attention_gate for cuda = portable

@@ -1,55 +1,71 @@
-//! Full-model measurement with ordinary automatic selection and explicit hardware
-//! inputs. No physical implementation, tiling, or candidate flags are accepted.
-#[cfg(target_os = "macos")]
+//! Full-model measurement with ordinary automatic selection. Only a search budget is
+//! supplied; no physical implementation, tiling, or candidate flags are accepted.
+//! The report records each entry's selection status and estimates as estimates.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use seismic_accounting::{workload::DerivationLimits};
     use seismic_engine::models::qwen35::baseline::Baseline;
-    use seismic_runtime::{Device, plan::Settings, tuner::{Form, Hardware}};
+    use seismic_runtime::{plan::Settings, Device};
     use std::{path::Path, rc::Rc};
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 7 {
-        return Err("usage: qwen_baseline ARTIFACT METAL_HARDWARE_JSON CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON".into());
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Profile {
-        device_name: String,
-        evidence: Vec<String>,
-        assumptions: Vec<String>,
-        hardware: seismic_metal::model::Hardware,
-    }
-    let profile_bytes = std::fs::read(&args[2])?;
-    let profile: Profile = serde_json::from_slice(&profile_bytes)?;
-    profile.hardware.validate()?;
-    if profile.evidence.is_empty() || profile.assumptions.is_empty() {
-        return Err("hardware input requires identified evidence and explicit modeling assumptions".into());
-    }
-    let device = Rc::new(Device::metal()?);
-    let seismic_runtime::DeviceFacts::Metal(facts) = device.facts() else { unreachable!() };
-    if facts.name != profile.device_name { return Err("hardware profile does not identify this device".into()); }
-    let parse = |s: &str| s.split(',').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
-    let prompt = parse(&args[4])?;
-    let continuation = parse(&args[5])?;
-    let settings = Settings {
-        hardware: Hardware::Metal(profile.hardware), form: Form::Metal,
-        derivation_limits: DerivationLimits { instructions: 10_000_000, operations: 1_000_000 },
-        search: seismic_runtime::tuner::Settings { limits: seismic_runtime::tuner::Limits { work: 1_000_000, ..Default::default() }, ..Default::default() },
+    let mut args = args;
+    // `--device cpu|cuda|metal` may appear anywhere; the positional arguments are unchanged.
+    let target = match args.iter().position(|a| a == "--device") {
+        None => "metal".to_string(),
+        Some(at) => {
+            let value = args.get(at + 1).cloned().ok_or("--device requires cpu, cuda or metal")?;
+            args.drain(at..at + 2);
+            value
+        }
     };
+    // Likewise `--strategy exact|greedy`: how selection improves the seed (default exact).
+    let strategy = match args.iter().position(|a| a == "--strategy") {
+        None => seismic_runtime::Strategy::Exact,
+        Some(at) => {
+            let strategy = match args.get(at + 1).map(String::as_str) {
+                Some("exact") => seismic_runtime::Strategy::Exact,
+                Some("greedy") => seismic_runtime::Strategy::Greedy,
+                _ => return Err("--strategy requires exact or greedy".into()),
+            };
+            args.drain(at..at + 2);
+            strategy
+        }
+    };
+    if args.len() != 6 && args.len() != 7 {
+        return Err("usage: qwen_baseline ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON [exact|admitted] [--device cpu|cuda|metal] [--strategy exact|greedy]".into());
+    }
+    let numerics = match args.get(6).map(String::as_str) {
+        None | Some("admitted") => seismic_lang::family::Numerics::Admitted,
+        Some("exact") => seismic_lang::family::Numerics::Exact,
+        Some(other) => return Err(format!("unknown numerics `{other}`").into()),
+    };
+    let device = Rc::new(Device::open(&target)?);
+    let device_name = match device.facts() {
+        #[cfg(target_os = "macos")]
+        seismic_runtime::DeviceFacts::Metal(facts) => facts.name,
+        seismic_runtime::DeviceFacts::Cpu(facts) => format!("host CPU, {} workers", facts.workers),
+        seismic_runtime::DeviceFacts::Cuda(facts) => facts.name,
+    };
+    let parse = |s: &str| s.split(',').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+    let prompt = parse(&args[3])?;
+    let continuation = parse(&args[4])?;
+    let settings = Settings { numerics, strategy, ..Settings::default() };
     let result = (|| {
         eprintln!("loading artifact and selecting numerical imports");
-        let mut baseline = Baseline::load(Path::new(&args[1]), device, settings, args[3].parse().map_err(|e| format!("context: {e}"))?)?;
+        let mut baseline = Baseline::load(Path::new(&args[1]), device, settings, args[2].parse().map_err(|e| format!("context: {e}"))?)?;
         eprintln!("starting cold automatic full-model forward");
         baseline.measure(&prompt, &continuation)
     })();
-    use sha2::{Digest, Sha256};
     let record = match &result {
         Ok(report) => serde_json::json!({"status":"measured", "report": report}),
         Err(error) => serde_json::json!({"status":"not_measured", "error": error}),
     };
-    let profile_sha256 = Sha256::digest(&profile_bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    let record = serde_json::json!({"result": record, "hardware_profile_sha256": profile_sha256, "evidence": profile.evidence, "assumptions": profile.assumptions});
-    std::fs::write(&args[6], serde_json::to_vec_pretty(&record)?)?;
+    let record = serde_json::json!({
+        "result": record,
+        "device": device_name,
+        "backend": target,
+        "numerics": format!("{numerics:?}"),
+        "strategy": format!("{strategy:?}"),
+        "budget": {"work": settings.budget.work, "seconds": settings.budget.time.map(|t| t.as_secs_f64())},
+    });
+    std::fs::write(&args[5], serde_json::to_vec_pretty(&record)?)?;
     result.map(|_| ()).map_err(Into::into)
 }
-#[cfg(not(target_os = "macos"))]
-fn main() { eprintln!("This baseline entry point requires Metal on macOS."); std::process::exit(1); }

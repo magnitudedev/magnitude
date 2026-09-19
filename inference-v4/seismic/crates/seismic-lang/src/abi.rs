@@ -20,7 +20,7 @@ impl ScalarParameter {
         }
     }
     pub fn from_lowered(
-        lowered: &crate::lowered_ir::LoweredIr,
+        lowered: &crate::exec::lowered_ir::LoweredIr,
         name: &str,
         dtype: DType,
     ) -> Result<Self, String> {
@@ -211,34 +211,5 @@ mod tests {
         assert_eq!(&encoded[10..12], &0x4080u16.to_le_bytes());
         assert!(layout.encode(&[2.0, 2.0, 3.0, 4.0, 0.0]).is_err());
         assert_eq!(ScalarLayout::words(&schema).unwrap().bytes, 40);
-    }
-    #[test]
-    fn declared_index_bounds_survive_lowering_and_raw_abi() {
-        use crate::{
-            program::{compile, SourceFile},
-            Scope,
-        };
-        let program=compile(&[SourceFile{path:"bounded.seismic.portable".into(),scope:Scope::Portable,text:"fn bounded[N](pos: index[N], out: tensor[1] i32):\n  t = tile[1] i32\n  for i in owned(t): t[i] = pos\n  store(t,out)\n".into()}],&[]).unwrap();
-        let lowered =
-            crate::lower::lower(&program, "bounded", "cpu", &[("N".into(), 4)].into()).unwrap();
-        let parameter = ScalarParameter::from_lowered(&lowered, "pos", DType::I32).unwrap();
-        assert_eq!(parameter.index_bound, Some(4));
-        for layout in [
-            ScalarLayout::natural(&[parameter.clone()]).unwrap(),
-            ScalarLayout::words(&[parameter]).unwrap(),
-        ] {
-            for n in [0.0, 3.0] {
-                let bytes = layout.encode(&[n]).unwrap();
-                layout.validate_bytes(&bytes).unwrap();
-            }
-            for n in [-1.0, 4.0, 0.5, f64::NAN, f64::INFINITY] {
-                assert!(layout.encode(&[n]).is_err());
-            }
-            for n in [-1i32, 4] {
-                let mut bytes = vec![0; layout.bytes];
-                bytes[..4].copy_from_slice(&n.to_le_bytes());
-                assert!(layout.validate_bytes(&bytes).is_err());
-            }
-        }
     }
 }

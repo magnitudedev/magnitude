@@ -1,6 +1,6 @@
 //! Admission of replicated private values and unique uniform publications for a
 //! subgroup realization. This analysis uses inlined dataflow, not function names.
-use seismic_lang::{ast::AssignOp, ir::*, lowered_ir::LoweredIr, sym::Sym, types::Ty};
+use seismic_lang::{exec::ir::*, exec::lowered_ir::LoweredIr, exec::types::Ty, sym::Sym, syntax::ast::AssignOp};
 use std::collections::{HashMap,HashSet};
 
 pub(crate) fn required(function:&LoweredIr)->bool {
@@ -13,7 +13,6 @@ pub(crate) fn required(function:&LoweredIr)->bool {
     }}
     fn body(b:&[Stmt])->bool { b.iter().any(|s|match &s.kind{
         StmtKind::Lanes{..}=>true,
-        StmtKind::Reduction(r)=>r.bodies().any(|b|body(b)),
         StmtKind::Parallel{body:b,..}|StmtKind::Owned{body:b,..}|StmtKind::Range{body:b,..}|StmtKind::LoadLoop{body:b,..}=>body(b),
         StmtKind::If{cond,then,els}=>expr(cond)||body(then)||body(els),
         StmtKind::Assign{target,value,..}=>expr(target)||expr(value),StmtKind::Expr(e)=>expr(e),
@@ -97,7 +96,6 @@ impl Analysis<'_>{
                 self.loop_body(body,divergent||!full)?;
             }
             StmtKind::LoadLoop{vars,views,body,..}=>{for(&var,view)in vars.iter().zip(views){let u=self.expression(view,divergent)?;self.uniform.insert(var,u);}self.loop_body(body,divergent)?;}
-            StmtKind::Reduction(_)=>return Err("subgroup admission requires the selected reduction expansion".into()),
         }}Ok(())
     }
     fn loop_body(&mut self,body:&[Stmt],divergent:bool)->Result<(),String>{

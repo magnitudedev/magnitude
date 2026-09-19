@@ -5,11 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-magnitude-solver = { path = "../../../solver" }
-serde.workspace = true
 seismic-lang.workspace = true
 seismic-realization.workspace = true
-seismic-accounting.workspace = true
 seismic-compiler.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

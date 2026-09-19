@@ -1,13 +1,19 @@
 //! Semantic selection qualification; native automatic-selection qualification is separate.
-use seismic_lang::{
-    interp::{Arg, Interpreter, TensorData},
-    types::DType,
-};
+#[path = "support/reference.rs"]
+mod reference;
+use reference::{Arg, TensorData, WIDTHS};
+use seismic_lang::types::DType;
 use std::collections::HashMap;
 
+/// Selection is integral, so both partitionings must agree exactly.
 fn sample(rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]> {
+    let [narrow, wide] = WIDTHS.map(|width| sample_at(width, rows, masks, draws));
+    assert_eq!(narrow, wide);
+    wide
+}
+fn sample_at(width: i64, rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]> {
     let program = seismic_std::program().unwrap();
-    let mut vm = Interpreter::new(&program);
+    let mut vm = reference::interpreter(&program, width);
     let m = rows.len();
     let v = rows[0].len();
     let logits = vm.add_tensor(TensorData::dense(DType::F32, vec![m, v], rows.concat()));
@@ -22,7 +28,8 @@ fn sample(rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]>
         draws.iter().flatten().map(|&x| x as f64).collect(),
     ));
     let out = vm.add_tensor(TensorData::dense(DType::I32, vec![m, 2], vec![0.; m * 2]));
-    vm.run(
+    reference::run(
+        &mut vm,
         "sample_rows",
         &[
             Arg::Tensor(logits),
@@ -31,8 +38,7 @@ fn sample(rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]>
             Arg::Tensor(out),
         ],
         &HashMap::from([("M".into(), m as i64), ("V".into(), v as i64)]),
-    )
-    .unwrap();
+    );
     (0..m)
         .map(|i| {
             [

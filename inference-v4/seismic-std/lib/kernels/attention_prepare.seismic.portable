@@ -2,57 +2,52 @@
 # width R + S is RMS-normalized with its weight, its first R channels rotated (half split,
 # angle pos * theta^(-2i/R)), the key and value appended to the history, and the output
 # gate split off. The projection interleaves query and gate per head: [head][2][R + S].
-fn attention_prepare[H, G, R, S, T](qg: tensor[1, H * 2 * (R + S)] bf16, kin: tensor[1, G * (R + S)] bf16, vin: tensor[1, G * (R + S)] bf16,
-                                    qw: tensor[R + S] bf16, kw: tensor[R + S] bf16, pos: index[T], theta: f32, eps: f32,
-                                    q: tensor[1, H, R + S] bf16, gate: tensor[1, H * (R + S)] bf16,
-                                    k: tensor[T, G, R + S] bf16, v: tensor[T, G, R + S] bf16):
-  for h in parallel:
-    x = load(qg[0, h * 2 * (R + S) : h * 2 * (R + S) + (R + S)])
-    wt = load(qw)
-    sq = tile[R + S] f32
-    for i in owned(sq): sq[i] = f32(x[i]) * f32(x[i])
-    ss = reduce(sq, 0, sum)
-    inv = rsqrt(ss / f32(R + S) + eps)
-    n = tile[R + S] f32
-    for i in owned(n): n[i] = f32(x[i]) * inv * f32(wt[i])
-    y = tile[R + S] f32
-    for i in owned(y):
-      if i < R / 2:
-        angle = f32(pos) * exp(-log(theta) * f32(2 * i) / f32(R))
-        y[i] = n[i] * cos(angle) - n[i + R / 2] * sin(angle)
-      else:
-        if i < R:
-          angle = f32(pos) * exp(-log(theta) * f32(2 * (i - R / 2)) / f32(R))
-          y[i] = n[i] * cos(angle) + n[i - R / 2] * sin(angle)
-        else:
-          y[i] = n[i]
-    store(y, q[0, h])
-    g = load(qg[0, h * 2 * (R + S) + (R + S) : (h + 1) * 2 * (R + S)])
-    gc = tile[R + S] f32
-    for i in owned(gc): gc[i] = f32(g[i])
-    store(gc, gate[0, h * (R + S) : (h + 1) * (R + S)])
-  for g in parallel:
-    x = load(kin[0, g * (R + S) : (g + 1) * (R + S)])
-    wt = load(kw)
-    sq = tile[R + S] f32
-    for i in owned(sq): sq[i] = f32(x[i]) * f32(x[i])
-    ss = reduce(sq, 0, sum)
-    inv = rsqrt(ss / f32(R + S) + eps)
-    n = tile[R + S] f32
-    for i in owned(n): n[i] = f32(x[i]) * inv * f32(wt[i])
-    y = tile[R + S] f32
-    for i in owned(y):
-      if i < R / 2:
-        angle = f32(pos) * exp(-log(theta) * f32(2 * i) / f32(R))
-        y[i] = n[i] * cos(angle) - n[i + R / 2] * sin(angle)
-      else:
-        if i < R:
-          angle = f32(pos) * exp(-log(theta) * f32(2 * (i - R / 2)) / f32(R))
-          y[i] = n[i] * cos(angle) + n[i - R / 2] * sin(angle)
-        else:
-          y[i] = n[i]
-    store(y, k[pos, g])
-    vt = load(vin[0, g * (R + S) : (g + 1) * (R + S)])
-    vc = tile[R + S] f32
-    for i in owned(vc): vc[i] = f32(vt[i])
-    store(vc, v[pos, g])
+# Only history row `pos` is written, so `k` and `v` are `inout`.
+export fn attention_prepare[H, G, R, S, T](qg: tensor[1, H * 2 * (R + S)] bf16, kin: tensor[1, G * (R + S)] bf16, vin: tensor[1, G * (R + S)] bf16,
+                                           qw: tensor[R + S] bf16, kw: tensor[R + S] bf16, pos: index[T], theta: f32, eps: f32,
+                                           out q: tensor[1, H, R + S] bf16, out gate: tensor[1, H * (R + S)] bf16,
+                                           inout k: tensor[T, G, R + S] bf16, inout v: tensor[T, G, R + S] bf16):
+    parallel [heads] in 0..H:
+        let wt = f32(qw)
+        for h in heads:
+            let x = f32(qg[0, h * 2 * (R + S) : h * 2 * (R + S) + (R + S)])
+            let ss = reduce(x * x, 0, sum)
+            let inv = rsqrt(ss / f32(R + S) + eps)
+            let n = x * inv * wt
+            var y = tile[R + S] f32
+            for i in owned(y):
+                if i < R / 2:
+                    let angle = f32(pos) * exp(-log(theta) * f32(2 * i) / f32(R))
+                    y[i] = n[i] * cos(angle) - n[i + R / 2] * sin(angle)
+                else:
+                    if i < R:
+                        let angle = f32(pos) * exp(-log(theta) * f32(2 * (i - R / 2)) / f32(R))
+                        y[i] = n[i] * cos(angle) + n[i - R / 2] * sin(angle)
+                    else:
+                        y[i] = n[i]
+            publish y to q[0, h]
+            publish f32(qg[0, h * 2 * (R + S) + (R + S) : (h + 1) * 2 * (R + S)]) to gate[0, h * (R + S) : (h + 1) * (R + S)]
+    parallel [groups] in 0..G:
+        let wt = f32(kw)
+        for g in groups:
+            let x = f32(kin[0, g * (R + S) : (g + 1) * (R + S)])
+            let ss = reduce(x * x, 0, sum)
+            let inv = rsqrt(ss / f32(R + S) + eps)
+            let n = x * inv * wt
+            var y = tile[R + S] f32
+            for i in owned(y):
+                if i < R / 2:
+                    let angle = f32(pos) * exp(-log(theta) * f32(2 * i) / f32(R))
+                    y[i] = n[i] * cos(angle) - n[i + R / 2] * sin(angle)
+                else:
+                    if i < R:
+                        let angle = f32(pos) * exp(-log(theta) * f32(2 * (i - R / 2)) / f32(R))
+                        y[i] = n[i] * cos(angle) + n[i - R / 2] * sin(angle)
+                    else:
+                        y[i] = n[i]
+            publish y to k[pos, g]
+            publish f32(vin[0, g * (R + S) : (g + 1) * (R + S)]) to v[pos, g]
+
+lower attention_prepare for metal = portable
+lower attention_prepare for cpu = portable
+lower attention_prepare for cuda = portable

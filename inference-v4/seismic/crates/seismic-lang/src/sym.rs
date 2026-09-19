@@ -619,16 +619,6 @@ impl Facts {
         self.extra_lower.push((atom, lo));
     }
 
-    /// The current count of path bounds, for rolling a branch's additions back.
-    pub fn path_mark(&self) -> (usize, usize) {
-        (self.extra_upper.len(), self.extra_lower.len())
-    }
-
-    pub fn path_rollback(&mut self, mark: (usize, usize)) {
-        self.extra_upper.truncate(mark.0);
-        self.extra_lower.truncate(mark.1);
-    }
-
     /// Every known upper bound of an atom.
     pub fn uppers_of(&self, a: &Atom) -> Vec<Sym> {
         let mut out: Vec<Sym> = self.upper.get(a).cloned().into_iter().collect();

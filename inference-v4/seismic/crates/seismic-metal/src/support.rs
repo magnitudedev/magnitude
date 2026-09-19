@@ -1,8 +1,6 @@
 //! Structured implementation of compiler-introduced validity and scalar helpers.
 //! These are operation graphs, not timing constants. A backend renderer and its
 //! resource mapping consume the same definitions, including failure-path atomics.
-use seismic_lang::types::DType;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Helper {
     Index,
@@ -399,14 +397,6 @@ impl Definition {
         }
     }
 }
-/// Generic helper instantiations carry their actual element precision in model
-/// requests; `Element` alone is never a hardware instruction width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Invocation {
-    pub helper: Helper,
-    pub element: Option<DType>,
-}
-
 /// Exact unsigned arithmetic used to enter a selected Metal work item. These
 /// operations are shared source-level requests, not a native instruction count:
 /// target mappings may implement constant division with different instructions.

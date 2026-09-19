@@ -299,8 +299,9 @@ pub fn mlx_tokenizer(path: &Path, artifact_identity: String) -> Result<BpeConfig
     let data: Value = serde_json::from_str(&read(&path.join("tokenizer.json"), TOKENIZER_LIMIT)?)
         .map_err(|e| e.to_string())?;
     let model = &data["model"];
+    // An empty affix is no affix: newer `tokenizers` serializers write `""` for `None`.
     for key in ["dropout", "continuing_subword_prefix", "end_of_word_suffix"] {
-        if model.get(key).is_some_and(|v| !v.is_null()) {
+        if model.get(key).is_some_and(|v| !v.is_null() && v != "") {
             return Err(format!("unsupported BPE model option: {key}"));
         }
     }

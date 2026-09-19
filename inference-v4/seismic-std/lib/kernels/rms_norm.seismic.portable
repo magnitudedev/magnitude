@@ -1,10 +1,37 @@
-fn rms_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, out: tensor[R, W] V, eps: f32):
-  for row in parallel:
-    t = load(x[row])
-    sq = tile[W] f32
-    for i in owned(sq): sq[i] = f32(t[i]) * f32(t[i])
-    ss = reduce(sq, 0, sum)
-    wt = load(weight)
-    y = tile[W] f32
-    for i in owned(y): y[i] = f32(t[i]) * rsqrt(ss / f32(W) + eps) * f32(wt[i])
-    store(y, out[row])
+# Row RMS normalization in F32; publication rounds to the output element type. The square
+# sum is the admitted `sum_any_order` contract below: its ordered body keeps the ascending F32
+# sum, its reassociating body lets a backend combine lane partials.
+export fn rms_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, out y: tensor[R, W] V, eps: f32):
+    parallel [rows] in 0..R:
+        let w = f32(weight)
+        for row in rows:
+            let t = f32(x[row])
+            let ss = sum_any_order(t * t)
+            publish t * rsqrt(ss / f32(W) + eps) * w to y[row]
+
+lower rms_norm for metal = portable
+lower rms_norm for cpu = portable
+lower rms_norm for cuda = portable
+
+# The same normalization with the square sum folded by a scalar loop over the row: the
+# identical ascending F32 sum of the identical products, with no tile to reduce. Every
+# cooperating participant folds the whole row itself.
+export fn rms_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, out y: tensor[R, W] V, eps: f32):
+    parallel [rows] in 0..R:
+        let w = f32(weight)
+        for row in rows:
+            var ss = f32(0.0)
+            for i in 0..W:
+                let v = f32(x[row, i])
+                ss = ss + v * v
+            let t = f32(x[row])
+            publish t * rsqrt(ss / f32(W) + eps) * w to y[row]
+
+# F32 sum of a tile's elements under an admitted contract: the association of the additions
+# is unspecified. The first body is the ascending sum; the second permits a backend to combine
+# partial sums (`unordered=true`). Results of the two differ by F32 summation rounding only.
+admit fn sum_any_order[N](t: tile[N] f32) -> f32:
+    return reduce(t, 0, sum)
+
+admit fn sum_any_order[N](t: tile[N] f32) -> f32:
+    return reduce(t, 0, sum, unordered=true)

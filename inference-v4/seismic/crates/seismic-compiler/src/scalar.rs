@@ -6,12 +6,13 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, Variable};
 use seismic_lang::abi::ScalarParameter;
 use seismic_lang::{
-    ast::{AssignOp, BinaryOp, UnaryOp},
-    ir::{Builtin, Expr, ExprKind, Index, ReduceOp, Stmt, StmtKind, VarId, VarKind},
-    lowered_ir::LoweredIr,
+    exec::ir::{Builtin, Expr, ExprKind, Index, ReduceOp, Stmt, StmtKind, VarId, VarKind},
+    exec::lowered_ir::LoweredIr,
+    exec::types::Ty,
     repr,
     sym::{Atom, Sym},
-    types::{DType, Elem, Ty},
+    syntax::ast::{AssignOp, BinaryOp, UnaryOp},
+    types::{DType, Elem},
 };
 use seismic_realization::{
     execution::{ExecutionEvidence, MemoryObject, Multiplicity},
@@ -24,14 +25,6 @@ use std::sync::Arc;
 enum Storage {
     /// Logical shape/layout retained after all element-data uses disappear.
     Geometry,
-    /// A compile-time load ownership choice. Both storage definitions remain
-    /// typed in one CFG; the immutable template binds the selector at selection.
-    Snapshot {
-        selector: Value,
-        borrowed: Box<View>,
-        owned: Box<View>,
-        dtype: DType,
-    },
     Dense {
         pointer: Value,
         dtype: DType,
@@ -89,6 +82,13 @@ impl StrideLayout {
         self.choice.as_ref().map_or_else(||predicate(&self.strides),|choice|choice.yes.all(predicate)&&choice.no.all(predicate))
     }
 }
+/// The current value of a loop index and, when its loop bounds are static, the inclusive
+/// range it stays in. A tile extent that mentions the index takes its capacity from the range.
+#[derive(Clone, Copy)]
+struct IndexBinding {
+    value: Value,
+    range: Option<(i64, i64)>,
+}
 #[derive(Clone)]
 enum Binding {
     Scalar(Variable, DType),
@@ -128,7 +128,7 @@ pub(crate) struct Emitter<'a, 'b> {
     lowered: &'b LoweredIr,
     data_variables: HashSet<VarId>,
     bindings: HashMap<VarId, Binding>,
-    indices: HashMap<String, Value>,
+    indices: HashMap<String, IndexBinding>,
     constants: HashMap<String, i64>,
     dimensions: HashMap<String, Dimension>,
     scratch: Value,
@@ -136,10 +136,6 @@ pub(crate) struct Emitter<'a, 'b> {
     pub buffers: Vec<BufferSpec>,
     pub scalars: Vec<ScalarParameter>,
     pub execution: ExecutionEvidence,
-    pub load_literals: Vec<crate::template::ParameterLiteral>,
-    pub choice_joins: Vec<(ir::Inst, ir::Block)>,
-    pub load_choices: HashMap<VarId, usize>,
-    pub source_choices: HashMap<VarId,usize>,
     multiplicity: Arc<Multiplicity>,
 }
 fn scalar_type(d: DType) -> Result<ir::Type, String> {
@@ -190,7 +186,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
             imports: Vec::new(),
             backend_calls: Vec::new(), participation,
             lowered,
-            data_variables: seismic_lang::demand::data_variables(&lowered.body),
+            data_variables: seismic_lang::exec::demand::data_variables(&lowered.body),
             bindings: HashMap::new(),
             indices: HashMap::new(),
             constants: lowered.shapes.clone(),
@@ -208,17 +204,18 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     (scratch, MemoryObject::PrivateScratch),
                 ]),
             },
-            load_literals: Vec::new(),
-            choice_joins: Vec::new(),
-            load_choices: HashMap::new(),
-            source_choices: HashMap::new(),
             multiplicity: Arc::new(Multiplicity::Constant(1)),
         };
         for (parameter_index, (name, ty)) in lowered.params.iter().enumerate() {
             // Phase storage parameters are appended after existing locals. ABI
             // ordinals therefore need not equal IR variable identities.
-            let mut variables = lowered.vars.iter().enumerate().filter(|(_, variable)| {
-                matches!(variable.kind, VarKind::Param(index) if index == parameter_index)
+            // A bounded index parameter is an `Index` variable whose atom is the parameter
+            // name; expressions read it as that symbol, resolved from its scalar binding.
+            let bounded_index = lowered.index_params.iter().any(|(index, _)| index == name);
+            let mut variables = lowered.vars.iter().enumerate().filter(|(_, variable)| match &variable.kind {
+                VarKind::Param(index) => *index == parameter_index,
+                VarKind::Index(Atom::Param(atom)) => bounded_index && atom == name,
+                _ => false,
             });
             let (id, variable) = variables.next().ok_or_else(|| format!("entry parameter {name} has no IR variable"))?;
             if variables.next().is_some() || variable.ty != *ty || variable.name != *name {
@@ -346,15 +343,24 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     .iter()
                     .find_map(|(name, dimension)| (*s == Sym::param(name)).then_some(*dimension))
                 { return Ok(dimension); }
-                let (minimum, capacity) = s.eval_interval(&|name| {
-                    self.constants.get(name).map(|&n| (n,n)).or_else(||
-                        self.dimensions.get(name).map(|d| (0,d.capacity)))
-                }).filter(|(minimum, _)| *minimum >= 0)
+                let (minimum, capacity) = s.eval_interval(&|name| self.static_range(name)).filter(|(minimum, _)| *minimum >= 0)
                     .ok_or_else(|| format!("runtime tile extent `{s}` has no proven capacity"))?;
                 if minimum == capacity { return Ok(Dimension::fixed(capacity)); }
                 Ok(Dimension { capacity, extent: Some(self.sym(s)?) })
             })
             .collect()
+    }
+    /// The inclusive static range of a name an extent may mention: a workload constant, a
+    /// runtime dimension (zero to its capacity), a loop index with static bounds, or a
+    /// bounded index parameter of the entry.
+    fn static_range(&self, name: &str) -> Option<(i64, i64)> {
+        self.constants.get(name).map(|&n| (n, n))
+            .or_else(|| self.dimensions.get(name).map(|d| (0, d.capacity)))
+            .or_else(|| self.indices.get(name).and_then(|index| index.range))
+            .or_else(|| self.lowered.index_params.iter().find(|(index, _)| index == name)
+                .and_then(|(_, bound)| bound.eval(&|p| self.constants.get(p).copied()))
+                .filter(|bound| *bound > 0)
+                .map(|bound| (0, bound - 1)))
     }
     fn extent(&mut self, dim: Dimension) -> Value {
         dim.extent
@@ -383,8 +389,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 if let Some(dimension) = self.dimensions.get(name).copied() {
                     return Ok(self.extent(dimension));
                 }
-                if let Some(value) = self.indices.get(name) {
-                    return Ok(*value);
+                if let Some(index) = self.indices.get(name) {
+                    return Ok(index.value);
                 }
                 if let Some(value) = self.constants.get(name) {
                     return Ok(self.builder.ins().iconst(types::I64, *value));
@@ -407,10 +413,14 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 Err(format!("scalar realization unresolved index `{name}`"))
             }
             Atom::Quot(n, d) | Atom::Rem(n, d) => {
+                // Instantiation runs after selection with every width concrete, so a
+                // quotient or remainder divisor is always a compile-time constant here.
                 let divisor = d
                     .eval(&|p| self.constants.get(p).copied())
                     .filter(|n| *n > 0)
-                    .ok_or("scalar realization symbolic divisor must be a positive constant")?;
+                    .ok_or_else(|| format!(
+                        "scalar realization of `{a}`: divisor `{d}` is not a positive compile-time constant; instantiation must make every width and extent in a divisor concrete"
+                    ))?;
                 let value = self.sym(n)?;
                 let divisor = self.builder.ins().iconst(types::I64, divisor);
                 // Symbolic numerators may be negative. Match Sym's Euclidean semantics.
@@ -465,8 +475,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         self.switch_to_block(head);
         let index = self.builder.block_params(head)[0];
         let cond = self.builder.ins().icmp(IntCC::SignedLessThan, index, hi);
-        let branch=self.builder.ins().brif(cond, run, &[], done, &[]);
-        self.choice_joins.push((branch,done));
+        self.builder.ins().brif(cond, run, &[], done, &[]);
         self.switch_to_block(run);
         body(self, index)?;
         let next = self.builder.ins().iadd_imm(index, 1);
@@ -608,30 +617,6 @@ impl<'a, 'b> Emitter<'a, 'b> {
         let offset = self.offset(view, indices)?;
         match &view.storage {
             Storage::Geometry => Err("element read from geometry-only value".into()),
-            Storage::Snapshot { selector, borrowed, owned, dtype } => {
-                let selector = *selector;
-                let dtype = *dtype;
-                let borrowed = borrowed.clone();
-                let owned = owned.clone();
-                // The enclosing view's logical offset includes slices and
-                // transposes. Reinterpret it in the owning snapshot geometry
-                // before addressing the original possibly strided source.
-                let mut remaining = offset;
-                let mut original = Vec::with_capacity(owned.shape.len());
-                for (axis, dimension) in owned.shape.iter().enumerate() {
-                    let stride = owned.strides[axis];
-                    let index = self.builder.ins().udiv_imm(remaining, stride);
-                    remaining = self.builder.ins().urem_imm(remaining, stride);
-                    let capacity = self.builder.ins().iconst(types::I64, dimension.capacity);
-                    let valid = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, capacity);
-                    self.require(valid);
-                    original.push(index);
-                }
-                let value = self.choice_value(selector, scalar_type(dtype)?,
-                    |s| s.read(&borrowed, &original).map(|(v,_)| v),
-                    |s| s.read(&owned, &original).map(|(v,_)| v))?;
-                Ok((value, dtype))
-            },
             Storage::Dense { pointer, dtype } => self.read_dense(*pointer, offset, *dtype),
             Storage::Packed { planes, name } => {
                 let r = repr::lookup(name).ok_or("unknown packed representation")?;
@@ -1103,7 +1088,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         }
         let dtype = match &source.storage {
             Storage::Geometry => return Err("cannot materialize geometry-only value data".into()),
-            Storage::Dense { dtype, .. } | Storage::Snapshot { dtype, .. } => *dtype,
+            Storage::Dense { dtype, .. } => *dtype,
             Storage::Coefficient { name, .. } => repr::lookup(name)
                 .ok_or("unknown representation")?
                 .coefficient_dtype(),
@@ -1112,88 +1097,6 @@ impl<'a, 'b> Emitter<'a, 'b> {
         let target = self.tile(source.shape.clone(), dtype)?;
         self.copy(&source, &target)?;
         Ok(target)
-    }
-    fn choice_values(
-        &mut self,selector:Value,types:&[ir::Type],
-        yes_body:impl FnOnce(&mut Self)->Result<Vec<Value>,String>,
-        no_body:impl FnOnce(&mut Self)->Result<Vec<Value>,String>,
-    )->Result<Vec<Value>,String> {
-        let parent=self.multiplicity.clone();
-        let yes=self.block_with(Multiplicity::product(parent.clone(),Arc::new(Multiplicity::Predicate {value:selector,expected:true})));
-        let no=self.block_with(Multiplicity::product(parent.clone(),Arc::new(Multiplicity::Predicate {value:selector,expected:false})));
-        let join=self.block_with(parent);
-        for &ty in types {self.builder.append_block_param(join,ty);}
-        let branch=self.builder.ins().brif(selector,yes,&[],no,&[]);
-        self.choice_joins.push((branch,join));
-        self.switch_to_block(yes);
-        let values=yes_body(self)?;
-        if values.len()!=types.len() {return Err("retained choice result arity mismatch".into());}
-        let arguments=values.into_iter().map(Into::into).collect::<Vec<_>>();
-        self.builder.ins().jump(join,&arguments);
-        self.switch_to_block(no);
-        let values=no_body(self)?;
-        if values.len()!=types.len() {return Err("retained choice result arity mismatch".into());}
-        let arguments=values.into_iter().map(Into::into).collect::<Vec<_>>();
-        self.builder.ins().jump(join,&arguments);
-        self.switch_to_block(join);
-        Ok(self.builder.block_params(join).to_vec())
-    }
-    fn choice_value(
-        &mut self,selector:Value,ty:ir::Type,
-        yes_body:impl FnOnce(&mut Self)->Result<Value,String>,
-        no_body:impl FnOnce(&mut Self)->Result<Value,String>,
-    )->Result<Value,String> {
-        Ok(self.choice_values(selector,&[ty],|emitter|yes_body(emitter).map(|value|vec![value]),|emitter|no_body(emitter).map(|value|vec![value]))?[0])
-    }
-    fn ownership_selector(&mut self,variable:VarId,site:usize)->Value {
-        let selector=self.builder.ins().iconst(types::I8,0);
-        let ir::ValueDef::Result(instruction,_)=self.builder.func.dfg.value_def(selector) else {unreachable!()};
-        self.load_literals.push(crate::template::ParameterLiteral {parameter:site,variable,instruction});
-        selector
-    }
-    fn snapshot_choice(&mut self,variable:VarId,site:usize,source:View)->Result<View,String> {
-        if matches!(source.storage,Storage::Packed {..}) {return self.packed_snapshot_choice(variable,site,source);}
-        let dtype=match &source.storage {
-            Storage::Dense {dtype,..}|Storage::Snapshot {dtype,..}=>*dtype,
-            Storage::Coefficient {name,..}=>repr::lookup(name).ok_or("unknown representation")?.coefficient_dtype(),
-            Storage::Geometry=>return Err("conditional snapshot requires element data".into()),
-            Storage::Packed {..}=>unreachable!(),
-        };
-        let selector=self.ownership_selector(variable,site);
-        let pointer=self.choice_value(selector,types::I64,|emitter|Ok(emitter.scratch),|emitter| {
-            let target=emitter.tile(source.shape.clone(),dtype)?;
-            emitter.copy(&source,&target)?;
-            let Storage::Dense {pointer,..}=target.storage else {unreachable!()};
-            Ok(pointer)
-        })?;
-        let target=View {storage:Storage::Dense {pointer,dtype},publication:false,
-            offset:self.builder.ins().iconst(types::I64,0),strides:strides(&source.shape)?,shape:source.shape.clone(),selected_strides:None};
-        Ok(View {storage:Storage::Snapshot {selector,borrowed:Box::new(source),owned:Box::new(target.clone()),dtype},..target})
-    }
-    /// Plane allocation/addressing and encoded copies exist only in the owning
-    /// arm. The join carries each selected plane and its matching row geometry.
-    fn packed_snapshot_choice(&mut self,variable:VarId,site:usize,source:View)->Result<View,String> {
-        let Storage::Packed {planes:borrowed,name}=source.storage.clone() else {unreachable!()};
-        let representation=repr::lookup(&name).ok_or("unknown packed snapshot representation")?;
-        let capacities=source.shape.iter().map(|dimension|u64::try_from(dimension.capacity).map_err(|_|"negative packed snapshot capacity")).collect::<Result<Vec<_>,_>>()?;
-        let layout=representation.snapshot_layout(&capacities).ok_or("packed snapshot layout overflow")?;
-        let strides=layout.strides.iter().map(|&stride|i64::try_from(stride).map_err(|_|"packed snapshot stride exceeds integer range")).collect::<Result<Vec<_>,_>>()?;
-        let selector=self.ownership_selector(variable,site);
-        let values=self.choice_values(selector,&vec![types::I64;borrowed.len()+1],
-            |_|Ok(std::iter::once(source.offset).chain(borrowed).collect()),
-            |emitter| {
-                let mut planes=Vec::new();
-                for plane in layout.planes {
-                    let count=i64::try_from(plane.elements).map_err(|_|"packed snapshot plane exceeds integer range")?;
-                    let allocation=emitter.tile(vec![Dimension::fixed(count)],plane.plane.dtype())?;
-                    let Storage::Dense {pointer,..}=allocation.storage else {unreachable!()};planes.push(pointer);
-                }
-                let target=View {storage:Storage::Packed {planes:planes.clone(),name:name.clone()},publication:false,offset:emitter.builder.ins().iconst(types::I64,0),shape:source.shape.clone(),strides:strides.clone(),selected_strides:None};
-                let offset=emitter.copy_packed(&source,&target)?;
-                Ok(std::iter::once(offset).chain(planes).collect())
-            })?;
-        let selected_strides=Some(StrideChoice {selector,yes:StrideLayout::of(&source),no:StrideLayout {strides:strides.clone(),choice:None}});
-        Ok(View {storage:Storage::Packed {planes:values[1..].to_vec(),name},offset:values[0],publication:false,shape:source.shape,strides,selected_strides})
     }
     pub fn parallel_root(&mut self, body: &[Stmt], flat: Value) -> Result<u64, String> {
         let [stmt] = body else {
@@ -1223,7 +1126,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         for ((var, dimension), stride) in vars.iter().zip(&shape).zip(strides(&shape)?) {
             let q = self.builder.ins().udiv_imm(flat, stride);
             let index = self.builder.ins().urem_imm(q, dimension.capacity);
-            self.bind_index(*var, index)?;
+            self.bind_index(*var, index, Some((0, dimension.capacity - 1)))?;
         }
         self.body(body)?;
         Ok(count as u64)
@@ -1235,16 +1138,15 @@ impl<'a, 'b> Emitter<'a, 'b> {
         }
         Ok(())
     }
-    fn bind_index(&mut self, id: VarId, value: Value) -> Result<(), String> {
+    fn bind_index(&mut self, id: VarId, value: Value, range: Option<(i64, i64)>) -> Result<(), String> {
         let VarKind::Index(Atom::Param(name)) = &self.lowered.vars[id].kind else {
             return Err("invalid scalar realization loop binding".into());
         };
-        self.indices.insert(name.clone(), value);
+        self.indices.insert(name.clone(), IndexBinding { value, range });
         Ok(())
     }
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            StmtKind::Reduction(_) => Err("scalar emission requires materialized reduction choices".into()),
             StmtKind::Parallel {
                 vars,
                 extents,
@@ -1252,8 +1154,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
             } => {
                 let shape = self.shape(extents)?;
                 self.each(&shape, |s, indices| {
-                    for (var, index) in vars.iter().zip(indices) {
-                        s.bind_index(*var, *index)?;
+                    for ((var, index), dimension) in vars.iter().zip(indices).zip(&shape) {
+                        s.bind_index(*var, *index, Some((0, dimension.capacity - 1)))?;
                     }
                     s.body(body)
                 })
@@ -1261,17 +1163,20 @@ impl<'a, 'b> Emitter<'a, 'b> {
             StmtKind::Owned { vars, tile, body } => {
                 let tile = self.geometry(tile)?;
                 self.each(&tile.shape, |s, indices| {
-                    for (var, index) in vars.iter().zip(indices) {
-                        s.bind_index(*var, *index)?;
+                    for ((var, index), dimension) in vars.iter().zip(indices).zip(&tile.shape) {
+                        s.bind_index(*var, *index, Some((0, dimension.capacity - 1)))?;
                     }
                     s.body(body)
                 })
             }
             StmtKind::Range { var, lo, hi, body } => {
+                let range = lo.eval_interval(&|name| self.static_range(name))
+                    .zip(hi.eval_interval(&|name| self.static_range(name)))
+                    .map(|((least, _), (_, bound))| (least, bound - 1));
                 let lo = self.sym(lo)?;
                 let hi = self.sym(hi)?;
                 self.loop_range(lo, hi, |s, index| {
-                    s.bind_index(*var, index)?;
+                    s.bind_index(*var, index, range)?;
                     s.body(body)
                 })
             }
@@ -1319,7 +1224,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let old_bindings = self.bindings.clone();
                 let emit_piece =
                     |s: &mut Self, start: Value, dim: Dimension| -> Result<(), String> {
-                        if let Some(variable)=offset {s.bind_index(*variable,start)?;}
+                        if let Some(variable)=offset {s.bind_index(*variable,start,Some((0,(dimension.capacity-1).max(0))))?;}
                         if dim.extent.is_none() {
                             s.constants.insert(name.clone(), dim.capacity);
                         } else {
@@ -1338,10 +1243,8 @@ impl<'a, 'b> Emitter<'a, 'b> {
                             }
                             let delta = s.stride_delta(&view,axis,start)?;
                             view.offset = s.builder.ins().iadd(view.offset, delta);
-                            let tile = if let Some(&site) = s.load_choices.get(var) {
-                                s.snapshot_choice(*var, site, view)?
-                            } else if *mode == seismic_lang::ir::LoadMode::Borrow { view } else { s.materialize(view)? };
-                            if *mode == seismic_lang::ir::LoadMode::Borrow { s.bindings.insert(*var,Binding::View(tile)); } else { s.bind_tile(*var,tile); }
+                            let tile = if *mode == seismic_lang::exec::ir::LoadMode::Borrow { view } else { s.materialize(view)? };
+                            if *mode == seismic_lang::exec::ir::LoadMode::Borrow { s.bindings.insert(*var,Binding::View(tile)); } else { s.bind_tile(*var,tile); }
                         }
                         s.body(body)
                     };
@@ -1389,17 +1292,6 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             StmtKind::Assign { target, op, value } => {
                 if let ExprKind::Var(variable) = target.kind {
-                    if let Some(&parameter)=self.source_choices.get(&variable) {
-                        if *op!=AssignOp::Assign || !matches!(value.kind,ExprKind::Bool(false)) || self.bindings.contains_key(&variable) {
-                            return Err("source predicate parameter was altered after retained family formation".into());
-                        }
-                        let value=self.builder.ins().iconst(types::I8,0);
-                        let ir::ValueDef::Result(instruction,_)=self.builder.func.dfg.value_def(value) else {unreachable!()};
-                        self.load_literals.push(crate::template::ParameterLiteral {parameter,variable,instruction});
-                        let local=self.builder.declare_var(types::I8);self.builder.def_var(local,value);
-                        self.bindings.insert(variable,Binding::Scalar(local,DType::Bool));
-                        return Ok(());
-                    }
                     if matches!(target.ty, Ty::Tile(_)) && !self.data_variables.contains(&variable) {
                         if *op != AssignOp::Assign {
                             return Err("compound geometry-only tile assignment".into());
@@ -1414,18 +1306,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                         return Ok(());
                     }
                 }
-                if let (ExprKind::Var(variable), ExprKind::Load { view, .. }) = (&target.kind, &value.kind) {
-                    if let Some(&site) = self.load_choices.get(variable) {
-                        if *op != AssignOp::Assign || self.bindings.contains_key(variable) {
-                            return Err("conditional snapshot must define a fresh value".into());
-                        }
-                        let source = self.expr(view)?.view()?;
-                        let snapshot = self.snapshot_choice(*variable, site, source)?;
-                        self.bindings.insert(*variable, Binding::View(snapshot));
-                        return Ok(());
-                    }
-                }
-                if let (ExprKind::Var(var), ExprKind::Load { view, mode: seismic_lang::ir::LoadMode::Borrow }) = (&target.kind, &value.kind) {
+                if let (ExprKind::Var(var), ExprKind::Load { view, mode: seismic_lang::exec::ir::LoadMode::Borrow }) = (&target.kind, &value.kind) {
                     if *op != AssignOp::Assign || self.bindings.contains_key(var) {
                         return Err("borrowed load must define fresh tile storage".into());
                     }
@@ -1555,8 +1436,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     }),
                 ));
                 let join = self.block_with(parent);
-                let branch=self.builder.ins().brif(condition, yes, &[], no, &[]);
-                self.choice_joins.push((branch,join));
+                self.builder.ins().brif(condition, yes, &[], no, &[]);
                 let bindings = self.bindings.clone();
                 let indices = self.indices.clone();
                 let constants = self.constants.clone();
@@ -1604,7 +1484,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                         let run = s.block_with(s.multiplicity.clone());
                         let done = s.block_with(s.multiplicity.clone());
                         s.builder.ins().brif(valid, run, &[], done, &[]);
-                        s.switch_to_block(run);s.bind_index(*var,index)?;s.body(body)?;
+                        s.switch_to_block(run);s.bind_index(*var,index,None)?;s.body(body)?;
                         s.builder.ins().jump(done,&[]);s.switch_to_block(done);Ok(())
                     })
                 })
@@ -1630,7 +1510,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         Ok(lane)
     }
     fn index_value(&mut self, e: &Expr) -> Result<Value, String> {
-        if seismic_lang::effects::can_substitute_symbolic_value(e) {
+        if seismic_lang::exec::effects::can_substitute_symbolic_value(e) {
             if let Some(sym) = &e.sym {
                 return self.sym(sym);
             }
@@ -1699,7 +1579,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         // The source view was evaluated first. A proven target shape does not
         // erase effects in the expressions that supplied its dimensions.
         for dimension in args.iter().skip(1) {
-            if !seismic_lang::effects::can_substitute_symbolic_value(dimension) {
+            if !seismic_lang::exec::effects::can_substitute_symbolic_value(dimension) {
                 self.expr(dimension)?.scalar()?;
             }
         }
@@ -1977,7 +1857,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         match &e.kind {
             ExprKind::Load { view, mode } => {
                 let input = self.expr(view)?;
-                if *mode == seismic_lang::ir::LoadMode::Borrow {
+                if *mode == seismic_lang::exec::ir::LoadMode::Borrow {
                     return Err("borrowed load requires an explicit IR value binding".into());
                 }
                 match input {
@@ -2171,7 +2051,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let view = self.geometry(&args[0])?;
                 // A statically known axis can still carry a nested view check.
                 // Its evaluation follows the base view in source argument order.
-                if !seismic_lang::effects::can_substitute_symbolic_value(&args[1]) {
+                if !seismic_lang::exec::effects::can_substitute_symbolic_value(&args[1]) {
                     self.expr(&args[1])?.scalar()?;
                 }
                 let axis = args[1].sym.as_ref().and_then(Sym::as_constant)
@@ -2209,9 +2089,12 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     Builtin::Fma => self.builder.ins().fma(values[0], values[1], values[2]),
                     Builtin::Sqrt => self.builder.ins().sqrt(values[0]),
                     Builtin::Rsqrt => {
-                        let root = self.builder.ins().sqrt(values[0]);
-                        let one = self.builder.ins().f32const(1.0);
-                        self.builder.ins().fdiv(one, root)
+                        // The reference evaluates `1 / sqrt(x)` in binary64 and rounds once.
+                        let wide = self.builder.ins().fpromote(types::F64, values[0]);
+                        let root = self.builder.ins().sqrt(wide);
+                        let one = self.builder.ins().f64const(1.0);
+                        let quotient = self.builder.ins().fdiv(one, root);
+                        self.builder.ins().fdemote(types::F32, quotient)
                     }
                     Builtin::Abs => self.builder.ins().fabs(values[0]),
                     Builtin::Exp
@@ -2295,11 +2178,11 @@ impl<'a, 'b> Emitter<'a, 'b> {
             .and_then(Sym::as_constant)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or("scalar realization reduction axis unresolved")?;
-        let operation = match args[2].kind { ExprKind::Int(tag) => seismic_lang::ir::ReduceOp::from_tag(tag), _ => None }
+        let operation = match args[2].kind { ExprKind::Int(tag) => seismic_lang::exec::ir::ReduceOp::from_tag(tag), _ => None }
             .ok_or("scalar realization reduction operation unresolved")?;
         let dtype = match &source.storage {
             Storage::Geometry => return Err("reduction reads geometry-only value data".into()),
-            Storage::Dense { dtype, .. } | Storage::Snapshot { dtype, .. } => *dtype,
+            Storage::Dense { dtype, .. } => *dtype,
             Storage::Coefficient { name, .. } => repr::lookup(name).ok_or("unknown representation")?.coefficient_dtype(),
             Storage::Packed { .. } => {
                 return Err(
@@ -2307,7 +2190,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 )
             }
         };
-        let contract = seismic_lang::reduction::Contract::new(operation, dtype,
+        let contract = seismic_lang::exec::reduction::Contract::new(operation, dtype,
             matches!(args.get(3).map(|e| &e.kind), Some(ExprKind::Bool(true))));
         let extent = *source
             .shape

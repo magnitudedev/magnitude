@@ -5,35 +5,89 @@ replacement for V3 or a qualified release.
 
 Start with the [architecture overview](docs/overview.md), then the
 [engine](docs/engine/overview.md) and [Seismic](docs/seismic/overview.md) contracts.
-These local docs define intended architecture. The [master implementation spec](/Users/anerli/notes/specs/26-09-17/inference-v4-master.md)
-and [accounting research/spec](/Users/anerli/notes/specs/26-09-17/seismic-accounting.md)
-provide implementation context; older conflicting mechanisms are superseded by the
-local architectural contracts. V3's active behavior and numerical contracts remain
-the preservation reference.
+These local docs are normative. Seismic is governed by the
+[structured authoring spec](../specs/26-09-18/seismic-structured-authoring-spec.md);
+the [implementation plan](../specs/26-09-19/seismic-structured-authoring-implementation-plan.md)
+records the decisions taken where the spec is silent. The
+[master implementation spec](/Users/anerli/notes/specs/26-09-17/inference-v4-master.md)
+gives engine context; where it describes Seismic differently, the structured
+authoring spec and the local docs win. V3's active behavior and numerical contracts
+remain the preservation reference.
 
-Current packages are the audited foundation: language/checker/interpreter, Metal
-emission/runtime, a shared scalar realization with native CPU/CUDA execution, derived
-accounting, a device-free Rust artifact/Qwen binding layer, and development CLI. The existing Qwen decode
-harness lives under `validation/qwen35-poc`; it is a development reference, not the
-production engine. New owners are added as their implementations are introduced.
+## Status
 
-From this directory:
+- **Seismic** is a language of authored execution structure with joint selection of
+  implementations, contiguous fusion groups, and numerical sites. Pipeline: check →
+  structured IR → joint family → budgeted selection → instantiation → Metal
+  realization → MSL → native kernel. A checked feasible witness is executable.
+- **Metal, the CPU and CUDA are the backends** on this pipeline. Metal is the reference
+  backend. The CPU (Cranelift) and CUDA (PTX) backends cover the same structure with scalar
+  code only; both agree bit for bit with the reference interpreter on the kernel table under
+  exact numerics.
+- **Qwen3.5-4B runs prefill and decode on Metal through this pipeline**, with every
+  kernel authored in Seismic and logits matching the V3 reference. Performance work
+  is ongoing; the estimate model behind selection is unqualified and no performance
+  claim is made here.
+- The engine owns artifacts (MLX and GGUF import through Seismic kernels), Qwen3.5
+  geometry, state, generation, chat, and serving.
+
+## Commands
+
+From this directory. Run one Cargo process at a time.
+
+Check every library source for Metal:
 
 ```sh
-cargo test --workspace
-cargo run -p seismic-cli -- check seismic-std/lib
-cargo run -p seismic-cli -- account seismic-std/lib --fn projection --shape N=128,K=256
-cargo run -p seismic-cli -- run seismic-std/lib --fn projection --shape N=128,K=256 --target cpu
+cargo run -p seismic-cli -- check seismic-std/lib engine/lib --targets metal
 ```
 
-Metal execution is available on macOS. CUDA scalar execution uses the installed driver
-and requires an explicit block-size candidate; neither backend is performance-qualified.
-`account --target cpu|cuda` also reports concrete SSA requests and scratch, separate
-from physical transactions or runtime predictions. `--loads borrow-proven` is an
-explicit alternative to materialized snapshots, not automatic tuning. The validation-only Qwen harness requires
-`--features metal-poc`; it is excluded from ordinary portable workspace builds.
+Inspect a selection (occurrences, candidates, sites, covers, seed and selected
+witness, estimates, proof status), or print the MSL of the selected witness:
 
-Read [validation/continuation.md](validation/continuation.md) for actual progress,
-known limitations and the next concrete steps. Generated evidence belongs under the
-ignored `validation/results/` directory; small identity/qualification manifests belong
-in source control.
+```sh
+cargo run -p seismic-cli -- select seismic-std/lib --fn linear --shape M=4,N=5,K=64 --element T=bf16,U=q4g64,V=bf16
+cargo run -p seismic-cli -- emit   seismic-std/lib --fn linear --shape M=4,N=5,K=64 --element T=bf16,U=q4g64,V=bf16
+```
+
+`--shape` binds every shape parameter of the entry and `--element` every element
+parameter. `select` and `emit` use the local Metal device's limits when one opens and
+documented default limits otherwise. There are no implementation, tiling, or
+candidate flags: those decisions belong to selection. Related commands:
+`analyze-search` (search structure of an entry, same flags), `bindings` (Rust
+bindings of an entry), `print` (canonical source).
+
+Metal kernel sweep — every standard kernel the Qwen path uses is selected, compiled,
+run on Metal, and compared with the reference interpreter:
+
+```sh
+cargo test -p seismic-runtime --test kernels -- --ignored
+```
+
+Engine reference tests — the structured interpreter against the V3 reference
+fixtures, under two partitions each (device-free):
+
+```sh
+cargo test -p seismic-engine --test sequence_program --test attention_step \
+    --test recurrent_step --test rotary_prepare --test routed --test sampling
+```
+
+Interpreter against Metal at real Qwen3.5-4B dimensions:
+
+```sh
+cargo test -p seismic-engine --test qwen_metal_reference -- --ignored
+```
+
+Full-model prefill and decode on Metal:
+
+```sh
+cargo run --release -p seismic-engine --example qwen_baseline -- \
+    ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON
+```
+
+`ARTIFACT` is the model artifact path, `CONTEXT` the context length,
+`PROMPT_IDS` and `CONTINUATION_IDS` comma-separated token ids, and `OUTPUT_JSON` the
+report path. The report records each entry's selection status and estimates, labelled
+as estimates, beside measured times. Only a search budget is configurable.
+
+Generated evidence belongs under the ignored `validation/results/` directory; small
+identity and qualification manifests belong in source control.

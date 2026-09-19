@@ -10,7 +10,7 @@ use crate::{
     reduction::{ReductionPlan, Site},
     storage::StoragePlan,
 };
-use seismic_lang::{ir::*, sym::Sym, types::Ty};
+use seismic_lang::{exec::ir::*, exec::types::Ty, sym::Sym};
 use seismic_realization::dispatch::{GroupDispatch, TileDeclaration, TilePlacement};
 use seismic_realization::execution::Multiplicity;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,7 +22,6 @@ pub use lifetime::Interval;
 pub enum Purpose {
     Value,
     ReductionInput,
-    Merge,
     PacketPlane(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -55,19 +54,13 @@ pub struct AllocationChoices {
     pub alternatives: Vec<usize>,
     pub new_slot: usize,
 }
-impl seismic_accounting::choices::Choices for AllocationChoices {
-    type Alternative = usize;
-    fn len(&self) -> usize {
-        self.alternatives.len()
-    }
-    fn get(&self, index: usize) -> Option<usize> {
-        self.alternatives.get(index).copied()
-    }
-}
 /// Memory accesses ordered among lanes of one SIMD group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemorySpace {
     Threadgroup,
+    /// Memory accesses ordered among every thread of the threadgroup: the outer owner of a
+    /// launch whose SIMD groups are inner owners publishes to them, and they complete to it.
+    Group,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BarrierPurpose {
@@ -75,9 +68,11 @@ pub enum BarrierPurpose {
     Copy,
     Owned,
     Lanes,
-    Merge,
     IntrinsicStore,
     Reuse(Purpose),
+    /// Completion of an inner owner region: every SIMD group of the threadgroup has finished
+    /// its visit before the outer owner continues. The site names the region's first binder.
+    Owners,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BarrierSite {
@@ -89,7 +84,7 @@ pub struct BarrierSite {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlValue {
     Integer(seismic_lang::sym::Sym),
-    Predicate(Box<seismic_lang::ir::Expr>),
+    Predicate(Box<seismic_lang::exec::ir::Expr>),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Barrier {
@@ -115,14 +110,13 @@ pub struct LaunchMemory {
     pub fragments: Vec<crate::collective::FragmentAllocation>,
     pub collectives: BTreeMap<crate::collective::Site, crate::collective::Collective>,
 }
-/// Device storage carrying a split phase's partial values to its merge launch.
+/// Device storage carrying a value retained from its producing launch to its consumers.
 /// Buffers currently have separate allocations; producer/consumer identities
 /// describe the required lifetime, not an assertion that reuse is implemented.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScratchAllocation {
     pub index: usize,
     /// Internal tensor parameter for an ordinary cross-phase retained value.
-    /// Split-reduction scratch has no parameter binding.
     pub parameter: Option<usize>,
     pub phase: usize,
     pub variable: VarId,
@@ -184,7 +178,7 @@ impl MemoryPlan {
                     if allocation.lifetime.overlaps(other.lifetime) {
                         return Err("simultaneously live allocations share storage".into());
                     }
-                    if slot.placement == TilePlacement::GroupShared
+                    if slot.placement.group_memory()
                         && (!allocation.uniform
                             || !launch.barriers.contains_key(&BarrierSite {
                                 operation: allocation.id.operation,
@@ -244,8 +238,8 @@ impl MemoryPlan {
     ) -> Result<Self, String> {
         let mut ends = Vec::with_capacity(phases.len());
         let mut launches = 0usize;
-        for phase in phases {
-            launches += 1 + usize::from(phase.split.is_some());
+        for _ in phases {
+            launches += 1;
             ends.push(launches - 1);
         }
         if launches != self.launches.len() { return Err("retained phase/launch count differs".into()); }
@@ -262,101 +256,80 @@ impl MemoryPlan {
         }
         Self::new(self.launches, scratch)
     }
-    /// Substitute launch geometry into retained allocation identities and slot
-    /// assignments. Lifetime analysis, storage selection and allocation discovery
-    /// have already completed; geometry changes do not replay those passes.
-    pub(crate) fn redispatch(&self, phases: &[Phase]) -> Result<Self, String> {
-        let mut launches = self.launches.clone();
-        let mut index = 0usize;
-        for phase in phases {
-            for (dispatch, parts) in std::iter::once((&phase.dispatch, phase.parts as u64))
-                .chain(phase.merge_dispatch.iter().map(|dispatch| (dispatch, 1))) {
-                let launch = launches.get_mut(index).ok_or("retained allocation launch is missing")?;
-                launch.prologue = crate::support::LaunchRecipe::new(phase.mapping.clone(), parts)?;
-                launch.prologue.instantiate(dispatch)?;
-                let mut shared = 0u64;
-                let mut private = 0u64;
-                for slot in &launch.slots {
-                    let layout = slot.layout(dispatch)?;
-                    shared = shared.checked_add(layout.shared_bytes_per_group).ok_or("retained shared storage overflow")?;
-                    private = private.checked_add(layout.private_bytes_per_lane).ok_or("retained private storage overflow")?;
-                }
-                launch.shared_bytes_per_group = shared;
-                launch.declared_private_bytes_per_lane = private;
-                index += 1;
-            }
-        }
-        if index != launches.len() { return Err("retained allocation launch count changed".into()) }
-        let mut scratch = self.scratch.clone();
-        for allocation in &mut scratch {
-            if allocation.parameter.is_some() { continue; }
-            let phase = phases.get(allocation.phase).ok_or("retained scratch phase is missing")?;
-            allocation.work_items = phase.merge_dispatch.as_ref().map_or(0, |dispatch| dispatch.work_items);
-            allocation.parts = phase.parts as u64;
-            allocation.bytes = allocation.work_items.checked_mul(allocation.parts)
-                .and_then(|count| count.checked_mul(allocation.elements_per_item))
-                .and_then(|count| count.checked_mul(u64::from(allocation.dtype.bytes())))
-                .and_then(|bytes| usize::try_from(bytes).ok()).ok_or("retained scratch size overflow")?;
-        }
-        Self::new(launches, scratch)
-    }
     pub fn launches(&self) -> &[LaunchMemory] {
         &self.launches
     }
 }
 
-pub fn plan(
-    vars: &[Var],
-    body: &[Stmt],
-    phases: &[Phase],
-    storage: &StoragePlan,
-    reductions: &ReductionPlan,
-    shared_limit: u64,
-) -> Result<MemoryPlan, String> {
-    plan_selected(
-        vars,
-        body,
-        phases,
-        storage,
-        reductions,
-        shared_limit,
-        &mut |choice| Ok(choice.new_slot),
-    )
+/// Tensor storage a launch may have written so far. A store or element assignment names
+/// its destination; any other tensor effect (call, atomic, writing intrinsic) is unknown.
+#[derive(Clone, Debug, Default)]
+struct TensorWrites {
+    unknown: bool,
+    roots: HashSet<VarId>,
 }
-pub fn plan_selected(
-    vars: &[Var],
-    body: &[Stmt],
-    phases: &[Phase],
-    storage: &StoragePlan,
-    reductions: &ReductionPlan,
-    shared_limit: u64,
-    select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
-) -> Result<MemoryPlan, String> {
-    plan_mode(vars, body, phases, storage, reductions, shared_limit, select, false)
+impl TensorWrites {
+    fn record(&mut self, statement: &Stmt) {
+        let effect = |e: &Expr| seismic_lang::exec::effects::tensor_effect(&Stmt { id: None, span: e.span, kind: StmtKind::Expr(e.clone()) });
+        match &statement.kind {
+            StmtKind::Parallel { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } | StmtKind::Owned { body, .. }
+            | StmtKind::LoadLoop { body, .. } => {
+                // Effects in the loop's own operands are classified with the whole statement.
+                let mut shell = statement.clone();
+                match &mut shell.kind {
+                    StmtKind::Parallel { body, .. } | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. } | StmtKind::Owned { body, .. }
+                    | StmtKind::LoadLoop { body, .. } => body.clear(),
+                    _ => {}
+                }
+                self.unknown |= seismic_lang::exec::effects::tensor_effect(&shell);
+                body.iter().for_each(|s| self.record(s));
+            }
+            StmtKind::If { cond, then, els } => {
+                self.unknown |= effect(cond);
+                then.iter().chain(els).for_each(|s| self.record(s));
+            }
+            StmtKind::Expr(Expr { kind: ExprKind::Builtin { name: Builtin::Store, args }, .. }) if args.len() == 2 && !args.iter().any(effect) => {
+                match crate::storage::tile_root(&args[1]) {
+                    Some(root) => {
+                        self.roots.insert(root);
+                    }
+                    None => self.unknown = true,
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.unknown |= effect(target) || effect(value);
+                if let ExprKind::Index { base, .. } = &target.kind {
+                    if matches!(base.ty, Ty::Tensor(_)) {
+                        match crate::storage::tile_root(base) {
+                            Some(root) => {
+                                self.roots.insert(root);
+                            }
+                            None => self.unknown = true,
+                        }
+                    }
+                }
+            }
+            StmtKind::Expr(_) => self.unknown |= seismic_lang::exec::effects::tensor_effect(statement),
+        }
+    }
 }
-/// Discover every allocation request and synchronization site in the typed
-/// union. Storage alternatives and backing reuse are bound separately; this
-/// metadata is never submitted as a selected implementation.
-pub(crate) fn plan_template(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePlan,
-    reductions: &ReductionPlan) -> Result<MemoryPlan, String> {
-    plan_mode(vars, body, phases, storage, reductions, u64::MAX, &mut |choice| Ok(choice.new_slot), true)
-}
-fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePlan, reductions: &ReductionPlan,
-    shared_limit: u64, select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>, retained: bool) -> Result<MemoryPlan, String> {
+pub fn plan_selected<'a>(vars: &'a [Var], body: &'a [Stmt], phases: &'a [Phase], storage: &'a StoragePlan, reductions: &'a ReductionPlan,
+    disjoint: &'a [seismic_lang::exec::lowered_ir::AliasRequirement], shared_limit: u64, select: &mut dyn FnMut(&AllocationChoices) -> Result<usize, String>) -> Result<MemoryPlan, String> {
     let lifetimes = lifetime::Analysis::new(body)?;
     struct Planner<'a> {
-        retained: bool,
         lifetimes: &'a lifetime::Analysis,
         select: &'a mut dyn FnMut(&AllocationChoices) -> Result<usize, String>,
-        split_launch: bool,
         vars: &'a [Var],
         uniform: HashSet<VarId>,
         uniform_views: HashSet<VarId>,
         uniform_atoms: HashSet<seismic_lang::sym::Atom>,
-        /// Tensor reads at a common address agree until this launch can write
-        /// tensor memory. A containing loop's effects apply before its body, so
-        /// the fact cannot accidentally describe only the first iteration.
-        uniform_tensor_reads: bool,
+        /// Tensor reads at a common address agree unless this launch can write the
+        /// tensor read. A containing loop's effects apply before its body, so the
+        /// fact cannot accidentally describe only the first iteration.
+        tensor_writes: TensorWrites,
+        /// The entry's disjointness contract: a write to one parameter leaves every
+        /// parameter it is required to be disjoint from unchanged.
+        disjoint: &'a [seismic_lang::exec::lowered_ir::AliasRequirement],
         storage: &'a StoragePlan,
         reductions: &'a ReductionPlan,
         bound: HashMap<VarId, Option<TilePlacement>>,
@@ -370,8 +343,32 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
         /// True when some lanes may skip this lexical scope. Uniformity is
         /// derived conservatively from parameter/index/scalar dataflow.
         partial_owned: bool,
+        /// Inside an inner owner region: the participants are the lanes of one SIMD group, so
+        /// a publication here is ordered among them only; the region's completion barrier
+        /// orders it for the rest of the threadgroup.
+        inner_owner: bool,
     }
     impl Planner<'_> {
+        /// No write of this launch so far can have changed the tensor `view` reads.
+        fn unwritten(&self, view: &Expr) -> bool {
+            if self.tensor_writes.unknown {
+                return false;
+            }
+            if self.tensor_writes.roots.is_empty() {
+                return true;
+            }
+            let parameter = |v: VarId| match self.vars.get(v).map(|var| &var.kind) {
+                Some(VarKind::Param(ordinal)) => Some(*ordinal),
+                _ => None,
+            };
+            let Some(read) = crate::storage::tile_root(view).and_then(parameter) else { return false };
+            self.tensor_writes.roots.iter().all(|&written| {
+                parameter(written).is_some_and(|written| {
+                    written != read
+                        && self.disjoint.iter().any(|r| !r.exact_allowed && ((r.left, r.right) == (read, written) || (r.left, r.right) == (written, read)))
+                })
+            })
+        }
         fn uniform_sym(&self, value: &Sym) -> bool {
             value.atoms().iter().all(|atom| {
                 self.uniform_atoms.contains(atom)
@@ -427,7 +424,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                 ExprKind::Binary { lhs, rhs, .. } => {
                     self.uniform_value(lhs) && self.uniform_value(rhs)
                 }
-                ExprKind::Index { base, indices } => self.uniform_tensor_reads
+                ExprKind::Index { base, indices } => self.unwritten(base)
                     && matches!(base.ty, Ty::Tensor(_))
                     && self.uniform_view(base)
                     && indices.iter().all(
@@ -477,7 +474,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             purpose: BarrierPurpose,
             memory: MemorySpace,
         ) -> Result<(), String> {
-            if self.partial_owned && !self.retained {
+            if self.partial_owned {
                 return Err(format!(
                     "memory barrier {purpose:?} at {operation:?} requires proven full-lane participation inside owned or conditional control"
                 ));
@@ -510,8 +507,11 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             purpose: BarrierPurpose,
             placement: Option<TilePlacement>,
         ) -> Result<(), String> {
-            if self.retained || placement == Some(TilePlacement::GroupShared) {
-                self.barrier(operation, variable, purpose, MemorySpace::Threadgroup)?;
+            match placement {
+                // The outer owner's threads are the whole threadgroup.
+                Some(TilePlacement::GroupWide) if !self.inner_owner => self.barrier(operation, variable, purpose, MemorySpace::Group)?,
+                Some(TilePlacement::GroupShared | TilePlacement::GroupWide) => self.barrier(operation, variable, purpose, MemorySpace::Threadgroup)?,
+                _ => {}
             }
             Ok(())
         }
@@ -547,21 +547,12 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             self.arrays.push(ArrayAllocation {
                 id,
                 declaration: declaration.clone(),
-                scope: if declaration.placement
-                    == seismic_realization::dispatch::TilePlacement::GroupShared
-                {
+                scope: if declaration.placement.group_memory() {
                     self.scope[..1].to_vec()
                 } else {
                     self.scope.clone()
                 },
-                lifetime: if self.split_launch {
-                    Interval {
-                        begin: 0,
-                        end: usize::MAX,
-                    }
-                } else {
-                    self.lifetimes.interval(operation, variable)?
-                },
+                lifetime: self.lifetimes.interval(operation, variable)?,
                 slot: usize::MAX,
                 uniform: !self.partial_owned,
                 executions: self.executions.clone(),
@@ -584,7 +575,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                             Purpose::PacketPlane(plane),
                             TileDeclaration {
                                 symbol: format!("{}_{}", selected.symbol, part.plane.name),
-                                dtype: part.plane.dtype(),
+                                dtype: seismic_realization::dispatch::local_storage_dtype(part.plane.dtype(), false),
                                 capacity: part.elements,
                                 placement: selected.placement.clone(),
                             },
@@ -626,7 +617,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                     for arg in args {
                         self.expression(arg, operation, ordinal, None)?;
                     }
-                    if self.partial_owned && op.collective() && !self.retained {
+                    if self.partial_owned && op.collective() {
                         return Err("subgroup intrinsic requires full-lane participation".into());
                     }
                     if matches!(
@@ -715,7 +706,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                 // Reuse the language's effect classification, including effects
                 // anywhere in a repeated body. Private tile storage has separate
                 // per-lane values and never acquires this tensor-read fact.
-                self.uniform_tensor_reads &= !seismic_lang::effects::tensor_effect(statement);
+                self.tensor_writes.record(statement);
                 let operation = statement
                     .id
                     .ok_or("allocation planning requires operation identities")?;
@@ -883,17 +874,26 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                         }
                         if !self.partial_owned
                             && self.uniform_value(value)
-                            && (*op == seismic_lang::ast::AssignOp::Assign
+                            && (*op == seismic_lang::syntax::ast::AssignOp::Assign
                                 || self.uniform.contains(&var))
                         {
                             self.uniform.insert(var);
                         } else {
                             self.uniform.remove(&var);
                         }
+                        // A borrowed load of a view of a tile in the group's shared memory
+                        // lives there: matrix atoms address it in place.
+                        let resident = match &value.kind {
+                            ExprKind::Load { mode: LoadMode::Borrow, view } => crate::storage::tile_root(view)
+                                .and_then(|root| self.bound.get(&root).cloned())
+                                .flatten()
+                                .filter(TilePlacement::group_memory),
+                            _ => None,
+                        };
                         if matches!(target.ty, Ty::Tile(_)) && !self.storage.requires_data(var) {
                             // Geometry assignments retain their scalar/view
                             // evaluation but create no element lifetime or copy.
-                            self.bound.entry(var).or_insert(None);
+                            self.bound.entry(var).or_insert(resident);
                             continue;
                         }
                         match &value.kind {
@@ -950,10 +950,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                                     operation,
                                     output: var,
                                 })?;
-                                let input_request = selected.decision.materialize_input || (self.retained
-                                    && selected.decision.contract.operation != ReduceOp::Argmax
-                                    && self.storage.declaration(selected.decision.input).is_ok());
-                                if input_request {
+                                if selected.decision.materialize_input {
                                     self.snapshot(
                                         operation,
                                         selected.decision.input,
@@ -986,7 +983,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                             }
                             _ => {}
                         }
-                        self.bound.entry(var).or_insert(None);
+                        self.bound.entry(var).or_insert(resident);
                     }
                     StmtKind::Owned {
                         vars: indices,
@@ -1018,18 +1015,24 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                         // The iteration domain need not be its only publication.
                         // A distributed owner can also write a shared tile whose
                         // next consumer uses different lane coordinates.
-                        fn shared_writes(body: &[Stmt], bound: &std::collections::HashMap<VarId, Option<TilePlacement>>) -> bool {
-                            body.iter().any(|s| match &s.kind {
+                        /// The widest group-memory placement among the element writes of `body`.
+                        fn shared_writes(body: &[Stmt], bound: &std::collections::HashMap<VarId, Option<TilePlacement>>) -> Option<TilePlacement> {
+                            let wider = |a: Option<TilePlacement>, b: Option<TilePlacement>| if a == Some(TilePlacement::GroupWide) || b.is_none() { a } else { b };
+                            body.iter().fold(None, |found, s| wider(found, match &s.kind {
                                 StmtKind::Assign { target, .. } if matches!(target.kind, ExprKind::Index { .. }) =>
-                                    crate::storage::tile_root(target).is_some_and(|v| bound.get(&v) == Some(&Some(TilePlacement::GroupShared))),
-                                StmtKind::If { then, els, .. } => shared_writes(then, bound) || shared_writes(els, bound),
+                                    crate::storage::tile_root(target).and_then(|v| bound.get(&v).cloned().flatten()).filter(TilePlacement::group_memory),
+                                StmtKind::If { then, els, .. } => wider(shared_writes(then, bound), shared_writes(els, bound)),
                                 StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
                                 | StmtKind::Parallel { body, .. } | StmtKind::Lanes { body, .. }
                                 | StmtKind::LoadLoop { body, .. } => shared_writes(body, bound),
-                                _ => false,
-                            })
+                                _ => None,
+                            }))
                         }
-                        let publication = if shared_writes(body, &self.bound) { Some(TilePlacement::GroupShared) } else { placement };
+                        let publication = match (shared_writes(body, &self.bound), placement) {
+                            (Some(TilePlacement::GroupWide), _) | (_, Some(TilePlacement::GroupWide)) => Some(TilePlacement::GroupWide),
+                            (Some(written), _) => Some(written),
+                            (None, placement) => placement,
+                        };
                         self.publish(operation, var, BarrierPurpose::Owned, publication)?;
                     }
                     StmtKind::Expr(Expr {
@@ -1037,10 +1040,10 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                         ..
                     }) if *name == seismic_lang::intrinsics::Operation::MatrixStore => {
                         let operand = args.get(1).ok_or("fragment store has no destination")?;
-                        let ExprKind::Var(var) = operand.kind else {
-                            return Err("fragment store requires a shared tile binding".into());
-                        };
-                        if self.bound.get(&var) != Some(&Some(TilePlacement::GroupShared)) {
+                        // The destination is a shared tile or a row-major view of one (a
+                        // sub-tile an inner owner updates in place).
+                        let var = crate::storage::tile_root(operand).ok_or("fragment store requires a shared tile binding")?;
+                        if !self.bound.get(&var).is_some_and(|placement| placement.as_ref().is_some_and(TilePlacement::group_memory)) {
                             return Err("fragment store requires owned shared tile storage".into());
                         }
                         let ExprKind::Var(_) = args[0].kind else {
@@ -1054,8 +1057,19 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                         )?;
                     }
                     StmtKind::Parallel { vars, body, .. } => {
+                        // An inner owner region: each SIMD group of the threadgroup runs one
+                        // visit, its binders uniform among that group's lanes. Every thread of
+                        // the threadgroup then meets at the region's completion barrier.
+                        if self.inner_owner || self.partial_owned {
+                            return Err("an inner owner region requires full participation of the launch piece's threads".into());
+                        }
                         self.uniform.extend(vars);
-                        self.nested(body, Scope::Body(operation), Multiplicity::Constant(1))?
+                        self.inner_owner = true;
+                        let visited = self.nested(body, Scope::Body(operation), Multiplicity::Constant(1));
+                        self.inner_owner = false;
+                        visited?;
+                        let binder = *vars.first().ok_or("an inner owner region has no binder")?;
+                        self.barrier(operation, binder, BarrierPurpose::Owners, MemorySpace::Group)?;
                     }
                     StmtKind::Range { var, lo, hi, body } => {
                         let outer = self.partial_owned;
@@ -1109,7 +1123,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
                         self.partial_owned = outer_partial;
                         let mut writes = HashSet::new();
                         for statement in body {
-                            seismic_lang::rewrite::writes(statement, &mut writes);
+                            seismic_lang::exec::writes::writes(statement, &mut writes);
                         }
                         let mut writes = writes.into_iter().collect::<Vec<_>>();
                         writes.sort_unstable();
@@ -1168,7 +1182,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             let mut occupants: Vec<Vec<usize>> = Vec::new();
             for index in 0..self.arrays.len() {
                 let array = &self.arrays[index];
-                let shared = array.declaration.placement == TilePlacement::GroupShared;
+                let shared = array.declaration.placement.group_memory();
                 let mut alternatives = slots
                     .iter()
                     .enumerate()
@@ -1210,7 +1224,7 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             for members in occupants.iter().filter(|members| members.len() > 1) {
                 for &index in members {
                     let array = &self.arrays[index];
-                    if array.declaration.placement == TilePlacement::GroupShared {
+                    if array.declaration.placement.group_memory() {
                         let site = BarrierSite {
                             operation: array.id.operation,
                             variable: array.id.variable,
@@ -1266,10 +1280,8 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
         return Err("allocation plan phase/domain mismatch".into());
     }
     let mut planner = Planner {
-        retained,
         lifetimes: &lifetimes,
         select,
-        split_launch: false,
         vars,
         uniform: vars
             .iter()
@@ -1277,7 +1289,8 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
             .filter_map(|(v, var)| matches!(var.kind, VarKind::Param(_)).then_some(v))
             .collect(),
         uniform_atoms: HashSet::new(),
-        uniform_tensor_reads: true,
+        tensor_writes: TensorWrites::default(),
+        disjoint,
         uniform_views: vars
             .iter()
             .enumerate()
@@ -1298,19 +1311,18 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
         collectives: BTreeMap::new(),
         executions: Arc::new(Multiplicity::Constant(1)),
         partial_owned: false,
+        inner_owner: false,
     };
     let mut launches = Vec::new();
-    let mut scratch = Vec::new();
-    for (phase_index, (root, phase)) in body.iter().zip(phases).enumerate() {
+    for (root, phase) in body.iter().zip(phases) {
         // Launch-local allocations and uniformity facts have no physical
         // existence in the next launch. Retained values are explicit reloads.
         planner.bound.retain(|variable, _| matches!(vars[*variable].kind, VarKind::Param(_)));
         planner.uniform.retain(|variable| matches!(vars[*variable].kind, VarKind::Param(_)));
         planner.uniform_views.retain(|variable| matches!(vars[*variable].kind, VarKind::Param(_)));
         planner.uniform_atoms.clear();
-        planner.split_launch = phase.split.is_some();
         // Ordered launches publish predecessor tensor writes before this phase.
-        planner.uniform_tensor_reads = true;
+        planner.tensor_writes = TensorWrites::default();
         let operation = root.id.ok_or("phase has no operation identity")?;
         let StmtKind::Parallel {
             vars: indices,
@@ -1322,95 +1334,13 @@ fn plan_mode(vars: &[Var], body: &[Stmt], phases: &[Phase], storage: &StoragePla
         };
         planner.uniform.extend(indices);
         planner.scope = vec![Scope::Body(operation)];
-        if let Some(split) = &phase.split {
-            planner.uniform.insert(split.part);
-            for &variable in &split.carried {
-                let Ty::Tile(tile) = &vars[variable].ty else {
-                    return Err("split scratch requires a tile value".into());
-                };
-                let dtype = tile
-                    .elem
-                    .read_dtype()
-                    .ok_or("split scratch dtype is unresolved")?;
-                let elements_per_item = tile.shape.iter().try_fold(1u64, |size, extent| {
-                    let extent = extent
-                        .as_constant()
-                        .and_then(|n| u64::try_from(n).ok())
-                        .ok_or("split scratch capacity must be nonnegative and static")?;
-                    size.checked_mul(extent)
-                        .ok_or("split scratch capacity overflow")
-                })?;
-                let work_items = phase.mapping.work_items();
-                let parts =
-                    u64::try_from(phase.parts).map_err(|_| "invalid split scratch part count")?;
-                let bytes = work_items
-                    .checked_mul(parts)
-                    .and_then(|n| n.checked_mul(elements_per_item))
-                    .and_then(|n| n.checked_mul(u64::from(dtype.bytes())))
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or("split scratch size overflow")?;
-                let producer = launches.len();
-                scratch.push(ScratchAllocation {
-                    index: scratch.len(),
-                    parameter: None,
-                    phase: phase_index,
-                    variable,
-                    dtype,
-                    elements_per_item,
-                    work_items,
-                    parts,
-                    bytes,
-                    producer,
-                    consumer: producer + 1,
-                });
-            }
-            let (split_body, ordinary) = match &split.retained {
-                Some(retained) => body.split_at_checked(retained.ordinary_at).ok_or("retained ordinary split position is invalid")?,
-                None => (body.as_slice(), &[][..]),
-            };
-            let (prefix, suffix) = split_body
-                .split_at_checked(split.loop_at)
-                .ok_or("allocation split position is invalid")?;
-            let (stream, tail) = suffix
-                .split_first()
-                .ok_or("allocation split stream is missing")?;
-            planner.body(prefix)?;
-            planner.body(&split.validation_bindings)?;
-            planner.body(std::slice::from_ref(stream))?;
-            planner.body(ordinary)?;
-            launches.push(planner.finish(
-                &phase.dispatch,
-                shared_limit,
-                launches.len().checked_sub(1),
-                crate::support::LaunchRecipe::new(phase.mapping.clone(), phase.parts as u64)?,
-            )?);
-            for var in &split.carried {
-                planner.materialize(operation, *var, Purpose::Merge)?;
-                let placement = Some(storage.declaration(*var)?.placement.clone());
-                planner.publish(operation, *var, BarrierPurpose::Merge, placement.clone())?;
-                planner.bound.insert(*var, placement);
-            }
-            planner.body(tail)?;
-            launches.push(
-                planner.finish(
-                    phase
-                        .merge_dispatch
-                        .as_ref()
-                        .ok_or("split merge dispatch is missing")?,
-                    shared_limit,
-                    launches.len().checked_sub(1),
-                    crate::support::LaunchRecipe::new(phase.mapping.clone(), 1)?,
-                )?,
-            );
-        } else {
-            planner.body(body)?;
-            launches.push(planner.finish(
-                &phase.dispatch,
-                shared_limit,
-                launches.len().checked_sub(1),
-                crate::support::LaunchRecipe::new(phase.mapping.clone(), 1)?,
-            )?);
-        }
+        planner.body(body)?;
+        launches.push(planner.finish(
+            &phase.dispatch,
+            shared_limit,
+            launches.len().checked_sub(1),
+            crate::support::LaunchRecipe::new(phase.mapping.clone(), 1)?,
+        )?);
     }
-    MemoryPlan::new(launches, scratch)
+    MemoryPlan::new(launches, Vec::new())
 }

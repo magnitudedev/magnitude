@@ -20,9 +20,5 @@ seismic-std.workspace = true
 seismic-runtime.workspace = true
 
 [dev-dependencies]
-seismic-cpu.workspace = true
-seismic-accounting.workspace = true
-seismic-realization.workspace = true
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
 seismic-metal.workspace = true
+seismic-compiler.workspace = true

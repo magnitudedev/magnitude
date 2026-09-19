@@ -1,7 +1,8 @@
 //! Embedded standard constructs and kernels. The same authored sources are available
 //! to portable inspection and native compilation without a source-tree dependency.
 use seismic_lang::{
-    program::{compile, Program, SourceFile},
+    program::{compile, SourceFile},
+    sir::Program,
     Scope,
 };
 pub fn sources() -> Vec<SourceFile> {
@@ -150,7 +151,7 @@ pub fn sources() -> Vec<SourceFile> {
     embedded
         .iter()
         .map(|(path, text, scope)| SourceFile {
-            path: path.into(),
+            path: (*path).into(),
             text: (*text).into(),
             scope: scope.clone(),
         })

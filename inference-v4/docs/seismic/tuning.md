@@ -1,169 +1,216 @@
 # Seismic tuning
 
-Automatic selection has one path:
+**Tuning is one joint selection: authored implementations, contiguous fusion groups,
+and numerical sites, chosen together under one estimate, within a budget.** It
+happens in IR, before any native source exists. Its result is a checked witness
+with an honest proof status.
 
-**Checked source and declared conditions → retained execution family → immutable
-shared solver model → search → checked selected execution → native artifact.**
+## Decisions
 
-Seismic constructs and interprets the execution family. `magnitude-solver` owns
-optimization strategy, search state, bounds, pruning and completion. The compiler
-uses the common `Model` and `Search` contract for both exact and neighborhood
-algorithms. Changing algorithms does not change the family, model vocabulary or
-reconstruction procedure.
+| Decision | Domain | Identity |
+| --- | --- | --- |
+| Implementation | The applicable candidates of one occurrence | The static call in its parent candidate; the entry is occurrence zero |
+| Grouping | The legal intervals of one sequence; selected intervals cover every unit exactly once | The authored block |
+| Number | The finite value domain of one site | The static binder (width) or `merge` axis (parts) in its owning candidate |
 
-## Inputs and ownership
+Nothing else is a decision. Piece counts, visits, dispatch geometry, byte counts,
+addresses, and masks are arithmetic over site values. Load mode, tile storage,
+allocation, transfer width, reduction algorithm, and unrolling are fixed backend
+rules ([Backends](backends.md)).
 
-| Input | Meaning |
+### Guards
+
+A candidate is active when it and all its ancestors are selected. Its child
+occurrences, sites, sequences, requirements, constraints, and cost factors exist only
+while it is active. Inactive decisions carry no cost and no constraint, are absent
+from the witness, and cannot force assignments elsewhere. Two occurrences may select
+different bodies of the same function.
+
+### Candidates and requirements
+
+A candidate with a `where` predicate over a structural extent carries numerical
+requirements on the bound site: multiple-of (atom and packet alignment), at-least,
+at-most, equal, and divides (`full`). The candidate is selectable only with site
+values that satisfy them. A requirement can name a site owned by an ancestor, which
+couples the child's choice to the parent's width; that coupling is exported, not
+resolved greedily.
+
+### Sites and domains
+
+The family gives each site its static extent. The backend narrows it to a finite
+value domain by a documented rule that does not consider cost. A single-value
+domain is not a search variable but keeps its identity in the witness. A site with
+no admissible value makes its owner unselectable.
+
+### Intervals and exact cover
+
+For each active sequence the solver selects intervals `[start, end)` such that every
+unit is covered exactly once. Only backend-listed intervals exist. An interval may
+require particular child candidates and may tie pairs of sites to equal values
+while it is selected; separate execution leaves them independent. Pairwise legality
+does not imply a longer interval.
+
+## Estimate and decomposition
+
+The objective is the sum of local cost factors supplied by the backend. Each factor
+names exactly the decisions it depends on:
+
+- the candidates whose selection activates it,
+- the intervals whose selection activates it,
+- the sites its value reads.
+
+**Decomposition is a compiler-to-solver requirement.** No factor or constraint hides
+the program behind an all-variable callback. Independent occurrences export
+independent factors, so the solver's residual decomposition solves them separately:
+twenty independent three-way choices cost sixty local evaluations, not `3^20`
+assignments. Real coupling is kept and only real coupling: a shared site, a
+requirement on an ancestor's site, an interval's equalities, a capacity limit over
+several tiles of one kernel. A parent's total may select a locally slower child.
+
+Factors and constraints are tabulated over the product of their scope's domains.
+A scope whose product exceeds the tabulation bound is *analysis unavailable*, not a
+truncated model.
+
+Hard limits are constraints, never costs. Preferences are costs, never constraints.
+No factor may return zero for a quantity it cannot derive; it fails, and selection
+reports *analysis unavailable*.
+
+## Seed
+
+The backend supplies one constructive complete witness. It is a starting result,
+not a default implementation and not a rule that excludes other bodies. The seed is
+audited against the joint family like any witness. An audited seed is the baseline
+result: a searched witness replaces it only when its estimate is strictly lower.
+The seed and its estimate are retained in the result for comparison.
+
+The seed is not injected into the solver. Search starts from the model alone, so
+the seed bounds the result from above but does not steer the search.
+
+A seed that fails the audit while the family is not proved empty is a defective seed
+policy and is reported as a reconstruction defect. No unchecked partial path ever
+executes.
+
+## Search
+
+One immutable solver model is built once. The budget bounds solver work and wall
+time.
+
+1. **Exact search** with half the budget. It may prove optimality or infeasibility.
+2. **Neighborhood improvement** with the remainder, when a validated seed exists.
+   Moves change implementations, covers, and numbers together.
+
+The better incumbent of the two phases is compared with the audited seed; the
+selected witness is the cheaper under the estimate, the seed on a tie. The proved
+lower bound is the larger of the two phases' bounds, capped by the selected
+estimate. A solver optimum costlier
+than the validated seed is a contradiction and is reported as a defect.
+
+The search consumes the generic solver unchanged: guards, residual AND/OR
+decomposition, completed-proof reuse, budgets, and feasible incumbents keep their
+solver meaning. There is no Seismic-specific solver and no second cache.
+
+### Strategy
+
+The budget carries a strategy (`Budget.strategy`, runtime `Settings.strategy`, CLI and
+harness `--strategy exact|greedy`). `Exact`, the default, is the search above.
+
+`Greedy` is a **diagnostic alternative**, kept to measure what solver search buys. It
+runs no solver. Starting from the audited seed it sweeps the decisions in a fixed
+order — occurrence choices in pre-order, then each active sequence's cover (all
+singletons, or one maximal offered fused interval with singletons around it), then
+active sites in id order — and for each decision tries every other value with all
+others fixed, keeping the cheapest complete witness. Every trial is a complete witness
+priced by the same exported model (`Model::validate_assignment`); nothing else ranks
+alternatives. Sweeps repeat until one improves nothing, at most 16 times; the work and
+time limits of the budget do not apply.
+
+Changing an occurrence's choice deactivates the old candidate's subtree and activates
+the new one. `Backend::seed` cannot be constrained to a partial choice, so newly active
+decisions take the seed policy's base values: the seed's own choice and value wherever
+the seed has one, otherwise candidate 0, the largest admissible width, parts 1, and
+singleton covers; if that completion is infeasible the all-smallest-values completion
+is tried once, and if both are the move is skipped. The seed's piece-target and
+limit-repair steps are not replayed.
+
+A greedy result is always `Feasible` with lower bound 0. Coordinate moves cannot make a
+change that needs several decisions to move together (a fused interval whose
+`equal_sites` differ, a slower child that enables a cheaper parent), so greedy
+witnesses are in general costlier than exact ones.
+
+### Timings
+
+`Selected` records the wall time of each phase — family construction, backend hooks
+(`bind_structure`, `constraints`, `intervals`, `factors`), model export (tabulation),
+seed (construction and audit), search, instantiate, realize — and search statistics:
+model variables and factors, solver work and nodes of the exact and neighborhood
+phases, or greedy sweeps and trials. `seismic select` prints them. These are
+measurements of the compiler, not estimates of the kernel.
+
+## Proof status
+
+| Status | Meaning |
 | --- | --- |
-| Portable program | Checked definitions, specialization and numerical/effect permissions. |
-| Execution form | Complete admitted transformation and implementation domains. |
-| Workload | Bound allocations, views, scalars, aliasing, known data and declared runtime domains. |
-| Hardware contract | Primitive services, resource capacities, units and applicability conditions. |
-| Objective | Timed execution boundary, scheduling interpretation and aggregation over the workload domain. |
+| Feasible | A complete, audited, instantiated execution. Search ended by budget, or the family has open obligations. Performance is an estimate. |
+| Model-optimal | Additionally, the solver proved optimality over the exported family — the listed candidates, intervals, and site domains — under the stated estimate model, and the family has no obligations. |
 
-The frontend owns transformation legality, operation occurrence identities,
-producer identity and snapshot provenance. Backends own typed terminal operations,
-dispatch, storage, participation and emission correspondence. Accounting derives
-joint resource and scheduling constraints from those operations. Runtime owns
-invocation checks, native compilation and artifact reuse.
+Model-optimal is a statement about a model. It proves nothing about physical
+optimality, about values outside the backend's site domains, or about candidates
+nobody authored. A feasible witness is executable; execution never waits for a proof.
 
-A supplied Lowered IR artifact represents an explicitly selected source domain;
-it is useful for compiler diagnostics and does not establish coverage of the
-original portable program's alternatives.
+## Outcomes
 
-## Execution-family construction
+| Outcome | Meaning | Not to be read as |
+| --- | --- | --- |
+| Invalid source or contract | Type, numerical, effect, ownership, or declaration error | — |
+| Missing target coverage | No adopted implementation for a reached call on this target and workload | A reason to interpret or fall back |
+| Unsupported structural mapping | The backend has no mapping for this structure, or no domain value satisfies a site's requirements | Infeasibility of the family |
+| Incompatible composition | Interfaces disagree, or a hard capacity cannot be met on a path selection cannot avoid | A cost |
+| No feasible configuration, proved | The exported family has no solution | A statement about one body or grouping |
+| Construction incomplete | Candidate construction left obligations | Missing support or infeasibility |
+| Selection incomplete | The budget ended with no checked configuration | Infeasibility |
+| Analysis unavailable | A quantity or estimate has no supported derivation | Zero cost |
+| Reconstruction defect | Seed, witness, or instantiation disagreed with the family | Candidate infeasibility; it is a compiler defect |
+| Selected feasible | Complete checked execution, estimated performance | A tuned or qualified result |
+| Selected with model proof | Optimal within the stated family and estimate | Physical optimality |
 
-Construction retains local alternatives, their original finite domains and their
-activation guards. Numeric domains remain arithmetic intervals or progressions
-where possible. Choice identity includes the source definition, call occurrence
-and defining topology; it is not an ordinal path through repeated lowering.
-Independent choices do not require a Cartesian product of completed kernels.
+Open obligations do not block a feasible selection whose own path is fully
+analyzed. They are listed with the result and they block the model proof.
 
-The same original variables feed shapes, dispatch counts, coordinates, storage
-capacities, operation guards and resource demands. Derived numeric operands retain
-their defining equations as well as their bounds. Aliases refer to the original
-variable identity. Conditional equations apply only under their defining guards.
-A construction envelope bounds possible occurrences; it is never substituted for
-the selected runtime quantity.
+Because a backend must supply a seed and a rejected seed is a defect, a selection
+currently either returns a checked witness or fails with one of the other outcomes;
+*construction incomplete* and *selection incomplete* are reserved classifications
+that the present pipeline does not produce.
 
-Serial setup, parallel regions, dependencies and values crossing launches belong
-to the same family. Guarded alternatives can introduce different phase counts,
-allocations and dependencies. Inactive phases retain their correspondence slots
-but create no native pipelines or dispatches. Scratch binding identities remain
-stable even when a selected scratch allocation has zero size.
+## Replay
 
-Reduction topology retains the source's ordering and identity permissions.
-Explicit ordered trees use bounded frontier decisions over the original ordered
-leaves, including the seed. Their constraints and reconstruction preserve every
-admitted tree without enumerating completed tree combinations. Segmented folds
-retain segment preparation, partial identities, tails and final publication.
+A complete witness can be replayed: the family and model are rebuilt, the witness
+is audited exactly as a seed is, then instantiated and realized. No search runs. The
+result is *feasible* with no lower bound, because nothing was compared. A witness
+that no longer fits the program, workload, or backend is rejected; it is never
+repaired. Replay is how a qualified witness is deployed without depending on
+search.
 
-Applicability must be established before an alternative can become executable.
-A genuinely illegal assignment is constrained out. Missing construction or
-analysis remains a typed coverage obligation in the shared model. A compiler
-failure is an error. None of these may silently drop an unfinished alternative,
-choose a diagnostic default or report an optimum over a smaller family.
+## Reuse
 
-## Joint accounting and search
+Selection identity is `(entry, shapes, elements)` on one device. Buffer contents,
+scalar arguments, and bounded index values such as the decode position are not
+part of it, so decode steps do not retune. Adding or removing an overload, lowering,
+or adoption changes the family and invalidates earlier witnesses.
 
-One model owns all implementation decisions, optional activities, dependencies,
-storage lifetimes, resource reservations and the declared objective. Every shared
-resource sees all applicable uses, including uses from different launches and
-alternative regions. Independently optimal child schedules do not establish a
-joint optimum.
+## Search analysis
 
-Concrete and symbolic interpretations share dispatch, storage and primitive
-service equations. Typed helper semantics and parameter conversions are shared
-with emission. Numeric participation facts remain attached to the control paths
-where they hold, including the live continuation of a padding return. Returning
-lanes cannot reappear when alternative states join.
+`analyze-search` constructs the family for an entry and workload without selecting,
+emitting, or compiling, and reports structure: templates, occurrences, occurrences
+with a choice, the largest alternative count, sites, sequences, a `log10` upper bound
+on raw assignments, independent components of the occurrence interaction graph,
+and open obligations. The raw product is a description of the family, not a
+prediction of solve work. The command predicts no times.
 
-Equivalent constant quantities and predicate definitions may share bindings.
-Distinct operation occurrences, reservations, memory effects and dependencies
-remain distinct. Reuse requires equivalent semantics and compatible activation;
-equal counts or isolated costs do not establish equivalence.
+## Acceptance
 
-Structured repetition must describe its serial/parallel meaning, recurrence,
-resource scope and finite tail through the common model contract. Bounded
-expansion can implement those semantics within a declared construction limit.
-Exceeding that limit remains unresolved; it does not authorize a backend-owned
-search, a separate exact child solve or an unaccounted executable path.
-
-`tune` exports once and creates one `Search`. `resume` advances that retained search
-over the same immutable model and reconstruction owner. Search limits are
-incremental; algorithm options remain fixed for the session. Changed source,
-workload, backend conditions, objective or construction limits require a new
-export. Resumption does not replay lowering or rediscover implementation choices.
-
-## Outcomes and executable boundary
-
-| Outcome | Meaning |
-| --- | --- |
-| `Optimal` | Feasible original-model assignment and completed global optimization under the declared objective. |
-| `Incomplete` | Retained search, stop reason, bounds and optional feasible incumbent; no executable selection. |
-| `Infeasible` | The admitted modeled domain is proven to have no feasible member. |
-| Error | Invalid request, malformed model or failed compiler/reconstruction invariant. |
-
-Only global `Optimal` can construct executable Tuned IR. An incomplete incumbent
-may be reconstructed for diagnostics; it cannot be converted into a runtime
-kernel. Time, work and memory limits do not weaken this gate. Unresolved coverage
-cannot become proof of infeasibility or completed optimization.
-
-Reconstruction validates the original assignment, resolves the retained source
-and backend choices, and checks geometry, storage, operations, objective and
-conditions against the same model. It consumes the retained implementation; it
-does not prepare another kernel from settings or select a nearby legal value.
-The selected execution retains its reconstructed source, not the unresolved
-template. Native compilation consumes that selected execution directly.
-
-There is no old selection coordinator, backend-local optimization fallback,
-whole-kernel candidate score table, automatic algorithm switch or native
-compile-and-try selection path.
-
-## Workload reuse and objective meaning
-
-Runtime controls are invocation inputs, not optimizer decisions. Compilation over
-a declared integer domain must establish validity and the stated objective over
-all admitted values. Canonical input bytes are not a representative sample. An
-unsupported control or transaction relationship remains unresolved rather than
-specializing to a convenient decode position.
-
-Reuse binds semantic source/form/workload identities, hardware and implementation
-contracts, objective, scheduling interpretation and analysis versions. Floating
-literal identity preserves representation bits, including signed zero and NaN
-payloads. Reusing a result under changed conditions requires a checked
-applicability relationship. Runtime checks the device and invocation conditions
-again before executing an artifact.
-
-A model optimum is conditional on the supplied model. A hypothetical timing model,
-a physical lower bound and an observed GPU duration are different claims. A
-feasible schedule in an optimistic relaxation is not an upper bound in the
-original model. Unenforceable hardware issue order cannot become a compiler action
-merely by retaining an unchanged kernel. Physical performance claims additionally
-require qualified mappings and hardware assumptions.
-
-All compared lower bounds and feasible upper bounds must share the objective,
-conditions and time units. A zero lower bound has no finite gap ratio. Native
-feedback from a selected winner can inform external qualification; it does not
-silently resume implementation selection.
-
-## Verification
-
-Validation concentrates on the boundaries:
-
-1. Both solver algorithms receive the same complete model and reconstruction.
-   Resume retains that model; changed requests are rejected.
-2. Small generated cases compare family coverage and reconstructed semantics with
-   independent legal realizations, including guards, dependencies, storage,
-   numerical permissions and snapshot provenance.
-3. Completed automatic selection passes through native compilation and execution,
-   checking values, bounds, phases and repeated invocation behavior.
-
-Typed stage verification checks scope, shape/type consistency, effects, snapshot
-provenance, resolved choices and collective participation. Missing mappings or
-unsupported analysis remain visible before native execution. Generated fixtures
-are produced by generators rather than checked-in data files.
-
-An installed shared interface does not imply complete language/backend coverage,
-solver throughput, native correctness or Qwen readiness. Those are established by
-the corresponding completed boundary and workload checks.
+- Independent choices export factors whose scopes never span two occurrences.
+- A coupled parent and child select the jointly cheaper assignment even when the
+  child alone is slower.
+- An unsatisfiable hard constraint yields *infeasible*; an invalid seed yields a
+  reconstruction defect.
+- The selected witness reproduces the solver's assignment and cost exactly.

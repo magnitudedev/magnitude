@@ -54,7 +54,7 @@ mod tests {
 /// shared by invocation binding and compiler ownership admission before choosing
 /// implementations; unused arguments keep their ABI positions.
 pub fn parameters(
-    function: &seismic_lang::lowered_ir::LoweredIr,
+    function: &seismic_lang::exec::lowered_ir::LoweredIr,
 ) -> Result<
     (
         Vec<crate::BufferSpec>,
@@ -65,7 +65,7 @@ pub fn parameters(
     parameter_types(&function.params, &function.index_params)
 }
 pub fn parameter_types(
-    params: &[(String, seismic_lang::types::Ty)],
+    params: &[(String, seismic_lang::exec::types::Ty)],
     index_params: &[(String, seismic_lang::sym::Sym)],
 ) -> Result<
     (
@@ -74,7 +74,7 @@ pub fn parameter_types(
     ),
     String,
 > {
-    use seismic_lang::{abi::ScalarParameter, types::Ty};
+    use seismic_lang::{abi::ScalarParameter, exec::types::Ty};
     let mut buffers = Vec::new();
     let mut scalars = Vec::new();
     for (name, ty) in params {

@@ -1,7 +1,7 @@
 //! Conservative source lifetimes for concrete synchronous Metal allocations.
 //! Loops remain structured. Views extend their backing value's lifetime; a
 //! use of an outer value in a loop retains it through the loop's completion.
-use seismic_lang::{ir::*, types::Ty};
+use seismic_lang::exec::{ir::*, types::Ty};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,12 +87,6 @@ impl Analysis {
                     expression(cond, &mut refs);
                     self.body(then)?;
                     self.body(els)?;
-                }
-                StmtKind::Reduction(_) => {
-                    return Err(
-                        "structured reduction must be materialized before allocation liveness"
-                            .into(),
-                    );
                 }
             }
             let end = self.cursor;

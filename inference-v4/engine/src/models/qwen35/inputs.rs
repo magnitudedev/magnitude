@@ -232,8 +232,9 @@ mod tests {
         )
     }
     #[test]
+    #[ignore = "requires a Metal device"]
     fn partial_images_retain_exact_slices_and_checkpoint_ownership() {
-        let device = Device::cpu();
+        let device = Device::metal().unwrap();
         let plan = plan();
         let initial =
             InputState::new(&device, plan.clone(), 0, vec![feature(&device, &plan)], 3).unwrap();
@@ -269,12 +270,13 @@ mod tests {
         assert_eq!(device.memory_usage().charged, 0);
     }
     #[test]
+    #[ignore = "requires a Metal device"]
     fn generation_checkpoint_forks_retain_their_own_unconsumed_features() {
         use crate::{
             models::sequence::{OwnedSequence, SequenceWork},
             state::StateStore,
         };
-        let device = Rc::new(Device::cpu());
+        let device = Rc::new(Device::metal().unwrap());
         let store = StateStore::new(device.clone(), 8, 16, vec![], vec![]).unwrap();
         let plan = plan();
         let input =
@@ -316,9 +318,10 @@ mod tests {
         assert_eq!(device.memory_usage().charged, 0);
     }
     #[test]
+    #[ignore = "requires a Metal device"]
     fn input_rejects_missing_duplicate_wrong_geometry_foreign_and_changed_tokens() {
-        let device = Device::cpu();
-        let foreign = Device::cpu();
+        let device = Device::metal().unwrap();
+        let foreign = Device::metal().unwrap();
         let plan = plan();
         assert!(InputState::new(&device, plan.clone(), 0, vec![], 3).is_err());
         let f = feature(&device, &plan);

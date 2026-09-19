@@ -1,130 +1,153 @@
 # GGUF block layouts are decoded into representation-owned compact planes.
 # Each output word owns all its bits, including codes crossing word boundaries.
-fn import_q4k[B](data: tensor[(B * 144 + 3) / 4] u32, halves: tensor[B * 72] f16, words: tensor[B * 32] u32, coefficients: tensor[B * 3] u32, scale_factor: tensor[B] f16, bias_factor: tensor[B] f16):
-  for block in parallel:
-    packed = tile[32] u32
-    for w in owned(packed):
-      word = u32(0)
-      for bit in range(32):
-        index = (w * 32 + bit) / 4
-        code = (((data[(block * 144 + 16 + index / 64 * 32 + index % 32) / 4] >> (8 * ((block * 144 + 16 + index / 64 * 32 + index % 32) % 4))) & 255) >> (index % 64 / 32 * 4)) & 15
-        word = word | (((code >> ((w * 32 + bit) % 4)) & 1) << bit)
-      packed[w] = word
-    store(packed, words[block * 32 : (block + 1) * 32])
-    local_coefficients = tile[3] u32
-    for w in owned(local_coefficients):
-      word = u32(0)
-      for bit in range(32):
-        field = (w * 32 + bit) / 6
-        g = field / 2
-        low = (data[(block * 144 + 4 + (field % 2) * 4 + g % 4) / 4] >> (8 * ((block * 144 + 4 + (field % 2) * 4 + g % 4) % 4))) & 255
-        high = (data[(block * 144 + 12 + g % 4) / 4] >> (8 * ((block * 144 + 12 + g % 4) % 4))) & 255
-        local = low & 63
-        if g >= 4: local = ((high >> ((field % 2) * 4)) & 15) | ((low >> 6) << 4)
-        word = word | (((local >> ((w * 32 + bit) % 6)) & 1) << bit)
-      local_coefficients[w] = word
-    store(local_coefficients, coefficients[block * 3 : (block + 1) * 3])
-    factor = tile[1] f16
-    for i in owned(factor):
-      factor[i] = halves[block * 72 + 0]
-    store(factor, scale_factor[block : block + 1])
-    bias = tile[1] f16
-    for i in owned(bias):
-      bias[i] = halves[block * 72 + 1]
-    store(bias, bias_factor[block : block + 1])
+# Byte `o` of the little-endian source is (data[o / 4] >> (8 * (o % 4))) & 255.
+export fn import_q4k[B](data: tensor[(B * 144 + 3) / 4] u32, halves: tensor[B * 72] f16, out words: tensor[B * 32] u32, out coefficients: tensor[B * 3] u32, out scale_factor: tensor[B] f16, out bias_factor: tensor[B] f16):
+    parallel [blocks] in 0..B:
+        for block in blocks:
+            var packed = tile[32] u32
+            for w in owned(packed):
+                var word = u32(0)
+                for bit in 0..32:
+                    let position = (w *32 + bit) / 4
+                    let code = (((data[(block * 144 + 16 + position / 64 * 32 + position % 32) / 4] >> u32(8 * ((block * 144 + 16 + position / 64 * 32 + position % 32) % 4))) & 255) >> u32(position % 64 / 32 * 4)) & 15
+                    word = word | (((code >> u32((w *32 + bit) % 4)) & 1) << u32(bit))
+                packed[w] = word
+            publish packed to words[block * 32 : (block + 1) * 32]
+            var local_coefficients = tile[3] u32
+            for w in owned(local_coefficients):
+                var word = u32(0)
+                for bit in 0..32:
+                    let field = (w *32 + bit) / 6
+                    let g = field / 2
+                    let low = (data[(block * 144 + 4 + (field % 2) * 4 + g % 4) / 4] >> u32(8 * ((block * 144 + 4 + (field % 2) * 4 + g % 4) % 4))) & 255
+                    let high = (data[(block * 144 + 12 + g % 4) / 4] >> u32(8 * ((block * 144 + 12 + g % 4) % 4))) & 255
+                    var local = low & 63
+                    if g >= 4:
+                        local = ((high >> u32((field % 2) * 4)) & 15) | ((low >> 6) << 4)
+                    word = word | (((local >> u32((w *32 + bit) % 6)) & 1) << u32(bit))
+                local_coefficients[w] = word
+            publish local_coefficients to coefficients[block * 3 : (block + 1) * 3]
+            var factor = tile[1] f16
+            for i in owned(factor):
+                factor[i] = halves[block * 72 + 0]
+            publish factor to scale_factor[block : block + 1]
+            var bias = tile[1] f16
+            for i in owned(bias):
+                bias[i] = halves[block * 72 + 1]
+            publish bias to bias_factor[block : block + 1]
 
-fn import_q5k[B](data: tensor[(B * 176 + 3) / 4] u32, halves: tensor[B * 88] f16, words: tensor[B * 40] u32, coefficients: tensor[B * 3] u32, scale_factor: tensor[B] f16, bias_factor: tensor[B] f16):
-  for block in parallel:
-    packed = tile[40] u32
-    for w in owned(packed):
-      word = u32(0)
-      for bit in range(32):
-        index = (w * 32 + bit) / 5
-        code = (((data[(block * 176 + 48 + index / 64 * 32 + index % 32) / 4] >> (8 * ((block * 176 + 48 + index / 64 * 32 + index % 32) % 4))) & 255) >> (index % 64 / 32 * 4)) & 15
-        code = code | (((((data[(block * 176 + 16 + index % 32) / 4] >> (8 * ((block * 176 + 16 + index % 32) % 4))) & 255) >> (index / 32)) & 1) << 4)
-        word = word | (((code >> ((w * 32 + bit) % 5)) & 1) << bit)
-      packed[w] = word
-    store(packed, words[block * 40 : (block + 1) * 40])
-    local_coefficients = tile[3] u32
-    for w in owned(local_coefficients):
-      word = u32(0)
-      for bit in range(32):
-        field = (w * 32 + bit) / 6
-        g = field / 2
-        low = (data[(block * 176 + 4 + (field % 2) * 4 + g % 4) / 4] >> (8 * ((block * 176 + 4 + (field % 2) * 4 + g % 4) % 4))) & 255
-        high = (data[(block * 176 + 12 + g % 4) / 4] >> (8 * ((block * 176 + 12 + g % 4) % 4))) & 255
-        local = low & 63
-        if g >= 4: local = ((high >> ((field % 2) * 4)) & 15) | ((low >> 6) << 4)
-        word = word | (((local >> ((w * 32 + bit) % 6)) & 1) << bit)
-      local_coefficients[w] = word
-    store(local_coefficients, coefficients[block * 3 : (block + 1) * 3])
-    factor = tile[1] f16
-    for i in owned(factor):
-      factor[i] = halves[block * 88 + 0]
-    store(factor, scale_factor[block : block + 1])
-    bias = tile[1] f16
-    for i in owned(bias):
-      bias[i] = halves[block * 88 + 1]
-    store(bias, bias_factor[block : block + 1])
+export fn import_q5k[B](data: tensor[(B * 176 + 3) / 4] u32, halves: tensor[B * 88] f16, out words: tensor[B * 40] u32, out coefficients: tensor[B * 3] u32, out scale_factor: tensor[B] f16, out bias_factor: tensor[B] f16):
+    parallel [blocks] in 0..B:
+        for block in blocks:
+            var packed = tile[40] u32
+            for w in owned(packed):
+                var word = u32(0)
+                for bit in 0..32:
+                    let position = (w *32 + bit) / 5
+                    var code = (((data[(block * 176 + 48 + position / 64 * 32 + position % 32) / 4] >> u32(8 * ((block * 176 + 48 + position / 64 * 32 + position % 32) % 4))) & 255) >> u32(position % 64 / 32 * 4)) & 15
+                    code = code | (((((data[(block * 176 + 16 + position % 32) / 4] >> u32(8 * ((block * 176 + 16 + position % 32) % 4))) & 255) >> u32(position / 32)) & 1) << 4)
+                    word = word | (((code >> u32((w *32 + bit) % 5)) & 1) << u32(bit))
+                packed[w] = word
+            publish packed to words[block * 40 : (block + 1) * 40]
+            var local_coefficients = tile[3] u32
+            for w in owned(local_coefficients):
+                var word = u32(0)
+                for bit in 0..32:
+                    let field = (w *32 + bit) / 6
+                    let g = field / 2
+                    let low = (data[(block * 176 + 4 + (field % 2) * 4 + g % 4) / 4] >> u32(8 * ((block * 176 + 4 + (field % 2) * 4 + g % 4) % 4))) & 255
+                    let high = (data[(block * 176 + 12 + g % 4) / 4] >> u32(8 * ((block * 176 + 12 + g % 4) % 4))) & 255
+                    var local = low & 63
+                    if g >= 4:
+                        local = ((high >> u32((field % 2) * 4)) & 15) | ((low >> 6) << 4)
+                    word = word | (((local >> u32((w *32 + bit) % 6)) & 1) << u32(bit))
+                local_coefficients[w] = word
+            publish local_coefficients to coefficients[block * 3 : (block + 1) * 3]
+            var factor = tile[1] f16
+            for i in owned(factor):
+                factor[i] = halves[block * 88 + 0]
+            publish factor to scale_factor[block : block + 1]
+            var bias = tile[1] f16
+            for i in owned(bias):
+                bias[i] = halves[block * 88 + 1]
+            publish bias to bias_factor[block : block + 1]
 
-fn import_q6k[B](data: tensor[(B * 210 + 3) / 4] u32, halves: tensor[B * 105] f16, words: tensor[B * 48] u32, coefficients: tensor[B * 4] u32, scale_factor: tensor[B] f16):
-  for block in parallel:
-    packed = tile[48] u32
-    for w in owned(packed):
-      word = u32(0)
-      for bit in range(32):
-        index = (w * 32 + bit) / 6
-        code = (((data[(block * 210 + index / 128 * 64 + index % 64) / 4] >> (8 * ((block * 210 + index / 128 * 64 + index % 64) % 4))) & 255) >> (index % 128 / 64 * 4)) & 15
-        code = code | (((((data[(block * 210 + 128 + index / 128 * 32 + index % 32) / 4] >> (8 * ((block * 210 + 128 + index / 128 * 32 + index % 32) % 4))) & 255) >> (index % 128 / 32 * 2)) & 3) << 4)
-        word = word | (((code >> ((w * 32 + bit) % 6)) & 1) << bit)
-      packed[w] = word
-    store(packed, words[block * 48 : (block + 1) * 48])
-    local_coefficients = tile[4] u32
-    for w in owned(local_coefficients):
-      word = u32(0)
-      for c in range(4):
-        g = w * 4 + c
-        local = (data[(block * 210 + 192 + g) / 4] >> (8 * ((block * 210 + 192 + g) % 4))) & 255
-        word = word | (local << (8 * c))
-      local_coefficients[w] = word
-    store(local_coefficients, coefficients[block * 4 : (block + 1) * 4])
-    factor = tile[1] f16
-    for i in owned(factor):
-      factor[i] = halves[block * 105 + 104]
-    store(factor, scale_factor[block : block + 1])
+export fn import_q6k[B](data: tensor[(B * 210 + 3) / 4] u32, halves: tensor[B * 105] f16, out words: tensor[B * 48] u32, out coefficients: tensor[B * 4] u32, out scale_factor: tensor[B] f16):
+    parallel [blocks] in 0..B:
+        for block in blocks:
+            var packed = tile[48] u32
+            for w in owned(packed):
+                var word = u32(0)
+                for bit in 0..32:
+                    let position = (w *32 + bit) / 6
+                    var code = (((data[(block * 210 + position / 128 * 64 + position % 64) / 4] >> u32(8 * ((block * 210 + position / 128 * 64 + position % 64) % 4))) & 255) >> u32(position % 128 / 64 * 4)) & 15
+                    code = code | (((((data[(block * 210 + 128 + position / 128 * 32 + position % 32) / 4] >> u32(8 * ((block * 210 + 128 + position / 128 * 32 + position % 32) % 4))) & 255) >> u32(position % 128 / 32 * 2)) & 3) << 4)
+                    word = word | (((code >> u32((w *32 + bit) % 6)) & 1) << u32(bit))
+                packed[w] = word
+            publish packed to words[block * 48 : (block + 1) * 48]
+            var local_coefficients = tile[4] u32
+            for w in owned(local_coefficients):
+                var word = u32(0)
+                for c in 0..4:
+                    let g = w *4 + c
+                    let local = (data[(block * 210 + 192 + g) / 4] >> u32(8 * ((block * 210 + 192 + g) % 4))) & 255
+                    word = word | (local << u32(8 * c))
+                local_coefficients[w] = word
+            publish local_coefficients to coefficients[block * 4 : (block + 1) * 4]
+            var factor = tile[1] f16
+            for i in owned(factor):
+                factor[i] = halves[block * 105 + 104]
+            publish factor to scale_factor[block : block + 1]
 
-fn import_q8_0[B](data: tensor[(B * 34 + 3) / 4] u32, halves: tensor[B * 17] f16, words: tensor[B * 8] u32, scale: tensor[B * 1] f16):
-  for block in parallel:
-    packed = tile[8] u32
-    for w in owned(packed):
-      word = u32(0)
-      for c in range(4):
-        index = w * 4 + c
-        code = ((data[(block * 34 + 2 + index) / 4] >> (8 * ((block * 34 + 2 + index) % 4))) & 255)
-        word = word | (code << (8 * c))
-      packed[w] = word
-    store(packed, words[block * 8 : (block + 1) * 8])
-    scales = tile[1] f16
-    for g in owned(scales):
-      scales[g] = halves[block * 17]
-    store(scales, scale[block * 1 : (block + 1) * 1])
+export fn import_q8_0[B](data: tensor[(B * 34 + 3) / 4] u32, halves: tensor[B * 17] f16, out words: tensor[B * 8] u32, out scale: tensor[B * 1] f16):
+    parallel [blocks] in 0..B:
+        for block in blocks:
+            var packed = tile[8] u32
+            for w in owned(packed):
+                var word = u32(0)
+                for c in 0..4:
+                    let position = w *4 + c
+                    let code = (data[(block * 34 + 2 + position) / 4] >> u32(8 * ((block * 34 + 2 + position) % 4))) & 255
+                    word = word | (code << u32(8 * c))
+                packed[w] = word
+            publish packed to words[block * 8 : (block + 1) * 8]
+            var scales = tile[1] f16
+            for g in owned(scales):
+                scales[g] = halves[block * 17]
+            publish scales to scale[block * 1 : (block + 1) * 1]
 
-fn import_iq4_xs[B](data: tensor[(B * 136 + 3) / 4] u32, halves: tensor[B * 68] f16, words: tensor[B * 32] u32, scale: tensor[B * 8] f32):
-  for block in parallel:
-    packed = tile[32] u32
-    for w in owned(packed):
-      word = u32(0)
-      for c in range(8):
-        index = w * 8 + c
-        code = (((data[(block * 136 + 8 + index / 32 * 16 + index % 16) / 4] >> (8 * ((block * 136 + 8 + index / 32 * 16 + index % 16) % 4))) & 255) >> (index % 32 / 16 * 4)) & 15
-        word = word | (code << (4 * c))
-      packed[w] = word
-    store(packed, words[block * 32 : (block + 1) * 32])
-    scales = tile[8] f32
-    for g in owned(scales):
-      high = ((data[(block * 136 + 2) / 4] >> (8 * ((block * 136 + 2) % 4))) & 255) | (((data[(block * 136 + 3) / 4] >> (8 * ((block * 136 + 3) % 4))) & 255) << 8)
-      low = (((data[(block * 136 + 4 + g / 2) / 4] >> (8 * ((block * 136 + 4 + g / 2) % 4))) & 255) >> (g % 2 * 4)) & 15
-      local = i32(low | (((high >> (2 * g)) & 3) << 4)) - 32
-      scales[g] = f32(halves[block * 68]) * f32(local)
-    store(scales, scale[block * 8 : (block + 1) * 8])
+export fn import_iq4_xs[B](data: tensor[(B * 136 + 3) / 4] u32, halves: tensor[B * 68] f16, out words: tensor[B * 32] u32, out scale: tensor[B * 8] f32):
+    parallel [blocks] in 0..B:
+        for block in blocks:
+            var packed = tile[32] u32
+            for w in owned(packed):
+                var word = u32(0)
+                for c in 0..8:
+                    let position = w *8 + c
+                    let code = (((data[(block * 136 + 8 + position / 32 * 16 + position % 16) / 4] >> u32(8 * ((block * 136 + 8 + position / 32 * 16 + position % 16) % 4))) & 255) >> u32(position % 32 / 16 * 4)) & 15
+                    word = word | (code << u32(4 * c))
+                packed[w] = word
+            publish packed to words[block * 32 : (block + 1) * 32]
+            var scales = tile[8] f32
+            for g in owned(scales):
+                let high = ((data[(block * 136 + 2) / 4] >> u32(8 * ((block * 136 + 2) % 4))) & 255) | (((data[(block * 136 + 3) / 4] >> u32(8 * ((block * 136 + 3) % 4))) & 255) << 8)
+                let low = (((data[(block * 136 + 4 + g / 2) / 4] >> u32(8 * ((block * 136 + 4 + g / 2) % 4))) & 255) >> u32(g % 2 * 4)) & 15
+                let local = i32(low | (((high >> u32(2 * g)) & 3) << 4)) - 32
+                scales[g] = f32(halves[block * 68]) * f32(local)
+            publish scales to scale[block * 8 : (block + 1) * 8]
 
+lower import_q4k for metal = portable
+lower import_q4k for cpu = portable
+lower import_q4k for cuda = portable
+lower import_q5k for metal = portable
+lower import_q5k for cpu = portable
+lower import_q5k for cuda = portable
+lower import_q6k for metal = portable
+lower import_q6k for cpu = portable
+lower import_q6k for cuda = portable
+lower import_q8_0 for metal = portable
+lower import_q8_0 for cpu = portable
+lower import_q8_0 for cuda = portable
+lower import_iq4_xs for metal = portable
+lower import_iq4_xs for cpu = portable
+lower import_iq4_xs for cuda = portable

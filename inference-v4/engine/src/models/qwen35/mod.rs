@@ -8,6 +8,7 @@ pub mod loading;
 pub mod program;
 pub mod preparation;
 pub mod service;
+pub mod session;
 pub mod vision;
 pub mod vision_runtime;
 pub mod inputs;

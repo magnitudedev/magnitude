@@ -2,16 +2,16 @@
 //! implementation is consumed by both emission and resource accounting.
 use crate::memory::{ControlValue, Scope};
 use seismic_lang::{
+    exec::ir::*,
+    exec::types::Ty,
     intrinsics::Operation,
-    ir::*,
-    types::{DType, Elem, Ty},
+    types::{DType, Elem},
 };
 use seismic_realization::{dispatch::TilePlacement, execution::Multiplicity};
 use std::sync::Arc;
 
 use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FragmentLayout {
     pub rows: u64,
     pub columns: u64,
@@ -146,29 +146,6 @@ impl Implementation {
             Self::Reduction { operation, .. } => Some(operation.name()),
         }
     }
-    pub fn requested_memory(&self) -> Option<(StorageSpace, bool, u64)> {
-        match self {
-            Self::Load { layout, memory, .. } => Some((
-                memory.space,
-                false,
-                layout.elements() * u64::from(memory.dtype.bytes()),
-            )),
-            Self::Store { layout, memory, .. } => Some((
-                memory.space,
-                true,
-                layout.elements() * u64::from(memory.dtype.bytes()),
-            )),
-            _ => None,
-        }
-    }
-    pub fn scalar_multiply_accumulates(&self) -> u64 {
-        match self {
-            Self::MultiplyAccumulate { layouts, .. } => {
-                layouts[0].rows * layouts[0].columns * layouts[1].columns
-            }
-            _ => 0,
-        }
-    }
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::ParticipantIndex => {}
@@ -204,9 +181,14 @@ impl Implementation {
                 for layout in layouts {
                     layout.metal_type()?;
                 }
-                if layouts[0].dtype != layouts[3].dtype || layouts[1].dtype != layouts[2].dtype {
+                // Each operand is consumed at its own float type and widened exactly to the
+                // accumulator's: bfloat x float atoms accumulating in float measured bit-identical
+                // to the F32 FMA chain (Apple M4 Max, 2026-09-19). The accumulator and the
+                // result share one type, and no operand is wider than it.
+                let wider = |operand: DType| operand.bytes() > layouts[0].dtype.bytes();
+                if layouts[0].dtype != layouts[3].dtype || !layouts[1].dtype.is_float() || !layouts[2].dtype.is_float() || wider(layouts[1].dtype) || wider(layouts[2].dtype) {
                     return Err(
-                        "matrix multiply accumulator/result and left/right precision must agree"
+                        "matrix multiply accumulator and result types must agree, and no float operand may be wider than them"
                             .into(),
                     );
                 }
@@ -294,7 +276,7 @@ pub(crate) fn implementation(
             let root = crate::storage::tile_root(&args[1])
                 .ok_or("matrix memory operand has no allocation root")?;
             let space = match bound.get(&root) {
-                Some(Some(TilePlacement::GroupShared)) => StorageSpace::Threadgroup,
+                Some(Some(TilePlacement::GroupShared | TilePlacement::GroupWide)) => StorageSpace::Threadgroup,
                 Some(None) => StorageSpace::Device,
                 _ => return Err("matrix operand lacks shared or borrowed device storage".into()),
             };

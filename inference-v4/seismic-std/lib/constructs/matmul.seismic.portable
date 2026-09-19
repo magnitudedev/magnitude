@@ -1,31 +1,9 @@
-# Contraction over the last axis of both operands. Each step retains its FMA;
-# a realization may merge contiguous partial chains with the declared addition.
-fn matmul_add[S](left: tile[S] f32, right: tile[S] f32, out: tile[S] f32):
-  for i in owned(out): out[i] = left[i] + right[i]
-
-fn matmul_accumulate[S](state: tile[S] f32, a: tile[S] T, b: tile[S] U, out: tile[S] f32):
-  for i in owned(out): out[i] = fma(a[i], b[i], state[i])
-
-construct matmul[M, N, K](A: tile[M, K] T, B: tile[N, K] U, acc: tile[M, N] f32):
-  for i, j in owned(acc):
-    a = A[i:i+1, :]
-    b = B[j:j+1, :]
-    state = tile[1] f32
-    zero = tile[1] f32
-    for s in owned(state): state[s] = acc[i, j]
-    for s in owned(zero): zero[s] = 0.0
-    reduce((a, b), 1, matmul_add, into=(state,), step=matmul_accumulate, identity=(zero,), ordered=false)
-    acc[i, j] = state[0]
-
-# A common contraction tree across the output rectangle retains each activation
-# leaf once for all columns. Every output keeps its FMA chain and its own seed.
-fn matmul_rectangle_add[M,N](left:tile[M,N] f32,right:tile[M,N] f32,out:tile[M,N] f32):
-  for i,j in owned(out): out[i,j] = left[i,j] + right[i,j]
-
-fn matmul_rectangle_accumulate[M,N](state:tile[M,N] f32,a:tile[M] T,b:tile[N] U,out:tile[M,N] f32):
-  for i,j in owned(out): out[i,j] = fma(a[i],b[j],state[i,j])
-
-fn matmul_rectangle[M,N,K](A:tile[M,K] T,B:tile[N,K] U,acc:tile[M,N] f32):
-  zero = tile[M,N] f32
-  for i,j in owned(zero): zero[i,j] = 0.0
-  reduce((A,B),1,matmul_rectangle_add,into=(acc,),step=matmul_rectangle_accumulate,identity=(zero,),ordered=false)
+# into[i, j] = fma-chain over k of a[i, k] * b[j, k], seeded by into[i, j], ascending k.
+# Packed operands decode to F32 at consumption. Successive calls over ordered windows of K
+# continue the same chain, so windowing never changes a result bit.
+fn matmul[M, N, K](a: tile[M, K] T, b: tile[N, K] U, inout into: tile[M, N] f32):
+    for i, j in owned(into):
+        var s = into[i, j]
+        for k in axis(a, 1):
+            s = fma(f32(a[i, k]), f32(b[j, k]), s)
+        into[i, j] = s

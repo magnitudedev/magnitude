@@ -372,6 +372,7 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
 }
 
 #[test]
+#[ignore = "requires a Metal device"]
 fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_together() {
     use seismic_engine::{
         generation::{FinishReason, Generation, Options, Readiness, Sampling},
@@ -424,7 +425,7 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
     )
     .unwrap();
     let store = StateStore::new(
-        Rc::new(Device::cpu()),
+        Rc::new(Device::metal().unwrap()),
         16,
         64,
         vec![4],

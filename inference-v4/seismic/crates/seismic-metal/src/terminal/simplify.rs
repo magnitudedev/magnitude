@@ -3,8 +3,33 @@
 use super::{Expression as E, Statement as S, Type as T};
 use crate::support::Helper;
 use std::collections::{HashMap, HashSet};
-pub(super) type Facts = HashMap<String, (i128, i128)>;
-use seismic_lang::ast::{BinaryOp as B, UnaryOp as U};
+/// Lexical facts about immutable scalars: an inclusive value enclosure and the largest
+/// power of two known to divide the value (absent means one).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Facts {
+    bounds: HashMap<String, (i128, i128)>,
+    alignment: HashMap<String, u64>,
+}
+impl Facts {
+    pub(super) fn new() -> Self { Self::default() }
+    pub(super) fn get(&self, name: &str) -> Option<&(i128, i128)> { self.bounds.get(name) }
+    pub(super) fn insert(&mut self, name: String, bound: (i128, i128)) -> Option<(i128, i128)> { self.bounds.insert(name, bound) }
+    /// Forget everything known about `name`.
+    pub(super) fn remove(&mut self, name: &str) -> Option<(i128, i128)> {
+        self.alignment.remove(name);
+        self.bounds.remove(name)
+    }
+    #[cfg(test)]
+    fn contains_key(&self, name: &str) -> bool { self.bounds.contains_key(name) }
+    fn aligned(&self, name: &str) -> u64 { self.alignment.get(name).copied().unwrap_or(1) }
+    fn align(&mut self, name: String, alignment: u64) {
+        if alignment > 1 { self.alignment.insert(name, alignment); }
+    }
+}
+impl<const N: usize> From<[(String, (i128, i128)); N]> for Facts {
+    fn from(bounds: [(String, (i128, i128)); N]) -> Self { Self { bounds: HashMap::from(bounds), alignment: HashMap::new() } }
+}
+use seismic_lang::syntax::ast::{BinaryOp as B, UnaryOp as U};
 
 /// An integer enclosure is also evidence that evaluating the expression cannot
 /// fail or access memory. Unknown integer variables are pure, but helpers,
@@ -149,6 +174,108 @@ pub(super) fn bounds_in(e: &E, facts: &Facts) -> Option<(i128, i128)> {
     };
     let (lo, hi) = limits(e.ty())?;
     (range.0 >= lo && range.1 <= hi).then_some(range)
+}
+
+/// Largest power of two (at most 2^62) proved to divide the value of an integer expression
+/// whose evaluation is total (`bounds_in` holds for it, so no node wraps).
+fn alignment(e: &E, facts: &Facts) -> u64 {
+    const MOST: u64 = 1 << 62;
+    match e {
+        E::Integer(0, _) => MOST,
+        E::Integer(n, _) => 1u64 << n.trailing_zeros().min(62),
+        E::Variable(name, _) => facts.aligned(name),
+        E::Cast(_, x) => alignment(x, facts),
+        E::Binary(B::Add | B::Sub, a, b, _) => alignment(a, facts).min(alignment(b, facts)),
+        E::Binary(B::Mul, a, b, _) => alignment(a, facts).saturating_mul(alignment(b, facts)).min(MOST),
+        _ => 1,
+    }
+}
+
+/// The addends of a nonnegative total integer expression, each in type `ty`. Sums are
+/// opened through value-preserving casts and multiplication by a literal.
+fn addends(e: &E, ty: T, facts: &Facts, out: &mut Vec<E>) {
+    match e {
+        E::Binary(B::Add, a, b, _) => {
+            addends(a, ty, facts, out);
+            addends(b, ty, facts, out);
+        }
+        E::Cast(_, x) if matches!(x.ty(), T::I32 | T::U32 | T::I64 | T::U64) && bounds_in(x, facts).is_some_and(|(lo, _)| lo >= 0) => addends(x, ty, facts, out),
+        E::Binary(B::Mul, a, b, _) if matches!(**b, E::Integer(..)) && matches!(**a, E::Binary(B::Add, ..) | E::Cast(..)) => {
+            let mut inner = Vec::new();
+            addends(a, ty, facts, &mut inner);
+            out.extend(inner.into_iter().map(|term| E::binary(B::Mul, term, (**b).clone(), ty)));
+        }
+        _ => out.push(e.clone().cast(ty)),
+    }
+}
+
+/// `term / 2^shift` for a term `alignment` proves divisible: the division moves into a
+/// literal factor where one carries it, else it is an exact shift.
+fn exact_quotient(term: E, shift: u32, ty: T, facts: &Facts) -> E {
+    let unit = 1u64 << shift;
+    match term {
+        E::Integer(n, t) => E::Integer(n >> shift, t),
+        E::Binary(B::Mul, a, b, t) if alignment(&b, facts) >= unit => E::Binary(B::Mul, a, Box::new(exact_quotient(*b, shift, t, facts)), t),
+        E::Binary(B::Mul, a, b, t) if alignment(&a, facts) >= unit => E::Binary(B::Mul, Box::new(exact_quotient(*a, shift, t, facts)), b, t),
+        E::Cast(t, x) if matches!(x.ty(), T::I32 | T::U32 | T::I64 | T::U64) && bounds_in(&x, facts).is_some_and(|(lo, _)| lo >= 0) => {
+            let inner = x.ty();
+            exact_quotient(*x, shift, inner, facts).cast(t)
+        }
+        other => E::Binary(B::Shr, Box::new(other.cast(ty)), Box::new(E::Integer(i64::from(shift), T::U32)), ty),
+    }
+}
+
+/// `(A + r) >> c == A / 2^c + (r >> c)` and `(A + r) & (2^c - 1) == r & (2^c - 1)` when `2^c`
+/// divides every addend of `A` and every addend is nonnegative and total. This exposes the
+/// loop-invariant group and word coordinates of a packed element index whose window origin
+/// is aligned to the packing unit. Returns `None` when nothing aligned can be separated.
+fn split_aligned(value: &E, shift: u32, mask: bool, ty: T, facts: &Facts) -> Option<E> {
+    if !(1..=30).contains(&shift) || bounds_in(value, facts)?.0 < 0 {
+        return None;
+    }
+    let mut terms = Vec::new();
+    addends(value, ty, facts, &mut terms);
+    if terms.len() < 2 || terms.iter().any(|term| !bounds_in(term, facts).is_some_and(|(lo, _)| lo >= 0)) {
+        return None;
+    }
+    let unit = 1u64 << shift;
+    let (aligned, rest): (Vec<E>, Vec<E>) = terms.into_iter().partition(|term| alignment(term, facts) >= unit);
+    if aligned.is_empty() {
+        return None;
+    }
+    let sum = |terms: Vec<E>| terms.into_iter().reduce(|a, b| E::binary(B::Add, a, b, ty));
+    let rest = sum(rest);
+    if mask {
+        let rest = rest.unwrap_or(E::Integer(0, ty));
+        return Some(E::Binary(B::BitAnd, Box::new(rest), Box::new(E::Integer((unit - 1) as i64, ty)), ty));
+    }
+    let quotient = sum(aligned.into_iter().map(|term| exact_quotient(term, shift, ty, facts)).collect())?;
+    Some(match rest {
+        Some(rest) => E::binary(B::Add, quotient, E::Binary(B::Shr, Box::new(rest), Box::new(E::Integer(i64::from(shift), T::U32)), ty), ty),
+        None => quotient,
+    })
+}
+
+/// The same value computed in `int`: every node of the integer expression is total and lies
+/// in `[0, i32::MAX]`, so no 32-bit operation wraps and signedness cannot matter. Apple GPUs
+/// compute 64-bit integers several times slower than 32-bit ones (a packed projection kernel
+/// measured 0.98 ms with `long` element coordinates and 0.68 ms with `int`).
+fn narrowed(e: &E, facts: &Facts) -> Option<E> {
+    let integer = |t: T| matches!(t, T::I32 | T::U32 | T::I64 | T::U64);
+    let (lo, hi) = bounds_in(e, facts)?;
+    if lo < 0 || hi > i128::from(i32::MAX) || !integer(e.ty()) {
+        return None;
+    }
+    Some(match e {
+        E::Integer(n, _) => E::Integer(*n, T::I32),
+        E::Variable(..) => e.clone().cast(T::I32),
+        E::Cast(_, x) if integer(x.ty()) => narrowed(x, facts)?,
+        E::Binary(op @ (B::Add | B::Sub | B::Mul | B::BitAnd | B::Div | B::Rem), a, b, _) => {
+            E::Binary(*op, Box::new(narrowed(a, facts)?), Box::new(narrowed(b, facts)?), T::I32)
+        }
+        E::Binary(op @ (B::Shr | B::Shl), a, b, _) if matches!(**b, E::Integer(..)) => E::Binary(*op, Box::new(narrowed(a, facts)?), b.clone(), T::I32),
+        _ => return None,
+    })
 }
 
 fn divisor_step(value: &E, modulus: i128, facts: &Facts) -> i128 {
@@ -481,6 +608,11 @@ fn expression_with(e: E, facts: &Facts) -> E {
             }
         }
     }
+    if matches!(e, E::Binary(_, _, _, T::I64 | T::U64)) {
+        if let Some(narrow) = narrowed(&e, facts) {
+            return narrow.cast(e.ty());
+        }
+    }
     e
 }
 
@@ -511,8 +643,49 @@ fn integer_identity(e: E, facts: &Facts) -> E {
         E::Integer(_, _) => bounds_in(e, facts).map(|(lo, _)| lo),
         _ => None,
     };
+    let bc = constant(b);
+    // Aligned packed coordinates (see `split_aligned`). The rewritten operands are
+    // simplified again so a bounded remainder folds to its value or to zero.
+    let separated = match (op, bc) {
+        (B::Shr, Some(shift)) => u32::try_from(shift).ok().and_then(|shift| split_aligned(a, shift, false, *ty, facts)),
+        (B::BitAnd, Some(mask)) if mask > 0 && u64::try_from(mask + 1).is_ok_and(|n| n.is_power_of_two()) => {
+            split_aligned(a, (mask + 1).trailing_zeros(), true, *ty, facts)
+        }
+        // A nonnegative dividend (checked by `split_aligned`) divides as it shifts.
+        (B::Div | B::Rem, Some(divisor)) if divisor > 1 && u64::try_from(divisor).is_ok_and(|n| n.is_power_of_two()) => {
+            split_aligned(a, divisor.trailing_zeros(), *op == B::Rem, *ty, facts)
+        }
+        _ => None,
+    };
+    if let Some(separated) = separated {
+        return match separated {
+            E::Binary(op, a, b, ty) => {
+                let (a, b) = (integer_identity(*a, facts), integer_identity(*b, facts));
+                integer_identity_leaf(E::Binary(op, Box::new(a), Box::new(b), ty), facts)
+            }
+            other => other,
+        };
+    }
+    integer_identity_leaf(e, facts)
+}
+
+/// The local identities of one integer operation (no aligned separation).
+fn integer_identity_leaf(e: E, facts: &Facts) -> E {
+    let E::Binary(op, a, b, ty) = &e else {
+        return e;
+    };
+    let constant = |e: &E| match e {
+        E::Integer(_, _) => bounds_in(e, facts).map(|(lo, _)| lo),
+        _ => None,
+    };
     let (ac, bc) = (constant(a), constant(b));
     let value = |e: &E| e.clone().cast(*ty);
+    match op {
+        B::Shr if bc.is_some_and(|shift| (0..63).contains(&shift)) && bounds_in(a, facts).is_some_and(|(lo, hi)| lo >= 0 && hi < (1i128 << bc.unwrap())) => {
+            return E::Integer(0, *ty);
+        }
+        _ => {}
+    }
     match op {
         B::Add | B::BitOr | B::BitXor if bc == Some(0) => return value(a),
         B::Add | B::BitOr | B::BitXor if ac == Some(0) => return value(b),
@@ -796,10 +969,12 @@ mod tests {
                 statement,
             })
             .collect();
-        launch(&mut sites);
-        assert!(!matches!(sites[2].statement, S::Evaluate(E::Helper(..))));
-        assert!(matches!(sites[5].statement, S::Evaluate(E::Helper(..))));
-        assert!(matches!(sites[8].statement, S::Evaluate(E::Helper(..))));
+        // The dominated check is discharged and its dead site removed; later sites shift by one.
+        assert!(launch(&mut sites));
+        assert_eq!(sites.len(), 8);
+        assert!(matches!(sites[2].statement, S::Else));
+        assert!(matches!(sites[4].statement, S::Evaluate(E::Helper(..))));
+        assert!(matches!(sites[7].statement, S::Evaluate(E::Helper(..))));
         let mut facts = Facts::new();
         assume(
             &E::binary(B::Gt, logical.clone(), E::integer(0), T::Bool),
@@ -831,13 +1006,14 @@ mod tests {
             S::Evaluate(E::Helper(Helper::Index, vec![E::variable("item", T::U32).cast(T::I64), E::Integer(17, T::I64)], T::I64)),
         ];
         let mut body: Vec<_> = sites.into_iter().map(|statement| super::super::Site { operation: None, statement }).collect();
-        launch(&mut body);
-        assert!(matches!(&body[2].statement, S::Evaluate(E::Cast(T::I64, _))));
+        // The proved check has no remaining effect and does not survive.
+        assert!(launch(&mut body));
+        assert_eq!(body.len(), 2);
         // A mutable admission predicate cannot establish that the original
         // item comparison was true when this later early return executes.
         body.insert(1, super::super::Site { operation: None, statement: S::Assign { name: "admitted".into(), value: E::Integer(1, T::Bool) } });
-        body[3].statement = S::Evaluate(E::Helper(Helper::Index, vec![E::variable("item", T::U32).cast(T::I64), E::Integer(17, T::I64)], T::I64));
-        launch(&mut body);
+        body.push(super::super::Site { operation: None, statement: S::Evaluate(E::Helper(Helper::Index, vec![E::variable("item", T::U32).cast(T::I64), E::Integer(17, T::I64)], T::I64)) });
+        assert!(!launch(&mut body));
         assert!(matches!(&body[3].statement, S::Evaluate(E::Helper(Helper::Index, ..))));
     }
 
@@ -888,14 +1064,16 @@ mod tests {
                 statement,
             })
             .collect();
-        launch(&mut sites);
-        assert!(!matches!(sites[2].statement, S::Evaluate(E::Helper(..))));
+        // The check of the first loop's own index is discharged and its dead site removed;
+        // later sites shift by one.
+        assert!(launch(&mut sites));
+        assert_eq!(sites.len(), 8);
         assert!(matches!(
-            sites[3].statement,
+            sites[2].statement,
             S::Evaluate(E::Helper(Helper::Index, _, _))
         ));
         assert!(matches!(
-            sites[7].statement,
+            sites[6].statement,
             S::Evaluate(E::Helper(Helper::Index, _, _))
         ));
     }
@@ -1041,8 +1219,15 @@ fn assume_condition(condition: &E, truth: bool, facts: &mut Facts, writes: &Hash
 /// are excluded before visiting any loop, so a fact from iteration zero can
 /// never be used after a loop-carried update. Unknown textual implementations
 /// disable this pass; their effects and scope cannot be inferred from strings.
-pub(super) fn launch(sites: &mut [super::Site]) {
+/// Simplify a launch under its lexical facts. A statement that simplification leaves dead
+/// (an `Evaluate` without effect, e.g. a bounds check proved in range and reduced to its
+/// cast) is removed: it computes nothing, and MSL parses `long(x);` as a declaration.
+/// Returns whether sites were removed.
+pub(super) fn launch(sites: &mut Vec<super::Site>) -> bool {
     walk_facts(sites, |_, site, facts| { site.statement = statement_with(site.statement.clone(), facts); });
+    let before = sites.len();
+    sites.retain(|site| !site.statement.is_dead());
+    sites.len() != before
 }
 
 pub(super) fn scope_facts(sites: &[super::Site], retained: &HashSet<usize>) -> HashMap<usize, Facts> {
@@ -1078,16 +1263,25 @@ pub(super) fn walk_facts(sites: &mut [super::Site], mut visit: impl FnMut(usize,
     for (index, site) in sites.iter_mut().enumerate() {
         visit(index, site, &facts);
         match &site.statement {
+            S::Participants { name, count } => {
+                if !writes.contains(name) && *count > 0 {
+                    facts.insert(name.clone(), (0, i128::from(*count - 1)));
+                }
+            }
             S::Let { name, value, ty } => {
                 let bound = bounds_in(&value.clone().cast(*ty), &facts);
                 conditions.remove(name);
                 if *ty == T::Bool && !writes.contains(name) && bound.is_some() {
                     conditions.insert(name.clone(), std::sync::Arc::new(value.clone()));
                 }
+                let aligned = alignment(value, &facts);
                 facts.remove(name);
                 if !writes.contains(name) {
                     if let Some(bound) = bound {
                         facts.insert(name.clone(), bound);
+                        if matches!(ty, T::I32 | T::U32 | T::I64 | T::U64) {
+                            facts.align(name.clone(), aligned);
+                        }
                     }
                 }
             }

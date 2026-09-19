@@ -114,7 +114,34 @@ pub enum TilePlacement {
     Distributed,
     /// Each work item owns a disjoint shared array within its group.
     GroupShared,
+    /// One shared array per group, common to all its work items: a tile of the outer owner
+    /// of a launch whose work items are the inner owners of one piece. Every lane of the
+    /// group cooperates on its element loops.
+    GroupWide,
 }
+impl TilePlacement {
+    /// The tile is an array in the group's shared memory.
+    pub fn group_memory(&self) -> bool {
+        matches!(self, Self::GroupShared | Self::GroupWide)
+    }
+}
+/// The element type a tile is held in inside a thread or threadgroup array. This is the one
+/// rule for local storage types; declarations, byte accounting and emission all follow the
+/// declaration it produces.
+///
+/// Half-width floats are held widened to `f32`: Apple's Metal compiler miscompiles
+/// thread-address-space `bfloat` arrays (bugs/26-09-19/metal-thread-local-bfloat-arrays.md),
+/// and `half` shares the path. Widening is exact; a value is rounded to its logical type
+/// before it is stored, and narrowed again only when published to device memory. A
+/// matrix-intrinsic operand keeps its native type: `simdgroup_load`/`store` address it as
+/// the matrix element type.
+pub fn local_storage_dtype(dtype: DType, native_operand: bool) -> DType {
+    match dtype {
+        DType::BF16 | DType::F16 if !native_operand => DType::F32,
+        other => other,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileDeclaration {
     pub symbol: String,

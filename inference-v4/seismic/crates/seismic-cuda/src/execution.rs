@@ -1,6 +1,7 @@
-//! Selected scalar CUDA execution, resolved without a driver or native compilation.
-//! This baseline assigns one work item to each CUDA thread. It does not model
-//! native registers/occupancy or select a performance-optimal block size.
+//! Realized scalar CUDA execution, resolved without a driver or native compilation.
+//! One work item (piece) per CUDA thread, or per warp of lanes when the body uses
+//! participant intrinsics. The block size is supplied by the mapping's launch rule; native
+//! registers and occupancy are not modeled.
 use seismic_realization::{ScalarProgram, dispatch::GroupDispatch};
 use std::sync::Arc;
 
@@ -100,15 +101,6 @@ impl Execution {
     pub fn storage(&self) -> &InvocationStorage {
         &self.storage
     }
-    pub(crate) fn same_implementation(&self, other: &Self) -> bool {
-        self.target == other.target
-            && self.dispatch == other.dispatch
-            && self.storage == other.storage
-            && self.program.public_buffer_count == other.program.public_buffer_count
-            && self.program.buffers == other.program.buffers
-            && self.program.scalars == other.program.scalars
-            && self.program.conditions == other.program.conditions
-    }
     pub(crate) fn validate_limits(&self, limits: Limits) -> Result<(), String> {
         if self.dispatch.threads_per_group > u64::from(limits.max_threads_per_block)
             || self.dispatch.groups > u64::from(limits.max_grid_x)
@@ -116,5 +108,27 @@ impl Execution {
             return Err("selected CUDA dispatch exceeds the execution device's limits".into());
         }
         Ok(())
+    }
+}
+
+/// The realized execution of one selected entry: its launches in source order, each a
+/// retained terminal PTX program with its launch geometry. Physical completion separates
+/// consecutive launches; values crossing a launch use invocation-owned buffers appended
+/// to the public binding table.
+#[derive(Clone)]
+pub struct Launches {
+    pub name: String,
+    pub phases: Vec<Execution>,
+}
+impl Launches {
+    /// PTX text of every launch, printed from the retained terminal programs.
+    pub fn ptx(&self) -> Vec<String> {
+        self.phases.iter().map(|phase| crate::ptx::print(phase.target_plan())).collect()
+    }
+}
+impl std::fmt::Debug for Launches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let geometry: Vec<(u64, u64)> = self.phases.iter().map(|p| (p.dispatch().groups, p.dispatch().threads_per_group)).collect();
+        f.debug_struct("Launches").field("name", &self.name).field("blocks_x_threads", &geometry).finish()
     }
 }

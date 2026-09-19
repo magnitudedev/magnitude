@@ -1,40 +1,62 @@
-//! `seismic` command-line tool.
+//! `seismic` command-line tool over the structured pipeline:
+//! sources -> `sir::Program` -> joint selection -> the selected witness's MSL.
 
-mod source;
+mod bindings;
+mod select;
 
-use seismic_lang::program::{collect_files, compile, Program};
-use seismic_lang::{parse, print};
-use std::collections::HashMap;
+use seismic_lang::family::{Numerics, Workload};
+use seismic_lang::program::{collect_files, compile};
+use seismic_lang::sir::Program;
+use seismic_lang::syntax;
+use seismic_lang::types::{DType, Elem};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  seismic check <file|dir>... [--lib <dir>]... [--backends a,b]
-  seismic print <file>...
-  seismic plan <file|dir>... --fn <name> --shape K=V,...
-  seismic bindings <file|dir>... --fn <name>
-Native execution requires completed automatic selection through seismic-runtime.
-Explicit candidate selection and native replay commands are not supported.";
+  seismic check <file|dir>... [--targets metal,...]
+  seismic print <file|dir>...
+  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--numerics exact|admitted] [--target cpu|cuda|metal] [--strategy exact|greedy]
+  seismic emit <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--numerics exact|admitted] [--target cpu|cuda|metal] [--strategy exact|greedy]
+  seismic analyze-search <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--numerics exact|admitted] [--target cpu|cuda|metal]
+  seismic bindings <file|dir>... --fn <name> [--element NAME=TYPE,...]
+`select`, `emit` and `analyze-search` target Metal unless `--target` is given. `emit` prints
+what the selected witness compiles to: MSL on Metal, the scalar instruction listing of every
+phase on the CPU, the PTX text of every launch on CUDA. An unselected candidate cannot be emitted. Implementation choices are
+compiler-owned.";
+
+/// The default target of `select`, `emit` and `analyze-search`.
+pub const TARGET: &str = "metal";
+/// Targets with a backend on the structured pipeline. A ported backend adds its name here
+/// and one arm in `select::Target`.
+pub const TARGETS: &[&str] = &["metal", "cpu", "cuda"];
 
 pub struct Options {
     pub paths: Vec<PathBuf>,
-    pub backends: Vec<String>,
-    pub function: Option<String>,
-    pub shapes: HashMap<String, i64>,
-    pub scalars: HashMap<String, f64>,
-    pub elements: HashMap<String,seismic_lang::types::Elem>,
+    pub targets: Vec<String>,
+    /// The backend `select`, `emit` and `analyze-search` run on.
     pub target: String,
+    pub function: Option<String>,
+    pub workload: Workload,
+    /// How `select` and `emit` improve the seed.
+    pub strategy: seismic_compiler::selection::Strategy,
+}
 
+impl Options {
+    pub fn entry(&self) -> Result<&str, String> {
+        self.function.as_deref().ok_or_else(|| "--fn is required".to_string())
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str);
-    let result = match command {
-        Some("check") => check(&args[1..]),
-        Some("print") => print_files(&args[1..]),
-        Some("plan") => source::plan(&args[1..]),
-        Some("bindings") => source::bindings(&args[1..]),
+    let rest = args.get(1..).unwrap_or(&[]);
+    let result = match args.first().map(String::as_str) {
+        Some("check") => check(rest),
+        Some("print") => print_files(rest),
+        Some("select") => select::select(rest),
+        Some("emit") => select::emit(rest),
+        Some("analyze-search") => select::analyze_search(rest),
+        Some("bindings") => bindings::bindings(rest),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
             Ok(())
@@ -51,83 +73,114 @@ fn main() -> ExitCode {
     }
 }
 
-pub fn options(args: &[String]) -> Result<Options, String> {
-    let mut o = Options { paths: Vec::new(), backends: vec!["metal".into(), "cpu".into()], function: None, shapes: HashMap::new(), elements: HashMap::new(), scalars: HashMap::new(), target: "metal".into() };
-    let mut i = 0;
-    let value = |i: &mut usize, what: &str| -> Result<String, String> {
-        *i += 1;
-        args.get(*i).cloned().ok_or_else(|| format!("{what} requires a value"))
-    };
-    while i < args.len() {
-        match args[i].as_str() {
-            "--lib" => o.paths.push(PathBuf::from(value(&mut i, "--lib")?)),
-            "--backends" => o.backends = value(&mut i, "--backends")?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            "--fn" => o.function = Some(value(&mut i, "--fn")?),
-            "--target" => o.target = value(&mut i, "--target")?,
-            "--element" => {
-                for binding in value(&mut i,"--element")?.split(',') {
-                    let (name,element)=binding.split_once('=').ok_or("expected element binding NAME=TYPE")?;
-                    let element=if let Some(dtype)=seismic_lang::types::DType::from_name(element) {seismic_lang::types::Elem::Dtype(dtype)}
-                        else if seismic_lang::repr::lookup(element).is_some() {seismic_lang::types::Elem::Repr(element.into())}
-                        else {return Err(format!("unknown concrete element type {element}"));};
-                    if o.elements.insert(name.into(),element).is_some() {return Err(format!("duplicate element binding {name}"));}
-                }
-            }
-            "--shape" => {
-                for kv in value(&mut i, "--shape")?.split(',') {
-                    let (k, v) = kv.split_once('=').ok_or_else(|| format!("bad shape binding `{kv}`"))?;
-                    o.shapes.insert(k.trim().to_string(), v.trim().parse().map_err(|_| format!("bad shape value `{v}`"))?);
-                }
-            }
-            "--scalar" => {
-                for kv in value(&mut i, "--scalar")?.split(',') {
-                    let (k, v) = kv.split_once('=').ok_or_else(|| format!("bad scalar binding `{kv}`"))?;
-                    o.scalars.insert(k.trim().to_string(), v.trim().parse().map_err(|_| format!("bad scalar value `{v}`"))?);
-                }
-            }
-            other if other.starts_with("--") => return Err(format!("unsupported option `{other}`; implementation choices are compiler-owned")),
-            other => o.paths.push(PathBuf::from(other)),
+/// Parse `args`, accepting only the flags in `allowed`.
+pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
+    let mut o = Options { paths: Vec::new(), targets: vec![TARGET.into()], target: TARGET.into(), function: None, workload: Workload::default(), strategy: Default::default() };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if !arg.starts_with("--") {
+            o.paths.push(PathBuf::from(arg));
+            continue;
         }
-        i += 1;
+        if !allowed.contains(&arg.as_str()) {
+            return Err(format!("unsupported option `{arg}`; implementation choices are compiler-owned"));
+        }
+        let value = rest.next().ok_or_else(|| format!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--targets" => {
+                o.targets = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if o.targets.is_empty() {
+                    return Err("--targets requires at least one target".into());
+                }
+            }
+            "--target" => {
+                if !TARGETS.contains(&value.as_str()) {
+                    return Err(format!("unknown target `{value}`; expected one of {}", TARGETS.join(", ")));
+                }
+                o.target = value.clone();
+                o.targets = vec![value.clone()];
+            }
+            "--fn" => o.function = Some(value.clone()),
+            "--shape" => {
+                for binding in value.split(',') {
+                    let (name, extent) = binding.split_once('=').ok_or_else(|| format!("bad shape binding `{binding}`; expected K=V"))?;
+                    let extent: i64 = extent.trim().parse().map_err(|_| format!("bad shape value `{extent}`"))?;
+                    if extent < 0 {
+                        return Err(format!("shape `{name}` must be nonnegative"));
+                    }
+                    if o.workload.shapes.insert(name.trim().to_string(), extent).is_some() {
+                        return Err(format!("duplicate shape binding {name}"));
+                    }
+                }
+            }
+            "--element" => {
+                for binding in value.split(',') {
+                    let (name, element) = binding.split_once('=').ok_or_else(|| format!("bad element binding `{binding}`; expected NAME=TYPE"))?;
+                    let element = element.trim();
+                    let element = if let Some(dtype) = DType::from_name(element) {
+                        Elem::Dtype(dtype)
+                    } else if seismic_lang::repr::lookup(element).is_some() {
+                        Elem::Repr(element.into())
+                    } else {
+                        return Err(format!("unknown concrete element type {element}"));
+                    };
+                    if o.workload.elems.insert(name.trim().to_string(), element).is_some() {
+                        return Err(format!("duplicate element binding {name}"));
+                    }
+                }
+            }
+            "--strategy" => {
+                o.strategy = match value.as_str() {
+                    "exact" => seismic_compiler::selection::Strategy::Exact,
+                    "greedy" => seismic_compiler::selection::Strategy::Greedy,
+                    other => return Err(format!("bad --strategy `{other}`; expected exact or greedy")),
+                }
+            }
+            "--numerics" => {
+                o.workload.numerics = match value.as_str() {
+                    "exact" => Numerics::Exact,
+                    "admitted" => Numerics::Admitted,
+                    other => return Err(format!("bad --numerics `{other}`; expected exact or admitted")),
+                }
+            }
+            other => return Err(format!("option `{other}` has no parser")),
+        }
     }
     if o.paths.is_empty() {
         return Err(format!("no files given\n{USAGE}"));
     }
-    if o.shapes.values().any(|n| *n < 0) {
-        return Err("shape dimensions must be nonnegative".into());
-    }
     Ok(o)
 }
 
-pub fn load_program(o: &Options) -> Result<Program, String> {
+/// Compile every collected file as one closed program; diagnostics are rendered in full.
+pub fn load_program(o: &Options) -> Result<(usize, Program), String> {
     let files = collect_files(&o.paths)?;
-    let mut backends = o.backends.clone();
-    if o.target == "cuda" && !backends.iter().any(|b| b == "cuda") { backends.push("cuda".into()); }
-    compile(&files, &backends).map_err(|errors| {
-        let mut out: Vec<String> = errors.iter().map(|e| e.render()).collect();
-        out.push(format!("{} error(s)", errors.len()));
+    let program = compile(&files, &o.targets).map_err(|diagnostics| {
+        let mut out: Vec<String> = diagnostics.iter().map(|d| d.render()).collect();
+        out.push(format!("{} error(s)", diagnostics.len()));
         out.join("\n")
-    })
+    })?;
+    Ok((files.len(), program))
 }
 
 fn check(args: &[String]) -> Result<(), String> {
-    let o = options(args)?;
-    let files = collect_files(&o.paths)?;
-    let program = load_program(&o)?;
-    println!("ok: {} file(s), {} function(s), {} lowering(s), backends {}", files.len(), program.functions.len(), program.lowerings.len(), o.backends.join(","));
-    for l in &program.lowerings {
-        if !l.residual.is_empty() {
-            println!("  {}.{}: applies where {}", l.construct, l.backend, l.residual.iter().map(|r| format!("{r} >= 0")).collect::<Vec<_>>().join(" and "));
-        }
-    }
+    let o = options(args, &["--targets"])?;
+    let (files, program) = load_program(&o)?;
+    println!(
+        "ok: {files} file(s), {} definition(s), {} contract family(ies), {} export(s), targets {}",
+        program.definitions.len(),
+        program.families.len(),
+        program.families.iter().filter(|f| f.export).count(),
+        o.targets.join(","),
+    );
     Ok(())
 }
 
 fn print_files(args: &[String]) -> Result<(), String> {
-    let o = options(args)?;
+    let o = options(args, &[])?;
     for f in collect_files(&o.paths)? {
-        let file = parse(&f.text).map_err(|d| d.render(&f.path.display().to_string(), &f.text))?;
-        print!("{}", print(&file));
+        let file = syntax::parse(&f.text).map_err(|d| d.render(&f.path, &f.text))?;
+        print!("{}", syntax::print(&file));
     }
     Ok(())
 }

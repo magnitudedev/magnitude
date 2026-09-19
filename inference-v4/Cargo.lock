@@ -1107,29 +1107,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "seismic-accounting"
-version = "0.1.0"
-dependencies = [
- "cranelift-codegen",
- "magnitude-solver",
- "seismic-lang",
- "seismic-realization",
- "serde",
-]
-
-[[package]]
 name = "seismic-cli"
 version = "0.1.0"
 dependencies = [
- "seismic-accounting",
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
- "seismic-realization",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -1139,7 +1124,6 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
  "magnitude-solver",
- "seismic-accounting",
  "seismic-lang",
  "seismic-realization",
 ]
@@ -1152,8 +1136,6 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
- "magnitude-solver",
- "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
@@ -1165,8 +1147,6 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "libloading",
- "magnitude-solver",
- "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
@@ -1182,11 +1162,9 @@ dependencies = [
  "hyper-util",
  "llguidance",
  "magnitude-templates",
- "seismic-accounting",
- "seismic-cpu",
+ "seismic-compiler",
  "seismic-lang",
  "seismic-metal",
- "seismic-realization",
  "seismic-runtime",
  "seismic-std",
  "serde",
@@ -1199,23 +1177,17 @@ dependencies = [
 [[package]]
 name = "seismic-lang"
 version = "0.1.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
- "magnitude-solver",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
- "seismic-accounting",
  "seismic-compiler",
  "seismic-lang",
  "seismic-realization",
- "serde",
 ]
 
 [[package]]
@@ -1230,16 +1202,13 @@ dependencies = [
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
- "magnitude-solver",
- "seismic-accounting",
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
  "seismic-realization",
- "serde_json",
- "sha2",
+ "seismic-std",
 ]
 
 [[package]]
@@ -1323,7 +1292,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

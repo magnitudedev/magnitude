@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--suite", default="single")
     parser.add_argument("--context", type=int, default=512)
     parser.add_argument("--repeat", type=int, default=1)
+    # V3's own fixtures: RULER-derived retrieval (the default) or the Moby Dick prose history.
+    parser.add_argument("--workload", choices=("retrieval", "prose"), default="retrieval")
     parser.add_argument("--startup-timeout", type=int, default=900)
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
@@ -83,7 +85,8 @@ def main():
         source, [Target(engine="magnitude", reference=str(artifact))], sections,
         (args.context,), (), args.repeat, None,
         lambda message: print(message, file=sys.stderr, flush=True),
-        retrieval=RulerFixture(seed=42, variant="single", haystack="records", queries=1),
+        prose=args.workload == "prose",
+        retrieval=None if args.workload == "prose" else RulerFixture(seed=42, variant="single", haystack="records", queries=1),
     ))
     print(json.dumps(result, indent=2))
 

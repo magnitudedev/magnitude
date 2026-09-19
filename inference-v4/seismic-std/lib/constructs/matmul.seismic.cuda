@@ -1,3 +1,1 @@
-# Correct scalar/SIMT baseline. Resource-modeled matrix and reduction realizations
-# are additional candidates; this declaration makes no performance claim.
-lower matmul: portable
+lower matmul for cuda = portable

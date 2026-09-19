@@ -1,1 +1,1 @@
-lower matmul: portable
+lower matmul for cpu = portable

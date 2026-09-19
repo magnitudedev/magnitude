@@ -2,7 +2,7 @@
 //! Packed MSL vectors retain scalar alignment and exact 2/3/4-element size.
 //! This is a source vector access contract, not a promised native instruction.
 use super::{Expression as E, Program, Site, Space, Statement as S, Type as T};
-use seismic_lang::{ast::BinaryOp as B, ir::OperationId, sym::{Atom, Sym}};
+use seismic_lang::{exec::ir::OperationId, sym::{Atom, Sym}, syntax::ast::BinaryOp as B};
 use std::collections::{HashMap, HashSet};
 use super::rewrite::substitute;
 mod bundle;
@@ -18,56 +18,6 @@ impl Choice {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection { pub choice: Choice, pub width: u8 }
-
-/// A local implementation region. Its alternatives replace only the retained
-/// source interval; surrounding computation is shared by every alternative.
-pub(crate) struct Region {
-    pub choice: Choice,
-    pub range: std::ops::Range<usize>,
-    pub alternatives: Vec<Vec<Site>>,
-}
-
-pub(crate) fn regions(program: &Program) -> Result<Vec<Vec<Region>>, String> {
-    let mut result = Vec::with_capacity(program.launches.len());
-    for (launch, body) in program.launches.iter().enumerate() {
-        let mut regions = Vec::new();
-        if body.iter().any(|site| matches!(site.statement, S::Unmapped(_))) {
-            result.push(regions);
-            continue;
-        }
-        // Legality facts belong to the retained launch, not to a width arm.
-        // Derive them once and share the exact local rewrite with apply().
-        let facts = copy_facts(body);
-        let original_names = binding_names(body);
-        for (site, statement) in body.iter().enumerate() {
-            let Some(copy) = recognized(body, site, &facts) else { continue; };
-            let choice = Choice { kind: Kind::CopyLoop, launch, site,
-                operation: statement.operation, maximum: (copy.end - copy.first).min(4) as u8 };
-            let range = site..copy.close + 1;
-            let alternatives = (1..=choice.maximum).map(|width|
-                copy_replacement(body, site, &copy, width, launch, &mut original_names.clone())).collect();
-            regions.push(Region { choice, range, alternatives });
-        }
-        for bundle in bundle::recognize(body) {
-            let site = bundle.sites[0];
-            let end = bundle.sites.last().copied().ok_or("empty retained read bundle")? + 1;
-            let choice = Choice { kind: Kind::ReadBundle, launch, site,
-                operation: body[site].operation, maximum: bundle.sites.len().min(4) as u8 };
-            let range = site..end;
-            let alternatives = (1..=choice.maximum).map(|width| {
-                let mut replacements = bundle::replacements(body, &bundle, width, launch, &mut original_names.clone());
-                range.clone().flat_map(|at| replacements.remove(&at).unwrap_or_else(|| vec![body[at].clone()])).collect()
-            }).collect();
-            regions.push(Region { choice, range, alternatives });
-        }
-        regions.sort_by_key(|region| region.range.start);
-        if regions.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
-            return Err("overlapping local transfer implementations need a shared region".into());
-        }
-        result.push(regions);
-    }
-    Ok(result)
-}
 
 fn binding_names(body: &[Site]) -> HashSet<String> {
     body.iter().filter_map(|site| match &site.statement {

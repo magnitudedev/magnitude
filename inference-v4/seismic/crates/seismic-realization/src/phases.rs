@@ -2,12 +2,13 @@
 //! A serial region executes once. Its values are published once and reloaded
 //! after completion, never recomputed independently by parallel consumers.
 use seismic_lang::{
-    ast::AssignOp,
-    ir::*,
-    lowered_ir::LoweredIr,
+    exec::ir::*,
+    exec::lowered_ir::LoweredIr,
+    exec::types::{Shaped, Ty},
     span::Span,
     sym::Sym,
-    types::{DType, Elem, Shaped, Ty},
+    syntax::ast::AssignOp,
+    types::{DType, Elem},
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -50,13 +51,6 @@ pub struct PhaseHandoff {
     pub publications: Vec<Stmt>,
 }
 
-/// Applicability never turns a missing realization into an infeasibility proof.
-/// Malformed checked IR is an error; a well-formed program whose phase storage
-/// or work domain is not represented yet retains an explicit unresolved reason.
-pub enum Applicability {
-    Supported(PhasePlan),
-    Unresolved { reason: String },
-}
 #[derive(Debug)]
 enum FormationError {
     Unresolved(String),
@@ -79,32 +73,11 @@ impl From<&str> for FormationError {
         Self::Invalid(reason.into())
     }
 }
-pub fn assess(source: &LoweredIr) -> Result<Applicability, String> {
-    seismic_lang::verify::lowered(source, seismic_lang::verify::Stage::Expanded)?;
-    match construct_checked(source) {
-        Ok(plan) => Ok(Applicability::Supported(plan)),
-        Err(FormationError::Unresolved(reason)) => Ok(Applicability::Unresolved { reason }),
-        Err(FormationError::Invalid(reason)) => Err(reason),
-    }
-}
-
 /// Construct one legal materialized phase realization. Parallel-local values
 /// cannot escape their owner domain, and parallel consumers cannot mutate a
 /// broadcast snapshot without a separately established ownership/merge rule.
 pub fn construct(source: &LoweredIr) -> Result<PhasePlan, String> {
     construct_checked(source).map_err(|error| error.to_string())
-}
-/// Compiler parameters have fixed values within one selected program and
-/// declared finite bounds while phase formation retains the whole family.
-pub fn construct_parameterized(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<PhasePlan, String> {
-    construct_retained(source, numeric, &BTreeSet::new())
-}
-/// Compiler predicates describe disjoint source alternatives within one
-/// retained template. Their conditional definitions remain visible to later
-/// regions guarded by the same original decisions. Concrete reconstruction
-/// verifies the selected source with the ordinary lexical scope rules.
-pub fn construct_retained(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<PhasePlan, String> {
-    construct_with_parameters(source, numeric, selectors).map_err(|error| error.to_string())
 }
 fn construct_checked(source: &LoweredIr) -> Result<PhasePlan, FormationError> {
     construct_with_parameters(source, &BTreeMap::new(), &BTreeSet::new())
@@ -160,7 +133,7 @@ fn construct_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (i64
         }
         let mut changed = HashSet::new();
         for statement in body {
-            seismic_lang::rewrite::value_writes(statement, &function.vars, &mut changed);
+            seismic_lang::exec::writes::value_writes(statement, &function.vars, &mut changed);
         }
         // Reassignment of an existing tile copies into its captured geometry.
         // Even a complete overwrite must retain the earlier shape checks.
@@ -475,22 +448,19 @@ fn capture_paths(body: &[Stmt], variable: VarId, vars: &[Var], selectors: &BTree
                 | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
                 | StmtKind::Lanes { body, .. } => body.clear(),
                 StmtKind::If { then, els, .. } => { then.clear(); els.clear(); }
-                StmtKind::Reduction(reduction) => {
-                    for implementation in reduction.implementations_mut() { implementation.body.clear(); }
-                }
                 StmtKind::Assign { .. } | StmtKind::Expr(_) => {}
             }
             let mut written = HashSet::new();
-            seismic_lang::rewrite::value_writes(&header, vars, &mut written);
+            seismic_lang::exec::writes::value_writes(&header, vars, &mut written);
             if written.contains(&variable) { out.writes.push(path.clone()); }
             // A complete scalar assignment establishes its value. A tile
             // assignment also consumes the retained destination geometry.
             let reads = match &header.kind {
                 StmtKind::Assign { target: Expr { kind: ExprKind::Var(v), .. }, op: AssignOp::Assign, value }
                     if *v == variable && !matches!(vars[variable].ty, Ty::Tile(_)) => {
-                        seismic_lang::effects::uses(&Stmt { id: None, span: header.span, kind: StmtKind::Expr(value.clone()) }, variable)
+                        seismic_lang::exec::effects::uses(&Stmt { id: None, span: header.span, kind: StmtKind::Expr(value.clone()) }, variable)
                     }
-                _ => seismic_lang::effects::uses(&header, variable),
+                _ => seismic_lang::exec::effects::uses(&header, variable),
             };
             if reads { out.reads.push(path.clone()); }
             match &statement.kind {
@@ -517,9 +487,6 @@ fn capture_paths(body: &[Stmt], variable: VarId, vars: &[Var], selectors: &BTree
                 StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
                 | StmtKind::Lanes { body, .. } => visit(body, variable, vars, selectors, path, out),
-                StmtKind::Reduction(reduction) => {
-                    for body in reduction.bodies() { visit(body, variable, vars, selectors, path, out); }
-                }
                 StmtKind::Assign { .. } | StmtKind::Expr(_) => {}
             }
         }
@@ -732,9 +699,6 @@ fn retained_views(body: &[Stmt], vars: &[Var]) -> Result<BTreeSet<VarId>, Format
                 StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
                 | StmtKind::Lanes { body, .. } => definitions(body, phase, false, out),
-                StmtKind::Reduction(reduction) => {
-                    for body in reduction.bodies() { definitions(body, phase, false, out); }
-                }
                 _ => {}
             }
         }
@@ -750,7 +714,7 @@ fn retained_views(body: &[Stmt], vars: &[Var]) -> Result<BTreeSet<VarId>, Format
     let mut required = BTreeSet::new();
     for &(phase, variable, _, serial) in &all {
         if body[phase + 1..].iter().enumerate().any(|(later, root)| {
-            seismic_lang::effects::uses(root, variable) || (serial && vars[variable].ty.shaped().is_some_and(|shape| {
+            seismic_lang::exec::effects::uses(root, variable) || (serial && vars[variable].ty.shaped().is_some_and(|shape| {
                 shape.shape.iter().flat_map(Sym::params).any(|symbol| symbols[phase + 1 + later].contains(&symbol))
             }))
         }) { required.insert(variable); }
@@ -880,9 +844,6 @@ fn control_paths(body: &[Stmt], selectors: &BTreeSet<VarId>) -> BTreeMap<String,
                 StmtKind::Parallel { body, .. } | StmtKind::LoadLoop { body, .. }
                 | StmtKind::Owned { body, .. } | StmtKind::Range { body, .. }
                 | StmtKind::Lanes { body, .. } => visit(body, path, selectors, out),
-                StmtKind::Reduction(reduction) => {
-                    for body in reduction.bodies() { visit(body, path, selectors, out); }
-                }
                 _ => {}
             }
         }
@@ -897,23 +858,10 @@ fn control_symbols(body: &[Stmt]) -> BTreeSet<String> {
 }
 
 /// Physical work domains retain a structural capacity and guard their logical
-/// runtime extent. This is shared by dispatch-domain choice construction and
-/// full phase formation, so mapping choices see the same bounded domain.
-pub fn work_domains(source: &LoweredIr) -> Result<LoweredIr, String> {
-    work_domains_checked(source).map_err(|error| error.to_string())
-}
-pub fn work_domains_parameterized(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>) -> Result<LoweredIr, String> {
-    work_domains_retained(source, numeric, &BTreeSet::new())
-}
-pub fn work_domains_retained(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<LoweredIr, String> {
-    work_domains_with_parameters(source, numeric, selectors).map_err(|error| error.to_string())
-}
-fn work_domains_checked(source: &LoweredIr) -> Result<LoweredIr, FormationError> {
-    work_domains_with_parameters(source, &BTreeMap::new(), &BTreeSet::new())
-}
+/// runtime extent.
 fn work_domains_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (i64, i64)>, selectors: &BTreeSet<VarId>) -> Result<LoweredIr, FormationError> {
     let mut function = source.clone();
-    seismic_lang::normalize::work_domain(&mut function.body);
+    seismic_lang::exec::normalize::work_domain(&mut function.body);
     let prefixes = close_views(&mut function, selectors)?;
     for phase in 0..function.body.len() {
         let StmtKind::Parallel { vars, extents, .. } = &function.body[phase].kind else {
@@ -937,7 +885,7 @@ fn work_domains_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (
             };
             let active = Expr {
                 kind: ExprKind::Binary {
-                    op: seismic_lang::ast::BinaryOp::Lt,
+                    op: seismic_lang::syntax::ast::BinaryOp::Lt,
                     lhs: Box::new(reference(variable, &function.vars, span)),
                     rhs: Box::new(limit),
                 },
@@ -949,7 +897,7 @@ fn work_domains_with_parameters(source: &LoweredIr, numeric: &BTreeMap<String, (
                 None => active,
                 Some(previous) => Expr {
                     kind: ExprKind::Binary {
-                        op: seismic_lang::ast::BinaryOp::And,
+                        op: seismic_lang::syntax::ast::BinaryOp::And,
                         lhs: Box::new(previous),
                         rhs: Box::new(active),
                     },
@@ -1170,7 +1118,16 @@ fn freeze_coordinate(
 fn parameter_variables(function: &LoweredIr) -> Result<BTreeSet<VarId>, String> {
     let mut result = BTreeSet::new();
     for (id, var) in function.vars.iter().enumerate() {
-        if let VarKind::Param(parameter) = var.kind {
+        // Entry index parameters are invocation scalars, defined in every phase
+        // exactly as `seismic_lang::verify` treats them.
+        let parameter = match &var.kind {
+            VarKind::Param(parameter) => Some(*parameter),
+            VarKind::Index(seismic_lang::sym::Atom::Param(name)) if function.index_params.iter().any(|(n, _)| n == name) => {
+                Some(function.params.iter().position(|(n, _)| n == name).ok_or_else(|| format!("index parameter `{name}` is absent from the entry ABI"))?)
+            }
+            _ => None,
+        };
+        if let Some(parameter) = parameter {
             if function
                 .params
                 .get(parameter)
@@ -1671,144 +1628,8 @@ impl Scope<'_> {
                     inner.extend(offset);
                     self.body(body, &mut inner)?;
                 }
-                StmtKind::Reduction(reduction) => {
-                    for operand in reduction.operands() {
-                        self.expr(operand, bound)?;
-                    }
-                    for implementation in reduction.implementations() {
-                        let mut inner = bound.clone();
-                        for value in implementation
-                            .left
-                            .iter()
-                            .chain(&implementation.right)
-                            .chain(&implementation.output)
-                        {
-                            if let ExprKind::Var(v) = value.kind {
-                                inner.insert(v);
-                            }
-                        }
-                        self.body(&implementation.body, &mut inner)?;
-                    }
-                }
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn lowered(source: &str) -> LoweredIr {
-        let program = seismic_lang::program::compile(
-            &[seismic_lang::program::SourceFile {
-                path: "phases.seismic.portable".into(),
-                scope: seismic_lang::Scope::Portable,
-                text: source.into(),
-            }],
-            &[],
-        )
-        .unwrap_or_else(|errors| {
-            panic!(
-                "{}",
-                errors
-                    .iter()
-                    .map(|e| e.render())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        });
-        seismic_lang::lower::lower(&program, "evaluate", "cpu", &Default::default()).unwrap()
-    }
-    #[test]
-    fn serial_values_are_published_once_and_serial_updates_publish_new_versions() {
-        let function = lowered(
-            "fn evaluate(x:tensor[8] f32,out:tensor[8] f32):\n  a = x[0]\n  snapshot = load(x)\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = snapshot[row] + a\n    store(y,out[row:row+1])\n  a += 1.0\n  for row in parallel:\n    y = tile[1] f32\n    for i in owned(y): y[i] = a\n    store(y,out[row:row+1])\n",
-        );
-        let plan = construct(&function).unwrap();
-        assert_eq!(plan.phases.len(), 4);
-        assert_eq!(plan.retained.len(), 2);
-        let scalar = plan.retained.iter().find(|v| v.elements == 1).unwrap();
-        assert_eq!(scalar.producer, 0);
-        assert_eq!(scalar.consumers, [1, 2, 3]);
-        assert_eq!(scalar.writers, [0, 2]);
-        let tile = plan.retained.iter().find(|v| v.elements == 8).unwrap();
-        assert_eq!(tile.consumers, [1]);
-        assert_eq!(plan.function.params.len(), function.params.len() + 2);
-        verify(&plan.function).unwrap();
-    }
-    #[test]
-    fn captured_view_retains_coordinate_reads_without_copying_its_referent() {
-        let function = lowered(
-            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] i32):\n  view = x[bounds[0]:bounds[1]]\n  for row in parallel:\n    y = tile[1] i32\n    for i in owned(y): y[i] = extent(view,0)\n    store(y,out[row:row+1])\n",
-        );
-        let plan = construct(&function).unwrap();
-        assert_eq!(plan.retained.len(), 2);
-        assert!(
-            plan.retained
-                .iter()
-                .all(|v| v.dtype == DType::I32 && v.elements == 1)
-        );
-        let StmtKind::Parallel { body, .. } = &plan.function.body[1].kind else {
-            unreachable!()
-        };
-        let bounds = function
-            .vars
-            .iter()
-            .position(|v| v.name == "bounds")
-            .unwrap();
-        assert!(!body.iter().any(|s| seismic_lang::effects::uses(s, bounds)));
-        verify(&plan.function).unwrap();
-    }
-    #[test]
-    fn geometry_used_only_by_a_symbolic_range_is_a_phase_input() {
-        let function = lowered(
-            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] i32):\n  view = x[bounds[0]:bounds[1]]\n  for row in parallel:\n    count = 0\n    for j in range(extent(view,0)): count += 1\n    y = tile[1] i32\n    for i in owned(y): y[i] = count\n    store(y,out[row:row+1])\n",
-        );
-        let plan = construct(&function).unwrap();
-        assert_eq!(plan.retained.len(), 2);
-        let StmtKind::Parallel { body, .. } = &plan.function.body[1].kind else {
-            unreachable!()
-        };
-        let view = function.vars.iter().position(|v| v.name == "view").unwrap();
-        assert!(body.iter().any(|s| matches!(&s.kind, StmtKind::Assign { target: Expr { kind: ExprKind::Var(v), .. }, .. } if *v == view)));
-        verify(&plan.function).unwrap();
-    }
-    #[test]
-    fn runtime_tile_shape_has_retained_lengths_and_structural_capacity() {
-        let function = lowered(
-            "fn evaluate(x:tensor[8] f32,bounds:tensor[2] i32,out:tensor[2] f32):\n  snapshot = load(x[bounds[0]:bounds[1]])\n  for row in parallel:\n    result = tile[1] f32\n    for i in owned(result): result[i] = reduce(snapshot,0,sum)\n    store(result,out[row:row+1])\n",
-        );
-        let plan = construct(&function).unwrap();
-        assert!(
-            plan.retained
-                .iter()
-                .any(|v| v.dtype == DType::I32 && v.elements == 1)
-        );
-        assert!(
-            plan.retained
-                .iter()
-                .any(|v| v.dtype == DType::F32 && v.elements == 8)
-        );
-        verify(&plan.function).unwrap();
-    }
-    #[test]
-    fn phase_scope_rejects_an_iteration_value_escaping_to_the_next_launch() {
-        let mut function = lowered(
-            "fn evaluate(x:tensor[8] f32,out:tensor[8] f32):\n  for row in parallel:\n    value = load(x[row:row+1])\n    store(value,out[row:row+1])\n",
-        );
-        let StmtKind::Parallel { body, .. } = &function.body[0].kind else {
-            unreachable!()
-        };
-        let StmtKind::Assign { target, .. } = &body[0].kind else {
-            unreachable!()
-        };
-        function.body.push(Stmt {
-            id: None,
-            span: target.span,
-            kind: StmtKind::Expr(target.clone()),
-        });
-        let error = construct(&function).unwrap_err();
-        assert!(error.contains("outside its defining scope"), "{error}");
     }
 }

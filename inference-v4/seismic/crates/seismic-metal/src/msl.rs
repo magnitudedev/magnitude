@@ -6,27 +6,25 @@
 //! Load realization is explicit, with borrowing admitted by shared lifetime rules.
 //! Dtype conversions preserve the checked numerical publication boundaries.
 
-pub(crate) mod parameters;
-
 use crate::collective::{
     Implementation as CollectiveImplementation, Site as CollectiveSite, StorageSpace,
 };
 use crate::memory::{AllocationId, BarrierPurpose, BarrierSite, MemorySpace, Purpose};
-use crate::storage::StorageDecision;
 use seismic_lang::abi::ScalarParameter;
-use seismic_lang::ast::{AssignOp, BinaryOp, UnaryOp};
-use seismic_lang::ir::*;
-use seismic_lang::lowered_ir::LoweredIr;
+use seismic_lang::exec::ir::*;
+use seismic_lang::exec::lowered_ir::LoweredIr;
+use seismic_lang::exec::types::Ty;
 use seismic_lang::repr;
 use seismic_lang::sym::{Atom, Sym};
-use seismic_lang::types::{DType, Elem, Ty};
+use seismic_lang::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
+use seismic_lang::types::{DType, Elem};
 use seismic_realization::{
     BufferSpec,
     dispatch::{GroupDispatch, TileDeclaration, TilePlacement},
 };
 use std::collections::{HashMap, HashSet};
 
-use crate::execution::{self, Config, Execution, SUBGROUP};
+use crate::execution::{Config, Execution, SUBGROUP};
 use crate::terminal::{Expression as TE, Space as TSpa, Statement as TS, Type as TT};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,7 +35,7 @@ pub struct Emitted {
     pub buffers: Vec<BufferSpec>,
     pub scalars: Vec<ScalarParameter>,
     /// Scratch the realization needs and the caller did not supply: bytes per buffer, in
-    /// the order they follow the caller's buffers. A split reduction's partial states live
+    /// the order they follow the caller's buffers. Values retained across launches live
     /// here, so no kernel has to declare them.
     pub scratch: Vec<usize>,
     /// Named compiler-owned bindings, in the same order as scratch allocations.
@@ -71,6 +69,64 @@ pub struct Launch {
     /// private-storage or register account. Native optimization can remove them.
     pub tiles: Vec<TileDeclaration>,
     pub declared_threadgroup_bytes: u64,
+    /// The kernel's buffer table: position `i` is its `[[buffer(i)]]`. A kernel declares
+    /// only the invocation resources its body references, numbered densely from 0.
+    pub bindings: Vec<Binding>,
+}
+
+/// One invocation resource, by its position in the entry's invocation ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// `Emitted::buffers[n]`: a caller-supplied parameter plane.
+    Buffer(usize),
+    /// `Emitted::scratch[n]`: compiler-owned storage.
+    Scratch(usize),
+    /// The scalar parameter block.
+    Scalars,
+    /// The invocation status word.
+    Status,
+}
+
+/// A thread's index among all threads of its threadgroup: the lane of the outer owner of a
+/// launch whose SIMD groups are inner owners.
+const GROUP_LANE: &str = "tg_lane";
+
+/// Metal admits buffer indices 0..=30 in one compute function.
+pub const MAX_KERNEL_BUFFERS: usize = 31;
+
+/// A resource a kernel may declare: its MSL declaration without the buffer attribute, the
+/// identifier its body names it by, and its invocation binding.
+struct Resource {
+    declaration: String,
+    identifier: String,
+    binding: Binding,
+}
+
+/// The signature of one kernel: the resources whose identifier occurs in `body`, in
+/// invocation order, then the thread coordinates. The status word is always bound: the
+/// runtime reads it after every invocation.
+fn kernel_signature(kernel: &str, resources: &[Resource], body: &[&str]) -> Result<(String, Vec<Binding>), String> {
+    let mut identifiers = std::collections::HashSet::new();
+    for text in body {
+        identifiers.extend(text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|token| !token.is_empty()));
+    }
+    let mut parameters = Vec::new();
+    let mut bindings = Vec::new();
+    for resource in resources {
+        if resource.binding == Binding::Status || identifiers.contains(resource.identifier.as_str()) {
+            parameters.push(format!("{} [[buffer({})]]", resource.declaration, bindings.len()));
+            bindings.push(resource.binding);
+        }
+    }
+    if bindings.len() > MAX_KERNEL_BUFFERS {
+        return Err(format!("launch `{kernel}` references {} buffers; one Metal kernel binds at most {MAX_KERNEL_BUFFERS}", bindings.len()));
+    }
+    parameters.extend(["uint3 tg_pos [[threadgroup_position_in_grid]]", "uint sg_id [[simdgroup_index_in_threadgroup]]", "uint lane [[thread_index_in_simdgroup]]"].map(String::from));
+    // The outer owner of a launch with inner owner regions addresses every thread of its group.
+    if identifiers.contains(GROUP_LANE) {
+        parameters.push(format!("uint {GROUP_LANE} [[thread_index_in_threadgroup]]"));
+    }
+    Ok((parameters.join(",\n    "), bindings))
 }
 
 /// One axis of a tile: static capacity and a C expression for the runtime extent.
@@ -82,6 +138,8 @@ struct Dim {
     physical_value: TE,
     ext: String,
     value: TE,
+    /// The extent `value` renders: the bound of an owned coordinate over this axis.
+    actual: Sym,
 }
 
 impl Dim {
@@ -100,7 +158,6 @@ struct ViewGeometry {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Realization {
-    Choice { arms: Vec<(String, Box<Realization>)> },
     /// Captured logical tile geometry with no addressable element storage.
     Geometry {
         dims: Vec<Dim>,
@@ -146,13 +203,6 @@ enum Realization {
     },
 }
 
-struct SplitTail {
-    phase: usize,
-    kernel: String,
-    carried: Vec<VarId>,
-    body: Vec<Stmt>,
-}
-
 struct Printer<'a> {
     terminal: crate::terminal::Program,
     terminal_indents: Vec<Vec<usize>>,
@@ -169,6 +219,17 @@ struct Printer<'a> {
     counter: usize,
     owned_ctx: Vec<(VarId, Vec<String>, Option<String>)>,
     lane_domains: Vec<(Sym, i64)>,
+    /// Lexical stack of integer atoms whose inclusive range holds by construction of the
+    /// emitted code (loop indices, owned coordinates, slice starts and lengths, checked
+    /// indices); `None` shadows an outer binding of an atom whose range is unknown. Only
+    /// these atoms take part in the symbolic bounds proofs of `proves_index`.
+    ranges: Vec<(Atom, Option<(Sym, Sym)>)>,
+    /// Slices already evaluated in an enclosing scope: `(start, end, extent)` to the names
+    /// of their checked start and length.
+    slices: Vec<((Sym, Sym, Sym), (String, String))>,
+    /// Scalar locals with exactly one assignment statement: immutable within one execution
+    /// of the block that assigns them, so their name is their symbolic value.
+    single_assignment: HashSet<VarId>,
     buffers: Vec<BufferSpec>,
     scalars: Vec<ScalarParameter>,
     shared_decls: Vec<(String, u64)>,
@@ -180,26 +241,45 @@ struct Printer<'a> {
     collective_ordinal: usize,
     /// Simdgroups per threadgroup for the kernel being emitted.
     simdgroups: i64,
-    grouping_parameters: bool,
-    parameters: &'a mut parameters::Operands,
-    active_implementations: std::collections::BTreeMap<String, bool>,
+    /// Tiles placed once per threadgroup (`TilePlacement::GroupWide`).
+    group_wide: HashSet<VarId>,
+    /// Piece coordinates of the inner owner of this thread's SIMD group, in binder order:
+    /// the trailing work axes of a launch with inner owner regions.
+    owner_coordinates: Vec<TE>,
+    /// Emission is inside an inner owner region.
+    inner_owner: bool,
 }
 
-pub fn emit(f: &LoweredIr) -> Result<Emitted, String> {
-    emit_with(f, Config::default())
-}
-
-pub fn emit_with(f: &LoweredIr, cfg: Config) -> Result<Emitted, String> {
-    emit_execution(&execution::prepare(f, cfg)?)
-}
-
-/// Resolve storage before printing the selected execution.
-pub fn emit_storage_selected(
-    f: &LoweredIr,
-    cfg: Config,
-    select: &mut dyn FnMut(&StorageDecision) -> Result<TilePlacement, String>,
-) -> Result<Emitted, String> {
-    emit_execution(&execution::prepare_storage_selected(f, cfg, select)?)
+/// `i32` scalar locals that exactly one statement assigns.
+fn single_assignment(f: &LoweredIr) -> HashSet<VarId> {
+    fn visit(stmts: &[Stmt], counts: &mut HashMap<VarId, usize>) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Parallel { body, .. }
+                | StmtKind::LoadLoop { body, .. }
+                | StmtKind::Owned { body, .. }
+                | StmtKind::Range { body, .. }
+                | StmtKind::Lanes { body, .. } => visit(body, counts),
+                StmtKind::If { then, els, .. } => {
+                    visit(then, counts);
+                    visit(els, counts);
+                }
+                StmtKind::Assign { target, .. } => {
+                    if let ExprKind::Var(v) = target.kind {
+                        *counts.entry(v).or_default() += 1;
+                    }
+                }
+                StmtKind::Expr(_) => {}
+            }
+        }
+    }
+    let mut counts = HashMap::new();
+    visit(&f.body, &mut counts);
+    counts
+        .into_iter()
+        .filter(|(v, count)| *count == 1 && matches!(f.vars[*v].kind, VarKind::Local) && matches!(f.vars[*v].ty, Ty::Scalar(DType::I32)))
+        .map(|(v, _)| v)
+        .collect()
 }
 
 /// Print an already transformed execution with resolved materialized-value placements.
@@ -218,54 +298,30 @@ pub fn prepare_execution(execution: &Execution) -> Result<&Emitted, String> {
         .map_err(Clone::clone)
 }
 fn build_execution(execution: &Execution) -> Result<Emitted, String> {
-    build_execution_mode(execution, false)
-}
-fn build_execution_mode(execution: &Execution, grouping_parameters: bool) -> Result<Emitted, String> {
-    build_execution_parameters(execution, grouping_parameters).map(|(emitted, _)| emitted)
-}
-fn build_execution_parameters(execution: &Execution, grouping_parameters: bool) -> Result<(Emitted, parameters::Operands), String> {
-    let mut parameters = parameters::Operands::default();
-    let mut parameter_names = HashMap::new();
-    let mut parameter_expressions = HashMap::new();
-    let mut numeric_names = HashMap::new();
-    for (name, value) in &execution.numeric_parameters {
-        let symbol = parameters::symbol(*value);
-        let expression = parameters.expression(symbol.clone(), *value).cast(TT::I32);
-        let (minimum, maximum) = value.bounds();
-        numeric_names.insert(name.clone(), if minimum == maximum { Sym::constant(minimum as i64) } else { Sym::param(&symbol) });
-        parameter_names.insert(name.clone(), symbol.clone());
-        parameter_expressions.insert(symbol, expression);
-    }
-    for (name, definition) in &execution.numeric_definitions {
-        let value = execution.numeric_parameters.get(name).ok_or("Metal numeric definition has no original binding")?;
-        if definition.params().iter().any(|name| !numeric_names.contains_key(name)) {
-            return Err("Metal numeric definition references an unregistered source parameter".into());
-        }
-        let definition = seismic_lang::lower::subst_sym(definition, &numeric_names, &HashMap::new());
-        parameters.define(*value, definition)?;
-    }
     let f = &execution.function;
     let phase_indices = execution.phases.iter()
-        .map(|phase| phase.split.iter().map(|split| split.part).collect())
+        .map(|_| Vec::new())
         .collect::<Vec<_>>();
-    if execution.implementation.is_some() { seismic_lang::verify::retained_phases(f, &phase_indices)?; }
-    else { seismic_lang::verify::executable_phases(f, &phase_indices)?; }
+    seismic_lang::exec::verify::executable_phases(f, &phase_indices)?;
     let cfg = &execution.config;
     let mut emitted = Printer {
         terminal: Default::default(),
         terminal_indents: Vec::new(),
-        expressions: parameter_expressions,
+        expressions: HashMap::new(),
         local_planes: HashMap::new(),
         f,
         execution,
         cfg,
         out: String::new(),
         real: HashMap::new(),
-        names: parameter_names,
+        names: HashMap::new(),
         indent: 0,
         counter: 0,
         owned_ctx: Vec::new(),
         lane_domains: Vec::new(),
+        ranges: Vec::new(),
+        slices: Vec::new(),
+        single_assignment: single_assignment(f),
         buffers: Vec::new(),
         scalars: Vec::new(),
         shared_decls: Vec::new(),
@@ -276,23 +332,22 @@ fn build_execution_parameters(execution: &Execution, grouping_parameters: bool) 
         current_operation: None,
         collective_ordinal: 0,
         simdgroups: cfg.sg_per_tg,
-        grouping_parameters,
-        parameters: &mut parameters,
-        active_implementations: Default::default(),
+        group_wide: HashSet::new(),
+        owner_coordinates: Vec::new(),
+        inner_owner: false,
     }
     .emit()?;
-    if execution.implementation.is_some() { emitted.terminal.validate_template()?; }
-    else { emitted.terminal.validate_typed()?; }
+    emitted.terminal.validate_typed()?;
     let planned = execution.memory.launches();
     if emitted.launches.len() != planned.len() {
         return Err("emitted launch count disagrees with allocation plan".into());
     }
     for (launch, plan) in emitted.launches.iter().zip(planned) {
-        if execution.implementation.is_none() && (launch
+        if launch
             .tiles
             .iter()
             .ne(plan.arrays.iter().map(|a| &a.declaration))
-            || launch.declared_threadgroup_bytes != plan.shared_bytes_per_group)
+            || launch.declared_threadgroup_bytes != plan.shared_bytes_per_group
         {
             let at = launch
                 .tiles
@@ -310,143 +365,12 @@ fn build_execution_parameters(execution: &Execution, grouping_parameters: bool) 
             ));
         }
     }
-    for (at, (a, ad)) in execution.partition_parameters.iter().enumerate() {
-        for (b, bd) in &execution.partition_parameters[at + 1..] {
-            let find = |id: usize| {
-                emitted
-                    .buffers
-                    .iter()
-                    .position(|slot| slot.parameter == f.vars[id].name && slot.plane.is_empty())
-                    .ok_or("partition parameter missing from ABI")
-            };
-            emitted.alias_pairs.push((find(*a)?, find(*b)?, ad == bd));
-        }
-    }
     emitted.alias_pairs.extend_from_slice(
         seismic_realization::InvocationConditions::from_lowered(execution.source())?.alias_pairs(),
     );
     emitted.alias_pairs.sort_unstable();
     emitted.alias_pairs.dedup();
-    Ok((emitted, parameters))
-}
-
-/// Terminal grouping operands are introduced at the printer's semantic launch
-/// boundary. No selected kernel is inspected to discover replaceable constants.
-fn grouping_parameter(launch: usize) -> String { format!("seismic_family_grouping_{launch}__") }
-
-pub(crate) struct GroupingTemplate {
-    emitted: Emitted,
-    shared_per_item: Vec<u64>,
-    operands: parameters::Operands,
-    scratch: Vec<(crate::memory::ScratchAllocation, Option<seismic_accounting::algebra::Value>)>,
-}
-impl GroupingTemplate {
-    pub(crate) fn new(execution: &Execution) -> Result<Self, String> {
-        let (emitted, operands) = build_execution_parameters(execution, true)?;
-        let shared_per_item = execution.memory().launches().iter().map(|launch| {
-            let unit = GroupDispatch::new(1, SUBGROUP as u64, 1)?;
-            launch.slots.iter().try_fold(0u64, |bytes, slot| bytes.checked_add(slot.layout(&unit)?.shared_bytes_per_group).ok_or_else(|| "Metal template shared storage overflow".into()))
-        }).collect::<Result<Vec<_>, String>>()?;
-        let scratch = execution.memory().scratch().iter().map(|allocation| {
-            let parts = execution.launch_parameters.as_ref().and_then(|launches| launches.get(allocation.producer)).map(|launch| launch.parts);
-            (allocation.clone(), parts)
-        }).collect();
-        Ok(Self { emitted, shared_per_item, operands, scratch })
-    }
-    pub(crate) fn emitted(&self) -> &Emitted { &self.emitted }
-    pub(crate) fn operands(&self) -> &parameters::Operands { &self.operands }
-    pub(crate) fn shared_per_item(&self) -> &[u64] { &self.shared_per_item }
-    pub(crate) fn instantiate(&self, dispatches: &[GroupDispatch], values: &[i64]) -> Result<Emitted, String> {
-        self.instantiate_program(dispatches, &self.emitted.terminal, values)
-    }
-    pub(crate) fn instantiate_program(&self, dispatches: &[GroupDispatch], program: &crate::terminal::Program, values: &[i64]) -> Result<Emitted, String> {
-        let program = self.operands.instantiate(program, values)?;
-        self.materialize(dispatches, &program, Some(values))
-    }
-    fn materialize(&self, dispatches: &[GroupDispatch], program: &crate::terminal::Program, values: Option<&[i64]>) -> Result<Emitted, String> {
-        if dispatches.len() != self.emitted.launches.len() { return Err("Metal terminal template launch count differs from assignment".into()); }
-        if program.launches().len() != dispatches.len() { return Err("Metal terminal region count differs from its launches".into()); }
-        let mut emitted = self.emitted.clone();
-        emitted.terminal = program.clone();
-        if let Some(values) = values { emitted.source = self.operands.source(&emitted.source, values)?; }
-        for (index, body) in program.launches().iter().enumerate() {
-            let begin = format!("/*seismic_family_body_begin_{index}__*/\n");
-            let end = format!("/*seismic_family_body_end_{index}__*/\n");
-            let start = emitted.source.find(&begin).ok_or("missing retained terminal body boundary")?;
-            let finish = emitted.source[start + begin.len()..].find(&end)
-                .map(|offset| start + begin.len() + offset + end.len())
-                .ok_or("missing retained terminal body completion")?;
-            let mut source = String::new();
-            let mut indent = 1usize;
-            for site in body {
-                if matches!(site.statement, TS::End | TS::Else) { indent = indent.checked_sub(1).ok_or("terminal family scope underflow")?; }
-                source.push_str(&"  ".repeat(indent)); source.push_str(&site.statement.render()); source.push('\n');
-                if matches!(site.statement, TS::For { .. } | TS::If(_) | TS::Scope | TS::Else) { indent += 1; }
-            }
-            if indent != 1 { return Err("terminal family left an open scope".into()); }
-            emitted.source.replace_range(start..finish, &source);
-        }
-        for (index, (launch, dispatch)) in emitted.launches.iter_mut().zip(dispatches).enumerate() {
-            let original = launch.dispatch.as_ref().ok_or("Metal terminal template has no work domain")?;
-            if dispatch.work_items > original.work_items || dispatch.lanes_per_item != original.lanes_per_item {
-                return Err("selected dispatch exceeds the retained terminal occurrence domain".into());
-            }
-            let name = grouping_parameter(index);
-            let value = crate::terminal::Expression::Integer(i64::try_from(dispatch.items_per_group).map_err(|_| "grouping exceeds terminal integer")?, crate::terminal::Type::U32);
-            for site in &mut emitted.terminal.launches[index] {
-                site.statement = crate::terminal::rewrite::statement(&site.statement, &name, &value);
-            }
-            emitted.source = emitted.source.replace(&name, &value.render());
-            launch.threadgroups = dispatch.groups;
-            launch.threads_per_threadgroup = dispatch.threads_per_group;
-            let selected_shared = match values {
-                Some(values) => self.operands.shared_bytes(index, dispatch, values)?,
-                None => None,
-            };
-            launch.declared_threadgroup_bytes = match selected_shared {
-                Some(bytes) => bytes,
-                None => self.shared_per_item[index].checked_mul(dispatch.items_per_group).ok_or("Metal grouping storage overflow")?,
-            };
-            if let Some(values) = values {
-                if let Some(tiles) = self.operands.tiles(index, values)? { launch.tiles = tiles; }
-            }
-            launch.dispatch = Some(dispatch.clone());
-        }
-        if let Some(values) = values {
-            for (allocation, parts) in &self.scratch {
-                if allocation.parameter.is_some() { continue; }
-                let parts = match parts {
-                    Some(parts) => {
-                        let value = *values.get(parts.id().0).ok_or("selected split part count is missing")?;
-                        let value = u64::try_from(value).map_err(|_| "selected split part count is negative")?;
-                        if value < parts.bounds().0 || value > parts.bounds().1 { return Err("selected split part count is outside its retained domain".into()); }
-                        value
-                    },
-                    None => allocation.parts,
-                };
-                let work_items = dispatches.get(allocation.consumer).ok_or("selected split consumer is missing")?.work_items;
-                let bytes = work_items.checked_mul(parts)
-                    .and_then(|count| count.checked_mul(allocation.elements_per_item))
-                    .and_then(|count| count.checked_mul(u64::from(allocation.dtype.bytes())))
-                    .and_then(|bytes| usize::try_from(bytes).ok()).ok_or("selected split scratch size overflow")?;
-                *emitted.scratch.get_mut(allocation.index).ok_or("selected split scratch allocation is missing")? = bytes;
-                emitted.scratch_bindings.get_mut(allocation.index).ok_or("selected split scratch binding is missing")?.bytes = bytes;
-            }
-        }
-        if values.is_some() { emitted.terminal.validate_typed()?; }
-        else { emitted.terminal.validate_template()?; }
-        Ok(emitted)
-    }
-    /// A work-item trace uses the same unsimplified typed parameter body with
-    /// canonical work coordinates. Native reconstruction substitutes the actual
-    /// grouping, preserving the same operations and their source order.
-    pub(crate) fn canonical(&self) -> Result<Emitted, String> {
-        let dispatches = self.emitted.launches.iter().map(|launch| {
-            let dispatch = launch.dispatch.as_ref().ok_or("template launch has no dispatch")?;
-            GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, 1)
-        }).collect::<Result<Vec<_>, String>>()?;
-        self.materialize(&dispatches, &self.emitted.terminal, None)
-    }
+    Ok(emitted)
 }
 
 fn ctype(d: DType) -> &'static str {
@@ -463,7 +387,7 @@ fn ctype(d: DType) -> &'static str {
 /// Canonical native name of a typed scalar binding. Retained source predicates
 /// use the same identity as ordinary scalar emission; callers never rediscover
 /// parameters by scanning or parsing emitted source text.
-pub(crate) fn variable_symbol(variable: &seismic_lang::ir::Var, id: VarId) -> String {
+pub(crate) fn variable_symbol(variable: &seismic_lang::exec::ir::Var, id: VarId) -> String {
     format!("{}_{}", sanitize(&variable.name), id)
 }
 
@@ -477,6 +401,9 @@ fn scalar_dtype(t: &Ty) -> Option<DType> {
 impl Printer<'_> {
     fn target(&mut self, statement: crate::terminal::Statement) {
         let statement = statement.realized();
+        if statement.is_dead() {
+            return;
+        }
         match &statement {
             TS::Let { name, ty, .. } => {
                 self.expressions
@@ -503,7 +430,7 @@ impl Printer<'_> {
     }
 
     fn realize_kernel(&mut self) -> Result<(), String> {
-        self.terminal.realize_launch(self.memory_launch);
+        let mut removed = self.terminal.realize_launch(self.memory_launch);
         let synchronized = crate::terminal::synchronize::coalesce(
             &mut self.terminal.launches[self.memory_launch],
         )?;
@@ -518,7 +445,7 @@ impl Printer<'_> {
                 self.memory_launch,
                 &self.execution.transfers,
             )?;
-            self.terminal.realize_launch(self.memory_launch);
+            removed |= self.terminal.realize_launch(self.memory_launch);
         }
         let selected = self
             .execution
@@ -531,9 +458,9 @@ impl Printer<'_> {
                 self.memory_launch,
                 &self.execution.traversals,
             )?;
-            self.terminal.realize_launch(self.memory_launch);
+            removed |= self.terminal.realize_launch(self.memory_launch);
         }
-        if selected || transferred || synchronized {
+        if selected || transferred || synchronized || removed {
             let mut indent = 1usize;
             self.terminal_indents[self.memory_launch] = self.terminal.launches[self.memory_launch]
                 .iter()
@@ -581,6 +508,72 @@ impl Printer<'_> {
         self.execution.storage.capacity(s)
     }
 
+    /// Whether every atom of `s` is a plain parameter whose range holds by construction.
+    /// Quotient and remainder atoms are excluded: their emitted arithmetic truncates.
+    fn ranged(&self, s: &Sym) -> bool {
+        let ranges = self.live_ranges();
+        s.atoms().iter().all(|atom| matches!(atom, Atom::Param(_)) && ranges.contains_key(atom))
+    }
+
+    /// The innermost binding of every atom, without shadowed atoms and without ranges that
+    /// mention an atom that is no longer ranged.
+    fn live_ranges(&self) -> std::collections::BTreeMap<Atom, (Sym, Sym)> {
+        let mut innermost = std::collections::BTreeMap::new();
+        for (atom, range) in &self.ranges {
+            innermost.insert(atom.clone(), range.clone());
+        }
+        let mut live: std::collections::BTreeMap<Atom, (Sym, Sym)> = innermost.into_iter().filter_map(|(atom, range)| Some((atom, range?))).collect();
+        loop {
+            let stale: Vec<Atom> = live
+                .iter()
+                .filter(|(_, (lo, hi))| lo.atoms().iter().chain(hi.atoms().iter()).any(|a| !matches!(a, Atom::Param(_)) || !live.contains_key(a)))
+                .map(|(atom, _)| atom.clone())
+                .collect();
+            if stale.is_empty() {
+                return live;
+            }
+            for atom in stale {
+                live.remove(&atom);
+            }
+        }
+    }
+
+    /// Bind `atom` to the inclusive range `[lo, hi]` until the enclosing scope is left. A
+    /// range over atoms that are not themselves ranged shadows any outer binding instead.
+    fn bind_range(&mut self, atom: Atom, lo: Sym, hi: Sym) {
+        // The prover takes every atom as nonnegative: a range enters only with a proven
+        // nonnegative lower end (`0 <= lo < lo + 1`).
+        let admitted = self.ranged(&hi) && self.proves_index(&lo, &lo.add(&Sym::constant(1)));
+        self.ranges.push((atom, admitted.then_some((lo, hi))));
+    }
+
+    /// Symbolic proof that `0 <= index < extent` from the ranges that hold by construction.
+    /// The prover treats every atom as nonnegative, so only ranged atoms are admitted.
+    fn proves_index(&self, index: &Sym, extent: &Sym) -> bool {
+        let ranges = self.live_ranges();
+        let ranged = |s: &Sym| s.atoms().iter().all(|atom| matches!(atom, Atom::Param(_)) && ranges.contains_key(atom));
+        if !ranged(index) || !ranged(extent) {
+            return false;
+        }
+        let mut facts = seismic_lang::sym::Facts::new();
+        for (atom, (lo, hi)) in &ranges {
+            facts.set_range(atom.clone(), lo.clone(), hi.clone());
+        }
+        let prover = seismic_lang::sym::Prover::new(&facts);
+        prover.nonneg(index) && prover.lt(index, extent)
+    }
+
+    /// Owned coordinates lie in `[0, extent)` of their axis: the replicated loops run to the
+    /// extent, the cooperative guard rejects every other element.
+    fn bind_owned(&mut self, vars: &[VarId], dims: &[Dim]) {
+        for (var, dim) in vars.iter().zip(dims) {
+            if let VarKind::Index(atom) = &self.vars()[*var].kind {
+                let extent = if self.ranged(&dim.actual) { dim.actual.clone() } else { Sym::constant(dim.cap) };
+                self.bind_range(atom.clone(), Sym::constant(0), extent.sub(&Sym::constant(1)));
+            }
+        }
+    }
+
     fn dim(&self, s: &Sym) -> Result<Dim, String> {
         let cap = self.cap(s)?;
         let ext = if s.as_constant().is_some() {
@@ -594,6 +587,7 @@ impl Printer<'_> {
             physical_value: self.target_sym(&self.execution.storage.capacity_expression(s))?,
             ext,
             value: self.target_sym(s)?,
+            actual: s.clone(),
         })
     }
 
@@ -610,9 +604,13 @@ impl Printer<'_> {
         TE::Select(Box::new(TE::binary(BinaryOp::Lt, value.clone(), TE::integer(1), TT::Bool)), Box::new(TE::integer(1)), Box::new(value))
     }
     fn physical_slots(dims: &[Dim]) -> TE {
+        Self::participant_slots(dims, SUBGROUP)
+    }
+    /// Elements each of `lanes` participants visits under the interleaved cover.
+    fn participant_slots(dims: &[Dim], lanes: i64) -> TE {
         let count = Self::physical_count(dims);
-        TE::binary(BinaryOp::Add, TE::binary(BinaryOp::Div, count.clone(), TE::integer(SUBGROUP), TT::I32),
-            TE::binary(BinaryOp::Ne, TE::binary(BinaryOp::Rem, count, TE::integer(SUBGROUP), TT::I32), TE::integer(0), TT::Bool).cast(TT::I32), TT::I32)
+        TE::binary(BinaryOp::Add, TE::binary(BinaryOp::Div, count.clone(), TE::integer(lanes), TT::I32),
+            TE::binary(BinaryOp::Ne, TE::binary(BinaryOp::Rem, count, TE::integer(lanes), TT::I32), TE::integer(0), TT::Bool).cast(TT::I32), TT::I32)
     }
     /// All value identities are established before printing.
     fn vars(&self) -> &[Var] {
@@ -629,7 +627,7 @@ impl Printer<'_> {
         header.push_str(crate::terminal::VALUE_SELECTION_SUPPORT);
         header.push_str(&crate::support::render(self.execution.support()));
         let mut index = 0usize;
-        let mut params_sig: Vec<String> = Vec::new();
+        let mut resources: Vec<Resource> = Vec::new();
         for (i, (name, ty)) in self.f.params.iter().enumerate() {
             let variable = self
                 .f
@@ -683,8 +681,7 @@ impl Printer<'_> {
                     };
                     match &s.elem {
                         Elem::Dtype(d) => {
-                            params_sig
-                                .push(format!("device {}* {name} [[buffer({index})]]", ctype(*d)));
+                            resources.push(Resource { declaration: format!("device {}* {name}", ctype(*d)), identifier: name.clone(), binding: Binding::Buffer(index) });
                             self.buffers.push(BufferSpec {
                                 parameter: name.clone(),
                                 plane: "".into(),
@@ -712,11 +709,11 @@ impl Printer<'_> {
                                         .ok_or("packed plane size overflow")?,
                                 )
                                 .map_err(|_| "packed plane size exceeds usize")?;
-                                params_sig.push(format!(
-                                    "device const {}* {name}_{} [[buffer({index})]]",
-                                    ctype(dtype),
-                                    plane.name
-                                ));
+                                resources.push(Resource {
+                                    declaration: format!("device const {}* {name}_{}", ctype(dtype), plane.name),
+                                    identifier: format!("{name}_{}", plane.name),
+                                    binding: Binding::Buffer(index),
+                                });
                                 self.buffers.push(BufferSpec {
                                     parameter: name.clone(),
                                     plane: plane.name.into(),
@@ -788,12 +785,11 @@ impl Printer<'_> {
             .iter()
             .zip(&scratch_bindings)
         {
-            params_sig.push(format!(
-                "device {}* {} [[buffer({})]]",
-                ctype(scratch.dtype),
-                binding.parameter,
-                index + scratch.index
-            ));
+            resources.push(Resource {
+                declaration: format!("device {}* {}", ctype(scratch.dtype), binding.parameter),
+                identifier: binding.parameter.clone(),
+                binding: Binding::Scratch(scratch.index),
+            });
         }
         index += self.execution.memory.scratch().len();
         if !self.scalars.is_empty() {
@@ -803,16 +799,11 @@ impl Printer<'_> {
                 header.push_str(&format!("  {} {n};\n", ctype(*d)));
             }
             header.push_str("};\n\n");
-            params_sig.push(format!("constant Scalars& sc [[buffer({index})]]"));
+            resources.push(Resource { declaration: "constant Scalars& sc".into(), identifier: "sc".into(), binding: Binding::Scalars });
         }
-        params_sig.push("uint3 tg_pos [[threadgroup_position_in_grid]]".into());
-        params_sig.push("uint sg_id [[simdgroup_index_in_threadgroup]]".into());
-        params_sig.push("uint lane [[thread_index_in_simdgroup]]".into());
-
+        // Position of the status word in the invocation ABI (after buffers, scratch, scalars).
         let status_slot = index + usize::from(!self.scalars.is_empty());
-        params_sig.push(format!(
-            "device atomic_uint* seismic_status [[buffer({status_slot})]]"
-        ));
+        resources.push(Resource { declaration: "device atomic_uint* seismic_status".into(), identifier: "seismic_status".into(), binding: Binding::Status });
         let mut launches = Vec::new();
         let body = &self.f.body;
         let parameter_realizations = self.real.clone();
@@ -823,22 +814,17 @@ impl Printer<'_> {
             self.names = parameter_names.clone();
             self.expressions = parameter_expressions.clone();
             self.local_planes.clear();
-            let mut split_tails = Vec::new();
             let phase = &self.execution.phases[k];
-            let StmtKind::Parallel { vars, body, .. } = &stmt.kind else {
+            let StmtKind::Parallel { vars, extents, body } = &stmt.kind else {
                 unreachable!()
             };
-            if let Some(split) = &phase.split {
-                let VarKind::Index(Atom::Param(atom)) = &self.f.vars[split.part].kind else {
-                    unreachable!()
-                };
-                self.names.insert(atom.clone(), "part".into());
-                self.real.insert(
-                    split.part,
-                    Realization::Index {
-                        name: "part".into(),
-                    },
-                );
+            // A live work item owns one piece coordinate below each extent of the launch.
+            self.ranges.clear();
+            self.slices.clear();
+            for (var, extent) in vars.iter().zip(extents) {
+                if let VarKind::Index(atom) = &self.vars()[*var].kind {
+                    self.bind_range(atom.clone(), Sym::constant(0), extent.sub(&Sym::constant(1)));
+                }
             }
             let kernel = format!("{}_{k}", self.f.name);
             let mut kernel_out = String::new();
@@ -848,42 +834,14 @@ impl Printer<'_> {
             self.simdgroups = sg_per_tg;
             self.emit_storage(&phase.dispatch)?;
             self.emit_prologue(vars, &phase.dispatch)?;
-            self.implementation_phase(k, &mut |printer, _| {
-            if let Some(split) = &phase.split {
-                // Each part streams its slice and publishes its carried state to scratch.
-                // A second launch folds the parts together with the loop body's own merge
-                // rule and runs the tail, so the kernel text never mentions either.
-                let carried = split.carried.clone();
-                let emit_split = &mut |printer: &mut Self, _: usize| {
-                    printer.block(&body[..split.loop_at])?;
-                    printer.block(&split.validation_bindings)?;
-                    for view in &split.original_views { printer.view_of(view)?; }
-                    printer.block(&body[split.loop_at..split.loop_at + 1])?;
-                    printer.publish_partials(k, &carried, "item")
-                };
-                if let Some(retained) = &split.retained {
-                    printer.implementation_arms(&[retained.selector.clone()], emit_split)?;
-                    printer.block(&body[retained.ordinary_at..])?;
-                } else { emit_split(printer, 0)?; }
-                printer.block(&[])
-            } else { printer.block(body) }
-            })?;
-            if let Some(split) = &phase.split {
-                split_tails.push(SplitTail {
-                    phase: k,
-                    kernel: kernel.clone(),
-                    carried: split.carried.clone(),
-                    body: body[split.loop_at + 1..split.retained.as_ref().map_or(body.len(), |retained| retained.ordinary_at)].to_vec(),
-                });
-            }
+            self.block(body)?;
             self.target(TS::Return(None));
             self.realize_kernel()?;
             self.indent = 0;
             std::mem::swap(&mut self.out, &mut kernel_out);
-            self.out.push_str(&format!(
-                "kernel void {kernel}(\n    {}\n) {{\n",
-                params_sig.join(",\n    ")
-            ));
+            let declared: Vec<&str> = self.shared_decls.iter().map(|(d, _)| d.as_str()).chain([kernel_out.as_str()]).collect();
+            let (signature, bindings) = kernel_signature(&kernel, &resources, &declared)?;
+            self.out.push_str(&format!("kernel void {kernel}(\n    {signature}\n) {{\n"));
             // Resource fit: a realization whose threadgroup memory exceeds the device's is
             // not a candidate. The model must not offer it, so it is an error here.
             let shared_bytes = self.shared_decls.iter().try_fold(0u64, |sum, (_, bytes)| {
@@ -898,9 +856,7 @@ impl Printer<'_> {
             for (d, _) in self.shared_decls.drain(..) {
                 self.out.push_str(&format!("  {d}\n"));
             }
-            if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_begin_{}__*/\n", self.memory_launch)); }
             self.out.push_str(&kernel_out);
-            if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_end_{}__*/\n", self.memory_launch)); }
             self.out.push_str("}\n\n");
             let after_barrier = self.execution.memory.launches()[launches.len()]
                 .predecessor
@@ -913,76 +869,8 @@ impl Printer<'_> {
                 dispatch: Some(phase.dispatch.clone()),
                 tiles: self.finish_memory()?,
                 declared_threadgroup_bytes: shared_bytes,
+                bindings,
             });
-            // Complete this phase before a subsequent phase can observe its output.
-            for SplitTail {
-                phase: k,
-                kernel: first,
-                carried,
-                body: tail,
-            } in split_tails
-            {
-                let StmtKind::Parallel { vars, .. } = &self.f.body[k].kind else {
-                    unreachable!()
-                };
-                let dispatch = self.execution.phases[k].merge_dispatch.as_ref().unwrap();
-                self.real = parameter_realizations.clone();
-                self.names = parameter_names.clone();
-                self.expressions = parameter_expressions.clone();
-                self.local_planes.clear();
-                let kernel = format!("{first}_merge");
-                let mut kernel_out = String::new();
-                std::mem::swap(&mut self.out, &mut kernel_out);
-                self.indent = 1;
-                let sg_per_tg = dispatch.items_per_group as i64;
-                self.simdgroups = sg_per_tg;
-                self.emit_storage(dispatch)?;
-                self.emit_prologue(vars, dispatch)?;
-                let split = self.execution.phases[k].split.as_ref().unwrap();
-                let emit_merge = &mut |printer: &mut Self, _: usize| {
-                    printer.merge_partials(k, &carried, &split.merges,
-                        printer.f.body[k].id.ok_or("merge phase has no operation identity")?)?;
-                    printer.block(&tail)
-                };
-                self.implementation_phase(k, &mut |printer, _| {
-                    if let Some(retained) = &split.retained {
-                        printer.implementation_arms(&[retained.selector.clone()], emit_merge)
-                    } else { emit_merge(printer, 0) }
-                })?;
-                self.target(TS::Return(None));
-                self.realize_kernel()?;
-                self.indent = 0;
-                std::mem::swap(&mut self.out, &mut kernel_out);
-                self.out.push_str(&format!(
-                    "kernel void {kernel}(\n    {}\n) {{\n",
-                    params_sig.join(",\n    ")
-                ));
-                let shared_bytes = self.shared_decls.iter().try_fold(0u64, |sum, (_, bytes)| {
-                    sum.checked_add(*bytes).ok_or("shared storage sum overflow")
-                })?;
-                if shared_bytes > self.cfg.max_threadgroup_bytes as u64 {
-                    return Err("split merge exceeds threadgroup storage limit".into());
-                }
-                for (d, _) in self.shared_decls.drain(..) {
-                    self.out.push_str(&format!("  {d}\n"));
-                }
-                if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_begin_{}__*/\n", self.memory_launch)); }
-                self.out.push_str(&kernel_out);
-                if self.grouping_parameters { self.out.push_str(&format!("/*seismic_family_body_end_{}__*/\n", self.memory_launch)); }
-                self.out.push_str("}\n\n");
-                let after_barrier = self.execution.memory.launches()[launches.len()]
-                    .predecessor
-                    .is_some();
-                launches.push(Launch {
-                    kernel,
-                    threadgroups: dispatch.groups,
-                    threads_per_threadgroup: dispatch.threads_per_group,
-                    after_barrier,
-                    dispatch: Some(dispatch.clone()),
-                    tiles: self.finish_memory()?,
-                    declared_threadgroup_bytes: shared_bytes,
-                });
-            }
         }
         Ok(Emitted {
             terminal: self.terminal,
@@ -1004,23 +892,13 @@ impl Printer<'_> {
     }
 
     fn emit_prologue(&mut self, vars: &[VarId], dispatch: &GroupDispatch) -> Result<(), String> {
-        if let Some(launches) = &self.execution.launch_parameters {
-            let launch = launches.get(self.memory_launch).cloned().ok_or("missing retained launch mapping")?;
-            let names = vars.iter().map(|&variable| self.index_name(variable)).collect::<Vec<_>>();
-            let grouping = if self.grouping_parameters {
-                TE::variable(grouping_parameter(self.memory_launch), TT::U32)
-            } else { TE::Integer(dispatch.items_per_group as i64, TT::U32) };
-            for site in launch.program(self.memory_launch, grouping, &names, self.parameters)? {
-                self.target(site.statement);
-            }
-            return Ok(());
-        }
         use crate::support::{Helper, LaunchOperation as O, LaunchValue as V};
         use crate::terminal::{Expression as E, Statement as S, Type as T};
         let program = self.execution.memory.launches()[self.memory_launch]
             .prologue
             .instantiate(dispatch)?;
-        if vars.len() != program.coordinates.len() {
+        // Work axes beyond the launch binders are the inner owners of one launch piece.
+        if vars.len() > program.coordinates.len() {
             return Err("parallel variables do not match launch coordinates".into());
         }
         let value = |v: V| match v {
@@ -1036,7 +914,6 @@ impl Printer<'_> {
         for (n, step) in program.steps.iter().enumerate() {
             let expression = match step.operation {
                 O::Add(a, b) => E::binary(BinaryOp::Add, value(a), value(b), T::U32),
-                O::Multiply(V::Group, _) if self.grouping_parameters => E::binary(BinaryOp::Mul, value(V::Group), E::variable(grouping_parameter(self.memory_launch), T::U32), T::U32),
                 O::Multiply(a, b) => E::binary(BinaryOp::Mul, value(a), value(b), T::U32),
                 O::Divide(a, b) => E::binary(BinaryOp::Div, value(a), value(b), T::U32),
                 O::Remainder(a, b) => E::binary(BinaryOp::Rem, value(a), value(b), T::U32),
@@ -1068,6 +945,11 @@ impl Printer<'_> {
                 value: value(part),
             });
         }
+        self.owner_coordinates = program.coordinates[vars.len()..].iter().map(|coordinate| value(*coordinate).cast(T::I32)).collect();
+        if !self.owner_coordinates.is_empty() {
+            let threads = i64::try_from(dispatch.threads_per_group).map_err(|_| "threadgroup thread count exceeds the signed range")?;
+            self.target(S::Participants { name: GROUP_LANE.into(), count: threads });
+        }
         for (&v, coordinate) in vars.iter().zip(program.coordinates) {
             let name = self.index_name(v);
             self.target(S::Let {
@@ -1077,6 +959,17 @@ impl Printer<'_> {
             });
         }
         Ok(())
+    }
+
+    /// Lane of this thread among the participants of the statement being emitted, and their
+    /// count: the threads of the threadgroup for a threadgroup-wide tile of the outer owner,
+    /// else the lanes of the SIMD group.
+    fn participants(&self, tile: VarId) -> (TE, i64) {
+        if self.group_wide.contains(&tile) && !self.inner_owner {
+            (TE::variable(GROUP_LANE, TT::U32), SUBGROUP * self.simdgroups)
+        } else {
+            (TE::variable("lane", TT::U32), SUBGROUP)
+        }
     }
 
     fn index_name(&mut self, v: VarId) -> String {
@@ -1093,9 +986,13 @@ impl Printer<'_> {
     }
 
     fn block(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        // Ranges and evaluated slices are lexical: names declared in this block end with it.
+        let scope = (self.ranges.len(), self.slices.len());
         for s in stmts {
             self.stmt(s)?;
         }
+        self.ranges.truncate(scope.0);
+        self.slices.truncate(scope.1);
         Ok(())
     }
 
@@ -1113,214 +1010,7 @@ impl Printer<'_> {
         result
     }
 
-    /// Compile one operation under the layout bindings that operation consumes.
-    /// Only its header expressions participate; choices in nested bodies remain
-    /// local to those bodies and are emitted after the surrounding control once.
-    fn retained_statement(&mut self, statement: &Stmt) -> Result<(), String> {
-        if let StmtKind::If { cond: Expr { kind: ExprKind::Var(variable), .. }, then, els } = &statement.kind {
-            if let Some(family) = self.execution.implementation.clone() {
-                let symbol = variable_symbol(&self.vars()[*variable], *variable);
-                if let Some(negative) = family.source_negations.get(&symbol) {
-                    return self.implementation_arms(&[symbol, negative.clone()], &mut |printer, ordinal| {
-                        printer.block(if ordinal == 0 { then } else { els })
-                    });
-                }
-            }
-        }
-        let mut header = statement.clone();
-        match &mut header.kind {
-            StmtKind::Parallel { body, .. } | StmtKind::Owned { body, .. }
-            | StmtKind::Range { body, .. } | StmtKind::Lanes { body, .. }
-            | StmtKind::LoadLoop { body, .. } => body.clear(),
-            StmtKind::If { then, els, .. } => { then.clear(); els.clear(); },
-            _ => {},
-        }
-        let dependent = self.real.iter().filter(|(variable, _)| seismic_lang::effects::uses(&header, **variable))
-            .filter_map(|(&variable, value)| match value {
-                Realization::Choice { arms } => Some((variable, arms.clone())), _ => None,
-            }).min_by_key(|(variable, _)| *variable);
-        if let Some((variable, arms)) = dependent {
-            let predicates = arms.iter().map(|(predicate, _)| predicate.clone()).collect::<Vec<_>>();
-            return self.implementation_arms(&predicates, &mut |printer, ordinal| {
-                printer.real.insert(variable, (*arms[ordinal].1).clone());
-                printer.retained_statement(statement)
-            });
-        }
-        if let StmtKind::Assign { target: Expr { kind: ExprKind::Var(variable), .. }, value, .. } = &statement.kind {
-            if let Some(family) = self.execution.implementation.clone() {
-                if matches!(statement.kind, StmtKind::Assign { ref target, .. } if matches!(target.ty, Ty::Tile(_)))
-                    && !matches!(value.kind, ExprKind::Load { .. } | ExprKind::Builtin { name: Builtin::Reduce, .. }) {
-                    if let Some(choice) = family.storage.get(variable) {
-                        if self.implementation_value(choice).is_none() {
-                            let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                            return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
-                        }
-                    }
-                }
-                if let ExprKind::Builtin { name: Builtin::Reduce, args } = &value.kind {
-                    if !matches!(args.get(2).map(|argument| &argument.kind), Some(ExprKind::Int(3))) {
-                        if let Some(Expr { kind: ExprKind::Var(input), .. }) = args.first() {
-                            if matches!(self.real.get(input), Some(Realization::View { .. })) {
-                                if let Some(choice) = family.storage.get(input) {
-                                    if self.implementation_value(choice).is_none() {
-                                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                                        return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(choice) = statement.id.and_then(|operation| family.reductions.get(&(operation, *variable))) {
-                        if self.implementation_value(choice).is_none() {
-                            let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                            return self.implementation_arms(&predicates, &mut |printer, _| printer.retained_statement(statement));
-                        }
-                    }
-                }
-            }
-        }
-        self.stmt_selected(statement)
-    }
-    fn implementation_guards(&self) -> Vec<magnitude_solver::model::Literal> {
-        let Some(family) = &self.execution.implementation else { return Vec::new(); };
-        let predicates = family.predicates();
-        self.active_implementations.iter().filter_map(|(name, &active)| predicates.get(name)
-            .map(|&variable| magnitude_solver::model::Literal::new(variable, i64::from(active)))).collect()
-    }
-    fn require_native_zero(&self, expression: Sym) -> Result<(), String> {
-        if let Some(family) = &self.execution.implementation {
-            family.native_requirements.lock().map_err(|_| "retained native requirements were poisoned")?
-                .push((self.implementation_guards(), expression));
-        }
-        Ok(())
-    }
-    fn require_uniform_participation(&self) -> Result<(), String> {
-        if let Some(family) = &self.execution.implementation {
-            if self.owned_ctx.iter().any(|(_, _, slot)| slot.is_some()) {
-                family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(self.implementation_guards());
-            }
-            for (extent, run) in &self.lane_domains {
-                let expression = extent.rem(&Sym::constant(*run));
-                if expression.eval_interval(&|name| self.execution.numeric_parameters.get(name)
-                    .and_then(|value| Some((i64::try_from(value.bounds().0).ok()?, i64::try_from(value.bounds().1).ok()?)))).is_some() {
-                    self.require_native_zero(expression)?;
-                } else if expression.as_constant() != Some(0) {
-                    family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(self.implementation_guards());
-                }
-            }
-        }
-        Ok(())
-    }
-    fn reduction_selection(&self, site: crate::reduction::Site) -> Result<Option<crate::reduction::Selected>, String> {
-        let Some(family) = &self.execution.implementation else { return self.execution.reductions.get(site).cloned().map(Some); };
-        let key = (site.operation, site.output);
-        let original = family.reduction_definitions.get(&key).ok_or("retained reduction lost its numerical contract")?;
-        let mut selected = original.clone();
-        let input = self.real.get(&selected.decision.input).ok_or("retained reduction input is unrealized")?;
-        let argmax = selected.decision.contract.operation == ReduceOp::Argmax;
-        selected.decision.materialize_input = !argmax && matches!(input, Realization::View { .. });
-        selected.decision.input_placement = match input {
-            Realization::Shared { .. } => Some(TilePlacement::GroupShared),
-            Realization::Distributed { .. } => Some(TilePlacement::Distributed),
-            Realization::Replicated { .. } => Some(TilePlacement::Replicated),
-            Realization::View { .. } if argmax => None,
-            Realization::View { .. } => family.storage.get(&selected.decision.input).and_then(|choice| self.implementation_value(choice)),
-            _ => return Err("retained reduction input has no addressable local binding".into()),
-        };
-        selected.decision.full_lanes = self.owned_ctx.iter().all(|(_, _, slot)| slot.is_none())
-            && self.lane_domains.iter().all(|(extent, run)| extent.as_constant().is_none_or(|extent| extent % run == 0));
-        let ordered = selected.decision.contract.ordered
-            || matches!(selected.decision.contract.input, DType::BF16 | DType::F16)
-            || selected.decision.contract.combination() == seismic_lang::reduction::Combination::SaturatingAdd;
-        selected.decision.domain = selected.decision.domain.placement_variant(selected.decision.input_placement.clone(), argmax,
-            selected.decision.full_lanes, selected.decision.contract.input, ordered)?;
-        selected.algorithm = self.implementation_value(family.reductions.get(&key).ok_or("retained reduction has no algorithm domain")?)
-            .ok_or("retained reduction algorithm remains unresolved in its local arm")?;
-        if !selected.decision.domain.algorithms().contains(&selected.algorithm)
-            || (!selected.decision.full_lanes && ((selected.decision.input_placement == Some(TilePlacement::Distributed)
-                && selected.algorithm != crate::reduction::Algorithm::LaneLocal)
-                || (selected.decision.materialize_input && selected.decision.input_placement == Some(TilePlacement::GroupShared)))) {
-            let predicates = family.predicates();
-            let guards = self.active_implementations.iter().filter_map(|(name, &active)| predicates.get(name)
-                .map(|&variable| magnitude_solver::model::Literal::new(variable, i64::from(active)))).collect();
-            family.impossible.lock().map_err(|_| "retained layout applicability was poisoned")?.push(guards);
-            return Ok(None);
-        }
-        if selected.algorithm == crate::reduction::Algorithm::Collective
-            || (selected.decision.input_placement == Some(TilePlacement::Distributed) && selected.algorithm != crate::reduction::Algorithm::LaneLocal)
-            || (selected.decision.materialize_input && selected.decision.input_placement == Some(TilePlacement::GroupShared)) {
-            self.require_uniform_participation()?;
-        }
-        selected.output = selected.decision.domain.output(selected.algorithm, self.vars()[site.output].name.clone())?;
-        Ok(Some(selected))
-    }
-    fn record_reduction(&self, selected: &crate::reduction::Selected, axis: usize) -> Result<(), String> {
-        if let Some(family) = &self.execution.implementation {
-            let shape = self.vars()[selected.decision.input].ty.shaped().ok_or("retained reduction input has no shape")?.shape.iter()
-                .map(|extent| self.execution.storage.capacity_expression(extent)).collect();
-            family.reduction_bindings.lock().map_err(|_| "retained reduction bindings were poisoned")?
-                .entry((selected.decision.site.operation, selected.decision.site.output)).or_default().push(crate::family::layout::ReductionBinding {
-                    guards: self.implementation_guards(), selected: selected.clone(), shape, axis, lane_domains: self.lane_domains.clone() });
-        }
-        Ok(())
-    }
-    fn implementation_value<T: Clone>(&self, choice: &crate::family::layout::Choice<T>) -> Option<T> {
-        choice.arms.iter().find(|arm| self.active_implementations.get(&arm.predicate) == Some(&true)).map(|arm| arm.value.clone())
-            .or_else(|| (choice.arms.len() == 1).then(|| choice.arms[0].value.clone()))
-    }
-    fn implementation_phase(&mut self, phase: usize, emit: &mut dyn FnMut(&mut Self, usize) -> Result<(), String>) -> Result<(), String> {
-        let predicate = self.execution.implementation.as_ref().and_then(|family| family.phase_predicates.get(phase)).cloned().flatten();
-        if let Some(predicate) = predicate { self.implementation_arms(&[predicate], emit) }
-        else { emit(self, 0) }
-    }
-    fn implementation_arms(&mut self, predicates: &[String], emit: &mut dyn FnMut(&mut Self, usize) -> Result<(), String>) -> Result<(), String> {
-        if let Some(ordinal) = predicates.iter().position(|predicate| self.active_implementations.get(predicate) == Some(&true)) {
-            return emit(self, ordinal);
-        }
-        let original_real = self.real.clone();
-        let original_names = self.names.clone();
-        let original_expressions = self.expressions.clone();
-        let original_active = self.active_implementations.clone();
-        let mut results = Vec::new();
-        let mut names = original_names.clone();
-        let mut expressions = original_expressions.clone();
-        for (ordinal, predicate) in predicates.iter().enumerate() {
-            if original_active.get(predicate) == Some(&false) { continue; }
-            self.real = original_real.clone();
-            self.names = original_names.clone();
-            self.expressions = original_expressions.clone();
-            self.active_implementations = original_active.clone();
-            for candidate in predicates { self.active_implementations.insert(candidate.clone(), candidate == predicate); }
-            if self.execution.implementation.as_ref().is_some_and(|family|
-                !family.compatible_ownership(&self.active_implementations)) { continue; }
-            self.target(TS::If(TE::variable(predicate, TT::Bool)));
-            self.indent += 1;
-            emit(self, ordinal)?;
-            self.indent -= 1;
-            self.target(TS::End);
-            results.push((predicate.clone(), self.real.clone()));
-            names.extend(self.names.clone()); expressions.extend(self.expressions.clone());
-        }
-        self.active_implementations = original_active;
-        self.names = names;
-        self.expressions = expressions;
-        self.real = original_real;
-        let variables = results.iter().flat_map(|(_, bindings)| bindings.keys().copied()).collect::<std::collections::BTreeSet<_>>();
-        for variable in variables {
-            let arms = results.iter().filter_map(|(predicate, bindings)| bindings.get(&variable)
-                .map(|value| (predicate.clone(), Box::new(value.clone())))).collect::<Vec<_>>();
-            if arms.is_empty() { continue; }
-            let value = if arms.len() == results.len() && arms.iter().all(|(_, value)| **value == *arms[0].1) {
-                (*arms[0].1).clone()
-            } else { Realization::Choice { arms } };
-            self.real.insert(variable, value);
-        }
-        Ok(())
-    }
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
-        if self.execution.implementation.is_some() { self.retained_statement(s) } else { self.stmt_selected(s) }
-    }
-    fn stmt_selected(&mut self, s: &Stmt) -> Result<(), String> {
         let previous = (self.current_operation, self.collective_ordinal);
         self.current_operation = s.id;
         self.collective_ordinal = 0;
@@ -1340,12 +1030,42 @@ impl Printer<'_> {
     }
     fn stmt_inner(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            StmtKind::Reduction(_) => {
-                Err("selected structured reduction reached printing without materialization".into())
+            StmtKind::Parallel { vars, extents, body } => {
+                // An inner owner region: this thread's SIMD group runs the visit whose piece
+                // coordinates are the trailing work axes of the launch. Every thread of the
+                // threadgroup then meets at the region's completion barrier.
+                if self.inner_owner || vars.len() != self.owner_coordinates.len() {
+                    return Err("an inner owner region does not match the owner axes of its launch".into());
+                }
+                self.target(TS::Scope);
+                self.indent += 1;
+                let bound = self.ranges.len();
+                for ((var, extent), coordinate) in vars.iter().zip(extents).zip(self.owner_coordinates.clone()) {
+                    let name = self.index_name(*var);
+                    if let VarKind::Index(atom) = &self.vars()[*var].kind {
+                        self.bind_range(atom.clone(), Sym::constant(0), extent.sub(&Sym::constant(1)));
+                    }
+                    self.target(TS::Let { name, ty: TT::I32, value: coordinate });
+                }
+                self.inner_owner = true;
+                let emitted = self.block(body);
+                self.inner_owner = false;
+                self.ranges.truncate(bound);
+                emitted?;
+                self.indent -= 1;
+                self.target(TS::End);
+                self.barrier(BarrierSite {
+                    operation: s.id.ok_or("inner owner region has no identity")?,
+                    variable: *vars.first().ok_or("inner owner region has no binder")?,
+                    purpose: BarrierPurpose::Owners,
+                })
             }
-            StmtKind::Parallel { .. } => Err("nested `parallel` is not supported".into()),
             StmtKind::Range { var, lo, hi, body } => {
                 let name = self.index_name(*var);
+                let bound = self.ranges.len();
+                if let VarKind::Index(atom) = &self.vars()[*var].kind {
+                    self.bind_range(atom.clone(), lo.clone(), hi.sub(&Sym::constant(1)));
+                }
                 let lo = self.target_sym(lo)?;
                 let hi = self.target_sym(hi)?;
                 self.target(crate::terminal::Statement::For {
@@ -1356,6 +1076,7 @@ impl Printer<'_> {
                 });
                 self.indent += 1;
                 self.block(body)?;
+                self.ranges.truncate(bound);
                 self.indent -= 1;
                 self.target(crate::terminal::Statement::End);
                 Ok(())
@@ -1448,7 +1169,7 @@ impl Printer<'_> {
                 self.target(crate::terminal::Statement::End);
                 let mut writes = HashSet::new();
                 for statement in body {
-                    seismic_lang::rewrite::writes(statement, &mut writes);
+                    seismic_lang::exec::writes::writes(statement, &mut writes);
                 }
                 let mut writes = writes.into_iter().collect::<Vec<_>>();
                 writes.sort_unstable();
@@ -1691,9 +1412,12 @@ impl Printer<'_> {
                             });
                             self.indent += 1;
                         }
+                        let bound = self.ranges.len();
+                        self.bind_owned(vars, &dims);
                         self.owned_ctx.push((tv, names.clone(), None));
                         self.block(body)?;
                         self.owned_ctx.pop();
+                        self.ranges.truncate(bound);
                         for _ in &dims {
                             self.indent -= 1;
                             self.target(crate::terminal::Statement::End);
@@ -1702,8 +1426,11 @@ impl Printer<'_> {
                     }
                     Realization::Shared { dims, .. } => {
                         // Threadgroup memory: elements are spread over the lanes in the same
-                        // order a distributed tile uses, then a barrier publishes them.
-                        let slots = Self::physical_slots(&dims);
+                        // order a distributed tile uses, then a barrier publishes them. A
+                        // threadgroup-wide tile of the outer owner is spread over every
+                        // thread of the threadgroup.
+                        let (lane, lanes) = self.participants(tv);
+                        let slots = Self::participant_slots(&dims, lanes);
                         let j = self.fresh("slot");
                         let e = self.fresh("e");
                         self.target(TS::For {
@@ -1718,10 +1445,10 @@ impl Printer<'_> {
                             ty: TT::I32,
                             value: TE::binary(
                                 BinaryOp::Add,
-                                TE::variable("lane", TT::U32).cast(TT::I32),
+                                lane.cast(TT::I32),
                                 TE::binary(
                                     BinaryOp::Mul,
-                                    TE::integer(SUBGROUP),
+                                    TE::integer(lanes),
                                     TE::variable(j.clone(), TT::I32),
                                     TT::I32,
                                 ),
@@ -1731,9 +1458,12 @@ impl Printer<'_> {
                         let guard = self.distributed_guard(&e, &dims, &names);
                         self.target(TS::If(guard));
                         self.indent += 1;
+                        let bound = self.ranges.len();
+                        self.bind_owned(vars, &dims);
                         self.owned_ctx.push((tv, names.clone(), Some(j.clone())));
                         self.block(body)?;
                         self.owned_ctx.pop();
+                        self.ranges.truncate(bound);
                         self.indent -= 1;
                         self.target(crate::terminal::Statement::End);
                         self.indent -= 1;
@@ -1768,9 +1498,12 @@ impl Printer<'_> {
                         let guard = self.distributed_guard(&e, &dims, &names);
                         self.target(TS::If(guard));
                         self.indent += 1;
+                        let bound = self.ranges.len();
+                        self.bind_owned(vars, &dims);
                         self.owned_ctx.push((tv, names.clone(), Some(j.clone())));
                         self.block(body)?;
                         self.owned_ctx.pop();
+                        self.ranges.truncate(bound);
                         self.indent -= 1;
                         self.target(crate::terminal::Statement::End);
                         self.indent -= 1;
@@ -2046,12 +1779,13 @@ impl Printer<'_> {
                         .ok_or("indexed view rank mismatch")?;
                     let atoms = checked.atoms();
                     if let [Atom::Param(atom)] = atoms.as_slice() {
-                        if *checked == Sym::param(atom) && !self.execution.numeric_parameters.contains_key(atom) {
+                        if *checked == Sym::param(atom) {
                             // The checked shape names the current evaluation.
                             // Captured bounds are symbolic too; a sibling branch
                             // must bind its own extent before allocating a tile.
                             // Existing realizations retain their captured Dim.
                             self.names.insert(atom.clone(), self.sym(&length)?);
+                            self.bind_range(Atom::Param(atom.clone()), length.clone(), length.clone());
                         }
                     }
                     geometry.starts.push(safe);
@@ -2093,6 +1827,7 @@ impl Printer<'_> {
                     physical_value: self.target_sym(&self.execution.storage.capacity_expression(checked))?,
                     ext: self.sym(actual)?,
                     value: self.target_sym(actual)?,
+                    actual: actual.clone(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2217,13 +1952,22 @@ impl Printer<'_> {
     /// evaluated into a named C variable that the symbol refers to.
     fn int_value(&mut self, e: &Expr) -> Result<Sym, String> {
         if let Some(s) = &e.sym {
-            if !seismic_lang::effects::can_substitute_symbolic_value(e) {
+            if !seismic_lang::exec::effects::can_substitute_symbolic_value(e) {
                 let value = self.target_expr(e)?;
                 self.target(TS::Evaluate(value));
             }
             // Retain checked coordinate equality for participant ownership,
             // even when evaluating the expression also establishes metadata.
             return Ok(s.clone());
+        }
+        // A scalar assigned by one statement is its own symbolic value: equal uses name
+        // equal coordinates (one evaluated slice, comparable bounds).
+        if let ExprKind::Var(v) = e.kind {
+            if let (true, Some(Realization::Scalar { name })) = (self.single_assignment.contains(&v), self.real.get(&v)) {
+                let name = name.clone();
+                self.names.insert(name.clone(), name.clone());
+                return Ok(Sym::param(&name));
+            }
         }
         let value = self.target_expr(e)?;
         let name = self.fresh("iv");
@@ -2254,6 +1998,11 @@ impl Printer<'_> {
             .map(|e| self.int_value(e))
             .transpose()?
             .unwrap_or_else(|| extent.clone());
+        // A slice evaluated in an enclosing scope is the same checked start and length.
+        let key = (start.clone(), end.clone(), extent.clone());
+        if let Some((_, (safe, length))) = self.slices.iter().find(|(evaluated, _)| *evaluated == key) {
+            return Ok((Sym::param(safe), Sym::param(length)));
+        }
         let begin_value = self.target_sym(&start)?.cast(TT::I64);
         let end_value = self.target_sym(&end)?.cast(TT::I64);
         let extent_value = self.target_sym(extent)?.cast(TT::I64);
@@ -2335,6 +2084,11 @@ impl Printer<'_> {
         }
         self.names.insert(safe.clone(), safe.clone());
         self.names.insert(length.clone(), length.clone());
+        // Clamped or validated (an invalid slice is empty at start zero):
+        // `0 <= start`, `0 <= length` and `start + length <= extent`.
+        self.bind_range(Atom::Param(safe.clone()), Sym::constant(0), extent.clone());
+        self.bind_range(Atom::Param(length.clone()), Sym::constant(0), extent.sub(&Sym::param(&safe)));
+        self.slices.push((key, (safe.clone(), length.clone())));
         Ok((Sym::param(&safe), Sym::param(&length)))
     }
 
@@ -2470,22 +2224,11 @@ impl Printer<'_> {
         operation: OperationId,
     ) -> Result<(), String> {
         let root = crate::storage::tile_root(tile).ok_or("owned view has no allocation")?;
-        if matches!(self.real.get(&root), Some(Realization::Geometry { .. } | Realization::View { .. })) {
-            if let Some(family) = self.execution.implementation.clone() {
-                if let Some(choice) = family.owners.get(&root) {
-                    if self.implementation_value(choice).is_none() {
-                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                        return self.implementation_arms(&predicates, &mut |printer, _| printer.owned_view(vars, tile, body, operation));
-                    }
-                }
-            }
-        }
         let shared = match self.real.get(&root) {
             Some(Realization::Replicated { .. }) => false,
             Some(Realization::Shared { .. }) => true,
             Some(Realization::Geometry { .. } | Realization::View { .. }) => {
-                self.execution.implementation.as_ref().and_then(|family| family.owners.get(&root))
-                    .and_then(|choice| self.implementation_value(choice)).unwrap_or_else(|| self.execution.storage.owned_cooperative(root))
+                self.execution.storage.owned_cooperative(root)
             }
             _ => return Err("owned view requires addressable selected tile storage".into()),
         };
@@ -2501,6 +2244,7 @@ impl Printer<'_> {
                     physical_value: self.target_sym(&self.execution.storage.capacity_expression(checked))?,
                     ext: self.sym(actual)?,
                     value: self.target_sym(actual)?,
+                    actual: actual.clone(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2531,9 +2275,12 @@ impl Printer<'_> {
                 value: TE::binary(BinaryOp::Div, TE::variable(&flat, TT::I32), TE::integer(SUBGROUP), TT::I32) });
             Some(slot)
         } else { None };
+        let bound = self.ranges.len();
+        self.bind_owned(vars, &dims);
         self.owned_ctx.push((root, names, slot));
         let result = self.block(body);
         self.owned_ctx.pop();
+        self.ranges.truncate(bound);
         result?;
         self.indent -= 1;
         self.target(TS::End);
@@ -2547,53 +2294,21 @@ impl Printer<'_> {
     }
 
     fn emit_storage(&mut self, dispatch: &GroupDispatch) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            let memory_launch = self.memory_launch;
-            for (index, request) in family.allocations.iter().enumerate().filter(|(_, request)| request.launch == memory_launch) {
-                let own = request.owner.arms.iter().find(|arm| arm.value == index).ok_or("retained backing lacks its defining arm")?;
-                for placement in &request.placements {
-                    self.parameters.arrays.push(parameters::Array { launch: self.memory_launch, id: request.allocation.id,
-                        symbol: request.allocation.declaration.symbol.clone(), dtype: request.allocation.declaration.dtype,
-                        placement: placement.value.clone(), capacity: request.capacity,
-                        guards: vec![magnitude_solver::model::Literal::new(request.active, 1), magnitude_solver::model::Literal::new(placement.active, 1)] });
-                    let symbol = crate::family::layout::Family::backing_symbol(index, &placement.value);
-                    let guards = vec![magnitude_solver::model::Literal::new(request.active, 1), magnitude_solver::model::Literal::new(own.active, 1), magnitude_solver::model::Literal::new(placement.active, 1)];
-                    let allocation = parameters::Allocation { launch: self.memory_launch, symbol: symbol.clone(),
-                        dtype: request.allocation.declaration.dtype, placement: placement.value.clone(),
-                        capacity: request.backing_capacity, guards };
-                    if placement.value == TilePlacement::GroupShared {
-                        let capacity = self.parameters.expression(format!("seismic_family_capacity_{}__", request.backing_capacity.id().0), request.backing_capacity);
-                        self.shared_decls.push((format!("{}threadgroup {} {}[{} * {}];\n{}", allocation.boundary(false),
-                            ctype(allocation.dtype), symbol, capacity.render(), grouping_parameter(self.memory_launch), allocation.boundary(true)), 0));
-                    } else {
-                        for predicate in [format!("seismic_allocation_active_{}__", request.active.0), own.predicate.clone(), placement.predicate.clone()] {
-                            self.target(TS::If(TE::variable(predicate, TT::Bool))); self.indent += 1;
-                        }
-                        let declaration = TileDeclaration { symbol: symbol.clone(), dtype: allocation.dtype,
-                            placement: placement.value.clone(), capacity: request.backing_capacity.bounds().1 };
-                        let layout = declaration.layout(dispatch)?;
-                        self.target(TS::Array { name: symbol, ty: allocation.dtype.into(), elements: layout.private_elements_per_lane });
-                        for _ in 0..3 { self.indent -= 1; self.target(TS::End); }
-                    }
-                    self.parameters.allocations.push(allocation);
-                }
-            }
-            return Ok(());
-        }
         let slots = self.execution.memory.launches()[self.memory_launch]
             .slots
             .clone();
         for declaration in slots {
             let layout = declaration.layout(dispatch)?;
-            if declaration.placement == TilePlacement::GroupShared {
+            if declaration.placement.group_memory() {
+                // An item-owned array holds one share per item of the group; a group-wide
+                // array exists once.
+                let shares = if declaration.placement == TilePlacement::GroupWide { 1 } else { dispatch.items_per_group };
                 self.shared_decls.push((
                     format!(
                         "threadgroup {} {}[{}];",
                         ctype(declaration.dtype),
                         declaration.symbol,
-                        if self.grouping_parameters {
-                            format!("{} * {}", layout.shared_elements_per_item, grouping_parameter(self.memory_launch))
-                        } else { (layout.shared_elements_per_item * dispatch.items_per_group).to_string() }
+                        (layout.shared_elements_per_item * shares).to_string()
                     ),
                     layout.shared_bytes_per_group,
                 ));
@@ -2607,26 +2322,7 @@ impl Printer<'_> {
         }
         Ok(())
     }
-    fn allocation_placement(&self, request: &crate::family::layout::AllocationRequest) -> Option<TilePlacement> {
-        request.placements.iter().find(|arm| self.active_implementations.get(&arm.predicate) == Some(&true)).map(|arm| arm.value.clone())
-            .or_else(|| (request.placements.len() == 1).then(|| request.placements[0].value.clone()))
-            .or_else(|| self.execution.implementation.as_ref().and_then(|family| family.reductions.get(&(request.allocation.id.operation, request.allocation.id.variable)))
-                .and_then(|choice| self.implementation_value(choice)).map(|algorithm| if algorithm == crate::reduction::Algorithm::LaneLocal { TilePlacement::Distributed } else { TilePlacement::Replicated }))
-    }
     fn allocation(&mut self, id: AllocationId) -> Result<TileDeclaration, String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            let request = family.allocations.iter().find(|request| request.launch == self.memory_launch && request.allocation.id == id)
-                .ok_or("native allocation has no retained local request")?;
-            family.allocation_uses.lock().map_err(|_| "retained allocation uses were poisoned")?
-                .entry((self.memory_launch, id)).or_default().push(self.implementation_guards());
-            let placement = self.allocation_placement(request).ok_or("native allocation placement remains unresolved in its local arm")?;
-            let mut declaration = request.allocation.declaration.clone();
-            declaration.placement = placement;
-            declaration.capacity = request.capacity.bounds().1;
-            self.tile_declarations.push(declaration.clone());
-            self.barrier(BarrierSite { operation: id.operation, variable: id.variable, purpose: BarrierPurpose::Reuse(id.purpose) })?;
-            return Ok(declaration);
-        }
         let launch = self
             .execution
             .memory
@@ -2653,22 +2349,6 @@ impl Printer<'_> {
         Ok(declaration)
     }
     fn bind_allocation(&mut self, id: AllocationId, name: &str) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            let request = family.allocations.iter().find(|request| request.launch == self.memory_launch && request.allocation.id == id)
-                .ok_or("native pointer has no retained allocation request")?;
-            let placement = self.allocation_placement(request).ok_or("pointer placement is outside its guarded local definition")?;
-            let predicates = request.owner.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-            return self.implementation_arms(&predicates, &mut |printer, ordinal| {
-                let owner = request.owner.arms[ordinal].value;
-                let backing = &family.allocations[owner];
-                let shared = placement == TilePlacement::GroupShared;
-                let capacity = printer.parameters.expression(format!("seismic_family_capacity_{}__", backing.backing_capacity.id().0), backing.backing_capacity);
-                printer.target(TS::Pointer { name: name.into(), base: crate::family::layout::Family::backing_symbol(owner, &placement),
-                    index: if shared { TE::binary(BinaryOp::Mul, TE::variable("sg_id", TT::U32), capacity, TT::U32) } else { TE::Integer(0, TT::U32) },
-                    space: if shared { TSpa::Threadgroup } else { TSpa::Private }, ty: request.allocation.declaration.dtype.into() });
-                Ok(())
-            });
-        }
         let launch = &self.execution.memory.launches()[self.memory_launch];
         let allocation = launch
             .arrays
@@ -2676,8 +2356,8 @@ impl Printer<'_> {
             .find(|a| a.id == id)
             .ok_or("bound allocation is absent")?;
         let slot = &launch.slots[allocation.slot];
-        let shared = slot.placement == TilePlacement::GroupShared;
-        let index = if shared {
+        let shared = slot.placement.group_memory();
+        let index = if slot.placement == TilePlacement::GroupShared {
             TE::binary(
                 BinaryOp::Mul,
                 TE::variable("sg_id", TT::U32),
@@ -2702,34 +2382,6 @@ impl Printer<'_> {
     }
 
     fn barrier(&mut self, site: BarrierSite) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            if let BarrierPurpose::Reuse(purpose) = site.purpose {
-                if let Some(request) = family.allocations.iter().find(|request| request.launch == self.memory_launch
-                    && request.allocation.id == (AllocationId { operation: site.operation, variable: site.variable, purpose })) {
-                    let shared = request.placements.iter().find(|arm| arm.value == TilePlacement::GroupShared);
-                    if let Some(shared) = shared {
-                        if self.active_implementations.get(&shared.predicate) == Some(&false) { return Ok(()); }
-                        self.target(TS::If(TE::variable(&shared.predicate, TT::Bool))); self.indent += 1;
-                        self.target(TS::If(TE::variable(format!("seismic_reuse_{}__", request.shared_reuse.0), TT::Bool))); self.indent += 1;
-                        self.target(TS::Barrier);
-                        self.indent -= 1; self.target(TS::End); self.indent -= 1; self.target(TS::End);
-                    }
-                }
-                return Ok(());
-            }
-            if let Some(condition) = family.barrier_conditions.get(&(self.memory_launch, site)) {
-                let mut guard = self.implementation_guards();
-                guard.push(magnitude_solver::model::Literal::new(condition.active, 1));
-                family.barrier_uses.lock().map_err(|_| "retained publication uses were poisoned")?
-                    .entry((self.memory_launch, site)).or_default().push(guard.clone());
-                let original = self.active_implementations.insert(condition.predicate.clone(), true);
-                self.require_uniform_participation()?;
-                match original { Some(value) => { self.active_implementations.insert(condition.predicate.clone(), value); }, None => { self.active_implementations.remove(&condition.predicate); } }
-                self.target(TS::If(TE::variable(&condition.predicate, TT::Bool))); self.indent += 1;
-                self.target(TS::Barrier); self.indent -= 1; self.target(TS::End);
-            }
-            return Ok(());
-        }
         let launch = self
             .execution
             .memory
@@ -2737,11 +2389,12 @@ impl Printer<'_> {
             .get(self.memory_launch)
             .ok_or("memory launch is missing")?;
         if let Some(barrier) = launch.barriers.get(&site) {
-            if !self.emitted_barriers.insert(site) && self.execution.implementation.is_none() {
+            if !self.emitted_barriers.insert(site) {
                 return Err("duplicate emitted memory barrier".into());
             }
             match barrier.memory {
                 MemorySpace::Threadgroup => self.target(TS::Barrier),
+                MemorySpace::Group => self.target(TS::GroupBarrier),
             }
         }
         Ok(())
@@ -2751,7 +2404,6 @@ impl Printer<'_> {
         &mut self,
         operation: seismic_lang::intrinsics::Operation,
     ) -> Result<CollectiveImplementation, String> {
-        self.require_uniform_participation()?;
         let site = CollectiveSite {
             operation: self
                 .current_operation
@@ -2769,17 +2421,12 @@ impl Printer<'_> {
         if instruction.implementation.operation() != operation {
             return Err("collective operation differs from the prepared implementation".into());
         }
-        if !self.emitted_collectives.insert(site) && self.execution.implementation.is_none() {
+        if !self.emitted_collectives.insert(site) {
             return Err("duplicate collective emission".into());
         }
         Ok(instruction.implementation.clone())
     }
     fn finish_memory(&mut self) -> Result<Vec<TileDeclaration>, String> {
-        if self.execution.implementation.is_some() {
-            let declarations = self.execution.memory.launches()[self.memory_launch].arrays.iter().map(|array| array.declaration.clone()).collect();
-            self.tile_declarations.clear(); self.emitted_collectives.clear(); self.emitted_barriers.clear(); self.memory_launch += 1;
-            return Ok(declarations);
-        }
         let launch = self
             .execution
             .memory
@@ -2835,7 +2482,8 @@ impl Printer<'_> {
             variable: v,
             purpose,
         })?;
-        if declaration.capacity != n_cap as u64 || declaration.dtype != dtype {
+        let held = |native| seismic_realization::dispatch::local_storage_dtype(dtype, native);
+        if declaration.capacity != n_cap as u64 || (declaration.dtype != held(false) && declaration.dtype != held(true)) {
             return Err(format!(
                 "emitted tile {v} disagrees with its selected storage contract"
             ));
@@ -2857,7 +2505,10 @@ impl Printer<'_> {
             },
             &name,
         )?;
-        let r = if placement == TilePlacement::GroupShared {
+        let r = if placement.group_memory() {
+            if placement == TilePlacement::GroupWide {
+                self.group_wide.insert(v);
+            }
             Realization::Shared { name, dims, dtype }
         } else if placement == TilePlacement::Replicated {
             Realization::Replicated { name, dims, dtype }
@@ -3390,14 +3041,18 @@ impl Printer<'_> {
                 };
                 let mut flat = TE::Integer(0, TT::I64);
                 for (point, dim) in points.iter().zip(dims) {
-                    let index = TE::Helper(
-                        crate::support::Helper::Index,
-                        vec![
-                            self.target_sym(point)?.cast(TT::I64),
-                            dim.value.cast(TT::I64),
-                        ],
-                        TT::I64,
-                    );
+                    let index = if self.proves_index(point, &dim.actual) {
+                        self.target_sym(point)?.cast(TT::I64)
+                    } else {
+                        TE::Helper(
+                            crate::support::Helper::Index,
+                            vec![
+                                self.target_sym(point)?.cast(TT::I64),
+                                dim.value.cast(TT::I64),
+                            ],
+                            TT::I64,
+                        )
+                    };
                     flat = TE::binary(
                         BinaryOp::Add,
                         TE::binary(BinaryOp::Mul, flat, dim.physical_value.clone().cast(TT::I64), TT::I64),
@@ -3699,6 +3354,10 @@ impl Printer<'_> {
     fn target_read_elem(&self, ptr: &str, off: &Sym, elem: &Elem) -> Result<TE, String> {
         let logical = self.target_sym(off)?.cast(TT::I64);
         match elem {
+            // An address proven inside the bound storage needs no checked read.
+            Elem::Dtype(dtype) if !self.local_planes.contains_key(ptr) && self.proves_index(off, &Sym::constant(i64::try_from(self.device_elements(ptr, *dtype)?).map_err(|_| "device storage exceeds the index range")?)) => {
+                Ok(TE::Read { name: ptr.into(), index: Box::new(logical), space: TSpa::Device, ty: (*dtype).into() })
+            }
             Elem::Dtype(dtype) => self.target_raw_read(ptr, logical, *dtype),
             Elem::Repr(name) => {
                 let r = repr::lookup(name).ok_or("unknown representation")?;
@@ -3785,6 +3444,11 @@ impl Printer<'_> {
     }
 
     fn checked_index(&mut self, index: &Sym, extent: &Sym) -> Result<Sym, String> {
+        // Valid by construction of the enclosing loops and slices: nothing to check, and the
+        // coordinate keeps its symbolic relation to them for the address proof of the read.
+        if self.proves_index(index, extent) {
+            return Ok(index.clone());
+        }
         let name = self.fresh("checked_index");
         let value = TE::Helper(
             crate::support::Helper::Index,
@@ -3804,6 +3468,11 @@ impl Printer<'_> {
         self.names.insert(name.clone(), name.clone());
         self.expressions
             .insert(name.clone(), TE::variable(&name, TT::I64));
+        // The helper yields a coordinate of the axis, or zero after recording the failure. Over
+        // a statically nonempty axis either is within it.
+        if extent.as_constant().is_some_and(|n| n >= 1) {
+            self.bind_range(Atom::Param(name.clone()), Sym::constant(0), extent.sub(&Sym::constant(1)));
+        }
         Ok(Sym::param(&name))
     }
 
@@ -3814,19 +3483,6 @@ impl Printer<'_> {
         mode: LoadMode,
         operation: OperationId,
     ) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            if let Some(choice) = family.load_sites.get(&(operation, v)) {
-                if let Some(mode) = self.implementation_value(choice) {
-                    return self.load_into_selected(v, view, mode, operation);
-                }
-                let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                return self.implementation_arms(&predicates, &mut |printer, ordinal|
-                    printer.load_into_selected(v, view, choice.arms[ordinal].value, operation));
-            }
-        }
-        self.load_into_selected(v, view, mode, operation)
-    }
-    fn load_into_selected(&mut self, v: VarId, view: &Expr, mode: LoadMode, operation: OperationId) -> Result<(), String> {
         let realized = self
             .view_of(view)
             .map_err(|e| format!("load into {}: {e}", self.vars()[v].name))?;
@@ -3877,19 +3533,6 @@ impl Printer<'_> {
         mode: LoadMode,
         operation: OperationId,
     ) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            if let Some(choice) = family.load_sites.get(&(operation, v)) {
-                if let Some(mode) = self.implementation_value(choice) {
-                    return self.bind_stream_load_selected(v, realized, mode, operation);
-                }
-                let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                return self.implementation_arms(&predicates, &mut |printer, ordinal|
-                    printer.bind_stream_load_selected(v, realized.clone(), choice.arms[ordinal].value, operation));
-            }
-        }
-        self.bind_stream_load_selected(v, realized, mode, operation)
-    }
-    fn bind_stream_load_selected(&mut self, v: VarId, realized: Realization, mode: LoadMode, operation: OperationId) -> Result<(), String> {
         if matches!(realized, Realization::Geometry { .. }) || mode == LoadMode::Borrow {
             self.real.insert(v, realized);
             Ok(())
@@ -3920,7 +3563,7 @@ impl Printer<'_> {
                 purpose: Purpose::PacketPlane(plane),
             };
             let declaration = self.allocation(id)?;
-            if declaration.capacity != part.elements || declaration.dtype != part.plane.dtype() {
+            if declaration.capacity != part.elements || declaration.dtype != seismic_realization::dispatch::local_storage_dtype(part.plane.dtype(), false) {
                 return Err("packet allocation differs from representation geometry".into());
             }
             let actual = match declaration.placement {
@@ -3998,8 +3641,7 @@ impl Printer<'_> {
             return Err("encoded snapshot requires contiguous packet rows".into());
         }
         for stride in &strides[..strides.len() - 1] {
-            if self.execution.implementation.is_some() { self.require_native_zero(stride.rem(&Sym::constant(group)))?; }
-            else if stride.as_constant().is_none_or(|value| value < 0 || value % group != 0) {
+            if stride.as_constant().is_none_or(|value| value < 0 || value % group != 0) {
                 return Err("encoded snapshot requires contiguous packet rows".into());
             }
         }
@@ -4042,6 +3684,7 @@ impl Printer<'_> {
                     physical_value: self.target_sym(&self.execution.storage.capacity_expression(bound))?,
                     ext: self.sym(extent)?,
                     value: self.target_sym(extent)?,
+                    actual: extent.clone(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -4183,14 +3826,6 @@ impl Printer<'_> {
         operation: OperationId,
         purpose: Purpose,
     ) -> Result<(), String> {
-        if let Some(family) = self.execution.implementation.clone() {
-            if let Some(choice) = family.storage.get(&v) {
-                if self.implementation_value(choice).is_none() {
-                    let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                    return self.implementation_arms(&predicates, &mut |printer, _| printer.snapshot_into(v, realized.clone(), operation, purpose));
-                }
-            }
-        }
         let Realization::View {
             space,
             param,
@@ -4246,6 +3881,7 @@ impl Printer<'_> {
                     physical_value: self.target_sym(&self.execution.storage.capacity_expression(bound))?,
                     ext: self.sym(extent)?,
                     value: self.target_sym(extent)?,
+                    actual: extent.clone(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -4506,11 +4142,17 @@ impl Printer<'_> {
                 ),
             });
         } else {
+            // A threadgroup-wide tile of the outer owner is published by every thread of the
+            // threadgroup; any other tile by the lanes of its SIMD group.
+            let (lane, lanes) = match tile.kind {
+                ExprKind::Var(v) => self.participants(v),
+                _ => (TE::variable("lane", TT::U32), SUBGROUP),
+            };
             self.target(TS::For {
                 name: index.clone(),
-                start: TE::variable("lane", TT::U32).cast(TT::I32),
+                start: lane.cast(TT::I32),
                 end: Self::physical_count(&dims),
-                step: SUBGROUP,
+                step: lanes,
             });
             self.indent += 1;
             flat = index.clone();
@@ -4650,8 +4292,7 @@ impl Printer<'_> {
         if op == 3 {
             return self.argmax_into(v, tv, axis, operation);
         }
-        let Some(selected) = self.reduction_selection(crate::reduction::Site { output: v, operation })? else { return Ok(None); };
-        self.record_reduction(&selected, axis)?;
+        let selected = self.execution.reductions.get(crate::reduction::Site { output: v, operation })?.clone();
         let mut src = self
             .real
             .get(&tv)
@@ -4689,7 +4330,7 @@ impl Printer<'_> {
             | Realization::Shared { dims, dtype, .. } => (dims.clone(), *dtype),
             other => return Err(format!("reduce of {other:?}")),
         };
-        let contract = seismic_lang::reduction::Contract::new(
+        let contract = seismic_lang::exec::reduction::Contract::new(
             ReduceOp::from_tag(op).ok_or("unknown reduction operation")?,
             dtype,
             matches!(args.get(3).map(|e| &e.kind), Some(ExprKind::Bool(true))),
@@ -4703,7 +4344,7 @@ impl Printer<'_> {
             TE::Integer(contract.identity().value() as i64, dtype.into())
         };
         let combine = |acc: TE, x: TE| -> TE {
-            use seismic_lang::reduction::Combination;
+            use seismic_lang::exec::reduction::Combination;
             let ty = TT::from(dtype);
             match contract.combination() {
                 Combination::LogicalOr => TE::binary(BinaryOp::Or, acc, x, TT::Bool),
@@ -4778,7 +4419,7 @@ impl Printer<'_> {
         // publication is a legal realization even when reassociation is allowed.
         let ordered = contract.ordered
             || matches!(dtype, DType::BF16 | DType::F16)
-            || contract.combination() == seismic_lang::reduction::Combination::SaturatingAdd;
+            || contract.combination() == seismic_lang::exec::reduction::Combination::SaturatingAdd;
         let mut out_dims = dims.clone();
         out_dims.remove(axis);
         let placement = match src {
@@ -4792,7 +4433,7 @@ impl Printer<'_> {
         {
             return Err("fold input placement disagrees with its selected contract".into());
         }
-        let mut reduction = crate::reduction::ReductionDomain::new(
+        let reduction = crate::reduction::ReductionDomain::new(
             &dims.iter().map(|d| d.cap).collect::<Vec<_>>(),
             axis,
             dtype,
@@ -4800,18 +4441,6 @@ impl Printer<'_> {
             placement.clone(),
             SUBGROUP as u64,
         )?;
-        if self.execution.implementation.is_some() {
-            reduction = reduction.placement_variant(Some(placement.clone()), false, selected.decision.full_lanes, dtype, ordered)?;
-            let inner = dims[axis + 1..].iter().fold(Sym::constant(1), |count, dim| count.mul(&dim.physical));
-            if selected.algorithm == crate::reduction::Algorithm::LaneLocal {
-                self.require_native_zero(inner.rem(&Sym::constant(SUBGROUP)))?;
-                self.require_native_zero(Sym::constant(1).quot(&inner.add(&Sym::constant(1))))?;
-            }
-            if selected.algorithm == crate::reduction::Algorithm::Collective {
-                self.require_native_zero(Sym::constant(1).quot(&inner.add(&Sym::constant(1))))?;
-                self.require_native_zero(Sym::constant(1).quot(&dims[axis].physical.add(&Sym::constant(1))))?;
-            }
-        }
         use crate::reduction::Algorithm;
         let out_cap = reduction.output_capacity() as i64;
         let scalar_result = reduction.scalar_output();
@@ -5062,22 +4691,32 @@ impl Printer<'_> {
                 TE::binary(BinaryOp::Rem, e.clone(), inner_cap.clone(), TT::I32),
                 TT::I32,
             );
-            let guard = TE::binary(
-                BinaryOp::And,
+            // A rank-1 input has one output and its element index is the axis coordinate.
+            let guard = if dims.len() == 1 {
+                TE::binary(
+                    BinaryOp::And,
+                    TE::binary(BinaryOp::Lt, e.clone(), Self::physical_count(&dims), TT::Bool),
+                    TE::binary(BinaryOp::Lt, e, axis_ext, TT::Bool),
+                    TT::Bool,
+                )
+            } else {
                 TE::binary(
                     BinaryOp::And,
                     TE::binary(
-                        BinaryOp::Lt,
-                        e,
-                        Self::physical_count(&dims),
+                        BinaryOp::And,
+                        TE::binary(
+                            BinaryOp::Lt,
+                            e,
+                            Self::physical_count(&dims),
+                            TT::Bool,
+                        ),
+                        TE::binary(BinaryOp::Lt, axis, axis_ext, TT::Bool),
                         TT::Bool,
                     ),
-                    TE::binary(BinaryOp::Lt, axis, axis_ext, TT::Bool),
+                    TE::binary(BinaryOp::Eq, output, TE::variable(&o, TT::I32), TT::Bool),
                     TT::Bool,
-                ),
-                TE::binary(BinaryOp::Eq, output, TE::variable(&o, TT::I32), TT::Bool),
-                TT::Bool,
-            );
+                )
+            };
             self.target(TS::If(guard));
             self.indent += 1;
             self.target(TS::Assign {
@@ -5158,8 +4797,7 @@ impl Printer<'_> {
             }
             other => return Err(format!("argmax of {other:?}")),
         };
-        let Some(selected) = self.reduction_selection(crate::reduction::Site { output: v, operation })? else { return Ok(None); };
-        self.record_reduction(&selected, axis)?;
+        let selected = self.execution.reductions.get(crate::reduction::Site { output: v, operation })?.clone();
         let placement = match &src {
             Realization::Replicated { .. } => Some(TilePlacement::Replicated),
             Realization::Distributed { .. } => Some(TilePlacement::Distributed),
@@ -5167,13 +4805,8 @@ impl Printer<'_> {
             Realization::View { .. } => None,
             _ => unreachable!(),
         };
-        let domain = if self.execution.implementation.is_some() {
-            crate::reduction::ReductionDomain::new(&dims.iter().map(|dim| dim.cap).collect::<Vec<_>>(), axis, DType::I32, true,
-                TilePlacement::Replicated, SUBGROUP as u64)?.placement_variant(placement.clone(), true, selected.decision.full_lanes, dtype, true)?
-        } else {
-            crate::reduction::ReductionDomain::argmax(&dims.iter().map(|dim| dim.cap).collect::<Vec<_>>(), axis, dtype,
-                placement.clone(), selected.decision.full_lanes, SUBGROUP as u64)?
-        };
+        let domain = crate::reduction::ReductionDomain::argmax(&dims.iter().map(|dim| dim.cap).collect::<Vec<_>>(), axis, dtype,
+            placement.clone(), selected.decision.full_lanes, SUBGROUP as u64)?;
         if selected.decision.contract.operation != ReduceOp::Argmax
             || selected.decision.contract.input != dtype
             || selected.decision.input != tv
@@ -5181,9 +4814,6 @@ impl Printer<'_> {
             || selected.decision.domain != domain
         {
             return Err("argmax disagrees with its selected input/domain".into());
-        }
-        if self.execution.implementation.is_some() {
-            self.require_native_zero(Sym::constant(1).quot(&dims[axis].physical.add(&Sym::constant(1))))?;
         }
         let algorithm = selected.algorithm;
         use crate::reduction::Algorithm;
@@ -5628,296 +5258,6 @@ impl Printer<'_> {
         });
     }
 
-    /// Write this part's carried state to compiler-allocated scratch, one region per
-    /// (item, part), using the memory plan's buffer identity and layout.
-    fn publish_partials(
-        &mut self,
-        phase: usize,
-        carried: &[VarId],
-        row: &str,
-    ) -> Result<(), String> {
-        if carried.len() > 1 {
-            for variable in carried { self.publish_partials(phase, std::slice::from_ref(variable), row)?; }
-            return Ok(());
-        }
-        if let Some(&variable) = carried.first() {
-            if let Some(Realization::Choice { arms }) = self.real.get(&variable).cloned() {
-                let predicates = arms.iter().map(|(predicate, _)| predicate.clone()).collect::<Vec<_>>();
-                return self.implementation_arms(&predicates, &mut |printer, ordinal| {
-                    printer.real.insert(variable, (*arms[ordinal].1).clone());
-                    printer.publish_partials(phase, carried, row)
-                });
-            }
-        }
-        let scratch: Vec<_> = self
-            .execution
-            .memory
-            .scratch()
-            .iter()
-            .filter(|s| s.phase == phase && s.parameter.is_none() && carried.contains(&s.variable))
-            .cloned()
-            .collect();
-        if scratch.len() != carried.len() {
-            return Err("split scratch plan does not match carried values".into());
-        }
-        for (v, allocation) in carried.iter().zip(scratch) {
-            let (name, cap, slots, space, distributed) = match self.real.get(v) {
-                Some(Realization::Replicated { name, dims, .. }) => {
-                    let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
-                    (name.clone(), cap, Self::physical_count(dims), TSpa::Private, false)
-                }
-                Some(Realization::Shared { name, dims, .. }) => {
-                    let cap = dims.iter().map(|d| d.cap).product::<i64>().max(1);
-                    (name.clone(), cap, Self::physical_count(dims), TSpa::Threadgroup, false)
-                }
-                Some(Realization::Distributed {
-                    name, dims, slots, ..
-                }) => (
-                    name.clone(),
-                    dims.iter().map(|d| d.cap).product::<i64>().max(1),
-                    slots.clone(),
-                    TSpa::Private,
-                    true,
-                ),
-                other => {
-                    return Err(format!(
-                        "carried tile is {other:?}; splitting cannot publish it"
-                    ));
-                }
-            };
-            if allocation.variable != *v
-                || allocation.elements_per_item != cap as u64
-                || allocation.dtype != DType::F32
-            {
-                return Err("published partial value disagrees with scratch plan".into());
-            }
-            let buf = format!("split_{}", allocation.index);
-            let i = self.fresh("i");
-            if !distributed {
-                self.target(TS::If(TE::binary(
-                    BinaryOp::Eq,
-                    TE::variable("lane", TT::U32),
-                    TE::Integer(0, TT::U32),
-                    TT::Bool,
-                )));
-                self.indent += 1;
-            }
-            self.target(TS::For {
-                name: i.clone(),
-                start: TE::integer(0),
-                end: slots.clone(),
-                step: 1,
-            });
-            self.indent += 1;
-            let element = if distributed {
-                TE::binary(
-                    BinaryOp::Add,
-                    TE::variable("lane", TT::U32),
-                    TE::binary(
-                        BinaryOp::Mul,
-                        TE::Integer(SUBGROUP, TT::U32),
-                        TE::variable(&i, TT::I32).cast(TT::U32),
-                        TT::U32,
-                    ),
-                    TT::U32,
-                )
-            } else {
-                TE::variable(&i, TT::I32).cast(TT::U32)
-            };
-            if distributed {
-                self.target(TS::If(TE::binary(
-                    BinaryOp::Lt,
-                    element.clone(),
-                    TE::Integer(cap, TT::U32),
-                    TT::Bool,
-                )));
-                self.indent += 1;
-            }
-            let base = TE::binary(
-                BinaryOp::Mul,
-                TE::binary(
-                    BinaryOp::Add,
-                    TE::binary(
-                        BinaryOp::Mul,
-                        TE::variable(row, TT::U32),
-                        self.split_parts(phase, allocation.parts)?.cast(TT::U32),
-                        TT::U32,
-                    ),
-                    TE::variable("part", TT::I32).cast(TT::U32),
-                    TT::U32,
-                ),
-                TE::Integer(cap, TT::U32),
-                TT::U32,
-            );
-            self.target(TS::Write {
-                name: buf,
-                index: TE::binary(BinaryOp::Add, base, element, TT::U32),
-                space: TSpa::Device,
-                ty: TT::F32,
-                value: TE::Read {
-                    name,
-                    index: Box::new(TE::variable(&i, TT::I32)),
-                    space,
-                    ty: TT::F32,
-                },
-            });
-            self.indent -= 1;
-            self.target(TS::End);
-            self.indent -= 1;
-            self.target(TS::End);
-        }
-        Ok(())
-    }
-
-    /// Fold the parts of a split reduction, reading each part's published state and
-    /// applying the streaming body's own merge rule, then leave the result in the carried
-    /// tiles so the kernel's tail runs unchanged.
-    fn merge_partials(
-        &mut self,
-        phase: usize,
-        carried: &[VarId],
-        merges: &[execution::Merge],
-        operation: OperationId,
-    ) -> Result<(), String> {
-        if carried.len() > 1 {
-            for (variable, merge) in carried.iter().zip(merges) { self.merge_partials(phase, std::slice::from_ref(variable), std::slice::from_ref(merge), operation)?; }
-            return Ok(());
-        }
-        if let Some(&variable) = carried.first() {
-            if let Some(family) = self.execution.implementation.clone() {
-                if let Some(choice) = family.storage.get(&variable) {
-                    if self.implementation_value(choice).is_none() {
-                        let predicates = choice.arms.iter().map(|arm| arm.predicate.clone()).collect::<Vec<_>>();
-                        return self.implementation_arms(&predicates, &mut |printer, _| printer.merge_partials(phase, carried, merges, operation));
-                    }
-                }
-            }
-        }
-        let scratch: Vec<_> = self
-            .execution
-            .memory
-            .scratch()
-            .iter()
-            .filter(|s| s.phase == phase && s.parameter.is_none() && carried.contains(&s.variable))
-            .cloned()
-            .collect();
-        if carried.len() != scratch.len() || carried.len() != merges.len() {
-            return Err("split handoff does not match its proven merge rules".into());
-        }
-        for ((v, allocation), merge) in carried.iter().zip(scratch).zip(merges) {
-            if allocation.variable != *v {
-                return Err("merge value disagrees with scratch plan".into());
-            }
-            let buf = format!("split_{}", allocation.index);
-            let parts = self.split_parts(phase, allocation.parts)?;
-            let cap = allocation.elements_per_item;
-            let Ty::Tile(shaped) = self.vars()[*v].ty.clone() else {
-                return Err("carried state is not a tile".into());
-            };
-            let r = self.declare_tile(*v, &shaped.shape, DType::F32, operation, Purpose::Merge)?;
-            let (name, shared) = match r {
-                Realization::Replicated { name, .. } | Realization::Distributed { name, .. } => {
-                    (name, false)
-                }
-                Realization::Shared { name, .. } => (name, true),
-                _ => return Err("merge needs materialized state".into()),
-            };
-            if cap != 1 {
-                return Err("scalar merge state has non-scalar capacity".into());
-            }
-            let space = if shared {
-                TSpa::Threadgroup
-            } else {
-                TSpa::Private
-            };
-            if shared {
-                self.target(TS::If(TE::binary(
-                    BinaryOp::Eq,
-                    TE::variable("lane", TT::U32),
-                    TE::Integer(0, TT::U32),
-                    TT::Bool,
-                )));
-                self.indent += 1;
-            }
-            let base = TE::binary(
-                BinaryOp::Mul,
-                TE::variable("item", TT::U32),
-                parts.clone().cast(TT::U32),
-                TT::U32,
-            );
-            self.target(TS::Write {
-                name: name.clone(),
-                index: TE::integer(0),
-                space,
-                ty: TT::F32,
-                value: TE::Read {
-                    name: buf.clone(),
-                    index: Box::new(base.clone()),
-                    space: TSpa::Device,
-                    ty: TT::F32,
-                },
-            });
-            let p = self.fresh("part");
-            self.target(TS::For {
-                name: p.clone(),
-                start: TE::integer(1),
-                end: parts.cast(TT::I32),
-                step: 1,
-            });
-            self.indent += 1;
-            let partial = TE::Read {
-                name: buf,
-                index: Box::new(TE::binary(
-                    BinaryOp::Add,
-                    base,
-                    TE::variable(p, TT::I32).cast(TT::U32),
-                    TT::U32,
-                )),
-                space: TSpa::Device,
-                ty: TT::F32,
-            };
-            let value = match merge {
-                execution::Merge::Sum => TE::binary(
-                    BinaryOp::Add,
-                    TE::Read {
-                        name: name.clone(),
-                        index: Box::new(TE::integer(0)),
-                        space,
-                        ty: TT::F32,
-                    },
-                    partial,
-                    TT::F32,
-                ),
-            };
-            self.target(TS::Write {
-                name,
-                index: TE::integer(0),
-                space,
-                ty: TT::F32,
-                value,
-            });
-            self.indent -= 1;
-            self.target(TS::End);
-            if shared {
-                self.indent -= 1;
-                self.target(TS::End);
-            }
-            self.barrier(BarrierSite {
-                operation,
-                variable: *v,
-                purpose: BarrierPurpose::Merge,
-            })?;
-        }
-        Ok(())
-    }
-
-    fn split_parts(&self, phase: usize, fallback: u64) -> Result<TE, String> {
-        match self.execution.phases[phase].split.as_ref().and_then(|split| split.retained.as_ref()) {
-            Some(retained) => self.target_sym(&Sym::param(&retained.parts_symbol)),
-            None => Ok(TE::integer(fallback as i64)),
-        }
-    }
-
     fn intrinsic_stmt(
         &mut self,
         name: &seismic_lang::intrinsics::Operation,
@@ -5999,7 +5339,7 @@ impl Printer<'_> {
                                     .into(),
                             );
                         }
-                        if *name == seismic_lang::intrinsics::Operation::MatrixStore {
+                        if *name == seismic_lang::intrinsics::Operation::MatrixStore && space != TSpa::Threadgroup {
                             return Err("fragment store requires owned shared tile storage".into());
                         }
                         if !matches!(elem, Elem::Dtype(_)) {
@@ -6061,9 +5401,7 @@ impl Printer<'_> {
                             leading,
                             space,
                         });
-                        let ExprKind::Var(destination) = args[1].kind else {
-                            return Err("fragment store has no tile binding".into());
-                        };
+                        let destination = crate::storage::tile_root(&args[1]).ok_or("fragment store has no tile binding")?;
                         self.barrier(BarrierSite {
                             operation,
                             variable: destination,
@@ -6353,7 +5691,7 @@ impl Printer<'_> {
             .and_then(|n| usize::try_from(n).ok())
             .ok_or("extent axis must be a nonnegative constant")?;
         let shape = self.view_shape(view)?;
-        if !seismic_lang::effects::can_substitute_symbolic_value(&args[1]) {
+        if !seismic_lang::exec::effects::can_substitute_symbolic_value(&args[1]) {
             let value = self.target_expr(&args[1])?;
             self.target(TS::Evaluate(value));
         }
@@ -6525,80 +5863,4 @@ fn row_major_syms(shape: &[i64]) -> Vec<Sym> {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     strides.into_iter().map(Sym::constant).collect()
-}
-
-#[cfg(test)]
-mod allocation_tests {
-    use super::*;
-
-    #[test]
-    fn rejects_wrong_allocation_site_even_when_declarations_match() {
-        let program = seismic_lang::program::compile(&[seismic_lang::program::SourceFile {
-            path: "allocation_identity.seismic.portable".into(),
-            scope: seismic_lang::Scope::Portable,
-            text: "fn evaluate(x: tensor[6] f32, out: tensor[6] f32):\n  a = load(x)\n  a = load(x)\n  store(a,out)\n".into(),
-        }], &[]).unwrap();
-        let lowered =
-            seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
-        let mut execution = execution::prepare(
-            &lowered,
-            Config {
-                loads: seismic_realization::LoadStrategy::Materialize,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        emit_execution(&execution).unwrap();
-        let arrays = &execution.memory.launches()[0].arrays;
-        assert_eq!(arrays.len(), 2);
-        assert_eq!(arrays[0].declaration, arrays[1].declaration);
-        let first = arrays[0].id.operation;
-        let second = arrays[1].id.operation;
-        let StmtKind::Parallel { body, .. } = &mut execution.function.body[0].kind else {
-            panic!()
-        };
-        let statement = body
-            .iter_mut()
-            .find(|statement| statement.id == Some(first))
-            .unwrap();
-        statement.id = Some(second);
-        execution.invalidate_terminal();
-        assert!(
-            emit_execution(&execution)
-                .unwrap_err()
-                .contains("allocation site mismatch")
-        );
-    }
-
-    #[test]
-    fn rejects_a_missing_publication_site() {
-        let program = seismic_lang::program::compile(&[seismic_lang::program::SourceFile {
-            path: "publication_identity.seismic.portable".into(),
-            scope: seismic_lang::Scope::Portable,
-            text: "fn evaluate(out: tensor[6] f32):\n  a = tile[6] f32\n  for i in owned(a): a[i] = 1.0\n  store(a,out)\n".into(),
-        }], &[]).unwrap();
-        let lowered =
-            seismic_lang::lower::lower(&program, "evaluate", "metal", &Default::default()).unwrap();
-        let mut execution =
-            execution::prepare_storage_selected(&lowered, Config::default(), &mut |_| {
-                Ok(TilePlacement::GroupShared)
-            })
-            .unwrap();
-        assert_eq!(execution.memory.launches()[0].barriers.len(), 1);
-        emit_execution(&execution).unwrap();
-        let StmtKind::Parallel { body, .. } = &mut execution.function.body[0].kind else {
-            panic!()
-        };
-        let owned = body
-            .iter_mut()
-            .find(|statement| matches!(statement.kind, StmtKind::Owned { .. }))
-            .unwrap();
-        owned.id = Some(OperationId(usize::MAX));
-        execution.invalidate_terminal();
-        assert!(
-            emit_execution(&execution)
-                .unwrap_err()
-                .contains("omitted planned memory barriers")
-        );
-    }
 }

@@ -89,7 +89,7 @@ pub(super) fn replacements(body: &[Site], bundle: &Bundle, width: u8, launch: us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::ast::BinaryOp as B;
+    use seismic_lang::syntax::ast::BinaryOp as B;
     use crate::terminal::{Program, Space, transfer::{self, Kind, Selection}};
     fn site(statement: S) -> Site { Site { operation: None, statement } }
     fn load(name: &str, index: E) -> S {

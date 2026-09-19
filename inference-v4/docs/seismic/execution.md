@@ -1,373 +1,196 @@
-# Seismic execution representation
+# Seismic execution
 
-An execution describes how a computation obtains values, performs operations, uses
-storage, coordinates participants, and publishes observable results. The same structure
-supports legal-choice construction, resource derivation, emission, and performance
-constraints under the [compiler principles](compiler.md).
+**This document defines what an authored structure means when it executes, which
+adjacent work may share a realization, and how a witness becomes one concrete
+execution.** Source rules are in [Language](language.md); target rules are in
+[Backends](backends.md).
 
-## Shared semantic structure
+## Reference semantics
 
-| Entity | Meaning |
+The reference interpreter executes the structured IR directly and is the semantic
+oracle. It accepts any legal partition from its caller: a width per static binder.
+A conforming program produces the same results under every partition, up to the
+numerical permission of its admitted functions. Every backend execution must agree
+with the interpreter, including rounding at each operation's dtype, publication
+rounding, accumulation dtype, FMA, and reduction order.
+
+Reduction order has one authored exception. `reduce(t, axis, sum|max|min,
+unordered=true)`, legal only inside an `admit fn`, permits a backend to reassociate
+that reduction; the interpreter still accumulates in ascending order. The execution IR
+carries the permission on the reduction (`ordered = not unordered`), and a backend may
+use a reassociating algorithm only there. Two library contracts package the
+permission: `sum_any_order` (an ordered and a reassociating body) and
+`matmul_any_order` (a contraction whose association, and the distribution of a packed
+operand's affine decode over the sum, are unspecified). A caller opts in by calling
+them; an overload family whose bodies differ in this way is itself declared `admit`
+(`linear`). Agreement with the interpreter is then up to F32 summation rounding on
+those paths and exact everywhere else.
+
+## Regions
+
+| Form | Meaning |
 | --- | --- |
-| Operation | A typed computation or effect with numerical and participation semantics. |
-| Value version | A particular definition/publication, including its representation and precision. |
-| Allocation | Canonical storage identity with size, alignment, address space, and lifetime. |
-| View | A mapping into a logical value version, with offsets, strides, extents, and backing storage when its elements are needed. |
-| Control region | A loop, branch, ownership region, or parallel domain and its execution conditions. |
-| Completion event | Completion and visibility of an operation, distinct from its issue where asynchronous. |
-| Dependency | A required value, effect, synchronization, or completion relation. |
-| Obligation | A proposition that must be established statically or enforced at an appropriate runtime boundary. |
-| Decision | An unresolved choice among implementations or execution structures with a derived legal domain. |
+| `parallel` | Independent visits, one slice per binder per visit. A body cannot mutate enclosing state; it may publish to provably disjoint views and yield a result. |
+| `ordered` | Visits in ascending lexicographic order, last binder fastest. Each visit completes before the next begins. A body may update enclosing `var` state. |
+| `pipeline` | Ordered visits whose body is one linear stage chain. Each state object has exactly one updating stage. Preparation may run ahead only across stable reads. |
+| `merge` clause | Canonical near-equal contiguous partition of the axis; adjacent partials combine level by level, an odd value is forwarded. Empty domain gives the identity; one part gives its partial. |
+| Refinement | A region over an enclosing slice partitions that slice. It owns a new site. |
+| Rebinding | A region over a region result revisits the producer's pieces. It creates no site and reruns nothing. |
 
-Identities are scoped by semantic program identity. Source spans support diagnostics but
-do not distinguish cloned operations or establish equivalence. Transformations retain
-origin relationships while assigning new identities where meaning changes.
+One static binder is one site. Every dynamic instance of the binder uses the same
+selected value. A binder applied to several tensors is one joint traversal.
 
-Allocation identity is not a parameter name. Different views can alias, and the same
-bytes can hold different value versions over time. Copies, borrowed views, and
-recomputed values have distinct semantics even when their current contents match.
+Lexical position fixes production: a binding before an inner region is produced once
+per enclosing visit; inside, once per inner visit. Execution never moves,
+duplicates, or merges producers.
 
-Geometry can remain live after a value's element data becomes dead. Its definition
-still captures endpoints, clamps dynamic windows, checks points, and validates
-reshape layout at the original evaluation site. An owning tile snapshot has its
-own contiguous layout even when no element allocation is necessary. Endpoint and
-axis expressions can themselves read data and retain those dependencies. Reshape
-target dimensions likewise evaluate after the source view, in argument order,
-even when their symbolic values are known. A captured view retains that evaluation
-rather than repeating its original expressions when later consumed.
+## Stages and completion
 
-Geometry-only realization is explicit and cannot service an element access. The
-compiler may omit element production only after proving that no data consumer,
-escaping state update, publication, numerical failure, or layout failure is lost.
-Captured runtime coordinates are ordinary typed scalar values in this same IR;
-shape-equivalence identities alone do not identify a runtime snapshot. Projection
-retains conversions and guards, and allocates only its demanded result. A dynamic
-window that may cover the entire input still has that full capacity unless a
-separate bounded consumer or streaming realization establishes a smaller demand.
+Consecutive `stage` statements are one linear chain; a stage receives the previous
+stage's yield positionally. Outside a pipeline, a stage and all work it started
+complete before the next stage starts, at the scope of the enclosing owner: the
+invocation, one parallel visit, or one ordered visit. A region completes before the
+statement after it. Region exit discharges every completion obligation inside it.
 
-The same captured rectangle can restrict an admitted pure producer region with
-multiple updates. Its original statements retain update order, logical coordinates
-and intermediate precision. Bounds are evaluated before the rectangle is used;
-its lengths refer to the extents established by those checks. Projection may not
-remove a failure in an unrequested part of the original producer.
+Inside a pipeline, stages of one visit run in chain order and carried-state updates
+of visit `i` precede those of visit `i+1`.
 
-Ordered reductions over computed tile windows can use the same bounded iteration
-as tensor-backed domains. Capacity follows structural view provenance; the loop
-reads the already captured value's geometry rather than reevaluating its original
-endpoints. A later temporary with the same shape does not replace that snapshot.
-Inputs that overlap mutable reduction state are captured once before decomposition,
-so each piece consumes the original input while carrying the preceding state.
-An empty logical domain executes no pieces and leaves the initial state intact.
+A helper call is never a launch, materialization, or completion boundary by itself.
 
-A streamed value used only for geometry requires no element transfer or storage.
-Its source still evaluates before the loop, including endpoint reads, layout and
-point checks, and agreement with the iteration domain, even for an empty domain.
-Each piece retains the owning contiguous layout and captured shape of its logical
-load. Data demand propagates through the body; unsupported geometry forms retain
-their data realization. Storage, reduction planning and emission use that same
-demand result.
+## Region results
 
-## Operation and implementation contracts
+A region used as an expression yields exactly one value of one schema per visit.
+The result keeps the producer's partition: consumers revisit the same pieces and
+select the member of the current visit. Results are immutable, may nest, and may
+pass through stage ports and helper calls. They cannot be counted, indexed by
+number, flattened, or escape the compiled composition. Their cardinality is never
+semantic data.
 
-An admitted operation has an exhaustive definition of:
+Storage of a result is derived, never declared: one backing per yielded member, with
+one leading piece axis per binder of every enclosing producer, sized by the selected
+piece counts, alive until the last consumer.
 
-- Operand/result types, shapes, and representations.
-- Numerical meaning, rounding/publication points, overflow, exceptional values,
-  and permitted reassociation or approximation.
-- Reads, writes, alias relationships, and value dependencies.
-- Required participants, convergence, ordering, and synchronization.
-- Shape, alignment, layout, and backend capability constraints.
+## Partial values
 
-Each backend implementation additionally supplies its execution structure, resource
-semantics, and emission mapping. Implementations can expand into shared operations or
-terminate at backend primitives. Primitive contracts define the supported semantics;
-arbitrary callbacks cannot assert missing behavior, legality, or costs. The same
-implementation structure accounts for helpers, temporary operations, and synchronization
-before emission.
+A value yielded from a region, or reduced over a structural axis, depends on the
+partition until it is combined. Outside an admitted function it may only be
+forwarded, stored in results, combined by a `merge` clause, accumulated into state
+by `+`, `max`, or `min` within a traversal of the same result, or passed to an
+admitted function. Admission is a trust boundary, not a proof. Ordered
+accumulation into carried state across windows preserves the element order of the
+whole traversal and needs no admission.
 
-The admitted implementation definition is the common authority for accounting and
-emission. It is not sufficient to maintain an opcode emitter and an unrelated cost table
-with matching names. Hardware-dependent parameters are supplied by a bound hardware
-contract; the operation definition specifies which parameters it requires and how they
-participate in the model.
+## Execution units
 
-Structural completeness is an admission invariant. An operation cannot enter the
-qualified compilation path with an optional resource implementation or an opaque
-unmodeled effect. Physical fidelity of the completed contract remains a separate
-qualification requirement described in [Backends](backends.md).
+An execution unit is a static portion of one authored block with a prescribed
+backend execution. Units partition the block's statements in authored order.
 
-## Stage invariants
-
-Portable IR describes logical domains and computation independently of physical
-partitioning. Execution choices cannot determine source-visible shapes, iteration
-counts, or index meaning. Algorithmic windows retain their declared boundaries;
-physical pieces refine their execution without redefining them. Numerical variation
-is limited to the computation's explicit permissions.
-
-Portable IR contains construct calls and common typed operations. Applying Seismic
-`lower` definitions replaces calls with backend implementations while retaining
-alternative bodies and dependent choices where optimization is required.
-
-Lowered IR contains the computation and its constrained execution family. It must not
-prematurely choose an implementation merely because it is the first lowering, a
-convenient tile size, or an emitter's preferred path.
-
-Tuned IR resolves all compilation decisions into the actual execution. Its allocations,
-addresses, checks, communication, synchronization, and launch graph must determine its
-derived model and objective. It contains no unresolved performance fallback. Runtime
-control flow remains explicit where allowed by the workload domain.
-
-## Legal execution forms
-
-An execution form defines the implementations and transformations admitted for a
-computation. It is defined independently of search order, search budget, and the set of
-candidates an optimizer happened to visit.
-
-| Decision family | Admitted dimensions |
+| Unit kind | Statement |
 | --- | --- |
-| Algorithm and implementation | Declared library/lowering alternatives, permitted factorizations, scalar/vector/packed/matrix instruction covers and their staging/conversions. |
-| Decomposition | Multi-axis tiling, traversal, interchange, grouping, streamed pieces, unrolling, tails, reduction trees and splits, segmented work, supported scans. |
-| Composition | Fusion/fission, producer placement and sharing, local intermediates, state retention, partial/merge launches, execution boundaries. |
-| Ownership | Coordinate-to-participant mappings, vector widths, lanes/subgroups/workgroups/workers, producer/consumer roles, supported persistent work policies. |
-| Layout and representation | Supported strided/blocked/permuted/packed/swizzled maps, padding, alignment, fragment layout, internal repacking with exact conversion semantics. |
-| Residence | Borrow/materialize, distributed/replicated values, address spaces, rematerialization, allocation granularity and lifetime reuse. |
-| Movement and pipeline | Direct/indirect/vector/bulk transfers, staging, prefetch, synchronous/asynchronous movement, buffering depth, pipeline stages and overlap. |
-| Communication | Broadcast/collectives, shared exchange, barriers/events, permitted atomics, scratch handoff and launch dependencies. |
-| Executable order and control | Local ordering, issue/wait placement, launch overlap/submission grouping, predication, guarded specialization, supported runtime assignment policies. |
+| Elementwise | Tile-valued binding or tile state update computed pointwise over identical axes, with scalar broadcast |
+| Local | Reduction, scalar work, loop, branch, helper call, or any other non-elementwise computation |
+| Call | Call occurrence at a lowering boundary |
+| Publish | `publish` |
+| Region | Nested region, as statement or bound expression |
+| Stage | One stage of a chain |
 
-These families describe one constrained execution, not independent tuning knobs.
-Fusion changes liveness and ownership; layout changes instruction applicability
-and communication; splitting adds merge work and scratch; pipelining changes
-storage and residency. Derive all consequences together. A chosen traversal order
-for search must not fix earlier choices irreversibly or remove legal combinations.
+- A single-consumer pure tile-valued `let` adjacent to its consumer's unit joins that
+  unit. One that is not adjacent stays its own unit. A multi-consumer `let` is one
+  producer in every grouping.
+- Operators within one statement never split.
+- A stage outside a pipeline carries a completion after it. A fused interval may
+  cross a completion only through a realization that preserves it.
+- A block with fewer than two units has no sequence and no grouping decision.
+- Bodies of loops, branches, stages, and regions have their own sequences. Dynamic
+  visits never create units.
 
-Libraries supply algorithms and their permitted alternatives. The form optimizes
-their realizations; it does not search arbitrary equivalent algorithms. Backend
-mechanisms may extend intrinsic contracts without introducing model-specific
-decision families.
+## Contiguous fusion
 
-An execution assignment determines:
+A fusion candidate is a contiguous interval of one sequence with one prescribed
+realization. The backend lists every legal interval, including the singletons that
+are separate execution. The solver picks an exact cover. Nothing else fuses.
 
-- Iteration domains, partition hierarchy, traversal, tails and multiplicity.
-- Selected operation covers, execution regions, participant roles and ownership.
-- Value producers/consumers, access maps, precision and retained/recomputed instances.
-- Instance layouts, allocations, residence, alignment and live intervals.
-- Actual movement, issue/completion events, visibility and storage release.
-- Executable control, launch boundaries, policies and ordering dependencies.
+An interval is legal only when its realization establishes all of:
 
-Every result has a valid producer/access path; every effect retains its required
-multiplicity and order; every intrinsic's requirements hold. Necessary communication
-is explicit. Search specializes this structure rather than treating arbitrary
-rewrite-pass histories as distinct candidates.
+1. **Order.** Units stay in authored order. A joint traversal interleaves them per
+   coordinate only when every dependence, state update, failure, and completion is
+   preserved.
+2. **Correspondence.** The units iterate provably corresponding coordinates within
+   the already granted owner. Equal extents or equal selected widths are not proof.
+   Required width equalities are exported as constraints on the sites.
+3. **Production and numerics.** Every producer keeps its occurrence, multiplicity,
+   snapshot semantics, and conversions. No reassociation, no common-producer
+   discovery.
+4. **Interfaces.** Values leaving the interval keep their representation and
+   lifetime. Only compiler-owned intermediates may disappear. A `publish` is never
+   removed.
+5. **Completion and participation.** Every port, ordered visit, and collective
+   participation rule still holds.
+6. **Resources.** Hard capacity limits hold for the combined group.
 
-Source-order phase construction groups consecutive serial statements into one
-rank-zero work domain and retains each outer parallel domain. Serial setup runs
-once before dependent parallel regions. Every launch completes before its
-successor, including tensor writes and invocation-owned value publications.
-Scalars and dense tiles crossing boundaries receive internal typed storage;
-publication and reload are ordinary operations in the same accounted program.
-Later serial updates publish a new version before subsequent consumers. These
-allocations are owned by the compiled invocation and do not extend its public ABI.
+Legality admits a candidate to the solver. It says nothing about profit. A legal
+group with a high estimate stays a candidate.
 
-A retained tensor view keeps its backing identity and captures each dynamic
-coordinate at the original evaluation site. Consumers reconstruct geometry from
-those retained scalar coordinates; they do not reread coordinate tensors or copy
-the view's referent. Runtime-sized dense snapshots retain their actual lengths
-separately from the capacity derived from their source views. Publication and
-reload use those lengths, preserving empty and clamped windows.
+## Instantiation
 
-Each launch is checked independently for typed bindings, scope, and participant
-indices. Iteration-local values cannot escape their domain, and mutation of a
-broadcast value requires an ownership or merge proof. Unsupported storage or
-domain construction stays explicitly unresolved; it cannot silently eliminate
-an alternative. Malformed IR and inconsistent construction metadata remain errors.
+Instantiation is a deterministic function of the program, the family, and the
+witness. It returns one execution IR or a diagnostic. It never chooses and never
+repairs.
 
-Decision identity and alternatives remain typed through lowering, accounting, and
-selection. Display labels do not replace those identities. Resolving a decision
-specializes the same execution structure and its derived constraints; neither the tuner
-nor a diagnostic candidate path reconstructs its meaning separately.
-
-Domains may be symbolic integer ranges or dependent alternatives. Semantic,
-representation, ownership, and hardware constraints determine legality. Workload extents
-and backend capabilities bound choices; handwritten preferred subsets do not establish
-coverage.
-
-For example, placing a tile in subgroup-shared storage affects capacity, communication,
-publication barriers, and legal reduction implementations. Those consequences are
-derived from one decision, rather than selected independently and reconciled after
-emission.
-
-Form restrictions must be explicit and meaningful. A bound for graph-preserving direct
-computation does not automatically cover algebraic replacement algorithms. Expanding the
-admitted form requires rederiving affected bounds and invalidating incompatible cached
-analyses and selections. A diagnostic restriction cannot silently replace required
-compiler coverage.
-
-## Finite domains and coverage boundaries
-
-Each admitted form defines its parameter and structural domains independently of
-search budgets. Finite tensor sizes alone do not bound arbitrary duplication,
-algorithm expansion or scheduler programs.
-
-| Domain | Required boundary |
+| Subject | Rule |
 | --- | --- |
-| Algorithm expansion | Finite alternatives and terminating, acyclic or well-founded expansion |
-| Decomposition | Bounded work domains and specified partition hierarchy; include tails and empty work |
-| Ownership/layout | Explicit finite families and parameter bounds, including backend fragment maps; no implicit search over arbitrary integer functions |
-| Padding | Bounds from admitted layouts/instructions or an explicit form restriction |
-| Reduction/order | Finite trees/orders over admitted occurrences with numerical and dependence restrictions |
-| Replication/recomputation | Defined occurrence construction and bounds; no unrestricted rewrite duplication |
-| Pipelines | Useful outstanding work/capacity bounds where established, otherwise an explicit supported depth domain |
-| Dynamic policies/variants | Finite supported policies and guards with bounded work and progress requirements |
+| Entry | Parameters become the invocation ABI in declaration order. Tensors and views bind buffers; scalars bind scalar arguments; a bounded index binds a checked runtime scalar. |
+| Aliasing | Every written tensor parameter must be disjoint from every other tensor parameter, except that a declared `alias` pair may coincide exactly. The requirement travels with the execution and is checked at invocation. |
+| Calls | The selected candidate's body is inlined. Views stay references. |
+| Slice | Piece `p` of a binder with lower bound `lo` and width `w` is `[lo + p·w, lo + (p+1)·w)`. |
+| Root `parallel` region of the entry | One launch whose work items are the pieces. |
+| Every other region | Ordered loops over pieces inside its owner, first binder outermost. |
+| Root stages and invocation-scope statements | Consecutive root statements, executed in order with completion between them. |
+| Tile computation | One element loop per unit; one loop for a selected elementwise interval. A dependency between its units that is not elementwise is a diagnostic. |
+| Selected interval of root `parallel` regions | One launch over the shared pieces; differing binder geometry under the selected widths is a diagnostic. |
+| `merge` | The canonical adjacent-pair recurrence over the selected part count. |
+| Region result | Local tiles with leading piece axes. |
+| Reduction | The execution IR's reduction carries its numerical contract: ordered unless the source said `unordered=true`. |
+| Runtime-bounded range | Bounds clamped to the axis; the extent is a runtime value. |
+| Data-dependent point index | Runtime bounds check with defined failure. |
 
-For a regular tiled axis of positive extent N, expose 1..N unless a justified
-constraint restricts that domain; account separately for admitted padded
-implementations and N=0. Powers-of-two or divisor-only lists do not establish
-general coverage. Arbitrary layouts and arbitrary runtime scheduler programs are
-not silently included in a bounded family.
+The execution IR is verified before it is returned. The backend then realizes it by
+its own fixed rules ([Backends](backends.md)).
 
-Distinguish semantic/hardware constraints, optimum-preserving dominance arguments,
-and deliberate form restrictions. Less arithmetic or storage does not inherently
-dominate: extra recomputation, padding or buffering can improve communication and
-concurrency. Finiteness does not establish tractable search. Unsupported analysis
-is not evidence of infeasibility.
+## Current limitations
 
-## Safety and effect obligations
+- **Divisor widths only.** A width must divide its static extent. Instantiation
+  rejects any other width. The language contract for tails stands (a selected body
+  must be correct for every valid extent up to its capacity), but no tail piece is
+  generated yet.
+- **Runtime extents.** A domain with a runtime extent is instantiated only at width
+  one. Runtime-length history is authored as a semantic range, not a slice.
+- **Region results stay inside one launch.** A result produced in one launch and
+  consumed in another has no mapping, nor does a root traversal of a result.
+- **Synchronous pipeline only.** One visit prepares, then consumes, on the same
+  participant. Ring depth is fixed at one and is not a site.
+- **Invocation-scope loops** cannot contain regions or calls. A root region result
+  is supported only when a `merge` clause reduces it within its launch.
+- **Intervals do not span a helper call.** See [Compiler](compiler.md#source-stability).
+- **Intervals do not span a lowering-boundary call.** Every call statement is a `Call`
+  unit and the family reports when a callee's root block is solely parallel regions,
+  but instantiation realizes a selected interval of root `parallel` *region* units
+  only. A composition entry pays one launch per callee region.
+- **Runtime-extent tiles are shared by capacity.** Element loops over a tile with a runtime
+  extent divide its capacity among the lanes (a short extent leaves some lanes with less
+  work), and matrix lowerings whose predicates name a runtime extent are inapplicable.
+  Attention over runtime-length history writes its score tile cooperatively into
+  threadgroup memory with the ordered `matmul` chain and runs its value product
+  history-major; it is not windowed.
+- `lanes` loops and `atomic(max|min)` have no structured form; `atomic(add)` is
+  checked but cannot be instantiated.
 
-Bounds, shape compatibility, aliasing, initialization, representation validity, parallel
-independence, and collective convergence are typed IR predicates. “Obligation” names a
-required condition, not a string assertion or a separate proof artifact. Types and
-construction enforce local invariants; the owning analyses and stage validators
-establish global properties. Runtime-dependent conditions remain explicit checks with
-execution semantics.
+Each limitation is reported as its own diagnosed outcome. None selects a different
+execution silently.
 
-| Discharge | Required behavior |
-| --- | --- |
-| Static validation | Construction or analysis establishes the predicate under retained conditions; emit no redundant runtime check. |
-| Invocation check | Check properties of bindings or execution conditions before relying on them. |
-| Dynamic check | Represent the necessary check at the execution point, its dependencies, failure behavior, and resource cost. |
+## Acceptance
 
-Transformations may hoist or combine checks only when doing so preserves observable
-behavior and validity. A masked lane does not justify an out-of-bounds access before the
-mask is applied. A lane-local predicate does not establish collective convergence. An
-allocation bound does not by itself prove a logical view access valid.
-
-Remaining checks are part of the selected execution. Emission must not rediscover bounds
-or introduce a second checking policy. Failure behavior distinguishes a statically
-invalid program, a rejected invocation, and a dynamic execution failure; runtime
-completion and partial-effect handling follow [Runtime](runtime.md).
-
-## Transformation contracts
-
-Every transformation establishes semantic equivalence under retained conditions,
-reconstructs dependencies and value/storage relationships, and preserves or rederives
-obligations and decision domains.
-
-Fusion preserves required publications and dependencies. Recomputation preserves
-numerical/effect semantics. Storage reuse requires non-overlapping live intervals and
-appropriate completion ordering. A reduction rewrite requires a legal merge operation
-and the relevant reassociation permissions. Floating-point identities cannot be
-justified solely by real-number algebra.
-
-An internal memory round trip may disappear while its numerical conversion remains.
-Externally visible writes, KV publication and successor-state updates cannot be
-removed as if they were temporary values. Asynchronous storage remains live until
-all relevant users complete, not merely until their operations are issued.
-
-Communication requires the actual visibility and participation scope. Persistent
-or cooperative execution requires a valid progress contract; an ordinary GPU
-launch does not imply a cross-workgroup barrier. Coupled reduction state requires
-its admitted merge semantics, including masked, empty and exceptional-value cases.
-
-Numerical and effect preservation is independent of optimizer cost improvement.
-Transforms must handle aliases and snapshots, exceptional floating-point values,
-partial or empty domains, and collective participation according to their semantics.
-
-Participant-owned segmented folds retain the selected source merge tree, including
-its seed leaf exactly once. Leaves map cyclically onto subgroup lanes and private
-slots, so the number of segments may exceed subgroup width. Partial state remains
-proportional to leaves per participant. Exchange reads a uniform source slot across
-all participants before shuffling from the selected lane; receiver-dependent slot
-reads cannot implement a remote private-memory lookup. Pairwise and explicit
-contiguous trees retain their original child order and arithmetic. Extra lanes or
-slots initialize private identity values but do not introduce padded merge leaves.
-
-Seed placement is an explicit participant-ownership choice. One mapping leaves the
-seed at logical leaf zero while computing each segment in its final lane/slot.
-The other computes segment `j` at cyclic coordinate `j`, then shifts the retained
-partial states to coordinate `j + 1` and inserts the original seed at zero. This
-can avoid an extra serial segment on one lane when the segment count is a multiple
-of subgroup width. Slots shift in descending order; all shuffle source slots are
-uniform. Both mappings enter the identical merge tree with identical leaves.
-The transfer instructions, temporary state, and ownership are ordinary execution
-IR, so their costs participate in the same derivation as the segment arithmetic.
-
-### Terminal loop traversal
-
-After allocation and storage are fixed, Metal retains contiguous device-to-private
-snapshot copies and adjacent device-read bundles as typed transfer choices. Scalar accesses and supported packed
-vectors of two, three, or four elements belong to the same domain. Pure local
-coordinate bindings are resolved using the terminal owner's lexical integer
-analysis. A vector alternative requires contiguous source addresses without
-integer wrapping; it preserves per-element conversions and destination writes.
-Guards must hold for every component, otherwise that chunk executes its original
-scalar copies. The remaining tail stays scalar. Packed vectors retain scalar
-alignment and exact payload size; they introduce no stronger binding condition.
-The selected vector read is a terminal operation used by emission, known-value
-propagation, request geometry, and hardware service derivation. It is not a claim
-that the native compiler emits one instruction. Transfer choices are retained
-before traversal choices, so unrolling sees the selected copy loops. Read bundles
-resolve immutable scalar aliases through the same integer analysis, require
-consecutive addresses in one backing, and cross only total scalar definitions.
-They preserve scalar bindings, conversions, and incomplete tails. Writes,
-control boundaries, unresolved checked reads, and other effects end the bundle;
-no source name or packed representation is part of recognition.
-
-Metal then retains each finite constant loop
-as a typed traversal domain. Widths `1..iteration_count` preserve the original
-ordered iteration sequence; nondivisor widths emit complete chunks and exact
-remaining iterations. Full unrolling exposes constant private-array indices.
-Selection never infers native registers or chooses widths from benchmark feedback.
-
-The selected loop transformation operates on the same terminal statements used
-by emission and accounting. Lexical scopes retain local declarations between
-copies; bounds failures, casts, and FMA order remain in their original occurrence.
-Loops containing unknown textual implementations, mutated induction variables,
-or an unproved final integer increment have no unrolled alternative. The owning
-terminal preparation is retained across refinement, and numeric width domains do
-not allocate a vector of all alternatives.
-
-Pairwise participant folds additionally admit completion by leaf waves. Each
-subgroup-sized contiguous set of leaves executes the same lower tree levels
-before the next set is generated. Its root is retained across participants, so
-live leaf storage becomes one root per completed wave rather than every leaf.
-The upper levels combine these roots in the unchanged pairwise order. Both seed
-placements remain available; deferred seed insertion carries the preceding
-wave's final segment into the next wave without recomputing it. The final partial
-wave contributes only its real leaves. Explicit trees keep the existing complete
-leaf realization unless their independent subtree schedule is established.
-
-Metal storage domains retain the participant relationship between an owned loop and every tile element it writes. Replicated publication requires the loop's full per-lane traversal; cooperative publication uses the distributed traversal. These replication classes propagate jointly through writes and borrowed storage aliases, including constraints imposed by matrix operands. A distributed read also constrains its owning loop to cooperative traversal. Selecting an earlier tile can therefore narrow later storage domains. Shared writes receive an owned-region publication barrier even when the region's named iteration tile uses distributed private storage. The memory plan owns that barrier and emission and accounting consume it together.
-
-An owned iteration domain need not have a data allocation. Borrowed device views
-and geometry-only tiles use the same publication ownership relationships as
-materialized tiles: when they fill cooperative storage, their coordinates are
-partitioned cooperatively; when they fill replicated storage, every lane traverses
-the domain. Device aliases do not force separate logical iteration domains into
-one replication class. The selected ownership is stored in the storage plan and
-consumed by both convergence/publication analysis and terminal construction.
-
-Terminal synchronization refinement can defer a publication barrier to the next
-barrier in the same control region when the intervening shared accesses do not
-conflict. Read/write, write/read and write/write hazards use backing-slot pointer
-aliases, including matrix transfers; unknown effects and control exits stop the
-analysis. The first and last barriers of a region remain, and nested regions with
-barriers are opaque to their parent. This coalescing runs before terminal transfer
-and traversal choices, so their retained mandatory-work bounds see the same fixed
-barrier set. Emission and accounting consume the coalesced typed program.
-The synchronization analysis additionally tracks known low byte-address bits.
-This can prove that different columns of a strided allocation are disjoint even
-when their bounding intervals overlap. Integer-width wrapping, pointer offsets,
-and every byte of each scalar access participate in that calculation. Matrix
-transfers conservatively touch their entire backing allocation; unresolved address
-bits never establish disjointness.
+- Reference fixtures agree under at least two different partitions.
+- For every supported kernel, the selected Metal execution agrees with the
+  interpreter.
+- Instantiating the same witness twice yields the same execution IR.

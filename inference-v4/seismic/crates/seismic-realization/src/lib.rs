@@ -23,7 +23,7 @@ pub struct InvocationConditions {
     alias_pairs: Vec<(usize, usize, bool)>,
 }
 impl InvocationConditions {
-    pub fn from_lowered(function: &seismic_lang::lowered_ir::LoweredIr) -> Result<Self, String> {
+    pub fn from_lowered(function: &seismic_lang::exec::lowered_ir::LoweredIr) -> Result<Self, String> {
         function.ownership.validate(function)?;
         let (parameters, _) = storage::parameters(function)?;
         let mut alias_pairs = Vec::new();
@@ -36,8 +36,8 @@ impl InvocationConditions {
                 .params
                 .get(requirement.right)
                 .ok_or("invalid source alias parameter")?;
-            if !matches!(left.1, seismic_lang::types::Ty::Tensor(_))
-                || !matches!(right.1, seismic_lang::types::Ty::Tensor(_))
+            if !matches!(left.1, seismic_lang::exec::types::Ty::Tensor(_))
+                || !matches!(right.1, seismic_lang::exec::types::Ty::Tensor(_))
             {
                 return Err("source alias requirement needs tensor parameters".into());
             }
@@ -61,8 +61,8 @@ impl InvocationConditions {
         }
         let read_only_buffers = parameters.iter().enumerate().filter_map(|(slot, buffer)| {
             let parameter = function.params.iter().position(|(name, _)| name == &buffer.parameter)?;
-            let (id, _) = function.vars.iter().enumerate().find(|(_, var)| matches!(var.kind, seismic_lang::ir::VarKind::Param(p) if p == parameter))?;
-            seismic_lang::effects::tensor_parameter_read_only(&function.body, id).then_some(slot)
+            let (id, _) = function.vars.iter().enumerate().find(|(_, var)| matches!(var.kind, seismic_lang::exec::ir::VarKind::Param(p) if p == parameter))?;
+            seismic_lang::exec::effects::tensor_parameter_read_only(&function.body, id).then_some(slot)
         }).collect();
         Ok(Self {
             read_only_buffers,
@@ -143,7 +143,7 @@ impl MathFunction {
 pub enum ParticipantOperation {
     LaneIndex,
     ShuffleIndex,
-    Reduce(seismic_lang::ir::ReduceOp),
+    Reduce(seismic_lang::exec::ir::ReduceOp),
 }
 /// Concrete storage and instruction program, not a cost estimate. Math imports
 /// retain semantic identities; the target must supply an admitted implementation.
@@ -162,7 +162,7 @@ pub struct ScalarProgram {
     pub participation: dispatch::Participation,
     pub work_items: u64,
     pub dispatch: Dispatch,
-    pub loads: Vec<seismic_lang::normalize::loads::Decision>,
+    pub loads: Vec<seismic_lang::exec::normalize::loads::Decision>,
     pub execution: execution::ExecutionEvidence,
 }
 

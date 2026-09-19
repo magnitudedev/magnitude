@@ -1,7 +1,7 @@
 //! Resident bindings for checked numerical compositions. Model policy chooses
 //! parameters; this owner validates their contracts and retains scratch/code.
 use crate::weights::residency::ResidentWeight;
-use seismic_lang::types::{DType, Elem, Ty};
+use seismic_lang::{sir::Param, types::{DType, Elem, Extent, Shaped, Ty}};
 use seismic_runtime::{
     plan::{Bindings, CompiledPlan, PlanCompiler, StepObservation, Submission},
     Buffer, Device, Error,
@@ -11,15 +11,38 @@ use std::collections::{HashMap, HashSet};
 pub struct Composition {
     device: Device,
     spec: CompositionSpec,
-    controls: HashSet<String>,
     control_types: HashMap<String, (DType, usize)>,
-    control_domains: HashMap<String, seismic_runtime::tuner::IntegerRange>,
+    control_domains: HashMap<String, IntegerRange>,
     plan: CompiledPlan,
     weights: HashMap<String, ResidentWeight>,
     scratch: HashMap<String, Buffer>,
     external: HashSet<String>,
     runtime_scalars: HashSet<String>,
     scalars: HashMap<String, f64>,
+}
+/// Inclusive bounds every element of an integer control must satisfy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntegerRange {
+    pub min: i128,
+    pub max: i128,
+}
+impl IntegerRange {
+    pub fn contains(&self, value: i128) -> bool { self.min <= value && value <= self.max }
+}
+/// Entry parameters carry only semantic extents; a slice width has no caller value.
+fn extents(tensor: &Shaped, shapes: &HashMap<String, i64>) -> Result<Vec<usize>, String> {
+    tensor.axes.iter().map(|axis| match axis {
+        Extent::Semantic(extent) => extent.eval(&|p| shapes.get(p).copied())
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| "unresolved entry tensor shape".to_string()),
+        Extent::Structural(_) => Err("entry tensor has a structural extent".into()),
+    }).collect()
+}
+fn tensor<'a>(params: &'a [Param], name: &str) -> Option<&'a Shaped> {
+    params.iter().find_map(|p| match &p.ty {
+        Ty::Tensor(t) if p.name == name => Some(t),
+        _ => None,
+    })
 }
 #[derive(Clone)]
 pub struct CompositionSpec {
@@ -43,33 +66,26 @@ impl Composition {
             intermediates,
             scalars,
         } = spec;
-        let function = compiler
-            .program()
-            .functions
-            .iter()
-            .find(|f| f.name == entry)
-            .ok_or("unknown composition")?;
+        let program = compiler.program();
+        let family = program.export(&entry).ok_or("unknown composition")?;
+        // Every definition of an exported family shares one contract; the first
+        // body or bodyless contract states the entry ABI.
+        let params = &program
+            .definition(*family.bodies.iter().chain(&family.contracts).next().ok_or("composition has no contract")?)
+            .params;
         for (name, weight) in &weights {
             if !weight.belongs_to(compiler.device()) {
                 return Err(format!("weight {name} belongs to another resource domain").into());
             }
-            let (_, Ty::Tensor(t)) = function
-                .params
+            let Ty::Tensor(t) = &params
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|p| &p.name == name)
                 .ok_or_else(|| format!("unknown weight {name}"))?
+                .ty
             else {
                 return Err(format!("weight {name} is not a tensor").into());
             };
-            let expected = t
-                .shape
-                .iter()
-                .map(|s| {
-                    s.eval(&|p| shapes.get(p).copied())
-                        .and_then(|v| u64::try_from(v).ok())
-                        .ok_or("unresolved weight shape")
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let expected = extents(t, &shapes)?.into_iter().map(|v| v as u64).collect::<Vec<_>>();
             if expected != weight.descriptor().shape {
                 return Err(format!("weight {name} shape differs from composition").into());
             }
@@ -90,27 +106,19 @@ impl Composition {
             }
         }
         for name in &external {
-            if weights.contains_key(name)
-                || !function
-                    .params
-                    .iter()
-                    .any(|(n, t)| n == name && matches!(t, Ty::Tensor(_)))
-            {
+            if weights.contains_key(name) || tensor(params, name).is_none() {
                 return Err(format!("invalid external tensor {name}").into());
             }
         }
         for name in &intermediates {
             if weights.contains_key(name)
                 || external.contains(name)
-                || !function
-                    .params
-                    .iter()
-                    .any(|(n, t)| n == name && matches!(t, Ty::Tensor(_)))
+                || tensor(params, name).is_none()
             {
                 return Err(format!("invalid intermediate tensor {name}").into());
             }
         }
-        for (name, ty) in &function.params {
+        for Param { name, ty, .. } in params {
             if matches!(ty, Ty::Tensor(_))
                 && !weights.contains_key(name)
                 && !external.contains(name)
@@ -120,26 +128,17 @@ impl Composition {
             }
         }
         for name in scalars.keys() {
-            if !function
-                .params
-                .iter()
-                .any(|(n, t)| n == name && matches!(t, Ty::Scalar(_)))
-            {
+            if !params.iter().any(|p| &p.name == name && matches!(p.ty, Ty::Scalar(_))) {
                 return Err(format!("invalid scalar {name}").into());
             }
         }
-        let runtime_scalars = function
-            .params
+        let runtime_scalars = params
             .iter()
-            .filter_map(|(name, ty)| {
-                (matches!(ty, Ty::Scalar(_)) && !scalars.contains_key(name)).then_some(name.clone())
-            })
+            .filter(|p| matches!(p.ty, Ty::Scalar(_)) && !scalars.contains_key(&p.name))
+            .map(|p| p.name.clone())
             .collect::<HashSet<_>>();
-        let ownership = seismic_lang::composition::Ownership {
-            intermediates: intermediates.iter().cloned().collect(),
-        };
         let mut control_types = HashMap::new();
-        for (name, ty) in &function.params {
+        for Param { name, ty, .. } in params {
             if !external.contains(name) { continue; }
             let Ty::Tensor(tensor) = ty else { continue; };
             let element = match &tensor.elem {
@@ -147,14 +146,12 @@ impl Composition {
                 element => element,
             };
             let Elem::Dtype(dtype @ (DType::I32 | DType::U32)) = element else { continue; };
-            let elements = tensor.shape.iter().try_fold(1usize, |n, shape| {
-                shape.eval(&|name| shapes.get(name).copied()).and_then(|extent| usize::try_from(extent).ok())
-                    .and_then(|extent| n.checked_mul(extent)).ok_or("control tensor extent overflow")
-            })?;
-            control_types.insert(name.clone(), (*dtype, elements));
+            let count = extents(tensor, &shapes)?.into_iter()
+                .try_fold(1usize, |n, extent| n.checked_mul(extent)).ok_or("control tensor extent overflow")?;
+            control_types.insert(name.clone(), (*dtype, count));
         }
         let mut scratch = HashMap::new();
-        for (name, ty) in &function.params {
+        for Param { name, ty, .. } in params {
             if weights.contains_key(name) || external.contains(name) {
                 continue;
             }
@@ -166,22 +163,18 @@ impl Composition {
                 let Elem::Dtype(dtype) = element else {
                     return Err("composition scratch must be dense".into());
                 };
-                let bytes = t.shape.iter().try_fold(dtype.bytes() as usize, |n, s| {
-                    s.eval(&|p| shapes.get(p).copied())
-                        .and_then(|v| usize::try_from(v).ok())
-                        .and_then(|d| n.checked_mul(d))
-                        .ok_or("scratch allocation overflow or unresolved shape")
-                })?;
+                let bytes = extents(t, &shapes)?.into_iter()
+                    .try_fold(dtype.bytes() as usize, |n, d| n.checked_mul(d))
+                    .ok_or("scratch allocation overflow")?;
                 scratch.insert(name.clone(), compiler.device().buffer(bytes)?);
             }
         }
         Ok(Self {
             device: compiler.device().clone(),
             spec: retained,
-            controls: HashSet::new(),
             control_types,
             control_domains: HashMap::new(),
-            plan: compiler.compile_entry(&entry, &shapes, &elements, &ownership)?,
+            plan: compiler.compile_entry(&entry, &shapes, &elements)?,
             weights,
             scratch,
             external,
@@ -204,28 +197,33 @@ impl Composition {
                 .map_err(|_| "specialized dimension overflow")?);
         }
         let mut composition = Self::compile(compiler, spec)?;
-        composition.controls = self.controls.clone();
         composition.control_domains = self.control_domains.clone();
         Ok(composition)
     }
-    pub(crate) fn control_inputs(mut self, names: &[&str]) -> Result<Self, String> {
+    pub(crate) fn control_inputs(self, names: &[&str]) -> Result<Self, String> {
         if names.iter().any(|name| !self.external.contains(*name)) { return Err("control input is not an external tensor".into()); }
-        self.controls.extend(names.iter().map(|name| name.to_string()));
         Ok(self)
     }
-    /// Admit changing integer controls only under one checked finite domain.
-    /// Selection must account for the whole range before the code is reusable.
-    pub(crate) fn control_domain(mut self, name: &str, range: seismic_runtime::tuner::IntegerRange) -> Result<Self, String> {
+    /// Admit changing integer controls only under one checked finite domain,
+    /// established on every invocation before any numerical work is bound.
+    pub(crate) fn control_domain(mut self, name: &str, range: IntegerRange) -> Result<Self, String> {
         if !self.control_types.contains_key(name) {
             return Err("varying control domain requires an external integer tensor".into());
         }
-        self.controls.insert(name.into());
         self.control_domains.insert(name.into(), range);
         Ok(self)
     }
     pub(crate) fn shares_compilation(&self, other: &Self) -> bool { self.plan.shares_compilation(&other.plan) }
     pub fn kernel_count(&self) -> usize {
         self.plan.kernel_count()
+    }
+    /// What selection decided, once this composition's kernel exists. Reading it
+    /// never triggers selection or native compilation.
+    pub fn selection(&self) -> Result<Option<seismic_runtime::Selection>, String> {
+        if self.plan.kernel_count() == 0 { return Ok(None); }
+        let kernel = self.plan.kernel()?;
+        let kernel = kernel.try_borrow().map_err(|_| "shared kernel is already executing")?;
+        Ok(Some(kernel.selection().clone()))
     }
     pub fn execute(
         &mut self,
@@ -275,40 +273,28 @@ impl Composition {
             );
         }
         let invocation = Invocation {
-            generalize_controls: self.plan.supports_integer_domains(),
-            controls: &self.controls,
-            control_types: &self.control_types,
-            control_domains: &self.control_domains,
             weights: &self.weights,
             scratch: &self.scratch,
             tensors,
             fixed: &self.scalars,
             scalars,
         };
-        if !invocation.generalize_controls {
-            // Preserve input bounds on forms that specialize exact control
-            // bytes. Their lack of domain analysis never removes a condition.
-            for (name, range) in &self.control_domains {
-                let (dtype, elements) = self.control_types[name];
-                let buffer = tensors.get(name).ok_or("unbound integer control")?;
-                let mut bytes = vec![0; elements.checked_mul(dtype.bytes() as usize).ok_or("control extent overflow")?];
-                buffer.read(&mut bytes)?;
-                for bytes in bytes.chunks_exact(4) {
-                    let raw: [u8; 4] = bytes.try_into().expect("integer control width");
-                    let value = if dtype == DType::I32 { i128::from(i32::from_le_bytes(raw)) }
-                        else { i128::from(u32::from_le_bytes(raw)) };
-                    if !range.contains(value) { return Err("invocation does not establish its integer input domain".into()); }
-                }
+        for (name, range) in &self.control_domains {
+            let (dtype, elements) = self.control_types[name];
+            let buffer = tensors.get(name).ok_or("unbound integer control")?;
+            let mut bytes = vec![0; elements.checked_mul(dtype.bytes() as usize).ok_or("control extent overflow")?];
+            buffer.read(&mut bytes)?;
+            for bytes in bytes.chunks_exact(4) {
+                let raw: [u8; 4] = bytes.try_into().expect("integer control width");
+                let value = if dtype == DType::I32 { i128::from(i32::from_le_bytes(raw)) }
+                    else { i128::from(u32::from_le_bytes(raw)) };
+                if !range.contains(value) { return Err("invocation does not establish its integer input domain".into()); }
             }
         }
         self.plan.prepare(&invocation)
     }
 }
 struct Invocation<'a> {
-    generalize_controls: bool,
-    controls: &'a HashSet<String>,
-    control_types: &'a HashMap<String, (DType, usize)>,
-    control_domains: &'a HashMap<String, seismic_runtime::tuner::IntegerRange>,
     weights: &'a HashMap<String, ResidentWeight>,
     scratch: &'a HashMap<String, Buffer>,
     tensors: &'a HashMap<String, Buffer>,
@@ -316,19 +302,6 @@ struct Invocation<'a> {
     scalars: &'a HashMap<String, f64>,
 }
 impl Bindings for Invocation<'_> {
-    fn known_buffer(&self, root: &str, plane: &str) -> bool { plane.is_empty() && self.controls.contains(root) }
-    fn buffer_domains(&self, root: &str, plane: &str) -> Vec<seismic_runtime::tuner::BufferIntegerDomain> {
-        if !self.generalize_controls || !plane.is_empty() { return Vec::new(); }
-        let Some(&range) = self.control_domains.get(root) else { return Vec::new(); };
-        let (dtype, elements) = self.control_types[root];
-        let width = dtype.bytes() as usize;
-        (0..elements).map(|index| seismic_runtime::tuner::BufferIntegerDomain {
-            offset: (index * width) as u64,
-            bytes: width as u8,
-            signed: dtype == DType::I32,
-            range,
-        }).collect()
-    }
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
         if let Some(weight) = self.weights.get(root) {
             return weight.plane(plane);

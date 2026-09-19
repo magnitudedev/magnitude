@@ -48,7 +48,7 @@ impl Analysis {
                                 kind:
                                     ExprKind::Load {
                                         view,
-                                        mode: seismic_lang::ir::LoadMode::Borrow,
+                                        mode: seismic_lang::exec::ir::LoadMode::Borrow,
                                     },
                                 ..
                             },
@@ -66,7 +66,7 @@ impl Analysis {
                         ..
                     } => {
                         for ((target, view), mode) in vars.iter().zip(views).zip(modes) {
-                            if *mode == seismic_lang::ir::LoadMode::Borrow {
+                            if *mode == seismic_lang::exec::ir::LoadMode::Borrow {
                                 if let Some(root) = tile_root(view) {
                                     aliases.join(*target, root);
                                 }
@@ -181,11 +181,6 @@ impl Analysis {
                     | StmtKind::Parallel { body, .. }
                     | StmtKind::LoadLoop { body, .. }
                     | StmtKind::Lanes { body, .. } => visit(body, owner, vars, analysis),
-                    StmtKind::Reduction(r) => {
-                        for body in r.bodies() {
-                            visit(body, owner, vars, analysis);
-                        }
-                    }
                 }
             }
         }
@@ -193,19 +188,6 @@ impl Analysis {
         result.cooperative = intrinsic.iter().map(|&v| result.groups.root(v)).collect();
         result
     }
-    /// Semantic classes shared by concrete selection and symbolic constraints.
-    pub fn group(&self, variable: VarId) -> usize { self.groups.root(variable) }
-    pub fn groups(&self) -> Vec<usize> {
-        let mut result = (0..self.groups.0.len()).map(|v| self.groups.root(v)).collect::<Vec<_>>();
-        result.sort_unstable(); result.dedup(); result
-    }
-    pub fn owner_variables(&self) -> impl Iterator<Item = VarId> + '_ { self.owners.iter().copied() }
-    pub fn read_owner_groups(&self, variable: VarId) -> Vec<usize> {
-        let mut result = self.read_owners.get(&self.aliases.root(variable)).into_iter().flatten()
-            .map(|&owner| self.groups.root(owner)).collect::<Vec<_>>();
-        result.sort_unstable(); result.dedup(); result
-    }
-    pub fn forced_groups(&self) -> impl Iterator<Item = usize> + '_ { self.cooperative.iter().copied() }
     pub fn requires_cooperation(&self, variable: VarId) -> bool {
         self.cooperative.contains(&self.groups.root(variable))
     }

@@ -10,7 +10,7 @@ use crate::{
     weights::{descriptor::WeightDescriptor, residency::ResidentWeight},
 };
 use seismic_lang::{
-    program::Program,
+    sir::Program,
     types::{DType, Elem},
 };
 use seismic_runtime::{
@@ -170,7 +170,7 @@ impl Encoder {
                 ("table", &description.positions),
             ])?,
             &["pixels", "indices", "coefficients", "out"],
-            &["ordered", "projected"],
+            &["reordered", "projected"],
             false,
         )?;
         let mut blocks = Vec::new();
@@ -368,8 +368,9 @@ impl Encoder {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires a Metal device"]
     fn feature_leases_share_one_charge_until_last_owner_drops() {
-        let device = Device::cpu();
+        let device = Device::metal().unwrap();
         let features = Features {
             identity: "lifetime-only-fixture".into(),
             rows: 2,

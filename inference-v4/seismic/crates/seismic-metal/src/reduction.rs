@@ -160,7 +160,7 @@ impl ReductionDomain {
         }
         Ok(Some(TileDeclaration {
             symbol,
-            dtype: self.dtype,
+            dtype: seismic_realization::dispatch::local_storage_dtype(self.dtype, false),
             capacity: self.output_capacity,
             placement: if algorithm == Algorithm::LaneLocal {
                 TilePlacement::Distributed
@@ -168,27 +168,6 @@ impl ReductionDomain {
                 TilePlacement::Replicated
             },
         }))
-    }
-    pub(crate) fn with_algorithms(mut self, algorithms: Vec<Algorithm>) -> Self { self.algorithms = algorithms; self }
-    pub(crate) fn placement_variant(&self, source: Option<TilePlacement>, argmax: bool, full_lanes: bool,
-        dtype: DType, ordered: bool) -> Result<Self, String> {
-        let mut variant = self.clone();
-        variant.algorithms.clear();
-        if !argmax || full_lanes || source != Some(TilePlacement::Distributed) { variant.algorithms.push(Algorithm::Ordered); }
-        if argmax {
-            if full_lanes && matches!(dtype, DType::F32 | DType::I32 | DType::U32)
-                && (source.is_none() || source == Some(TilePlacement::Distributed)) {
-                variant.algorithms.push(Algorithm::Collective);
-            }
-        } else if source == Some(TilePlacement::Distributed) {
-            // Exact inner divisibility is retained as a guarded original numeric
-            // requirement by the native family emitter, not decided by its envelope.
-            if self.inner_capacity > 0 { variant.algorithms.push(Algorithm::LaneLocal); }
-            if !ordered && matches!(dtype, DType::F32 | DType::I32 | DType::U32) && self.axis_capacity > 0 && self.inner_capacity > 0 {
-                variant.algorithms.push(Algorithm::Collective);
-            }
-        }
-        Ok(variant)
     }
     pub fn output_slots(&self, algorithm: Algorithm) -> Result<u64, String> {
         if !self.algorithms.contains(&algorithm) {
@@ -206,32 +185,18 @@ impl ReductionDomain {
 /// Identity of a normalized reduction operation and its output binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Site {
-    pub output: seismic_lang::ir::VarId,
-    pub operation: seismic_lang::ir::OperationId,
+    pub output: seismic_lang::exec::ir::VarId,
+    pub operation: seismic_lang::exec::ir::OperationId,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub site: Site,
-    pub input: seismic_lang::ir::VarId,
+    pub input: seismic_lang::exec::ir::VarId,
     pub materialize_input: bool,
     pub input_placement: Option<TilePlacement>,
-    pub contract: seismic_lang::reduction::Contract,
+    pub contract: seismic_lang::exec::reduction::Contract,
     pub full_lanes: bool,
     pub domain: ReductionDomain,
-}
-impl Decision {
-    /// Existing explicit diagnostic policy; the legal domain remains authoritative.
-    pub fn diagnostic(&self) -> Algorithm {
-        if self.domain.output_capacity() > crate::execution::SUBGROUP as u64
-            && self.domain.algorithms().contains(&Algorithm::LaneLocal)
-        {
-            Algorithm::LaneLocal
-        } else if self.domain.algorithms().contains(&Algorithm::Collective) {
-            Algorithm::Collective
-        } else {
-            Algorithm::Ordered
-        }
-    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selected {
@@ -244,12 +209,6 @@ pub struct ReductionPlan {
     selections: std::collections::HashMap<Site, Selected>,
 }
 impl ReductionPlan {
-    pub(crate) fn with_selection(mut self, selection: Selected) -> Self {
-        self.selections.insert(selection.decision.site, selection); self
-    }
-    pub fn selections(&self) -> &std::collections::HashMap<Site, Selected> {
-        &self.selections
-    }
     pub fn get(&self, site: Site) -> Result<&Selected, String> {
         self.selections
             .get(&site)
@@ -259,28 +218,11 @@ impl ReductionPlan {
 
 /// Resolve reduction forms against already selected materialized-value placements.
 /// Output ownership feeds subsequent reductions; no native code is generated.
-pub fn plan(
-    vars: &[seismic_lang::ir::Var],
-    body: &[seismic_lang::ir::Stmt],
-    phases: &[crate::execution::Phase],
-    storage: &crate::storage::StoragePlan,
-    select: &mut dyn FnMut(&Decision) -> Result<Algorithm, String>,
-) -> Result<ReductionPlan, String> {
-    plan_mode(vars, body, phases, storage, select, false)
-}
-/// Retain sites and numerical contracts before selecting ownership or an
-/// algorithm. The ordinary ordered body supplies shape metadata only; all
-/// admitted algorithm arms are represented by the retained layout family.
-pub(crate) fn plan_template(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt],
-    phases: &[crate::execution::Phase], storage: &crate::storage::StoragePlan) -> Result<ReductionPlan, String> {
-    plan_mode(vars, body, phases, storage, &mut |_| Ok(Algorithm::Ordered), true)
-}
-fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], phases: &[crate::execution::Phase],
-    storage: &crate::storage::StoragePlan, select: &mut dyn FnMut(&Decision) -> Result<Algorithm, String>, retained: bool) -> Result<ReductionPlan, String> {
-    use seismic_lang::{ir::*, types::Ty};
+pub fn plan(vars: &[seismic_lang::exec::ir::Var], body: &[seismic_lang::exec::ir::Stmt], phases: &[crate::execution::Phase],
+    storage: &crate::storage::StoragePlan, select: &mut dyn FnMut(&Decision) -> Result<Algorithm, String>) -> Result<ReductionPlan, String> {
+    use seismic_lang::exec::{ir::*, types::Ty};
     use std::collections::HashMap;
     struct Planner<'a> {
-        retained: bool,
         vars: &'a [Var],
         storage: &'a crate::storage::StoragePlan,
         select: &'a mut dyn FnMut(&Decision) -> Result<Algorithm, String>,
@@ -393,7 +335,7 @@ fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], ph
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let dtype =
                                     tile.elem.read_dtype().ok_or("unresolved reduction dtype")?;
-                                let contract = seismic_lang::reduction::Contract::new(
+                                let contract = seismic_lang::exec::reduction::Contract::new(
                                     ReduceOp::from_tag(*operation)
                                         .ok_or("unknown reduction operation")?,
                                     dtype,
@@ -405,11 +347,8 @@ fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], ph
                                 let ordered = contract.ordered
                                     || matches!(dtype, DType::F16 | DType::BF16)
                                     || contract.combination()
-                                        == seismic_lang::reduction::Combination::SaturatingAdd;
-                                let domain = if argmax && self.retained {
-                                    ReductionDomain::new(&capacities, *axis as usize, DType::I32, true, TilePlacement::Replicated, crate::execution::SUBGROUP as u64)?
-                                        .placement_variant(placement.clone(), true, true, dtype, true)?
-                                } else if argmax {
+                                        == seismic_lang::exec::reduction::Combination::SaturatingAdd;
+                                let domain = if argmax {
                                     ReductionDomain::argmax(
                                         &capacities,
                                         *axis as usize,
@@ -446,7 +385,7 @@ fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], ph
                                     domain,
                                 };
                                 let algorithm = (self.select)(&decision)?;
-                                if !self.retained && !self.full_lanes
+                                if !self.full_lanes
                                     && ((placement == Some(TilePlacement::Distributed)
                                         && algorithm != Algorithm::LaneLocal)
                                         || (materialize_input
@@ -528,7 +467,6 @@ fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], ph
         vars,
         storage,
         select,
-        retained,
         bindings: HashMap::new(),
         result: ReductionPlan::default(),
         full_lanes: true,
@@ -536,20 +474,8 @@ fn plan_mode(vars: &[seismic_lang::ir::Var], body: &[seismic_lang::ir::Stmt], ph
     if phases.len() != body.len() {
         return Err("reduction plan phase/domain mismatch".into());
     }
-    for (root, phase) in body.iter().zip(phases) {
-        if let Some(split) = &phase.split {
-            let StmtKind::Parallel { body, .. } = &root.kind else {
-                return Err("split reduction phase has no parallel domain".into());
-            };
-            let (prefix, suffix) = body
-                .split_at_checked(split.loop_at)
-                .ok_or("split reduction position is invalid")?;
-            planner.body(prefix)?;
-            planner.body(&split.validation_bindings)?;
-            planner.body(suffix)?;
-        } else {
-            planner.body(std::slice::from_ref(root))?;
-        }
+    for root in body {
+        planner.body(std::slice::from_ref(root))?;
     }
     Ok(planner.result)
 }

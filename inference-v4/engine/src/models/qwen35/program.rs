@@ -1,6 +1,7 @@
 //! Authored numerical compositions following V3's publication boundaries.
 use seismic_lang::{
-    program::{compile, Program, SourceFile},
+    program::{compile, SourceFile},
+    sir::Program,
     Scope,
 };
 /// Contains no hardware policy. Candidate selection belongs to the compiler and

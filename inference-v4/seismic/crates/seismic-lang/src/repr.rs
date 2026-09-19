@@ -16,12 +16,6 @@ pub struct Repr {
     pub code: CodeInterpretation,
 }
 
-/// Equivalent source-IR covers for a bounded packet decode owner. Specialized
-/// decoding retains fixed code ranges and word reuse; indexed decoding uses a
-/// bounded element loop with runtime word/bit coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PacketDecoder { Specialized, Indexed }
-
 /// Private packet rows large enough to retain any logical prefix within a
 /// representation group. The same physical plane geometry owns native storage
 /// declarations and raw snapshot copies on every backend.
@@ -266,7 +260,6 @@ impl Repr {
     pub fn bits_per_value(&self) -> f64 {
         self.planes().iter().map(|p| p.entry_bits() as f64 * p.fields as f64 / p.group as f64).sum()
     }
-    pub fn words_extent(&self, k: &Sym) -> Sym { self.plane("words").unwrap().extent(k) }
     pub fn groups_extent(&self, k: &Sym) -> Sym { k.quot(&Sym::constant(self.group as i64)) }
 }
 

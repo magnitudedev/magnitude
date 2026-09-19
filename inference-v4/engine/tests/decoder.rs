@@ -8,8 +8,6 @@ use seismic_engine::{
 };
 use seismic_lang::types::DType;
 use seismic_runtime::{Device, plan::Settings};
-#[path = "support/decoder_hardware.rs"]
-mod hardware;
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -270,24 +268,12 @@ fn exercise(device: Device, settings: Settings, routed: bool) {
     std::fs::remove_dir_all(directory).unwrap();
 }
 #[test]
-#[ignore = "automatic CPU Qwen accounting still has unmapped opaque math helpers"]
-fn cpu_dense_decoder() {
-    exercise(Device::cpu(), hardware::cpu(), false);
-}
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "requires Metal hardware"]
+#[ignore = "requires a Metal device"]
 fn metal_dense_decoder() {
-    exercise(Device::metal().unwrap(), hardware::metal(), false);
+    exercise(Device::metal().unwrap(), Settings::default(), false);
 }
 #[test]
-#[ignore = "automatic CPU Qwen accounting still has unmapped opaque math helpers and data-dependent routing"]
-fn cpu_routed_decoder() {
-    exercise(Device::cpu(), hardware::cpu(), true);
-}
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "automatic Metal accounting still needs data-dependent routing"]
+#[ignore = "requires a Metal device"]
 fn metal_routed_decoder() {
-    exercise(Device::metal().unwrap(), hardware::metal(), true);
+    exercise(Device::metal().unwrap(), Settings::default(), true);
 }

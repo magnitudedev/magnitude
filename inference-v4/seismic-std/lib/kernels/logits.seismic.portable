@@ -1,9 +1,11 @@
 # One activation row against a packed readout matrix, kept in f32 for sampling.
-fn logits[N, K](x: tensor[1, K] bf16, w: tensor[N, K] q4g64, out: tensor[1, N] f32):
-  for col in parallel:
-    acc = tile[1, 1] f32
-    for i, j in owned(acc): acc[i, j] = 0.0
-    xt = load(x)
-    wt = load(w[col : col + 1])
-    matmul(xt, wt, acc)
-    store(acc, out[0 : 1, col : col + 1])
+export fn logits[N, K](x: tensor[1, K] bf16, w: tensor[N, K] q4g64, out out: tensor[1, N] f32):
+    parallel [cols] in 0..N:
+        var acc = zeros_like(out[:, cols], dtype=f32)
+        ordered [k] in 0..K:
+            matmul(load(x[:, k]), load(w[cols, k]), into=acc)
+        publish acc to out[:, cols]
+
+lower logits for metal = portable
+lower logits for cpu = portable
+lower logits for cuda = portable

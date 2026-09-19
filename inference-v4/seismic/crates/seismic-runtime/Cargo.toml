@@ -5,17 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-magnitude-solver = { path = "../../../solver" }
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
-seismic-accounting.workspace = true
 seismic-realization.workspace = true
+seismic-metal.workspace = true
 seismic-cpu.workspace = true
 seismic-cuda.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-seismic-metal.workspace = true
-
 [dev-dependencies]
-serde_json = "=1.0.151"
-sha2 = "=0.11.0"
+seismic-std.workspace = true

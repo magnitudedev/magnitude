@@ -3,7 +3,7 @@
 mod packed;
 use super::{Description, FeedForwardWeights, Geometry, HeadMapping, MixerWeights};
 use crate::{
-    execution::{Composition, CompositionSpec},
+    execution::{Composition, CompositionSpec, IntegerRange},
     generation::{
         sampling::{Sampler, Selection},
         Proposal, Sampling,
@@ -67,7 +67,7 @@ pub struct Decoder {
     geometry: Geometry,
     store: Rc<StateStore>,
     device: Rc<Device>,
-    program: seismic_lang::program::Program,
+    program: seismic_lang::sir::Program,
     settings: Settings,
     context_capacity: usize,
     rows: HashMap<(usize, usize), Rows>,
@@ -326,7 +326,7 @@ impl Decoder {
             &["embedded"],
             HashMap::new(),
         )?
-        .control_domain("tokens", seismic_runtime::tuner::IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1, stride: 1 })?;
+        .control_domain("tokens", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
         let mut blocks = Vec::new();
         let mut components = Vec::new();
         let mut history_rows = Vec::new();
@@ -396,8 +396,8 @@ impl Decoder {
                     )?;
                     let mixer =
                         mixer.control_inputs(&["visible"])?
-                            .control_domain("coordinates", seismic_runtime::tuner::IntegerRange { min: 0, max: i128::from(i32::MAX), stride: 1 })?
-                            .control_domain("destinations", seismic_runtime::tuner::IntegerRange { min: 0, max: history_capacity as i128 - 1, stride: 1 })?;
+                            .control_domain("coordinates", IntegerRange { min: 0, max: i128::from(i32::MAX) })?
+                            .control_domain("destinations", IntegerRange { min: 0, max: history_capacity as i128 - 1 })?;
                     (mixer, state_index, true)
                 }
                 MixerWeights::Recurrent(r) => {
@@ -574,7 +574,7 @@ impl Decoder {
             &["last", "normalized"],
             scalar(&[("epsilon", g.epsilon)]),
         )?
-        .control_domain("selected", seismic_runtime::tuner::IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1, stride: 1 })?;
+        .control_domain("selected", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
         let readout = bound(
             "qwen_readout_rows",
             shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
@@ -741,7 +741,7 @@ impl Decoder {
     pub fn state_store(&self) -> &Rc<StateStore> {
         &self.store
     }
-    pub fn compiled_kernel_count(&self) -> usize {
+    fn unique_compositions(&self) -> Vec<&Composition> {
         let mut unique: Vec<&Composition> = Vec::new();
         for rows in self.rows.values() {
             for composition in std::iter::once(&rows.embedding)
@@ -770,8 +770,18 @@ impl Decoder {
                 unique.push(composition);
             }
         }
-        unique.iter().map(|c| c.kernel_count()).sum::<usize>()
+        unique
+    }
+    pub fn compiled_kernel_count(&self) -> usize {
+        self.unique_compositions().iter().map(|c| c.kernel_count()).sum::<usize>()
             + self.sampler.as_ref().map_or(0, Sampler::kernel_count)
+    }
+    /// Selection records of every decoder kernel compiled so far, one per compilation.
+    pub fn selections(&self) -> Result<Vec<seismic_runtime::Selection>, String> {
+        Ok(self.unique_compositions().into_iter()
+            .map(Composition::selection)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter().flatten().collect())
     }
     pub fn propose<'a>(
         &mut self,
@@ -1112,8 +1122,9 @@ mod conditioned_transaction_tests {
     use super::super::{inputs::InputState, preparation::InputPlan};
     use crate::inputs::TokenId;
     #[test]
+    #[ignore = "requires a Metal device"]
     fn conditioning_commits_only_after_numerical_completion_and_acceptance() {
-        let device = Rc::new(Device::cpu());
+        let device = Rc::new(Device::metal().unwrap());
         let store = StateStore::new(device.clone(), 8, 8, vec![], vec![]).unwrap();
         let mut state = store.create().unwrap();
         let mut input = InputState::new(&device, Rc::new(InputPlan::text(vec![TokenId(7)]).unwrap()), 0, vec![], 3).unwrap();

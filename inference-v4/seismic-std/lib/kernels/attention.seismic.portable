@@ -1,61 +1,98 @@
-# Softmax update over a logical history domain. Its matrix contractions and
-# reductions remain available for compiler-derived blocking and retained state.
+# Online softmax update over one logical history span: the carried maximum `m`,
+# normalization sum `l` and weighted-value accumulator `acc` absorb the span's scores in
+# one step. The score tile is local to the call; the caller authors which span it covers.
 fn attention_update[M, K, W](qt: tile[M, W] A, kt: tile[K, W] A, vt: tile[K, W] A,
-                           m: tile[M] f32, l: tile[M] f32, acc: tile[M, W] f32, scale: f32):
-  s = tile[M, K] f32
-  for i, j in owned(s): s[i, j] = 0.0
-  matmul(qt, kt, s)
-  rowmax = reduce(s, 1, max)
-  m2 = tile[M] f32
-  for i in owned(m2): m2[i] = max(m[i], rowmax[i] * scale)
-  for i, j in owned(s): s[i, j] = exp(s[i, j] * scale - m2[i])
-  a = tile[M] f32
-  for i in owned(a): a[i] = exp(m[i] - m2[i])
-  rowsum = reduce(s, 1, sum)
-  for i in owned(l): l[i] = fma(l[i], a[i], rowsum[i])
-  for i, j in owned(acc): acc[i, j] = acc[i, j] * a[i]
-  matmul(s, vt.T, acc)
-  m = m2
+                             inout m: tile[M] f32, inout l: tile[M] f32, inout acc: tile[M, W] f32, scale: f32):
+    var s = tile[M, K] f32
+    for i, j in owned(s):
+        s[i, j] = 0.0
+    matmul(qt, kt, into=s)
+    let rowmax = reduce(s, 1, max)
+    var m2 = tile[M] f32
+    for i in owned(m2):
+        m2[i] = max(m[i], rowmax[i] * scale)
+    for i, j in owned(s):
+        s[i, j] = exp(s[i, j] * scale - m2[i])
+    var a = tile[M] f32
+    for i in owned(a):
+        a[i] = exp(m[i] - m2[i])
+    let rowsum = reduce(s, 1, sum)
+    for i in owned(l):
+        l[i] = fma(l[i], a[i], rowsum[i])
+    for i, j in owned(acc):
+        acc[i, j] = acc[i, j] * a[i]
+    # The value product is the `matmul` chain of every output (F32 FMA over ascending
+    # history), visited history-major: each history row of `vt` is read once, in storage
+    # order, by all outputs, instead of each output striding down a column of the view.
+    for k in axis(s, 1):
+        for i, j in owned(acc):
+            acc[i, j] = fma(s[i, k], f32(vt[k, j]), acc[i, j])
+    for i in owned(m):
+        m[i] = m2[i]
 
 # Causal attention over grouped query heads. Each visible range is a logical
 # algorithmic window, independent of compiler partitioning. Empty history has no
 # update effect; decoding consumes the fresh dense row before cache-codec rounding.
-fn attention[Q, T, H, KV, W](q: tensor[Q, H, W] A, k: tensor[T, KV, W] A, v: tensor[T, KV, W] A,
-                             visible: tensor[Q, 2] i32, out: tensor[Q, H, W] A, scale: f32):
-  for row, kv_head in parallel:
-    qt = load(q[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
-    m = tile[H / KV] f32
-    l = tile[H / KV] f32
-    acc = tile[H / KV, W] f32
-    for i in owned(m): m[i] = -inf; l[i] = 0.0
-    for i, j in owned(acc): acc[i, j] = 0.0
-    kt = load(k[visible[row, 0] : visible[row, 1], kv_head])
-    vt = load(v[visible[row, 0] : visible[row, 1], kv_head])
-    if extent(kt, 0) > 0:
-      attention_update(qt, kt, vt, m, l, acc, scale)
-    y = tile[H / KV, W] f32
-    for i, j in owned(y): y[i, j] = acc[i, j] / l[i]
-    store(y, out[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
+export fn attention[Q, T, H, KV, W](q: tensor[Q, H, W] A, k: tensor[T, KV, W] A, v: tensor[T, KV, W] A,
+                                    visible: tensor[Q, 2] i32, out out: tensor[Q, H, W] A, scale: f32):
+    parallel [rows, kv_heads] in (0..Q, 0..KV):
+        for row in rows:
+            for kv_head in kv_heads:
+                let qt = load(q[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
+                var m = tile[H / KV] f32
+                var l = tile[H / KV] f32
+                var acc = tile[H / KV, W] f32
+                for i in owned(m):
+                    m[i] = -inf
+                for i in owned(l):
+                    l[i] = 0.0
+                for i, j in owned(acc):
+                    acc[i, j] = 0.0
+                let lo = visible[row, 0]
+                let hi = visible[row, 1]
+                let kt = load(k[lo : hi, kv_head])
+                let vt = load(v[lo : hi, kv_head])
+                if extent(kt, 0) > 0:
+                    attention_update(qt, kt, vt, m, l, acc, scale)
+                var y = tile[H / KV, W] f32
+                for i, j in owned(y):
+                    y[i, j] = acc[i, j] / l[i]
+                publish y to out[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)]
 
 # Decode attends to the previously visible history plus the new dense row. Fresh
 # inputs do not acquire history-codec rounding before their first consumption.
-fn attention_decode[T, H, KV, W](q: tensor[1, H, W] A, k: tensor[T, KV, W] A,
+export fn attention_decode[T, H, KV, W](q: tensor[1, H, W] A, k: tensor[T, KV, W] A,
     v: tensor[T, KV, W] A, fresh_key: tensor[1, KV, W] A, fresh_value: tensor[1, KV, W] A,
-    visible: tensor[1, 2] i32, out: tensor[1, H, W] A, scale: f32):
-  for kv_head in parallel:
-    qt = load(q[0, kv_head * (H / KV):(kv_head + 1) * (H / KV)])
-    m = tile[H / KV] f32
-    l = tile[H / KV] f32
-    acc = tile[H / KV, W] f32
-    for i in owned(m): m[i] = -inf; l[i] = 0.0
-    for i, j in owned(acc): acc[i, j] = 0.0
-    kt = load(k[visible[0, 0]:visible[0, 1], kv_head])
-    vt = load(v[visible[0, 0]:visible[0, 1], kv_head])
-    if extent(kt, 0) > 0:
-      attention_update(qt, kt, vt, m, l, acc, scale)
-    fresh_kt = load(fresh_key[0:1, kv_head])
-    fresh_vt = load(fresh_value[0:1, kv_head])
-    attention_update(qt, fresh_kt, fresh_vt, m, l, acc, scale)
-    y = tile[H / KV, W] f32
-    for i, j in owned(y): y[i, j] = acc[i, j] / l[i]
-    store(y, out[0, kv_head * (H / KV):(kv_head + 1) * (H / KV)])
+    visible: tensor[1, 2] i32, out out: tensor[1, H, W] A, scale: f32):
+    parallel [kv_heads] in 0..KV:
+        for kv_head in kv_heads:
+            let qt = load(q[0, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
+            var m = tile[H / KV] f32
+            var l = tile[H / KV] f32
+            var acc = tile[H / KV, W] f32
+            for i in owned(m):
+                m[i] = -inf
+            for i in owned(l):
+                l[i] = 0.0
+            for i, j in owned(acc):
+                acc[i, j] = 0.0
+            let lo = visible[0, 0]
+            let hi = visible[0, 1]
+            let kt = load(k[lo : hi, kv_head])
+            let vt = load(v[lo : hi, kv_head])
+            if extent(kt, 0) > 0:
+                attention_update(qt, kt, vt, m, l, acc, scale)
+            let fresh_kt = load(fresh_key[0 : 1, kv_head])
+            let fresh_vt = load(fresh_value[0 : 1, kv_head])
+            attention_update(qt, fresh_kt, fresh_vt, m, l, acc, scale)
+            var y = tile[H / KV, W] f32
+            for i, j in owned(y):
+                y[i, j] = acc[i, j] / l[i]
+            publish y to out[0, kv_head * (H / KV) : (kv_head + 1) * (H / KV)]
+
+lower attention for metal = portable
+lower attention for cpu = portable
+lower attention for cuda = portable
+lower attention_decode for metal = portable
+lower attention_decode for cpu = portable
+lower attention_decode for cuda = portable

@@ -165,6 +165,10 @@ impl Device {
             info,
         })
     }
+    /// Natively compile exactly the realized launches of one selected entry.
+    pub fn compile_launches(&self, launches: crate::execution::Launches) -> Result<Sequence, String> {
+        self.compile_executions(launches.phases)
+    }
     /// Consume the complete selected launch sequence, without re-preparing IR.
     pub fn compile_executions(&self, executions: Vec<Execution>) -> Result<Sequence, String> {
         if executions.is_empty() {
@@ -570,6 +574,23 @@ impl Sequence {
         self.phases
             .iter()
             .map(|kernel| (kernel.execution.program(), &kernel.native))
+    }
+    /// The CUDA event interval of every launch, in launch order (the timing probe's view).
+    pub fn execute_launches(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<Vec<f64>, String> {
+        if buffers.len() != self.public_buffers.len() {
+            return Err("CUDA sequence public binding count mismatch".into());
+        }
+        let bindings = buffers.iter().chain(&self.internal).cloned().collect::<Vec<_>>();
+        let result = (|| {
+            for kernel in &mut self.phases {
+                kernel.bind(&bindings, scalars)?;
+            }
+            self.phases.iter_mut().enumerate().map(|(index, kernel)| kernel.launch_timed().map_err(|error| format!("CUDA phase {index}: {error}"))).collect()
+        })();
+        for kernel in &mut self.phases {
+            kernel.release_bindings();
+        }
+        result
     }
     /// Device timing is the sum of per-kernel event intervals, excluding host gaps.
     pub fn execute(

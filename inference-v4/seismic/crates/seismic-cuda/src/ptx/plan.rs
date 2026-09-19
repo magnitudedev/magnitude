@@ -12,6 +12,8 @@ pub enum RegisterClass {
     Bits32,
     Bits64,
     Float32,
+    /// Binary64 values: the shared scalar realization evaluates `rsqrt` in binary64.
+    Float64,
     Predicate,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -25,6 +27,7 @@ pub enum DataType {
     S32,
     S64,
     F32,
+    F64,
     Pred,
 }
 impl DataType {
@@ -32,7 +35,7 @@ impl DataType {
         match self {
             Self::U8 => 8,
             Self::U16 => 16,
-            Self::B64 | Self::U64 | Self::S64 => 64,
+            Self::B64 | Self::U64 | Self::S64 | Self::F64 => 64,
             Self::Pred => 1,
             _ => 32,
         }
@@ -48,6 +51,7 @@ impl DataType {
             Self::S32 => "s32",
             Self::S64 => "s64",
             Self::F32 => "f32",
+            Self::F64 => "f64",
             Self::Pred => "pred",
         }
     }
@@ -101,6 +105,7 @@ pub enum Operand {
     Signed(i64),
     Unsigned(u64),
     Float32Bits(u32),
+    Float64Bits(u64),
     Special(SpecialRegister),
 }
 impl From<RegisterId> for Operand {

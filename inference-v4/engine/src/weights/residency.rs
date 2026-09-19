@@ -5,7 +5,8 @@ use super::{
     Error,
 };
 use seismic_lang::{
-    program::{compile, Program, SourceFile},
+    program::{compile, SourceFile},
+    sir::Program,
     types::{DType, Elem},
     Scope,
 };
@@ -37,6 +38,18 @@ impl ResidentWeight {
         self.planes.get(name)
     }
 }
+/// The import entry and resident representation of a block encoding.
+pub fn block_import(encoding: super::gguf::Encoding) -> Option<(&'static str, &'static str)> {
+    use super::gguf::Encoding;
+    match encoding {
+        Encoding::Q4K => Some(("import_q4k", "q4k")),
+        Encoding::Q5K => Some(("import_q5k", "q5k")),
+        Encoding::Q6K => Some(("import_q6k", "q6k")),
+        Encoding::Q8_0 => Some(("import_q8_0", "q8g32s")),
+        Encoding::Iq4Xs => Some(("import_iq4_xs", "iq4g32")),
+        Encoding::F32 | Encoding::F16 => None,
+    }
+}
 pub struct Importer {
     device: Rc<Device>,
     settings: Settings,
@@ -65,9 +78,13 @@ impl Importer {
                     .into(),
                 },
             ],
-            &[],
+            // Coverage is checked for the target the importer selects on.
+            &[device.backend().to_string()],
         )
-        .map_err(|e| invalid(format!("weight import program: {e:?}")))?;
+        .map_err(|errors| invalid(format!(
+            "weight import program: {}",
+            errors.iter().map(|e| e.render()).collect::<Vec<_>>().join("\n")
+        )))?;
         Ok(Self {
             device,
             settings,
@@ -99,7 +116,6 @@ impl Importer {
                 shape,
                 encoding,
             } => {
-                use super::gguf::Encoding;
                 if element_count(shape)? != count
                     || descriptor.transform != Transform::Identity
                     || shape
@@ -108,14 +124,8 @@ impl Importer {
                 {
                     return Err(invalid("block weight geometry or transform is unsupported"));
                 }
-                let (entry, representation) = match encoding {
-                    Encoding::Q4K => ("import_q4k", "q4k"),
-                    Encoding::Q5K => ("import_q5k", "q5k"),
-                    Encoding::Q6K => ("import_q6k", "q6k"),
-                    Encoding::Q8_0 => ("import_q8_0", "q8g32s"),
-                    Encoding::Iq4Xs => ("import_iq4_xs", "iq4g32"),
-                    _ => return Err(invalid("dense encoding cannot use block import")),
-                };
+                let (entry, representation) = block_import(*encoding)
+                    .ok_or_else(|| invalid("dense encoding cannot use block import"))?;
                 let repr = seismic_lang::repr::lookup(representation).unwrap();
                 if descriptor.shape.last().is_none_or(|n| {
                     !n.is_multiple_of(u64::from(repr.storage_group()))
@@ -152,7 +162,6 @@ impl Importer {
                                 .map_err(|_| invalid("block count exceeds index range"))?,
                         )]),
                         &HashMap::new(),
-                        &Default::default(),
                     )
                     .map_err(invalid)?;
                     self.block_kernels.insert(key, plan);
@@ -198,7 +207,6 @@ impl Importer {
                                     ("T".into(), Elem::Dtype(tensor.dtype)),
                                     ("U".into(), Elem::Dtype(target)),
                                 ]),
-                                &Default::default(),
                             )
                             .map_err(invalid)?;
                             self.kernels.insert(key, plan);

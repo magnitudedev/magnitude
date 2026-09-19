@@ -1,83 +1,39 @@
-use seismic_lang::{
-    lower::{lower_specialized, Options},
-    types::{DType, Elem, Ty},
-};
-use seismic_runtime::{Candidate, Device};
+#[path = "support/reference.rs"]
+mod reference;
+use reference::{allocate, fill, Backend, WIDTHS};
+use seismic_lang::types::{DType, Ty};
 use serde_json::Value;
 use std::collections::HashMap;
-fn exercise(device: Device, candidate: Candidate) {
+fn exercise(backend: &mut Backend<'_>) {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../validation/results/fixtures/qwen-rotary-reference.json"
     ))
     .unwrap();
-    let program = seismic_std::program().unwrap();
-    let shapes = fixture["shapes"]
+    let shapes: HashMap<String, i64> = fixture["shapes"]
         .as_object()
         .unwrap()
         .iter()
         .map(|(k, v)| (k.clone(), v.as_i64().unwrap()))
         .collect();
-    let lowered = lower_specialized(
-        &program,
-        "rotary_prepare",
-        device.backend(),
-        &shapes,
-        &HashMap::from([("A".into(), Elem::Dtype(DType::BF16))]),
-        &Options::default(),
-    )
-    .unwrap();
-    let mut kernel = device.compile(&lowered, candidate).unwrap();
-    let function = program
-        .functions
-        .iter()
-        .find(|f| f.name == "rotary_prepare")
-        .unwrap();
-    let mut buffers = vec![];
-    let mut names = vec![];
-    let mut scalars = vec![];
-    for (name, ty) in &function.params {
-        match ty {
-            Ty::Tensor(t) => {
-                let dtype = match t.elem {
-                    Elem::Dtype(d) => d,
-                    _ => DType::BF16,
-                };
-                let count = t
-                    .shape
-                    .iter()
-                    .map(|s| s.eval(&|p| shapes.get(p).copied()).unwrap() as usize)
-                    .product::<usize>();
-                let buffer = device.buffer(count * dtype.bytes() as usize).unwrap();
-                if let Some(values) = fixture["inputs"][name].as_array() {
-                    let bytes = values
-                        .iter()
-                        .flat_map(|v| match dtype {
-                            DType::F32 => (v.as_f64().unwrap() as f32).to_le_bytes().to_vec(),
-                            DType::I32 => (v.as_i64().unwrap() as i32).to_le_bytes().to_vec(),
-                            _ => (((v.as_f64().unwrap() as f32).to_bits() >> 16) as u16)
-                                .to_le_bytes()
-                                .to_vec(),
-                        })
-                        .collect::<Vec<_>>();
-                    buffer.write(&bytes).unwrap();
-                }
-                names.push(name.clone());
-                buffers.push(buffer);
-            }
-            Ty::Scalar(_) => scalars.push(fixture["scalars"][name].as_f64().unwrap()),
-            _ => panic!(),
+    let mut tensors = allocate(backend.program(), "rotary_prepare", &shapes, |_| DType::BF16);
+    for (name, tensor) in tensors.iter_mut() {
+        if let Some(values) = fixture["inputs"][name].as_array() {
+            fill(tensor, values.iter().map(|v| v.as_f64().unwrap()));
         }
     }
-    kernel.execute(&buffers, &scalars).unwrap();
-    for (name, values) in fixture["outputs"].as_object().unwrap() {
-        let expected = values.as_array().unwrap();
-        let mut bytes = vec![0; expected.len() * 2];
-        buffers[names.iter().position(|n| n == name).unwrap()]
-            .read(&mut bytes)
-            .unwrap();
+    let scalars = reference::entry(backend.program(), "rotary_prepare")
+        .params
+        .iter()
+        .filter(|p| !matches!(p.ty, Ty::Tensor(_)))
+        .map(|p| (p.name.clone(), fixture["scalars"][&p.name].as_f64().unwrap()))
+        .collect();
+    backend.run("rotary_prepare", &shapes, &mut tensors, &scalars);
+    for (name, expected) in fixture["outputs"].as_object().unwrap() {
+        let actual = reference::values(&tensors[name]);
+        let expected = expected.as_array().unwrap();
+        assert_eq!(actual.len(), expected.len());
         let mut maximum = 0f32;
-        for (i, (b, e)) in bytes.chunks_exact(2).zip(expected).enumerate() {
-            let actual = f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16);
+        for (i, (actual, e)) in actual.into_iter().zip(expected).enumerate() {
             let expected = e.as_f64().unwrap() as f32;
             maximum = maximum.max((actual - expected).abs());
             assert!(
@@ -89,34 +45,17 @@ fn exercise(device: Device, candidate: Candidate) {
     }
 }
 #[test]
-fn cpu_rotary_prepare() {
-    exercise(
-        Device::cpu(),
-        Candidate::Cpu {
-            loads: seismic_realization::LoadStrategy::Materialize,
-        },
-    );
+fn reference_rotary_prepare() {
+    let program = seismic_std::program().unwrap();
+    for width in WIDTHS {
+        exercise(&mut Backend::Interpreter(&program, width));
+    }
 }
-#[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires Metal hardware"]
+#[ignore = "requires a Metal device"]
 fn metal_rotary_prepare() {
-    exercise(
-        Device::metal().unwrap(),
-        Candidate::Metal(Default::default()),
-    );
-}
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_rotary_prepare() {
-    exercise(
-        Device::cuda(0).unwrap(),
-        Candidate::Cuda {
-            options: seismic_realization::ScalarOptions {
-                dispatch: seismic_realization::Dispatch::ParallelRoot,
-                loads: seismic_realization::LoadStrategy::Materialize,
-            },
-            threads_per_block: 32,
-        },
-    );
+    use seismic_runtime::{plan::{PlanCompiler, Settings}, Device};
+    let program = seismic_std::program().unwrap();
+    let device = Device::metal().unwrap();
+    exercise(&mut Backend::Metal(PlanCompiler::new(&device, &program, Settings::default())));
 }

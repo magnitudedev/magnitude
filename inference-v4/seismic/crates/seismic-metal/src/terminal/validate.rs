@@ -1,5 +1,5 @@
 use super::{Expression as E, Program, Statement as S, Type};
-use seismic_lang::ast::{BinaryOp, UnaryOp};
+use seismic_lang::syntax::ast::{BinaryOp, UnaryOp};
 use std::collections::{HashMap, HashSet};
 
 fn expression(value: &E) -> bool {
@@ -44,6 +44,8 @@ fn statement(statement: &S) -> bool {
         | S::End
         | S::FailureStatus
         | S::Barrier
+        | S::GroupBarrier
+        | S::Participants { .. }
         | S::Fragment { .. }
         | S::MatrixMultiplyAccumulate { .. } => true,
         S::Unmapped(_) => false,
@@ -160,32 +162,12 @@ fn typed(
 }
 
 pub(super) fn program(program: &Program) -> Result<(), String> {
-    program_mode(program, false)
-}
-/// Compile-time alternatives have deferred binding joins and are not a native
-/// lexical program. Validate operation types and structured delimiters here;
-/// the selected program must still pass the full lexical validator above.
-pub(super) fn template(program: &Program) -> Result<(), String> {
-    program_mode(program, true)
-}
-fn program_mode(program: &Program, retained: bool) -> Result<(), String> {
     for (launch, sites) in program.launches.iter().enumerate() {
         let locals: HashSet<_> = sites
             .iter()
             .filter_map(|s| declared(&s.statement).map(|(name, _)| name.to_owned()))
             .collect();
         let mut scopes = vec![(Scope::Root, HashMap::new())];
-        let mut declarations = HashMap::<String, Option<Type>>::new();
-        if retained {
-            for site in sites {
-                if let Some((name, ty)) = declared(&site.statement) {
-                    if let Some(previous) = declarations.insert(name.to_owned(), ty) {
-                        if previous != ty { return Err(format!("retained Metal binding `{name}` changes type between alternatives")); }
-                    }
-                }
-            }
-        }
-        let retained_scope = retained.then(|| [(Scope::Root, declarations)]);
         for (index, site) in sites.iter().enumerate() {
             let context = |reason: String| {
                 format!(
@@ -196,7 +178,7 @@ fn program_mode(program: &Program, retained: bool) -> Result<(), String> {
             if !statement(&site.statement) {
                 return Err(context("untyped Metal operation".into()));
             }
-            let binding_scopes = retained_scope.as_ref().map_or(scopes.as_slice(), |scope| scope.as_slice());
+            let binding_scopes = scopes.as_slice();
             let check = |value| typed(value, binding_scopes, &locals).map_err(&context);
             match &site.statement {
                 S::Write { name, .. } => { binding(name, binding_scopes, &locals).map_err(&context)?; }
@@ -283,7 +265,7 @@ fn program_mode(program: &Program, retained: bool) -> Result<(), String> {
                     .unwrap()
                     .1
                     .insert(name.into(), ty)
-                    .is_some() && !retained
+                    .is_some()
                 {
                     return Err(context(format!("duplicate local `{name}` in one scope")));
                 }

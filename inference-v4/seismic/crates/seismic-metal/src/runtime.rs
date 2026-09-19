@@ -11,6 +11,9 @@ use std::ptr::NonNull;
 mod observation;
 pub use observation::{DispatchObservation, Observation};
 
+/// Dispatches per committed command buffer of an unprofiled batch.
+const COMMIT_DISPATCHES: usize = 64;
+
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -121,6 +124,15 @@ impl Device {
             return Err("Metal alias condition names an absent invocation binding".into());
         }
         for launch in &emitted.launches {
+            let absent = launch.bindings.iter().any(|binding| match *binding {
+                crate::msl::Binding::Buffer(n) => n >= emitted.buffers.len(),
+                crate::msl::Binding::Scratch(n) => n >= emitted.scratch.len(),
+                crate::msl::Binding::Scalars => emitted.scalars.is_empty(),
+                crate::msl::Binding::Status => false,
+            });
+            if absent || launch.bindings.len() > crate::msl::MAX_KERNEL_BUFFERS {
+                return Err(format!("launch `{}` has an invalid buffer table ({} bindings)", launch.kernel, launch.bindings.len()));
+            }
             if let Some(dispatch) = &launch.dispatch {
                 if *dispatch != seismic_realization::dispatch::GroupDispatch::new(dispatch.work_items, dispatch.lanes_per_item, dispatch.items_per_group)?
                     || launch.threadgroups != dispatch.groups || launch.threads_per_threadgroup != dispatch.threads_per_group {
@@ -280,19 +292,18 @@ impl Device {
         } else {
             None
         };
-        let command = self
-            .queue
-            .commandBuffer()
-            .ok_or("could not create a command buffer")?;
-        let shared_encoder = if profile {
-            None
-        } else {
-            Some(
-                command
-                    .computeCommandEncoder()
-                    .ok_or("could not create a compute encoder")?,
-            )
+        let open = || -> Result<_, String> {
+            let command = self.queue.commandBuffer().ok_or("could not create a command buffer")?;
+            let encoder = if profile { None } else { Some(command.computeCommandEncoder().ok_or("could not create a compute encoder")?) };
+            Ok((command, encoder))
         };
+        // Submission rule: an unprofiled batch is committed in command buffers of
+        // `COMMIT_DISPATCHES` dispatches, in source order on the one queue, so the device
+        // executes the head of the batch while the host encodes the rest. Completion, error
+        // and status checks still cover the whole batch before return.
+        let mut committed = Vec::new();
+        let (mut command, mut shared_encoder) = open()?;
+        let mut encoded = 0usize;
         let mut first = true;
         for _ in 0..repeat {
             for (invocation_index, invocation) in invocations.iter().enumerate() {
@@ -303,47 +314,47 @@ impl Device {
                 } = invocation;
                 for compiled in &pipeline.states {
                     let CompiledLaunch { index: launch_index, launch, state } = compiled;
-                    let encoder = if let Some(capture) = &mut capture {
-                        capture.encoder(&command, invocation_index, *launch_index, &launch.kernel)?
-                    } else {
-                        shared_encoder.as_ref().unwrap().clone()
+                    if !profile && encoded == COMMIT_DISPATCHES {
+                        if let Some(encoder) = &shared_encoder {
+                            encoder.endEncoding();
+                        }
+                        command.commit();
+                        committed.push(command);
+                        (command, shared_encoder) = open()?;
+                        (encoded, first) = (0, true);
+                    }
+                    encoded += 1;
+                    let encoder = match (&mut capture, &shared_encoder) {
+                        (Some(capture), _) => capture.encoder(&command, invocation_index, *launch_index, &launch.kernel)?,
+                        (None, Some(encoder)) => encoder.clone(),
+                        (None, None) => return Err("Metal submission has no compute encoder".into()),
                     };
                     if !profile && (!first || launch.after_barrier) {
                         encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
                     }
                     first = false;
                     encoder.setComputePipelineState(state);
-                    for (i, b) in buffers.iter().enumerate() {
-                        unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), b.offset, i) };
+                    // Each kernel declares only the resources it references; its table maps
+                    // local buffer index -> invocation resource (validated by `compile`).
+                    for (local, binding) in launch.bindings.iter().enumerate() {
+                        match *binding {
+                            crate::msl::Binding::Buffer(n) => {
+                                let b = buffers.get(n).ok_or("Metal launch binds an absent invocation buffer")?;
+                                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), b.offset, local) };
+                            }
+                            crate::msl::Binding::Scratch(n) => {
+                                let b = pipeline.scratch.get(n).ok_or("Metal launch binds absent scratch storage")?;
+                                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, local) };
+                            }
+                            crate::msl::Binding::Status => unsafe { encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, local) },
+                            crate::msl::Binding::Scalars => {
+                                let bytes = NonNull::new(scalars.as_ptr() as *mut _).ok_or("Metal scalar block has no storage")?;
+                                unsafe { encoder.setBytes_length_atIndex(bytes, scalars.len(), local) };
+                            }
+                        }
                     }
-                    for (i, b) in pipeline.scratch.iter().enumerate() {
-                        unsafe {
-                            encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, buffers.len() + i)
-                        };
-                    }
-                    if let Some(slot) = pipeline.emitted.status_slot {
-                        unsafe { encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, slot) };
-                    }
-                    let scalar_slot = buffers.len() + pipeline.scratch.len();
-                    if !scalars.is_empty() {
-                        unsafe {
-                            encoder.setBytes_length_atIndex(
-                                NonNull::new(scalars.as_ptr() as *mut _).unwrap(),
-                                scalars.len(),
-                                scalar_slot,
-                            )
-                        };
-                    }
-                    let grid = MTLSize {
-                        width: launch.threadgroups as usize,
-                        height: 1,
-                        depth: 1,
-                    };
-                    let group = MTLSize {
-                        width: launch.threads_per_threadgroup as usize,
-                        height: 1,
-                        depth: 1,
-                    };
+                    let grid = MTLSize { width: launch.threadgroups as usize, height: 1, depth: 1 };
+                    let group = MTLSize { width: launch.threads_per_threadgroup as usize, height: 1, depth: 1 };
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
                     if profile {
                         encoder.endEncoding();
@@ -355,18 +366,19 @@ impl Device {
             encoder.endEncoding();
         }
         command.commit();
-        command.waitUntilCompleted();
-        if let Some(e) = command.error() {
-            return Err(format!(
-                "command buffer failed: {}",
-                e.localizedDescription()
-            ));
+        committed.push(command);
+        for command in &committed {
+            command.waitUntilCompleted();
+            if let Some(e) = command.error() {
+                return Err(format!("command buffer failed: {}", e.localizedDescription()));
+            }
         }
         if status.read(4) != [0; 4] {
             return Err("Metal invocation encountered an out-of-bounds view".into());
         }
         Ok(Observation {
-            command_seconds: command.GPUEndTime() - command.GPUStartTime(),
+            // First start to last end on the one queue, including any wait for the host.
+            command_seconds: committed.last().zip(committed.first()).map_or(0.0, |(last, first)| last.GPUEndTime() - first.GPUStartTime()),
             dispatches: capture
                 .map(|capture| capture.finish(self))
                 .transpose()?
@@ -421,44 +433,4 @@ impl Buffer {
         unsafe { std::ptr::copy_nonoverlapping((self.buffer.contents().as_ptr() as *const u8).add(self.offset), out.as_mut_ptr(), len) };
         out
     }
-}
-
-/// Achievable device bandwidth: a streaming read of `bytes` through a reduction kernel, in GB/s.
-pub fn calibrate_bandwidth(device: &Device, bytes: usize) -> Result<f64, String> {
-    let n = bytes / 4;
-    let source = r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void stream_read(device const float4* x [[buffer(0)]], device float* out [[buffer(1)]],
-                        constant uint& n4 [[buffer(2)]],
-                        uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                        uint sg [[simdgroup_index_in_threadgroup]], uint tg [[threadgroup_position_in_grid]]) {
-  float acc = 0.0f;
-  for (uint i = gid; i < n4; i += 262144u * 4u) { float4 v = x[i]; acc += v.x + v.y + v.z + v.w; }
-  acc = simd_sum(acc);
-  if (lane == 0) out[tg * 8 + sg] = acc;
-}
-"#;
-    let emitted = Emitted {
-        terminal: Default::default(),
-        status_slot: None,
-        alias_pairs: Vec::new(),
-        scratch: Vec::new(),
-        scratch_bindings: Vec::new(),
-        source: source.to_string(),
-        launches: vec![Launch { kernel: "stream_read".into(), threadgroups: 4096, threads_per_threadgroup: 256, after_barrier: false, dispatch: None, tiles:Vec::new(), declared_threadgroup_bytes:0 }],
-        buffers: vec![seismic_realization::BufferSpec { parameter: "x".into(), plane: "".into(), bytes: n * 4, alignment: 4 }, seismic_realization::BufferSpec { parameter: "out".into(), plane: "".into(), bytes: 4096 * 8 * 4, alignment: 4 }],
-        scalars: vec![seismic_lang::abi::ScalarParameter::plain("n4", seismic_lang::types::DType::U32)],
-    };
-    let pipeline = device.compile(emitted)?;
-    let input = device.buffer(n * 4)?;
-    let out = device.buffer(4096 * 8 * 4)?;
-    let n4 = (n / 4) as u32;
-    let scalars = n4.to_le_bytes().to_vec();
-    let mut best = f64::MAX;
-    for _ in 0..8 {
-        let t = device.run(&pipeline, &[&input, &out], &scalars, 4)?;
-        best = best.min(t / 4.0);
-    }
-    Ok(n as f64 * 4.0 / best / 1e9)
 }

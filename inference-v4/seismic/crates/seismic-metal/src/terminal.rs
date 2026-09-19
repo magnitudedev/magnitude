@@ -2,22 +2,21 @@
 //! contain only typed nodes; opaque diagnostic nodes never enter execution.
 use crate::support::Helper;
 use seismic_lang::{
-    ast::{BinaryOp, UnaryOp},
-    ir::OperationId,
+    exec::ir::OperationId,
+    syntax::ast::{BinaryOp, UnaryOp},
     types::DType,
 };
 use std::fmt;
 mod simplify;
+mod storage;
 pub(crate) mod synchronize;
 pub(crate) mod helper;
 pub(crate) mod rewrite;
 mod validate;
 pub mod traversal;
 pub mod transfer;
-pub(crate) mod family;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Bool,
     I32,
@@ -78,70 +77,11 @@ impl From<DType> for Type {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Space {
     Private,
     Threadgroup,
     Device,
     Constant,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum Primitive {
-    Binary {
-        operation: BinaryOp,
-        ty: Type,
-    },
-    Unary {
-        operation: UnaryOp,
-        ty: Type,
-    },
-    Cast {
-        from: Type,
-        to: Type,
-    },
-    Read {
-        space: Space,
-        ty: Type,
-    },
-    VectorRead { space: Space, ty: Type, components: u8 },
-    Write {
-        space: Space,
-        ty: Type,
-    },
-    Address {
-        space: Space,
-        ty: Type,
-    },
-    Branch,
-    Return,
-    Select,
-    Bitcast {
-        from: Type,
-        to: Type,
-    },
-    Barrier,
-    Launch,
-    Group,
-    Builtin {
-        name: String,
-        inputs: Vec<Type>,
-        result: Type,
-    },
-    /// A complete MSL subgroup matrix intrinsic, not an asserted native
-    /// instruction. Its layout supplies logical bytes/FMA work structurally.
-    MatrixLoad {
-        layout: crate::collective::FragmentLayout,
-        space: Space,
-        transpose: bool,
-    },
-    MatrixStore {
-        layout: crate::collective::FragmentLayout,
-        space: Space,
-    },
-    MatrixMultiplyAccumulate {
-        layouts: [crate::collective::FragmentLayout; 4],
-    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expression {
@@ -229,6 +169,18 @@ impl Expression {
             self
         } else {
             Self::Cast(ty, Box::new(self))
+        }
+    }
+    /// Whether evaluating this expression can do anything but produce its value: a checked
+    /// helper may write the invocation status, a builtin may be a collective every lane must
+    /// enter. Arithmetic, casts, selections and plain reads have no effect.
+    pub fn has_effect(&self) -> bool {
+        match self {
+            Self::Integer(..) | Self::Float(..) | Self::Variable(..) | Self::VectorElement { .. } | Self::Parameter { .. } => false,
+            Self::Helper(..) | Self::Builtin(..) | Self::Unmapped(..) => true,
+            Self::Binary(_, a, b, _) | Self::ShortCircuit { left: a, right: b, .. } => a.has_effect() || b.has_effect(),
+            Self::Unary(_, e, _) | Self::Cast(_, e) | Self::Bitcast(_, e) | Self::Read { index: e, .. } => e.has_effect(),
+            Self::Select(c, a, b) | Self::EagerSelect(c, a, b) => c.has_effect() || a.has_effect() || b.has_effect(),
         }
     }
     pub fn render(&self) -> String {
@@ -353,6 +305,11 @@ pub enum Statement {
     Return(Option<Expression>),
     FailureStatus,
     Barrier,
+    /// Every thread of the threadgroup: the outer owner of a launch with inner owner regions.
+    GroupBarrier,
+    /// Launch ABI fact: the kernel argument `name` is a participant index below `count`.
+    /// Declares nothing; the simplifier's range proofs read it.
+    Participants { name: String, count: i64 },
     Fragment {
         name: String,
         layout: crate::collective::FragmentLayout,
@@ -381,6 +338,10 @@ pub enum Statement {
     Unmapped(String),
 }
 impl Statement {
+    /// An evaluation whose value is discarded and whose expression has no effect.
+    pub(crate) fn is_dead(&self) -> bool {
+        matches!(self, Self::Evaluate(e) if !e.has_effect())
+    }
     pub(crate) fn realized(self) -> Self {
         simplify::statement(self)
     }
@@ -429,6 +390,8 @@ impl Statement {
                 "atomic_store_explicit(seismic_status, 1u, memory_order_relaxed);".into()
             }
             Self::Barrier => "simdgroup_barrier(mem_flags::mem_threadgroup);".into(),
+            Self::GroupBarrier => "threadgroup_barrier(mem_flags::mem_threadgroup);".into(),
+            Self::Participants { name, count } => format!("// {name} < {count}"),
             Self::Fragment { name, layout } => format!(
                 "simdgroup_matrix<{}, {}, {}> {name};",
                 Type::from(layout.dtype).metal(),
@@ -475,11 +438,11 @@ impl Program {
     pub fn validate_typed(&self) -> Result<(), String> {
         validate::program(self)
     }
-    pub(crate) fn validate_template(&self) -> Result<(), String> {
-        validate::template(self)
-    }
-    pub(crate) fn realize_launch(&mut self, index: usize) {
-        simplify::launch(&mut self.launches[index]);
+    /// Simplify one launch; returns whether dead sites were removed. Emission and
+    /// accounting share this program, so neither sees a removed site.
+    pub(crate) fn realize_launch(&mut self, index: usize) -> bool {
+        storage::widen(&mut self.launches[index]);
+        simplify::launch(&mut self.launches[index])
     }
     pub fn launches(&self) -> &[Vec<Site>] {
         &self.launches

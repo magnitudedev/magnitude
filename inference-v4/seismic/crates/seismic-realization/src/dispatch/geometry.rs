@@ -90,12 +90,16 @@ pub fn storage<A: Algebra>(
             let per_lane = a.ceil_div(capacity, lanes)?;
             (a.maximum(per_lane, one)?, zero)
         }
-        TilePlacement::GroupShared => (zero, a.maximum(capacity, one)?),
+        TilePlacement::GroupShared | TilePlacement::GroupWide => (zero, a.maximum(capacity, one)?),
     };
     let bytes = a.constant(bytes)?;
     let private_bytes_per_lane = a.product(private, bytes)?;
     let shared_bytes = a.product(shared, bytes)?;
-    let shared_bytes_per_group = a.product(shared_bytes, items)?;
+    // A group-wide array exists once per group; an item-owned one once per item of the group.
+    let shared_bytes_per_group = match placement {
+        TilePlacement::GroupWide => shared_bytes,
+        _ => a.product(shared_bytes, items)?,
+    };
     Ok(Storage {
         private_elements_per_lane: private,
         shared_elements_per_item: shared,

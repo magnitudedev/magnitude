@@ -1,7 +1,7 @@
 //! Lower the shared helper definition into the same typed terminal body used
 //! for local realization, helper invocation accounting, and requirement discovery.
 use super::{Expression, Statement, Type};
-use seismic_lang::ast::{BinaryOp, UnaryOp};
+use seismic_lang::syntax::ast::{BinaryOp, UnaryOp};
 use std::collections::BTreeMap;
 
 fn ty(t: crate::support::Type, element: Type) -> Type {
@@ -15,14 +15,6 @@ fn ty(t: crate::support::Type, element: Type) -> Type {
         T::Element => element,
         T::Void => Type::Bool,
     }
-}
-
-/// Calls use the parameter conversions performed by the emitted helper ABI.
-/// Keep these in the terminal expressions so accounting sees the same casts.
-pub(crate) fn arguments(helper: crate::support::Helper, args: &[Expression], element: Type) -> Vec<Expression> {
-    let definition = crate::support::Definition::new(helper);
-    definition.parameters.iter().zip(args).map(|((_, parameter), argument)|
-        argument.clone().cast(ty(*parameter, element))).collect()
 }
 
 /// Single-expression helpers have no local lifetime or control to retain.

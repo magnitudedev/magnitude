@@ -1,7 +1,7 @@
 //! Typed traversal of constant, finite terminal loops. It changes execution
 //! instructions before both emission and accounting, without native feedback.
 use super::{Expression as E, Program, Site, Statement as S, Type as T};
-use seismic_lang::{ast::BinaryOp as B, ir::OperationId};
+use seismic_lang::{exec::ir::OperationId, syntax::ast::BinaryOp as B};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
