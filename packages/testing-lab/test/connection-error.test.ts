@@ -17,6 +17,7 @@ for (const behavior of ["preserve", "overwrite", "missing-alert"] as const) test
   yield* fs.writeFileString(file, original)
   let recovered = false
   const driver: DesktopDriver = {
+    updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
     identity: () => Effect.die("Not used by this fixture"), host: () => Effect.succeed("unused"), navigate: () => Effect.void, ready: () => Effect.void, serviceFailure: () => Effect.succeed("unused"),
     search: () => Effect.void, details: () => Effect.void, download: () => Effect.void,
     load: () => Effect.void, disconnect: () => Effect.void, theme: () => Effect.void,

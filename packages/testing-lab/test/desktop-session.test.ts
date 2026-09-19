@@ -5,6 +5,7 @@ import { DesktopDriver, type DesktopLaunch } from "../src/desktop-driver"
 const events: string[] = []
 const launchDriver = (config: DesktopLaunch) => Layer.scoped(DesktopDriver, Effect.acquireRelease(
   Effect.sync(() => { events.push(`open:${config.evidence}`); return {
+    updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
     identity: () => Effect.die("Not used by this fixture"), host: () => Effect.succeed("test-version"),
     navigate: () => Effect.void, ready: () => Effect.void, serviceFailure: () => Effect.succeed("unused"), search: () => Effect.void,
     details: () => Effect.void, download: () => Effect.void, load: () => Effect.void,

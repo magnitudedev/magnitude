@@ -446,10 +446,10 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
     : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
     : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
   if (Result.isInitial(observation)) return <UpdatesSkeleton />
-  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
+  return <div data-testid={automation.updates} data-update-state={current?._tag} data-update-version={current && "version" in current ? current.version : undefined} data-update-check={snapshot?.check._tag} className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
     <h3 className="font-medium">Application updates</h3>
     {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
-      <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
+      <input data-testid={automation.updateAutomatic} type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
       Auto-download updates
     </label>}
     {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
@@ -460,10 +460,10 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
     <p className="mt-3 text-sm text-slate-500" role="status">{message}</p>
     {snapshot?.check._tag === "Failed" && <p className="mt-2 text-sm" role="alert">{snapshot.check.message}</p>}
     <div className="mt-3 flex flex-wrap gap-2">
-      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
-      {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button data-testid={automation.updateAction("check")} variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
+      {current?._tag === "Available" && <Button data-testid={automation.updateAction("download")} disabled={pending} onClick={() => download()}>Download update</Button>}
+      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button data-testid={automation.updateAction("restart")} disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
+      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button data-testid={automation.updateAction("discard")} variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
     </div>
     {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
     {[checking, downloading, restarting, discarding, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}

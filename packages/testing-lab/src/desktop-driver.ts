@@ -1,3 +1,4 @@
+import { playwrightUpdates, type DesktopUpdates } from "./update-controls"
 import { ApplicationIdentity, ReadyApplicationSnapshot } from "./application-identity"
 import { desktopAutomation as automation } from "../../../desktop/src/automation"
 import { FileSystem } from "@effect/platform"
@@ -11,6 +12,7 @@ export const DesktopLaunch = Schema.Struct({ executable: Schema.String, profile:
   port: Schema.Int.pipe(Schema.between(1024, 65535)), environment: Schema.Record({ key: Schema.String, value: Schema.String }) })
 export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
+  readonly updates: DesktopUpdates
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
   readonly identity: () => Effect.Effect<ApplicationIdentity, AssertionFailure>
   readonly host: () => Effect.Effect<string, AssertionFailure>
@@ -78,6 +80,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   })
   const card = (id: string) => page.getByTestId(automation.model(id))
   return {
+    updates: playwrightUpdates(page, navigate("settings")),
     navigate,
     identity: () => Effect.gen(function* () {
       const wire = yield* action("Read native service ownership", () => page.evaluate(() => new Promise<unknown>((resolve, reject) => {

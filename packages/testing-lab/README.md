@@ -573,3 +573,19 @@ identities, usable service and no cleanup errors. Three tests exercise service r
 observer failure, early CLI exit and cancellation. Unix guest images need `lsof`; Linux native
 qualification remains outstanding. Windows requires a native console driver and stays blocked
 for this case. This does not claim cancellation of model acquisition or generation.
+
+## Update UI driver
+
+The desktop driver now exposes Settings update actions (check, download, restart, discard),
+automatic-download control and transfer-state waits with candidate version observations.
+Selectors use stable action IDs and rendered domain-state attributes. A real Electron renderer
+fixture exercised these controls with deliberately changed labels/colors and verified immediate
+failure reporting. This fixture does not update an installed app or qualify U1–U6. Old/new
+acceptance package inputs, signed fixture routing and suite orchestration still need implementation.
+The existing release acceptance-build configuration should provide the isolated trust path;
+production trust must remain a separate qualification.
+
+Five targeted driver/session/error tests passed and testing-lab typechecking passed. The desktop
+package typecheck returned exit 2 with Effect diagnostics in unchanged main/preload and dependency
+files, including `multipleEffectProvide` at desktop/src/main.ts:146; no renderer/automation diagnostic
+was emitted. Full output: `/tmp/ml-desktop-update-typecheck-20260918.log`.

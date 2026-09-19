@@ -14,4 +14,7 @@ export const desktopAutomation = {
   serviceReady: "desktop.service-ready",
   sidebarToggle: "desktop.sidebar-toggle",
   sidebar: "desktop.sidebar",
+  updates: "desktop.updates",
+  updateAction: (action: string) => `desktop.update.${action}`,
+  updateAutomatic: "desktop.update.automatic",
 } as const

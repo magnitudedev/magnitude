@@ -143,6 +143,10 @@ service and CLI versions. Artifact names alone cannot qualify architecture or ve
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
+Update controls expose rendered transfer state and candidate version through stable identities.
+The driver uses the normal Settings actions and surfaces failed or unavailable updates promptly.
+A renderer interaction test alone cannot qualify installation, trust or retained-data acceptance;
+those require an old/new package pair and observation of the resulting installed application.
 Settings persistence is checked across actual application process restarts using the same
 isolated profile; a page reload cannot satisfy it. Each launch preserves its own trace and
 process log, and the previous process is released before the next launches. Application quit
