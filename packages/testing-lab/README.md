@@ -194,15 +194,24 @@ under the pinned runtime. Compilation and packaging invoke the existing release 
 processes. The compile receipt binds source digest, commit and native host; packaging emits the
 release manifest (including the Mac update ZIP). Artifact admission verifies all output bytes before
 installation. Compiler/packager failures remain separate case outcomes and preserve command logs.
+The worker preserves explicitly configured `CARGO_HOME` and `RUSTUP_HOME` while isolating the
+build's HOME. Bun compilation uses the release-owned host target, including the Linux x64
+baseline target.
 
 `scripts/source-build-probe.ts` exercises these phases on a real local source snapshot. Set
 `LAB_BUILD_PROBE_ROOT` to a new directory and `LAB_BUILD_PROBE_TARGET` to the actual local target.
 The lower-level candidate script accepts `LAB_BUILD_PHASE=compile|package|all`, `LAB_BUILD_OUTPUT`,
 `LAB_BUILD_SOURCE_DIGEST`, and `LAB_BUILD_SOURCE_COMMIT`.
 
-This initial integration builds on the allocated target before installation. Separate producer and
-consumer machines, shared producer deduplication, private engine payload publication, and native
-Windows toolchain configuration are still required for full remote verification.
+An actual Azure Ubuntu 24.04 Intel x64 source worker passed compilation and production of both
+existing DEB and RPM formats. The exported installer, service and CPU inference archives were
+independently admitted by hash and length; the producer VM, NIC and disk were removed. Building
+an RPM on Ubuntu does not qualify installation on Fedora or Red Hat.
+
+Scheduled source execution still builds on the allocated target before installation. Separate
+producer/consumer orchestration, shared producer deduplication and native Windows toolchain
+configuration remain required for full remote verification. The shared worker already serves
+admitted private runtime archives through its scoped release fixture.
 
 ## Current packaged-app execution
 

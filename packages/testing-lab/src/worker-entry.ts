@@ -17,7 +17,7 @@ import { qualifyGuestUser } from "./guest-user"
 import { DisposableDesktopUser } from "./desktop-environment"
 
 export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type, root: string) => Effect.gen(function* () {
-  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* Effect.gen(function* () {
     const user = yield* qualifyGuestUser(invocation.assignment.target.target.provider, invocation.disposable, environment)
     if (Option.isSome(user)) environment.HOME = user.value.home

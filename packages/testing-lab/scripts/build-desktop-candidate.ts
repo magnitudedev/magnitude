@@ -16,7 +16,7 @@ import { InfrastructureFailure } from "../src/domain"
 import { ACN_EXECUTABLE_NAME } from "../../release/src/executables"
 import { compileIcnBase, CompiledIcnBase, packageIcnBase } from "../../release/scripts/build/icn-base"
 import { buildBackendArtifact } from "../../release/scripts/build/backend"
-import { currentHost } from "../../release/src/targets"
+import { currentHost, hostById } from "../../release/src/targets"
 import { Backend } from "../src/domain"
 import { selectBuildBackendPacks } from "../src/native-build-selection"
 import { buildArchive } from "../../release/scripts/build/common"
@@ -65,7 +65,7 @@ const run = Effect.gen(function* () {
       nativePacks.push(artifact)
     }
     yield* execute(["run", "build"], join(root, "desktop"))
-    const bunTarget = `bun-${target.platform === "win32" ? "windows" : target.platform}-${target.arch}`
+    const bunTarget = hostById(host).bunTarget
     const service = yield* Effect.tryPromise({ try: () => buildAcnBinary(bunTarget), catch: () => new InfrastructureFailure({ operation: "build-acn", message: "Release-owned service compilation failed" }) })
     const cli = yield* Effect.tryPromise({ try: () => buildCliBinary(bunTarget), catch: () => new InfrastructureFailure({ operation: "build-cli", message: "Release-owned CLI compilation failed" }) })
     const apps = yield* buildDesktopApplication({ service, cli, version: identity.cliVersion, revision: identity.revision, outputDirectory: join(output, "application") })
