@@ -220,3 +220,11 @@ The exact DMG passed local macOS15 launch/readiness/CLI checks and a fresh UI ac
 run (11 passed,11 blocked,zero failed cases,clean removal). The cloud app launched but its inference
 process exited before readiness; cloud generation remains unqualified. Provider cleanup completed;
 the empty-inventory CLI notice exposed and now has a tested parser fix. No borrowed Mac remains.
+
+Package identity now inspects installed Mach-O, ELF64 or PE32+ headers and checks the running
+desktop against the exact bundled service and CLI versions. The native host and Unix command
+helper must also contain the requested architecture. This is distinct from dependency and
+production-signature validation, which remain separate cases. `install-probe.ts` records native
+host identity, installs the exact package, launches its desktop, checks payload identity and removes
+the owned installation even when assertions fail. This path passed with the current DMG on
+macOS15.5 ARM64; Linux and Windows header fixtures do not qualify native installation there.

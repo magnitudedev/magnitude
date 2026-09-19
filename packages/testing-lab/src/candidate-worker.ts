@@ -13,6 +13,7 @@ import { HostObservation } from "./hardware"
 import { Installer } from "./installer"
 import { ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
+import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { WorkAssignment, TargetResult } from "./work-store"
@@ -118,6 +119,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           return CaseObservation.make({ detail: source ? "Built final native packages from the admitted source and verified exact installer bytes"
             : "Downloaded the selected native installer and verified its admitted hash and length; no package build was executed",
             evidence: [yield* inputEvidence, sourceEvidence, ...(build?.evidence ?? [])] })
+        }
+        case "P3": {
+          const identity = yield* inspectPackageIdentity(yield* installed, yield* (yield* desktop).host(), environment).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, yield* evidence("package-identity.json", PackageIdentity, identity)] })
         }
         case "I2": yield* installed; break
         case "I3": {

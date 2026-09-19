@@ -68,6 +68,8 @@ termination is limited to processes owned by the attempt.
 ## Evidence and acceptance
 
 Each case records its input identity, observed hardware, outcome, diagnostics and evidence paths.
+Installed package identity is verified against native binary headers and the running desktop,
+service and CLI versions. Artifact names alone cannot qualify architecture or version agreement.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.

@@ -45,7 +45,7 @@ const suiteCases: Readonly<Record<Suite, readonly string[]>> = {
 }
 const prefixes: Readonly<Record<Suite, string>> = { package: "P", install: "I", app: "A", endpoint: "E", harness: "H", recovery: "R", cli: "C", update: "U", uninstall: "X" }
 const prerequisites: Readonly<Record<string, readonly string[]>> = {
-  P2: ["P1"], P3: ["P2"], P4: ["P2"], P5: ["P2"],
+  P2: ["P1"], P3: ["P2", "I3"], P4: ["P2"], P5: ["P2"],
   I1: ["P2"], I2: ["I1"], I3: ["I2"], I4: ["I3"], I5: ["I1"],
   A1: ["I3"], A2: ["A1"], A3: ["A2"], A4: ["A1"], A5: ["A3"], A6: ["A1"], A7: ["A1"],
   E1: ["A3"], E2: ["E1", "E6"], E3: ["E1", "E6"], E4: ["E1", "E6"], E5: ["E1"], E6: ["E1"],
