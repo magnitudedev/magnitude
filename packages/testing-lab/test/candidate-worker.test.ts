@@ -17,7 +17,7 @@ import { SourceBuilder } from "../src/source-builder"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment, validateTargetResult } from "../src/work-store"
 
-for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-artifact-worker-" })
   const bytes = new TextEncoder().encode("fixture installer")
@@ -31,11 +31,13 @@ for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt",
   let compiled = 0, packaged = 0
   const sourceFailed = mode === "source-compile-failure" || mode === "source-package-failure"
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "worker-artifact-test", owner: "developer",
+    ...(mode === "update-baseline-invalid" ? { updateFrom: { kind: "artifacts", digest: sha256(json) } } : {}),
     input: { kind: isSource ? "source" : "artifacts", digest: sha256(json) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-metal-apple-silicon" },
     mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 100, idleMinutes: 15 } })
   const plan = yield* planRun(request)
   const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P5", "I1", "I2", "C1"].includes(c.id)) }
   if (mode === "explicit-uninstall") selected.cases.push(allCases.find(test => test.id === "X1")!)
+  if (mode.startsWith("update-baseline-")) selected.cases.push(allCases.find(test => test.id === "U1")!)
   const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "fixture" },
     plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
   const started = yield* Deferred.make<void>()
@@ -78,6 +80,7 @@ for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt",
       expect(yield* fs.exists(nativeState)).toBe(false)
     }
     if (mode === "explicit-uninstall") expect(result.cases.find(test => test.caseId === "X1")!.outcome.status).toBe("passed")
+    if (mode.startsWith("update-baseline-")) expect(result.cases.find(test => test.caseId === "U1")!.outcome.status).toBe(mode === "update-baseline-missing" ? "blocked" : "failed")
     expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" ? 1 : 0)
     if (installed > 0 && mode !== "defect") expect(result.cases.find(c => c.caseId === "C1")!.evidence.some(item => item.path.startsWith("evidence/cli/"))).toBe(true)
     for (const item of result.cases.flatMap(c => c.evidence)) expect(yield* objects.exists(item.sha256)).toBe(true)

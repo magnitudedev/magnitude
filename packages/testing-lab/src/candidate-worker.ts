@@ -10,7 +10,7 @@ import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
 import { installationSession } from "./installation-session"
 import { selectedHarnesses } from "./catalog"
 import { captureRetainedProfile, RetainedProfile, verifyRetainedProfile } from "./retained-profile"
-import { ApplicationIdentity } from "./application-identity"
+import { ApplicationIdentity, assertServiceExited } from "./application-identity"
 import { verifyServiceOwnership } from "./suites/service"
 import { occupyServicePort } from "./port-fault"
 import { exerciseConnectionError } from "./harnesses/connection-error"
@@ -32,6 +32,8 @@ import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { CliInterruption, verifyCliInterruption } from "./suites/cli-interruption"
 import { WorkAssignment, TargetResult } from "./work-store"
+import { prepareUpdatePair, UpdatePair } from "./update-pair"
+import { UpdateBaseline, verifyUpdateBaseline } from "./suites/update"
 
 export const CandidateWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
   model: Schema.NonEmptyString, environment: Schema.Record({ key: Schema.String, value: Schema.String }) })
@@ -103,11 +105,15 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const installation = yield* Effect.cached(candidate.pipe(Effect.flatMap(value => installationSession(value,
       detail => { cleanupErrors.push(`Uninstall: ${detail}`) }).pipe(Effect.provideService(Installer, installer), Effect.provideService(Scope.Scope, scope)))))
     const installed = installation.pipe(Effect.flatMap(value => value.get))
+    let activeSession: Option.Option<Effect.Effect.Success<ReturnType<typeof desktopSession>>> = Option.none()
+    let fixtureCleanupFailed = false
     const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
-      return yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
+      const value = yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
         evidence: join(evidenceDirectory, "desktop"), port: config.port, environment }, detail => { cleanupErrors.push(detail) }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
+      activeSession = Option.some(value)
+      return value
     }))
     const desktop = session.pipe(Effect.flatMap(value => value.driver))
     const retentionSelected = assignment.target.cases.some(test => test.id === "X3" || test.id === "X4")
@@ -133,7 +139,55 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(harnessSuite(harness, config.model,
       join(evidenceDirectory, "harness", harness), join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), environment)))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
+      if (fixtureCleanupFailed) return yield* unavailable("Native fixture restoration failed; refusing further operations on an uncertain installation")
       switch (test.id as string) {
+        case "U1": {
+          const baseline = assignment.plan.request.updateFrom
+          if (Option.isNone(baseline)) return yield* unavailable("Update tests require an admitted previous artifact manifest through --update-from")
+          const pair = yield* prepareUpdatePair(baseline.value.digest, (yield* manifest).release, target, join(config.root, "update-pair"))
+          const pairEvidence = yield* evidence("update-pair.json", UpdatePair, pair)
+          // Native package managers have one installation. Suspend the primary journey and restore
+          // its exact ownership after this separate baseline/profile fixture has completely closed.
+          const cleanupStart = cleanupErrors.length
+          if (Option.isSome(activeSession)) yield* activeSession.value.stop
+          if (cleanupErrors.length !== cleanupStart) {
+            fixtureCleanupFailed = true
+            return yield* unavailable("Primary application cleanup failed before update baseline installation")
+          }
+          const ownership = yield* installation
+          const previous = yield* ownership.current
+          return yield* Effect.acquireUseRelease(
+            Effect.void,
+            () => Effect.scoped(Effect.gen(function* () {
+              const app = yield* ownership.replace(pair.previous)
+              const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
+                : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" })
+              const updateEnvironment = { ...environment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
+              const updateSession = yield* desktopSession({ executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
+                evidence: join(evidenceDirectory, "update-baseline"), port: config.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
+              const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
+              const driver = yield* updateSession.driver
+              const identity = yield* inspectPackageIdentity(app, yield* driver.host(), updateEnvironment)
+              yield* driver.quit()
+              yield* updateSession.stop
+              yield* assertServiceExited(observation.reopenedOwner.servicePid)
+              const profile = yield* captureRetainedProfile(updateEnvironment.MAGNITUDE_DEV_DATA_DIR)
+              return CaseObservation.make({ detail: "Installed the admitted previous version, verified desktop/service/CLI package identity and persisted theme across an application/service restart",
+                evidence: [pairEvidence, hostEvidence, yield* evidence("update-baseline.json", UpdateBaseline, observation),
+                  yield* evidence("update-baseline-package.json", PackageIdentity, identity), yield* evidence("update-baseline-profile.json", RetainedProfile, profile)] })
+            })),
+            () => Effect.gen(function* () {
+              if (cleanupErrors.length !== cleanupStart) {
+                fixtureCleanupFailed = true
+                return
+              }
+              yield* (Option.isSome(previous) ? ownership.replace(previous.value.candidate).pipe(Effect.asVoid) : ownership.reset(yield* candidate))
+            }).pipe(Effect.catchAllCause(cause => Effect.sync(() => {
+              fixtureCleanupFailed = true
+              cleanupErrors.push(`Restore candidate after update baseline: ${Cause.pretty(cause)}`)
+            }))),
+          )
+        }
         case "P1": {
           if (source) {
             const result = yield* source.compile
@@ -290,7 +344,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
       return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, hostEvidence] })
-    }).pipe(Effect.onExit(exit => Exit.isFailure(exit) ? Effect.gen(function* () {
+    }).pipe(Effect.provide(Layer.mergeAll(Layer.succeed(FileSystem.FileSystem, fs), Layer.succeed(ArtifactStore, objects), Layer.succeed(ProcessExecutor, processes))), Effect.onExit(exit => Exit.isFailure(exit) ? Effect.gen(function* () {
       const identity = `${test.id}-${Option.getOrElse(test.harness, () => "shared")}`
       const detail = Cause.pretty(exit.cause).replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").slice(0, 32 * 1024)
       diagnostics.set(identity, yield* evidence(`${identity}-failure.json`, Schema.Struct({ detail: Schema.String }), { detail }))
@@ -324,6 +378,14 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const item = yield* publishEvidenceFile(evidenceDirectory, relative, maxBytes)
     finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, item] }
   }).pipe(Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Evidence ${relative}: ${error.message}`) })))
+  const baselineEvidence = join(evidenceDirectory, "update-baseline")
+  if (yield* fs.exists(baselineEvidence)) {
+    const launches = ["", ...(yield* fs.readDirectory(baselineEvidence)).filter(name => /^relaunch-\d+$/.test(name))]
+    for (const launch of launches) for (const file of ["ui-trace.zip", "desktop.log"]) {
+      const relative = join("update-baseline", launch, file)
+      if (yield* fs.exists(join(evidenceDirectory, relative))) yield* exportFile(relative, "U1", file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+    }
+  }
   if (yield* fs.exists(join(evidenceDirectory, "desktop", "ui-trace.zip"))) yield* exportFile("desktop/ui-trace.zip", "I3", 128 * 1024 * 1024)
   const desktopEvidence = join(evidenceDirectory, "desktop")
   if (yield* fs.exists(desktopEvidence)) {

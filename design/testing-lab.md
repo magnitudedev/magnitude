@@ -157,6 +157,14 @@ Update controls expose rendered transfer state and candidate version through sta
 The driver uses the normal Settings actions and surfaces failed or unavailable updates promptly.
 A renderer interaction test alone cannot qualify installation, trust or retained-data acceptance;
 those require an old/new package pair and observation of the resulting installed application.
+The baseline case consumes both admitted artifact graphs before changing any installation. It
+uses a separate profile and native control directory, verifies the previous desktop/service/CLI
+payload identity, and proves persisted settings across a new application and service instance.
+System package managers have one installation: baseline setup suspends the primary desktop,
+temporarily replaces the package, closes the baseline app and restores the prior package ownership.
+An originally absent installation remains lazy. Cleanup or restoration failure prevents later
+cases from using uncertain native state. Direct package restoration is fixture management and
+cannot qualify an application-driven update. Baseline traces and profile digests are retained.
 Private update fixtures own a loopback HTTPS listener, temporary TLS material and an ephemeral
 publisher. Their public configuration is compiled into acceptance packages before execution;
 ordinary production packages cannot be relabelled as accepting that trust. Certificate trust is

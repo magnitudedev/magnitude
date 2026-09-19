@@ -15,6 +15,8 @@ import { command, CommandOutput, ProcessExecutorLive } from "../src/process"
 import { assertRuntime } from "../src/runtime"
 import { extractSource, snapshotSource } from "../src/snapshot"
 import { updateFixture } from "../src/update-fixture"
+import { UpdateBaseline, verifyUpdateBaseline } from "../src/suites/update"
+import { inspectPackageIdentity, PackageIdentity } from "../src/suites/package"
 
 /** Native acquisition gate; installation/relaunch remains a separate probe phase. */
 const run = Effect.gen(function* () {
@@ -63,13 +65,15 @@ const run = Effect.gen(function* () {
     const installed = yield* installationSession(candidate, detail => { cleanupErrors.push(detail) })
     const app = yield* installed.get
     const state = yield* fs.makeTempDirectoryScoped({ prefix: "ml-update-state-" })
+    const appEnvironment = { ...environment, HOME: home, NODE_EXTRA_CA_CERTS: fixture.caPath, MAGNITUDE_DESKTOP_STATE_DIR: state }
     const session = yield* desktopSession({ executable: app.executable, profile: join(root, "profile"), evidence: join(root, "evidence"), port: 11449,
-      environment: { ...environment, HOME: home, NODE_EXTRA_CA_CERTS: fixture.caPath, MAGNITUDE_DESKTOP_STATE_DIR: state },
+      environment: appEnvironment,
     }, detail => { cleanupErrors.push(detail) })
+    const baseline = yield* verifyUpdateBaseline(session, previousVersion)
+    yield* fs.writeFileString(join(root, "baseline.json"), yield* Schema.encode(Schema.parseJson(UpdateBaseline))(baseline))
     const driver = yield* session.driver
-    if ((yield* driver.host()) !== previousVersion) return yield* new AssertionFailure({ message: "Previous installed app has the wrong version" })
-    yield* driver.theme("dark")
-    yield* driver.updates.automatic(false)
+    const identity = yield* inspectPackageIdentity(app, yield* driver.host(), appEnvironment)
+    yield* fs.writeFileString(join(root, "baseline-package.json"), yield* Schema.encode(Schema.parseJson(PackageIdentity))(identity))
     const update = { path: join(root, "candidate/artifacts", zip.filename), version: nextVersion,
       target: { os: "darwin", arch: "arm64", package: "mac-zip" } as const, bytes: zip.bytes, sha256: Digest.make(zip.sha256) }
     yield* fixture.publish(update, "Corrupt")

@@ -599,8 +599,11 @@ Both manifests must be registered by the caller before admission. Missing baseli
 is rejected. Namespace transport and outward HTTP workers transfer both verified graphs; worker
 credentials do not gain access to other owner uploads. Tests exercise baseline graph download,
 revoked/missing access, native-executor handoff and real HTTP/PostgreSQL admission rejection.
-This input path is implemented; U1–U6 still require installation-transition orchestration and
-a running signed update fixture. A supplied baseline is not yet proof of a valid upgrade pair.
+The shared worker executes U1 from this input: it validates the package pair before native changes,
+installs the previous package into a separate profile/control directory, verifies desktop/service/CLI
+identity and persists appearance across an actual application/service restart. It then closes the
+baseline and restores the primary package ownership. Missing baseline blocks U1; an invalid pair
+fails before changing the installation. U2–U6 worker integration remains outstanding.
 
 Update pair preparation now verifies and materializes the previous native installer, the
 candidate native installer, and the candidate update archive before installation changes.
@@ -609,8 +612,7 @@ Both releases must contain exactly one installer matching the target host and pa
 macOS additionally needs exactly one matching ZIP, while Windows/Linux update with their native
 EXE/DEB/RPM. Content-address verification and byte counts apply to all materialized files.
 Seven pair/candidate tests passed across these package formats. These are artifact-preparation
-fixtures, not native upgrades; publisher trust, installed binary identity and U1–U6 orchestration
-still require the actual application transition.
+fixtures, not native upgrades; publisher trust and U2–U6 still require the actual application transition.
 
 Installation sessions can now replace the owned package for baseline fixture setup. Replacement
 is serialized, repeated requests for the same candidate share the installed result, failed
@@ -618,6 +620,21 @@ removal retains the previous owner, and failed installation leaves an absent sta
 requested package for a later explicit attempt. Cancellation waits for admitted native mutation
 so cleanup ownership is not lost. Eight ownership tests cover these paths. This mechanism is
 not an updater and cannot satisfy U2 by directly installing the candidate.
+The session also exposes current ownership and can reset its next candidate without installing it.
+This preserves lazy installation when a standalone baseline case had no preceding native install.
+If baseline application cleanup or package restoration fails, the worker blocks further native
+cases and records cleanup failure. It exports both baseline launch traces, process logs, package
+identity, owner identities and a digest-only snapshot of persisted profile files.
+
+Set `LAB_WORKER_BASELINE` to the previous release manifest when using
+`scripts/artifact-worker-probe.ts` to exercise U1 between candidate installation and candidate CLI
+verification/removal. The local macOS15 ARM64 run at
+`/tmp/ml-update-baseline-verified-20260919/result.json` passed its seven selected cases with no cleanup
+errors. It verified the 0.1.3 baseline through two distinct app/service instances, restored 0.1.4,
+verified that candidate's bundled CLI and removed the installation. Baseline traces/logs were exported
+to content-addressed evidence. Both packages came from the same source with fixture versions; this
+does not qualify historical migration, native updater replacement, or Windows/Linux execution.
+Thirty-one focused worker, baseline, pair and ownership tests pass, as does targeted typechecking.
 
 Private acceptance routing is now selected through a compiled update configuration. Set
 `MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG` to a JSON file when invoking the existing release

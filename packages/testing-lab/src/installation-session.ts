@@ -1,4 +1,4 @@
-import { Effect, Ref, Schema } from "effect"
+import { Effect, Option, Ref, Schema } from "effect"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { Candidate } from "./candidate"
 import { InstalledApplication, Installer } from "./installer"
@@ -28,17 +28,23 @@ export const installationSession = (candidate: Candidate, onCleanupError: (detai
   })
   const get = semaphore.withPermits(1)(Effect.uninterruptible(install))
   const remove = semaphore.withPermits(1)(Effect.uninterruptible(uninstall))
-  /** Fixture preparation only: replacing an installer cannot qualify an application's self-update. */
-  const replace = (next: Candidate) => semaphore.withPermits(1)(Effect.uninterruptible(Effect.gen(function* () {
+  const current = semaphore.withPermits(1)(Ref.get(state).pipe(Effect.map(value => value._tag === "Present" ? Option.some(value.application) : Option.none())))
+  const resetTo = (next: Candidate) => Effect.gen(function* () {
     if (!Schema.equivalence(Target)(candidate.target, next.target)) return yield* new AssertionFailure({ message: "Cannot replace an installation with a different test target" })
-    const current = yield* Ref.get(state)
-    if (current._tag === "Present" && Schema.equivalence(Candidate)(current.application.candidate, next)) return current.application
     yield* uninstall
     const absent = yield* Ref.get(state)
     if (absent._tag !== "Absent") return yield* Effect.dieMessage("Installation gate did not retain absent ownership")
     yield* Ref.set(state, lifecycle.transition(absent, "Absent", { candidate: next }))
+  })
+  /** Select the next fixture without installing it; preserve lazy ownership after temporary suites. */
+  const reset = (next: Candidate) => semaphore.withPermits(1)(Effect.uninterruptible(resetTo(next)))
+  /** Fixture preparation only: replacing an installer cannot qualify an application's self-update. */
+  const replace = (next: Candidate) => semaphore.withPermits(1)(Effect.uninterruptible(Effect.gen(function* () {
+    const current = yield* Ref.get(state)
+    if (current._tag === "Present" && Schema.equivalence(Candidate)(current.application.candidate, next)) return current.application
+    yield* resetTo(next)
     return yield* install
   })))
   yield* Effect.addFinalizer(() => remove.pipe(Effect.catchAll(error => Effect.sync(() => { onCleanupError(error.message) }))))
-  return { get, remove, replace }
+  return { get, remove, replace, reset, current }
 })

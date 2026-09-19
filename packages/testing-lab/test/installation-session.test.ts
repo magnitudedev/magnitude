@@ -9,6 +9,23 @@ import { AssertionFailure } from "../src/domain"
 const target = targets.find(target => target.id === "macos-15-arm64-metal-apple-silicon")!
 const candidate = Schema.decodeUnknownSync(Candidate)({ version: "0.1.3", target, path: "/candidate.dmg",
   artifact: { id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64", filename: "Magnitude.dmg", bytes: 1, sha256: "a".repeat(64) } })
+test("restores an absent fixture without installing it or retaining the temporary version", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const events: string[] = []
+  yield* Effect.gen(function* () {
+    const session = yield* installationSession(candidate, () => {})
+    expect(Option.isNone(yield* session.current)).toBe(true)
+    const previous = Candidate.make({ ...candidate, version: "0.1.2", path: "/previous.dmg" })
+    yield* session.replace(previous)
+    expect(Option.getOrThrow(yield* session.current).candidate.version).toBe("0.1.2")
+    yield* session.reset(candidate)
+    expect(Option.isNone(yield* session.current)).toBe(true)
+    expect(events).toEqual(["install:0.1.2", "remove:0.1.2"])
+    expect((yield* session.get).candidate.version).toBe("0.1.3")
+  }).pipe(Effect.provideService(Installer, {
+    install: value => Effect.sync(() => { events.push(`install:${value.version}`); return InstalledApplication.make({ candidate: value, root: "/app", executable: "/app/exe", cli: "/app/cli", packageVersion: value.version }) }),
+    uninstall: value => Effect.sync(() => { events.push(`remove:${value.candidate.version}`) }),
+  }))
+}))))
 for (const scenario of ["reinstall", "remove", "remove-fails"] as const) test(`tracks installation ownership for ${scenario}`, async () => {
   let installs = 0, removals = 0
   const cleanupErrors: string[] = []
