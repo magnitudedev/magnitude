@@ -128,6 +128,11 @@ Installed-package ownership follows explicit present/absent transitions. Removal
 ownership only after the native uninstaller succeeds; reinstall acquires new ownership.
 Final cleanup removes only the currently owned installation. Dangling package launcher
 symlinks count as removal failures even when their targets no longer exist.
+Fixture replacement serializes removal and installation under the same ownership gate.
+Failed removal retains the previous owner; failed replacement installation leaves no owned
+installation and retains the requested package for an explicit subsequent attempt. Cancellation
+cannot discard ownership of a native installation that completed during the transition.
+Installing a replacement directly is fixture preparation, never proof of application self-update.
 User-data retention compares the stopped application's complete isolated profile before and
 after native removal, including file contents, directories and symbolic links without following
 links outside the profile. Evidence contains hashes rather than file contents. Reinstall must

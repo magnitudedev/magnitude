@@ -603,3 +603,25 @@ credentials do not gain access to other owner uploads. Tests exercise baseline g
 revoked/missing access, native-executor handoff and real HTTP/PostgreSQL admission rejection.
 This input path is implemented; U1–U6 still require installation-transition orchestration and
 acceptance trust routing. A supplied baseline is not yet proof of a valid upgrade pair.
+
+Update pair preparation now verifies and materializes the previous native installer, the
+candidate native installer, and the candidate update archive before installation changes.
+Candidate version must be newer; identical installer bytes cannot represent different versions.
+Both releases must contain exactly one installer matching the target host and package format.
+macOS additionally needs exactly one matching ZIP, while Windows/Linux update with their native
+EXE/DEB/RPM. Content-address verification and byte counts apply to all materialized files.
+Seven pair/candidate tests passed across these package formats. These are artifact-preparation
+fixtures, not native upgrades; publisher trust, installed binary identity and U1–U6 orchestration
+still require the actual application transition.
+
+Installation sessions can now replace the owned package for baseline fixture setup. Replacement
+is serialized, repeated requests for the same candidate share the installed result, failed
+removal retains the previous owner, and failed installation leaves an absent state with the
+requested package for a later explicit attempt. Cancellation waits for admitted native mutation
+so cleanup ownership is not lost. Eight ownership tests cover these paths. This mechanism is
+not an updater and cannot satisfy U2 by directly installing the candidate.
+
+An integration constraint remains: the current product download resolver admits only GitHub
+release-asset URLs. Private unpublished update fixtures need an explicit acceptance-build
+routing policy; production download/trust restrictions must remain intact. No private-update
+routing change or successful native update is claimed yet.
