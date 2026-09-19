@@ -159,10 +159,10 @@ export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => 
   return "Magnitude service could not start. See diagnostics for details."
 }
 
+const DESKTOP_APP_ORIGIN = "magnitude://app"
+
 function isAllowedCorsOrigin(origin: string): boolean {
-  return (
-    LOCAL_HTTP_ORIGIN.test(origin) || origin === "file://" || origin === "null"
-  )
+  return LOCAL_HTTP_ORIGIN.test(origin) || origin === DESKTOP_APP_ORIGIN
 }
 
 function corsHeadersFor(

@@ -27,6 +27,7 @@ import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
 import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
 import { HttpsUrlSchema, MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
+import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
 import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
@@ -100,6 +101,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     }).pipe(Effect.provide(NativeMacApplicationInstallation))
   }
   yield* Effect.promise(() => app.whenReady())
+  yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -190,7 +192,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   let wantsWindow = !background
   const loadRenderer = () => Effect.tryPromise(() => process.env.ELECTRON_RENDERER_URL
     ? window.loadURL(process.env.ELECTRON_RENDERER_URL)
-    : window.loadFile(join(here, "../renderer/index.html"))).pipe(
+    : window.loadURL(`${DESKTOP_APP_ORIGIN}/index.html`)).pipe(
       Effect.catchAll(error => rendererRecovery.loadFailed.pipe(Effect.zipRight(Effect.logError(error)))),
     )
   const show = (page?: Page) => Ref.get(state).pipe(Effect.flatMap(current => current?._tag === "Stopping" || current?._tag === "Stopped" ? Effect.void : Effect.gen(function* () {
