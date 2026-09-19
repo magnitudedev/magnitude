@@ -17,8 +17,12 @@ impl Reconstruction<ScalarProgram> for Plan {
     fn reconstruct(&self, witness:&magnitude_solver::FeasibleSolution, lower_bound:u64)->Result<Reconstructed<ScalarProgram>,String> {
         let values=witness.values();
         let (source,mut decisions)=self.source.reconstruct(values)?;
-        let template=self.template.as_ref().ok_or("CPU scalar family is not constructed")?;
-        let assignment=self.parameters.iter().map(|id|values.get(id.0).and_then(|&n|usize::try_from(n).ok()).ok_or("CPU scalar parameter assignment missing")).collect::<Result<Vec<_>,_>>()?;
+        // Materialize the selected execution from the reconstructed concrete
+        // source. Implementation numeric decisions (segment/traversal widths,
+        // capacities) are already resolved here, so the scalar program has
+        // constant loop bounds instead of residual symbolic parameters.
+        let template=ScalarFamily::new(&source,crate::host_call_conv()?,seismic_realization::Dispatch::Sequential,seismic_realization::dispatch::Participation::Thread)?;
+        let assignment=vec![0usize;template.domains().len()];
         let mut program=template.instantiate(&assignment)?;
         program.conditions=seismic_realization::InvocationConditions::from_lowered(&source)?;
         let objective=self.account.as_ref().ok_or("CPU accounting remains unresolved")?.reconstruct(values,lower_bound)?;
@@ -36,7 +40,7 @@ impl Reconstruction<ScalarProgram> for Plan {
 }
 
 pub(super) fn build(input:Input<'_>,hardware:&ScalarHardware,workload:&ScalarWorkload,limits:DerivationLimits)->Result<Export<ScalarProgram>,String> {
-    let family=Binding::construct(input,"cpu")?;
+    let family=Arc::new(Binding::construct(input,"cpu")?.expanded()?);
     let mut builder=ModelBuilder::new();
     builder.units(format!("{} / {} seconds",hardware.timebase.seconds_numerator,hardware.timebase.seconds_denominator));
     let source=Binding::append(&mut builder,family.clone())?;

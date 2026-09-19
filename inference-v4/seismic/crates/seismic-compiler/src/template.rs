@@ -93,12 +93,16 @@ impl ScalarFamily {
         let mut retained=SourceRegions {family,function:family.template().clone(),parameters:Vec::new(),variables:Vec::new()};
         retained.function.body=retained.region(family.root())?;
         let normalized=seismic_lang::reduction::structured::materialize(&retained.function)?;
-        let loads=loads::Family::new(normalized)?;
+        let mut loads=loads::Family::new(normalized)?;
         // Effect analysis must preserve guarded legality before borrowing is
-        // admitted. A topology-sensitive proof cannot be replaced with the
-        // conservative result of analyzing the union as one runtime program.
-        if !retained.parameters.is_empty() && loads.sites().iter().any(|site|!site.can_borrow && site.selected.is_none() && choice_affects_snapshot(&loads.function().body,site.variable,&retained.variables)) {
-            return Err(Error::Unsupported("source-dependent load ownership needs a guard-conditioned snapshot lifetime proof".into()));
+        // admitted. When a source choice can change a snapshot's lifetime, the
+        // guard-conditioned borrow proof is unavailable, so that site keeps its
+        // conservative materializing mode instead of a possibly-unsound borrow.
+        if !retained.parameters.is_empty() {
+            let guard_dependent = loads.sites().iter().enumerate().filter(|(_,site)|site.can_borrow && site.selected.is_none()
+                && choice_affects_snapshot(&loads.function().body,site.variable,&retained.variables))
+                .map(|(index,_)|index).collect::<Vec<_>>();
+            for site in guard_dependent { loads.restrict(site,LoadMode::Materialize)?; }
         }
         let function=loads.instantiate(&vec![0;loads.domains().len()])?;
         let choices=loads.sites().iter().zip(loads.domains()).enumerate().filter(|(_,(_,domain))|domain.len()>1).map(|(site,(definition,_))|(definition.variable,site)).collect();

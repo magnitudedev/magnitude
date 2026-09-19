@@ -54,6 +54,15 @@ impl Family {
         family.domains = domains;
         Ok(family)
     }
+    /// Restrict one site to a single legal mode. A guard-conditioned lifetime
+    /// proof may be unavailable; the conservative mode must then be sound on
+    /// its own. This never admits a borrow the original domain did not allow.
+    pub fn restrict(&mut self, site: usize, mode: LoadMode) -> Result<(), String> {
+        let legal = self.domains.get(site).ok_or("load site is outside the family")?;
+        if !legal.contains(&mode) { return Err("restricted load mode is not legal at this site".into()); }
+        self.domains[site] = vec![mode];
+        Ok(())
+    }
     pub fn function(&self) -> &LoweredIr { &self.function }
     pub fn sites(&self) -> &[Site] { &self.sites }
     pub fn domains(&self) -> &[Vec<LoadMode>] { &self.domains }

@@ -9,12 +9,11 @@ struct Prepared {
 impl Expander {
     pub(super) fn step_allocations(&mut self, reduction: &ReductionFamily, site: &Site) -> Result<RegionId, String> {
         let implementation = reduction.operation.step.as_ref().and_then(|step| step.implementation.as_ref()).ok_or("fold has no step parameter bindings")?.clone();
+        // Every step parameter used by the callback is allocated in the
+        // enclosing scope. A state-retention choice only changes how the output
+        // is published; the binding identity itself must outlive that choice.
         let mut setup = vec![self.allocations(&implementation.left, site)];
-        if let Some(decision) = &reduction.state {
-            let separate = self.allocations(&implementation.output, &self.active(site, decision, 0));
-            let retained = self.sequence(Vec::new(), &self.active(site, decision, 1));
-            setup.push(self.branch(decision, vec![separate, retained], site));
-        } else { setup.push(self.allocations(&implementation.output, site)); }
+        setup.push(self.allocations(&implementation.output, site));
         Ok(self.sequence(setup, site))
     }
     pub(super) fn step_visit(&mut self, reduction: &ReductionFamily, state: &[Expr], inputs: &[Expr], site: &Site) -> Result<(RegionId, RegionId), String> {
@@ -37,11 +36,10 @@ impl Expander {
         }).collect::<Result<Vec<_>, _>>()?;
         for (input, (target, prepared)) in targets.iter().zip(inputs).enumerate() {
             let operand = reduction.operands.iter().find(|(candidate, _)| *candidate == input).map(|(_, decision)| decision);
-            if let Some(decision) = operand {
-                let private = self.allocations(std::slice::from_ref(target), &self.active(site, decision, 0));
-                let view = self.sequence(Vec::new(), &self.active(site, decision, 1));
-                setup.push(self.branch(decision, vec![private, view], site));
-            } else { setup.push(self.allocations(std::slice::from_ref(target), site)); }
+            // The operand binding is read by the shared callback, so it is
+            // allocated once here regardless of the ownership arm. The choice
+            // below selects copy or load into that same enclosing binding.
+            setup.push(self.allocations(std::slice::from_ref(target), site));
             let mut ownership = Vec::new();
             for mode in 0..(if operand.is_some() { 2 } else { 1 }) {
                 let ownership_site = operand.map_or_else(|| site.clone(), |decision| self.active(site, decision, mode));
@@ -51,8 +49,13 @@ impl Expander {
                     let value = at.map_or_else(|| source.clone(), |index| structured::slice(source, reduction.operation.axis,
                         &symbol(index.sym.as_ref().unwrap().sub(offset), site.span), site.span));
                     let prepared = if mode == 1 {
-                        let borrowed = Expr { kind: ExprKind::Load { view: Box::new(value), mode: LoadMode::Borrow }, ty: target.ty.clone(), sym: None, span: site.span };
-                        self.statement(stmt(StmtKind::Assign { target: target.clone(), op: AssignOp::Assign, value: borrowed }, site.span), &active)
+                        // The operand binding outlives the ownership choice, so
+                        // a view must own its storage here: a loan crossing the
+                        // choice needs a guard-conditioned lifetime proof that
+                        // this representation does not carry. Materializing is
+                        // the same operand value without that obligation.
+                        let loaded = Expr { kind: ExprKind::Load { view: Box::new(value), mode: LoadMode::Materialize }, ty: target.ty.clone(), sym: None, span: site.span };
+                        self.statement(stmt(StmtKind::Assign { target: target.clone(), op: AssignOp::Assign, value: loaded }, site.span), &active)
                     } else { self.copies(std::slice::from_ref(target), std::slice::from_ref(&value), &active) };
                     preparations.push(prepared);
                 }
@@ -226,10 +229,12 @@ impl Expander {
         let within_extent = self.conditional(condition(at.clone(), BinaryOp::Lt, extent, site.span), visit, empty, site);
         let empty = self.sequence(Vec::new(), site);
         let within_window = self.conditional(condition(at, BinaryOp::Lt, start.add(&length), site.span), within_extent, empty, site);
-        let ExprKind::Var(index) = copy.kind else { unreachable!() };
-        let effects = self.family.regions[within_window.0].effects.clone();
-        let replicated = self.push(site, RegionKind::Replicated { index, count: width.clone(), body: within_window }, effects);
-        setup.push(self.range(&chunk, Sym::constant(0), length.add(&width).sub(&Sym::constant(1)).quot(&width), replicated, site));
+        // A window walks the original copy index serially. Its width is a
+        // residual numeric source parameter, so this is a runtime range rather
+        // than static code replication; effects and recurrence are computed
+        // over the loop instead of unrolled copies.
+        let window = self.range(&copy, Sym::constant(0), width.clone(), within_window, site);
+        setup.push(self.range(&chunk, Sym::constant(0), length.add(&width).sub(&Sym::constant(1)).quot(&width), window, site));
         Ok(self.sequence(setup, site))
     }
     fn snapshot(&mut self, source: &Expr, axis: usize, start: Sym, length: Sym, extent: Sym, site: &Site) -> Result<(Expr, RegionId), String> {

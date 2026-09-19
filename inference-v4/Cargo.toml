@@ -34,5 +34,8 @@ seismic-compiler = { path = "seismic/crates/seismic-compiler" }
 seismic-cuda = { path = "seismic/crates/seismic-cuda" }
 seismic-runtime = { path = "seismic/crates/seismic-runtime" }
 
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 debug = 1
