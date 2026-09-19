@@ -285,6 +285,10 @@ validated AzureConfig JSON file, `LAB_AZURE_PROBE_ROOT` to a diagnostic director
 `LAB_AZURE_TARGET=ubuntu-24.04-x64-cpu-intel`. The configured subnet must already exist in the
 same subscription/resource group. This probe owns its VM/NIC/disk, not the shared subnet. It does
 not qualify app installation, artifact transfer, the full guest bootstrap or GPU execution.
+Full workers also require an explicit outbound route, such as a NAT gateway, for package
+repositories, admitted artifact downloads and model downloads. A private NIC alone does not
+establish Internet egress. The allocator does not modify shared network policy or attach public
+IPs to workers; provision and account for the subnet's egress separately.
 The live probe passed in the credited subscription's `magnitude-ci` group in WestUS2 with
 Standard_D4s_v6 and Canonical Ubuntu24.04 image24.04.202609040. The VM had no public IP;
 the guest reported Ubuntu24.04, x86_64 and GenuineIntel. VM, disk and NIC cleanup passed.
@@ -405,6 +409,22 @@ The real occupied-port service failure/recovery probe passed at
 to the worker, but full A7 acceptance is not claimed: OpenCode's diagnostic remains
 a known failure, and the combined worker scenario has not yet been qualified on
 the complete target matrix. No test fault terminates an existing port owner.
+
+R4 generates and attests the requested backend, terminates only the verified resident
+inference worker, observes the model's failed state, explicitly reloads, then generates
+and attests again. The native worker generation must change while the application,
+service and persistent inference server remain the same. Before/fault/after receipts
+survive failed assertions. Linux uses pidfds after checking the installed executable,
+worker role, user and service ancestry; macOS and Windows termination remain blocked
+until their native mechanisms are implemented and qualified. Unit coverage does not
+qualify a native crash/recovery journey.
+
+The clean Azure Ubuntu 24.04 Intel run at `/tmp/ml-worker-recovery-egress-20260919/verified-result.json`
+passed all 13 selected package/install/app/generation/recovery/removal cases. Worker generation
+changed from 1 to 2 and both generations returned `HELLO` with the admitted CPU module; app,
+service and persistent ICN identities were unchanged. The native pidfd fixture also passed refusal
+of a foreign profile, parent and service PID. This qualifies the Linux CPU journey on that guest;
+CUDA, other distributions and other operating systems still require native qualification.
 
 R5 is connected: bundled CLI stop must reach `Unloaded`, reload must reach `Ready`,
 and a subsequent endpoint generation must complete. The real packaged macOS 15 ARM64

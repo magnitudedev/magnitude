@@ -23,3 +23,22 @@ for (const fault of ["none", "stop", "load"] as const) test(`model reload observ
   expect(result._tag).toBe(fault === "none" ? "Right" : "Left")
   expect(calls).toEqual(fault === "stop" ? ["stop", "status"] : ["stop", "status", "load", "status"])
 })).pipe(Effect.provide(BunContext.layer))))
+
+test("worker recovery observes failure and loads explicitly without a stop command", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const evidence = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-reload-" })
+  const calls: string[] = []
+  let loaded = false
+  const executor = Layer.succeed(ProcessExecutor, { run: spec => Effect.sync(() => {
+    const operation = spec.args[1]!
+    calls.push(operation)
+    if (operation === "load") loaded = true
+    return { exitCode: 0, stderr: "", stdout: operation === "status" ? `Runtime ${loaded ? "Ready" : "Failed"}` : "Requested" }
+  }) })
+  yield* Effect.gen(function* () {
+    const cli = yield* CliTests
+    yield* cli.failedModel
+    yield* cli.loadModel
+  }).pipe(Effect.provide(bundledCliTests({ executable: "/installed/magnitude", version: "0.1.3", model: "model", evidence, environment: {} }).pipe(Layer.provide(executor))))
+  expect(calls).toEqual(["status", "load", "status"])
+})).pipe(Effect.provide(BunContext.layer))))

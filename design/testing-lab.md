@@ -290,6 +290,12 @@ Error scenarios preserve malformed harness files and restore the original fixtur
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback
 listener; recovery requires successful startup after that listener is released.
+Resident-worker fault injection must verify the installed executable, inference-worker role and
+ancestry under the owning service before terminating that exact process. Recovery observes the
+failed model instance and explicitly reloads it; it never assumes automatic reload. A new native
+worker generation must again match the admitted modules and requested backend while the app,
+service and persistent inference-server identities remain unchanged. Before/fault/after evidence
+is retained even when recovery fails. Unqualified native termination mechanisms block this case.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
 Backend acceptance must correlate its public generation with the native completion and target-model

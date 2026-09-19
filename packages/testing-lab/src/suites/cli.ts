@@ -11,6 +11,8 @@ export interface CliTests {
   readonly ensureService: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly inspect: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly reloadModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly loadModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly failedModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly modelLifecycle: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly connections: (harness: typeof Harness.Type, inspect: (connected: boolean) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly invalid: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
@@ -34,24 +36,31 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
   const successful = (args: readonly string[]) => invoke(args).pipe(Effect.flatMap(result => result.exitCode === 0 ? Effect.succeed(result.stdout)
     : Effect.fail(fail(`Bundled CLI ${args.join(" ")} exited ${result.exitCode}: ${(result.stderr || result.stdout).slice(-1000)}`))))
   const assert = (condition: boolean, detail: string) => condition ? Effect.void : Effect.fail(fail(detail))
+  const loadModel = Effect.gen(function* () {
+    yield* successful(["models", "load", config.model])
+    yield* Effect.gen(function* () {
+      const status = yield* successful(["models", "status", config.model])
+      yield* assert(!/Runtime\s+Failed/.test(status), "CLI model load failed")
+      return /Runtime\s+Ready/.test(status)
+    }).pipe(Effect.repeat({ until: ready => ready, schedule: Schedule.spaced("1 second") }),
+      Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
+  })
   const reloadModel = Effect.gen(function* () {
-      yield* successful(["models", "stop"])
-      yield* Effect.gen(function* () {
-        const status = yield* successful(["models", "status", config.model])
-        yield* assert(!/Runtime\s+Failed/.test(status), "CLI model stop failed")
-        return /Runtime\s+Unloaded/.test(status)
-      }).pipe(Effect.repeat({ until: stopped => stopped, schedule: Schedule.spaced("1 second") }),
-        Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("CLI stop did not unload the model") }))
-      yield* successful(["models", "load", config.model])
-      yield* Effect.gen(function* () {
-        const status = yield* successful(["models", "status", config.model])
-        yield* assert(!/Runtime\s+Failed/.test(status), "CLI model load failed")
-        return /Runtime\s+Ready/.test(status)
-      }).pipe(Effect.repeat({ until: ready => ready, schedule: Schedule.spaced("1 second") }),
-        Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
+    yield* successful(["models", "stop"])
+    yield* Effect.gen(function* () {
+      const status = yield* successful(["models", "status", config.model])
+      yield* assert(!/Runtime\s+Failed/.test(status), "CLI model stop failed")
+      return /Runtime\s+Unloaded/.test(status)
+    }).pipe(Effect.repeat({ until: stopped => stopped, schedule: Schedule.spaced("1 second") }),
+      Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("CLI stop did not unload the model") }))
+    yield* loadModel
   })
   return {
     reloadModel,
+    loadModel,
+    failedModel: successful(["models", "status", config.model]).pipe(Effect.map(status => /Runtime\s+Failed/.test(status)),
+      Effect.repeat({ until: failed => failed, schedule: Schedule.spaced("1 second") }), Effect.asVoid,
+      Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("Lost inference worker did not become a failed model instance") })),
     ensureService: successful(["service", "start"]).pipe(Effect.asVoid),
     version: successful(["--version"]).pipe(Effect.flatMap(output => assert(output.trim() === config.version, "Bundled CLI version differs from installed candidate"))),
     inspect: Effect.gen(function* () {
