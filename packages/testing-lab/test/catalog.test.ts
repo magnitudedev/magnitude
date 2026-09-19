@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest"
 import { Effect, Option, Schema } from "effect"
-import { cases, planRun, prTargetIds, targets } from "../src/catalog"
+import { cases, planRun, prTargetIds, selectedHarnesses, targets } from "../src/catalog"
 import { RunRequest } from "../src/domain"
 
 export const request = (selection: unknown = { kind: "profile", profile: "pr" }) => Schema.decodeUnknownSync(RunRequest)({
@@ -38,6 +38,22 @@ describe("coverage policy", () => {
   test("does not allow a full or release claim to be narrowed implicitly", async () => {
     const result = await Effect.runPromise(planRun(request({ kind: "profile", profile: "full", target: targets[0]!.id })).pipe(Effect.either))
     expect(result._tag).toBe("Left")
+  })
+  test("quick harness overrides preserve the same case selection and worker clients", async () => {
+    const base = { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }
+    const defaultPlan = await Effect.runPromise(planRun(request(base)))
+    const configured = request({ ...base, harnesses: ["opencode", "hermes"] })
+    const plan = await Effect.runPromise(planRun(configured))
+    expect(new Set(plan.targets[0]!.cases.map(test => test.id))).toEqual(new Set(defaultPlan.targets[0]!.cases.map(test => test.id)))
+    expect(plan.targets[0]!.cases.filter(test => test.id === "H5").map(test => Option.getOrThrow(test.harness))).toEqual(["opencode", "hermes"])
+    expect(selectedHarnesses(configured.selection)).toEqual(["opencode", "hermes"])
+    expect(selectedHarnesses(defaultPlan.request.selection)).toEqual(["pi"])
+  })
+  test("API callers cannot narrow broad profiles or duplicate a harness", async () => {
+    for (const profile of ["pr", "full", "release"]) {
+      expect((await Effect.runPromise(planRun(request({ kind: "profile", profile, harnesses: ["pi"] })).pipe(Effect.either)))._tag).toBe("Left")
+    }
+    expect((await Effect.runPromise(planRun(request({ kind: "profile", profile: "quick", target: targets[0]!.id, harnesses: ["pi", "pi"] })).pipe(Effect.either)))._tag).toBe("Left")
   })
   test("release refuses source, warm reuse, or untrusted execution", async () => {
     expect(await Effect.runPromise(planRun(request({ kind: "profile", profile: "release" })).pipe(Effect.either))).toMatchObject({ _tag: "Left" })

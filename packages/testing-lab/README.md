@@ -430,3 +430,22 @@ for service readiness. Its X2 prerequisite remains enforced. The native macOS pr
 and reinstall, with no cleanup errors. This is not login-startup or cross-platform
 qualification. Isolated product profiles intentionally disable login startup; that
 case needs its own disposable native-user execution path.
+
+## Local selection and CI reports
+
+`bun lab run --source . --target ubuntu-24.04-x64-cpu-intel --suite app,cli --harness pi,hermes`
+submits the current unpublished source with those suites and their prerequisites.
+Custom selection requires explicit targets (comma-separated for multiple targets),
+replaces profile selection, and defaults to all three harnesses. Empty or duplicate
+selection entries are rejected. `--profile quick --harness opencode,hermes` replaces
+Pi while preserving quick's case selection. PR/full/release cannot be narrowed with
+that flag; use an explicit custom suite selection.
+
+Add `--json out/run.json --junit out/junit.xml` to a waiting run, or use these flags
+with `bun lab results --run RUN_ID` to export a completed run. Output directories are
+created and each file is replaced atomically. Reports cannot accompany `--no-wait`.
+JSON preserves the complete result. JUnit records product failures as failures and
+blocked/cancelled/not-selected required cases as errors. Missing/duplicate results,
+unselected result entries and cleanup failures also become errors, so CI cannot
+mistake incomplete coverage for success. Evidence digests and paths accompany each
+case. Existing command exit-code semantics remain authoritative.

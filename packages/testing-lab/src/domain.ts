@@ -40,7 +40,8 @@ export const Input = Schema.Union(
 )
 export const Selection = Schema.Union(
   Schema.Struct({ kind: Schema.Literal("profile"), profile: Profile,
-    target: Schema.optionalWith(TargetId, { as: "Option", exact: true }) }),
+    target: Schema.optionalWith(TargetId, { as: "Option", exact: true }),
+    harnesses: Schema.optionalWith(Schema.NonEmptyArray(Harness), { as: "Option", exact: true }) }),
   Schema.Struct({ kind: Schema.Literal("custom"), targets: Schema.NonEmptyArray(TargetId),
     suites: Schema.NonEmptyArray(Suite), harnesses: Schema.NonEmptyArray(Harness) }),
 )

@@ -8,6 +8,7 @@ import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
 import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
 import { installationSession } from "./installation-session"
+import { selectedHarnesses } from "./catalog"
 import { captureRetainedProfile, RetainedProfile, verifyRetainedProfile } from "./retained-profile"
 import { ApplicationIdentity } from "./application-identity"
 import { verifyServiceOwnership } from "./suites/service"
@@ -93,8 +94,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
     const selection = assignment.plan.request.selection
-    const harnesses: readonly Harness[] = selection.kind === "custom" && selection.harnesses.length > 0 ? selection.harnesses
-      : selection.kind === "profile" && selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"]
+    const harnesses = selectedHarnesses(selection)
     const connections = assignment.target.cases.some(test => test.id === "A5" || test.id === "C4" || test.id === "A7")
       ? yield* Effect.forEach(harnesses, harness => connectionFixture(join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), harness, `http://127.0.0.1:${config.port}/inference/v1`)) : []
     const candidate = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => prepareCandidate(value.release, target, join(config.root, "candidate"))),

@@ -1,5 +1,5 @@
 import { Effect, Option, Schema } from "effect"
-import { CaseId, Harness, InvalidInput, PlannedCase, RunPlan, RunRequest, Suite, Target, TargetId } from "./domain"
+import { CaseId, Harness, InvalidInput, PlannedCase, RunPlan, RunRequest, Selection, Suite, Target, TargetId } from "./domain"
 
 const target = (os: Target["os"], version: string, arch: Target["arch"], backend: Target["backend"], hardware: Target["hardware"]): Target =>
   Schema.decodeUnknownSync(Target)({ id: `${os}-${version}-${arch}-${backend}-${hardware}`,
@@ -66,8 +66,16 @@ const updateRepresentatives = new Set(["macos-26-arm64-metal-apple-silicon", "wi
 export const findTarget = (id: TargetId) => Effect.fromNullable(targets.find(t => t.id === id)).pipe(
   Effect.mapError(() => new InvalidInput({ message: `Unknown target: ${id}` })),
 )
+export const selectedHarnesses = (selection: typeof Selection.Type): readonly Harness[] => selection.kind === "custom" ? selection.harnesses
+  : Option.getOrElse(selection.harnesses, (): readonly Harness[] => selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"])
+
 export const planRun = (request: RunRequest) => Effect.gen(function* () {
   const selection = request.selection
+  if (selection.kind === "profile" && Option.isSome(selection.harnesses) && selection.profile !== "quick") {
+    return yield* new InvalidInput({ message: "Harness overrides apply only to quick; use custom selection to narrow other profiles" })
+  }
+  const harnesses = selectedHarnesses(selection)
+  if (new Set(harnesses).size !== harnesses.length) return yield* new InvalidInput({ message: "Duplicate harnesses in selection" })
   if (selection.kind === "profile" && Option.isSome(selection.target) && selection.profile !== "quick") {
     return yield* new InvalidInput({ message: "Only quick accepts one target override; use a custom selection to narrow other profiles" })
   }
@@ -91,7 +99,6 @@ export const planRun = (request: RunRequest) => Effect.gen(function* () {
       for (const prerequisite of c.prerequisites) if (!chosen.has(prerequisite)) { chosen.add(prerequisite); include(prerequisite) }
     }
     for (const id of chosen) include(id)
-    const harnesses: readonly Harness[] = selection.kind === "custom" ? selection.harnesses : selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"]
     const expanded = cases.filter(c => chosen.has(c.id)).map(c => request.input.kind === "artifacts" && c.id === "P1"
       ? { ...c, title: "Record supplied artifact provenance without compiling" }
       : request.input.kind === "artifacts" && c.id === "P2" ? { ...c, title: "Verify supplied final package bytes without rebuilding" } : c)

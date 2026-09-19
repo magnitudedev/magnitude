@@ -6,7 +6,8 @@ import { homedir } from "node:os"
 import { configuredClientToken } from "./client-token"
 import { LabClient, labClientLayer } from "./client"
 import { planRun, targets } from "./catalog"
-import { Digest, InfrastructureFailure, InvalidInput, RunId, RunPlan, RunRequest, RunResult, Target, resultExitCode } from "./domain"
+import { Digest, InfrastructureFailure, InvalidInput, RunId, RunPlan, RunRequest, RunResult, Selection, Target, resultExitCode } from "./domain"
+import { ReportPaths, writeReports } from "./reports"
 import { ProcessExecutorLive } from "./process"
 import { manifestJson, snapshotSource } from "./snapshot"
 import { assertRuntime } from "./runtime"
@@ -21,6 +22,8 @@ const help = `Magnitude testing lab
   bun lab plan --request run.json
   bun lab run --source . --target macos-26-arm64-metal-apple-silicon
   bun lab run --source . --profile pr --budget 150 --concurrency 4
+  bun lab run --source . --target ubuntu-24.04-x64-cuda-a10 --suite harness,cli --harness pi,opencode,hermes
+  bun lab run --source . --profile pr --json out/run.json --junit out/junit.xml
   bun lab run --artifacts ./dist/release-manifest.json --profile quick
   bun lab status --run run-<uuid>
   bun lab results --run run-<uuid>
@@ -35,6 +38,10 @@ LAB_ENTRA_TENANT and LAB_ENTRA_APPLICATION after Azure CLI login and lab API con
 Identity tokens renew during long runs. --mode iterate|verify defaults to verify. --no-wait submits and
 returns the run ID. --allow-spark is explicit consent to use the shared office Spark.
 Results exit 0 only when every selected case passed and cleanup completed.
+--suite replaces profile selection and requires explicit comma-separated --target values.
+--harness selects clients for custom suites; it defaults to pi,opencode,hermes.
+With --profile quick, --harness replaces the default Pi client without changing cases.
+--json and --junit write completed reports for run or results. They cannot be used with --no-wait.
 Serve reads LAB_COORDINATOR_CONFIG and LAB_DATABASE_URL; credential values come from
 the environment variables named in the server configuration.
 `
@@ -42,7 +49,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
   const command = args[0] ?? "help"
   const options = new Map<string, string>()
   const boolean = new Set(["no-wait", "allow-spark"])
-  const allowed = new Set(["request", "source", "artifacts", "target", "profile", "budget", "concurrency", "deadline", "mode", "objects", "run", ...boolean])
+  const allowed = new Set(["request", "source", "artifacts", "target", "profile", "suite", "harness", "json", "junit", "budget", "concurrency", "deadline", "mode", "objects", "run", ...boolean])
   for (let i = 1; i < args.length; i++) {
     const flag = args[i]!
     if (!flag.startsWith("--") || !allowed.has(flag.slice(2))) return yield* new InvalidInput({ message: `Unknown argument: ${flag}` })
@@ -53,7 +60,23 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
     options.set(name, value)
   }
   if (command === "run" && options.has("source") === options.has("artifacts")) return yield* new InvalidInput({ message: "Specify exactly one of --source or --artifacts" })
+  if ((options.has("json") || options.has("junit")) && (!["run", "results"].includes(command) || options.has("no-wait"))) return yield* new InvalidInput({ message: "Reports require a completed run or results command without --no-wait" })
   return { command, options }
+})
+export const selectionFromOptions = (options: ReadonlyMap<string, string>) => Effect.gen(function* () {
+  const list = (value: string) => value.split(",").map(item => item.trim())
+  if (options.has("suite")) {
+    if (options.has("profile") || !options.has("target")) return yield* new InvalidInput({ message: "Custom --suite requires --target and cannot be combined with --profile" })
+    const targets = list(options.get("target")!), suites = list(options.get("suite")!), harnesses = list(options.get("harness") ?? "pi,opencode,hermes")
+    if ([targets, suites, harnesses].some(values => new Set(values).size !== values.length || values.some(value => !value))) return yield* new InvalidInput({ message: "Selection lists must contain distinct nonempty values" })
+    return yield* Schema.decodeUnknown(Selection)({ kind: "custom", targets, suites, harnesses })
+  }
+  const profile = options.get("profile") ?? "quick"
+  if (options.has("harness") && profile !== "quick") return yield* new InvalidInput({ message: "Only quick permits --harness overrides; use --suite for custom coverage" })
+  const harnesses = options.has("harness") ? list(options.get("harness")!) : []
+  if (new Set(harnesses).size !== harnesses.length || harnesses.some(value => !value)) return yield* new InvalidInput({ message: "Harness selection must contain distinct nonempty values" })
+  return yield* Schema.decodeUnknown(Selection)({ kind: "profile", profile, ...(options.has("target") ? { target: options.get("target") } : {}),
+    ...(options.has("harness") ? { harnesses } : {}) })
 })
 const print = <A, I>(schema: Schema.Schema<A, I>, value: A) => Schema.encode(Schema.parseJson(schema))(value).pipe(Effect.flatMap(Console.log))
 const remote = <A, E, R>(effect: Effect.Effect<A, E, R | LabClient>) => Effect.gen(function* () {
@@ -65,6 +88,12 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
   yield* assertRuntime
   const { command, options } = yield* parseArguments(args)
   const fs = yield* FileSystem.FileSystem
+  const reports = yield* Schema.decodeUnknown(ReportPaths)(Object.fromEntries(["json", "junit"].flatMap(name => options.has(name) ? [[name, options.get(name)!]] : [])))
+  const completed = (result: RunResult) => Effect.gen(function* () {
+    yield* writeReports(result, reports)
+    yield* print(RunResult, result)
+    process.exitCode = resultExitCode(result)
+  })
   const required = (name: string) => Effect.fromNullable(options.get(name)).pipe(Effect.mapError(() => new InvalidInput({ message: `Missing --${name}` })))
   if (command === "help" || command === "--help") return yield* Console.log(help)
   if (command === "serve") return yield* serveConfiguredCoordinator
@@ -81,11 +110,11 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
       if (command === "cancel") return yield* print(RunRecord, yield* client.cancel(id))
       const result = yield* client.result(id)
       if (Option.isNone(result)) { yield* Console.error("Run is still in progress"); process.exitCode = 2; return }
-      yield* print(RunResult, result.value)
-      process.exitCode = resultExitCode(result.value)
+      yield* completed(result.value)
     }))
   }
   if (command !== "run") return yield* new InvalidInput({ message: `Unknown command: ${command}` })
+  const selection = yield* selectionFromOptions(options)
   const objects = resolve(options.get("objects") ?? join(homedir(), ".cache", "magnitude-lab", "objects"))
   const prepared = options.has("artifacts")
     ? { kind: "artifacts" as const, ...yield* snapshotArtifacts(options.get("artifacts")!, objects) }
@@ -97,7 +126,7 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     const client = yield* LabClient
     const identity = yield* client.identity()
     const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: crypto.randomUUID(), ...identity,
-      input: { kind: prepared.kind, digest: prepared.digest }, selection: { kind: "profile", profile: options.get("profile") ?? "quick", ...(options.has("target") ? { target: options.get("target") } : {}) },
+      input: { kind: prepared.kind, digest: prepared.digest }, selection: yield* Schema.encode(Selection)(selection),
       mode: options.get("mode") ?? "verify", allowSpark: options.has("allow-spark"),
       limits: { concurrency: Number(options.get("concurrency") ?? 1), deadlineMinutes: Number(options.get("deadline") ?? 60), budgetUsd: Number(options.get("budget") ?? 25), idleMinutes: 15 },
     })
@@ -118,8 +147,7 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     for (;;) {
       const result = yield* client.result(run.state.runId)
       if (Option.isSome(result)) {
-        yield* print(RunResult, result.value)
-        process.exitCode = resultExitCode(result.value)
+        yield* completed(result.value)
         return
       }
       yield* Effect.sleep("3 seconds")

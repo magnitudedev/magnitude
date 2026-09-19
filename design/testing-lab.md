@@ -34,6 +34,9 @@ requires an isolated profile, and privileged install/uninstall is restricted to 
 `quick`, `pr`, `full` and `release` select cases and targets. Target expansion is explicit, including
 unqualified targets. Missing capacity or credentials blocks a case; it never removes it or makes
 it pass. Release acceptance requires final production-signed artifacts and complete coverage.
+Quick permits an explicit harness override without changing its selected case IDs. Broader
+profiles retain all mandatory harnesses; narrowing them requires an explicit custom selection.
+The planner and worker use the same harness selection policy.
 
 ## Responsibilities
 
@@ -110,6 +113,9 @@ may occupy separate elements. Service failure injection owns only an isolated lo
 listener; recovery requires successful startup after that listener is released.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
+JSON and JUnit reports derive from the same admitted plan and completed result.
+JUnit distinguishes product failures from infrastructure errors; missing, blocked,
+cancelled or duplicate selected results and cleanup failures cannot become green checks.
 Finalized UI traces and command logs are published as content-addressed evidence before worker
 removal. Evidence export failures remain visible without replacing the original case outcome.
 
