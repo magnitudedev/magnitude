@@ -1,4 +1,4 @@
-import { isGithubReleaseAssetUrl } from "./github-artifact"
+import { acceptsArtifactUrl, githubArtifactDelivery, type ArtifactDelivery } from "./artifact-delivery"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform"
 import { Clock, Effect, Option, Schema, Stream } from "effect"
 import type { KeyObject } from "node:crypto"
@@ -18,6 +18,7 @@ export interface HostedUpdateConnection {
   readonly metadata: UpdateClientMetadata
   readonly sign: (url: URL) => Effect.Effect<string, UpdateSigningFailed>
   readonly userAgent: string
+  readonly artifactDelivery?: ArtifactDelivery
 }
 
 const signedRequest = (options: HostedUpdateConnection, path: string, extra: Readonly<Record<string, string>> = {}) => Effect.gen(function* () {
@@ -71,7 +72,7 @@ export const resolveHostedDownload = (options: HostedUpdateConnection & {
   if (!acceptsUpdateRelease(options.release, fields.version) || response.status !== 302) return yield* new HostedUpdateCheckFailed({ reason: "response" })
   return yield* Effect.try({ try: () => {
     const location = response.headers.location
-    if (!location || !isGithubReleaseAssetUrl(location)) throw new Error("Unexpected artifact redirect")
+    if (!location || !acceptsArtifactUrl(options.artifactDelivery ?? githubArtifactDelivery, location)) throw new Error("Unexpected artifact redirect")
     return location
   }, catch: () => new HostedUpdateCheckFailed({ reason: "response" }) })
 }).pipe(

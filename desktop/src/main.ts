@@ -126,14 +126,14 @@ const program = Effect.scoped(Effect.gen(function* () {
       const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
       const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(privateFiles))
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
-      const { trustedPublishers, origin } = updateConfiguration.value
+      const { trustedPublishers, origin, artifactDelivery } = updateConfiguration.value
       const metadata = process.platform === "linux"
         ? yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion()).pipe(Effect.provide(NodeContext.layer))
         : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: process.platform === "win32" ? "windows" : "darwin",
             os_version: process.getSystemVersion(), arch: process.arch, package: process.platform === "win32" ? "windows-exe" : "mac-zip" })
       const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })
       const store = yield* makePreparedUpdateStore({ dataDirectory: dataDir, target, trustedPublishers }).pipe(Effect.provide(privateFiles))
-      const options = { origin, metadata, sign: identity.sign, trustedPublishers,
+      const options = { origin, metadata, sign: identity.sign, trustedPublishers, artifactDelivery,
         userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} ${metadata.os}/${process.getSystemVersion()}`,
         cacheDirectory: join(dataDir, "updates"), dataDirectory: dataDir, stateDirectory: stateDir }
       const platform = yield* Effect.gen(function* () {

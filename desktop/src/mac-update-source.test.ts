@@ -5,7 +5,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer, Option, Schema, Stream } from "effect"
-import { UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/hosted-update"
+import { ArtifactDelivery, UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/hosted-update"
 import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
 import { MacUpdateHandoff, UpdatePreferences, makePreparedUpdateStore, PreparedUpdateStore, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
@@ -15,7 +15,7 @@ import { macUpdateSource } from "./mac-update-source"
 import { installPreparedUpdate, PreparedUpdateInstaller } from "./prepared-update-installation"
 
 describe("Mac update acquisition and native handoff", () => {
-  it.each([false, true])("verifies downloaded bytes before native staging (corrupt=%s)", async corrupt => {
+  it.each([{ corrupt: false, privateDelivery: false }, { corrupt: true, privateDelivery: false }, { corrupt: false, privateDelivery: true }, { corrupt: true, privateDelivery: true }])("verifies downloaded bytes before native staging: %j", async ({ corrupt, privateDelivery }) => {
     const bytes = Buffer.from("verified ZIP fixture")
     const candidate = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
       id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" },
@@ -29,13 +29,15 @@ describe("Mac update acquisition and native handoff", () => {
     await writeFile(join(root, "addon"), "addon fixture")
     const identity = generateKeyPairSync("ed25519")
     const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "darwin", os_version: "26", arch: "arm64", package: "mac-zip" })
+    const artifactUrl = privateDelivery ? "https://private-lab.example/app.zip" : `https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/${candidate.artifact.filename}`
+    const artifactDelivery = Schema.decodeUnknownSync(ArtifactDelivery)(privateDelivery ? { _tag: "PrivateAcceptance", origin: "https://private-lab.example" } : { _tag: "Github" })
     const fetchArtifact = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init)
       if (new URL(request.url).pathname === "/api/download") {
         expect(request.headers.has("authorization")).toBe(true)
-        return new Response(null, { status: 302, headers: { location: `https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/${candidate.artifact.filename}` } })
+        return new Response(null, { status: 302, headers: { location: artifactUrl } })
       }
-      expect(request.url).toBe(`https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/${candidate.artifact.filename}`)
+      expect(request.url).toBe(artifactUrl)
       expect(request.headers.has("authorization")).toBe(false)
       return new Response(corrupt ? Buffer.alloc(bytes.length, 0) : bytes, { headers: { "content-length": String(bytes.length) } })
     }, { preconnect: () => {} })
@@ -43,7 +45,7 @@ describe("Mac update acquisition and native handoff", () => {
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
         const store = yield* makePreparedUpdateStore({ dataDirectory: root, target: candidate.artifact.target, trustedPublishers: new Map([["test", publisher.publicKey]]) })
-        const platform = yield* macUpdateSource({ origin: "https://magnitude.dev", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root, stateDirectory: join(root, "state"), bundle: join(root, "Magnitude.app"), cliPath: join(root, "cli"), addonPath: join(root, "addon") }).pipe(
+        const platform = yield* macUpdateSource({ artifactDelivery, origin: privateDelivery ? "https://acceptance.example" : "https://magnitude.dev", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root, stateDirectory: join(root, "state"), bundle: join(root, "Magnitude.app"), cliPath: join(root, "cli"), addonPath: join(root, "addon") }).pipe(
           Effect.provideService(PreparedUpdateStore, store),
           Effect.provideService(MacUpdateHandoff, { start: () => Effect.succeed({ commit: Effect.sync(() => expect(staged).toBe(true)) }) }),
           Effect.provideService(NativeMacUpdate, {

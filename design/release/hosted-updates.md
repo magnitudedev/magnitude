@@ -19,8 +19,13 @@ Updates must match the application platform and release channel. The client veri
 signatures, downloaded file integrity, and applicable native publisher signatures before
 installation. Failed checks or verification must not be reported as successful updates.
 
-Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
-release assets, and interrupted or invalid transfers must not publish a prepared installer.
+Production application binaries are distributed through GitHub Releases. Downloads must resolve
+to trusted release assets. Private acceptance builds may instead bind one explicit HTTPS artifact
+origin at build time, separate from production service origins. Artifact responses cannot introduce
+or change that policy. Private transfers reject redirects and omit installation credentials and
+cookies; publisher signatures and file integrity remain required. Runtime environment variables
+cannot enable private delivery in a production build. Interrupted or invalid transfers must not
+publish a prepared installer.
 
 Update acceptance covers download, verification, installation, relaunch, and preservation of
 application state.

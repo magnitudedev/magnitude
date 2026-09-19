@@ -1,3 +1,4 @@
+import { ArtifactDelivery } from "./artifact-delivery"
 import { githubArtifactUrl } from "./github-artifact"
 import { FetchHttpClient } from "@effect/platform"
 import { Effect, Either, Option, Schema } from "effect"
@@ -75,4 +76,24 @@ describe("hosted update client", () => {
       expect(Either.isLeft(result)).toBe(true)
     }
   })
+})
+
+it("resolves private artifacts only with an explicitly bound acceptance origin", async () => {
+  const release = (await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))).release
+  const artifactDelivery = Schema.decodeUnknownSync(ArtifactDelivery)({ _tag: "PrivateAcceptance", origin: "https://lab.example" })
+  for (const location of ["https://lab.example/app.zip?sig=scoped", "https://other.example/app.zip", githubArtifactUrl(manifest)]) {
+    let calls = 0
+    const result = await Effect.runPromise(resolveHostedDownload({ origin: "https://update-fixture.example", metadata,
+      sign: url => signUpdateRequest(installation.privateKey, url), userAgent: "Acceptance/1.0.0", release, artifactDelivery,
+    }).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls++
+      const request = new Request(input, init)
+      expect(new URL(request.url).origin).toBe("https://update-fixture.example")
+      expect(request.headers.has("authorization")).toBe(true)
+      expect(init?.redirect).toBe("manual")
+      return new Response(null, { status: 302, headers: { location } })
+    }, { preconnect: () => {} })), Effect.either))
+    expect(calls).toBe(1)
+    expect(Either.isRight(result)).toBe(location.startsWith("https://lab.example/"))
+  }
 })

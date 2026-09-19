@@ -6,10 +6,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { expect, it } from "vitest"
+import { ArtifactDelivery } from "./artifact-delivery"
 import { downloadUpdateArtifact } from "./installer-download"
 import { UpdateManifest } from "./manifest"
 
-it.each([false, true])("recovers interrupted ranges and incorrect response totals with malformed initial negotiation=%s", async malformedProbe => {
+it.each([{ malformedProbe: false, privateDelivery: false }, { malformedProbe: true, privateDelivery: false }, { malformedProbe: true, privateDelivery: true }])("recovers interrupted ranges and incorrect response totals: %j", async ({ malformedProbe, privateDelivery }) => {
   const bytes = Buffer.alloc(9 * 1024 * 1024, 0x61)
   const directory = await mkdtemp(join(tmpdir(), "installer-ranges-"))
   const attempts = new Map<string, number>()
@@ -34,7 +35,8 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
     } })
     const destination = join(directory, "app.exe")
     const result = await Effect.runPromise(downloadUpdateArtifact({ release: { version: manifest.version, bytes: manifest.artifact.bytes, sha256: manifest.artifact.sha256, signature: "A".repeat(86) + "==" }, destination,
-      url: "https://github.com/magnitudedev/magnitude/releases/download/test/app.exe", onProgress: Option.none(),
+      url: privateDelivery ? "https://lab.example/app.exe" : "https://github.com/magnitudedev/magnitude/releases/download/test/app.exe", onProgress: Option.none(),
+      artifactDelivery: Schema.decodeUnknownSync(ArtifactDelivery)(privateDelivery ? { _tag: "PrivateAcceptance", origin: "https://lab.example" } : { _tag: "Github" }),
     }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer]), Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (_input: RequestInfo | URL, init?: RequestInit) => {
       expect(init?.redirect).toBe("manual")
       return fetch(`http://127.0.0.1:${server.port}/app.exe`, init)
@@ -46,4 +48,21 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
     expect(attempts.get("bytes=8388608-9437183")).toBe(2)
     expect((await readFile(destination)).equals(bytes)).toBe(true)
   } finally { server.stop(true); await rm(directory, { recursive: true, force: true }) }
+})
+
+it("does not publish corrupted private acceptance bytes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "private-installer-integrity-"))
+  const destination = join(directory, "app.zip")
+  const bytes = Buffer.from("tampered package")
+  try {
+    const result = await Effect.runPromise(downloadUpdateArtifact({
+      release: { version: "2.0.0", bytes: bytes.length, sha256: "0".repeat(64), signature: "A".repeat(86) + "==" },
+      destination, url: "https://lab.example/app.zip", onProgress: Option.none(),
+      artifactDelivery: Schema.decodeUnknownSync(ArtifactDelivery)({ _tag: "PrivateAcceptance", origin: "https://lab.example" }),
+    }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer]), Effect.provideService(FetchHttpClient.Fetch,
+      Object.assign(async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }), { preconnect: () => {} })), Effect.either))
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left.phase).toBe("integrity")
+    await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" })
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })

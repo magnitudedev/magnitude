@@ -1,5 +1,5 @@
 import { HttpClient } from "@effect/platform"
-import { githubDownloadClient } from "./github-download"
+import { artifactDeliveryClient, type ArtifactDelivery } from "./artifact-delivery"
 import { Effect, Option } from "effect"
 import { defaultArtifactDownloadPolicy, downloadArtifact, type ArtifactDownloadInput } from "../artifact-download"
 import type { UpdateRelease } from "./release"
@@ -10,8 +10,9 @@ export const downloadUpdateArtifact = (options: {
   readonly url: string
   readonly destination: string
   readonly onProgress: ArtifactDownloadInput["onProgress"]
+  readonly artifactDelivery?: ArtifactDelivery
 }) => Effect.gen(function* () {
-  const client = yield* githubDownloadClient
+  const client = yield* artifactDeliveryClient(options.artifactDelivery)
   return yield* downloadArtifact({
   url: options.url, destination: options.destination,
   bytes: options.release.bytes, sha256: options.release.sha256,

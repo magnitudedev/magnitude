@@ -580,10 +580,8 @@ The desktop driver now exposes Settings update actions (check, download, restart
 automatic-download control and transfer-state waits with candidate version observations.
 Selectors use stable action IDs and rendered domain-state attributes. A real Electron renderer
 fixture exercised these controls with deliberately changed labels/colors and verified immediate
-failure reporting. This fixture does not update an installed app or qualify U1–U6. Old/new
-acceptance package inputs, signed fixture routing and suite orchestration still need implementation.
-The existing release acceptance-build configuration should provide the isolated trust path;
-production trust must remain a separate qualification.
+failure reporting. This fixture does not update an installed app or qualify U1–U6. Old/new package inputs and private acceptance routing are implemented; a signed fixture service
+and native suite orchestration remain. Production trust remains a separate qualification.
 
 Five targeted driver/session/error tests passed and testing-lab typechecking passed. The desktop
 package typecheck returned exit 2 with Effect diagnostics in unchanged main/preload and dependency
@@ -602,7 +600,7 @@ is rejected. Namespace transport and outward HTTP workers transfer both verified
 credentials do not gain access to other owner uploads. Tests exercise baseline graph download,
 revoked/missing access, native-executor handoff and real HTTP/PostgreSQL admission rejection.
 This input path is implemented; U1–U6 still require installation-transition orchestration and
-acceptance trust routing. A supplied baseline is not yet proof of a valid upgrade pair.
+a running signed update fixture. A supplied baseline is not yet proof of a valid upgrade pair.
 
 Update pair preparation now verifies and materializes the previous native installer, the
 candidate native installer, and the candidate update archive before installation changes.
@@ -621,7 +619,24 @@ requested package for a later explicit attempt. Cancellation waits for admitted 
 so cleanup ownership is not lost. Eight ownership tests cover these paths. This mechanism is
 not an updater and cannot satisfy U2 by directly installing the candidate.
 
-An integration constraint remains: the current product download resolver admits only GitHub
-release-asset URLs. Private unpublished update fixtures need an explicit acceptance-build
-routing policy; production download/trust restrictions must remain intact. No private-update
-routing change or successful native update is claimed yet.
+Private acceptance routing is now selected through a compiled update configuration. Set
+`MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG` to a JSON file when invoking the existing release
+acceptance builder. It validates and copies the configuration before modifying version inputs.
+The file contains `acceptance: true`, the HTTPS update `origin`, `keyId`, publisher `publicKey`
+(PEM), and optionally `artifactDelivery: { "_tag": "PrivateAcceptance", "origin": "https://your-private-origin" }`.
+Windows additionally needs `windowsPublisher`. Omitting artifact delivery retains GitHub delivery.
+No private key belongs in this file. The fixture must sign offers using the matching private key.
+
+Private byte transfers admit only the compiled HTTPS origin, reject all redirects, omit installation
+credentials and cookies, and retain hash/size checks and native publisher verification. Production
+configuration cannot select this policy; runtime environment variables cannot enable it. A local
+HTTPS fixture still needs a certificate trusted by the test process; disabling TLS verification is
+not part of this mechanism.
+
+59 release tests passed, including private-policy/configuration rejection, interrupted range
+recovery and corrupt-file rejection. The Mac update source passed four valid/corrupt delivery
+cases across GitHub/private policies; its native installer is mocked, so these are not U2 evidence.
+One Linux source regression passed; three Windows-native tests were skipped on macOS. Both private
+acceptance and normal desktop bundles compiled locally. Release typechecking passed; desktop
+checking retains the existing Effect multiple-provide warning at main.ts:146 (exit 2). No real
+old/new native update or U1–U6 qualification is claimed yet.

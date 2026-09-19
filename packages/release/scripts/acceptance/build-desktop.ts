@@ -12,6 +12,7 @@ import { buildWindowsDesktopInstaller } from "../build/desktop-windows"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
+import { decodeUpdateConfiguration, UpdateConfiguration } from "../../src/hosted-update/configuration"
 
 class AcceptanceBuildFailed extends Schema.TaggedError<AcceptanceBuildFailed>()("AcceptanceBuildFailed", { message: Schema.String }) {}
 const root = resolve(import.meta.dir, "../../../..")
@@ -27,13 +28,17 @@ const run = Effect.gen(function* () {
   const output = resolve(yield* Config.string("MAGNITUDE_ACCEPTANCE_OUTPUT"))
   yield* fs.makeDirectory(output, { recursive: true })
   const configPath = join(output, "update-acceptance.json")
-  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
-    windowsPublisher: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  })) )({
-    origin: "https://magnitude-update-acceptance.vercel.app",
+  const suppliedConfig = yield* Config.option(Config.string("MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG"))
+  const configuration = Option.isSome(suppliedConfig)
+    ? yield* Schema.decodeUnknown(Schema.parseJson(UpdateConfiguration))(yield* fs.readFileString(resolve(suppliedConfig.value)), { onExcessProperty: "error" })
+    : yield* Schema.decodeUnknown(UpdateConfiguration)({
+    origin: "https://magnitude-update-acceptance.vercel.app", acceptance: true,
     keyId: "acceptance", publicKey: yield* fs.readFileString(join(root, "packages/release/resources/distribution/acceptance.pub.pem")),
-    windowsPublisher: target.platform === "win32" ? Option.some("Magnitude Update Acceptance") : Option.none(),
-  }))
+    ...(target.platform === "win32" ? { windowsPublisher: "Magnitude Update Acceptance" } : {}),
+  })
+  // Validate publisher trust and build isolation before changing any version or compiling code.
+  yield* decodeUpdateConfiguration(yield* Schema.encode(UpdateConfiguration)(configuration), true)
+  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(UpdateConfiguration))(configuration))
   const command = (args: readonly [string, ...string[]], cwd = root) => Command.make(...args).pipe(Command.workingDirectory(cwd),
     Command.env({ MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG: configPath }), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
     Effect.flatMap(code => code === 0 ? Effect.void : new AcceptanceBuildFailed({ message: `${args[0]} exited ${code}` })))

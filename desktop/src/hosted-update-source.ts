@@ -24,6 +24,7 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
     const downloaded = yield* downloadUpdateArtifact({
       url, destination: join(directory, updateInstallerFilename(yield* Schema.decodeUnknown(ReleaseTarget)({ os: options.metadata.os, arch: options.metadata.arch, package: options.metadata.package }))),
       release: candidate,
+      ...(options.artifactDelivery ? { artifactDelivery: options.artifactDelivery } : {}),
       onProgress: Option.some(value => progress(value.acceptedBytes)),
     })
     return downloaded.destination
