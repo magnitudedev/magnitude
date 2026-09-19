@@ -533,7 +533,14 @@ the configured guest user, and the guest returns results through HTTPS. Delivery
 the lease deadline and is never automatically replayed after an ambiguous response.
 
 Azure Linux bootstrap and server wiring have targeted tests, including executing the generated
-shell with hostile-looking argument literals. They are **not yet live cloud qualified**.
+shell with hostile-looking argument literals. A live Ubuntu 24.04 Intel VM also verified delivery:
+`/tmp/ml-azure-bootstrap-fixed-20260918/report.json` and `bootstrap.json` record matching protected
+credential, configured guest user, workspace and origin, followed by clean VM/disk/NIC removal.
+The first live attempt exposed that Azure's `runAsUser` drops named protected parameters through
+sudo. The bootstrap now receives the credential in the agent context and explicitly switches to
+the guest user while preserving only the three lab environment variables. No credential value
+is inserted into command arguments or script text. This qualifies bootstrap delivery on that
+Ubuntu image only; complete outward app execution and other Linux images remain unqualified.
 Windows is rejected by this bootstrap and requires an interactive-session launcher; a VM agent
 service-session launch cannot qualify the desktop suite. Microsoft's parameter semantics are
 specified in [Managed Run Command](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/run-command-managed).

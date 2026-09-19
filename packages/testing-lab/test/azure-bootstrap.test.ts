@@ -34,7 +34,7 @@ for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "exp
     expect(statSync(file).mode & 0o777).toBe(0o600)
     const body = JSON.parse(readFileSync(file, "utf8"))
     expect(body.properties.protectedParameters).toEqual([{ name: "LAB_WORKER_TOKEN", value: Redacted.value(invocation.token) }])
-    expect(body.properties.runAsUser).toBe("labworker")
+    expect(body.properties.runAsUser).toBeUndefined()
     expect(body.properties.asyncExecution).toBe(true)
     expect(body.properties.timeoutInSeconds).toBeGreaterThan(0)
     script = body.properties.source.script
@@ -52,7 +52,10 @@ for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "exp
   expect(requests.length).toBe(mode === "foreign-scope" || mode === "expired" ? 0 : mode === "success" || mode === "delivery-error" ? 2 : 1)
   if (mode === "success") {
     // Execute the exact generated shell to catch interpolation bugs, rather than comparing quoting strings.
-    const executed = await Effect.runPromise(checkedCommand("/bin/sh", ["-c", script], {
+    const userSwitch = "/usr/bin/sudo -n -H --preserve-env=LAB_WORKER_TOKEN,LAB_WORKER_ROOT,LAB_URL -u 'labworker' -- "
+    expect(script).toContain(userSwitch)
+    // The user switch is qualified on Azure; execute the remaining exact shell locally for literal handling.
+    const executed = await Effect.runPromise(checkedCommand("/bin/sh", ["-c", script.replace(userSwitch, "")], {
       inheritEnv: false, env: { LAB_WORKER_TOKEN: Redacted.value(invocation.token) },
     }).pipe(Effect.provide(ProcessExecutorLive)))
     expect(executed.stdout).toBe(`${invocation.args[1]}\n`)

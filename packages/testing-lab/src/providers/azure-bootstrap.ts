@@ -50,12 +50,15 @@ export const azureLinuxBootstrap = (config: typeof AzureBootstrapConfig.Type) =>
         !Schema.equivalence(MachineTags)(tags, machine.tags)) return yield* fail("Worker ownership changed before credential delivery")
       if (vm.properties.provisioningState !== "Succeeded" || vm.properties.storageProfile.osDisk.osType !== "Linux") return yield* fail("Linux bootstrap requires a provisioned Linux VM")
       if (deadline <= Date.now()) return yield* fail("Worker expired while verifying its identity")
-      // Shell literals protect configured arguments; the secret never appears in the script or CLI argv.
+      // Azure's runAsUser uses sudo without preserving named protected parameters.
+      // Receive them as root, then retain only the lab variables through an explicit user switch.
+      // The credential remains an environment value, never a command argument or script literal.
       const script = ["#!/bin/sh", "set -eu", "umask 077", ': "${LAB_WORKER_TOKEN:?Missing worker credential}"',
         `export LAB_WORKER_ROOT=${quote(launch.root)}`, `export LAB_URL=${quote(launch.origin)}`,
-        `exec ${[launch.executable, ...launch.args].map(quote).join(" ")}`].join("\n")
+        "cd /",
+        `exec /usr/bin/sudo -n -H --preserve-env=LAB_WORKER_TOKEN,LAB_WORKER_ROOT,LAB_URL -u ${quote(config.adminUsername)} -- ${[launch.executable, ...launch.args].map(quote).join(" ")}`].join("\n")
       yield* request("PUT", `${machine.id}/runCommands/lab-worker`, { location: vm.location, properties: {
-        source: { script }, asyncExecution: true, runAsUser: config.adminUsername,
+        source: { script }, asyncExecution: true,
         timeoutInSeconds: Math.max(1, Math.ceil((deadline - Date.now()) / 1000)),
         protectedParameters: [{ name: "LAB_WORKER_TOKEN", value: Redacted.value(launch.token) }],
       } })
