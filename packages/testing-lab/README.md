@@ -50,7 +50,7 @@ These are executable acceptance probes, separate from fixture-backed unit/integr
   navigation, appearance and window lifecycle. `LAB_PROBE_READY=true` also requires service Ready.
 - `scripts/generation-probe.ts` downloads and loads a named model through Catalog, then exercises
   real discovery, generation, SSE, tool-call follow-up, invalid inputs and cancellation/retry.
-  It requires `LAB_PROBE_MODEL_ID` and `LAB_PROBE_MODEL_NAME`; `LAB_PROBE_CACHED=true` explicitly
+  It selects the model by canonical `LAB_PROBE_MODEL_ID`; `LAB_PROBE_CACHED=true` explicitly
   skips downloading a model already acquired in this isolated profile.
 
 Both UI probes require `LAB_PROBE_ROOT` and `LAB_PROBE_EXECUTABLE`. They retain bounded application
@@ -105,3 +105,45 @@ without a selected default. `LAB_PROBE_HERMES_SET_MODEL=true` with `LAB_PROBE_BU
 the separate explicit-selection scenario; it must not replace or hide the fresh-profile case.
 TUI interaction, complete suite integration, GPU/backend receipts and the full OS matrix remain
 unqualified. No performance benchmark gates have been introduced.
+
+## UI resilience
+
+Packaged UI tests use the stable action/entity identifiers in `desktop/src/automation.ts`.
+They do not locate controls by visible copy, accessible-label wording, icon, color, screen position,
+CSS class, or DOM ancestry. Model and harness identity comes from canonical IDs. Catalog search
+also accepts a canonical model ID. State assertions use semantic readiness/connection attributes
+and accessibility state, followed by actual endpoint/harness behavior; attributes alone do not
+qualify generation. Screenshots and traces are diagnostic evidence, not visual golden files.
+
+When redesigning a control, carry its action identifier with it. Keep entity identity on the
+containing model/harness component. A real workflow change belongs in the shared DesktopDriver;
+individual scenario files should not acquire their own selectors. Removed or unusable actions
+must fail clearly. No fallback text selectors, positional selectors, forced clicks, or assertion
+retries are used to conceal regressions. Time bounds wait for state, not arbitrary sleeps.
+
+`scripts/ui-resilience-probe.ts` runs the real packaged app with a presentation-only challenge:
+rewritten button/heading text and accessible labels, different colors, reversed navigation and
+setting order. It exercises navigation, settings, window lifecycle, model loading, Connections and
+real generation. This probe passed on local macOS 15.5. It uses the same isolated cached model
+profile as the other probes and `LAB_PROBE_TOOLS_PATH` to find Pi. The presentation mutation is
+in test support only; it is not shipped as an application feature.
+
+## Native installer and bundled CLI probes
+
+`prepareCandidate` chooses exactly one desktop installer for the target host/format, materializes
+its content-addressed bytes, and checks digest and size before publishing the accepted path.
+`nativeInstaller` rechecks bytes immediately before invoking native installation. Windows and
+Linux mutations require a disposable worker/user; macOS can use a private owned install directory.
+Existing installations are rejected. The Windows path uses the real per-user NSIS destination,
+and waits for its copied uninstaller process. Linux uses the existing DEB/RPM package managers.
+Windows/Linux execution and complete registration, trust and user-data checks remain unqualified.
+
+`install-probe.ts` exercised a real DMG install, exact bundled CLI version and removal on local
+macOS 15.5. Its inputs are `LAB_INSTALL_PACKAGE`, `LAB_INSTALL_VERSION`, `LAB_INSTALL_ROOT`, and
+`LAB_INSTALL_TARGET`. This narrow probe does not qualify app startup or the entire install suite.
+
+`cli-probe.ts` exercises the packaged binary's version/help/hardware/service commands, cached
+model pull/stop/load, real generation after reload, Pi/OpenCode/Hermes add/sync/remove, invalid
+inputs and native SQLite/Bun without developer tools on PATH. All nine checks passed locally.
+It additionally requires `LAB_PROBE_BUNDLED_CLI`, `LAB_PROBE_VERSION`, and `LAB_PROBE_TOOLS_PATH`.
+Public shell registration, interruption and full service lifecycle remain separate work.

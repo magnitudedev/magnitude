@@ -16,7 +16,6 @@ const run = Effect.gen(function* () {
   const client = yield* Config.string("LAB_PROBE_HERMES")
   const selectModel = yield* Config.boolean("LAB_PROBE_HERMES_SET_MODEL").pipe(Config.withDefault(false))
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
-  const name = yield* Config.string("LAB_PROBE_MODEL_NAME")
   const fs = yield* FileSystem.FileSystem
   const task = yield* fileFixture(root)
   const fixture = task.directory
@@ -28,9 +27,9 @@ const run = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.host()
     yield* desktop.ready()
-    yield* desktop.search(name)
-    yield* desktop.load(name)
-    yield* desktop.connect("Hermes")
+    yield* desktop.search(model)
+    yield* desktop.load(model)
+    yield* desktop.connect("hermes")
     yield* desktop.screenshot("hermes-connected")
     if (selectModel) {
       const bundledCli = yield* Config.string("LAB_PROBE_BUNDLED_CLI")
@@ -49,7 +48,7 @@ const run = Effect.gen(function* () {
     yield* task.verify
     turns.push(yield* client.prompt("What word did you replace before with in our previous turn? Reply with that single word. Do not use tools.", Option.some(turns[0]!.sessionId)))
     if (turns[2]!.text.trim() !== "after") return yield* new AssertionFailure({ message: "Hermes did not retain the previous conversation after process restart" })
-    yield* desktop.disconnect("Hermes")
+    yield* desktop.disconnect("hermes")
     yield* desktop.screenshot("hermes-disconnected")
   }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "hermes-evidence"), port: 11279, environment })))
   const outcome = yield* program.pipe(Effect.either)

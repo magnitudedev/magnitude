@@ -1,0 +1,17 @@
+/** Stable interaction identifiers for packaged-app acceptance. Wording and layout are not contracts. */
+export const desktopAutomation = {
+  navigation: (page: string) => `desktop.navigate.${page}`,
+  page: (page: string) => `desktop.page.${page}`,
+  model: (id: string) => `desktop.model.${id}`,
+  harness: (id: string) => `desktop.harness.${id}`,
+  theme: (value: string) => `desktop.theme.${value}`,
+  modelSearch: "desktop.model-search",
+  modelDownload: "desktop.model-download",
+  modelLoad: "desktop.model-load",
+  modelDownloadProgress: "desktop.model-download-progress",
+  harnessConnect: "desktop.harness-connect",
+  harnessDisconnect: "desktop.harness-disconnect",
+  serviceReady: "desktop.service-ready",
+  sidebarToggle: "desktop.sidebar-toggle",
+  sidebar: "desktop.sidebar",
+} as const

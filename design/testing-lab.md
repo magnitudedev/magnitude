@@ -55,6 +55,12 @@ original attempt and evidence.
 ## Evidence and acceptance
 
 Each case records its input identity, observed hardware, outcome, diagnostics and evidence paths.
+UI drivers address stable action and entity identities rather than copy, colors, geometry, or
+DOM position. UI redesign preserves those identities; changed workflows are centralized in the
+driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
+Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
+probe verifies that copy and layout changes do not break functional paths.
+
 Blocked prerequisites propagate without hiding the original product failure. Pass means every
 required selected case passed and cleanup completed. Tests must demonstrate corrupt-input rejection,
 source fidelity, cancellation, stale-worker fencing, allocation ambiguity recovery, backend mismatch

@@ -13,7 +13,6 @@ const run = Effect.gen(function* () {
   const root = yield* Config.string("LAB_PROBE_ROOT")
   const executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
-  const name = yield* Config.string("LAB_PROBE_MODEL_NAME")
   const cached = yield* Config.boolean("LAB_PROBE_CACHED").pipe(Config.withDefault(false))
   const fs = yield* FileSystem.FileSystem
   const checks: { name: string; passed: boolean; detail: string }[] = []
@@ -24,16 +23,16 @@ const run = Effect.gen(function* () {
     const endpoint = yield* EndpointTests
     appVersion = yield* desktop.host()
     yield* desktop.ready()
-    yield* desktop.search(name)
+    yield* desktop.search(model)
     yield* desktop.screenshot("model-before-download")
     if (!cached) {
-      yield* desktop.download(name)
+      yield* desktop.download(model)
       yield* desktop.screenshot("model-downloaded")
-      checks.push({ name: "Download through the packaged app", passed: true, detail: name })
+      checks.push({ name: "Download through the packaged app", passed: true, detail: model })
     }
-    yield* desktop.load(name)
+    yield* desktop.load(model)
     yield* desktop.screenshot("model-loaded")
-    checks.push({ name: "Load through the packaged app", passed: true, detail: name })
+    checks.push({ name: "Load through the packaged app", passed: true, detail: model })
     const steps: ReadonlyArray<readonly [string, Effect.Effect<Generation | void, AssertionFailure>]> = [
       ["Endpoint discovery", endpoint.discover], ["Nonstreamed generation", endpoint.generate], ["Streaming generation", endpoint.stream],
       ["Tool call and follow-up", endpoint.tools], ["Invalid requests and subsequent generation", endpoint.invalid], ["Cancellation and subsequent generation", endpoint.cancelAndRetry],
@@ -42,7 +41,7 @@ const run = Effect.gen(function* () {
       const result = yield* test.pipe(Effect.either)
       checks.push({ name, passed: result._tag === "Right", detail: result._tag === "Left" ? result.left.message : typeof result.right === "object" ? result.right.text : "Assertions passed" })
     }
-    yield* desktop.navigate("Status")
+    yield* desktop.navigate("status")
     yield* desktop.screenshot("generation-status")
     yield* fs.writeFileString(join(root, "status.txt"), yield* desktop.text())
   }).pipe(Effect.tapError(() => Effect.gen(function* () {

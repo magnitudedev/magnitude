@@ -14,7 +14,6 @@ const run = Effect.gen(function* () {
   const executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
   const pi = yield* Config.string("LAB_PROBE_PI")
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
-  const name = yield* Config.string("LAB_PROBE_MODEL_NAME")
   const fs = yield* FileSystem.FileSystem
   const task = yield* fileFixture(root)
   const fixture = task.directory
@@ -25,9 +24,9 @@ const run = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.host()
     yield* desktop.ready()
-    yield* desktop.search(name)
-    yield* desktop.load(name)
-    yield* desktop.connect("Pi")
+    yield* desktop.search(model)
+    yield* desktop.load(model)
+    yield* desktop.connect("pi")
     yield* desktop.screenshot("pi-connected")
     const sessionConfig = { executable: pi,
       args: ["--mode", "rpc", "--provider", "magnitude", "--model", model, "--thinking", "off", "--tools", "read,write,edit", "--offline", "--session", join(root, `pi-session-${crypto.randomUUID()}.jsonl`)],
@@ -47,7 +46,7 @@ const run = Effect.gen(function* () {
       turns.push(yield* resumed.prompt("What word did you replace before with in our previous turn? Reply with that single word. Do not use tools."))
       if (turns[2]!.text.trim() !== "after") return yield* new AssertionFailure({ message: "Pi did not retain the previous conversation after process restart" })
     }))
-    yield* desktop.disconnect("Pi")
+    yield* desktop.disconnect("pi")
     yield* desktop.screenshot("pi-disconnected")
   })).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "pi-evidence"), port: 11279, environment })))
   const outcome = yield* program.pipe(Effect.either)

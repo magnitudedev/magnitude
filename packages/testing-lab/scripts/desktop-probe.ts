@@ -16,17 +16,17 @@ const probe = Effect.gen(function* () {
   const result = yield* Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     checks.push(`Native host bridge reported version ${yield* desktop.host()}`)
-    for (const page of ["Usage", "Settings", "Connections", "Status"] as const) {
+    for (const page of ["usage", "settings", "connections", "status"] as const) {
       yield* desktop.navigate(page)
       yield* desktop.screenshot(page.toLowerCase())
       checks.push(`Navigated ${page}`)
     }
-    yield* desktop.theme("Dark")
+    yield* desktop.theme("dark")
     yield* desktop.screenshot("dark")
-    yield* desktop.theme("Light")
+    yield* desktop.theme("light")
     yield* desktop.screenshot("light")
     checks.push("Changed appearance using Settings")
-    yield* desktop.navigate("Status")
+    yield* desktop.navigate("status")
     yield* fs.writeFileString(join(root, "status.txt"), yield* desktop.text())
     yield* desktop.chrome()
     checks.push("Collapsed sidebar, minimized/restored, closed/reopened window")
@@ -37,11 +37,10 @@ const probe = Effect.gen(function* () {
       if (readiness._tag === "Left") return yield* readiness.left
       checks.push("Packaged service reached Ready")
     }
-    yield* desktop.navigate("Status")
+    yield* desktop.navigate("status")
     yield* fs.writeFileString(join(root, "status.txt"), yield* desktop.text())
     if (requireReady) {
-      yield* desktop.navigate("Catalog")
-      yield* Effect.sleep("5 seconds")
+      yield* desktop.navigate("catalog")
       yield* desktop.screenshot("catalog")
       yield* fs.writeFileString(join(root, "catalog.txt"), yield* desktop.text())
     }

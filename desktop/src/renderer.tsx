@@ -1,3 +1,4 @@
+import { desktopAutomation as automation } from "./automation"
 import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
@@ -137,7 +138,7 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false }:
       {downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{stages[progress.stage]}</span>}
       <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
     </h3>
-    <Progress aria-label="Download progress" aria-valuetext={bytes} value={percent} trackClassName="h-2" indicatorClassName={`bg-blue-700 dark:bg-blue-500 ${percent === null ? "w-full motion-safe:animate-pulse" : ""}`} />
+    <Progress data-testid={automation.modelDownloadProgress} aria-label="Download progress" aria-valuetext={bytes} value={percent} trackClassName="h-2" indicatorClassName={`bg-blue-700 dark:bg-blue-500 ${percent === null ? "w-full motion-safe:animate-pulse" : ""}`} />
     <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span>{bytes}</span><span>{percent !== null ? `${Math.floor(percent)}%` : "—"}</span></div>
     <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div><dt className="text-xs text-slate-500 dark:text-slate-400">Download speed</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{rate !== null ? formatTransferRate(rate) : "—"}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{eta}</dd></div></dl>
     {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
@@ -155,8 +156,8 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
   return <div>
     <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
+      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button data-testid={automation.modelDownload} disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button data-testid={automation.modelLoad} className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
         {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
         {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
@@ -176,7 +177,7 @@ function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLoc
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
   const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
-  return <article className={pageLayout.modelCard}>
+  return <article data-testid={automation.model(model.modelId)} data-model-ready={residency?._tag === "Ready"} data-model-installed={localModelIsInstalled(model)} className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
       <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
       <ModelControls model={model} {...(replacing ? { replacing } : {})}>
@@ -281,7 +282,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
       || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
-    return matchesFilter && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
+    return matchesFilter && `${model.modelId} ${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
   })
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
@@ -304,7 +305,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
             <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
         </div>
-        <Input aria-label="Search models" placeholder="Search models…" className={pageLayout.modelSearch} value={search} onChange={event => setSearch(event.target.value)} />
+        <Input data-testid={automation.modelSearch} aria-label="Search models" placeholder="Search models…" className={pageLayout.modelSearch} value={search} onChange={event => setSearch(event.target.value)} />
       </div>
     </>}
     {discover && <HardwareOverview /> }
@@ -397,7 +398,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
         <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
         <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
-          {ready ? <CheckCircleIcon aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
+          {ready ? <CheckCircleIcon data-testid={automation.serviceReady} aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
           <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
         </div>
       </div>
@@ -473,7 +474,7 @@ function AppearanceSettings() {
   return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
     <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
     <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
+      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button data-testid={automation.theme(value)} key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
     </div>
   </section>
 }
@@ -526,11 +527,11 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
   return <div className="relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
     {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
     <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
-      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+      <button data-testid={automation.sidebarToggle} type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
         <SidebarSimpleIcon className="size-5" />
       </button>
     </div>
-    <aside aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">
+    <aside data-testid={automation.sidebar} aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">
       <div className={`flex h-full w-56 flex-col border-r border-slate-200 pt-10 pb-8 transition-transform duration-250 ease-in-out motion-reduce:transition-none dark:border-slate-750 ${collapsed ? "-translate-x-full" : "translate-x-0"}`}>
       <div className="mb-10 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
         <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
@@ -538,14 +539,14 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
       <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
         {(Object.keys(pageNames) as Page[]).map(key => {
           const Icon = pageIcons[key]
-          return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+          return <Button data-testid={automation.navigation(key)} variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
             <Icon className="size-4 shrink-0" />{pageNames[key]}
           </Button>
         })}
       </nav>
       </div>
     </aside>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto">
+    <main data-testid={automation.page(page)} key={page} className="min-w-0 flex-1 overflow-y-auto">
       <div data-page-content className={`mx-auto w-[calc(100vw-224px)] max-w-6xl px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
         {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
         {children}

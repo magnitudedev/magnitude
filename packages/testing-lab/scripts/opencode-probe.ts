@@ -15,7 +15,6 @@ const run = Effect.gen(function* () {
   const executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
   const client = yield* Config.string("LAB_PROBE_OPENCODE")
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
-  const name = yield* Config.string("LAB_PROBE_MODEL_NAME")
   const fs = yield* FileSystem.FileSystem
   const task = yield* fileFixture(root, { "opencode.json": yield* Schema.encode(Schema.parseJson(Schema.Struct({ $schema: Schema.Literal("https://opencode.ai/config.json"), permission: Schema.Record({ key: Schema.String, value: Schema.Literal("allow", "deny") }) })))({ $schema: "https://opencode.ai/config.json", permission: { "*": "deny", read: "allow", edit: "allow" } }) })
   const fixture = task.directory
@@ -27,9 +26,9 @@ const run = Effect.gen(function* () {
     const desktop = yield* DesktopDriver
     yield* desktop.host()
     yield* desktop.ready()
-    yield* desktop.search(name)
-    yield* desktop.load(name)
-    yield* desktop.connect("OpenCode")
+    yield* desktop.search(model)
+    yield* desktop.load(model)
+    yield* desktop.connect("opencode")
     yield* desktop.screenshot("opencode-connected")
     const client = yield* openCode({ executable: yield* Config.string("LAB_PROBE_OPENCODE"), cwd: fixture, model,
       evidence: join(root, "opencode-events"), environment: { ...environment, HOME: home, XDG_CONFIG_HOME: join(home, ".config"),
@@ -41,7 +40,7 @@ const run = Effect.gen(function* () {
     yield* task.verify
     turns.push(yield* client.prompt("What word did you replace before with in our previous turn? Reply with that single word. Do not use tools.", Option.some(turns[0]!.sessionId)))
     if (turns[2]!.text.trim() !== "after") return yield* new AssertionFailure({ message: "OpenCode did not retain the previous conversation after process restart" })
-    yield* desktop.disconnect("OpenCode")
+    yield* desktop.disconnect("opencode")
     yield* desktop.screenshot("opencode-disconnected")
   }).pipe(Effect.provide(playwrightDesktop({ executable, profile: join(root, "profile"), evidence: join(root, "opencode-evidence"), port: 11279, environment })))
   const outcome = yield* program.pipe(Effect.either)
