@@ -17,13 +17,15 @@ import { SourceBuilder } from "../src/source-builder"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment, validateTargetResult } from "../src/work-store"
 
-for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-artifact-worker-" })
   const bytes = new TextEncoder().encode("fixture installer")
   const artifactJson = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
     schemaVersion: 2, version: "0.1.3", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.3", sourceCommit: "a".repeat(40),
-    artifacts: [{ id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64", filename: "Magnitude.dmg", bytes: bytes.length, sha256: sha256(bytes) }],
+    artifacts: [{ id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64", filename: "Magnitude.dmg", bytes: bytes.length, sha256: sha256(bytes) },
+      ...(mode === "runtime-artifacts" ? [{ id: "icn-base-darwin-arm64", kind: "icn-base", host: "darwin-arm64", backend: "cpu", filename: "native.tar.gz",
+        nativeBuild: "fixture", backendModuleAbi: "fixture", bytes: bytes.length, sha256: sha256(bytes) }] : [])],
   } })
   const artifactInput = yield* Schema.decodeUnknown(Schema.parseJson(ArtifactInput))(artifactJson)
   const isSource = mode.startsWith("source-")
@@ -43,12 +45,14 @@ for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt",
   const started = yield* Deferred.make<void>()
   let installed = 0, removed = 0
   let nativeState: string | undefined
+  let runtimeOrigin: string | undefined
   const program = Effect.gen(function* () {
     const objects = yield* ArtifactStore
     yield* objects.put(sha256(json), Stream.make(new TextEncoder().encode(json)))
     yield* objects.put(sha256(bytes), Stream.make(bytes))
     if (mode === "corrupt") yield* fs.writeFileString(join(root, "objects", sha256(bytes)), "changed bytes")
-    const execution = runCandidateWorker(assignment, { root: join(root, "attempt"), port: 11279, model: "fixture", environment: {} })
+    const execution = runCandidateWorker(assignment, { root: join(root, "attempt"), port: 11279, model: "fixture", environment: mode === "runtime-artifacts"
+      ? { MAGNITUDE_ICN_PATH: "/ambient/development/installation.json", MAGNITUDE_RELEASE_BASE_URL: "https://wrong.invalid" } : {} })
     if (mode === "cancel") {
       const fiber = yield* Effect.fork(execution)
       yield* Deferred.await(started)
@@ -79,6 +83,10 @@ for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt",
       expect(Buffer.byteLength(join(nativeState, "application.sock"))).toBeLessThanOrEqual(103)
       expect(yield* fs.exists(nativeState)).toBe(false)
     }
+    if (mode === "runtime-artifacts") {
+      expect(runtimeOrigin).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//)
+      expect((yield* Effect.tryPromise(() => fetch(runtimeOrigin!)).pipe(Effect.either))._tag).toBe("Left")
+    }
     if (mode === "explicit-uninstall") expect(result.cases.find(test => test.caseId === "X1")!.outcome.status).toBe("passed")
     if (mode.startsWith("update-baseline-")) expect(result.cases.find(test => test.caseId === "U1")!.outcome.status).toBe(mode === "update-baseline-missing" ? "blocked" : "failed")
     expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" ? 1 : 0)
@@ -95,7 +103,9 @@ for (const mode of ["success", "explicit-uninstall", "wrong-version", "corrupt",
     Layer.succeed(HostInspector, { inspect: () => Effect.succeed({ os: "macos", version: "15.5", build: "fixture", arch: "arm64", cpuVendor: "Apple", cpuName: "fixture", machineModel: "fixture", memoryBytes: 1024, gpus: [] }) }),
     Layer.succeed(Installer, { install: candidate => Effect.sync(() => { installed++; return { candidate, root: "fixture", executable: "fixture", cli: "fixture", packageVersion: "0.1.3" } }),
       uninstall: () => Effect.gen(function* () { removed++; if (mode === "cleanup-failure") return yield* new InfrastructureFailure({ operation: "fixture-cleanup", message: "Failed cleanup fixture" }) }) }),
-    Layer.succeed(ProcessExecutor, { run: spec => { nativeState = spec.env.MAGNITUDE_DESKTOP_STATE_DIR; return mode === "cancel" ? Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never))
+    Layer.succeed(ProcessExecutor, { run: spec => { nativeState = spec.env.MAGNITUDE_DESKTOP_STATE_DIR;
+      if (mode === "runtime-artifacts") { runtimeOrigin = spec.env.MAGNITUDE_RELEASE_BASE_URL; expect(spec.env.MAGNITUDE_ICN_PATH).toBeUndefined() }
+      return mode === "cancel" ? Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never))
       : mode === "defect" ? Effect.dieMessage("Injected command defect") : Effect.succeed({ exitCode: 0, stdout: mode === "wrong-version" ? "0.0.0" : "0.1.3", stderr: "" }) } }),
   ]))
 })).pipe(Effect.provide(BunContext.layer))))

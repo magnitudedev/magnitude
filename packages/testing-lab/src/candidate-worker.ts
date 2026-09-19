@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { ArtifactStore } from "./artifact-store"
 import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
+import { runtimeEnvironment } from "./runtime-release"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
 import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
@@ -96,6 +97,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       XDG_CONFIG_HOME: join(config.root, "home", ".config"), XDG_DATA_HOME: join(config.root, "home", ".local", "share"),
       MAGNITUDE_DEV_DATA_DIR: join(config.root, "profile"), MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
+    const candidateEnvironment = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => runtimeEnvironment(value.release, target.artifactHost, environment)),
+      Effect.provideService(ArtifactStore, objects), Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope)))
     const selection = assignment.plan.request.selection
     const harnesses = selectedHarnesses(selection)
     const connections = assignment.target.cases.some(test => test.id === "A5" || test.id === "C4" || test.id === "A7")
@@ -110,7 +113,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const session = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
       const value = yield* desktopSession({ executable: app.executable, profile: environment.MAGNITUDE_DEV_DATA_DIR,
-        evidence: join(evidenceDirectory, "desktop"), port: config.port, environment }, detail => { cleanupErrors.push(detail) }).pipe(
+        evidence: join(evidenceDirectory, "desktop"), port: config.port, environment: yield* candidateEnvironment }, detail => { cleanupErrors.push(detail) }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Scope.Scope, scope))
       activeSession = Option.some(value)
       return value
@@ -127,7 +130,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const cli = yield* Effect.cached(Effect.gen(function* () {
       const app = yield* installed
       const context = yield* Layer.buildWithScope(bundledCliTests({ executable: app.cli, version: (yield* manifest).release.version, model: config.model,
-        evidence: join(evidenceDirectory, "cli"), environment }).pipe(Layer.provide(Layer.merge(Layer.succeed(ProcessExecutor, processes), Layer.succeed(FileSystem.FileSystem, fs)))), scope)
+        evidence: join(evidenceDirectory, "cli"), environment: yield* candidateEnvironment }).pipe(Layer.provide(Layer.merge(Layer.succeed(ProcessExecutor, processes), Layer.succeed(FileSystem.FileSystem, fs)))), scope)
       return Context.get(context, CliTests)
     }))
     const endpoint = yield* Effect.cached(Effect.gen(function* () {
@@ -136,8 +139,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     }))
     const tools = yield* Effect.serviceOption(HarnessTools)
     const harnessSuites = new Map<Harness, ReturnType<typeof harnessSuite>>()
-    for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(harnessSuite(harness, config.model,
-      join(evidenceDirectory, "harness", harness), join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), environment)))
+    for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(candidateEnvironment.pipe(Effect.flatMap(prepared => harnessSuite(harness, config.model,
+      join(evidenceDirectory, "harness", harness), join(environment.MAGNITUDE_DEV_DATA_DIR, "harness-home"), prepared)))))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       if (fixtureCleanupFailed) return yield* unavailable("Native fixture restoration failed; refusing further operations on an uncertain installation")
       switch (test.id as string) {
@@ -162,7 +165,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
               const app = yield* ownership.replace(pair.previous)
               const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
                 : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" })
-              const updateEnvironment = { ...environment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
+              const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
+              const updateEnvironment = { ...baselineEnvironment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
               const updateSession = yield* desktopSession({ executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
                 evidence: join(evidenceDirectory, "update-baseline"), port: config.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
               const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
@@ -310,7 +314,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const before = yield* driver.identity()
           const tests = yield* cli
           yield* tests.invalid
-          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: config.port, environment }, before).pipe(
+          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: config.port, environment: yield* candidateEnvironment }, before).pipe(
             Effect.provideService(ProcessExecutor, processes))
           yield* tests.inspect
           if (!Schema.equivalence(ApplicationIdentity)(before, yield* driver.identity())) return yield* new AssertionFailure({ message: "CLI interruption changed the owning application or service" })

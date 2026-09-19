@@ -31,6 +31,15 @@ frozen and verified like candidate artifacts, registered under the same owner an
 the immutable assignment. Admission requires both inputs. Worker transfer authority includes
 exactly their manifest graphs; unrelated uploaded artifacts remain inaccessible. Supplying a
 baseline alone does not establish version ordering, update trust or a successful installation.
+Runtime release fixtures preserve the admitted manifest and expose only its selected host's native
+base and backend archives through ordinary release URLs. Verified private copies and a random-route
+loopback listener share the run scope. Publication rejects missing bases, unsafe names and corrupt
+bytes; delivery supports bounded byte ranges without redirecting to external or development files.
+Successful fixture transport alone does not qualify compilation, extraction or backend execution.
+Candidate desktop and bundled CLI sessions share their candidate runtime origin. An update baseline
+uses its own validated release manifest and separately scoped origin; it cannot inherit the candidate
+origin. Worker acceptance removes ambient development-installation overrides. An app-only input
+retains ordinary released-runtime acquisition and does not qualify unpublished inference changes.
 
 `iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
 and consumer state. Neither mode may touch a developer's normal application data. Local execution

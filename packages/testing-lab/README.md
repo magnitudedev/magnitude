@@ -686,6 +686,20 @@ owner's library usable. This regression ran on macOS; Linux/Windows runtime qual
 outstanding. Five collector/correlation tests and lab typechecking pass. Cleanup was empty. The
 explicit development installation remains a diagnostic input, not admitted release-artifact proof.
 
+`runtimeRelease(release, host)` prepares verified private copies of admitted native base/backend
+archives and serves the exact manifest through production release URL conventions on a scoped
+random loopback route. It supports parallel byte ranges, rejects unknown routes, and closes before
+its temporary copies are removed. Production `acquireRelease` and `downloadArtifact` pass against
+the fixture, including segmented download with fallback disabled. Tests also reject missing host
+bases, reserved names, wrong lengths and corrupt CAS bytes, and prove later CAS mutation cannot
+change published copies. Candidate desktop and bundled CLI sessions now use this origin when the
+admitted manifest includes native archives. U1 retains the validated previous manifest and gives
+its baseline session a separate scoped origin; baseline cleanup leaves the candidate origin intact.
+All ordinary worker sessions remove ambient development-installation overrides (including Windows
+case variants). App-only manifests retain ordinary released-runtime acquisition, and cannot prove
+unpublished inference changes. Source runtime compilation remains outstanding. Delivery alone does
+not qualify native archive contents or application execution.
+
 Private acceptance routing is now selected through a compiled update configuration. Set
 `MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG` to a JSON file when invoking the existing release
 acceptance builder. It validates and copies the configuration before modifying version inputs.

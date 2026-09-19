@@ -8,7 +8,7 @@ import { Candidate, prepareCandidate, selectInstaller } from "./candidate"
 import { AssertionFailure, Digest, Target } from "./domain"
 import { ArtifactInput } from "./inputs"
 
-export const UpdatePair = Schema.Struct({ previous: Candidate, candidate: Candidate,
+export const UpdatePair = Schema.Struct({ previous: Candidate, previousRelease: ReleaseManifestSchema, candidate: Candidate,
   update: Schema.Struct({ artifact: ReleaseArtifactSchema, path: Schema.NonEmptyString }) })
 const fail = (message: string) => new AssertionFailure({ message })
 
@@ -42,5 +42,5 @@ export const prepareUpdatePair = (baseline: Digest, candidate: typeof ReleaseMan
     yield* downloadObject(Digest.make(archive.sha256), path)
   }
   if (Number((yield* fs.stat(path)).size) !== archive.bytes) return yield* fail("Update archive length differs from the admitted manifest")
-  return UpdatePair.make({ previous: oldPackage, candidate: newPackage, update: { artifact: archive, path } })
+  return UpdatePair.make({ previous: oldPackage, previousRelease: previous.release, candidate: newPackage, update: { artifact: archive, path } })
 })
