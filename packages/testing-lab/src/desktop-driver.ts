@@ -127,7 +127,13 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       if (!message.trim()) throw new Error("Service failure displayed an empty diagnostic")
       return message
     }))),
-    ready: () => navigate("status").pipe(Effect.zipRight(action("Wait for packaged service readiness", () => page.getByTestId(automation.serviceReady).waitFor({ timeout: 180_000 })))),
+    ready: () => navigate("status").pipe(Effect.zipRight(action("Wait for packaged service readiness", async () => {
+      const status = page.getByTestId(automation.page("status"))
+      const ready = status.getByTestId(automation.serviceReady)
+      const failure = status.getByRole("alert").first()
+      await ready.or(failure).first().waitFor({ timeout: 180_000 })
+      if (!await ready.isVisible()) throw new Error(await failure.innerText())
+    }))),
     search: name => navigate("catalog").pipe(Effect.zipRight(action("Search model catalog", async () => {
       await page.getByTestId(automation.modelSearch).fill(name)
       await card(name).waitFor({ timeout: 120_000 })

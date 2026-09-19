@@ -22,6 +22,13 @@ hashes and lengths before submission. Subsequent edits to local packages cannot 
 input. Existing artifacts are never rebuilt or relabelled as a successful compilation. Source execution
 extracts the admitted snapshot into a fresh workspace, installs frozen dependencies, and records
 compilation and final packaging independently. A failed compile blocks packaging and consumption.
+Source candidates compile the release-owned CPU base and the selected host's backend pack alongside
+the desktop. CPU targets need no additional pack; Metal and CUDA targets require their matching
+pack. Compilation receipts bind the selected backend and native build identity. Final packaging
+archives those exact compiled inputs and admits desktop, base and pack bytes together; it cannot
+silently substitute a published inference runtime for unpublished source changes.
+The manifest also includes the canonical archive of the bundled service, whose size is consumed
+by ordinary runtime startup. Package admission validates that startup's bundle metadata is complete.
 Build receipts bind the snapshot digest, base commit and native host; final manifests and every
 package byte are verified before the installer can consume them. A base commit alone never
 identifies dirty source. Producer reuse across targets and separate consumer allocation remain
@@ -223,7 +230,10 @@ does not establish runtime-module identity or qualify the selected backend.
 Loaded-module diagnostics retain filename, digest and length only when supplied. Absence remains
 unknown; malformed supplied records invalidate collection. The native producer uses an already-loaded
 full-path lookup, and the lab must independently compare its backing-file identity with the admitted
-runtime. Neither an on-disk module nor a same-named loaded module from another directory proves that
+runtime. Expected module identities are computed from integrity-verified archives using the release
+extractor. Missing, duplicate, unknown or byte-mismatched observed modules fail this comparison;
+unused CPU variants need not be loaded. This comparison does not establish accelerator allocation.
+Neither an on-disk module nor a same-named loaded module from another directory proves that
 the selected installation executed.
 JSON and JUnit reports derive from the same admitted plan and completed result.
 JUnit distinguishes product failures from infrastructure errors; missing, blocked,

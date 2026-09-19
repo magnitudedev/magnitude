@@ -25,6 +25,7 @@ for (const mode of ["success", "compile-failure", "package-failure", "wrong-prov
     phases.push(phase)
     expect(spec.inheritEnv).toBe(false)
     expect(spec.env.LAB_BUILD_SOURCE_DIGEST).toBe(digest)
+    expect(spec.env.LAB_BUILD_BACKEND).toBe(target.backend)
     expect(yield* fs.readFileString(join(Option.getOrThrow(spec.cwd), "dirty.txt"))).toBe("unpublished local change")
     expect(spec.env.HOME).toBe(join(root, "build", "home"))
     if (phase === "dependencies") expect(spec.args).toEqual(["install", "--frozen-lockfile"])

@@ -3,10 +3,11 @@ import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
-import { isWindowsEngineLibrary, signWindowsCode } from "./windows-signing"
+import { signWindowsCode } from "./windows-signing"
+import { compileIcnBase, packageIcnBase } from "./icn-base"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
-import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
+import { appleSigning, appleCommand } from "../apple/signing"
 import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
 import {
@@ -18,12 +19,11 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, delimiter, dirname, resolve } from "node:path"
+import { delimiter, dirname, resolve } from "node:path"
 import { Effect, Option, Schedule, Schema } from "effect"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
 import { mergeWindowsEnvironment } from "@magnitudedev/utils/windows-native"
 import {
-  BackendEligibilityReport,
   IcnInstallationDeclaration,
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol"
@@ -38,7 +38,6 @@ import {
   currentHost,
   hostById,
   icnBaseArchive,
-  releaseBuildEnvironment,
   type HostId,
 } from "../../src/targets"
 import { buildAcnBinary } from "./acn"
@@ -48,9 +47,7 @@ import {
   type ArchiveSource,
   run,
   verifyAppleDeploymentTarget,
-  verifyOwnedLoaderPaths,
 } from "./common"
-import { buildIcnBinary } from "../../../../inference/scripts/compile"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol"
 import { appleRequirement } from "../../src/trust"
@@ -280,21 +277,6 @@ export const smokeHostArchives = async (
   }
 }
 
-const regularSources = (
-  directory: "runtime" | "backends",
-  files: readonly string[],
-): readonly ArchiveSource[] => {
-  const seen = new Set<string>()
-  return files.map((source) => {
-    const name = basename(source)
-    if (seen.has(name)) {
-      throw new Error(`duplicate ${directory} output ${name}`)
-    }
-    seen.add(name)
-    return { path: `${directory}/${name}`, source, mode: 0o755 }
-  })
-}
-
 export const buildHostArtifacts = async (
   hostId: HostId,
   catalogRoot: string,
@@ -312,71 +294,21 @@ export const buildHostArtifacts = async (
   ], { cwd: PROJECT_ROOT })
   const cli = await buildCliBinary(host.bunTarget)
   const acn = await buildAcnBinary(host.bunTarget)
-  const icn = await buildIcnBinary({
-    target: host.bunTarget,
-    profile: `base-${host.id}`,
-    features: host.cargoFeatures,
-    buildEnvironment: releaseBuildEnvironment(host),
-  })
-  const cpuModules = icn.backendModules.filter((file) =>
-    basename(file).toLowerCase().includes("cpu")
-  )
-  if (cpuModules.length === 0) {
-    throw new Error(`${host.id} ICN base emitted no CPU module`)
-  }
-  await verifyOwnedLoaderPaths({
-    host: host.id,
-    executable: icn.binary,
-    modules: cpuModules,
-    runtime: icn.runtimeLibraries,
-  })
-  await verifyAppleDeploymentTarget(host.id, [
-    cli,
-    acn,
-    icn.binary,
-    ...icn.runtimeLibraries,
-    ...cpuModules,
-  ])
+  const icn = await Effect.runPromise(compileIcnBase(host.id).pipe(Effect.provide(BunContext.layer)))
+  const cpuModules = icn.backendModules
+  await verifyAppleDeploymentTarget(host.id, [cli, acn])
 
   if (host.id.startsWith("darwin-")) {
     for (const kind of ["cli", "acn"]) {
       const embedded = await runAppleBuild(regularAppleFiles(resolve(PROJECT_ROOT, "bin/apple-inputs", kind)))
       await verifyAppleDeploymentTarget(host.id, embedded.map((file) => file.source))
     }
-    for (const file of [icn.binary, ...icn.runtimeLibraries, ...cpuModules]) {
-      await runAppleBuild(signAppleCode(file, `dev.magnitude.inference.${basename(file)}`, file === icn.binary ? "native" : "library"))
-    }
   }
   await chmod(cli, 0o755)
   await chmod(acn, 0o755)
-  await chmod(icn.binary, 0o755)
-
-  const loader = host.id.startsWith("windows-")
-    ? "PATH"
-    : host.id.startsWith("darwin-")
-      ? "DYLD_LIBRARY_PATH"
-      : "LD_LIBRARY_PATH"
-  const eligibility = await run([
-    icn.binary,
-    "backend-eligibility",
-    "--json",
-  ], {
-    env: {
-      ...process.env,
-      [loader]: [...icn.runtimeLibraries.map(dirname), process.env[loader]]
-        .filter(Boolean)
-        .join(delimiter),
-    },
-  })
-  Schema.decodeUnknownSync(
-    Schema.parseJson(BackendEligibilityReport),
-  )(eligibility)
-
   const cliArchivePath = resolve(output, cliArchive(host.id))
   if (host.id === "windows-x64-msvc") {
-    await Effect.runPromise(Effect.forEach([cli, acn, icn.binary, ...cpuModules,
-      ...icn.runtimeLibraries.filter(file => isWindowsEngineLibrary(basename(file))),
-    ], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
+    await Effect.runPromise(Effect.forEach([cli, acn], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
   }
   const acnArchivePath = resolve(output, acnArchive(host.id))
   const icnArchivePath = resolve(output, icnBaseArchive(host.id))
@@ -476,34 +408,7 @@ export const buildHostArtifacts = async (
     },
     acnSources,
   )
-  const icnArtifact = await buildArchive(
-    icnArchivePath,
-    resolve(output, `icn-base-${host.id}.artifact.json`),
-    {
-      id: `icn-base-${host.id}`,
-      kind: "icn-base",
-      host: Option.some(host.id),
-      backend: Option.some("cpu"),
-      requiredBaseId: Option.none(),
-      nativeBuild: Option.some(icn.identity.native_build),
-      backendModuleAbi: Option.some(icn.identity.backend_module_abi),
-      compatibility: Option.none(),
-    },
-    [
-      {
-        path: `bin/${ICN_EXECUTABLE_NAME}${host.executableExtension}`,
-        source: icn.binary,
-        mode: 0o755,
-      },
-      {
-        path: "catalog/model-planner-inputs.bundle",
-        source: resolve(catalogRoot, "model-planner-inputs.bundle"),
-        mode: 0o644,
-      },
-      ...regularSources("runtime", icn.runtimeLibraries),
-      ...regularSources("backends", cpuModules),
-    ],
-  )
+  const icnArtifact = await Effect.runPromise(packageIcnBase(host.id, icn, catalogRoot, output))
   await smokeHostArchives(
     host,
     cliArchivePath,

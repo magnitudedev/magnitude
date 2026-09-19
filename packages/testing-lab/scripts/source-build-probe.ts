@@ -18,7 +18,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   const target = yield* Config.string("LAB_BUILD_PROBE_TARGET").pipe(Effect.flatMap(Schema.decodeUnknown(TargetId)), Effect.flatMap(findTarget))
   const objects = join(root, "objects")
   const source = yield* snapshotSource(resolve(import.meta.dir, "../../.."), objects)
-  const environment = Object.fromEntries(["PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  const environment = Object.fromEntries(["PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "CARGO_HOME", "RUSTUP_HOME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const results = yield* Effect.gen(function* () {
     const stages = yield* (yield* SourceBuilder).prepare(source.manifest, source.digest, target)
     const results = yield* runCases(target, cases.filter(test => test.id === "P1" || test.id === "P2")).pipe(Effect.provideService(CaseExecutor, {

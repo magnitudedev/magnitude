@@ -37,7 +37,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
       yield* fs.makeDirectory(home, { mode: 0o700 })
       const env = { ...config.environment, HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
         LOCALAPPDATA: join(home, "AppData", "Local"), XDG_CONFIG_HOME: join(home, ".config"), XDG_CACHE_HOME: join(home, ".cache"),
-        LAB_BUILD_OUTPUT: output, LAB_BUILD_SOURCE_DIGEST: digest, LAB_BUILD_SOURCE_COMMIT: source.commit }
+        LAB_BUILD_OUTPUT: output, LAB_BUILD_SOURCE_DIGEST: digest, LAB_BUILD_SOURCE_COMMIT: source.commit, LAB_BUILD_BACKEND: target.backend }
       const record = (name: string, result: CommandOutput) => Effect.gen(function* () {
         const wire = yield* Schema.encode(Schema.parseJson(CommandOutput))({ ...result,
           stdout: result.stdout.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]"), stderr: result.stderr.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]") })
