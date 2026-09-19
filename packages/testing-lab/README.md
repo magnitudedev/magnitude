@@ -544,3 +544,20 @@ Ubuntu image only; complete outward app execution and other Linux images remain 
 Windows is rejected by this bootstrap and requires an interactive-session launcher; a VM agent
 service-session launch cannot qualify the desktop suite. Microsoft's parameter semantics are
 specified in [Managed Run Command](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/run-command-managed).
+
+## Bundled CLI interruption
+
+C5 now runs invalid-command exit checks and interrupts the actual bundled CLI while it waits
+on its owning service. The Unix driver pauses only the service PID observed through the
+isolated desktop, waits for the CLI's established loopback connection, sends SIGINT to its
+owned CLI process group, and requires interruption exit behavior. The service resumes on
+success, failure and cancellation. The case then checks CLI inspection and unchanged native
+application/service identity. Invalid commands must exit 1 with a diagnostic; arbitrary
+nonzero exits cannot satisfy that check. C5 now depends on A1 as well as C1.
+
+The packaged macOS ARM64 probe passed at
+`/tmp/ml-cli-interruption-exit-20260918/interruption-report.json`: exit 130, unchanged owning
+identities, usable service and no cleanup errors. Three tests exercise service resumption on
+observer failure, early CLI exit and cancellation. Unix guest images need `lsof`; Linux native
+qualification remains outstanding. Windows requires a native console driver and stays blocked
+for this case. This does not claim cancellation of model acquisition or generation.

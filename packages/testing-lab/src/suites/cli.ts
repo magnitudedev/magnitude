@@ -88,7 +88,7 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
     invalid: Effect.gen(function* () {
       for (const args of [["lab-nonexistent-command"], ["catalog", "show", "lab-invalid-model"]]) {
         const result = yield* invoke(args)
-        yield* assert(result.exitCode !== 0 && Boolean((result.stderr + result.stdout).trim()), "Invalid CLI input returned success or no diagnostic")
+        yield* assert(result.exitCode === 1 && Boolean((result.stderr + result.stdout).trim()), "Invalid CLI input did not return the expected error exit code and diagnostic")
       }
       yield* assert(/Runtime\s+Ready/.test(yield* successful(["service", "status"])), "Invalid CLI input disrupted the owning service")
     }),

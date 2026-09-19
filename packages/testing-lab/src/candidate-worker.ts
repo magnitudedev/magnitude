@@ -30,6 +30,7 @@ import { Harness } from "./domain"
 import { harnessSuite, HarnessTools, HarnessTurn } from "./harnesses/suite"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
+import { CliInterruption, verifyCliInterruption } from "./suites/cli-interruption"
 import { WorkAssignment, TargetResult } from "./work-store"
 
 export const CandidateWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
@@ -248,6 +249,19 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const tests = yield* cli
           for (const fixture of connections) yield* tests.connections(fixture.harness, fixture.inspect)
           break
+        }
+        case "C5": {
+          const driver = yield* desktop
+          yield* driver.ready()
+          const before = yield* driver.identity()
+          const tests = yield* cli
+          yield* tests.invalid
+          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: config.port, environment }, before).pipe(
+            Effect.provideService(ProcessExecutor, processes))
+          yield* tests.inspect
+          if (!Schema.equivalence(ApplicationIdentity)(before, yield* driver.identity())) return yield* new AssertionFailure({ message: "CLI interruption changed the owning application or service" })
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("C5-interruption.json", CliInterruption, interruption)] })
         }
         case "C6": yield* (yield* cli).nativeRuntime; break
         case "X1": {

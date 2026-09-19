@@ -146,6 +146,11 @@ window hiding and forced cleanup cannot satisfy quit acceptance. Repeated servic
 retain the native application PID, service PID and service instance identity. After a
 restart the previous owning service must have exited and the replacement must have
 a new identity; tests never terminate a leftover process to manufacture acceptance.
+CLI interruption acceptance first observes a connection to the deliberately stalled owned
+service, then interrupts the CLI and requires the expected interruption exit. Early process
+exit cannot satisfy this case. The service is resumed on every exit path, and afterward the
+same application and service identities must remain usable. Unsupported native interruption
+mechanisms block qualification rather than substituting forced termination.
 Error scenarios preserve malformed harness files and restore the original fixture bytes
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback
