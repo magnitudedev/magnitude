@@ -1,5 +1,8 @@
 //! Persistent llama.cpp executor for ICN.
 
+mod execution_evidence;
+pub use execution_evidence::ResidentModelAllocation;
+
 use std::collections::VecDeque;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::path::PathBuf;
@@ -489,8 +492,15 @@ pub struct LlamaCompletionBackend {
     model_id: String,
     properties: ModelProperties,
     acceleration: String,
+    target_allocations: Vec<ResidentModelAllocation>,
     commands: SyncSender<ExecutorCommand>,
     executor: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct LoadedModel {
+    properties: ModelProperties,
+    acceleration: String,
+    target_allocations: Vec<ResidentModelAllocation>,
 }
 
 /// Stable semantic phases of prepared native model loading.
@@ -526,7 +536,7 @@ pub struct PreparedModelLoad {
     phases: Vec<ModelLoadPhase>,
     commands: SyncSender<ExecutorCommand>,
     start: SyncSender<Arc<dyn ModelLoadObserver>>,
-    ready: Receiver<Result<(ModelProperties, String), ModelLoadError>>,
+    ready: Receiver<Result<LoadedModel, ModelLoadError>>,
     executor: JoinHandle<()>,
 }
 
@@ -638,10 +648,11 @@ impl PreparedModelLoad {
             .send(observer)
             .map_err(|_| ModelLoadError::from(InferenceError::ExecutorStopped))?;
         match ready.recv() {
-            Ok(Ok((properties, acceleration))) => Ok(LlamaCompletionBackend {
+            Ok(Ok(loaded)) => Ok(LlamaCompletionBackend {
                 model_id,
-                properties,
-                acceleration,
+                properties: loaded.properties,
+                acceleration: loaded.acceleration,
+                target_allocations: loaded.target_allocations,
                 commands,
                 executor: Mutex::new(Some(executor)),
             }),
@@ -703,6 +714,12 @@ impl From<InferenceError> for ModelLoadError {
 }
 
 impl LlamaCompletionBackend {
+    /// Native target-model allocations captured after load/warmup, excluding draft and projector.
+    #[must_use]
+    pub fn target_allocations(&self) -> &[ResidentModelAllocation] {
+        &self.target_allocations
+    }
+
     /// The normalized acceleration selected by the native load plan.
     #[must_use]
     pub fn acceleration(&self) -> &str {
@@ -986,7 +1003,7 @@ fn executor_main(
     planned: icn_hardware::BackendLoadPlan,
     acceleration: String,
     commands: Receiver<ExecutorCommand>,
-    ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
+    ready: SyncSender<Result<LoadedModel, ModelLoadError>>,
     observer: Arc<dyn ModelLoadObserver>,
     template_capabilities: TemplateCapabilities,
     reasoning: ReasoningProfile,
@@ -1381,7 +1398,7 @@ fn run_initialized_executor<'model>(
     mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
-    ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
+    ready: &SyncSender<Result<LoadedModel, ModelLoadError>>,
     acceleration: String,
     observer: &dyn ModelLoadObserver,
     template_capabilities: &TemplateCapabilities,
@@ -1396,7 +1413,7 @@ fn run_initialized_executor<'model>(
     }
     observer.phase_completed(ModelLoadPhase::Warmup);
     observer.phase_started(ModelLoadPhase::Finalize);
-    let resident_allocations = match capture_resident_allocations(
+    let (resident_allocations, target_allocations) = match capture_resident_allocations(
         context,
         draft_context.as_deref(),
         draft_has_separate_model,
@@ -1429,7 +1446,14 @@ fn run_initialized_executor<'model>(
             return;
         }
     };
-    if ready.send(Ok((properties, acceleration))).is_err() {
+    if ready
+        .send(Ok(LoadedModel {
+            properties,
+            acceleration,
+            target_allocations,
+        }))
+        .is_err()
+    {
         return;
     }
     run_scheduler(
@@ -1451,8 +1475,9 @@ fn capture_resident_allocations(
     draft_context: Option<&LlamaContext<'_>>,
     draft_has_separate_model: bool,
     auxiliary_allocations: &[ResidentAllocation],
-) -> Result<Vec<ResidentAllocation>, LlamaMemoryBreakdownError> {
+) -> Result<(Vec<ResidentAllocation>, Vec<ResidentModelAllocation>), LlamaMemoryBreakdownError> {
     let target = context.memory_breakdown()?;
+    let target_allocations = execution_evidence::target_model_allocations(&target);
     let mut allocations = target
         .into_iter()
         .map(ResidentAllocation::from)
@@ -1471,7 +1496,7 @@ fn capture_resident_allocations(
         allocations.extend(draft);
     }
     allocations.extend_from_slice(auxiliary_allocations);
-    Ok(allocations)
+    Ok((allocations, target_allocations))
 }
 
 fn model_instance_allocation(

@@ -1040,6 +1040,12 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
         }
     };
     responses.send(WorkerMessage::Loaded { properties })?;
+    // Capture only bounded target-model allocation metadata. Diagnostic serialization cannot
+    // change inference results, and draft/projector allocations cannot certify target execution.
+    let target_allocations = serde_json::to_string(backend.target_allocations())
+        .ok()
+        .filter(|value| value.len() <= 16 * 1024)
+        .map(Arc::<str>::from);
 
     let cancellations = Arc::new(Mutex::new(HashMap::<u64, Arc<AtomicBool>>::new()));
     loop {
@@ -1063,9 +1069,12 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                 let backend = Arc::clone(&backend);
                 let responses = responses.clone();
                 let cancellations = Arc::clone(&cancellations);
+                let model_id = model_id.clone();
+                let target_allocations = target_allocations.clone();
                 thread::spawn(move || {
-                    let span =
-                        tracing::info_span!("icn.worker.inference", worker.request.id = request_id);
+                    let span = tracing::info_span!("icn.worker.inference",
+                        worker.request.id = request_id, worker.generation = worker_generation,
+                        model.id = %model_id);
                     crate::telemetry::set_parent_from_carrier(&span, &trace);
                     let _entered = span.enter();
                     let result = backend.complete(
@@ -1092,6 +1101,19 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                     );
                     if let Ok(mut active) = cancellations.lock() {
                         active.remove(&request_id);
+                    }
+                    if result.is_ok()
+                        && let Some(allocations) = target_allocations
+                    {
+                        tracing::info!(
+                            event.name = "icn.inference.completed",
+                            worker.request.id = request_id,
+                            worker.generation = worker_generation,
+                            worker.pid = std::process::id(),
+                            model.id = %model_id,
+                            native.target.allocations = %allocations,
+                            "completed inference with resident target model"
+                        );
                     }
                     let message = match result {
                         Ok(completion) => WorkerMessage::RequestCompleted {

@@ -6326,7 +6326,10 @@ async fn main() -> anyhow::Result<()> {
     ) {
         worker_process::install_parent_watchdog()?;
     }
-    let _telemetry = telemetry::init(matches!(&cli.command, Command::Serve { .. }))?;
+    let _telemetry = telemetry::init(matches!(
+        &cli.command,
+        Command::Serve { .. } | Command::InferenceWorker { .. }
+    ))?;
     // Native planner diagnostics are extremely verbose and can dominate metadata-only assessment.
     // ICN emits bounded, structured operation telemetry at the service boundary instead.
     icn_engine::disable_native_diagnostics();

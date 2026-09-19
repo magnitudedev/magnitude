@@ -297,6 +297,41 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires the isolated testing-lab OTLP collector"]
+    fn exports_execution_fixture() {
+        let endpoint =
+            std::env::var("MAGNITUDE_OTEL_ENDPOINT").expect("isolated collector endpoint");
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        let guard = init(true).expect("initialize real OTLP exporter");
+        let span = tracing::info_span!("icn.worker.inference.fixture");
+        let carrier = TraceCarrier::from([(
+            "traceparent".to_owned(),
+            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_owned(),
+        )]);
+        set_parent_from_carrier(&span, &carrier);
+        let allocations = serde_json::to_string(&[icn_engine::ResidentModelAllocation::Device {
+            backend: "Metal".to_owned(),
+            physical_id: None,
+            native_index: 1,
+            model_bytes: 4096,
+        }])
+        .expect("serialize fixture allocations");
+        span.in_scope(|| {
+            tracing::info!(
+                event.name = "icn.inference.completed",
+                worker.request.id = 7_u64,
+                worker.generation = 2_u64,
+                worker.pid = std::process::id(),
+                model.id = "fixture-model",
+                native.target.allocations = %allocations,
+                "native exporter transport fixture"
+            )
+        });
+        drop(span);
+        drop(guard);
+    }
+
+    #[test]
     fn signal_endpoints_accept_a_base_or_signal_url() {
         assert_eq!(
             signal_endpoint("http://127.0.0.1:27686", "traces"),

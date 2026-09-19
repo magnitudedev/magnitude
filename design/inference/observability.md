@@ -76,6 +76,20 @@ query strings. Function instrumentation therefore skips arguments by default and
 in explicitly. Per-token spans are prohibited; token activity belongs in aggregate fields, metrics,
 or bounded lifecycle events.
 
+Successful native inference emits an `icn.inference.completed` event under the request's worker
+span. The service and resident inference workers initialize export from the same explicit endpoint
+configuration; worker diagnostics never enter the private standard-output protocol. The event
+carries the canonical model ID, worker PID, residency generation, private request ID and a bounded
+JSON summary of target-model resident allocations. The summary is captured after native
+load and warmup, before physical-memory-domain aggregation; it retains backend/device identity for
+Metal unified-memory allocations. Draft/projector allocations and buffers with no model bytes are
+excluded, so their GPU use cannot substitute for target-model residency. Missing physical identity
+remains unknown. Serialization is bounded to 16 KiB and failure merely omits the diagnostic.
+Failed inference does not emit this completion event. No prompt, generated text, paths or tokens
+enter the summary. This is allocation and completion evidence, not a performance benchmark or a
+complete acceptance verdict: a consumer must still bind the trace to its public request and verify
+the loaded runtime module and selected device before claiming backend acceptance.
+
 The server disables the native backend's unbounded diagnostic callback. Per-layer tensor placement,
 graph construction, and device initialization dumps are not service telemetry and must not be
 forwarded to standard error or OTLP. ICN emits bounded structured summaries and errors at its own

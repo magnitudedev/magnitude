@@ -150,14 +150,18 @@ impl NativeWorkerLauncher {
             std::env::current_exe().context("failed to locate ICN worker executable")?;
         let mut command = Command::new(executable);
         configure_parent_lifetime(&mut command)?;
-        command
-            .arg(role.subcommand())
-            .env("MAGNITUDE_OTEL", "0")
-            .env("RUST_LOG", "error")
-            .env_remove("MAGNITUDE_OTEL_ENDPOINT")
-            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-            .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT");
+        command.arg(role.subcommand());
+        // Resident inference exports request-correlated execution evidence. Planning remains
+        // summarized by its service owner; neither role writes diagnostics to protocol stdout.
+        if matches!(role, NativeWorkerRole::Planning) {
+            command
+                .env("RUST_LOG", "error")
+                .env("MAGNITUDE_OTEL", "0")
+                .env_remove("MAGNITUDE_OTEL_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT");
+        }
         match &self.authority {
             NativeRuntimeAuthority::Installation(installation) => {
                 command
@@ -514,6 +518,19 @@ mod tests {
                 .and_then(|(_, value)| value)
                 .expect("worker retains spawning parent identity");
             assert_eq!(parent, std::process::id().to_string().as_str());
+            for name in [
+                "MAGNITUDE_OTEL",
+                "MAGNITUDE_OTEL_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            ] {
+                assert_eq!(
+                    command.get_envs().any(|(key, _)| key == name),
+                    matches!(role, NativeWorkerRole::Planning),
+                    "inference must inherit {name}; planning must disable it"
+                );
+            }
             #[cfg(windows)]
             {
                 let creation = command

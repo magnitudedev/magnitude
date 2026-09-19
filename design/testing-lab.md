@@ -199,6 +199,18 @@ may occupy separate elements. Service failure injection owns only an isolated lo
 listener; recovery requires successful startup after that listener is released.
 Screenshots are diagnostics rather than visual acceptance baselines. A presentation perturbation
 probe verifies that copy and layout changes do not break functional paths.
+Backend acceptance must correlate its public generation with the native completion and target-model
+allocation evidence. Hardware enumeration, load-plan intent, or draft/projector GPU allocations
+cannot qualify the target model's backend. Native completion diagnostics preserve the pre-aggregation
+device locations; the lab must still validate runtime-module identity and request correlation.
+The scoped execution collector accepts OTLP/JSON only on random loopback routes, retains only
+reviewed ICN completion fields, bounds request and retained record sizes, and removes its listener
+on scope exit. Exact exporter retries are idempotent; conflicting records invalidate collection.
+Each observed generation has a fresh W3C trace propagated through the public ACN inference proxy.
+The collector waits for that trace after generation succeeds without replaying generation, rejects
+model mismatch and ambiguous native completions, and preserves both the public completion ID and
+private native request ID rather than pretending they are the same identifier. Correlation alone
+does not establish runtime-module identity or qualify the selected backend.
 JSON and JUnit reports derive from the same admitted plan and completed result.
 JUnit distinguishes product failures from infrastructure errors; missing, blocked,
 cancelled or duplicate selected results and cleanup failures cannot become green checks.

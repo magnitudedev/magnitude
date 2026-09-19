@@ -636,6 +636,41 @@ to content-addressed evidence. Both packages came from the same source with fixt
 does not qualify historical migration, native updater replacement, or Windows/Linux execution.
 Thirty-one focused worker, baseline, pair and ownership tests pass, as does targeted typechecking.
 
+Backend verification groundwork now exists in the native executor: it retains target-model
+allocation locations before physical-memory aggregation, excluding draft/projector allocations and
+buffers without model bytes. A successful worker completion emits bounded structured diagnostics
+with model ID, worker PID/generation, private request ID and those allocations under its trace.
+This does not yet pass E6: the worker still needs the integrated runtime-module identity
+verification and live CPU/Metal/CUDA qualification. No inference benchmark is introduced.
+
+`executionTelemetry()` provides a scoped private-loopback OTLP/JSON collector with bounded
+retention, reviewed fields, retry deduplication and conflicting-record rejection.
+`observeGeneration()` gives an ordinary endpoint generation a unique trace and correlates it with
+one matching native completion, preserving public/native request IDs separately. It tolerates
+delayed export without repeating inference. This adapter is not yet wired into the worker's E6
+verdict because runtime-module/device verification and packaged live qualification remain required.
+
+The actual Rust exporter transport passed at `/tmp/ml-native-telemetry-20260919/observations.json`
+using `LAB_TELEMETRY_PROBE_ROOT=/absolute/fresh/path bun packages/testing-lab/scripts/execution-telemetry-probe.ts`.
+That probe runs an explicitly ignored Rust transport fixture against the owned collector and flushes
+the real exporter. Its completion/allocation values are synthetic; it is not a Metal generation test.
+
+`scripts/native-generation-probe.ts` exercises real UI model loading and public endpoint generation
+against an explicitly supplied native installation. Set `LAB_PROBE_ROOT` (an isolated profile with
+the selected model already cached), `LAB_PROBE_EXECUTABLE`, `LAB_PROBE_ICN_INSTALLATION`, and
+`LAB_PROBE_MODEL_ID`; `LAB_PROBE_PORT` defaults to 11339. Run with the pinned lab Bun runtime.
+It owns its telemetry listener and desktop-control directory, records both correlated and collected
+native evidence, and reports cleanup failures. It does not qualify the package's inference acquisition.
+
+The real local run at `/tmp/ml-native-generation-export-20260919/native-generation.json` passed:
+Qwen3.5 4B returned `HELLO`; the same trace identified worker46546, public completion
+`chatcmpl-icn-1`, private request4, and 2,904,582,144 target-model bytes on native backend `MTL`
+plus 521,472,000 host bytes. The physical device ID remained unknown. This run found and fixed
+disabled worker export and stripped endpoint/log settings in worker launch. Planning-worker export
+remains suppressed. App cleanup passed; this is real completion/allocation correlation, not a full
+E6 verdict or loaded-module proof. The lab's 14 collector/correlation/endpoint tests, targeted
+typecheck, native launcher regression, and actual dynamic Metal build pass.
+
 Private acceptance routing is now selected through a compiled update configuration. Set
 `MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG` to a JSON file when invoking the existing release
 acceptance builder. It validates and copies the configuration before modifying version inputs.

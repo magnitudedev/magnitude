@@ -44,6 +44,7 @@ describe("ACN inference proxy", () => {
           authorization: "Bearer caller-secret",
           "x-magnitude-acn-id": "rpc-only",
           "content-type": "application/octet-stream",
+          traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
         },
         // Required by Node's Request implementation; ignored by Bun.
         duplex: "half",
@@ -53,6 +54,7 @@ describe("ACN inference proxy", () => {
     expect(forwardedUrl).toBe("http://127.0.0.1:43210/v1/chat/completions?stream=true")
     expect(new Headers(forwarded?.headers).get("authorization")).toBe("Bearer private-icn")
     expect(new Headers(forwarded?.headers).has("x-magnitude-acn-id")).toBe(false)
+    expect(new Headers(forwarded?.headers).get("traceparent")).toBe("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
     expect(forwarded?.signal).toBe(signal)
     expect(await new Response(forwarded?.body).text()).toBe("request bytes")
     expect(result.status).toBe(206)
