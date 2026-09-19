@@ -1,6 +1,6 @@
 import { FetchHttpClient, FileSystem, HttpClient, HttpClientRequest, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer } from "@effect/platform-bun"
-import { Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { join } from "node:path"
 import { expect, test } from "vitest"
 import { planRun } from "../src/catalog"
@@ -13,6 +13,7 @@ import { WorkStore, WorkStoreLive } from "../src/work-store"
 import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 import { WorkerResults, WorkerResultsLive } from "../src/worker-results"
 import { WorkerEvidence, WorkerEvidenceLimits, WorkerEvidenceLive } from "../src/worker-evidence"
+import { WorkerClient, workerClientLayer } from "../src/worker-client"
 import { WorkerTickets, WorkerTicketsLive } from "../src/worker-tickets"
 import { workerApi } from "../src/worker-api"
 import { WorkerInputsLive } from "../src/worker-inputs"
@@ -69,6 +70,10 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       const forged = { ...invocation, assignment: { ...assignment, target: { ...assignment.target, cases: [] } } }
       expect((yield* tickets.issue(forged).pipe(Effect.either))._tag).toBe("Left")
       const ticket = yield* tickets.issue(invocation)
+      const guest = Context.get(yield* Layer.build(workerClientLayer(url.replace("/v1/worker/assignment", ""), ticket.token)), WorkerClient)
+      expect(yield* guest.assignment).toEqual(invocation)
+      expect(Buffer.concat(Array.from(yield* guest.download(sha256(payload)).pipe(Stream.runCollect))).toString("utf8")).toBe(new TextDecoder().decode(payload))
+      expect((yield* guest.download(sha256(unrelated)).pipe(Stream.runDrain, Effect.either))._tag).toBe("Left")
       if (mode === "revoked") {
         let consumed = false
         const tooLarge = yield* evidence.upload(ticket.token, sha256(unrelated), WorkerEvidenceLimits.objectBytes + 1,
@@ -119,10 +124,10 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
         HttpClientRequest.bodyUint8Array(bytes), HttpClientRequest.setHeader("content-length", String(bytes.length))))
       expect((yield* upload(new TextEncoder().encode("corrupt"))).status).toBe(500)
       expect((yield* db.query("SELECT 1 FROM lab_worker_objects WHERE run_id=$1", [assignment.claim.runId]))).toHaveLength(0)
-      expect((yield* upload(unrelated)).status).toBe(204)
+      yield* guest.upload(sha256(unrelated), unrelated.length, Stream.make(unrelated))
       expect((yield* upload(unrelated)).status).toBe(204)
       reply = unverified
-      expect((yield* send(reply)).status).toBe(204)
+      yield* guest.submit(reply)
       expect((yield* send(reply)).status).toBe(204)
       expect(Option.getOrThrow(yield* receipts.read(assignment.claim))).toEqual(reply)
       expect((yield* send({ ...reply, result: { ...reply.result, cleanupErrors: ["Changed reply"] } })).status).toBe(409)
@@ -156,6 +161,8 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect((yield* http.get(objectUrl(sha256(payload)), auth)).status).toBe(401)
       expect((yield* send(reply)).status).toBe(401)
       expect((yield* upload(unrelated)).status).toBe(401)
+      const guestDenied = yield* guest.assignment.pipe(Effect.either)
+      expect(guestDenied._tag === "Left" && guestDenied.left.status).toBe(401)
     }
   }).pipe(Effect.provide(services))
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive, FetchHttpClient.layer, BunHttpServer.layer({ hostname: "127.0.0.1", port: 0 })]))))

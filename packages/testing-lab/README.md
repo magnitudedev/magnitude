@@ -488,3 +488,26 @@ have a ten-minute deadline; abandoned reservations expire after fifteen minutes.
 Only matching SHA-256 and byte length can transition an upload to verified, with
 a fresh authorization check before publication. Failed uploads release their own
 reservations. Existing verified bytes may be redelivered, but are checked again.
+
+The guest HTTP client now supports assignment fetch, hash-verified streamed downloads,
+length-declared evidence upload and result submission. It accepts HTTPS origins or
+loopback HTTP for local tests, rejects redirects, bounds transfers and never retries
+mutations automatically. Live protocol tests use this client against the real HTTP
+API and temporary PostgreSQL database.
+
+`src/outward-worker.ts` is now an executable guest entry point configured by
+`LAB_URL`, `LAB_WORKER_TOKEN`, and `LAB_WORKER_ROOT`. It downloads admitted inputs
+into a fresh owned workspace, invokes the same native executor as the transport
+worker, saves `reply.json` before delivery, uploads unique evidence and returns the
+result. It checks live assignment authority every ten seconds and honors the run
+deadline. Existing workspaces cannot trigger another execution. Failed delivery
+leaves the reply available for inspection; a delivery-only resume command is not
+implemented yet. Scheduler/bootstrap wiring is still unfinished.
+
+The real macOS 15 ARM64 artifact probe in `scripts/outward-worker-probe.ts` passed
+its install/launch/version/corrupt-installer checks through a loopback HTTP coordinator,
+including evidence upload and result receipt. Report:
+`/tmp/ml-outward-native-20260918/outward-report.json`. Seven cases passed and P4/P5/I4
+remain explicitly blocked. Cleanup errors were empty and the installed app was gone.
+P1/P2 recorded artifact provenance/verification; they did not compile or package anew.
+This does not qualify Metal inference, other platforms or Azure execution.

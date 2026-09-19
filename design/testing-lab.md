@@ -93,6 +93,15 @@ the request. Uploading and verified objects are distinct states. Hash/length ver
 and a fresh authority check precede publication; incomplete uploads cannot satisfy a result.
 Concurrent reservations count toward the same budget, and failed uploads release only their
 own reservation. Expired reservations can be reclaimed without granting evidence authority.
+Guest HTTP clients use one HTTPS coordinator origin (loopback HTTP is permitted for local
+tests), reject redirects and verify downloaded content addresses. Transport errors never
+automatically repeat native test execution. Assignment, transfer and reply sizes and waits
+are bounded independently of the overall attempt deadline.
+An outward guest claims a fresh local workspace before downloading or executing inputs.
+An existing workspace cannot trigger another execution. The guest saves its validated reply
+before delivery, deduplicates evidence by content identity and monitors live assignment
+authority while working. Lost authority or the attempt deadline interrupts execution and
+its owned cleanup scope; transport failures do not silently rerun tests.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
 Installed-package ownership follows explicit present/absent transitions. Removal updates
