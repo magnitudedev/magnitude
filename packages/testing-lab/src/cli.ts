@@ -3,6 +3,7 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
 import { join, resolve } from "node:path"
 import { homedir } from "node:os"
+import { configuredClientToken } from "./client-token"
 import { LabClient, labClientLayer } from "./client"
 import { planRun, targets } from "./catalog"
 import { Digest, InfrastructureFailure, InvalidInput, RunId, RunPlan, RunRequest, RunResult, Target, resultExitCode } from "./domain"
@@ -28,7 +29,10 @@ const help = `Magnitude testing lab
 Use --artifacts instead of --source to verify packages beside a release manifest.
 Run uploads dirty tracked files and nonignored new files without a commit or push.
 LAB_URL and LAB_TOKEN select the authenticated coordinator. Token identity determines
-ownership and trust. --mode iterate|verify defaults to verify. --no-wait submits and
+ownership and trust. GitHub jobs use LAB_AUTH=github and LAB_OIDC_AUDIENCE instead
+of LAB_TOKEN, with id-token: write permission. Developers can use LAB_AUTH=entra with
+LAB_ENTRA_TENANT and LAB_ENTRA_APPLICATION after Azure CLI login and lab API consent.
+Identity tokens renew during long runs. --mode iterate|verify defaults to verify. --no-wait submits and
 returns the run ID. --allow-spark is explicit consent to use the shared office Spark.
 Results exit 0 only when every selected case passed and cleanup completed.
 Serve reads LAB_COORDINATOR_CONFIG and LAB_DATABASE_URL; credential values come from
@@ -54,7 +58,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
 const print = <A, I>(schema: Schema.Schema<A, I>, value: A) => Schema.encode(Schema.parseJson(schema))(value).pipe(Effect.flatMap(Console.log))
 const remote = <A, E, R>(effect: Effect.Effect<A, E, R | LabClient>) => Effect.gen(function* () {
   const url = yield* Config.string("LAB_URL")
-  const token = yield* Config.redacted("LAB_TOKEN")
+  const token = yield* configuredClientToken.pipe(Effect.provide(FetchHttpClient.layer))
   return yield* effect.pipe(Effect.provide(labClientLayer(url, token).pipe(Layer.provide(FetchHttpClient.layer))))
 })
 export const cli = (args: readonly string[]) => Effect.gen(function* () {

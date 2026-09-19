@@ -19,7 +19,7 @@ export interface LabClient {
   readonly result: (id: RunId) => Effect.Effect<Option.Option<RunResult>, LabApiError>
 }
 export const LabClient = Context.GenericTag<LabClient>("@magnitudedev/testing-lab/LabClient")
-export const labClientLayer = (origin: string, token: Redacted.Redacted<string>) => Layer.effect(LabClient, Effect.gen(function* () {
+export const labClientLayer = (origin: string, token: Effect.Effect<Redacted.Redacted<string>, LabApiError>) => Layer.effect(LabClient, Effect.gen(function* () {
   const url = yield* Effect.try({ try: () => new URL(origin), catch: () => new LabApiError({ status: 0, message: "Invalid coordinator URL" }) })
   if (url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
     (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) {
@@ -28,7 +28,7 @@ export const labClientLayer = (origin: string, token: Redacted.Redacted<string>)
   const http = yield* HttpClient.HttpClient
   const send = (path: string, body: Option.Option<RunRequest>, post = false) => Effect.gen(function* () {
     let request = (post ? HttpClientRequest.post : HttpClientRequest.get)(`${url.origin}${path}`,
-      { headers: { authorization: `Bearer ${Redacted.value(token)}` } })
+      { headers: { authorization: `Bearer ${Redacted.value(yield* token)}` } })
     if (Option.isSome(body)) {
       const json = yield* Schema.encode(Schema.parseJson(RunRequest))(body.value).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Invalid run request" })))
       request = HttpClientRequest.bodyText(request, json, "application/json")
@@ -45,12 +45,12 @@ export const labClientLayer = (origin: string, token: Redacted.Redacted<string>)
   return {
     missing: digests => Effect.gen(function* () {
       const json = yield* Schema.encode(Schema.parseJson(ObjectBatch))(digests).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Object batches allow at most 1000 digests" })))
-      const response = yield* http.execute(HttpClientRequest.post(`${url.origin}/v1/objects/missing`, { headers: { authorization: `Bearer ${Redacted.value(token)}` } }).pipe(HttpClientRequest.bodyText(json, "application/json"))).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Object availability request failed" })))
+      const response = yield* http.execute(HttpClientRequest.post(`${url.origin}/v1/objects/missing`, { headers: { authorization: `Bearer ${Redacted.value(yield* token)}` } }).pipe(HttpClientRequest.bodyText(json, "application/json"))).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Object availability request failed" })))
       if (response.status !== 200) return yield* new LabApiError({ status: response.status, message: "Object availability request rejected" })
       return yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknown(ObjectBatch)), Effect.mapError(() => new LabApiError({ status: 0, message: "Malformed object availability response" })))
     }).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new LabApiError({ status: 0, message: "Object availability request timed out" }) })),
     upload: (digest, bytes) => Effect.gen(function* () {
-      const request = HttpClientRequest.put(`${url.origin}/v1/objects/${digest}`, { headers: { authorization: `Bearer ${Redacted.value(token)}` } }).pipe(
+      const request = HttpClientRequest.put(`${url.origin}/v1/objects/${digest}`, { headers: { authorization: `Bearer ${Redacted.value(yield* token)}` } }).pipe(
         HttpClientRequest.bodyStream(bytes, { contentType: "application/octet-stream" }),
       )
       const response = yield* http.execute(request).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Object upload failed" })))
@@ -58,7 +58,7 @@ export const labClientLayer = (origin: string, token: Redacted.Redacted<string>)
     }).pipe(Effect.timeoutFail({ duration: "10 minutes", onTimeout: () => new LabApiError({ status: 0, message: "Object upload timed out" }) })),
     registerInput: input => Effect.gen(function* () {
       const json = yield* Schema.encode(Schema.parseJson(Input))(input).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Invalid input reference" })))
-      const request = HttpClientRequest.post(`${url.origin}/v1/inputs`, { headers: { authorization: `Bearer ${Redacted.value(token)}` } }).pipe(HttpClientRequest.bodyText(json, "application/json"))
+      const request = HttpClientRequest.post(`${url.origin}/v1/inputs`, { headers: { authorization: `Bearer ${Redacted.value(yield* token)}` } }).pipe(HttpClientRequest.bodyText(json, "application/json"))
       const response = yield* http.execute(request).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Input registration failed" })))
       if (response.status !== 204) return yield* new LabApiError({ status: response.status, message: "Input registration rejected" })
     }).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new LabApiError({ status: 0, message: "Input registration timed out" }) })),

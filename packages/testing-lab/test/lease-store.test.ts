@@ -175,6 +175,6 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
       const submission = yield* client.submit({ ...request, idempotencyKey: RunRequest.fields.idempotencyKey.make("http-client-request") })
       expect((yield* client.result(submission.state.runId))._tag).toBe("None")
       expect((yield* client.cancel(submission.state.runId)).state._tag).toBe("Cancelling")
-    }).pipe(Effect.provide(labClientLayer(`http://127.0.0.1:${server.address.port}`, Redacted.make("a".repeat(40))).pipe(Layer.provide(FetchHttpClient.layer))))
+    }).pipe(Effect.provide(labClientLayer(`http://127.0.0.1:${server.address.port}`, Effect.succeed(Redacted.make("a".repeat(40)))).pipe(Layer.provide(FetchHttpClient.layer))))
   }).pipe(Effect.provide(layers))
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))), 60_000)

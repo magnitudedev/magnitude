@@ -55,6 +55,14 @@ qualify generation. Generation checks output/protocol/tool behavior, not speed.
 
 ## Ownership and recovery
 
+Authentication maps credentials to server-owned identities and permissions. Developer identity
+requires a tenant-specific, signature-verified Entra v2 access token for the lab API, the delegated
+Lab.Access scope and an explicitly allowed immutable user object ID. Azure subscription roles
+alone do not grant lab access. GitHub OIDC verifies
+signature, issuer, audience, lifetime and an immutable repository/owner allowlist. Each workflow
+run attempt has a separate owner and always receives untrusted CI permissions; token or request
+claims cannot elevate it. Clients renew short-lived CI tokens before later API requests;
+credential renewal never replays an upload or mutation. Pull-request-target workflows are not admitted by this policy.
 Admission is idempotent and reserves a bounded budget. Durable transactional claims and monotonic
 attempt fences prevent stale workers from committing results. Worker invocation binds the assignment and attempt fence; returned case membership and evidence
 hashes are verified before acceptance. Transfers expose only the owner-authorized input graph.

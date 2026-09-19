@@ -25,7 +25,7 @@ test("live coordinator admits API inputs, schedules runs and preserves owner iso
     const running = yield* Effect.forkScoped(service.run)
     if (service.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected TCP address")
     const origin = `http://127.0.0.1:${service.address.port}`
-    const ownerClient = labClientLayer(origin, token).pipe(Layer.provide(FetchHttpClient.layer))
+    const ownerClient = labClientLayer(origin, Effect.succeed(token)).pipe(Layer.provide(FetchHttpClient.layer))
     const source = '{"schemaVersion":1,"kind":"source","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[]}'
     const input = { kind: "source" as const, digest: sha256(source) }
     const id = yield* Effect.gen(function* () {
@@ -47,7 +47,7 @@ test("live coordinator admits API inputs, schedules runs and preserves owner iso
       return id
     }).pipe(Effect.provide(ownerClient))
     const denied = yield* Effect.flatMap(LabClient, client => client.get(id)).pipe(Effect.either,
-      Effect.provide(labClientLayer(origin, other).pipe(Layer.provide(FetchHttpClient.layer))))
+      Effect.provide(labClientLayer(origin, Effect.succeed(other)).pipe(Layer.provide(FetchHttpClient.layer))))
     expect(denied._tag === "Left" && denied.left.status).toBe(403)
     yield* Fiber.interrupt(running)
   }).pipe(Effect.provide([database, fileArtifactStore(join(root, "objects")), BunHttpServer.layer({ hostname: "127.0.0.1", port: 0 }),
@@ -74,7 +74,7 @@ test("configured entry point keeps the server alive and rejects weak credentials
   const running = yield* Effect.forkScoped(service.run)
   if (service.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected configured TCP address")
   const identity = yield* Effect.flatMap(LabClient, client => client.identity()).pipe(Effect.provide(
-    labClientLayer(`http://127.0.0.1:${service.address.port}`, Redacted.make("c".repeat(40))).pipe(Layer.provide(FetchHttpClient.layer))))
+    labClientLayer(`http://127.0.0.1:${service.address.port}`, Effect.succeed(Redacted.make("c".repeat(40)))).pipe(Layer.provide(FetchHttpClient.layer))))
   expect(identity.owner).toBe("configured")
   yield* Fiber.interrupt(running)
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))

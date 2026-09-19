@@ -312,3 +312,25 @@ For remote deployment, terminate HTTPS at the ingress; the bearer credential mod
 private-service path. Entra/GitHub OIDC, outward worker polling, Bicep deployment and managed
 coordinator hosting remain unfinished. A real HTTP/PostgreSQL test covers upload, admission,
 idempotent submission, automatic scheduling, results, owner isolation and configured startup.
+
+GitHub OIDC admission can be enabled with a `github` configuration containing `audience`
+and `repositories: [{ repositoryId, ownerId }]` (immutable GitHub numeric IDs as strings).
+`credentials` may be empty when GitHub is configured. Tokens must use the configured audience;
+all admitted GitHub runs receive `untrusted-ci` permissions, isolated by run ID and attempt.
+Supported events are pull_request, push, workflow_dispatch and merge_group. This is the server
+verification boundary. In GitHub jobs set `LAB_AUTH=github`, `LAB_OIDC_AUDIENCE` to the
+configured audience, and grant `id-token: write`; omit `LAB_TOKEN`. The CLI uses the runner
+provided token endpoint and renews its cached credential after one minute. A deployed GitHub
+workflow and live Entra application registration/consent are still pending. See [GitHub OIDC claims](https://docs.github.com/en/actions/reference/security/oidc)
+and [JOSE verification](https://github.com/panva/jose).
+
+Developer identity authentication uses `LAB_AUTH=entra`, `LAB_ENTRA_TENANT` and
+`LAB_ENTRA_APPLICATION` (UUIDs), with Azure CLI already signed in. Omit `LAB_TOKEN`.
+The server's `entra` configuration contains `tenantId`, `applicationId`, and `users`
+(an explicit array of Entra object IDs). The API application must issue v2 access tokens
+and expose the delegated `Lab.Access` scope under `api://<applicationId>`; Azure CLI
+needs consent for that scope. The client renews through Azure CLI without printing tokens.
+Only allowed users with that delegated scope receive developer permissions. ARM tokens,
+ID tokens and app-only role tokens do not qualify. The tenant currently has no application
+named `magnitude-testing-lab`; registration and live consent qualification are unfinished.
+See [Microsoft's claims validation guidance](https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation).
