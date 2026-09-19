@@ -168,6 +168,10 @@ termination is limited to processes owned by the attempt.
 Each case records its input identity, observed hardware, outcome, diagnostics and evidence paths.
 Installed package identity is verified against native binary headers and the running desktop,
 service and CLI versions. Artifact names alone cannot qualify architecture or version agreement.
+Native dependency inspection preserves required, weak and delayed imports and platform loader
+search paths. A missing or malformed tool report cannot become an empty successful graph.
+Reading declarations does not establish dependency closure: acceptance must resolve the complete
+owned graph from final application and runtime bytes without developer-machine search paths.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
@@ -248,7 +252,8 @@ JSON and JUnit reports derive from the same admitted plan and completed result.
 JUnit distinguishes product failures from infrastructure errors; missing, blocked,
 cancelled or duplicate selected results and cleanup failures cannot become green checks.
 Finalized UI traces and command logs are published as content-addressed evidence before worker
-removal. Evidence export failures remain visible without replacing the original case outcome.
+removal. Custom selections retain shared desktop diagnostics even when they omit the install-launch
+case. Evidence export failures remain visible without replacing the original case outcome.
 
 Blocked prerequisites propagate without hiding the original product failure. Pass means every
 required selected case passed and cleanup completed. Tests must demonstrate corrupt-input rejection,

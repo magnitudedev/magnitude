@@ -387,12 +387,16 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   // Export bounded, redacted process output after the desktop scope has flushed it.
   const desktopLog = join(evidenceDirectory, "desktop", "desktop.log")
   const finalCases = [...cases]
-  if (yield* fs.exists(desktopLog)) {
+  // Custom selections need not contain I3. Preserve shared diagnostics on a selected
+  // result even when the desktop was acquired by a different scenario.
+  const desktopCase = finalCases.find(result => result.caseId === "I3") ?? finalCases[0]
+  yield* Effect.gen(function* () {
+    if (!desktopCase || !(yield* fs.exists(desktopLog))) return
     const detail = (yield* fs.readFileString(desktopLog)).replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").slice(-2 * 1024 * 1024)
     const log = yield* evidence("desktop-process.json", Schema.Struct({ detail: Schema.String }), { detail })
-    const index = finalCases.findIndex(result => result.caseId === "I3")
-    if (index >= 0) finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, log] }
-  }
+    const index = finalCases.indexOf(desktopCase)
+    finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, log] }
+  }).pipe(Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Desktop process evidence: ${error.message}`) })))
   // Traces are finalized when the desktop scope closes. Publish before the allocator removes
   // the worker; a local path alone is not durable evidence. Export errors preserve case results.
   const exportFile = (relative: string, caseId: string, maxBytes: number, harness?: Harness) => Effect.gen(function* () {
@@ -409,7 +413,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       if (yield* fs.exists(join(evidenceDirectory, relative))) yield* exportFile(relative, "U1", file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
     }
   }
-  if (yield* fs.exists(join(evidenceDirectory, "desktop", "ui-trace.zip"))) yield* exportFile("desktop/ui-trace.zip", "I3", 128 * 1024 * 1024)
+  if (desktopCase && (yield* fs.exists(join(evidenceDirectory, "desktop", "ui-trace.zip")))) yield* exportFile("desktop/ui-trace.zip", desktopCase.caseId, 128 * 1024 * 1024, Option.getOrUndefined(desktopCase.harness))
   const desktopEvidence = join(evidenceDirectory, "desktop")
   if (yield* fs.exists(desktopEvidence)) {
     const relaunches = (yield* fs.readDirectory(desktopEvidence)).filter(name => /^relaunch-\d+$/.test(name))

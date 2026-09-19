@@ -17,7 +17,7 @@ import { SourceBuilder } from "../src/source-builder"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment, validateTargetResult } from "../src/work-store"
 
-for (const mode of ["success", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-artifact-worker-" })
   const bytes = new TextEncoder().encode("fixture installer")
@@ -89,8 +89,18 @@ for (const mode of ["success", "runtime-artifacts", "explicit-uninstall", "wrong
     }
     if (mode === "explicit-uninstall") expect(result.cases.find(test => test.caseId === "X1")!.outcome.status).toBe("passed")
     if (mode.startsWith("update-baseline-")) expect(result.cases.find(test => test.caseId === "U1")!.outcome.status).toBe(mode === "update-baseline-missing" ? "blocked" : "failed")
-    expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" ? 1 : 0)
+    expect(result.cleanupErrors.length).toBe(mode === "cleanup-failure" || mode === "desktop-evidence-failure" ? 1 : 0)
     if (installed > 0 && mode !== "defect") expect(result.cases.find(c => c.caseId === "C1")!.evidence.some(item => item.path.startsWith("evidence/cli/"))).toBe(true)
+    if (mode === "desktop-evidence") {
+      const evidence = result.cases.flatMap(c => c.evidence)
+      const log = evidence.find(item => item.path === "evidence/desktop-process.json")!
+      expect(log).toBeDefined()
+      const wire = Buffer.concat(Array.from(yield* objects.get(log.sha256).pipe(Stream.runCollect))).toString("utf8")
+      expect(wire).toContain("final shutdown diagnostic")
+      expect(wire).not.toContain("secret-token")
+      expect(evidence.some(item => item.path === "evidence/desktop/ui-trace.zip")).toBe(true)
+    }
+    if (mode === "desktop-evidence-failure") expect(result.cleanupErrors[0]).toContain("Desktop process evidence:")
     for (const item of result.cases.flatMap(c => c.evidence)) expect(yield* objects.exists(item.sha256)).toBe(true)
   })
   yield* program.pipe(Effect.provide([
@@ -102,7 +112,17 @@ for (const mode of ["success", "runtime-artifacts", "explicit-uninstall", "wrong
     }) }),
     Layer.succeed(HostInspector, { inspect: () => Effect.succeed({ os: "macos", version: "15.5", build: "fixture", arch: "arm64", cpuVendor: "Apple", cpuName: "fixture", machineModel: "fixture", memoryBytes: 1024, gpus: [] }) }),
     Layer.succeed(Installer, { install: candidate => Effect.sync(() => { installed++; return { candidate, root: "fixture", executable: "fixture", cli: "fixture", packageVersion: "0.1.3" } }),
-      uninstall: () => Effect.gen(function* () { removed++; if (mode === "cleanup-failure") return yield* new InfrastructureFailure({ operation: "fixture-cleanup", message: "Failed cleanup fixture" }) }) }),
+      uninstall: () => Effect.gen(function* () { removed++;
+        if (mode === "desktop-evidence" || mode === "desktop-evidence-failure") {
+          const directory = join(root, "attempt", "evidence", "desktop")
+          yield* fs.makeDirectory(directory, { recursive: true })
+          if (mode === "desktop-evidence-failure") yield* fs.makeDirectory(join(directory, "desktop.log"))
+          else {
+            yield* fs.writeFileString(join(directory, "desktop.log"), "final shutdown diagnostic Bearer secret-token")
+            yield* fs.writeFile(join(directory, "ui-trace.zip"), new Uint8Array([80, 75, 3, 4]))
+          }
+        }
+        if (mode === "cleanup-failure") return yield* new InfrastructureFailure({ operation: "fixture-cleanup", message: "Failed cleanup fixture" }) }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : new InfrastructureFailure({ operation: "fixture-evidence", message: error.message }))) }),
     Layer.succeed(ProcessExecutor, { run: spec => { nativeState = spec.env.MAGNITUDE_DESKTOP_STATE_DIR;
       if (mode === "runtime-artifacts") { runtimeOrigin = spec.env.MAGNITUDE_RELEASE_BASE_URL; expect(spec.env.MAGNITUDE_ICN_PATH).toBeUndefined() }
       return mode === "cancel" ? Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never))
