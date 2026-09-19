@@ -90,6 +90,15 @@ enter the summary. This is allocation and completion evidence, not a performance
 complete acceptance verdict: a consumer must still bind the trace to its public request and verify
 the loaded runtime module and selected device before claiming backend acceptance.
 
+When export is configured, the resident worker also observes already-loaded modules from its exact
+installation backend directory and reports bounded filename, length and SHA-256 records. Loader
+lookup uses full paths and cannot load an absent module. Hashing streams the immutable backing
+files once per residency, retains the loader reference during observation, and rejects observed
+file changes. These are backing-file digests, not hashes of relocated machine code. No filesystem
+path is exported. Missing or failed observation remains unavailable, not an empty successful
+qualification; diagnostic failure cannot change inference results. The lab must compare these
+observations against independently admitted artifact identity before accepting the runtime.
+
 The server disables the native backend's unbounded diagnostic callback. Per-layer tensor placement,
 graph construction, and device initialization dumps are not service telemetry and must not be
 forwarded to standard error or OTLP. ICN emits bounded structured summaries and errors at its own

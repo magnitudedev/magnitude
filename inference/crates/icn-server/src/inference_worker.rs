@@ -934,7 +934,11 @@ impl ModelLoadObserver for IpcLoadObserver {
     }
 }
 
-pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result<()> {
+pub(crate) fn run_worker(
+    build: String,
+    native: NativeBackend,
+    installation: Option<&crate::installation::Installation>,
+) -> anyhow::Result<()> {
     let generation = Arc::new(AtomicU64::new(0));
     let (responses, response_receiver) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
     let writer_generation = Arc::clone(&generation);
@@ -1046,6 +1050,15 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
         .ok()
         .filter(|value| value.len() <= 16 * 1024)
         .map(Arc::<str>::from);
+    let backend_modules = crate::telemetry::export_configured()
+        .then_some(installation)
+        .flatten()
+        .and_then(|installation| {
+            crate::loaded_modules::observe(&installation.backend_directory()).ok()
+        })
+        .and_then(|modules| serde_json::to_string(&modules).ok())
+        .filter(|value| value.len() <= 16 * 1024)
+        .map(Arc::<str>::from);
 
     let cancellations = Arc::new(Mutex::new(HashMap::<u64, Arc<AtomicBool>>::new()));
     loop {
@@ -1071,6 +1084,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                 let cancellations = Arc::clone(&cancellations);
                 let model_id = model_id.clone();
                 let target_allocations = target_allocations.clone();
+                let backend_modules = backend_modules.clone();
                 thread::spawn(move || {
                     let span = tracing::info_span!("icn.worker.inference",
                         worker.request.id = request_id, worker.generation = worker_generation,
@@ -1112,6 +1126,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                             worker.pid = std::process::id(),
                             model.id = %model_id,
                             native.target.allocations = %allocations,
+                            native.backend.modules = backend_modules.as_deref(),
                             "completed inference with resident target model"
                         );
                     }

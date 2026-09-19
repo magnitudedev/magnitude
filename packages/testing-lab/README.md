@@ -650,6 +650,12 @@ one matching native completion, preserving public/native request IDs separately.
 delayed export without repeating inference. This adapter is not yet wired into the worker's E6
 verdict because runtime-module/device verification and packaged live qualification remain required.
 
+Native completion can now include already-loaded backend module filenames, lengths and backing-file
+SHA-256 digests. The producer uses full-path loader lookup without loading absent libraries, holds
+the extra reference while streaming the immutable file, and omits unavailable observations. It only
+hashes when export is configured. The collector preserves missing observations as unknown and rejects
+malformed supplied records. These digests must still be matched to admitted runtime artifacts in E6.
+
 The actual Rust exporter transport passed at `/tmp/ml-native-telemetry-20260919/observations.json`
 using `LAB_TELEMETRY_PROBE_ROOT=/absolute/fresh/path bun packages/testing-lab/scripts/execution-telemetry-probe.ts`.
 That probe runs an explicitly ignored Rust transport fixture against the owned collector and flushes
@@ -670,6 +676,15 @@ disabled worker export and stripped endpoint/log settings in worker launch. Plan
 remains suppressed. App cleanup passed; this is real completion/allocation correlation, not a full
 E6 verdict or loaded-module proof. The lab's 14 collector/correlation/endpoint tests, targeted
 typecheck, native launcher regression, and actual dynamic Metal build pass.
+
+The subsequent `/tmp/ml-native-modules-20260919/native-generation.json` run additionally verified
+loaded-module observations: worker47315 generated `HELLO` and reported `libggml-cpu-apple_m4.so`
+(918,120 bytes) and `libggml-metal.so` (2,060,592 bytes). Independent streamed hashing matched both
+reported digests. The native loader regression proves that an existing unloaded library stays
+unloaded, another directory's identical basename does not qualify, and observation leaves the actual
+owner's library usable. This regression ran on macOS; Linux/Windows runtime qualification remains
+outstanding. Five collector/correlation tests and lab typechecking pass. Cleanup was empty. The
+explicit development installation remains a diagnostic input, not admitted release-artifact proof.
 
 Private acceptance routing is now selected through a compiled update configuration. Set
 `MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG` to a JSON file when invoking the existing release

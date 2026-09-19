@@ -58,6 +58,7 @@ mod cuda_driver;
 mod inference_worker;
 mod installation;
 mod load_progress;
+mod loaded_modules;
 mod memory_supervisor;
 mod parent_control;
 mod telemetry;
@@ -6611,7 +6612,11 @@ async fn main() -> anyhow::Result<()> {
         Command::InferenceWorker { runtime } => {
             let authority = runtime.authority()?;
             let native_backend = initialize_native_runtime(&authority)?;
-            inference_worker::run_worker(build_identity::native_build(), native_backend)?
+            inference_worker::run_worker(
+                build_identity::native_build(),
+                native_backend,
+                authority.installation(),
+            )?
         }
     }
     Ok(())

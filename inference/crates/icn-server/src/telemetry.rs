@@ -218,6 +218,10 @@ fn otel_filter() -> EnvFilter {
         .add_directive("hyper=off".parse().expect("valid directive"))
 }
 
+pub(crate) fn export_configured() -> bool {
+    otlp_endpoints().is_some()
+}
+
 fn otlp_endpoints() -> Option<OtlpEndpoints> {
     let magnitude_base = std::env::var("MAGNITUDE_OTEL_ENDPOINT").ok();
     let standard_base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();

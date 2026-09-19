@@ -211,6 +211,11 @@ The collector waits for that trace after generation succeeds without replaying g
 model mismatch and ambiguous native completions, and preserves both the public completion ID and
 private native request ID rather than pretending they are the same identifier. Correlation alone
 does not establish runtime-module identity or qualify the selected backend.
+Loaded-module diagnostics retain filename, digest and length only when supplied. Absence remains
+unknown; malformed supplied records invalidate collection. The native producer uses an already-loaded
+full-path lookup, and the lab must independently compare its backing-file identity with the admitted
+runtime. Neither an on-disk module nor a same-named loaded module from another directory proves that
+the selected installation executed.
 JSON and JUnit reports derive from the same admitted plan and completed result.
 JUnit distinguishes product failures from infrastructure errors; missing, blocked,
 cancelled or duplicate selected results and cleanup failures cannot become green checks.

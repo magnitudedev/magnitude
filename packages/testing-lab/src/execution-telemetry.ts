@@ -1,19 +1,22 @@
 import { Effect, Ref, Runtime, Schema } from "effect"
 import { randomUUID } from "node:crypto"
-import { InfrastructureFailure } from "./domain"
+import { Digest, InfrastructureFailure } from "./domain"
 
 export const ExecutionTraceId = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{32}$/),
   Schema.filter(value => value !== "0".repeat(32)), Schema.brand("ExecutionTraceId"))
 const PositiveInteger = Schema.Int.pipe(Schema.positive(), Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
 const NativeId = Schema.String.pipe(Schema.pattern(/^[1-9][0-9]{0,19}$/),
   Schema.filter(value => BigInt(value) <= 18446744073709551615n), Schema.brand("NativeExecutionId"))
+export const LoadedBackendModule = Schema.Struct({ name: Schema.NonEmptyString.pipe(Schema.maxLength(256), Schema.pattern(/^[^/\\]+$/)),
+  sha256: Digest, bytes: PositiveInteger })
 export const NativeModelAllocation = Schema.Union(
   Schema.Struct({ kind: Schema.Literal("host"), model_bytes: PositiveInteger }),
   Schema.Struct({ kind: Schema.Literal("device"), backend: Schema.NonEmptyString.pipe(Schema.maxLength(256)),
     physical_id: Schema.NullOr(Schema.NonEmptyString.pipe(Schema.maxLength(256))), native_index: Schema.Int.pipe(Schema.nonNegative(), Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER)), model_bytes: PositiveInteger }),
 )
 export const NativeExecution = Schema.Struct({ traceId: ExecutionTraceId, model: Schema.NonEmptyString.pipe(Schema.maxLength(1024)),
-  workerPid: PositiveInteger, workerGeneration: NativeId, requestId: NativeId, allocations: Schema.Array(NativeModelAllocation) })
+  workerPid: PositiveInteger, workerGeneration: NativeId, requestId: NativeId, allocations: Schema.Array(NativeModelAllocation),
+  modules: Schema.optionalWith(Schema.Array(LoadedBackendModule).pipe(Schema.maxItems(64)), { as: "Option", exact: true }) })
 export type NativeExecution = typeof NativeExecution.Type
 const Attribute = Schema.Struct({ key: Schema.String, value: Schema.Unknown })
 const Attributes = Schema.Array(Attribute)
@@ -54,9 +57,15 @@ export const decodeNativeExecutions = (input: unknown) => Effect.gen(function* (
       const allocationJson = yield* string("native.target.allocations")
       if (Buffer.byteLength(allocationJson) > 16 * 1024) return yield* failure("Native allocation diagnostic exceeds its byte limit")
       const allocations = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Array(NativeModelAllocation)))(allocationJson)
+      const modules = yield* Effect.gen(function* () {
+        if (!attributes.has("native.backend.modules")) return {}
+        const json = yield* string("native.backend.modules")
+        if (Buffer.byteLength(json) > 16 * 1024) return yield* failure("Loaded module diagnostic exceeds its byte limit")
+        return { modules: yield* Schema.decodeUnknown(Schema.parseJson(Schema.Array(LoadedBackendModule)))(json) }
+      })
       records.push(yield* Schema.decodeUnknown(NativeExecution)({ traceId: trace.traceId, model: yield* string("model.id"),
         workerPid: Number(yield* integer("worker.pid")), workerGeneration: yield* integer("worker.generation"),
-        requestId: yield* integer("worker.request.id"), allocations }))
+        requestId: yield* integer("worker.request.id"), allocations, ...modules }))
     }
   }
   return records
