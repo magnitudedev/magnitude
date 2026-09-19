@@ -157,6 +157,15 @@ Update controls expose rendered transfer state and candidate version through sta
 The driver uses the normal Settings actions and surfaces failed or unavailable updates promptly.
 A renderer interaction test alone cannot qualify installation, trust or retained-data acceptance;
 those require an old/new package pair and observation of the resulting installed application.
+Private update fixtures own a loopback HTTPS listener, temporary TLS material and an ephemeral
+publisher. Their public configuration is compiled into acceptance packages before execution;
+ordinary production packages cannot be relabelled as accepting that trust. Certificate trust is
+limited to the launched test process, never installed in the host trust store. Publication copies
+and verifies the exact candidate bytes before atomically offering a signed target/version. Failed
+publication preserves the preceding offer. Signed request admission validates target metadata,
+timestamp and bounded nonce replay state. Artifact capability routes expose only the owned copy,
+support exact byte ranges and reject forwarded installation credentials. Scope release closes
+the listener and removes its temporary trust and artifacts.
 Settings persistence is checked across actual application process restarts using the same
 isolated profile; a page reload cannot satisfy it. Each launch preserves its own trace and
 process log, and the previous process is released before the next launches. Application quit

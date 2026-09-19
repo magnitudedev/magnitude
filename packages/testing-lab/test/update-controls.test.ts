@@ -14,7 +14,7 @@ test("update controls survive presentation changes and stop on a rendered failur
   const html = join(root, "fixture.html"), main = join(root, "main.cjs")
   yield* fs.writeFileString(html, `<!doctype html><body>
     <section style="display:flex;flex-direction:column-reverse" data-testid="desktop.updates" data-update-state="Idle" data-update-check="Idle">
-      <input type="checkbox" data-testid="desktop.update.automatic">
+      <input type="checkbox" data-testid="desktop.update.automatic" onchange="this.dataset.changes=String(Number(this.dataset.changes??0)+1);const next=this.checked;this.checked=!next;setTimeout(()=>{this.checked=next},50)">
       <button data-testid="desktop.update.check" onclick="this.parentElement.dataset.updateState='Available';this.parentElement.dataset.updateVersion='0.1.4'">Check</button>
       <button data-testid="desktop.update.download" onclick="this.parentElement.dataset.updateState='Ready'">Download</button>
       <button data-testid="desktop.update.restart" onclick="this.parentElement.dataset.updateState='Closed'">Restart</button>
@@ -32,7 +32,9 @@ test("update controls survive presentation changes and stop on a rendered failur
   const controls = playwrightUpdates(page, Effect.void)
   yield* controls.automatic(true)
   expect(yield* Effect.promise(() => page.getByTestId("desktop.update.automatic").isChecked())).toBe(true)
+  yield* controls.automatic(true)
   yield* controls.automatic(false)
+  expect(yield* Effect.promise(() => page.getByTestId("desktop.update.automatic").getAttribute("data-changes"))).toBe("2")
   yield* controls.action("check")
   expect(Option.getOrThrow((yield* controls.wait("Available")).version)).toBe("0.1.4")
   yield* controls.action("download")

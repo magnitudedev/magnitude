@@ -142,6 +142,8 @@ hidden and concurrent startup, close-to-tray, renderer recovery, full Quit, and 
 Installer packaging and acceptance allow bounded retries when macOS reports a busy mounted image;
 they retain the attached device identity because an unsuccessful eject may already have removed
 the mount path. They never force-detach it, and persistent detach failures still fail the build.
+Installer authoring explicitly uses HFS+ rather than the build host's default filesystem.
+Finder's layout file must be observed within a bounded deadline before sealing the image.
 Publication requires a consumer receipt covering the desktop's exact final bytes.
 The Mac update ZIP has its own final digest and must be independently consumed alongside the DMG.
 Apple consumers extract it, compare its app with the installer payload, verify the sealed signature

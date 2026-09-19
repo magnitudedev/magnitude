@@ -19,7 +19,9 @@ export const playwrightUpdates = (page: Page, openSettings: Effect.Effect<void, 
   action: name => openSettings.pipe(Effect.zipRight(action(`Update ${name}`, () => page.getByTestId(automation.updateAction(name)).click()))),
   automatic: enabled => openSettings.pipe(Effect.zipRight(action("Set automatic update downloads", async () => {
     const control = page.getByTestId(automation.updateAutomatic)
-    await control.setChecked(enabled)
+    // Controlled inputs may restore their previous value until the owner's async acknowledgement.
+    // Click once, then observe the rendered state; setChecked requires an immediate DOM toggle.
+    if (await control.isChecked() !== enabled) await control.click()
     await control.and(page.locator(enabled ? ":checked" : ":not(:checked)")).waitFor()
   }))),
   wait: expected => openSettings.pipe(Effect.zipRight(action("Wait for application update state", async () => {

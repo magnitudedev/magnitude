@@ -18,6 +18,5 @@ on run argv
       close
     end tell
     update installerFolder without registering applications
-    delay 2
   end tell
 end run

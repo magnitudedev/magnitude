@@ -640,3 +640,43 @@ One Linux source regression passed; three Windows-native tests were skipped on m
 acceptance and normal desktop bundles compiled locally. Release typechecking passed; desktop
 checking retains the existing Effect multiple-provide warning at main.ts:146 (exit 2). No real
 old/new native update or U1–U6 qualification is claimed yet.
+
+The scoped `updateFixture` now creates a loopback HTTPS server, temporary certificate and ephemeral
+publisher, and writes the public acceptance configuration for the build. Keep that scope alive
+while building and running the acceptance pair. Pass its `caPath` as `NODE_EXTRA_CA_CERTS` only to
+the test application; the host trust store is unchanged. Publish verifies and copies the candidate
+before offering it. Signed checks and download resolution validate metadata, timestamps and nonce
+replay; artifact routes serve the owned bytes and support ranges. Withdraw removes the offer, and
+scope cleanup closes the listener and deletes certificates, private TLS key and copied packages.
+
+Real HTTPS tests use Electron's Node runtime: the certificate fails without explicit process trust
+and succeeds with it. They verify signed offers, replay/expired-request rejection, target/version
+filtering, immutable delivery after source mutation, ranges, failed-publication retention, credential
+rejection and listener/file cleanup. Together with pair/ownership/UI checks, 14 targeted tests pass;
+testing-lab typechecking passes. The fixture is not yet wired into scheduled U1–U6 execution.
+An arbitrary previously built production package cannot consume this ephemeral trust. Both private
+acceptance packages must be built for the same fixture; testing an actual production baseline
+requires its production-trusted release path and remains a separate qualification.
+
+## Installed Mac private-update probe
+
+`LAB_UPDATE_PROBE_ROOT=/absolute/fresh/path LAB_UPDATE_PROBE_TARGET=macos-15-arm64-metal-apple-silicon bun packages/testing-lab/scripts/update-probe.ts`
+uses the pinned Bun runtime, snapshots unpublished source into a separate directory, installs frozen
+dependencies and builds 0.1.3/0.1.4 acceptance packages for one scoped HTTPS fixture. These are fixture
+versions of the same source, not a historical release migration. It installs the older DMG, changes
+an appearance setting, disables automatic downloads through the UI, offers the newer ZIP and uses
+Settings to check, download, verify and discard it. It then quits and removes the owned installation.
+It records build logs, source digest, host observation, Playwright trace, screenshot and cleanup errors.
+
+The native macOS15 ARM64 probe passed at `/tmp/ml-native-update-controls-20260919/update-report.json`
+with no cleanup errors. Both package builds passed. The installation, temporary trust/listener and
+probe disk mounts were gone afterward. This establishes native acquisition, not U2 replacement,
+relaunch, retained-data migration, post-update generation, or production publisher trust.
+Local code-signing inventory currently reports zero valid identities; the fixture builds are ad hoc.
+
+The probe found and fixed two issues: DMG authoring now selects HFS+ explicitly rather than depending
+on the host's APFS default (the fresh-image layout regression passes), and the update checkbox driver
+clicks once then waits for its asynchronous rendered acknowledgement. It does not repeat the click
+or require an immediate DOM toggle. The renderer regression checks delayed state and idempotent
+selection while still perturbing presentation. Fourteen lab tests and three native image tests pass;
+release and testing-lab targeted typechecks pass.

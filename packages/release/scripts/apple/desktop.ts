@@ -50,7 +50,7 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   const writable = join(stage, "installer.dmg")
   const mount = join(stage, "mounted")
   yield* fs.makeDirectory(mount)
-  yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
+  yield* appleCommand("/usr/bin/hdiutil", "create", "-fs", "HFS+", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
   yield* Effect.scoped(Effect.gen(function* () {
     yield* Effect.acquireRelease(
       attachDesktopDmg(writable, mount, "-readwrite"),
@@ -59,9 +59,11 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
     yield* appleCommand("/usr/bin/osascript", join(resources, "dmg-layout.applescript"), mount).pipe(
       Effect.timeoutFail({ duration: "45 seconds", onTimeout: () => new AppleDistributionFailed({ message: "Finder did not finish configuring the installer layout" }) }),
     )
-    if (!(yield* fs.exists(join(mount, ".DS_Store")))) {
-      return yield* new AppleDistributionFailed({ message: "Finder did not save the installer layout" })
-    }
+    // Finder's command acknowledgement precedes its asynchronous layout-file write.
+    yield* fs.exists(join(mount, ".DS_Store")).pipe(
+      Effect.repeat({ schedule: Schedule.spaced("250 millis"), until: exists => exists }),
+      Effect.timeoutFail({ duration: "20 seconds", onTimeout: () => new AppleDistributionFailed({ message: "Finder did not save the installer layout" }) }),
+    )
   }))
   yield* appleCommand("/usr/bin/hdiutil", "convert", writable, "-format", "UDZO", "-o", output)
   yield* appleCommand("/usr/bin/hdiutil", "verify", output)
