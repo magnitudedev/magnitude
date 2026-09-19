@@ -21,7 +21,7 @@ for (const transient of [false, true]) test(`manifest cache coalesces downloads 
   const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
     claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
   let authorized = true, manifestReads = 0, checks = 0
-  const tickets = Layer.succeed(WorkerTickets, { issue: () => Effect.dieMessage("Not used"), revoke: () => Effect.void, authorize: () => Effect.suspend(() => {
+  const tickets = Layer.succeed(WorkerTickets, { issue: () => Effect.dieMessage("Not used"), withAuthority: () => Effect.dieMessage("Not used"), revoke: () => Effect.void, authorize: () => Effect.suspend(() => {
     checks++
     return authorized ? Effect.succeed(invocation) : Effect.fail(new WorkerAccessDenied({}))
   }) })

@@ -79,6 +79,20 @@ export const initializeDatabase = Effect.flatMap(Database, db => db.transaction(
     invocation text NOT NULL, revoked boolean NOT NULL DEFAULT false,
     UNIQUE(run_id,target_id,fence), FOREIGN KEY(run_id,target_id) REFERENCES lab_work(run_id,target_id)
   )`)
+  yield* tx.query(`CREATE TABLE IF NOT EXISTS lab_worker_objects (
+    run_id text NOT NULL, target_id text NOT NULL, fence bigint NOT NULL,
+    digest text NOT NULL, bytes bigint NOT NULL CHECK(bytes >= 0),
+    state text NOT NULL DEFAULT 'Uploading' CHECK(state IN ('Uploading','Verified')), upload_id uuid NOT NULL,
+    upload_expires_at timestamptz NOT NULL,
+    PRIMARY KEY(run_id,target_id,fence,digest),
+    FOREIGN KEY(run_id,target_id,fence) REFERENCES lab_worker_tickets(run_id,target_id,fence)
+  )`)
+  yield* tx.query(`CREATE TABLE IF NOT EXISTS lab_worker_results (
+    run_id text NOT NULL, target_id text NOT NULL, fence bigint NOT NULL,
+    reply text NOT NULL, digest text NOT NULL,
+    PRIMARY KEY(run_id,target_id,fence),
+    FOREIGN KEY(run_id,target_id,fence) REFERENCES lab_worker_tickets(run_id,target_id,fence)
+  )`)
 })))
 
 /** Decode every database boundary rather than asserting driver output types. */

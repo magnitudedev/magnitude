@@ -84,6 +84,15 @@ referenced content.
 The immutable manifest graph may be cached within bounded memory; live worker authorization
 is never cached. Failed graph reads are evicted so later requests can recover from an
 infrastructure failure without replaying a test assertion.
+Worker result receipts are immutable per attempt and require exact selected-case membership.
+Evidence references must match verified uploads for that attempt. Repeated identical delivery
+is idempotent; a changed reply is rejected. Receipt insertion and live authority validation
+share one database transaction, preventing cancellation or reassignment from racing acceptance.
+Evidence uploads reserve their declared bytes against an attempt budget before consuming
+the request. Uploading and verified objects are distinct states. Hash/length verification
+and a fresh authority check precede publication; incomplete uploads cannot satisfy a result.
+Concurrent reservations count toward the same budget, and failed uploads release only their
+own reservation. Expired reservations can be reclaimed without granting evidence authority.
 Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
 
 Installed-package ownership follows explicit present/absent transitions. Removal updates

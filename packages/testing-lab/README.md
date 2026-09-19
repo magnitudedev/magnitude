@@ -459,19 +459,32 @@ request checks the current claim/fence, run deadline and state. Cancellation,
 completion, revocation and reassignment deny access immediately; responses are
 noncacheable. Native provider credentials are not included in the invocation.
 
-This is the assignment/authentication foundation, not a working Azure worker path.
-Scoped object transfer, result return, bootstrap delivery and scheduler integration
-are still required. The current execution runner continues using its existing
+Bootstrap delivery and scheduler integration are still required for a working Azure
+worker path. The current execution runner continues using its existing
 transport path. PostgreSQL plus live HTTP tests cover credential persistence and
 invalidation; no Azure worker qualification is claimed by those tests.
 
 Worker input downloads are now available at `/v1/worker/objects/:digest`. They permit
 only the assigned manifest and its referenced source/artifact objects; other
 same-owner uploads remain inaccessible. Live HTTP/SQL tests exercise both input
-kinds and credential invalidation. Result/evidence return and bootstrap/runner
-integration are still unfinished, so this does not yet enable Azure execution.
+kinds and credential invalidation. This does not yet enable Azure execution.
 
 Worker input graphs use a bounded, owner-scoped immutable cache (eight manifests,
 five-minute lifetime). Concurrent object downloads share manifest parsing. Every
 request still checks live credential authority, and failed graph reads are evicted
 immediately. This avoids rereading a large source manifest for every source file.
+
+`POST /v1/worker/result` now persists an immutable attempt receipt. It validates the
+claim, exact selected-case membership and attempt-specific evidence metadata.
+Identical redelivery is idempotent; changed replies return conflict. Authorization
+and receipt insertion share a transaction with locks on the live attempt/run.
+Receipt storage does not finish a run or bypass allocator cleanup. Runner polling
+integration is still unfinished.
+
+`PUT /v1/worker/evidence/:digest` requires an exact Content-Length and reserves
+storage before consuming bytes: at most 256 MiB per object, 4 GiB and 1,000 objects
+per attempt. Both active and verified uploads count toward those limits. Uploads
+have a ten-minute deadline; abandoned reservations expire after fifteen minutes.
+Only matching SHA-256 and byte length can transition an upload to verified, with
+a fresh authorization check before publication. Failed uploads release their own
+reservations. Existing verified bytes may be redelivered, but are checked again.

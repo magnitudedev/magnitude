@@ -10,6 +10,8 @@ import { WorkStoreLive } from "./work-store"
 import { WorkerTicketsLive } from "./worker-tickets"
 import { workerApi } from "./worker-api"
 import { WorkerInputsLive } from "./worker-inputs"
+import { WorkerResultsLive } from "./worker-results"
+import { WorkerEvidenceLive } from "./worker-evidence"
 
 export const CoordinatorConfig = Schema.Struct({ instance: Schema.NonEmptyString,
   concurrency: Schema.Int.pipe(Schema.between(1, 64)), accountBudgetUsd: Schema.Number.pipe(Schema.positive(), Schema.finite()),
@@ -18,7 +20,9 @@ export const CoordinatorConfig = Schema.Struct({ instance: Schema.NonEmptyString
 export const startCoordinator = (config: typeof CoordinatorConfig.Type) => Effect.gen(function* () {
   yield* initializeDatabase
   const workerInputs = WorkerInputsLive.pipe(Layer.provide(Layer.merge(InputRegistryLive, WorkerTicketsLive)))
-  const services = yield* Layer.build(Layer.mergeAll(InputRegistryLive, LeaseStoreLive, WorkStoreLive, WorkerTicketsLive, workerInputs, runStoreLayer(config.accountBudgetUsd)))
+  const workerResults = WorkerResultsLive.pipe(Layer.provide(WorkerTicketsLive))
+  const workerEvidence = WorkerEvidenceLive.pipe(Layer.provide(WorkerTicketsLive))
+  const services = yield* Layer.build(Layer.mergeAll(InputRegistryLive, LeaseStoreLive, WorkStoreLive, WorkerTicketsLive, workerInputs, workerResults, workerEvidence, runStoreLayer(config.accountBudgetUsd)))
   const scheduler = Context.get(yield* Layer.build(SchedulerLive.pipe(Layer.provide(Layer.succeedContext(services)))), Scheduler)
   const auth = yield* Authenticator
   const server = yield* HttpServer.HttpServer

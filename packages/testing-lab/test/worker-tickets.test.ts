@@ -1,15 +1,18 @@
-import { FetchHttpClient, FileSystem, HttpClient, HttpServer } from "@effect/platform"
+import { FetchHttpClient, FileSystem, HttpClient, HttpClientRequest, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer } from "@effect/platform-bun"
 import { Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { join } from "node:path"
 import { expect, test } from "vitest"
 import { planRun } from "../src/catalog"
 import { Database, initializeDatabase } from "../src/database"
-import { RunRequest } from "../src/domain"
+import { InfrastructureFailure, RunRequest } from "../src/domain"
+import { Fence } from "../src/lease"
 import { ProcessExecutorLive } from "../src/process"
 import { RunStore, runStoreLayer } from "../src/run-store"
 import { WorkStore, WorkStoreLive } from "../src/work-store"
-import { WorkerInvocation } from "../src/worker-protocol"
+import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
+import { WorkerResults, WorkerResultsLive } from "../src/worker-results"
+import { WorkerEvidence, WorkerEvidenceLimits, WorkerEvidenceLive } from "../src/worker-evidence"
 import { WorkerTickets, WorkerTicketsLive } from "../src/worker-tickets"
 import { workerApi } from "../src/worker-api"
 import { WorkerInputsLive } from "../src/worker-inputs"
@@ -23,9 +26,12 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
   const database = yield* temporaryDatabase
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-inputs-" })
-  const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, fileArtifactStore(join(root, "objects")))))
+  const storage = fileArtifactStore(join(root, "objects"))
+  const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, storage)))
   const ticketService = WorkerTicketsLive.pipe(Layer.provide(database))
   const services = Layer.mergeAll(database, inputs, runStoreLayer(1000).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)), ticketService,
+    WorkerResultsLive.pipe(Layer.provide(Layer.merge(database, ticketService))),
+    WorkerEvidenceLive.pipe(Layer.provide(Layer.mergeAll(database, ticketService, storage))),
     WorkerInputsLive.pipe(Layer.provide(Layer.merge(inputs, ticketService))))
   yield* Effect.gen(function* () {
     yield* initializeDatabase
@@ -36,6 +42,8 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
     const url = `http://127.0.0.1:${server.address.port}/v1/worker/assignment`
     const http = yield* HttpClient.HttpClient
     const registry = yield* InputRegistry
+    const receipts = yield* WorkerResults
+    const evidence = yield* WorkerEvidence
     const payload = new TextEncoder().encode("Assigned source content")
     const unrelated = new TextEncoder().encode("Unrelated private upload owned by the same developer")
     const sourceManifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
@@ -61,6 +69,25 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       const forged = { ...invocation, assignment: { ...assignment, target: { ...assignment.target, cases: [] } } }
       expect((yield* tickets.issue(forged).pipe(Effect.either))._tag).toBe("Left")
       const ticket = yield* tickets.issue(invocation)
+      if (mode === "revoked") {
+        let consumed = false
+        const tooLarge = yield* evidence.upload(ticket.token, sha256(unrelated), WorkerEvidenceLimits.objectBytes + 1,
+          Stream.fromEffect(Effect.sync(() => { consumed = true; return unrelated }))).pipe(Effect.either)
+        expect(tooLarge._tag === "Left" && tooLarge.left._tag).toBe("InvalidResult")
+        expect(consumed).toBe(false)
+        const short = yield* evidence.upload(ticket.token, sha256(unrelated), unrelated.length + 1, Stream.make(unrelated)).pipe(Effect.either)
+        expect(short._tag).toBe("Left")
+        const interrupted = yield* evidence.upload(ticket.token, sha256(unrelated), unrelated.length,
+          Stream.fail(new InfrastructureFailure({ operation: "fixture-stream", message: "Interrupted upload fixture" }))).pipe(Effect.either)
+        expect(interrupted._tag).toBe("Left")
+        expect((yield* db.query("SELECT 1 FROM lab_worker_objects WHERE run_id=$1", [assignment.claim.runId]))).toHaveLength(0)
+        yield* db.query(`INSERT INTO lab_worker_objects(run_id,target_id,fence,digest,bytes,upload_id,upload_expires_at)
+          SELECT $1,$2,$3,repeat(md5(n::text),2),$4,md5(n::text)::uuid,clock_timestamp()+interval '15 minutes'
+          FROM generate_series(1,16) n`, [assignment.claim.runId, assignment.claim.targetId, assignment.claim.fence, WorkerEvidenceLimits.objectBytes])
+        const full = yield* evidence.upload(ticket.token, sha256(unrelated), unrelated.length, Stream.make(unrelated)).pipe(Effect.either)
+        expect(full._tag === "Left" && full.left._tag).toBe("InvalidResult")
+        yield* db.query("DELETE FROM lab_worker_objects WHERE run_id=$1 AND state='Uploading'", [assignment.claim.runId])
+      }
       expect(yield* tickets.authorize(ticket.token)).toEqual(invocation)
       const response = yield* http.get(url, { headers: { authorization: `Bearer ${Redacted.value(ticket.token)}` } })
       expect(response.status).toBe(200)
@@ -74,6 +101,31 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect(fileResponse.status).toBe(200)
       expect(yield* fileResponse.text).toBe(new TextDecoder().decode(payload))
       expect((yield* http.get(objectUrl(sha256(unrelated)), auth)).status).toBe(401)
+      const now = new Date().toISOString()
+      let reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result: { cleanupErrors: [], cases: assignment.target.cases.map(test => ({
+        targetId: assignment.claim.targetId, caseId: test.id, harness: test.harness, startedAt: now, endedAt: now, evidence: [],
+        outcome: { status: "passed", detail: "Result transport fixture, not native acceptance" },
+      })) } })
+      const send = (value: typeof WorkerReply.Type) => Effect.gen(function* () {
+        const json = yield* Schema.encode(Schema.parseJson(WorkerReply))(value)
+        return yield* http.execute(HttpClientRequest.post(url.replace("/assignment", "/result"), auth).pipe(HttpClientRequest.bodyText(json, "application/json")))
+      })
+      expect(Option.isNone(yield* receipts.read(assignment.claim))).toBe(true)
+      expect((yield* send({ ...reply, claim: { ...reply.claim, fence: Fence.make(reply.claim.fence + 1) } })).status).toBe(409)
+      expect((yield* send({ ...reply, result: { ...reply.result, cases: reply.result.cases.slice(1) } })).status).toBe(409)
+      const unverified = { ...reply, result: { ...reply.result, cases: reply.result.cases.map(test => ({ ...test, evidence: [{ path: "evidence/missing.json", sha256: sha256(unrelated), bytes: unrelated.length }] })) } }
+      expect((yield* send(unverified)).status).toBe(409)
+      const upload = (bytes: Uint8Array) => http.execute(HttpClientRequest.put(url.replace("/assignment", `/evidence/${sha256(unrelated)}`), auth).pipe(
+        HttpClientRequest.bodyUint8Array(bytes), HttpClientRequest.setHeader("content-length", String(bytes.length))))
+      expect((yield* upload(new TextEncoder().encode("corrupt"))).status).toBe(500)
+      expect((yield* db.query("SELECT 1 FROM lab_worker_objects WHERE run_id=$1", [assignment.claim.runId]))).toHaveLength(0)
+      expect((yield* upload(unrelated)).status).toBe(204)
+      expect((yield* upload(unrelated)).status).toBe(204)
+      reply = unverified
+      expect((yield* send(reply)).status).toBe(204)
+      expect((yield* send(reply)).status).toBe(204)
+      expect(Option.getOrThrow(yield* receipts.read(assignment.claim))).toEqual(reply)
+      expect((yield* send({ ...reply, result: { ...reply.result, cleanupErrors: ["Changed reply"] } })).status).toBe(409)
       expect((yield* tickets.issue(invocation).pipe(Effect.either))._tag).toBe("Left")
       expect((yield* tickets.authorize(Redacted.make("x".repeat(43))).pipe(Effect.either))._tag).toBe("Left")
       const rows = yield* db.query("SELECT token_digest,invocation FROM lab_worker_tickets WHERE ticket_id=$1", [ticket.id])
@@ -81,7 +133,12 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect(rows[0]?.invocation).not.toContain(Redacted.value(ticket.token))
       // Reconstruct the service over the same database: credentials survive coordinator service restart.
       expect(yield* Effect.flatMap(WorkerTickets, service => service.authorize(ticket.token)).pipe(Effect.provide(WorkerTicketsLive))).toEqual(invocation)
-      if (mode === "revoked" || mode === "artifacts") yield* tickets.revoke(ticket.id)
+      if (mode === "revoked") {
+        const revokedUpload = yield* evidence.upload(ticket.token, sha256(unrelated), unrelated.length,
+          Stream.concat(Stream.make(unrelated), Stream.drain(Stream.fromEffect(tickets.revoke(ticket.id))))).pipe(Effect.either)
+        expect(revokedUpload._tag === "Left" && revokedUpload.left._tag).toBe("WorkerAccessDenied")
+      }
+      if (mode === "artifacts") yield* tickets.revoke(ticket.id)
       if (mode === "cancelled") yield* runs.cancel(run.state.runId)
       if (mode === "expired-claim") yield* db.query("UPDATE lab_work SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE run_id=$1", [run.state.runId])
       if (mode === "expired-run") yield* db.query("UPDATE lab_runs SET deadline=clock_timestamp()-interval '1 second' WHERE run_id=$1", [run.state.runId])
@@ -97,6 +154,8 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect(rejected.status).toBe(401)
       expect(yield* rejected.json).toEqual({ error: "WorkerAccessDenied" })
       expect((yield* http.get(objectUrl(sha256(payload)), auth)).status).toBe(401)
+      expect((yield* send(reply)).status).toBe(401)
+      expect((yield* upload(unrelated)).status).toBe(401)
     }
   }).pipe(Effect.provide(services))
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive, FetchHttpClient.layer, BunHttpServer.layer({ hostname: "127.0.0.1", port: 0 })]))))
