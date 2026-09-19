@@ -15,6 +15,8 @@ import { captureRetainedProfile, RetainedProfile, verifyRetainedProfile } from "
 import { ApplicationIdentity, assertServiceExited } from "./application-identity"
 import { verifyServiceOwnership } from "./suites/service"
 import { verifyWorkerRecovery, WorkerRecoveryEvidence } from "./suites/worker-recovery"
+import { linuxNetworkFault } from "./network-fault"
+import { verifyOfflineRecovery, OfflineRecoveryEvidence } from "./suites/offline-recovery"
 import { nativeWorkerFault } from "./worker-fault"
 import { InstallationOwnership, verifyInstallationOwnership } from "./suites/installation-ownership"
 import { occupyServicePort } from "./port-fault"
@@ -66,6 +68,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   const diagnostics = new Map<string, typeof Evidence.Type>()
   const backendEvidence: (typeof Evidence.Type)[] = []
   const recoveryEvidence: (typeof Evidence.Type)[] = []
+  const offlineEvidence: (typeof Evidence.Type)[] = []
   const evidenceDirectory = join(config.root, "evidence")
   if (yield* fs.exists(config.root)) return yield* unavailable("Candidate worker requires a fresh owned workspace")
   yield* fs.makeDirectory(evidenceDirectory, { recursive: true, mode: 0o700 })
@@ -106,7 +109,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const applicationEvidence = yield* evidence("application-context.json", Schema.Struct({ mode: Schema.String, profile: Schema.String, port: Schema.Int, harnessHome: Schema.String }),
       { mode: application.mode, profile: application.profile, port: application.port, harnessHome: application.harnessHome })
     const environment = application.environment
-    const collector = assignment.target.cases.some(test => test.id === "E6" || test.id === "R4")
+    const collector = assignment.target.cases.some(test => test.id === "E6" || test.id === "R4" || test.id === "R3")
       ? Option.some(yield* executionTelemetry().pipe(Effect.provideService(Scope.Scope, scope))) : Option.none()
     const candidateEnvironment = yield* Effect.cached(manifest.pipe(Effect.flatMap(value => runtimeEnvironment(value.release, target.artifactHost,
       Option.isSome(collector) ? { ...environment, MAGNITUDE_OTEL_ENDPOINT: collector.value.endpoint } : environment)),
@@ -341,6 +344,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
             yield* evidence(`${test.id}-generation.json`, Generation, generation)] })
         }
+        case "R3": {
+          if (Option.isNone(collector)) return yield* unavailable("Offline recovery requires native execution evidence")
+          const expected = yield* admittedRuntimeModules((yield* manifest).release, target.artifactHost).pipe(Effect.provide(NodeArchiveExtractor))
+          offlineEvidence.push(yield* evidence("R3-admitted-modules.json", Schema.Array(LoadedBackendModule), expected))
+          const observe = observeGeneration(`http://127.0.0.1:${application.port}`, config.model, collector.value).pipe(Effect.provide(FetchHttpClient.layer))
+          yield* verifyOfflineRecovery(observe, generation => attestRuntimeModules(generation.native, expected).pipe(
+            Effect.zipRight(attestGeneration(target, host, config.model, generation.native))), value => evidence(`R3-${value._tag}.json`, OfflineRecoveryEvidence, value).pipe(
+              Effect.tap(item => Effect.sync(() => { offlineEvidence.push(item) })), Effect.asVoid), detail => { cleanupErrors.push(`Offline network restoration: ${detail}`) }).pipe(
+            Effect.provideService(DesktopDriver, yield* desktop), Effect.provideService(CliTests, yield* cli), Effect.provide(linuxNetworkFault))
+          return CaseObservation.make({ detail: "Reloaded the cached model and attested generation with external traffic blocked, then restored connectivity", evidence: [yield* inputEvidence, hostEvidence] })
+        }
         case "R4": {
           if (Option.isNone(collector)) return yield* unavailable("Worker recovery requires native execution evidence")
           const expected = yield* admittedRuntimeModules((yield* manifest).release, target.artifactHost).pipe(Effect.provide(NodeArchiveExtractor))
@@ -431,7 +445,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
       const buildEvidence = source && (result.caseId === "P1" || result.caseId === "P2") ? source.evidence().filter(item => result.caseId !== "P1" || item.path !== "evidence/build-package.json") : []
-      const refs = [...result.evidence, applicationEvidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(diagnostic ? [diagnostic] : [])]
+      const refs = [...result.evidence, applicationEvidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })
@@ -483,7 +497,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   const cliEvidence = join(evidenceDirectory, "cli")
   if (yield* fs.exists(cliEvidence)) {
     const cliCase = finalCases.find(result => result.caseId === "C1")
-      ?? finalCases.find(result => ["I4", "R4", "R5", "R6", "C2", "C3", "C4", "C5", "C6"].includes(result.caseId))
+      ?? finalCases.find(result => ["I4", "R3", "R4", "R5", "R6", "C2", "C3", "C4", "C5", "C6"].includes(result.caseId))
     const names = (yield* fs.readDirectory(cliEvidence)).filter(name => /^\d+-[a-z0-9-]+\.json$/.test(name)).sort()
     if (names.length > 100) cleanupErrors.push("CLI evidence exceeded its file-count limit")
     else if (cliCase) for (const name of names) yield* exportFile(`cli/${name}`, cliCase.caseId, 32 * 1024 * 1024, Option.getOrUndefined(cliCase.harness))

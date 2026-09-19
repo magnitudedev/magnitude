@@ -290,6 +290,13 @@ Error scenarios preserve malformed harness files and restore the original fixtur
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback
 listener; recovery requires successful startup after that listener is released.
+Offline generation must establish an external connection before isolation and prove it fails
+while a cached model is reloaded and generation is attested. Loopback remains available to the
+application and its test client. Network isolation is allowed only for a qualified disposable
+guest user and affects that user's external traffic, not the host management agent or other
+users. The fault owns its temporary rules; it never flushes shared firewall policy. Cleanup is
+registered before installation, restoration is checked after success or failure, and cleanup
+failures remain visible. A missing native isolation mechanism blocks the case.
 Resident-worker fault injection must verify the installed executable, inference-worker role and
 ancestry under the owning service before terminating that exact process. Recovery observes the
 failed model instance and explicitly reloads it; it never assumes automatic reload. A new native

@@ -410,6 +410,28 @@ to the worker, but full A7 acceptance is not claimed: OpenCode's diagnostic rema
 a known failure, and the combined worker scenario has not yet been qualified on
 the complete target matrix. No test fault terminates an existing port owner.
 
+R3 proves cached offline generation by establishing a fresh external TCP control, cutting the
+disposable user's external traffic, stopping/reloading the cached model through the bundled CLI,
+and attesting generation on a new native worker. It verifies the cut again after generation and
+restores external connectivity while preserving app/service ownership. Failed generation still
+releases isolation and records restoration; partial evidence and cleanup failures remain visible.
+
+Linux uses a private nftables `inet` table scoped to the qualified guest UID, preserving loopback
+and other users. Workers require `/usr/sbin/nft` and noninteractive sudo for it. The implementation
+preflights both creation and idempotent removal; it never flushes a shared table. See the
+[nftables manual](https://netfilter.org/projects/nftables/manpage.html) for UID matching and table
+lifecycle. `network-fault-native.test.ts` requires `LAB_NATIVE_NETWORK_FAULT=1` on a disposable
+Linux guest; it checks external rejection, loopback availability and cleanup after success and
+an injected failure. This opt-in must never be set on a shared developer machine or Spark.
+macOS and Windows isolation are not yet implemented.
+
+The clean Azure Ubuntu 24.04 Intel run at `/tmp/ml-offline-recovery-20260919/verified-result.json`
+passed all 13 selected cases, including R3. The cached model reloaded from worker generation 1
+to 2 and returned `HELLO` offline with matching admitted CPU-module bytes. App/service ownership
+was unchanged, external connectivity was restored, and the four bundled CLI commands were
+exported despite C1 not being selected. Both native isolation/cleanup fixtures passed. Other
+distributions and GPU targets remain unqualified for this scenario.
+
 R4 generates and attests the requested backend, terminates only the verified resident
 inference worker, observes the model's failed state, explicitly reloads, then generates
 and attests again. The native worker generation must change while the application,
