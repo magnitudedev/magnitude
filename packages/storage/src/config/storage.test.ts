@@ -33,7 +33,7 @@ describe("authored configuration boundary", () => {
     await Bun.write(paths.configFile, JSON.stringify({
       unknownDomain: { value: 42 },
       contextLimits: { softCapRatio: 0.8, softCapMaxTokens: null },
-      checkForUpdateOnStartup: false,
+      appearance: "dark",
     }))
 
     const loaded = await Effect.runPromise(Effect.gen(function* () {
@@ -43,7 +43,7 @@ describe("authored configuration boundary", () => {
 
     expect(loaded.contextLimits).toEqual({ softCapRatio: 0.8, softCapMaxTokens: null })
     expect(loaded.providers).toEqual(Option.none())
-    expect(loaded.checkForUpdateOnStartup).toEqual(Option.some(false))
+    expect(loaded.appearance).toEqual(Option.some("dark"))
   })
 
   it("preserves unrelated unknown authored fields during a current-field update", async () => {

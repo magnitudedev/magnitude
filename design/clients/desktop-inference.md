@@ -3,11 +3,9 @@ applies_to:
   - assets/hardware/**
   - desktop/test/hardware/**
   - desktop/src/*.ts
-  - desktop/src/renderer*
   - desktop/src/*.tsx
-  - desktop/src/desktop-rpc.ts
-  - desktop/src/electron-rpc.ts
-  - desktop/src/login-startup.ts
+  - packages/daemon-management/src/desktop-native/*-preferences.ts
+  - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
   - packages/client-common/src/desktop/**
   - packages/harness-connections/**
@@ -45,7 +43,7 @@ readiness; it never substitutes a hardcoded version or the service protocol vers
 Main owns scheduled Magnitude-hosted update checks, automatic downloads and explicit Settings actions
 independently of the renderer and service readiness. The automatic-download preference does not
 disable checks. Window Close and observer loss cannot cancel admitted work. Magnitude-owned user data
-lives under the shared `.magnitude` root: canonical config owns the automatic-download preference,
+lives under the shared `.magnitude` root: canonical config owns appearance and the automatic-download preference,
 root identity.pem owns request identity, electron/ owns Electron userData and sessionData configured
 before profile initialization, state/ owns application coordination, and updates/ owns one installer
 and one update.json. Isolated development/test roots preserve the same layout.
@@ -169,7 +167,17 @@ action through the observed acquisition state. Catalog and My Models retain load
 Discover has no separate connection link or hint.
 
 The inference rewrite preserves the existing desktop/web visual identity. Reuse the existing
-appearance initializer and `magnitude.appearance` preference, with System, Light, and Dark choices.
+appearance initializer, with System, Light, and Dark choices. Desktop appearance is owned by the
+client host and persisted as `appearance` in its canonical config. Absence means System. Main reads
+it before window creation; the renderer reads it through the host bridge before its first render.
+Successful saves update native and renderer appearance; failed saves retain the previous appearance
+and surface an error. Desktop preference writes are serialized so appearance and update choices do
+not overwrite each other. Appearance reads never rewrite malformed configuration; existing general config recovery may
+preserve a corrupt backup and restore defaults. A failed startup appearance read uses
+System and reports the unavailable preference. Browser storage is not a desktop settings authority,
+and no old browser preference is imported. Renderer reloads reread the host preference independently
+of ACN readiness. The browser client retains its own persistence adapter around shared appearance
+rendering.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

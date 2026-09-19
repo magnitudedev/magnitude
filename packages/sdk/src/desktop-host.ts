@@ -3,6 +3,9 @@ import { Schema } from "effect"
 import { DesktopUpdateState } from "./desktop-update"
 export { DesktopUpdateState } from "./desktop-update"
 
+export const AppearancePreference = Schema.Literal("system", "light", "dark")
+export type AppearancePreference = typeof AppearancePreference.Type
+
 export const ApplicationUpdateAction = Schema.Literal("status", "check", "download", "install", "discard")
 export type ApplicationUpdateAction = typeof ApplicationUpdateAction.Type
 export class ApplicationUpdateControlFailed extends Schema.TaggedError<ApplicationUpdateControlFailed>()("ApplicationUpdateControlFailed", { message: Schema.String }) {}

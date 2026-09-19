@@ -21,7 +21,7 @@ export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
   autoDownloadUpdates: SerializableOptional(Schema.Boolean),
-  checkForUpdateOnStartup: SerializableOptional(Schema.Boolean),
+  appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

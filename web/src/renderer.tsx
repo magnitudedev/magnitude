@@ -15,14 +15,14 @@ import {
   createAgentClient,
   AgentClientProvider,
   ServiceStartupProvider,
-  initializeAppearance,
+  initializeBrowserAppearance,
   createBrowserPlatform,
   createBrowserAcnConnection,
   stopDisplayViewController,
 } from "@magnitudedev/web"
 import "./styles/tailwind.css"
 
-initializeAppearance()
+initializeBrowserAppearance()
 
 const root = createRoot(document.getElementById("root")!)
 

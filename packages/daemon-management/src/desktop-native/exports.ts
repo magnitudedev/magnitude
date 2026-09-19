@@ -32,3 +32,5 @@ export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } fro
 export { MacUpdateHandoff, MacUpdateHandoffRequest, MacUpdateHandoffFailed, startMacUpdateHandoff, relaunchMacAfterUpdate } from "./mac-update-handoff"
 
 export { previousInstallationUpgrade } from "./previous-installation-live"
+
+export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePreferences } from "./appearance-preferences"

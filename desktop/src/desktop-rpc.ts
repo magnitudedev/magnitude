@@ -1,6 +1,6 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
-import { ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
+import { AppearancePreference, ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common"
 import { Schema } from "effect"
 
@@ -21,7 +21,8 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("Observe", { payload: Unit, success: ApplicationSnapshot, error: HostError, stream: true }),
   Rpc.make("Actions", { payload: Unit, success: ApplicationAction, error: HostError, stream: true }),
   Rpc.make("PresentModel", { payload: ModelTrayPresentation, success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("Appearance", { payload: Schema.Struct({ preference: Schema.Literal("system", "light", "dark") }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("GetAppearance", { payload: Unit, success: AppearancePreference, error: HostError }).pipe(replaySafe),
+  Rpc.make("SetAppearance", { payload: Schema.Struct({ preference: AppearancePreference }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("LoginStartup", { payload: Unit, success: LoginStartupState, error: HostError, stream: true }),
   Rpc.make("SetLoginStartup", { payload: Schema.Struct({ enabled: Schema.Boolean }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Connections", { payload: Unit, success: DesktopConnectionsSnapshot, error: HostError, stream: true }),
@@ -45,7 +46,8 @@ export interface DesktopApi {
   readonly observe: (value: (snapshot: typeof ApplicationSnapshot.Encoded) => void, error: (message: string) => void) => () => void
   readonly actions: (value: (action: typeof ApplicationAction.Type) => void) => () => void
   readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Promise<void>
-  readonly appearance: (preference: "system" | "light" | "dark") => Promise<void>
+  readonly getAppearance: () => Promise<AppearancePreference>
+  readonly setAppearance: (preference: AppearancePreference) => Promise<void>
   readonly loginStartup: (value: (state: typeof LoginStartupState.Type) => void, error: (message: string) => void) => () => void
   readonly setLoginStartup: (enabled: boolean) => Promise<void>
   readonly connections: (value: (rows: typeof DesktopConnectionsSnapshot.Encoded) => void, error: (message: string) => void) => () => void

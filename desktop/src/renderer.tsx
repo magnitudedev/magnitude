@@ -2,7 +2,7 @@ import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, C
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
-import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
+import { initializeAppearance, setAppearancePreference, useAppearancePreference, type AppearancePreference } from "../../web/src/stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
@@ -53,7 +53,6 @@ import { ModelLogo } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
 
-initializeAppearance()
 document.documentElement.dataset.desktopPlatform = window.__magnitudeDesktop.platform
 const host = window.__magnitudeDesktop
 class DesktopHostFailed extends Schema.TaggedError<DesktopHostFailed>()("DesktopHostFailed", { message: Schema.String }) {}
@@ -66,6 +65,12 @@ const hostFailureMessage = (cause: Cause.Cause<unknown>) => {
   return Option.isSome(failure) && Schema.is(DesktopHostFailed)(failure.value)
     ? failure.value.message : "Magnitude could not complete this action. Try again or check Status."
 }
+
+// The host owns persistence; this store is only the renderer's applied appearance.
+const appearanceReadError = Atom.keepAlive(Atom.make<string | null>(null))
+const saveAppearance = Atom.fn((preference: AppearancePreference, context) => hostCommand(() => host.setAppearance(preference)).pipe(
+  Effect.tap(() => Effect.sync(() => { context.set(appearanceReadError, null); setAppearancePreference(preference) })),
+))
 
 const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHostFailed>(emit => Effect.acquireRelease(
   Effect.sync(() => host.observe(encoded => {
@@ -470,11 +475,16 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
 }
 function AppearanceSettings() {
   const appearance = useAppearancePreference()
+  const save = useAtomSet(saveAppearance)
+  const saving = useAtomValue(saveAppearance)
+  const readError = useAtomValue(appearanceReadError)
   return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
     <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
     <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
+      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
     </div>
+    {readError && <p role="alert" className="px-5 pb-5 text-sm">{readError}</p>}
+    {Result.isFailure(saving) && <p role="alert" className="px-5 pb-5 text-sm">{hostFailureMessage(saving.cause)}</p>}
   </section>
 }
 function LoginSettings() {
@@ -555,14 +565,12 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
 }
 
 const root = createRoot(document.getElementById("root")!)
-root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
 const boot = Effect.gen(function* () {
+  const appearance = yield* Effect.tryPromise(() => host.getAppearance()).pipe(Effect.either)
+  initializeAppearance(appearance._tag === "Right" ? appearance.right : "system")
+  root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
   const initial = yield* observation.pipe(Stream.take(1), Stream.runHead, Effect.flatMap(value => value._tag === "Some" ? Effect.succeed(value.value) : Effect.fail(new DesktopHostUnavailable())))
   const scope = yield* Scope.make()
-  const updateNativeTheme = () => { void host.appearance(getAppearancePreference()).catch(console.error) }
-  updateNativeTheme()
-  const unsubscribeAppearance = subscribeAppearance(updateNativeTheme)
-  yield* Scope.addFinalizer(scope, Effect.sync(unsubscribeAppearance))
   const runtime = yield* Effect.runtime<never>()
   window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
   const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin: initial.endpoint, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
@@ -596,6 +604,6 @@ const boot = Effect.gen(function* () {
     actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     presentModel: value => Effect.tryPromise(() => host.presentModel(value)),
   } })
-  root.render(<RegistryProvider><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
+  root.render(<RegistryProvider initialValues={[[appearanceReadError, appearance._tag === "Left" ? "The saved appearance could not be read. Using System appearance." : null]]}><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
 })
 Effect.runPromise(boot).catch(error => root.render(<p role="alert">Unable to open Magnitude: {String(error)}</p>))

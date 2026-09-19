@@ -26,5 +26,5 @@ export {
 export { createBrowserAcnConnection, createBrowserPlatform } from "./platform/browser"
 export { DaemonConnectionError } from "./components/daemon-connection-error"
 export { MagnitudeMark } from "./components/magnitude-mark"
-export { initializeAppearance } from "./stores/appearance-store"
+export { initializeBrowserAppearance } from "./stores/browser-appearance"
 export { DiffHunk, type DiffHunkProps } from "./components/diff-hunk"

@@ -17,7 +17,7 @@ import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
-import { makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
@@ -102,6 +102,11 @@ const program = Effect.scoped(Effect.gen(function* () {
   }
   yield* Effect.promise(() => app.whenReady())
   yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
+  const preferenceWrites = yield* Effect.makeSemaphore(1)
+  const appearance = yield* makeAppearancePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as("system" as const))))
+  nativeTheme.themeSource = initialAppearance
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -277,7 +282,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
     ApplicationInfo: () => Effect.sync(() => ({ version: app.getVersion() })),
     Updates: () => updates.changes,
-    SetAutoDownload: ({ enabled }) => updates.setAutoDownload(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
+    SetAutoDownload: ({ enabled }) => preferenceWrites.withPermits(1)(updates.setAutoDownload(enabled)).pipe(Effect.mapError(connectionError), Effect.as({})),
     CheckUpdate: () => updateSchedule.check.pipe(Effect.mapError(connectionError), Effect.as({})),
     DownloadUpdate: () => updates.download.pipe(Effect.mapError(connectionError), Effect.as({})),
     DiscardUpdate: () => updates.discard.pipe(Effect.mapError(connectionError), Effect.as({})),
@@ -291,7 +296,11 @@ const program = Effect.scoped(Effect.gen(function* () {
     Observe: () => snapshots,
     Actions: () => Stream.concat(Stream.succeed({ _tag: "Navigate" as const, page: pendingPage }), Stream.fromPubSub(actions)),
     PresentModel: value => Ref.set(model, value).pipe(Effect.zipRight(refreshTray), Effect.as({})),
-    Appearance: ({ preference }) => Effect.sync(() => { nativeTheme.themeSource = preference; window?.setBackgroundColor(nativeTheme.shouldUseDarkColors ? slate[925] : slate[50]); return {} }),
+    GetAppearance: () => appearance.read.pipe(Effect.tapError(() => Effect.sync(() => { nativeTheme.themeSource = "system" })),
+      Effect.mapError(connectionError), Effect.tap(preference =>
+      Effect.sync(() => { nativeTheme.themeSource = preference }))),
+    SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.mapError(connectionError),
+      Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
     SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
     Connections: () => Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(connectionChanges), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(Stream.mapEffect(() => connections.pipe(Effect.flatMap(service => service.inspect), Effect.map(connections => ({ _tag: "Ready" as const, connections })), Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))))),
