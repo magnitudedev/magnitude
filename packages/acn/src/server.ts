@@ -38,7 +38,7 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
-import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
+import { IcnProcess, IcnExitedBeforeReady, IcnStartupRecordTimedOut, IcnReadinessTimedOut, makeIcnProvider } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
@@ -157,6 +157,27 @@ export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => 
     if (message) return message.slice(0, 500)
   }
   return "Magnitude service could not start. See diagnostics for details."
+}
+
+/** Keep model-free native startup output in diagnostics, never in public health detail. */
+export const acnStartupNativeOutput = (cause: Cause.Cause<unknown>): string => {
+  const tails: string[] = []
+  for (const failure of Cause.failures(cause)) {
+    if (!(failure instanceof IcnExitedBeforeReady || failure instanceof IcnStartupRecordTimedOut || failure instanceof IcnReadinessTimedOut)) continue
+    const redacted = failure.output
+      .replace(/\b(Bearer|Basic)\s+[^\s"']+/gi, "$1 [REDACTED]")
+      .replace(/((?:MAGNITUDE_ICN_AUTH_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|api[_-]?key|access[_-]?token|authorization)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, "$1[REDACTED]")
+    tails.push(`ICN process ${failure.pid}:\n${redacted}`)
+  }
+  // Redact before truncating so cutting into a credential cannot expose its suffix.
+  return tails.join("\n").slice(-16_384)
+}
+
+export const logAcnStartupFailure = (cause: Cause.Cause<unknown>) => {
+  const output = acnStartupNativeOutput(cause)
+  return Effect.logError("ACN application startup failed", cause).pipe(
+    Effect.annotateLogs(output ? { nativeStartupOutput: output } : {}),
+  )
 }
 
 function isAllowedCorsOrigin(origin: string): boolean {
@@ -727,7 +748,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: acnStartupFailureDetail(cause),
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", cause)))),
+      }).pipe(Effect.zipRight(logAcnStartupFailure(cause)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),

@@ -48,6 +48,10 @@ monotonic and idempotent.
 
 The desktop bounds startup and recovery. ACN independently owns a five-minute absolute
 application-startup ceiling; optional progress cannot extend it. Expiry enters Stopping(startup-failed).
+Startup diagnostics retain a bounded, credential-redacted native output tail for typed ICN
+pre-readiness exit and timeout failures. It is attached to the single startup-boundary log;
+public health retains only its short safe detail. Arbitrary error payloads and defects are not
+reinterpreted as native output, and diagnostics cannot change readiness or retry policy.
 
 ## Per-user application
 
