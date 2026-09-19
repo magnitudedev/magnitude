@@ -91,6 +91,8 @@ result as `coordinator.js` beside `Dockerfile` and `entrypoint.sh` in a private 
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
+Supply a unique `revision` suffix whenever the image or configuration changes. Updating a
+Container Apps secret alone does not restart the process that read its previous value.
 
 Service parameters contain a TLS-verifying database URL, base64-encoded server configuration,
 base64-encoded worker cloud-init, and a private operator token. Supply them through a mode-0600

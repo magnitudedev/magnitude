@@ -2,6 +2,11 @@
 
 Run `npm ci --prefix packages/testing-lab/tools` to install the exact Pi 0.85.1 and OpenCode 1.18.31 clients and their locked dependencies. Worker image builds should install these into an isolated tools directory with this package manifest and lockfile; never consume ambient user installations. The live implementation probes used the same versions installed under `/tmp/magnitude-lab-tools`.
 
+Regenerate the lockfile in an empty directory containing only `package.json`, then verify
+`npm ci` there and both CLI versions before copying the lockfile back. Generating it beside
+linked local installations can record absolute or relative developer paths that fail on
+fresh workers. The lockfile regression test rejects those paths and links.
+
 Hermes is qualified separately from source:
 
 - Repository: https://github.com/NousResearch/hermes-agent

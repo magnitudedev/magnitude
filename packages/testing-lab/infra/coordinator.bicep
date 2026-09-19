@@ -4,6 +4,8 @@ param prefix string = 'magnitude-lab'
 param registryName string = 'magnitudelab5304'
 @description('Immutable registry image reference including its digest.')
 param image string
+@description('Unique revision suffix, changed whenever image or mounted configuration changes.')
+param revision string
 @secure()
 param databaseUrl string
 @secure()
@@ -36,6 +38,7 @@ resource coordinator 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: revision
       scale: { minReplicas: 1, maxReplicas: 1 }
       terminationGracePeriodSeconds: 600
       containers: [{

@@ -43,7 +43,7 @@ subprocess.run(['sudo','-n','-u',account.pw_name,'--','tar','-xf',str(root/'down
 subprocess.run(['sudo','-n','-u',account.pw_name,'--','tar','-xzf',str(root/'download-runtime'),'-C',str(root)],check=True)
 workspace=root/'runtime'
 rust_version=tomllib.loads((workspace/'inference/rust-toolchain.toml').read_text())['toolchain']['channel']
-path=f'{root}/node-bin/bin:{root}/tooling/node_modules/.bin:{home}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+path=f'{root}/node-bin/bin:{root}/tooling/node_modules/.bin:{workspace}/packages/testing-lab/tools/node_modules/.bin:{home}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 environment=[f'HOME={home}',f'USER={account.pw_name}',f'LOGNAME={account.pw_name}',f'PATH={path}',
  f'CARGO_HOME={home}/.cargo',f'RUSTUP_HOME={home}/.rustup',f'LAB_BUN_VERSION={config["bunVersion"]}',f'LAB_RUST_VERSION={rust_version}']
 (root/'download-rustup').rename(root/'rustup-init')
@@ -56,6 +56,10 @@ test "$(bun --version)" = "$LAB_BUN_VERSION"
 bun install --frozen-lockfile --ignore-scripts
 bun packages/version/scripts/generate-version.ts
 npm ci --prefix packages/testing-lab/tools --no-audit --no-fund
+test "$(command -v pi)" = "$PWD/packages/testing-lab/tools/node_modules/.bin/pi"
+test "$(command -v opencode)" = "$PWD/packages/testing-lab/tools/node_modules/.bin/opencode"
+pi --version
+opencode --version
 bun -e 'await import("./packages/testing-lab/src/outward-worker.ts")'
 '''],cwd=workspace,check=True)
 launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 077',
