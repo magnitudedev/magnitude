@@ -387,3 +387,18 @@ The real occupied-port service failure/recovery probe passed at
 to the worker, but full A7 acceptance is not claimed: OpenCode's diagnostic remains
 a known failure, and the combined worker scenario has not yet been qualified on
 the complete target matrix. No test fault terminates an existing port owner.
+
+R5 is connected: bundled CLI stop must reach `Unloaded`, reload must reach `Ready`,
+and a subsequent endpoint generation must complete. The real packaged macOS 15 ARM64
+probe passed at `/tmp/ml-model-reload-20260918/reload-report.json`, recording separate
+completion IDs before and after reload plus all CLI output. The diagnostic does not
+attest the selected hardware backend; scheduled R5 remains gated on E2/E6 evidence.
+`model-reload-probe.ts` uses the same isolated model/cache setup as the connection probe.
+
+R6 reads the native application/service PIDs and service instance identity, issues
+repeated bundled CLI starts, and requires stable ownership. Across two app restarts
+it verifies that each previous service process has exited and that the replacement
+has a new identity. The real macOS 15 ARM64 diagnostic passed six start requests
+across three app lifetimes at `/tmp/ml-service-ownership-20260918/ownership-report.json`.
+All observed app/service PIDs were gone after cleanup. This does not qualify other
+OS targets or unobserved auxiliary processes.

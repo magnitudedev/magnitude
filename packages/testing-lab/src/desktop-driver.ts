@@ -1,3 +1,4 @@
+import { ApplicationIdentity, ReadyApplicationSnapshot } from "./application-identity"
 import { desktopAutomation as automation } from "../../../desktop/src/automation"
 import { FileSystem } from "@effect/platform"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
@@ -11,6 +12,7 @@ export const DesktopLaunch = Schema.Struct({ executable: Schema.String, profile:
 export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
+  readonly identity: () => Effect.Effect<ApplicationIdentity, AssertionFailure>
   readonly host: () => Effect.Effect<string, AssertionFailure>
   readonly serviceFailure: () => Effect.Effect<string, AssertionFailure>
   readonly ready: () => Effect.Effect<void, AssertionFailure>
@@ -77,6 +79,21 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   const card = (id: string) => page.getByTestId(automation.model(id))
   return {
     navigate,
+    identity: () => Effect.gen(function* () {
+      const wire = yield* action("Read native service ownership", () => page.evaluate(() => new Promise<unknown>((resolve, reject) => {
+        const bridge = (window as unknown as { __magnitudeDesktop?: { observe: (value: (snapshot: unknown) => void, error: (message: string) => void) => () => void } }).__magnitudeDesktop
+        if (!bridge) { reject(new Error("Missing native observation bridge")); return }
+        let unsubscribe: (() => void) | undefined
+        let finished = false
+        const finish = () => { finished = true; clearTimeout(timer); unsubscribe?.() }
+        const timer = setTimeout(() => { finish(); reject(new Error("Native ownership observation timed out")) }, 15_000)
+        unsubscribe = bridge.observe(value => { finish(); resolve(value) }, message => { finish(); reject(new Error(message)) })
+        if (finished) unsubscribe()
+      })))
+      const snapshot = yield* Schema.decodeUnknown(ReadyApplicationSnapshot)(wire).pipe(Effect.mapError(() => new AssertionFailure({ message: "Native service observation is not ready or lacks identity" })))
+      if (snapshot.pid !== nativeProcess!.pid || snapshot.service.health.pid === snapshot.pid || snapshot.endpoint !== `http://127.0.0.1:${config.port}`) return yield* new AssertionFailure({ message: "Native service identity does not belong to the isolated application" })
+      return ApplicationIdentity.make({ applicationPid: snapshot.pid, servicePid: snapshot.service.health.pid, serviceInstance: snapshot.service.health.id })
+    }),
     host: () => action("Verify packaged native host bridge", () => page.evaluate(async () => {
       const bridge = (window as unknown as { __magnitudeDesktop?: { applicationInfo: () => Promise<{ version: string }> } }).__magnitudeDesktop
       if (!bridge) throw new Error("Desktop preload did not expose its native host bridge")

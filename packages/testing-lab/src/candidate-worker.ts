@@ -6,6 +6,8 @@ import { ArtifactInput, InputManifest } from "./inputs"
 import { SourceBuilder } from "./source-builder"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
+import { ApplicationIdentity } from "./application-identity"
+import { verifyServiceOwnership } from "./suites/service"
 import { occupyServicePort } from "./port-fault"
 import { exerciseConnectionError } from "./harnesses/connection-error"
 import { desktopSession } from "./desktop-session"
@@ -209,6 +211,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
             yield* evidence(`${test.id}-generation.json`, Generation, generation)] })
         }
+        case "R5": {
+          yield* (yield* cli).reloadModel
+          const generation = yield* (yield* endpoint).generate
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("R5-generation.json", Generation, generation)] })
+        }
+        case "R6": {
+          const observations = yield* verifyServiceOwnership(yield* session).pipe(Effect.provideService(CliTests, yield* cli))
+          return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
+            yield* evidence("R6-service-ownership.json", Schema.Array(ApplicationIdentity), observations)] })
+        }
         case "E5": yield* (yield* endpoint).invalid; break
         case "H1": case "H2": case "H3": case "H4": case "H5": case "H6": {
           if (Option.isNone(tools) || Option.isNone(test.harness)) return yield* unavailable("Worker has no qualified harness tool configuration")
@@ -273,7 +286,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     for (const name of relaunches) {
       for (const file of ["ui-trace.zip", "desktop.log"]) {
         if (yield* fs.exists(join(desktopEvidence, name, file))) {
-          for (const caseId of ["A4", "A6", "A7"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+          for (const caseId of ["A4", "A6", "A7", "R6"]) yield* exportFile(`desktop/${name}/${file}`, caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
         }
       }
     }

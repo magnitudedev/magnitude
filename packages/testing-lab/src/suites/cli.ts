@@ -8,7 +8,9 @@ export const CliTestConfig = Schema.Struct({ executable: Schema.String, version:
   evidence: Schema.String, environment: Schema.Record({ key: Schema.String, value: Schema.String }) })
 export interface CliTests {
   readonly version: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly ensureService: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly inspect: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
+  readonly reloadModel: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly modelLifecycle: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly connections: (harness: typeof Harness.Type, inspect: (connected: boolean) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>) => Effect.Effect<void, AssertionFailure | InfrastructureFailure>
   readonly invalid: Effect.Effect<void, AssertionFailure | InfrastructureFailure>
@@ -32,7 +34,25 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
   const successful = (args: readonly string[]) => invoke(args).pipe(Effect.flatMap(result => result.exitCode === 0 ? Effect.succeed(result.stdout)
     : Effect.fail(fail(`Bundled CLI ${args.join(" ")} exited ${result.exitCode}: ${(result.stderr || result.stdout).slice(-1000)}`))))
   const assert = (condition: boolean, detail: string) => condition ? Effect.void : Effect.fail(fail(detail))
+  const reloadModel = Effect.gen(function* () {
+      yield* successful(["models", "stop"])
+      yield* Effect.gen(function* () {
+        const status = yield* successful(["models", "status", config.model])
+        yield* assert(!/Runtime\s+Failed/.test(status), "CLI model stop failed")
+        return /Runtime\s+Unloaded/.test(status)
+      }).pipe(Effect.repeat({ until: stopped => stopped, schedule: Schedule.spaced("1 second") }),
+        Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => fail("CLI stop did not unload the model") }))
+      yield* successful(["models", "load", config.model])
+      yield* Effect.gen(function* () {
+        const status = yield* successful(["models", "status", config.model])
+        yield* assert(!/Runtime\s+Failed/.test(status), "CLI model load failed")
+        return /Runtime\s+Ready/.test(status)
+      }).pipe(Effect.repeat({ until: ready => ready, schedule: Schedule.spaced("1 second") }),
+        Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
+  })
   return {
+    reloadModel,
+    ensureService: successful(["service", "start"]).pipe(Effect.asVoid),
     version: successful(["--version"]).pipe(Effect.flatMap(output => assert(output.trim() === config.version, "Bundled CLI version differs from installed candidate"))),
     inspect: Effect.gen(function* () {
       const help = yield* successful(["--help"])
@@ -48,14 +68,7 @@ export const bundledCliTests = (config: typeof CliTestConfig.Type) => Layer.effe
       }
       const pull = yield* successful(["catalog", "pull", config.model])
       yield* assert(pull.includes("already installed and up to date"), "Cached model pull unexpectedly started another acquisition")
-      yield* successful(["models", "stop"])
-      yield* successful(["models", "load", config.model])
-      yield* Effect.gen(function* () {
-        const status = yield* successful(["models", "status", config.model])
-        yield* assert(!/Runtime\s+Failed/.test(status), "CLI model load failed")
-        return /Runtime\s+Ready/.test(status)
-      }).pipe(Effect.repeat({ until: ready => ready, schedule: Schedule.spaced("1 second") }),
-        Effect.timeoutFail({ duration: "3 minutes", onTimeout: () => fail("CLI model did not become ready") }))
+      yield* reloadModel
       // Residency is not generation success: the caller must follow this with EndpointTests.generate.
     }),
     connections: (harness, inspect) => Effect.gen(function* () {
