@@ -71,6 +71,37 @@ bunx --bun vitest run
 bunx tsc --noEmit
 ```
 
-The database integration test launches an isolated temporary PostgreSQL instance. Its current
-fixture discovers the Postgres.app 17 installation on this Mac; portable test-runtime discovery
-is still needed for remote CI. Provider fixture tests never claim to exercise real cloud VMs.
+Database integration tests launch isolated temporary PostgreSQL instances over Unix sockets.
+Set `LAB_TEST_POSTGRES_BIN`, provide `pg_config` on PATH, or use the Postgres.app fallback on macOS.
+The fixture still requires a Unix host; Windows database tests should use a separate database
+service. Provider fixture tests never claim to exercise real cloud VMs.
+
+## Scheduler and harness implementation checkpoint
+
+The durable scheduler now claims target assignments, records ownership before allocation,
+heartbeats work and leases, invokes an injected worker runner, and releases resources on success,
+failure and cancellation. The independent reconciler cleans expired/cancelled leases and tagged
+expired orphans. A finite cleanup timeout leaves a discoverable Releasing lease; it does not mark
+the run complete. Real PostgreSQL tests exercise these paths. Local transport uses owned directories,
+checks lease markers and rejects transfer traversal and symlink escapes. The actual remote
+WorkerRunner and coordinator deployment remain unfinished.
+
+`pi-probe.ts`, `opencode-probe.ts`, and `hermes-probe.ts` exercise product-created connections,
+real generation, a read/edit task, and session persistence against a packaged app. Each uses
+an isolated harness home, no inherited provider credentials, and a disposable working directory.
+They require the generation probe's cached model plus `LAB_PROBE_PI`, `LAB_PROBE_OPENCODE`,
+or `LAB_PROBE_HERMES` pointing to the pinned client executable. See `tools/README.md` for versions.
+
+Pi's RPC decoder waits for `agent_settled` and verifies assistant provider/model and successful
+terminal generation. OpenCode verifies completed JSON parts and the persisted transcript's
+provider/model; its CLI does not emit token deltas, so that alone does not prove streaming.
+Hermes verifies streamed text, matching tool starts/results, terminal result and session identity.
+Protocol tests inject failures and cannot be mistaken for real inference qualification.
+
+Live macOS results: Pi and OpenCode passed all of those programmatic journeys. Hermes passed
+with explicit persistent model selection through the actual bundled CLI. Its fresh UI-only
+connection remains a reproduced failure: Hermes's first-run guard ignores the named provider
+without a selected default. `LAB_PROBE_HERMES_SET_MODEL=true` with `LAB_PROBE_BUNDLED_CLI` exercises
+the separate explicit-selection scenario; it must not replace or hide the fresh-profile case.
+TUI interaction, complete suite integration, GPU/backend receipts and the full OS matrix remain
+unqualified. No performance benchmark gates have been introduced.

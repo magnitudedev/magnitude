@@ -86,7 +86,7 @@ export const playwrightDesktop = (config: DesktopLaunch) => Layer.scoped(Desktop
     }),
     connect: name => navigate("Connections").pipe(Effect.zipRight(action(`Connect ${name} through the app`, async () => {
       const harness = page.getByRole("article", { name, exact: true })
-      await harness.getByRole("button", { name: "Connect", exact: true }).click()
+      await harness.getByRole("button", { name: "Connect", exact: true }).or(harness.getByRole("button", { name: "Refresh connection", exact: true })).click()
       await harness.getByText("Connected", { exact: true }).waitFor()
     }))),
     disconnect: name => navigate("Connections").pipe(Effect.zipRight(action(`Disconnect ${name} through the app`, async () => {

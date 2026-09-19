@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Schema } from "effect"
+import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { Database, decodeRow } from "./database"
 import { CaseResult, InfrastructureFailure, RunId, RunPlan, RunResult, TargetId, TargetPlan } from "./domain"
@@ -7,7 +7,7 @@ import { Cancelling as CancellingRun, Running as RunningRun, Queued as QueuedRun
 
 export const WorkClaim = Schema.Struct({ runId: RunId, targetId: TargetId, fence: Fence, worker: Schema.NonEmptyString })
 export type WorkClaim = typeof WorkClaim.Type
-export const WorkAssignment = Schema.Struct({ claim: WorkClaim, plan: RunPlan, target: TargetPlan })
+export const WorkAssignment = Schema.Struct({ claim: WorkClaim, plan: RunPlan, target: TargetPlan, deadline: Schema.DateTimeUtc })
 export type WorkAssignment = typeof WorkAssignment.Type
 export const TargetResult = Schema.Struct({ cases: Schema.Array(CaseResult), cleanupErrors: Schema.Array(Schema.String) })
 export type TargetResult = typeof TargetResult.Type
@@ -27,7 +27,7 @@ export interface WorkStore {
 }
 export const WorkStore = Context.GenericTag<WorkStore>("@magnitudedev/testing-lab/WorkStore")
 const Candidate = Schema.Struct({ run_id: RunId, target_id: TargetId, plan: Schema.parseJson(RunPlan),
-  run_state: Schema.Literal("Queued", "Running"), fence: Schema.NumberFromString.pipe(Schema.compose(Fence)) })
+  run_state: Schema.Literal("Queued", "Running"), deadline: Schema.DateFromSelf, fence: Schema.NumberFromString.pipe(Schema.compose(Fence)) })
 const duration = (seconds: number) => Number.isInteger(seconds) && seconds > 0 && seconds <= 3600
 const invalidDuration = () => new InfrastructureFailure({ operation: "work-claim", message: "Claim duration must be 1–3600 seconds" })
 const stale = (claim: WorkClaim) => new StaleWork({ runId: claim.runId, targetId: claim.targetId })
@@ -47,7 +47,7 @@ export const WorkStoreLive = Layer.effect(WorkStore, Effect.gen(function* () {
     claim: (worker, seconds) => !duration(seconds) ? Effect.fail(invalidDuration()) : db.transaction(tx => Effect.gen(function* () {
       // Claim admission is short and serialized across schedulers so per-run concurrency is strict.
       yield* tx.query("SELECT pg_advisory_xact_lock(91826004)")
-      const rows = yield* tx.query(`SELECT w.run_id,w.target_id,w.fence,r.plan,r.state AS run_state FROM lab_work w
+      const rows = yield* tx.query(`SELECT w.run_id,w.target_id,w.fence,r.plan,r.deadline,r.state AS run_state FROM lab_work w
         JOIN lab_runs r USING(run_id) WHERE w.state='Queued' AND r.state IN ('Queued','Running')
         AND r.deadline > clock_timestamp()
         AND (SELECT COUNT(*) FROM lab_work active WHERE active.run_id=r.run_id AND active.state='Running')
@@ -66,7 +66,7 @@ export const WorkStoreLive = Layer.effect(WorkStore, Effect.gen(function* () {
         yield* tx.query("UPDATE lab_runs SET state=$2 WHERE run_id=$1", [candidate.run_id, run._tag])
       }
       yield* tx.query("INSERT INTO lab_attempts(run_id,target_id,fence,worker) VALUES($1,$2,$3,$4)", [candidate.run_id, candidate.target_id, candidate.fence, worker])
-      return Option.some(WorkAssignment.make({ claim: { runId: candidate.run_id, targetId: candidate.target_id, fence: candidate.fence, worker }, plan: candidate.plan, target }))
+      return Option.some(WorkAssignment.make({ claim: { runId: candidate.run_id, targetId: candidate.target_id, fence: candidate.fence, worker }, plan: candidate.plan, target, deadline: DateTime.unsafeMake(candidate.deadline) }))
     })),
     heartbeat: (claim, seconds) => !duration(seconds) ? Effect.fail(invalidDuration()) : db.transaction(tx => Effect.gen(function* () {
       const rows = yield* tx.query(`UPDATE lab_work w SET claim_expires_at=LEAST(r.deadline,clock_timestamp()+$5*interval '1 second')

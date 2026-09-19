@@ -3,7 +3,7 @@ import { FileSystem, FetchHttpClient, HttpApp, HttpServer } from "@effect/platfo
 import { BunContext, BunHttpServer } from "@effect/platform-bun"
 import { Context, DateTime, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { join } from "node:path"
-import { Database, databaseLayer, initializeDatabase } from "../src/database"
+import { Database, initializeDatabase } from "../src/database"
 import { Allocating, LeaseStore } from "../src/lease"
 import { LeaseStoreLive } from "../src/lease-store"
 import { LeaseId, RunId, RunRequest, TargetId } from "../src/domain"
@@ -16,19 +16,13 @@ import { LabClient, labClientLayer } from "../src/client"
 import { InputRegistry, InputRegistryLive } from "../src/inputs"
 import { fileArtifactStore } from "../src/artifact-store"
 import { sha256 } from "../src/snapshot"
-import { checkedCommand, ProcessExecutorLive } from "../src/process"
+import { ProcessExecutorLive } from "../src/process"
+import { temporaryDatabase } from "./postgres"
 
 test("PostgreSQL fences stale workers, rolls back transactions and serializes Spark reservations", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-postgres-" })
-  const bin = process.env.LAB_TEST_POSTGRES_BIN ?? "/Applications/Postgres.app/Contents/Versions/latest/bin"
-  const data = join(root, "data")
-  yield* checkedCommand(join(bin, "initdb"), ["-D", data, "-U", "lab", "--auth=trust", "--no-locale"], { timeoutMs: 30_000 })
-  yield* Effect.acquireRelease(
-    checkedCommand(join(bin, "pg_ctl"), ["-D", data, "-l", join(root, "postgres.log"), "-o", `-k ${root} -h '' -F`, "-w", "start"]),
-    () => checkedCommand(join(bin, "pg_ctl"), ["-D", data, "-m", "immediate", "-w", "stop"]).pipe(Effect.orDie),
-  )
-  const database = databaseLayer(Redacted.make(`postgresql://lab@localhost/postgres?host=${encodeURIComponent(root)}`))
+  const database = yield* temporaryDatabase
   const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, fileArtifactStore(join(root, "objects")).pipe(Layer.provide(BunContext.layer)))))
   const layers = Layer.mergeAll(database, inputs, LeaseStoreLive.pipe(Layer.provide(database)), runStoreLayer(500).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)))
   yield* Effect.gen(function* () {
