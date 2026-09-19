@@ -12,10 +12,13 @@
   "dependencies": {
     "@effect/platform": "^0.96.1",
     "@effect/platform-bun": "^0.90.0",
+    "@effect/platform-node": "0.107.0",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
+    "@xterm/headless": "6.0.0",
     "effect": "3.21.2",
     "jose": "^6",
+    "node-pty": "1.2.0-beta.15",
     "pg": "8.20.0",
     "playwright": "^1.62.1",
     "yaml": "^2.9.0"

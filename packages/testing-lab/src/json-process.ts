@@ -25,10 +25,11 @@ export const jsonProcess = (config: typeof JsonProcessConfig.Type) => Effect.gen
     })
     if (child.exitCode === null) {
       yield* stop("SIGTERM")
-      const exited = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("2 seconds"))
+      const exited = yield* Effect.promise(() => child.exited).pipe(Effect.interruptible, Effect.timeoutOption("2 seconds"))
       if (exited._tag === "None") yield* stop("SIGKILL")
     }
-    yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("3 seconds"))
+    yield* Effect.promise(() => child.exited).pipe(Effect.interruptible,
+      Effect.timeoutFail({ duration: "3 seconds", onTimeout: () => failed("Harness process survived forced cleanup") }), Effect.orDie)
   }))
   const read = (stream: ReadableStream<Uint8Array>) => Stream.fromReadableStream(() => stream, () => failed("Harness output stream failed")).pipe(Stream.decodeText())
   let pending = ""

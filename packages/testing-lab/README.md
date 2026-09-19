@@ -268,8 +268,32 @@ The worker connects H1–H6 to real Pi/OpenCode/Hermes processes, with shared ge
 conversation identifier recall, bounded read/edit fixtures and persisted-session reuse. Images must
 configure absolute `LAB_PI_EXECUTABLE`, `LAB_OPENCODE_EXECUTABLE`, `LAB_HERMES_EXECUTABLE` paths;
 the suite rejects versions outside the pinned tools set. Native event logs are retained per harness.
-Version checks alone do not qualify an immutable worker image. H7 terminal interaction remains
-unimplemented, and the backend gate still blocks scheduled generation acceptance.
+Version checks alone do not qualify an immutable worker image. H7 harness scenarios are not yet
+connected; the native terminal foundation is implemented separately.
+
+`TerminalDriver` owns a Node.js 24+ subprocess hosting `node-pty`, while the Effect worker
+interprets its output with `@xterm/headless`. It launches argument arrays with an explicit
+environment, reports the native child's exit, supports keyboard input and resize, bounds output,
+and retains raw/parsed terminal evidence. Runtime and harness executable paths are explicit.
+The lab-only `node-pty` pin is `1.2.0-beta.15`: the stable 1.1.0 tarball has a documented
+[macOS executable-permission defect](https://github.com/microsoft/node-pty/issues/919).
+The selected package includes Unix and Windows native bindings; these are not app runtime assets.
+
+Set `LAB_TERMINAL_NODE_EXECUTABLE` to an absolute real Node executable when running
+`test/terminal.test.ts`; Bun's `--bun` launcher can otherwise put a Bun shim ahead of Node.
+Five native Mac ARM64 fixtures passed: rendered cursor/Unicode/alternate-screen behavior with
+resize and keyboard interruption, forced cleanup, cancellation cleanup, missing-executable
+rejection, and output-bound failure cleanup. Node 26.8.1 and Bun 1.4.2 were used for this check.
+Linux and Windows terminal qualification, and actual Pi/OpenCode/Hermes H7 journeys, remain
+pending. Passing these fixtures does not establish harness generation or cancellation.
+
+With `LAB_PI_EXECUTABLE` additionally pointing to Pi 0.85.1, `test/pi-terminal.test.ts`
+exercises the real Pi TUI against a controlled loopback SSE endpoint: keyboard model selection,
+rendered streaming output, Escape cancellation confirmed by both the aborted request and Pi's
+persisted assistant record, a successful follow-up, and normal keyboard exit. This passed on
+Mac ARM64. It qualifies terminal automation against the pinned client, not Magnitude generation;
+H7 still needs production-suite integration and real inference qualification. The fixture waits
+through Pi's startup using only an idempotent model-selection command and never retries generation.
 
 `harness-suite-probe.ts` exercises these scenarios independently of backend qualification. It accepts
 the Connections probe variables plus `LAB_PROBE_MODEL_ID` and optional comma-separated

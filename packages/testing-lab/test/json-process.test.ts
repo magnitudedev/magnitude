@@ -1,7 +1,7 @@
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { join } from "node:path"
 import { jsonProcess, type JsonProcess } from "../src/json-process"
 
@@ -33,3 +33,11 @@ test("RPC writes are flushed and scoped shutdown terminates an idle process", ()
   child => child.send({ id: "test", type: "state" }).pipe(Effect.zipRight(child.receive), Effect.tap(value => Effect.sync(() => {
     expect(value).toEqual({ received: { id: "test", type: "state" } })
   })))) )
+
+test("scoped RPC shutdown escalates when the child ignores graceful termination", async () => {
+  let pid = 0
+  await withProcess('process.on("SIGTERM",()=>{});process.stdout.write(JSON.stringify({pid:process.pid})+"\\n");setInterval(()=>{},1000)',
+    child => child.receive.pipe(Effect.flatMap(Schema.decodeUnknown(Schema.Struct({ pid: Schema.Int }))), Effect.tap(value => Effect.sync(() => { pid = value.pid }))))
+  expect(pid).toBeGreaterThan(0)
+  expect(() => process.kill(pid, 0)).toThrow()
+}, 10000)

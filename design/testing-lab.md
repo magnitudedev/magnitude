@@ -286,6 +286,13 @@ service, then interrupts the CLI and requires the expected interruption exit. Ea
 exit cannot satisfy this case. The service is resumed on every exit path, and afterward the
 same application and service identities must remain usable. Unsupported native interruption
 mechanisms block qualification rather than substituting forced termination.
+Harness terminal paths use a real native PTY or ConPTY with an explicitly selected runtime
+and isolated environment. Terminal interpretation preserves cursor movement, alternate screens,
+Unicode and resize behavior; stripping escape sequences cannot substitute for rendered state.
+Native child exit is distinct from transport exit, and forced cleanup cannot qualify normal exit
+or user interruption. Sessions retain bounded transcripts and rendered evidence and reap owned
+children on success, failure and cancellation. Terminal fixtures establish driver behavior only;
+harness acceptance additionally requires its real model selection, generation and interruption.
 Error scenarios preserve malformed harness files and restore the original fixture bytes
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback
