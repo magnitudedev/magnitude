@@ -293,6 +293,11 @@ Native child exit is distinct from transport exit, and forced cleanup cannot qua
 or user interruption. Sessions retain bounded transcripts and rendered evidence and reap owned
 children on success, failure and cancellation. Terminal fixtures establish driver behavior only;
 harness acceptance additionally requires its real model selection, generation and interruption.
+The Pi terminal journey confirms keyboard selection, observes generated text absent from echoed
+input, and requires a native persisted aborted assistant turn followed by a completed turn in
+the same session with the selected provider/model. A turn that naturally finishes before Escape
+fails interruption qualification. Session records and intermediate rendered screens are exported
+alongside the terminal transcript; a standalone probe does not establish full worker qualification.
 Error scenarios preserve malformed harness files and restore the original fixture bytes
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback

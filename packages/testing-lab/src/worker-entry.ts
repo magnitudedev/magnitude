@@ -15,16 +15,17 @@ import { WorkerInvocation, WorkerReply } from "./worker-protocol"
 import { configuredHarnessTools } from "./harnesses/suite"
 import { qualifyGuestUser } from "./guest-user"
 import { DisposableDesktopUser } from "./desktop-environment"
+import { NativeTerminalDriver } from "./terminal"
 
 export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type, root: string) => Effect.gen(function* () {
-  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL", "LAB_TERMINAL_NODE_EXECUTABLE"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* Effect.gen(function* () {
     const user = yield* qualifyGuestUser(invocation.assignment.target.target.provider, invocation.disposable, environment)
     if (Option.isSome(user)) environment.HOME = user.value.home
     const userLayer = Option.match(user, { onNone: () => Layer.empty, onSome: value => Layer.succeed(DisposableDesktopUser, value) })
     const installationRoot = Option.isSome(user) && process.platform === "darwin" ? "/Applications" : join(root, "installation")
     return yield* runCandidateWorker(invocation.assignment, { root: join(root, "workspace"), port: invocation.port, model: invocation.model, environment }).pipe(
-    Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive, configuredHarnessTools,
+    Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive, configuredHarnessTools, NativeTerminalDriver,
       nativeInstaller({ disposable: invocation.disposable, root: installationRoot, environment }),
       nativeSourceBuilder({ root: join(root, "build"), objects: join(root, "objects"), environment }).pipe(Layer.provide(fileArtifactStore(join(root, "objects"))))]), Effect.provide(userLayer))
   }).pipe(

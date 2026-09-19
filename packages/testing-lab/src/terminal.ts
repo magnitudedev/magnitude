@@ -90,6 +90,6 @@ export const NativeTerminalDriver = Layer.effect(TerminalDriver, Effect.gen(func
   }) } satisfies TerminalDriver
 }))
 
-export const waitForTerminal = (session: TerminalSession, predicate: (screen: typeof TerminalScreen.Type) => boolean, description: string) =>
+export const waitForTerminal = (session: TerminalSession, predicate: (screen: typeof TerminalScreen.Type) => boolean, description: string, timeoutMs = 30_000) =>
   session.screen.pipe(Effect.repeat({ until: predicate, schedule: Schedule.identity<typeof TerminalScreen.Type>().pipe(Schedule.addDelay(() => "100 millis")) }),
-    Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new AssertionFailure({ message: `Terminal did not ${description}` }) }))
+    Effect.timeoutFail({ duration: timeoutMs, onTimeout: () => new AssertionFailure({ message: `Terminal did not ${description}` }) }))

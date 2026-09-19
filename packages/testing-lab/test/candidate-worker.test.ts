@@ -1,7 +1,7 @@
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { join } from "node:path"
 import releasePlan from "../../release/release-plan.json"
 import { ArtifactStore, fileArtifactStore } from "../src/artifact-store"
@@ -17,7 +17,7 @@ import { SourceBuilder } from "../src/source-builder"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment, validateTargetResult } from "../src/work-store"
 
-for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid", "terminal-missing-runtime"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-artifact-worker-" })
   const bytes = new TextEncoder().encode("fixture installer")
@@ -40,6 +40,7 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
   const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P4", "P5", "I1", "I2", "C1"].includes(c.id)) }
   if (mode === "explicit-uninstall") selected.cases.push(allCases.find(test => test.id === "X1")!)
   if (mode.startsWith("update-baseline-")) selected.cases.push(allCases.find(test => test.id === "U1")!)
+  if (mode === "terminal-missing-runtime") selected.cases.push({ ...allCases.find(test => test.id === "H7")!, harness: Option.some("pi"), prerequisites: [] })
   const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "fixture" },
     plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
   const started = yield* Deferred.make<void>()
@@ -63,6 +64,11 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     }
     const result = yield* execution
     yield* validateTargetResult(selected, result)
+    if (mode === "terminal-missing-runtime") {
+      const terminal = result.cases.find(test => test.caseId === "H7")!
+      expect(terminal.outcome.status).toBe("blocked")
+      expect(terminal.outcome.detail).toContain("LAB_TERMINAL_NODE_EXECUTABLE")
+    }
     // This fixture returns version text for all commands, not valid signature evidence.
     const signature = result.cases.find(c => c.caseId === "P5")!.outcome
     expect(signature.status).toBe(mode === "runtime-artifacts" ? "failed" : "blocked")

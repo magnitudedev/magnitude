@@ -57,7 +57,7 @@ const prerequisites: Readonly<Record<string, readonly string[]>> = {
 }
 export const cases: readonly PlannedCase[] = Object.entries(suiteCases).flatMap(([suite, titles]) => titles.map((title, index) => ({
   id: CaseId.make(`${prefixes[suite as Suite]}${index + 1}`), suite: suite as Suite, title,
-  timeoutSeconds: suite === "package" ? 3600 : suite === "recovery" && index === 1 ? 2400 : suite === "update" || title.includes("model") ? 900 : 300,
+  timeoutSeconds: suite === "package" ? 3600 : suite === "recovery" && index === 1 ? 2400 : suite === "update" || suite === "harness" && index === 6 || title.includes("model") ? 900 : 300,
   harness: Option.none<Harness>(), prerequisites: (prerequisites[`${prefixes[suite as Suite]}${index + 1}`] ?? []).map(id => CaseId.make(id)),
 })))
 const quickIds = new Set(["P1", "P2", "P3", "P4", "P5", "I1", "I2", "I3", "I4", "A1", "A2", "A3", "A5", "E1", "E3", "E6", "H1", "H2", "H3", "H5", "C1", "C2"])

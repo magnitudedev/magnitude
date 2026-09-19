@@ -113,8 +113,8 @@ with explicit persistent model selection through the actual bundled CLI. Its fre
 connection remains a reproduced failure: Hermes's first-run guard ignores the named provider
 without a selected default. `LAB_PROBE_HERMES_SET_MODEL=true` with `LAB_PROBE_BUNDLED_CLI` exercises
 the separate explicit-selection scenario; it must not replace or hide the fresh-profile case.
-TUI interaction, complete suite integration, GPU/backend receipts and the full OS matrix remain
-unqualified. No performance benchmark gates have been introduced.
+Pi terminal interaction also passed against real local generation; OpenCode/Hermes TUI interaction,
+complete suite integration, GPU/backend receipts and the full OS matrix remain unqualified. No performance benchmark gates have been introduced.
 
 ## UI resilience
 
@@ -268,8 +268,9 @@ The worker connects H1–H6 to real Pi/OpenCode/Hermes processes, with shared ge
 conversation identifier recall, bounded read/edit fixtures and persisted-session reuse. Images must
 configure absolute `LAB_PI_EXECUTABLE`, `LAB_OPENCODE_EXECUTABLE`, `LAB_HERMES_EXECUTABLE` paths;
 the suite rejects versions outside the pinned tools set. Native event logs are retained per harness.
-Version checks alone do not qualify an immutable worker image. H7 harness scenarios are not yet
-connected; the native terminal foundation is implemented separately.
+Version checks alone do not qualify an immutable worker image. H7 dispatches the Pi terminal journey;
+OpenCode and Hermes H7 remain explicitly blocked until their terminal journeys are implemented.
+Worker images must also configure an absolute `LAB_TERMINAL_NODE_EXECUTABLE` for Node 24+.
 
 `TerminalDriver` owns a Node.js 24+ subprocess hosting `node-pty`, while the Effect worker
 interprets its output with `@xterm/headless`. It launches argument arrays with an explicit
@@ -284,16 +285,26 @@ Set `LAB_TERMINAL_NODE_EXECUTABLE` to an absolute real Node executable when runn
 Five native Mac ARM64 fixtures passed: rendered cursor/Unicode/alternate-screen behavior with
 resize and keyboard interruption, forced cleanup, cancellation cleanup, missing-executable
 rejection, and output-bound failure cleanup. Node 26.8.1 and Bun 1.4.2 were used for this check.
-Linux and Windows terminal qualification, and actual Pi/OpenCode/Hermes H7 journeys, remain
-pending. Passing these fixtures does not establish harness generation or cancellation.
+Linux and Windows terminal qualification remain pending. Passing these fixtures does not establish
+harness generation or cancellation.
 
 With `LAB_PI_EXECUTABLE` additionally pointing to Pi 0.85.1, `test/pi-terminal.test.ts`
 exercises the real Pi TUI against a controlled loopback SSE endpoint: keyboard model selection,
 rendered streaming output, Escape cancellation confirmed by both the aborted request and Pi's
 persisted assistant record, a successful follow-up, and normal keyboard exit. This passed on
 Mac ARM64. It qualifies terminal automation against the pinned client, not Magnitude generation;
-H7 still needs production-suite integration and real inference qualification. The fixture waits
+A second fixture rejects a first turn that finishes naturally before Escape; keyboard input alone
+cannot satisfy interruption. The fixture waits
 through Pi's startup using only an idempotent model-selection command and never retries generation.
+
+`pi-terminal-probe.ts` uses the packaged app's UI-created connection and the same reusable Pi
+journey as H7. It passed on local Mac ARM64 with Qwen3.5 4B Q4: rendered partial generation,
+a persisted aborted assistant turn, successful follow-up in the same identified session, and
+normal keyboard exit with no cleanup errors. It takes `LAB_PROBE_ROOT`, `LAB_PROBE_EXECUTABLE`,
+`LAB_PROBE_MODEL_ID`, `LAB_PI_EXECUTABLE`, `LAB_TERMINAL_NODE_EXECUTABLE`, and optional
+`LAB_PROBE_PORT`. This standalone probe does not qualify the complete worker matrix or backend;
+regular H7 retains the existing H2/backend prerequisites and exports session, screen and terminal
+artifacts before a guest is removed.
 
 `harness-suite-probe.ts` exercises these scenarios independently of backend qualification. It accepts
 the Connections probe variables plus `LAB_PROBE_MODEL_ID` and optional comma-separated
