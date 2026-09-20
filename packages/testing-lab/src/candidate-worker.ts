@@ -43,6 +43,7 @@ import { inspectMacPackageDependencies, MacPackageDependencies } from "./suites/
 import { appleTrustPolicy, ApplePackageTrust, inspectApplePackageTrust } from "./suites/apple-package-trust"
 import { windowsTrustPolicy, WindowsPackageTrust, inspectWindowsPackageTrust } from "./suites/windows-package-trust"
 import { inspectLinuxPackageDependencies, LinuxPackageDependencies } from "./suites/linux-package-dependencies"
+import { inspectWindowsPackageDependencies, WindowsPackageDependencies } from "./suites/windows-package-dependencies"
 import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
 import { Harness } from "./domain"
@@ -293,10 +294,14 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, yield* evidence("package-identity.json", PackageIdentity, identity)] })
         }
         case "P4": {
-          if (target.os === "windows") return yield* unavailable("Native dependency closure is not yet qualified for Windows")
           const release = (yield* manifest).release
           if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
             return yield* unavailable("Dependency closure requires the admitted native runtime archives")
+          }
+          if (target.os === "windows") {
+            const report = yield* inspectWindowsPackageDependencies(yield* installed, release, environment).pipe(Effect.provide(NodeArchiveExtractor))
+            return CaseObservation.make({ detail: "Verified packaged PE import closure in native loader contexts, including delay imports, API-set mappings and signed OS boundaries",
+              evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", WindowsPackageDependencies, report)] })
           }
           if (target.os !== "macos") {
             const report = yield* inspectLinuxPackageDependencies(yield* installed, release).pipe(Effect.provide(NodeArchiveExtractor))

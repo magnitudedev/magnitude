@@ -8,7 +8,7 @@ export const WindowsToolDownloads = Schema.Struct({
   bun: InitializationDownload, node: InitializationDownload, git: InitializationDownload,
   powershell: InitializationDownload, ninja: InitializationDownload, cmake: InitializationDownload,
   nsis: InitializationDownload, uv: InitializationDownload, pi: InitializationDownload,
-  opencode: InitializationDownload, tirith: InitializationDownload, rustup: InitializationDownload,
+  opencode: InitializationDownload, tirith: InitializationDownload, rustup: InitializationDownload, dependencies: InitializationDownload,
   vsBuildTools: InitializationDownload, vsChannel: InitializationDownload,
 })
 export const windowsToolDownloads = Effect.gen(function* () {

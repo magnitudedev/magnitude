@@ -33,8 +33,10 @@ It does not issue a provider upload command per source file. Native extraction m
 worker execution; extraction failures retain redacted diagnostics. The worker still verifies input
 objects when consuming them. Candidate-produced archives are not accepted by this handoff.
 Source candidates compile the release-owned CPU base and the selected host's backend pack alongside
-the desktop. CPU targets need no additional pack; Metal and CUDA targets require their matching
-pack. Compilation receipts bind the selected backend and native build identity. Final packaging
+the desktop. Metal and CUDA targets require their matching pack. Apple Silicon also includes
+the Metal pack for CPU checks because ordinary application startup requires its distribution
+metadata. Other CPU targets need only the base. This packaging requirement does not change
+the requested execution backend: CPU checks still reject target-model GPU allocation. Compilation receipts bind the selected backend and native build identity. Final packaging
 archives those exact compiled inputs and admits desktop, base and pack bytes together; it cannot
 silently substitute a published inference runtime for unpublished source changes.
 The manifest also includes the canonical archive of the bundled service, whose size is consumed
@@ -387,6 +389,12 @@ Program headers must identify the architecture’s standard GNU loader when an i
 present, and that loader must exist as an OS-directory ELF image of the correct architecture.
 Only explicit desktop/system ABI names may cross the OS boundary; inference implementation and
 CUDA toolkit libraries must remain owned. The NVIDIA driver library is admitted only for CUDA.
+PE inspection uses the guest's API-set, side-by-side and architecture-aware native resolution.
+Each owned root retains its loader context, including only the product's declared owned runtime
+search directory, never a developer PATH. Ordinary and delayed imports must resolve through the
+complete owned graph. OS boundaries require architecture-matching files in native Windows system
+locations and a valid Microsoft signature; only CUDA may additionally admit NVIDIA's signed driver.
+Candidate libraries are inspected, not executed, to establish this closure.
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.

@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { ArchiveExtractor } from "../../release/src/archive"
 import { downloadObject } from "./artifact-store"
 import { AssertionFailure, Digest, Target } from "./domain"
+import { runtimePackBackend } from "./native-build-selection"
 
 const invalid = (message: string) => new AssertionFailure({ message: `Runtime dependency composition: ${message}` })
 
@@ -14,9 +15,10 @@ export const admittedRuntimeComposition = (release: typeof ReleaseManifestSchema
   const fs = yield* FileSystem.FileSystem
   const extractor = yield* ArchiveExtractor
   const bases = release.artifacts.filter(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))
-  const packs = target.backend === "cpu" ? [] : release.artifacts.filter(artifact => artifact.kind === "icn-backend"
-    && Option.contains(artifact.host, target.artifactHost) && Option.contains(artifact.backend, target.backend))
-  if (bases.length !== 1 || (target.backend !== "cpu" && packs.length !== 1)) return yield* invalid("exactly one base and the selected backend pack are required")
+  const required = runtimePackBackend(target.artifactHost, target.backend)
+  const packs = Option.isNone(required) ? [] : release.artifacts.filter(artifact => artifact.kind === "icn-backend"
+    && Option.contains(artifact.host, target.artifactHost) && Option.contains(artifact.backend, required.value))
+  if (bases.length !== 1 || (Option.isSome(required) && packs.length !== 1)) return yield* invalid("exactly one base and the required runtime pack are needed")
   const base = bases[0]!
   for (const pack of packs) {
     if (!Option.contains(pack.requiredBaseId, base.id) || !Option.contains(pack.nativeBuild, Option.getOrThrow(base.nativeBuild))

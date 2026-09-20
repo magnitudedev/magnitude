@@ -12,7 +12,7 @@ import { checkedCommand, ProcessExecutorLive } from "../src/process"
 import { admittedRuntimeComposition } from "../src/runtime-composition"
 import { sha256 } from "../src/snapshot"
 
-test("composes verified archives, keeps CPU selection explicit and rejects identity, path and byte conflicts", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+test("composes verified host-required archives and rejects identity, path and byte conflicts", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const temporary = yield* fs.makeTempDirectoryScoped({ prefix: "lab-composition-fixture-" })
   const objects = join(temporary, "objects")
@@ -47,8 +47,8 @@ test("composes verified archives, keeps CPU selection explicit and rejects ident
       expect(yield* fs.readFileString(join(result.root, "runtime", "owned.dylib"))).toBe("runtime")
       expect((yield* fs.readDirectory(join(result.root, "backends"))).sort()).toEqual(["cpu.dylib", "metal.dylib"])
       const cpu = yield* admittedRuntimeComposition(release, { ...target, backend: "cpu" })
-      expect(cpu.artifacts).toEqual(["base"])
-      expect(yield* fs.readDirectory(join(cpu.root, "backends"))).toEqual(["cpu.dylib"])
+      expect(cpu.artifacts).toEqual(["base", "metal"])
+      expect((yield* fs.readDirectory(join(cpu.root, "backends"))).sort()).toEqual(["cpu.dylib", "metal.dylib"])
     }))
     expect(yield* fs.exists(composed)).toBe(false)
     const baseArtifact = release.artifacts[0]!, pack = release.artifacts[1]!
@@ -57,6 +57,7 @@ test("composes verified archives, keeps CPU selection explicit and rejects ident
       expect((yield* Effect.scoped(admittedRuntimeComposition({ ...release, artifacts: [baseArtifact, changed] }, target)).pipe(Effect.either))._tag).toBe("Left")
     }
     expect((yield* Effect.scoped(admittedRuntimeComposition({ ...release, artifacts: [baseArtifact] }, target)).pipe(Effect.either))._tag).toBe("Left")
+    expect((yield* Effect.scoped(admittedRuntimeComposition({ ...release, artifacts: [baseArtifact] }, { ...target, backend: "cpu" })).pipe(Effect.either))._tag).toBe("Left")
     yield* fs.writeFileString(join(objects, base.sha256), "corrupt CAS bytes")
     expect((yield* Effect.scoped(admittedRuntimeComposition(release, target)).pipe(Effect.either))._tag).toBe("Left")
   }).pipe(Effect.provide(fileArtifactStore(objects)))

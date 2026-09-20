@@ -68,5 +68,10 @@
     "url": "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip",
     "sha256": "56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f",
     "bytes": 2362938
+  },
+  "dependencies": {
+    "url": "https://github.com/lucasg/Dependencies/releases/download/v1.11/Dependencies_x64_Release.zip",
+    "sha256": "820215f3107c135635ded01de2fb0785797cf1fe5fae1cedb6f0afc42f91881b",
+    "bytes": 4402867
   }
 }

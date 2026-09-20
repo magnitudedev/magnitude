@@ -98,7 +98,7 @@ Set-Location (Join-Path $workspace 'packages\testing-lab')
 Invoke-Native $tools.node @('-e','const pty=require("node-pty"); const p=pty.spawn(process.env.ComSpec,["/d","/c","exit 0"],{}); p.onExit(e=>process.exit(e.exitCode)); setTimeout(()=>{p.kill();process.exit(1)},10000)')
 Set-Location $workspace
 Invoke-Native $tools.bun @('-e','await import("./packages/testing-lab/src/outward-worker.ts")')
-$launch = [ordered]@{workspace=$workspace;bun=$tools.bun;path=$env:PATH;cargo=$env:CARGO_HOME;rustup=$env:RUSTUP_HOME;node=$tools.node;pi=$tools.pi;opencode=$tools.opencode;hermes=$hermesExecutable}
+$launch = [ordered]@{workspace=$workspace;bun=$tools.bun;path=$env:PATH;cargo=$env:CARGO_HOME;rustup=$env:RUSTUP_HOME;node=$tools.node;pi=$tools.pi;opencode=$tools.opencode;hermes=$hermesExecutable;dependencies=$tools.dependencies}
 $launch | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'launch.json') -Encoding UTF8
 # Runtime is private to the admitted account and SYSTEM; the separate state receipt stays SYSTEM-owned.
 $acl = Get-Acl -LiteralPath $root

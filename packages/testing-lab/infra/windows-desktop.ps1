@@ -14,6 +14,7 @@ $env:PATH=$config.path
 $env:CARGO_HOME=$config.cargo
 $env:RUSTUP_HOME=$config.rustup
 $env:LAB_TERMINAL_NODE_EXECUTABLE=$config.node
+$env:LAB_DEPENDENCIES_EXECUTABLE=$config.dependencies
 $env:LAB_PI_EXECUTABLE=$config.pi
 $env:LAB_OPENCODE_EXECUTABLE=$config.opencode
 $env:LAB_HERMES_EXECUTABLE=$config.hermes

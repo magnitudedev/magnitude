@@ -74,7 +74,7 @@ function Invoke-Tool([string]$Executable, [string[]]$Arguments) {
   if ($LASTEXITCODE -ne 0) { throw "Tool $([IO.Path]::GetFileName($Executable)) exited $LASTEXITCODE" }
 }
 $paths = [ordered]@{}
-foreach ($entry in @(@('bun','bun.exe'),@('node','node.exe'),@('powershell','pwsh.exe'),@('ninja','ninja.exe'),@('uv','uv.exe'),@('pi','pi.exe'),@('opencode','opencode.exe'),@('cmake','cmake.exe'))) {
+foreach ($entry in @(@('bun','bun.exe'),@('node','node.exe'),@('powershell','pwsh.exe'),@('ninja','ninja.exe'),@('uv','uv.exe'),@('pi','pi.exe'),@('opencode','opencode.exe'),@('cmake','cmake.exe'),@('dependencies','Dependencies.exe'))) {
   $paths[$entry[0]] = Find-Tool (Expand-Tool $entry[0]) $entry[1]
 }
 # NSIS includes its public launcher and a private Bin copy. Use the public launcher.
@@ -128,6 +128,7 @@ Invoke-Tool $paths.uv @('--version')
 Invoke-Tool $paths.pi @('--version')
 Invoke-Tool $paths.opencode @('--version')
 Invoke-Tool $paths.tirith @('--version')
+Invoke-Tool $paths.dependencies @('-json','-depth','1','-chain',"$env:SystemRoot\System32\cmd.exe")
 $paths | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root 'paths.json') -Encoding UTF8
 @{schemaVersion=1; downloads=$config; paths=$paths; restartRequired=($process.ExitCode -eq 3010)} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $root 'receipt.json') -Encoding UTF8
 Write-Output 'Pinned Windows tool installation and native command checks completed'

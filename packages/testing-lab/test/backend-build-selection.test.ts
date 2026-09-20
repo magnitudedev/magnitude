@@ -3,13 +3,14 @@ import { expect, test } from "vitest"
 import { selectBuildBackendPacks } from "../src/native-build-selection"
 import { targets } from "../src/catalog"
 
-test("every lab target selects its declared release backend without Vulkan or CPU fallback", () => Effect.runPromise(Effect.gen(function* () {
+test("every lab target includes required distribution packs without changing execution acceptance", () => Effect.runPromise(Effect.gen(function* () {
   for (const target of targets) {
     const packs = yield* selectBuildBackendPacks(target.artifactHost, target.backend)
-    expect(packs).toHaveLength(target.backend === "cpu" ? 0 : 1)
+    const apple = target.artifactHost === "darwin-arm64"
+    expect(packs).toHaveLength(target.backend === "cpu" && !apple ? 0 : 1)
     for (const pack of packs) {
       expect(pack.host).toBe(target.artifactHost)
-      expect(pack.backend).toBe(target.backend)
+      expect(pack.backend).toBe(apple && target.backend === "cpu" ? "metal" : target.backend)
       if (pack.backend === "cuda") expect(pack.cuda.toolkitVersion).toBe("12.9")
     }
   }
