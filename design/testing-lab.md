@@ -227,7 +227,12 @@ Windows preparation separates pinned tooling, trusted runtime dependencies, and 
 user's desktop. Runtime readiness binds the runtime digest, native distribution/architecture and
 user SID. One-shot login credentials are removed at logon before a desktop receipt is published;
 that receipt also requires a live interactive session. A separate server diagnostic distribution
-can exercise preparation mechanisms but cannot qualify a Windows client target.
+can exercise preparation mechanisms but cannot qualify a Windows client target. Azure records
+recipe-bound preparation stages and observes ambiguous command submissions without repeating
+installers. Restart intent is persisted before reboot so reconciliation cannot reboot an already
+prepared desktop. Readiness is refreshed against the live session; an older command receipt cannot
+satisfy a failed or ambiguous refresh. Stage execution and observation stay within the allocation
+lease, and failure diagnostics are retained before cleanup.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,

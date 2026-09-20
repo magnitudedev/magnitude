@@ -5,6 +5,7 @@ import { Digest, InfrastructureFailure, TargetId } from "../domain"
 import { AzureMachine, MachineAllocator, MachineTags } from "../machines"
 import { checkedCommand, ProcessExecutor } from "../process"
 import { AzureInitialization, prepareAzureInitialization } from "./azure-initialization"
+import { prepareWindowsMachine, windowsPreparationDiagnostics } from "./azure-windows-preparation"
 import { azureInitializationWait } from "./azure-readiness"
 import { ArtifactStore } from "../artifact-store"
 import { retainWorkerDiagnostic } from "../worker-diagnostics"
@@ -122,7 +123,9 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
   }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail("Invalid Azure initialization observation")),
     Effect.timeoutFail({ duration: Math.max(1, Math.min(20 * 60_000, DateTime.toEpochMillis(machine.tags.expiresAt) - Date.now())),
     onTimeout: () => fail("Worker initialization exceeded its deadline; allocation remains owned for cleanup") }))
-  const initializationDiagnostics = (machine: typeof AzureMachine.Type) => Effect.gen(function* () {
+  const initializationDiagnostics = (machine: typeof AzureMachine.Type, windows = false) => Effect.gen(function* () {
+    if (windows) return yield* windowsPreparationDiagnostics(machine, rest).pipe(
+      Effect.flatMap(output => retainWorkerDiagnostic(machine, "initialization", output)), Effect.provideService(ArtifactStore, objects))
     // Publish bounded, redacted diagnostics before deleting the failed allocation.
     // The run report grants owner access; container-local files do not survive deployment.
     const reply = yield* checked(config.executable, ["vm", "run-command", "invoke", "--subscription", config.subscription,
@@ -143,7 +146,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       if ((target.os === "windows") !== (image.os === "Windows")) return yield* fail("Image OS does not match target")
       // Administrator-owned setup is separate from submitted source. Verify it before allocating anything.
       const initialization = yield* Option.match(image.initialization, { onNone: () => Effect.void, onSome: setup => Effect.gen(function* () {
-        if (image.os !== "Linux") return yield* fail("Cloud initialization is supported only for Linux workers")
+        if ((image.os === "Windows") !== ("kind" in setup && setup.kind === "windows")) return yield* fail("Initialization recipe does not match the native image OS")
         return yield* prepareAzureInitialization(setup, { executable: config.executable, subscription: config.subscription,
           adminUsername: config.adminUsername, architecture: target.arch, os: target.os, version: target.version }).pipe(
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, executor))
@@ -168,7 +171,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
               managedDisk: { storageAccountType: "Premium_LRS" } } },
             networkProfile: { networkInterfaces: [{ id: nicId(machine.name), properties: { primary: true, deleteOption: "Delete" } }] },
             osProfile: { computerName: machine.name, adminUsername: config.adminUsername,
-              ...(initialization === undefined ? {} : { customData: initialization.customData }),
+              ...(initialization?.kind === "linux" ? { customData: initialization.customData } : {}),
               ...(image.os === "Windows" ? { adminPassword: password, windowsConfiguration: { provisionVMAgent: true, enableAutomaticUpdates: false } }
                 : { linuxConfiguration: { disablePasswordAuthentication: true, provisionVMAgent: true,
                   ssh: { publicKeys: [{ path: `/home/${config.adminUsername}/.ssh/authorized_keys`, keyData: config.sshPublicKey }] } } }) } } }
@@ -180,8 +183,12 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       // Azure does not inherit VM tags onto its managed disk. Tag it before admitting work,
       // and again before deletion, so a disk left by failed asynchronous deletion is discoverable.
       yield* tagDisk(machine, encodedTags)
-      if (initialization) yield* waitInitialized(machine, initialization.identity).pipe(
-        Effect.catchAll(error => initializationDiagnostics(machine).pipe(Effect.either, Effect.flatMap(diagnostics =>
+      if (initialization) yield* (initialization.kind === "linux" ? waitInitialized(machine, initialization.identity) : prepareWindowsMachine(machine, initialization,
+        { executable: config.executable, subscription: config.subscription, location: config.location }, { rest, waitProvisioned: waitProvisioned(machine),
+          restart: checked(config.executable, ["vm", "restart", "--subscription", config.subscription, "--resource-group", config.resourceGroup,
+            "--name", machine.name, "--only-show-errors"], { timeoutMs: 300_000 }).pipe(Effect.mapError(() => fail("Windows desktop restart failed or its observation expired; allocation remains owned for cleanup"))),
+        }).pipe(Effect.provideService(ProcessExecutor, executor))).pipe(
+        Effect.catchAll(error => initializationDiagnostics(machine, initialization.kind === "windows").pipe(Effect.either, Effect.flatMap(diagnostics =>
           Effect.fail(new InfrastructureFailure({ operation: "azure", message: `${error.message}; ${diagnostics._tag === "Right" ? "initialization diagnostics retained in run evidence" : diagnostics.left.message}`,
             evidence: diagnostics._tag === "Right" ? Option.some([diagnostics.right]) : Option.none() }))))))
       return machine

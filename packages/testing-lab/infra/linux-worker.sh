@@ -17,15 +17,15 @@ case "$ID:$VERSION_ID" in
     # Restarting the Azure agent while its readiness command runs can sever observation.
     export NEEDRESTART_MODE=l
     apt-get update -qq
-    apt-get install -y -qq sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils lsof nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
+    apt-get install -y -qq sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake clang libclang-dev libssl-dev pkg-config fakeroot rpm binutils lsof nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
     ;;
   fedora:44)
-    dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils lsof nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
+    dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils lsof nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
     ;;
   rhel:10|rhel:10.*)
     # RHEL consumers install RPMs built on the canonical Ubuntu producer. They do
     # not need an additional repository just to install Debian packaging tools.
-    dnf -y install sudo curl ca-certificates python3 python3-pip python3-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config rpm-build binutils lsof nftables polkit dbus-daemon gnome-shell gtk3 nss alsa-lib mesa-libgbm mesa-dri-drivers libXtst libffi-devel python3-gobject-base
+    dnf -y install sudo curl ca-certificates python3 python3-pip python3-devel git xz tar gcc gcc-c++ make cmake clang clang-devel openssl-devel pkgconf-pkg-config rpm-build binutils lsof nftables polkit dbus-daemon gnome-shell gtk3 nss alsa-lib mesa-libgbm mesa-dri-drivers libXtst libffi-devel python3-gobject-base
     ;;
   *) printf '%s\n' 'Unsupported Linux worker distribution' >&2; exit 1 ;;
 esac

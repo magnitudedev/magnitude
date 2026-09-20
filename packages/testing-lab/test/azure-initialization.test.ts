@@ -43,6 +43,7 @@ for (const mode of ["renew", "wrong-blob", "write-permission", "expired", "forei
     if (first._tag === "Left") return yield* Effect.die(first.left)
     const second = yield* prepare
     expect(calls).toBe(2)
+    if (first.right.kind !== "linux" || second.kind !== "linux") throw new Error("Expected Linux preparation")
     expect(first.right.identity).toBe(second.identity)
     expect(first.right.customData).not.toBe(second.customData)
     const rendered = parse(Buffer.from(second.customData, "base64").toString())

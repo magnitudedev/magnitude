@@ -140,7 +140,8 @@ workers stay in West US 2. Pass the database password through a private secure-p
 never a shell argument or Git file. PostgreSQL backup retention is seven days.
 
 Bundle `src/server.ts` with the repository-pinned Bun using `bun build --target=bun`. Place the
-result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh` and `linux-worker.sh` in a private build context.
+result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh`, `linux-worker.sh`,
+`windows-tools.ps1`, `windows-runtime.ps1` and `windows-desktop.ps1` in a private build context.
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
@@ -190,3 +191,23 @@ replace the updater, its signature checks, or the native package transaction. Th
 preauthorized installation, not interactive password-prompt handling. The rule exists only on
 the disposable worker and disappears with it. The matching variables are documented by
 [Polkit](https://polkit.pages.freedesktop.org/polkit/polkit.8.html).
+
+### Windows worker preparation
+
+Configure a Windows image with a `kind: "windows"` initialization recipe. Pin each of
+`toolsSetup`, `runtimeSetup` and `desktopSetup` by file path and SHA-256; the coordinator image
+contains these scripts under `/opt/lab/`. Include the decoded native download pins from
+`tools/windows-downloads.json`, the exact client distribution (`windows` version `10` or `11`),
+`architecture: "x64"`, the allocation's administrator username, and the same content-addressed
+runtime blob descriptor used by Linux. The recipe must match the target before allocation.
+
+Allocation installs native tools, grants a temporary blob-only runtime download capability,
+prepares dependencies and a disposable interactive desktop, reboots once, and verifies the live
+desktop plus removal of temporary login credentials. Managed command identities allow observation
+to resume without reinstalling or rebooting a ready desktop. Only readiness is refreshed after
+success. Failed stages retain execution diagnostics in the run's evidence and leave the owned
+lease discoverable for cleanup. Windows initialization does not use Linux cloud-init.
+
+Server 2025 diagnostic preparation is a separate mechanism test, not Windows 10/11 qualification.
+Do not configure a client image until its licensing eligibility is established. The implementation
+does not assert a Windows client license on the user's behalf.
