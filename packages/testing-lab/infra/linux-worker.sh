@@ -23,6 +23,32 @@ case "$ID:$VERSION_ID" in
     dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils lsof nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
     ;;
   rhel:10|rhel:10.*)
+    # The Azure RHEL image leaves /home at 1 GiB even when its OS disk is larger.
+    # Grow only the pinned image's existing home volume before installing tooling.
+    python3 - <<'STORAGE'
+import json,pathlib,subprocess
+def output(*args):return subprocess.check_output(args,text=True).strip()
+home=output('findmnt','-n','-o','SOURCE','-T','/home')
+if output('findmnt','-n','-o','TARGET','-T','/home')!='/home' or output('findmnt','-n','-o','FSTYPE','-T','/home')!='xfs':
+ raise SystemExit('Unexpected RHEL workspace filesystem')
+volumes=json.loads(output('lvs','--reportformat','json','--units','b','--nosuffix','-o','lv_path,vg_name,lv_size',home))['report'][0]['lv']
+if len(volumes)!=1 or volumes[0]['lv_path']!='/dev/rootvg/homelv':raise SystemExit('Unexpected RHEL workspace volume')
+if float(volumes[0]['lv_size']) < 64*1024**3:
+ physical=json.loads(output('pvs','--reportformat','json','-o','pv_name,vg_name'))['report'][0]['pv']
+ physical=[p for p in physical if p['vg_name']==volumes[0]['vg_name']]
+ if len(physical)!=1:raise SystemExit('Ambiguous RHEL workspace physical volume')
+ partition=pathlib.Path(physical[0]['pv_name']).resolve()
+ parent=output('lsblk','--nodeps','-n','-o','PKNAME',str(partition))
+ number=(pathlib.Path('/sys/class/block')/partition.name/'partition').read_text().strip()
+ if not parent or '/' in parent or '\n' in parent or not number.isdigit():raise SystemExit('Invalid RHEL workspace partition')
+ growth=subprocess.run(['growpart','/dev/'+parent,number],capture_output=True,text=True)
+ if growth.returncode!=0 and not (growth.returncode==1 and 'NOCHANGE:' in growth.stdout):
+  raise SystemExit('Could not grow RHEL workspace partition: '+growth.stdout+growth.stderr)
+ subprocess.run(['pvresize',str(partition)],check=True)
+ subprocess.run(['lvextend','--resizefs','--size','64G',home],check=True)
+if int(output('df','--output=avail','-B1','/home').splitlines()[-1]) < 48*1024**3:
+ raise SystemExit('RHEL workspace has less than 48 GiB free')
+STORAGE
     # RHEL consumers install RPMs built on the canonical Ubuntu producer. They do
     # not need an additional repository just to install Debian packaging tools.
     dnf -y install sudo curl ca-certificates python3 python3-pip python3-devel git xz tar gcc gcc-c++ make cmake clang clang-devel openssl-devel pkgconf-pkg-config rpm-build binutils lsof nftables polkit dbus-daemon gnome-shell gtk3 nss alsa-lib mesa-libgbm mesa-dri-drivers libXtst libffi-devel python3-gobject-base

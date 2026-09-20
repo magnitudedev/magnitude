@@ -4,7 +4,7 @@ import { Effect, Layer, Option, Redacted, Schema } from "effect"
 import { parse } from "yaml"
 import { expect, test } from "vitest"
 import { prepareAzureInitialization, LinuxAzureInitialization } from "../src/providers/azure-initialization"
-import { azureInitializationWait } from "../src/providers/azure-readiness"
+import { azureInitializationWait, azureInitializationDiagnosticsScript } from "../src/providers/azure-readiness"
 import { LinuxInitialization } from "../src/providers/linux-initialization"
 import { checkedCommand, ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import { sha256 } from "../src/snapshot"
@@ -69,3 +69,17 @@ for (const [exit, ready, passed] of [[0, true, true], [2, true, true], [1, true,
     expect(retained.status).toBe("done")
   })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))
 }
+
+
+test("initialization diagnostics preserve the native failure before a large Python command traceback", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-init-diagnostics-" })
+  yield* fs.writeFileString(`${root}/cloud-init`, `#!/bin/sh\nprintf '%s\n' '{"status":"error","errors":["native preparation failed"]}'\nexit 1\n`, { mode: 0o755 })
+  const log = `${root}/output.log`
+  yield* fs.writeFileString(log, "earlier output\nNative dependency error: missing compiler\nTraceback (most recent call last):\n" + "inline script\n".repeat(2000))
+  const result = yield* checkedCommand("/bin/sh", ["-c", azureInitializationDiagnosticsScript(log)], { env: { PATH: `${root}:/usr/bin:/bin` }, inheritEnv: false })
+  expect(result.stdout).toContain("Native dependency error: missing compiler")
+  expect(result.stdout).toContain('"status": "error"')
+  expect(result.stdout).not.toContain("inline script")
+  expect(result.stdout.length).toBeLessThan(3500)
+})).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))

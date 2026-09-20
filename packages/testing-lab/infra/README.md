@@ -2,13 +2,14 @@
 
 These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13, Fedora 44 and Red Hat 10 CPU
 workers for the existing outward worker protocol. A successful deployment is not proof of
-a completed app test. Debian/Fedora/Red Hat preparation is implemented but awaits complete native app qualification.
-Windows runtime/user preparation and GPU driver setup remain separate work. Native Windows
-tool installation is available through `scripts/prepare-windows-tools.ts`: it renders a trusted
-SYSTEM-side script for a disposable x64 guest, with pinned archives, verified VS components and
-OS-partition growth when the allocated disk is larger than the image partition. Its tooling receipt
-is not complete worker readiness. Runtime extraction, Rust/Hermes setup and interactive-user
-preparation still need integration before Windows client targets can be admitted.
+a completed app test. See [the coverage ledger](../COVERAGE.md) for actual qualification.
+Red Hat's Azure image leaves its home logical volume at 1 GiB; preparation verifies the expected
+XFS/LVM layout and expands that volume to 64 GiB before installing dependencies.
+Windows preparation installs pinned tools and runtime dependencies, creates the admitted user's
+interactive desktop, removes one-shot login credentials, and verifies live readiness. It is
+integrated with allocation and natively proven on a disposable Windows Server diagnostic;
+Windows 10/11 still require eligible client licensing and their own application qualification.
+GPU driver preparation remains outstanding.
 Windows delivery now supports an already prepared interactive desktop user: its configured
 runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
 Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,
@@ -211,3 +212,18 @@ lease discoverable for cleanup. Windows initialization does not use Linux cloud-
 Server 2025 diagnostic preparation is a separate mechanism test, not Windows 10/11 qualification.
 Do not configure a client image until its licensing eligibility is established. The implementation
 does not assert a Windows client license on the user's behalf.
+
+### Namespace coordinator authentication
+
+The coordinator image includes Devbox 0.0.189, verified against the vendor's published Linux
+archive digest. Supply a dedicated operator login in the secure `namespaceCredentialBase64`
+deployment parameter. The entrypoint creates a private `NSC_TOKEN_FILE` and removes the encoded
+credential from its environment. No Namespace credential enters a guest or a submitted source
+snapshot. The login remains bound to its Namespace workspace membership and expiration; renew
+it through the named coordinator keychain and deploy a new secret/revision before expiration.
+
+The tested named keychain is `magnitude-testing-lab-coordinator`. Machine inventory and image
+catalog reads succeed through its explicit credential file. The current CLI rejected opaque
+revocable-token credentials for Devbox operations; those diagnostic tokens were revoked. Do not
+substitute `devbox auth check` for a real API check: it reports the local user login, even when
+`NSC_TOKEN_FILE` is configured for another credential.

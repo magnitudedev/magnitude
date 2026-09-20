@@ -6,7 +6,7 @@ import { AzureMachine, MachineAllocator, MachineTags } from "../machines"
 import { checkedCommand, ProcessExecutor } from "../process"
 import { AzureInitialization, prepareAzureInitialization } from "./azure-initialization"
 import { prepareWindowsMachine, windowsPreparationDiagnostics } from "./azure-windows-preparation"
-import { azureInitializationWait } from "./azure-readiness"
+import { azureInitializationWait, azureInitializationDiagnosticsScript } from "./azure-readiness"
 import { ArtifactStore } from "../artifact-store"
 import { retainWorkerDiagnostic } from "../worker-diagnostics"
 
@@ -130,7 +130,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
     // The run report grants owner access; container-local files do not survive deployment.
     const reply = yield* checked(config.executable, ["vm", "run-command", "invoke", "--subscription", config.subscription,
       "--resource-group", config.resourceGroup, "--name", machine.name, "--command-id", "RunShellScript",
-      "--scripts", "tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json", "--only-show-errors", "--output", "json"],
+      "--scripts", azureInitializationDiagnosticsScript(), "--only-show-errors", "--output", "json"],
       { timeoutMs: 180_000, maxOutputBytes: 64 * 1024 })
     const output = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ value: Schema.Array(Schema.Struct({ message: Schema.String })) })))(reply.stdout)
     return yield* retainWorkerDiagnostic(machine, "initialization", output.value.map(entry => entry.message).join("\n")).pipe(Effect.provideService(ArtifactStore, objects))

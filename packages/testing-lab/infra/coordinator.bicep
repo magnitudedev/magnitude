@@ -13,6 +13,8 @@ param coordinatorConfigBase64 string
 @secure()
 param workerInitializationBase64 string = ''
 @secure()
+param namespaceCredentialBase64 string = ''
+@secure()
 param developerToken string
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = { name: '${prefix}-coordinator' }
@@ -34,7 +36,7 @@ resource coordinator 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'database-url', value: databaseUrl }
         { name: 'coordinator-config', value: coordinatorConfigBase64 }
         { name: 'developer-token', value: developerToken }
-      ], empty(workerInitializationBase64) ? [] : [{ name: 'worker-initialization', value: workerInitializationBase64 }])
+      ], empty(workerInitializationBase64) ? [] : [{ name: 'worker-initialization', value: workerInitializationBase64 }], empty(namespaceCredentialBase64) ? [] : [{ name: 'namespace-credential', value: namespaceCredentialBase64 }])
     }
     template: {
       revisionSuffix: revision
@@ -49,7 +51,7 @@ resource coordinator 'Microsoft.App/containerApps@2024-03-01' = {
           { name: 'LAB_DATABASE_URL', secretRef: 'database-url' }
           { name: 'LAB_COORDINATOR_CONFIG_BASE64', secretRef: 'coordinator-config' }
           { name: 'LAB_DEVELOPER_TOKEN', secretRef: 'developer-token' }
-        ], empty(workerInitializationBase64) ? [] : [{ name: 'LAB_WORKER_INITIALIZATION_BASE64', secretRef: 'worker-initialization' }])
+        ], empty(workerInitializationBase64) ? [] : [{ name: 'LAB_WORKER_INITIALIZATION_BASE64', secretRef: 'worker-initialization' }], empty(namespaceCredentialBase64) ? [] : [{ name: 'LAB_NAMESPACE_CREDENTIAL_BASE64', secretRef: 'namespace-credential' }])
         probes: [
           { type: 'Startup', tcpSocket: { port: 8080 }, periodSeconds: 5, failureThreshold: 60 }
           { type: 'Liveness', tcpSocket: { port: 8080 }, periodSeconds: 30, failureThreshold: 3 }

@@ -9,6 +9,13 @@ if [ -n "${LAB_WORKER_INITIALIZATION_BASE64:-}" ]; then
   printf '%s' "$LAB_WORKER_INITIALIZATION_BASE64" | base64 -d > /opt/lab/worker-cloud-init.yml
   unset LAB_WORKER_INITIALIZATION_BASE64
 fi
+if [ -n "${LAB_NAMESPACE_CREDENTIAL_BASE64:-}" ]; then
+  mkdir -p /opt/lab/namespace-auth
+  chmod 700 /opt/lab/namespace-auth
+  printf '%s' "$LAB_NAMESPACE_CREDENTIAL_BASE64" | base64 -d > /opt/lab/namespace-auth/token.json
+  unset LAB_NAMESPACE_CREDENTIAL_BASE64
+  export NSC_TOKEN_FILE=/opt/lab/namespace-auth/token.json
+fi
 export LAB_COORDINATOR_CONFIG=/opt/lab/config.json
 az login --identity --client-id "$LAB_AZURE_CLIENT_ID" --output none
 exec bun /opt/lab/coordinator.js

@@ -111,7 +111,7 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
         if (spec.args[0] === "resource") return output(rows)
         if (spec.args[0] === "vm") {
           diagnostics = true
-          expect(spec.args).toContain("tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json")
+          expect(spec.args[spec.args.indexOf("--scripts") + 1]).toContain("[native preparation output]")
           return output({ value: [{ message: 'setup diagnostic: https://user:private-password@account.blob.core.windows.net/archive?sig=private-signature Bearer private-token\n{"password":"private-json-password with spaces"}\nLAB_WORKER_TOKEN=private-env-token' }] })
         }
         const method = spec.args[spec.args.indexOf("--method") + 1], url = spec.args[spec.args.indexOf("--url") + 1]!
