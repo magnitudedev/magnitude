@@ -223,6 +223,11 @@ capability renewal does not alter the pinned preparation identity or grant provi
 Native readiness requires completed cloud-init and the lab setup's final completion receipt.
 Fatal cloud-init errors or a missing receipt fail admission. Recoverable platform warnings are
 retained in detailed status and cannot substitute for the lab's successful completion receipt.
+Windows preparation separates pinned tooling, trusted runtime dependencies, and the admitted
+user's desktop. Runtime readiness binds the runtime digest, native distribution/architecture and
+user SID. One-shot login credentials are removed at logon before a desktop receipt is published;
+that receipt also requires a live interactive session. A separate server diagnostic distribution
+can exercise preparation mechanisms but cannot qualify a Windows client target.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,

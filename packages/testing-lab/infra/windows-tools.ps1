@@ -110,11 +110,13 @@ if ($LASTEXITCODE -ne 0 -or @($observed).Count -ne 1 -or $observed.TrimEnd('\') 
 if (-not (Test-Path -LiteralPath (Join-Path $vsRoot 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Native libclang is missing' }
 $paths.visualStudio = $vsRoot
 $paths.rustup = Get-PinnedTool 'rustup'
-Move-Item -LiteralPath $paths.rustup -Destination ($paths.rustup + '.exe')
-$paths.rustup += '.exe'
+$rustInstaller = Join-Path $downloads 'rustup-init.exe'
+Move-Item -LiteralPath $paths.rustup -Destination $rustInstaller
+$paths.rustup = $rustInstaller
 # Runtime preparation will install the Rust channel from its trusted source snapshot.
 # Verify native commands now; do not claim an application build or client-OS qualification.
 $env:PATH = (@($paths.GetEnumerator() | Where-Object { $_.Key -ne 'visualStudio' } | ForEach-Object { Split-Path -Parent $_.Value }) -join ';') + ';' + $env:PATH
+Invoke-Tool $paths.rustup @('--version')
 Invoke-Tool $paths.bun @('--version')
 Invoke-Tool $paths.node @('--version')
 Invoke-Tool $paths.powershell @('-NoProfile','-NonInteractive','-Command','$PSVersionTable.PSVersion.ToString()')
