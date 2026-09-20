@@ -110,5 +110,6 @@ production trust checks. Listing a target with `bun lab targets` does not mean i
 driver or entire suite is qualified. Avoid `full` until the remaining provider setup is complete.
 
 `verify` uses clean workers. Warm worker/cache reuse is unfinished: `iterate` is rejected before
-input upload or resource allocation. The shared office Spark always
-requires explicit `--allow-spark`; leave it out of normal development runs.
+input upload or resource allocation. The shared office Spark is not connected to the deployed
+coordinator yet. `--allow-spark` is an admission safeguard, not working provider integration.
+Leave it out of runs until authorized access and isolated execution are qualified.
