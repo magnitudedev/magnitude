@@ -4,11 +4,10 @@ Use the same `bun lab` command from your checkout and from CI. Local changes do 
 commit or push. The coordinator snapshots the requested input, builds it on one disposable
 machine, and tests the resulting packages on a different clean machine.
 
-**Current qualification:** the smaller Ubuntu Intel CPU flow has passed locally and in GitHub
-Actions. The latest complete nine-suite run returned 65 passes and one Hermes file-edit failure.
-Its workers were removed, but an image-tagging mistake also produced a cleanup error; the
-tags are corrected and a clean complete rerun remains required. Other catalog targets are not
-yet ready for routine use. See [coverage and implementation evidence](README.md).
+**Current qualification:** complete Ubuntu runs finished locally (65/66 passed) and in GitHub
+Actions (64/66 passed), with clean resource removal and verified retained evidence. Hermes file
+editing remains a real failure; one Pi terminal readiness assertion is being corrected. Other
+targets remain in qualification. See the concise [coverage ledger](COVERAGE.md).
 
 ## Sign in once
 
@@ -104,7 +103,7 @@ pass. A failed prerequisite blocks its dependents while independent checks conti
 [The GitHub workflow](../../.github/workflows/testing-lab.yml) submits the same complete command,
 using GitHub OIDC instead of a developer login. Blacksmith only submits and observes; Azure builds
 and tests. The workflow saves reports/evidence and requests cleanup on failure or cancellation.
-Its complete nine-suite run is pending qualification; the earlier smaller run passed.
+Its complete nine-suite run finished with two failed cases and clean cleanup; the earlier smaller run passed.
 
 `quick`, `pr`, `full` and `release` select coverage; they are not different test engines. `--suite`
 with explicit targets selects a custom subset. `release` requires trusted final artifacts and

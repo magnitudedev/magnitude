@@ -129,6 +129,9 @@ tool in the same native turn. Every invocation needs a matching result, no faile
 remain unresolved, and the resulting file tree must match the exact intended change. Native
 error events remain in the evidence. A completed tool turn without text deltas cannot qualify
 streaming; streaming is asserted separately against an observed text-generating turn.
+Terminal generation markers ignore letter case consistently in echo exclusion, rendered output
+and persisted text. Native interruption, same-session recovery and successful completion remain
+required; a marker or a completed first answer cannot establish cancellation.
 
 ## Ownership and recovery
 

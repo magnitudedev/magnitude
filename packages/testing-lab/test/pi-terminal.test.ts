@@ -31,7 +31,7 @@ test.skipIf(!runtime || !executable).each([false, true])("Pi native TUI verifies
       const chunk = (delta: unknown, finish: string | null = null) => encoder.encode(`data: ${JSON.stringify({ id: `fixture-${index}`,
         object: "chat.completion.chunk", created: 1, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`)
       return new Response(new ReadableStream({ start(controller) {
-        controller.enqueue(chunk({ role: "assistant", content: index === 1 ? partial : recovered }))
+        controller.enqueue(chunk({ role: "assistant", content: index === 1 ? partial.toLowerCase() : recovered.toLowerCase() }))
         if (index === 2 || finishFirst) {
           controller.enqueue(chunk({}, "stop")); controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close()
         }
@@ -57,7 +57,7 @@ test.skipIf(!runtime || !executable).each([false, true])("Pi native TUI verifies
     expect(receipt._tag).toBe("Right")
     if (receipt._tag === "Right") {
       expect(receipt.right.model).toBe(model)
-      expect(receipt.right.text).toBe(recovered)
+      expect(receipt.right.text).toBe(recovered.toLowerCase())
     }
     expect(requests).toBe(2)
     expect(cancelled).toBe(true)

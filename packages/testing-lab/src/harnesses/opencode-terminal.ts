@@ -3,7 +3,7 @@ import { Effect, Option, Schedule, Schema } from "effect"
 import { join } from "node:path"
 import { AssertionFailure } from "../domain"
 import { command } from "../process"
-import { HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
+import { containsTerminalMarker, HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
 import { TerminalConfig, TerminalDriver, TerminalScreen, waitForTerminal } from "../terminal"
 
 const optional = <A, I>(schema: Schema.Schema<A, I>) => Schema.optionalWith(schema, { as: "Option", exact: true })
@@ -35,7 +35,7 @@ export const openCodeModelName = (home: string, model: string) => Effect.gen(fun
 export const openCodeTerminal = (config: typeof OpenCodeTerminalConfig.Type, onCleanupError: (message: string) => void) => Effect.scoped(Effect.gen(function* () {
   yield* Schema.decodeUnknown(OpenCodeTerminalConfig)(config)
   const fs = yield* FileSystem.FileSystem
-  for (const turn of [config.interrupt, config.recovery]) if (turn.prompt.includes(turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
+  for (const turn of [config.interrupt, config.recovery]) if (containsTerminalMarker(turn.prompt, turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
   yield* fs.makeDirectory(config.evidence, { recursive: true })
   const run = (args: readonly string[]) => command(config.executable, args, { env: config.environment, inheritEnv: false,
     cwd: Option.some(config.cwd), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 }).pipe(Effect.flatMap(output =>
@@ -66,7 +66,7 @@ export const openCodeTerminal = (config: typeof OpenCodeTerminalConfig.Type, onC
     yield* wait(lines => !lines.some(line => line.includes("Select variant")), "select the off variant")
   }
   yield* submit(config.interrupt.prompt)
-  yield* saveScreen("streaming", yield* wait(lines => lines.some(line => line.includes(config.interrupt.expected)), "render streamed assistant output", 300_000))
+  yield* saveScreen("streaming", yield* wait(lines => lines.some(line => containsTerminalMarker(line, config.interrupt.expected)), "render streamed assistant output", 300_000))
   const sessions = (yield* list).filter(session => !previous.has(session.id))
   if (sessions.length !== 1) return yield* fail("OpenCode did not create exactly one identifiable terminal session")
   const id = sessions[0]!.id
@@ -98,13 +98,13 @@ export const openCodeTerminal = (config: typeof OpenCodeTerminalConfig.Type, onC
     return yield* fail("OpenCode did not persist exactly one interrupted assistant turn")
   }
   yield* submit(config.recovery.prompt)
-  yield* saveScreen("recovered", yield* wait(lines => lines.some(line => line.includes(config.recovery.expected)), "render the follow-up", 300_000))
+  yield* saveScreen("recovered", yield* wait(lines => lines.some(line => containsTerminalMarker(line, config.recovery.expected)), "render the follow-up", 300_000))
   const completed = yield* waitForTurn(2)
   yield* fs.writeFileString(join(config.evidence, "recovered.session.json"), yield* Schema.encode(Schema.parseJson(Export))(completed.saved))
   const first = completed.assistants[0]!, last = completed.assistants[1]!
   const text = last.parts.filter(Schema.is(Text)).map(part => part.text).join("")
   if (completed.assistants.length !== 2 || first.info.id !== aborted.assistants[0]!.info.id || last.info.id === first.info.id ||
-    Option.isSome(last.info.error) || !Option.contains(last.info.finish, "stop") || !text.includes(config.recovery.expected)) {
+    Option.isSome(last.info.error) || !Option.contains(last.info.finish, "stop") || !containsTerminalMarker(text, config.recovery.expected)) {
     return yield* fail("OpenCode did not persist a completed recovery answer in the same session")
   }
   yield* terminal.write("\u0004")

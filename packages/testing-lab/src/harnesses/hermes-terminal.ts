@@ -5,7 +5,7 @@ import { parseDocument } from "yaml"
 import { AssertionFailure } from "../domain"
 import { command } from "../process"
 import { TerminalConfig, TerminalDriver, TerminalScreen, waitForTerminal } from "../terminal"
-import { HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
+import { containsTerminalMarker, HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
 import { decodeHermesTerminalEvents, verifyHermesTerminalLifecycle } from "./hermes-terminal-events"
 import { hermesInstallation } from "./installation"
 
@@ -20,7 +20,7 @@ const fail = (message: string) => new AssertionFailure({ message })
 export const hermesTerminal = (config: typeof HermesTerminalConfig.Type, onCleanupError: (message: string) => void) => Effect.scoped(Effect.gen(function* () {
   yield* Schema.decodeUnknown(HermesTerminalConfig)(config)
   const fs = yield* FileSystem.FileSystem
-  for (const turn of [config.interrupt, config.recovery]) if (turn.prompt.includes(turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
+  for (const turn of [config.interrupt, config.recovery]) if (containsTerminalMarker(turn.prompt, turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
   yield* fs.makeDirectory(config.evidence, { recursive: true })
   const run = (args: readonly string[]) => command(config.executable, args, { env: config.environment, inheritEnv: false,
     cwd: Option.some(config.cwd), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 }).pipe(Effect.flatMap(output =>
@@ -69,13 +69,13 @@ export const hermesTerminal = (config: typeof HermesTerminalConfig.Type, onClean
   yield* save("selected-model", yield* terminal.screen)
   const submit = (prompt: string) => terminal.write(prompt).pipe(Effect.zipRight(wait(lines => lines.some(line => line.includes(prompt)), "render the entered prompt")), Effect.zipRight(terminal.write("\r")))
   yield* submit(config.interrupt.prompt)
-  yield* save("streaming", yield* wait(lines => lines.some(line => line.includes(config.interrupt.expected)), "render streamed Hermes output", 300_000))
+  yield* save("streaming", yield* wait(lines => lines.some(line => containsTerminalMarker(line, config.interrupt.expected)), "render streamed Hermes output", 300_000))
   if ((yield* readEvents).length !== 0) return yield* fail("Hermes completed before the interruption input")
   yield* terminal.write("\u0003")
   const interrupted = yield* waitEvents(1)
   if (interrupted.length !== 1 || !interrupted[0]!.extra.interrupted) return yield* fail("Hermes did not acknowledge keyboard interruption")
   yield* submit(config.recovery.prompt)
-  yield* save("recovered", yield* wait(lines => lines.some(line => line.includes(config.recovery.expected)), "render the Hermes recovery answer", 300_000))
+  yield* save("recovered", yield* wait(lines => lines.some(line => containsTerminalMarker(line, config.recovery.expected)), "render the Hermes recovery answer", 300_000))
   const completed = yield* waitEvents(2)
   const lifecycle = yield* verifyHermesTerminalLifecycle(completed, interrupted[0]!.session_id, config.model)
   yield* submit("/exit")
@@ -89,7 +89,7 @@ export const hermesTerminal = (config: typeof HermesTerminalConfig.Type, onClean
   // lifecycle plus the rendered nonce prove interruption; the final persisted answer proves recovery.
   const messages = saved.messages.filter(message => message.role === "assistant" && message.content?.trim())
   if (saved.id !== lifecycle.sessionId || saved.model !== config.model || saved.billing_provider !== "custom" || saved.billing_base_url !== config.endpoint || messages.length !== 2 || messages.some(message => message.session_id !== saved.id)
-    || messages[0]!.finish_reason !== null || messages[1]!.finish_reason !== "stop" || !messages[1]!.content!.includes(config.recovery.expected)) return yield* fail("Hermes persisted transcript does not match interrupted and recovered terminal output")
+    || messages[0]!.finish_reason !== null || messages[1]!.finish_reason !== "stop" || !containsTerminalMarker(messages[1]!.content!, config.recovery.expected)) return yield* fail("Hermes persisted transcript does not match interrupted and recovered terminal output")
   return HarnessTerminalReceipt.make({ sessionId: lifecycle.sessionId, pid: terminal.pid, model: config.model,
     interruptedMessageId: String(messages[0]!.id), recoveredMessageId: String(messages[1]!.id), text: messages[1]!.content! })
 }))
