@@ -1,6 +1,7 @@
 import { FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { ArtifactStore } from "./artifact-store"
 import { snapshotArtifacts } from "./artifact-input"
 import { CaseObservation } from "./case-runner"
@@ -35,9 +36,12 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
       if (yield* fs.exists(config.root)) return yield* failure("Source build requires a fresh workspace")
       yield* fs.makeDirectory(config.root, { recursive: true, mode: 0o700 })
       const workspace = join(config.root, "source"), output = join(config.root, "output"), home = join(config.root, "home")
+      const cudaRoot = join(config.root, "cuda-toolkit")
       yield* fs.makeDirectory(home, { mode: 0o700 })
       // Match the release ARM64 compiler: GCC on Ubuntu 24.04 cannot compile the SME variants.
-      const env = { ...config.environment, ...(platform === "linux" && target.arch === "arm64" ? { CC: "clang", CXX: "clang++" } : {}), HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
+      const env = { ...config.environment, ...(backend === "cuda" ? { CUDA_PATH: cudaRoot, CUDACXX: join(cudaRoot, "bin", platform === "win32" ? "nvcc.exe" : "nvcc"),
+        PATH: `${join(cudaRoot, "bin")}${platform === "win32" ? ";" : ":"}${config.environment.PATH ?? ""}` } : {}),
+        ...(platform === "linux" && target.arch === "arm64" ? { CC: "clang", CXX: "clang++" } : {}), HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
         LOCALAPPDATA: join(home, "AppData", "Local"), XDG_CONFIG_HOME: join(home, ".config"), XDG_CACHE_HOME: join(home, ".cache"),
         LAB_BUILD_OUTPUT: output, LAB_BUILD_SOURCE_DIGEST: digest, LAB_BUILD_SOURCE_COMMIT: source.commit, LAB_BUILD_BACKEND: backend }
       const record = (name: string, result: CommandOutput) => Effect.gen(function* () {
@@ -60,6 +64,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
       }).pipe(Effect.mapError(error => error._tag === "AssertionFailure" || error._tag === "InfrastructureFailure" ? error : failure(error.message)))
       const compile = yield* Effect.cached(Effect.gen(function* () {
         yield* extractSource(source, config.objects, workspace).pipe(Effect.provideService(FileSystem.FileSystem, fs))
+        if (backend === "cuda") yield* invoke("toolchain", [fileURLToPath(new URL("../scripts/prepare-cuda-toolkit.ts", import.meta.url)), cudaRoot])
         yield* invoke("dependencies", ["install", "--frozen-lockfile"])
         yield* invoke("compile", ["packages/testing-lab/scripts/build-desktop-candidate.ts"])
         return CaseObservation.make({ detail: `Compiled admitted source ${digest} on ${target.artifactHost}`, evidence: [...receipts] })

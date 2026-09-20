@@ -43,6 +43,10 @@ identifies dirty source. Source runs share one producer for each native artifact
 A producer uses a canonical native CPU build host and a separately selected backend toolchain;
 CUDA compilation does not implicitly allocate a GPU or use Spark. Build and test work have distinct
 identities, fenced attempts, credentials and allocations even when they use the same target.
+CUDA producers prepare an administrator-pinned compiler SDK in their owned build workspace.
+Every component download is length- and digest-verified before extraction. Compiler identity,
+required headers and a real kernel-to-PTX compilation must pass before candidate compilation;
+this proves toolchain availability only, never driver readiness or GPU execution.
 Consumers cannot start until the producer has published a complete verified package graph and its
 allocation has been released. Publication binds the source digest, commit, host, backend and actual
 producer lease. Build failures block dependent tests without allocating consumer machines.

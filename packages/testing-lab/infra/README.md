@@ -9,7 +9,8 @@ Windows preparation installs pinned tools and runtime dependencies, creates the 
 interactive desktop, removes one-shot login credentials, and verifies live readiness. It is
 integrated with allocation and natively proven on a disposable Windows Server diagnostic;
 Windows 10/11 still require eligible client licensing and their own application qualification.
-GPU driver preparation remains outstanding.
+GPU driver preparation remains outstanding. CUDA source producers now have a separate pinned
+SDK preparation phase; its native qualification status is recorded in the coverage ledger.
 Windows delivery now supports an already prepared interactive desktop user: its configured
 runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
 Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,
@@ -243,3 +244,17 @@ root, such as `/Users/runner/lab-work`, and `artifactHost: darwin-arm64`.
 The root-owned readiness receipt binds the preparation recipe. An incomplete installation fails
 and the owned worker is released rather than reused. Preparation failure logs are retained in
 the normal run evidence before cleanup.
+
+## CUDA compiler preparation
+
+CUDA source builds select the existing release CUDA 12.9 pack. Before candidate compilation,
+the trusted worker installs the pinned NVIDIA redistributable components from
+`tools/cuda-toolkit.json` into that build's private SDK directory. It verifies each download's
+length and SHA-256, verifies NVCC identity and required headers, compiles a kernel to PTX, and
+links a shared library against cuBLAS. The phase is retained with normal build evidence.
+`CUDA_PATH`, `CUDACXX` and the SDK binary path reach the source build through its explicit
+environment. CPU and Metal builds do not install this SDK.
+
+This compiler installation does not install a GPU driver or require GPU quota. A10 and RTX PRO
+6000 consumer drivers remain separate preparation work. Linux x64 SDK compilation/linking has
+native Azure CPU evidence; Windows and Linux ARM SDK execution remain unverified.
