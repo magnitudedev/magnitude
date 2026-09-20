@@ -547,7 +547,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     }
     const directory = join(evidenceDirectory, "harness", harness, "events")
     if (!(yield* fs.exists(directory))) continue
-    const names = (yield* fs.readDirectory(directory)).filter(name => /^(version\.txt|models\.txt|turn-\d+\.(jsonl|stderr\.log|prompt\.txt|session\.json))$/.test(name)).sort()
+    const names = (yield* fs.readDirectory(directory)).filter(name => /^(version\.txt|models\.txt|turn-\d+\.(jsonl|native-events\.jsonl|stream\.json|stderr\.log|prompt\.txt|session\.json))$/.test(name)).sort()
     if (names.length > 100) cleanupErrors.push(`${harness} evidence exceeded its file-count limit`)
     else for (const name of names) yield* exportFile(`harness/${harness}/events/${name}`, "H1", 32 * 1024 * 1024, harness)
   }

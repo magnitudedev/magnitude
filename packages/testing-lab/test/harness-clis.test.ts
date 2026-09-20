@@ -11,14 +11,24 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-cli-protocol-" })
   const session = variant === "session" ? "other-session" : "fixture-session"
-  const executor: ProcessExecutor = { run: spec => Effect.sync(() => {
+  const executor: ProcessExecutor = { run: spec => Effect.gen(function* () {
     expect(spec.inheritEnv).toBe(false)
-    expect(spec.env).toEqual({ HOME: root })
+    expect(spec.env.HOME).toBe(root)
     if (spec.args[0] === "models") return { exitCode: 0, stdout: "magnitude/fixture-model\n", stderr: "" }
     if (spec.args[0] === "export") return { exitCode: 0, stderr: "", stdout: json({ info: { id: session }, messages: [{ info: {
-      role: "assistant", providerID: variant === "provider" ? "other" : "magnitude", modelID: "fixture-model",
-    } }] }) }
+      id: "message-1", role: "assistant", providerID: variant === "provider" ? "other" : "magnitude", modelID: "fixture-model",
+    }, parts: [{ type: "text", text: "HELLO" }] }] }) }
     if (variant === "setup") return { exitCode: 1, stdout: "Hermes is not configured; run hermes setup", stderr: "" }
+    if (kind === "opencode") {
+      const part = { id: "text-1", sessionID: session, messageID: "message-1", type: "text", text: "", time: { start: 1 } }
+      const properties = { sessionID: session, part, time: 1 }
+      yield* fs.writeFileString(spec.env.LAB_OPENCODE_STREAM_LOG!, [
+        { type: "lab.observer.ready" },
+        { id: "event-1", type: "message.part.updated", properties },
+        { id: "event-2", type: "message.part.delta", properties: { sessionID: session, messageID: "message-1", partID: "text-1", field: "text", delta: "HELLO" } },
+        { id: "event-3", type: "message.part.updated", properties: { ...properties, part: { ...part, text: "HELLO", time: { start: 1, end: 2 } } } },
+      ].map(value => json(value)).join("\n") + "\n")
+    }
     const events = kind === "opencode" ? [
       { type: "step_start", sessionID: session, part: { type: "step-start" } },
       { type: "tool_use", sessionID: session, part: { type: "tool", tool: "read", state: { status: variant === "tool" ? "error" : "completed" } } },
@@ -31,8 +41,8 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
       { type: "text", text: "HELLO" },
       ...(variant === "truncated" ? [] : [{ type: "result", session_id: session, text: "HELLO", exit_code: 0 }]),
     ]
-    return { exitCode: variant === "exit" ? 1 : 0, stdout: events.map(json).join("\n") + "\n", stderr: "" }
-  }) }
+    return { exitCode: variant === "exit" ? 1 : 0, stdout: events.map(value => json(value)).join("\n") + "\n", stderr: "" }
+  }).pipe(Effect.orDie) }
   return yield* Effect.gen(function* () {
     const config = { executable: kind, cwd: root, environment: { HOME: root }, evidence: root, model: "fixture-model" }
     const client = yield* kind === "opencode" ? openCode(config) : hermes(config)

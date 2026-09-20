@@ -111,7 +111,13 @@ unrelated provider settings. Endpoint and harness tests attest the requested bac
 CPU fallback fails a Metal/CUDA target. Host identity is collected from native OS and device
 interfaces before test execution; a Windows Server build cannot qualify a Windows client target.
 Unavailable GPU memory totals remain unknown, not fabricated. Device discovery alone cannot
-qualify generation. Generation checks output/protocol/tool behavior, not speed.
+qualify generation. Generation checks output/protocol/tool behavior, not speed. OpenCode CLI streaming acceptance
+uses an observation-only hook on the pinned harness's native text-part updates and deltas.
+An empty initial part, its deltas and its timestamped completion establish the streaming lifecycle.
+The observed session and assistant identities must match the native exported transcript, and
+concatenated deltas must match both completed CLI output and persisted text. Missing, duplicate,
+truncated, foreign or unfinished lifecycle evidence fails qualification. Instrumentation may
+record events but cannot change provider configuration, prompts, tool behavior or generated output.
 Tool-result acceptance supplies a newly generated result that was absent from the original
 prompt and arguments; echoing known input cannot prove that the model consumed the tool result.
 
@@ -298,6 +304,9 @@ CUDA toolkit libraries must remain owned. The NVIDIA driver library is admitted 
 UI drivers address stable action and entity identities rather than copy, colors, geometry, or
 DOM position. UI redesign preserves those identities; changed workflows are centralized in the
 driver. Waits observe semantic state, while endpoint and harness behavior prove actual operation.
+Connection error acceptance requires a nonempty rendered alert and visible affected-file guidance;
+the driver opens a native disclosure when necessary rather than depending on its default expansion
+state or label. Hidden configuration text alone cannot satisfy the assertion.
 Update controls expose rendered transfer state and candidate version through stable identities.
 The driver uses the normal Settings actions and surfaces failed or unavailable updates promptly.
 A renderer interaction test alone cannot qualify installation, trust or retained-data acceptance;

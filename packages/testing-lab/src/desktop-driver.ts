@@ -39,6 +39,23 @@ export const DesktopDriver = Context.GenericTag<DesktopDriver>("@magnitudedev/te
 // Playwright is the explicit Promise boundary. Test orchestration and lifecycle stay in Effect.
 const action = <A>(description: string, run: () => Promise<A>) => Effect.tryPromise({ try: run,
   catch: error => new AssertionFailure({ message: `${description}: ${error instanceof Error ? error.message.slice(0, 1800) : "Playwright failed"}` }) })
+/** Observe the rendered error and reveal its file guidance through native disclosure semantics. */
+export const observeConnectionFailure = (page: Page, name: string, fileName: string) => action(`Observe ${name} configuration error`, async () => {
+  const harness = page.getByTestId(automation.harness(name))
+  await harness.getByTestId(automation.harnessConnect).click()
+  const alert = page.getByTestId(automation.page("connections")).getByRole("alert").first()
+  await alert.waitFor()
+  const guidance = harness.getByText(fileName, { exact: false })
+  // File identity is stable; the disclosure label, styling and placement are not.
+  const disclosure = harness.locator("details").filter({ has: page.getByText(fileName, { exact: false }) })
+  if (await disclosure.count()) {
+    if (await disclosure.getAttribute("open") === null) await disclosure.locator(":scope > summary").click()
+  }
+  await guidance.waitFor()
+  const message = await alert.innerText()
+  if (!message.trim()) throw new Error("Connection failure displayed an empty alert")
+  return `${message}\n${await guidance.innerText()}`
+})
 export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Page) => Promise<void>, onCleanupError?: (detail: string) => void) => Layer.scoped(DesktopDriver, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const environment = yield* desktopEnvironment(config)
@@ -168,17 +185,7 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
       await harness.and(page.locator('[data-connected="true"]')).waitFor()
       await harness.getByTestId(automation.harnessConnect).and(page.locator(':enabled')).waitFor()
     }))),
-    connectionFailure: (name, fileName) => navigate("connections").pipe(Effect.zipRight(action(`Observe ${name} configuration error`, async () => {
-      await page.getByTestId(automation.harness(name)).getByTestId(automation.harnessConnect).click()
-      // Alert and repair guidance may be separate UI elements; only the affected file is stable.
-      const alert = page.getByTestId(automation.page("connections")).getByRole("alert").first()
-      const guidance = page.getByTestId(automation.harness(name)).getByText(fileName, { exact: false })
-      await alert.waitFor()
-      await guidance.waitFor()
-      const message = await alert.innerText()
-      if (!message.trim()) throw new Error("Connection failure displayed an empty alert")
-      return `${message}\n${await guidance.innerText()}`
-    }))),
+    connectionFailure: (name, fileName) => navigate("connections").pipe(Effect.zipRight(observeConnectionFailure(page, name, fileName))),
     disconnect: name => navigate("connections").pipe(Effect.zipRight(action(`Disconnect ${name} through the app`, async () => {
       const harness = page.getByTestId(automation.harness(name))
       await harness.getByTestId(automation.harnessDisconnect).click()
