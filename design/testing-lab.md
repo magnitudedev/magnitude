@@ -22,6 +22,11 @@ hashes and lengths before submission. Subsequent edits to local packages cannot 
 input. Existing artifacts are never rebuilt or relabelled as a successful compilation. Source execution
 extracts the admitted snapshot into a fresh workspace, installs frozen dependencies, and records
 compilation and final packaging independently. A failed compile blocks packaging and consumption.
+Source graph admission checks owner-scoped object lengths in bounded batches, including every
+reference when multiple files share a digest. Azure object transport uses a shared HTTP client
+and a cached, renewable Entra token. Uploads are hash checked before conditional publication;
+downloads bind an observed ETag, enforce length limits and verify the content hash. Redirects
+are disabled, and authentication failures never become missing-object results.
 Source candidates compile the release-owned CPU base and the selected host's backend pack alongside
 the desktop. CPU targets need no additional pack; Metal and CUDA targets require their matching
 pack. Compilation receipts bind the selected backend and native build identity. Final packaging

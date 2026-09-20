@@ -1,4 +1,4 @@
-import { FileSystem } from "@effect/platform"
+import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunHttpServer, BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Context, Effect, Layer, Option, Redacted, Schema } from "effect"
 import { Authenticator, bearerAuthenticator } from "./api"
@@ -55,7 +55,7 @@ export const configuredCoordinator = Effect.gen(function* () {
     Effect.catchAll(error => Option.isSome(entra) ? entra.value.authenticate(header) : Effect.fail(error)),
   ) })
   const database = databaseLayer(yield* Config.redacted("LAB_DATABASE_URL"))
-  const storage = config.storage.kind === "file" ? fileArtifactStore(config.storage.directory) : azureArtifactStore(config.storage.config)
+  const storage = config.storage.kind === "file" ? fileArtifactStore(config.storage.directory) : azureArtifactStore(config.storage.config).pipe(Layer.provide(FetchHttpClient.layer))
   const allocators = new Map<typeof Provider.Type, MachineAllocator>(), transports = new Map<typeof Provider.Type, WorkerTransport>()
   if (Option.isSome(config.namespace)) {
     const namespace = config.namespace.value

@@ -107,6 +107,12 @@ access artifact blobs. Worker VMs do not receive that identity. Foundation resou
 service infrastructure and intentionally outlive individual runs. Their ongoing costs include
 PostgreSQL, the coordinator replica, registry, NAT and logs; worker VMs remain per-run leases.
 
+Artifact transfer uses the [Azure Blob REST API](https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob)
+over a shared HTTP client. Azure CLI acquires a renewable Entra credential; it is not invoked
+for every object. Conditional writes preserve immutable content addresses, and conditional reads
+plus byte limits and SHA-256 verification protect downloads. Source manifests verify owner-scoped
+object metadata in batches so admission does not require a database round trip per source file.
+
 The initial runtime download capability is time-limited. Its expiry must be tracked and its
 configuration renewed before subsequent allocations; automatic capability renewal or prepared
 image publication remains required before unattended long-term operation. Never present a

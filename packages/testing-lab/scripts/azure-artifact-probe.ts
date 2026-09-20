@@ -1,4 +1,4 @@
-import { FileSystem } from "@effect/platform"
+import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Schema, Stream } from "effect"
 import { createHash } from "node:crypto"
@@ -28,4 +28,4 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
     if (Number((yield* fs.stat(join(stage, "recovered"))).size) !== bytes) return yield* new InfrastructureFailure({ operation: "probe-download", message: "Recovered length differed" })
   }).pipe(Effect.provide(azureArtifactStore(config)))
   yield* fs.writeFileString(report, yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ passed: true, digest, bytes, account: config.account, container: config.container }))
-})).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive])))
+})).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive, FetchHttpClient.layer])))

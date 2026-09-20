@@ -56,7 +56,7 @@ export const labClientLayer = (origin: string, token: Effect.Effect<Redacted.Red
         HttpClientRequest.bodyStream(bytes, { contentType: "application/octet-stream" }),
       )
       const response = yield* http.execute(request).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Object upload failed" })))
-      if (response.status !== 204) return yield* new LabApiError({ status: response.status, message: "Object upload rejected" })
+      if (response.status !== 204) return yield* new LabApiError({ status: response.status, message: `Object ${digest} upload returned HTTP ${response.status}` })
     }).pipe(Effect.timeoutFail({ duration: "10 minutes", onTimeout: () => new LabApiError({ status: 0, message: "Object upload timed out" }) })),
     registerInput: input => Effect.gen(function* () {
       const json = yield* Schema.encode(Schema.parseJson(Input))(input).pipe(Effect.mapError(() => new LabApiError({ status: 0, message: "Invalid input reference" })))

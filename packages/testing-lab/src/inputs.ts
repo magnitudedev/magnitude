@@ -42,7 +42,11 @@ export const InputRegistryLive = Layer.effect(InputRegistry, Effect.gen(function
     register: (owner, input) => Effect.gen(function* () {
       const meta = yield* allowed(owner, input.digest)
       if (meta.bytes > 16 * 1024 * 1024) return yield* new InvalidInput({ message: "Input manifest exceeds 16 MiB" })
-      const chunks = yield* objects.get(input.digest).pipe(Stream.runCollect)
+      let manifestBytes = 0
+      const chunks = yield* objects.get(input.digest).pipe(Stream.tap(chunk => Effect.gen(function* () {
+        manifestBytes += chunk.byteLength
+        if (manifestBytes > meta.bytes || manifestBytes > 16 * 1024 * 1024) return yield* new InvalidInput({ message: "Input manifest exceeds its admitted length" })
+      })), Stream.runCollect)
       const json = Buffer.concat(Array.from(chunks)).toString("utf8")
       const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(json).pipe(Effect.mapError(() => new InvalidInput({ message: "Malformed input manifest" })))
       if (manifest.kind !== input.kind) return yield* new InvalidInput({ message: "Input kind does not match its manifest" })
@@ -54,9 +58,17 @@ export const InputRegistryLive = Layer.effect(InputRegistry, Effect.gen(function
         }
       }
       const files = manifest.kind === "source" ? manifest.entries.filter(e => e.kind === "file") : manifest.release.artifacts
+      const digests = [...new Set(files.map(file => file.sha256))]
+      const lengths = new Map<string, number>()
+      for (let offset = 0; offset < digests.length; offset += 1000) {
+        const rows = yield* db.query("SELECT digest,bytes FROM lab_objects WHERE owner=$1 AND digest=ANY($2::text[])", [owner, digests.slice(offset, offset + 1000)])
+        const uploaded = yield* decodeRow(Schema.Array(Schema.Struct({ digest: Digest, bytes: Schema.NumberFromString })), rows)
+        for (const file of uploaded) lengths.set(file.digest, file.bytes)
+      }
       for (const file of files) {
-        const uploaded = yield* allowed(owner, Digest.make(file.sha256))
-        if (uploaded.bytes !== file.bytes) return yield* new InvalidInput({ message: "Manifest object byte count does not match uploaded data" })
+        const uploaded = lengths.get(file.sha256)
+        if (uploaded === undefined) return yield* new InputDenied({})
+        if (uploaded !== file.bytes) return yield* new InvalidInput({ message: "Manifest object byte count does not match uploaded data" })
       }
       yield* db.query("INSERT INTO lab_inputs(owner,digest,kind) VALUES($1,$2,$3) ON CONFLICT(owner,digest) DO NOTHING", [owner, input.digest, input.kind])
     }),
