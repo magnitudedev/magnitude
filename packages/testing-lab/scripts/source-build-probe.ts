@@ -20,7 +20,7 @@ BunRuntime.runMain(Effect.gen(function* () {
   const source = yield* snapshotSource(resolve(import.meta.dir, "../../.."), objects)
   const environment = Object.fromEntries(["PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "CARGO_HOME", "RUSTUP_HOME"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const results = yield* Effect.gen(function* () {
-    const stages = yield* (yield* SourceBuilder).prepare(source.manifest, source.digest, target)
+    const stages = yield* (yield* SourceBuilder).prepare(source.manifest, source.digest, target, target.backend)
     const results = yield* runCases(target, cases.filter(test => test.id === "P1" || test.id === "P2")).pipe(Effect.provideService(CaseExecutor, {
       execute: test => test.id === "P1" ? stages.compile : stages.package.pipe(Effect.map(result => CaseObservation.make({ detail: "Built and admitted final installer bytes", evidence: result.evidence }))),
     }))

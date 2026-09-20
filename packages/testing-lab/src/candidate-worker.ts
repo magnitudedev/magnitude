@@ -3,7 +3,6 @@ import { Cause, Context, DateTime, Effect, Exit, Layer, Option, Schema, Scope, S
 import { dirname, isAbsolute, join } from "node:path"
 import { ArtifactStore } from "./artifact-store"
 import { ArtifactInput, InputManifest } from "./inputs"
-import { SourceBuilder } from "./source-builder"
 import { runtimeEnvironment } from "./runtime-release"
 import { prepareApplicationContext } from "./application-context"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
@@ -91,7 +90,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   const program = Effect.gen(function* () {
     const host = yield* inspector.inspect(target)
     const hostEvidence = yield* evidence("host.json", HostObservation, host)
-    const input = assignment.plan.request.input
+    const input = assignment.input
     let size = 0
     const chunks = yield* objects.get(input.digest).pipe(Stream.tap(chunk => Effect.gen(function* () {
       size += chunk.byteLength
@@ -101,11 +100,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     if (sha256(wire) !== input.digest) return yield* unavailable("Worker input manifest does not match admitted digest")
     const admitted = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(wire.toString("utf8")).pipe(Effect.mapError(() => unavailable("Invalid admitted input manifest")))
     if (admitted.kind !== input.kind) return yield* unavailable("Input kind does not match assignment")
-    const builder = yield* Effect.serviceOption(SourceBuilder)
-    if (admitted.kind === "source" && Option.isNone(builder)) return yield* unavailable("Worker has no source builder")
-    const source = admitted.kind === "source" ? yield* Option.getOrThrow(builder).prepare(admitted, input.digest, target) : undefined
-    const manifest = yield* Effect.cached(admitted.kind === "artifacts" ? Effect.succeed(admitted)
-      : source!.package.pipe(Effect.map(result => result.input)))
+    if (assignment.work.kind !== "test" || admitted.kind !== "artifacts") return yield* unavailable("A clean consumer requires admitted packages; source compilation belongs to a separate producer")
+    const manifest = Effect.succeed(admitted)
     const sourceEvidence = yield* evidence("admitted-input.json", InputManifest, admitted)
     const inputEvidence = yield* Effect.cached(Effect.gen(function* () {
       const value = yield* manifest
@@ -215,19 +211,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           )
         }
         case "P1": {
-          if (source) {
-            const result = yield* source.compile
-            return CaseObservation.make({ ...result, evidence: [...result.evidence, sourceEvidence, hostEvidence] })
-          }
           return CaseObservation.make({ detail: `Recorded supplied artifact provenance ${(yield* manifest).release.sourceCommit}; compilation was not executed`, evidence: [yield* inputEvidence, hostEvidence] })
         }
         case "P2":
         case "I1": {
           yield* candidate
-          const build = source ? yield* source.package : undefined
-          return CaseObservation.make({ detail: source ? "Built final native packages from the admitted source and verified exact installer bytes"
-            : "Downloaded the selected native installer and verified its admitted hash and length; no package build was executed",
-            evidence: [yield* inputEvidence, sourceEvidence, ...(build?.evidence ?? [])] })
+          return CaseObservation.make({ detail: "Downloaded the selected native installer and verified its admitted hash and length; no package build was executed",
+            evidence: [yield* inputEvidence, sourceEvidence] })
         }
         case "P3": {
           const identity = yield* inspectPackageIdentity(yield* installed, yield* (yield* desktop).host(), environment).pipe(
@@ -492,8 +482,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const results = yield* runCases(target, assignment.target.cases).pipe(Effect.provideService(CaseExecutor, { execute }))
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
-      const buildEvidence = source && (result.caseId === "P1" || result.caseId === "P2") ? source.evidence().filter(item => result.caseId !== "P1" || item.path !== "evidence/build-package.json") : []
-      const refs = [...result.evidence, applicationEvidence, ...buildEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
+
+      const refs = [...result.evidence, applicationEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })

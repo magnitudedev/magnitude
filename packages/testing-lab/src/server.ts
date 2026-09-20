@@ -80,7 +80,7 @@ export const configuredCoordinator = Effect.gen(function* () {
   }))
   const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, storage)))
   const tickets = WorkerTicketsLive.pipe(Layer.provide(database))
-  const results = WorkerResultsLive.pipe(Layer.provide(Layer.merge(database, tickets)))
+  const results = WorkerResultsLive.pipe(Layer.provide(Layer.mergeAll(database, tickets, storage)))
   const services = Layer.mergeAll(database, storage, authentication, Layer.succeed(MachineProviders, { allocators }),
     runner.pipe(Layer.provide(Layer.mergeAll(inputs, tickets, results)))).pipe(Layer.provideMerge(BunHttpServer.layer({ hostname: config.hostname, port: config.port, maxRequestBodySize: 4 * 1024 ** 3, idleTimeout: 255 })))
   // The runner and HTTP input registry use the same durable database and object store.

@@ -1,3 +1,5 @@
+import { TestWork } from "../src/execution-plan"
+import { WorkId } from "../src/work-identity"
 import { DateTime, Deferred, Effect, Fiber, Layer, Option, Redacted, Schema } from "effect"
 import { expect, test } from "vitest"
 import { planRun } from "../src/catalog"
@@ -18,12 +20,12 @@ for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "dea
   const plan = yield* planRun(request)
   const runId = RunId.make("run-00000000-0000-0000-0000-000000000001")
   const deadline = DateTime.unsafeMake(Date.now() + (mode === "deadline" ? 150 : 60_000))
-  const assignment = { plan, target: plan.targets[0]!, claim: { runId, targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline }
+  const assignment = { plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!, claim: { runId, targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "fixture" }, deadline }
   const invocation = WorkerInvocation.make({ schemaVersion: 1, assignment, disposable: false, port: 11279, model: "fixture" })
   const machine = LocalMachine.make({ provider: "local", root: "/tmp/worker-fixture", tags: { schemaVersion: 1, runId: mode === "foreign-lease" ? RunId.make("run-00000000-0000-0000-0000-000000000002") : runId,
     leaseId: LeaseId.make("lease-00000000-0000-0000-0000-000000000001"), expiresAt: deadline } })
   const now = new Date().toISOString()
-  const reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result: { cleanupErrors: [], cases: assignment.target.cases.map(test => ({
+  const reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result: { output: Option.none(), cleanupErrors: [], cases: assignment.target.cases.map(test => ({
     targetId: assignment.claim.targetId, caseId: test.id, harness: test.harness, startedAt: now, endedAt: now, evidence: [], outcome: { status: "passed", detail: "Runner fixture" },
   })) } })
   let issued = 0, revoked = 0, reads = 0

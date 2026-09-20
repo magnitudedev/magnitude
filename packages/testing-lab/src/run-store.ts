@@ -2,6 +2,8 @@ import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { Database, decodeRow } from "./database"
 import { InfrastructureFailure, RunId, RunPlan, RunRequest, RunResult } from "./domain"
+import { targets } from "./catalog"
+import { planExecution, WorkSpec } from "./execution-plan"
 import { sha256 } from "./snapshot"
 
 const identity = { runId: RunId, plan: RunPlan }
@@ -48,6 +50,7 @@ export const runStoreLayer = (accountBudgetUsd: number) => Layer.effect(RunStore
         if (decoded.request_digest !== digest) return yield* new AdmissionRejected({ message: "Idempotency key already belongs to a different request" })
         return yield* record(existing[0])
       }
+      const execution = yield* planExecution(plan.request, plan.targets, targets).pipe(Effect.mapError(error => new AdmissionRejected({ message: error.message })))
       const total = yield* tx.query("SELECT COALESCE(SUM(reserved_usd),0)::float8 AS value FROM lab_runs WHERE state <> 'Finished'")
       const amount = yield* decodeRow(Schema.Struct({ value: Schema.Number }), total[0])
       if (!Number.isFinite(accountBudgetUsd) || accountBudgetUsd <= 0 || !Number.isFinite(plan.estimatedComputeUsd) || plan.estimatedComputeUsd <= 0
@@ -60,8 +63,9 @@ export const runStoreLayer = (accountBudgetUsd: number) => Layer.effect(RunStore
       const rows = yield* tx.query(`INSERT INTO lab_runs(run_id,owner,idempotency_key,request_digest,plan,state,reserved_usd,deadline)
         VALUES($1,$2,$3,$4,$5,'Queued',$6,clock_timestamp()+$7*interval '1 minute') RETURNING *`,
       [id, plan.request.owner, plan.request.idempotencyKey, digest, encoded, plan.estimatedComputeUsd, plan.request.limits.deadlineMinutes])
-      for (const target of plan.targets) {
-        yield* tx.query("INSERT INTO lab_work(run_id,target_id,state) VALUES($1,$2,'Queued')", [id, target.target.id])
+      for (const work of execution) {
+        const spec = yield* Schema.encode(Schema.parseJson(WorkSpec))(work).pipe(Effect.mapError(() => new AdmissionRejected({ message: "Invalid execution work" })))
+        yield* tx.query("INSERT INTO lab_work(run_id,work_id,state,spec,producer_id) VALUES($1,$2,'Queued',$3,$4)", [id, work.id, spec, work.kind === "test" ? Option.getOrNull(work.producer) : null])
       }
       yield* tx.query("INSERT INTO lab_events(run_id,kind,detail) VALUES($1,'submitted',$2)", [id, encoded])
       return yield* record(rows[0])

@@ -3,12 +3,14 @@ import { Database, decodeRow, type DatabaseSession } from "./database"
 import { Allocating, Fence, LeaseConflict, LeaseRecord, LeaseStore, Ready, Released, Releasing, StaleLease, leaseFSM, type LeaseClaim } from "./lease"
 import { InfrastructureFailure, LeaseId, Provider, RunId, TargetId } from "./domain"
 
-const Row = Schema.Struct({ lease_id: LeaseId, run_id: RunId, target_id: TargetId, provider: Provider,
+import { WorkId } from "./work-identity"
+
+const Row = Schema.Struct({ lease_id: LeaseId, run_id: RunId, work_id: WorkId, work_fence: Schema.NumberFromString.pipe(Schema.compose(Fence)), target_id: TargetId, provider: Provider,
   resource_name: Schema.String, state: Schema.Literal("Allocating", "Ready", "Releasing", "Released"),
   expires_at: Schema.DateFromSelf, fence: Schema.NumberFromString.pipe(Schema.compose(Fence)),
   worker: Schema.String, claim_expires_at: Schema.DateFromSelf })
 const record = (value: unknown) => decodeRow(Row, value).pipe(Effect.map(row => {
-  const props = { leaseId: row.lease_id, runId: row.run_id, targetId: row.target_id, provider: row.provider,
+  const props = { leaseId: row.lease_id, runId: row.run_id, workId: row.work_id, workFence: row.work_fence, targetId: row.target_id, provider: row.provider,
     resourceName: row.resource_name, expiresAt: DateTime.unsafeMake(row.expires_at) }
   const constructors = { Allocating, Ready, Releasing, Released }
   return LeaseRecord.make({ state: new constructors[row.state](props), fence: row.fence, worker: row.worker,
@@ -39,9 +41,9 @@ export const LeaseStoreLive = Layer.effect(LeaseStore, Effect.gen(function* () {
       const time = yield* tx.query("SELECT $1::timestamptz > clock_timestamp() AS valid", [DateTime.toDate(state.expiresAt)])
       if (time[0]?.valid !== true) return yield* new LeaseConflict({ message: "Cannot reserve an expired lease" })
       const rows = yield* tx.query(`INSERT INTO lab_leases
-        (lease_id,run_id,target_id,provider,resource_name,state,expires_at,worker,claim_expires_at)
-        VALUES ($1,$2,$3,$4,$5,'Allocating',$6,$7,LEAST($6,clock_timestamp()+$8*interval '1 second')) RETURNING *`,
-      [state.leaseId, state.runId, state.targetId, state.provider, state.resourceName, DateTime.toDate(state.expiresAt), worker, seconds])
+        (lease_id,run_id,target_id,provider,resource_name,state,expires_at,worker,claim_expires_at,work_id,work_fence)
+        VALUES ($1,$2,$3,$4,$5,'Allocating',$6,$7,LEAST($6,clock_timestamp()+$8*interval '1 second'),$9,$10) RETURNING *`,
+      [state.leaseId, state.runId, state.targetId, state.provider, state.resourceName, DateTime.toDate(state.expiresAt), worker, seconds, state.workId, state.workFence])
       return yield* record(rows[0])
     })),
     ready: claim => db.transaction(tx => Effect.gen(function* () {

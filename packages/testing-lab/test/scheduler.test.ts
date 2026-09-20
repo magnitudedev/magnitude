@@ -9,7 +9,7 @@ import { LeaseStoreLive } from "../src/lease-store"
 import { type Machine, type MachineAllocator } from "../src/machines"
 import { RunStore, runStoreLayer } from "../src/run-store"
 import { MachineProviders, Scheduler, schedulerLayer, WorkerRunner } from "../src/scheduler"
-import { WorkStoreLive, type TargetResult } from "../src/work-store"
+import { WorkStoreLive, type WorkResult } from "../src/work-store"
 import { ProcessExecutorLive } from "../src/process"
 import { temporaryDatabase } from "./postgres"
 
@@ -45,11 +45,11 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout" | 
       yield* Deferred.succeed(started, undefined)
       if (mode === "cancel" || mode === "interrupt") return yield* Effect.never
       const now = new Date().toISOString()
-      return { cleanupErrors: [], cases: job.target.cases.map(c => ({ targetId: job.target.target.id, caseId: c.id, harness: c.harness,
-        startedAt: now, endedAt: now, evidence: [], outcome: { status: "passed", detail: "Scheduler fixture, not application qualification" } })) } satisfies TargetResult
+      return { output: Option.none(), cleanupErrors: [], cases: job.target.cases.map(c => ({ targetId: job.target.target.id, caseId: c.id, harness: c.harness,
+        startedAt: now, endedAt: now, evidence: [], outcome: { status: "passed", detail: "Scheduler fixture, not application qualification" } })) } satisfies WorkResult
     }) }
     const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: `fixture-${mode}`, owner: "fixture", trust: "developer",
-      input: { kind: "source", digest: "a".repeat(64) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
+      input: { kind: "artifacts", digest: "a".repeat(64) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
       mode: "verify", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 10, idleMinutes: 15 } })
     const run = yield* runs.submit(yield* planRun(request))
     yield* Effect.gen(function* () {

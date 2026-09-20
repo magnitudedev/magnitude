@@ -1,3 +1,5 @@
+import { Fence } from "../src/lease"
+import { WorkId } from "../src/work-identity"
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
@@ -15,7 +17,7 @@ test("local leases isolate files and reject replacement, traversal and foreign o
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-local-test-" })
   const target = { ...targets[0]!, arch: process.arch === "arm64" ? "arm64" as const : "x64" as const,
     os: process.platform === "darwin" ? "macos" as const : process.platform === "win32" ? "windows" as const : "ubuntu" as const, provider: "local" as const }
-  const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id,
+  const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
     provider: "local", resourceName: "ml-123456789abc", expiresAt: DateTime.unsafeMake(Date.now() + 60_000) })
   yield* Effect.gen(function* () {
     const allocator = yield* MachineAllocator

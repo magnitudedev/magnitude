@@ -93,6 +93,41 @@ export const initializeDatabase = Effect.flatMap(Database, db => db.transaction(
     PRIMARY KEY(run_id,target_id,fence),
     FOREIGN KEY(run_id,target_id,fence) REFERENCES lab_worker_tickets(run_id,target_id,fence)
   )`)
+  // One transactional migration, before any scheduler or API starts. Historical reports stay
+  // byte-for-byte intact; active old-protocol workers must drain before the deployment.
+  const migrated = yield* tx.query("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='lab_work' AND column_name='work_id'")
+  if (!migrated.length) {
+    if ((yield* tx.query("SELECT 1 FROM lab_work WHERE state <> 'Finished' LIMIT 1")).length ||
+      (yield* tx.query("SELECT 1 FROM lab_leases WHERE state <> 'Released' LIMIT 1")).length) {
+      return yield* new InfrastructureFailure({ operation: "database-migration", message: "Drain existing runs and leases before deploying work-stage identity" })
+    }
+    for (const table of ["lab_attempts", "lab_worker_tickets", "lab_worker_objects", "lab_worker_results"]) {
+      const constraints = yield* tx.query("SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass AND contype='f'", [table])
+      for (const row of constraints) {
+        const name = yield* decodeRow(Schema.Struct({ conname: Schema.String.pipe(Schema.pattern(/^[a-z_]+$/)) }), row)
+        yield* tx.query(`ALTER TABLE ${table} DROP CONSTRAINT ${name.conname}`)
+      }
+    }
+    for (const table of ["lab_work", "lab_attempts", "lab_worker_tickets", "lab_worker_objects", "lab_worker_results"]) {
+      yield* tx.query(`ALTER TABLE ${table} RENAME COLUMN target_id TO work_id`)
+      yield* tx.query(`UPDATE ${table} SET work_id='test:' || work_id`)
+    }
+    yield* tx.query("ALTER TABLE lab_work ADD COLUMN spec text, ADD COLUMN producer_id text, ADD COLUMN output text")
+    yield* tx.query(`UPDATE lab_work w SET spec=jsonb_build_object('kind','test','id',w.work_id,'target',t.value)::text
+      FROM lab_runs r, LATERAL jsonb_array_elements(r.plan::jsonb->'targets') t(value)
+      WHERE r.run_id=w.run_id AND 'test:' || (t.value->'target'->>'id')=w.work_id`)
+    yield* tx.query("ALTER TABLE lab_work ALTER COLUMN spec SET NOT NULL")
+    yield* tx.query("ALTER TABLE lab_leases ADD COLUMN work_id text, ADD COLUMN work_fence bigint NOT NULL DEFAULT 1")
+    yield* tx.query("UPDATE lab_leases SET work_id='test:' || target_id")
+    yield* tx.query("ALTER TABLE lab_leases ALTER COLUMN work_id SET NOT NULL")
+    yield* tx.query("ALTER TABLE lab_work ADD FOREIGN KEY(run_id,producer_id) REFERENCES lab_work(run_id,work_id)")
+    for (const table of ["lab_attempts", "lab_worker_tickets"]) {
+      yield* tx.query(`ALTER TABLE ${table} ADD FOREIGN KEY(run_id,work_id) REFERENCES lab_work(run_id,work_id)`)
+    }
+    for (const table of ["lab_worker_objects", "lab_worker_results"]) {
+      yield* tx.query(`ALTER TABLE ${table} ADD FOREIGN KEY(run_id,work_id,fence) REFERENCES lab_worker_tickets(run_id,work_id,fence)`)
+    }
+  }
 })))
 
 /** Decode every database boundary rather than asserting driver output types. */

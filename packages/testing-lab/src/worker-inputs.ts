@@ -1,5 +1,6 @@
+import { assignmentInputs } from "./work-store"
 import { Cache, Context, Data, Effect, Exit, Layer, Redacted, Schema, Stream } from "effect"
-import { Digest, InfrastructureFailure, OwnerId, runInputs } from "./domain"
+import { Digest, InfrastructureFailure, OwnerId } from "./domain"
 import { InputManifest, InputRegistry } from "./inputs"
 import { sha256 } from "./snapshot"
 import { WorkerAccessDenied, WorkerTickets } from "./worker-tickets"
@@ -35,7 +36,7 @@ export const WorkerInputsLive = Layer.effect(WorkerInputs, Effect.gen(function* 
       const { assignment } = yield* tickets.authorize(token)
       const { owner } = assignment.plan.request
       let permitted = false
-      for (const input of runInputs(assignment.plan.request)) {
+      for (const input of assignmentInputs(assignment)) {
         yield* inputs.require(owner, input)
         if (digest === input.digest) { permitted = true; break }
         const key = Data.struct({ owner, digest: input.digest, kind: input.kind })

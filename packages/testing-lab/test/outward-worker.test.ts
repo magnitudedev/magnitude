@@ -1,3 +1,6 @@
+import { Option } from "effect"
+import { TestWork } from "../src/execution-plan"
+import { WorkId } from "../src/work-identity"
 import releasePlan from "../../release/release-plan.json"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
@@ -19,19 +22,21 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
   const root = join(parent, "attempt")
   const payload = new TextEncoder().encode("source fixture")
   const report = new TextEncoder().encode("native executor fixture evidence")
-  const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
-    entries: [{ kind: "file", path: "file.ts", sha256: sha256(payload), bytes: payload.length, executable: false }] })
+  const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
+    schemaVersion: 2, version: "0.1.3", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.3", sourceCommit: "a".repeat(40),
+    artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: payload.length, sha256: sha256(payload) }],
+  } })
   const oldPackage = "previous installed package"
   const baseline = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
     schemaVersion: 2, version: "0.1.2", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.2", sourceCommit: "b".repeat(40),
     artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: oldPackage.length, sha256: sha256(oldPackage) }],
   } })
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "outward-guest-test", owner: "fixture", trust: "developer", mode: "verify", allowSpark: false,
-    input: { kind: "source", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
+    input: { kind: "artifacts", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
     limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 10, idleMinutes: 15 } })
   const plan = yield* planRun(request)
-  const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
-    claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
+  const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!,
+    claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
   const recovery = ["delivery-error", "saved-claim", "saved-invocation", "missing-reply", "oversized-reply", "saved-evidence", "delivery-revoked", "delivery-revoked-upload"].includes(mode)
   let executed = 0, uploads = 0, submissions = 0, cleaned = 0, started = false, downloads = 0, recovering = false, redeliveryStarted = false
   const client = Layer.succeed(WorkerClient, {
@@ -57,7 +62,7 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
     if (mode === "revoked") return yield* Effect.never.pipe(Effect.ensuring(Effect.sync(() => { cleaned++ })))
     yield* fs.writeFile(join(directory, "objects", sha256(report)), report)
     const now = new Date().toISOString()
-    return WorkerReply.make({ schemaVersion: 1, claim: { ...received.assignment.claim, fence: Fence.make(mode === "wrong-claim" ? 2 : 1) }, result: { cleanupErrors: [], cases: received.assignment.target.cases.map(test => ({
+    return WorkerReply.make({ schemaVersion: 1, claim: { ...received.assignment.claim, fence: Fence.make(mode === "wrong-claim" ? 2 : 1) }, result: { output: Option.none(), cleanupErrors: [], cases: received.assignment.target.cases.map(test => ({
       targetId: received.assignment.claim.targetId, caseId: test.id, harness: test.harness, startedAt: now, endedAt: now,
       outcome: { status: "passed", detail: "Orchestration fixture, not native acceptance" }, evidence: [{ path: "evidence/result.txt", sha256: sha256(report), bytes: report.length }],
     })) } })

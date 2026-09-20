@@ -45,7 +45,9 @@ test("live coordinator admits API inputs, schedules runs and preserves owner iso
         for (;;) { const result = yield* client.result(id); if (Option.isSome(result)) return result.value; yield* Effect.sleep("20 millis") }
       }).pipe(Effect.timeout("10 seconds"))
       expect(result.cases.length).toBeGreaterThan(10)
-      expect(result.cases.every(test => test.outcome.status === "blocked" && test.outcome.detail.includes("not configured"))).toBe(true)
+      expect(result.cases.every(test => test.outcome.status === "blocked")).toBe(true)
+      expect(result.cases.filter(test => test.caseId === "P1" || test.caseId === "P2").every(test => test.outcome.detail.includes("not configured"))).toBe(true)
+      expect(result.cases.filter(test => test.caseId !== "P1" && test.caseId !== "P2").every(test => test.outcome.detail.includes("Producer failed"))).toBe(true)
       return id
     }).pipe(Effect.provide(ownerClient))
     const denied = yield* Effect.flatMap(LabClient, client => client.get(id)).pipe(Effect.either,

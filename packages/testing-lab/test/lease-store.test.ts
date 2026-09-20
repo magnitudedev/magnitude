@@ -1,3 +1,5 @@
+import { Fence } from "../src/lease"
+import { WorkId } from "../src/work-identity"
 import { expect, test } from "vitest"
 import { FileSystem, FetchHttpClient, HttpApp, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer } from "@effect/platform-bun"
@@ -9,7 +11,7 @@ import { LeaseStoreLive } from "../src/lease-store"
 import { LeaseId, RunId, RunRequest, TargetId } from "../src/domain"
 import { RunStore, runStoreLayer } from "../src/run-store"
 import { planRun } from "../src/catalog"
-import { WorkStore, WorkStoreLive, type TargetResult } from "../src/work-store"
+import { WorkStore, WorkStoreLive, type WorkResult } from "../src/work-store"
 import { Principal } from "../src/domain"
 import { api, bearerAuthenticator } from "../src/api"
 import { LabClient, labClientLayer } from "../src/client"
@@ -35,7 +37,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     const db = yield* Database
     const state = (provider: "azure" | "spark" = "azure") => new Allocating({
       leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`),
-      targetId: TargetId.make("ubuntu-24.04-x64-cpu-intel"), provider, resourceName: `lab-${crypto.randomUUID()}`,
+      targetId: TargetId.make("ubuntu-24.04-x64-cpu-intel"), workId: WorkId.make(`test:${TargetId.make("ubuntu-24.04-x64-cpu-intel")}`), workFence: Fence.make(1), provider, resourceName: `lab-${crypto.randomUUID()}`,
       expiresAt: DateTime.unsafeMake(Date.now() + 60_000),
     })
     const first = yield* store.reserve(state(), "worker-a", 30)
@@ -80,7 +82,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     const submissions = yield* Effect.all([runs.submit(plan), runs.submit(plan)], { concurrency: 2 })
     expect(submissions[0].state.runId).toBe(submissions[1].state.runId)
     const runId = submissions[0].state.runId
-    expect((yield* db.query("SELECT * FROM lab_work WHERE run_id=$1", [runId])).length).toBe(plan.targets.length)
+    expect((yield* db.query("SELECT * FROM lab_work WHERE run_id=$1", [runId])).length).toBe(2)
     expect((yield* db.query("SELECT * FROM lab_events WHERE run_id=$1", [runId])).length).toBe(1)
     expect(yield* runs.submit({ ...plan, request: { ...request, mode: "iterate" } }).pipe(Effect.either)).toMatchObject({ _tag: "Left", left: { _tag: "AdmissionRejected" } })
     expect((yield* runs.cancel(runId)).state._tag).toBe("Cancelling")
@@ -102,7 +104,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     const evidenceBytes = new TextEncoder().encode("private test trace")
     const evidenceDigest = sha256(evidenceBytes)
     yield* fs.writeFile(join(root, "objects", evidenceDigest), evidenceBytes)
-    const targetResult: TargetResult = { cleanupErrors: [], cases: assignment.target.cases.map(c => ({
+    const targetResult: WorkResult = { output: Option.none(), cleanupErrors: [], cases: assignment.target.cases.map(c => ({
       targetId: assignment.claim.targetId, caseId: c.id, harness: c.harness,
       startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), evidence: [{ path: "evidence/trace.zip", sha256: evidenceDigest, bytes: evidenceBytes.length }],
       outcome: { status: "blocked", detail: "Database fixture; no product execution" },
@@ -113,7 +115,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
     expect((yield* db.query("SELECT ended_at FROM lab_attempts WHERE run_id=$1", [assignment.claim.runId]))[0]?.ended_at).toBeInstanceOf(Date)
     yield* work.reconcile()
     expect((yield* runs.get(assignment.claim.runId)).state._tag).toBe("Finished")
-    expect(Option.getOrThrow(yield* runs.result(assignment.claim.runId)).cases).toHaveLength(targetResult.cases.length)
+    expect(Option.getOrThrow(yield* runs.result(assignment.claim.runId)).cases).toHaveLength(workPlan.targets[0]!.cases.length)
     expect((yield* runs.get(runId)).state._tag).toBe("Finished")
     const retryRun = yield* runs.submit(yield* planRun({ ...workRequest, idempotencyKey: RunRequest.fields.idempotencyKey.make("retry-request-001") }))
     const lost = Option.getOrThrow(yield* work.claim("lost-worker", 30))

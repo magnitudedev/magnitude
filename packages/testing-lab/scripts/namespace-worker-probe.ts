@@ -1,3 +1,6 @@
+import { Option } from "effect"
+import { TestWork } from "../src/execution-plan"
+import { WorkId } from "../src/work-identity"
 import { FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
@@ -42,8 +45,8 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
     limits: { concurrency: 1, deadlineMinutes: 15, budgetUsd: 25, idleMinutes: 15 } })
   const plan = yield* planRun(request)
   if (plan.targets[0]!.target.provider !== "namespace") return yield* new InfrastructureFailure({ operation: "namespace-probe", message: "Probe requires a Namespace target" })
-  const assignment = WorkAssignment.make({ claim: { runId: machine.tags.runId, targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "namespace-native-probe" },
-    plan, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Math.min(Date.now() + 15 * 60_000, DateTime.toEpochMillis(machine.tags.expiresAt))) })
+  const assignment = WorkAssignment.make({ claim: { runId: machine.tags.runId, targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "namespace-native-probe" },
+    plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Math.min(Date.now() + 15 * 60_000, DateTime.toEpochMillis(machine.tags.expiresAt))) })
   const database = yield* temporaryDatabase
   const objects = fileArtifactStore(join(root, "coordinator-objects"))
   const inputs = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, objects)))

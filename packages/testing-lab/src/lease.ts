@@ -2,11 +2,13 @@ import { Context, Effect, Schema } from "effect"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { InfrastructureFailure, LeaseId, Provider, RunId, TargetId } from "./domain"
 
+import { WorkId } from "./work-identity"
+
 export const Fence = Schema.Int.pipe(Schema.positive(), Schema.brand("LeaseFence"))
 export type Fence = typeof Fence.Type
 export const LeaseClaim = Schema.Struct({ leaseId: LeaseId, fence: Fence })
 export type LeaseClaim = typeof LeaseClaim.Type
-const identity = { leaseId: LeaseId, runId: RunId, targetId: TargetId, provider: Provider,
+const identity = { leaseId: LeaseId, runId: RunId, workId: WorkId, workFence: Fence, targetId: TargetId, provider: Provider,
   resourceName: Schema.NonEmptyString, expiresAt: Schema.DateTimeUtc }
 export class Allocating extends Schema.TaggedClass<Allocating>()("Allocating", identity) {}
 export class Ready extends Schema.TaggedClass<Ready>()("Ready", identity) {}

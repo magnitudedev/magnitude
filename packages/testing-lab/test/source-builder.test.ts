@@ -47,7 +47,7 @@ for (const mode of ["success", "compile-failure", "package-failure", "wrong-prov
   yield* Effect.gen(function* () {
     const objects = yield* ArtifactStore
     yield* objects.put(sha256(sourceBytes), Stream.make(sourceBytes))
-    const stages = yield* (yield* SourceBuilder).prepare(source, digest, target)
+    const stages = yield* (yield* SourceBuilder).prepare(source, digest, target, target.backend)
     const compile = yield* stages.compile.pipe(Effect.either)
     expect(compile._tag).toBe(mode === "compile-failure" ? "Left" : "Right")
     const result = yield* stages.package.pipe(Effect.either)

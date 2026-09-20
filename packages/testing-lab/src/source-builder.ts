@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { ArtifactStore } from "./artifact-store"
 import { snapshotArtifacts } from "./artifact-input"
 import { CaseObservation } from "./case-runner"
-import { AssertionFailure, Digest, Evidence, InfrastructureFailure, Target } from "./domain"
+import { AssertionFailure, Backend, Digest, Evidence, InfrastructureFailure, Target } from "./domain"
 import { ArtifactInput } from "./inputs"
 import { command, CommandOutput, ProcessExecutor } from "./process"
 import { extractSource, sha256, SourceManifest } from "./snapshot"
@@ -12,10 +12,10 @@ import { extractSource, sha256, SourceManifest } from "./snapshot"
 export interface BuildStages {
   readonly evidence: () => readonly (typeof Evidence.Type)[]
   readonly compile: Effect.Effect<CaseObservation, AssertionFailure | InfrastructureFailure>
-  readonly package: Effect.Effect<{ readonly input: typeof ArtifactInput.Type; readonly evidence: readonly (typeof Evidence.Type)[] }, AssertionFailure | InfrastructureFailure>
+  readonly package: Effect.Effect<{ readonly input: typeof ArtifactInput.Type; readonly digest: Digest; readonly evidence: readonly (typeof Evidence.Type)[] }, AssertionFailure | InfrastructureFailure>
 }
 export interface SourceBuilder {
-  readonly prepare: (source: SourceManifest, digest: Digest, target: Target) => Effect.Effect<BuildStages, InfrastructureFailure>
+  readonly prepare: (source: SourceManifest, digest: Digest, target: Target, backend: typeof Backend.Type) => Effect.Effect<BuildStages, InfrastructureFailure>
 }
 export const SourceBuilder = Context.GenericTag<SourceBuilder>("@magnitudedev/testing-lab/SourceBuilder")
 export const SourceBuildConfig = Schema.Struct({ root: Schema.NonEmptyString, objects: Schema.NonEmptyString,
@@ -28,7 +28,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
   const objects = yield* ArtifactStore
   const executor = yield* ProcessExecutor
   return {
-    prepare: (source, digest, target) => Effect.gen(function* () {
+    prepare: (source, digest, target, backend) => Effect.gen(function* () {
       const platform = target.os === "macos" ? "darwin" : target.os === "windows" ? "win32" : "linux"
       if (platform !== process.platform || target.arch !== process.arch) return yield* failure("Build must execute on the selected native OS and architecture")
       if (yield* fs.exists(config.root)) return yield* failure("Source build requires a fresh workspace")
@@ -37,7 +37,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
       yield* fs.makeDirectory(home, { mode: 0o700 })
       const env = { ...config.environment, HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
         LOCALAPPDATA: join(home, "AppData", "Local"), XDG_CONFIG_HOME: join(home, ".config"), XDG_CACHE_HOME: join(home, ".cache"),
-        LAB_BUILD_OUTPUT: output, LAB_BUILD_SOURCE_DIGEST: digest, LAB_BUILD_SOURCE_COMMIT: source.commit, LAB_BUILD_BACKEND: target.backend }
+        LAB_BUILD_OUTPUT: output, LAB_BUILD_SOURCE_DIGEST: digest, LAB_BUILD_SOURCE_COMMIT: source.commit, LAB_BUILD_BACKEND: backend }
       const record = (name: string, result: CommandOutput) => Effect.gen(function* () {
         const wire = yield* Schema.encode(Schema.parseJson(CommandOutput))({ ...result,
           stdout: result.stdout.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]"), stderr: result.stderr.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]") })
@@ -65,7 +65,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
         const input = yield* Schema.decodeUnknown(Schema.parseJson(ArtifactInput))(frozen.json)
         if (input.release.sourceCommit !== source.commit) return yield* new AssertionFailure({ message: "Built package changed the source commit identity" })
         yield* objects.put(frozen.digest, Stream.make(new TextEncoder().encode(frozen.json)))
-        return { input, evidence: [...receipts] }
+        return { input, digest: frozen.digest, evidence: [...receipts] }
       }).pipe(Effect.mapError(error => error._tag === "AssertionFailure" || error._tag === "InfrastructureFailure" ? error : failure(error.message))))
       return { compile, package: packaged, evidence: () => [...receipts] }
     }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : failure(error.message))),

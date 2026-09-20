@@ -76,7 +76,7 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect((yield* guest.download(sha256(unrelated)).pipe(Stream.runDrain, Effect.either))._tag).toBe("Left")
       if (mode === "revoked") {
         let consumed = false
-        const tooLarge = yield* evidence.upload(ticket.token, sha256(unrelated), WorkerEvidenceLimits.objectBytes + 1,
+        const tooLarge = yield* evidence.upload(ticket.token, sha256(unrelated), 4 * 1024 ** 3 + 1,
           Stream.fromEffect(Effect.sync(() => { consumed = true; return unrelated }))).pipe(Effect.either)
         expect(tooLarge._tag === "Left" && tooLarge.left._tag).toBe("InvalidResult")
         expect(consumed).toBe(false)
@@ -86,9 +86,9 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
           Stream.fail(new InfrastructureFailure({ operation: "fixture-stream", message: "Interrupted upload fixture" }))).pipe(Effect.either)
         expect(interrupted._tag).toBe("Left")
         expect((yield* db.query("SELECT 1 FROM lab_worker_objects WHERE run_id=$1", [assignment.claim.runId]))).toHaveLength(0)
-        yield* db.query(`INSERT INTO lab_worker_objects(run_id,target_id,fence,digest,bytes,upload_id,upload_expires_at)
+        yield* db.query(`INSERT INTO lab_worker_objects(run_id,work_id,fence,digest,bytes,upload_id,upload_expires_at)
           SELECT $1,$2,$3,repeat(md5(n::text),2),$4,md5(n::text)::uuid,clock_timestamp()+interval '15 minutes'
-          FROM generate_series(1,16) n`, [assignment.claim.runId, assignment.claim.targetId, assignment.claim.fence, WorkerEvidenceLimits.objectBytes])
+          FROM generate_series(1,16) n`, [assignment.claim.runId, assignment.claim.workId, assignment.claim.fence, 1024 ** 3])
         const full = yield* evidence.upload(ticket.token, sha256(unrelated), unrelated.length, Stream.make(unrelated)).pipe(Effect.either)
         expect(full._tag === "Left" && full.left._tag).toBe("InvalidResult")
         yield* db.query("DELETE FROM lab_worker_objects WHERE run_id=$1 AND state='Uploading'", [assignment.claim.runId])
@@ -107,9 +107,9 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       expect(yield* fileResponse.text).toBe(new TextDecoder().decode(payload))
       expect((yield* http.get(objectUrl(sha256(unrelated)), auth)).status).toBe(401)
       const now = new Date().toISOString()
-      let reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result: { cleanupErrors: [], cases: assignment.target.cases.map(test => ({
+      let reply = WorkerReply.make({ schemaVersion: 1, claim: assignment.claim, result: { output: Option.none(), cleanupErrors: [], cases: assignment.target.cases.map(test => ({
         targetId: assignment.claim.targetId, caseId: test.id, harness: test.harness, startedAt: now, endedAt: now, evidence: [],
-        outcome: { status: "passed", detail: "Result transport fixture, not native acceptance" },
+        outcome: { status: "blocked", detail: "Result transport fixture, not native acceptance" },
       })) } })
       const send = (value: typeof WorkerReply.Type) => Effect.gen(function* () {
         const json = yield* Schema.encode(Schema.parseJson(WorkerReply))(value)
@@ -150,8 +150,8 @@ test("worker credentials are durable, attempt-bound and immediately invalidated 
       if (mode === "reassigned") yield* db.query("UPDATE lab_work SET fence=fence+1,worker='replacement' WHERE run_id=$1", [run.state.runId])
       if (mode === "finished") {
         const now = new Date().toISOString()
-        yield* work.finish(assignment.claim, { cleanupErrors: [], cases: assignment.target.cases.map(test => ({ targetId: assignment.claim.targetId, caseId: test.id, harness: test.harness,
-          startedAt: now, endedAt: now, evidence: [], outcome: { status: "passed", detail: "Credential lifecycle fixture, not native acceptance" } })) })
+        yield* work.finish(assignment.claim, { output: Option.none(), cleanupErrors: [], cases: assignment.target.cases.map(test => ({ targetId: assignment.claim.targetId, caseId: test.id, harness: test.harness,
+          startedAt: now, endedAt: now, evidence: [], outcome: { status: "blocked", detail: "Credential lifecycle fixture, not native acceptance" } })) })
       }
       const denied = yield* tickets.authorize(ticket.token).pipe(Effect.either)
       expect(denied._tag === "Left" && denied.left._tag).toBe("WorkerAccessDenied")

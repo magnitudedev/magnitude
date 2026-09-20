@@ -42,9 +42,9 @@ export const workerClientLayer = (origin: string, token: Redacted.Redacted<strin
       Effect.mapError(error => new InfrastructureFailure({ operation: "worker-download", message: error.message })))), 4 * 1024 ** 3).pipe(
         Stream.timeoutFail(() => new InfrastructureFailure({ operation: "worker-download", message: "Input download stalled" }), "2 minutes")),
     upload: (digest, bytes, content) => Effect.gen(function* () {
-      if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 256 * 1024 ** 2) return yield* failure("Invalid worker evidence length")
+      if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 4 * 1024 ** 3) return yield* failure("Invalid worker object length")
       yield* send(HttpClientRequest.put(`${url.origin}/v1/worker/evidence/${digest}`, { headers }).pipe(
-        HttpClientRequest.bodyStream(content, { contentType: "application/octet-stream", contentLength: bytes })), 10 * 60_000)
+        HttpClientRequest.bodyStream(content, { contentType: "application/octet-stream", contentLength: bytes }), HttpClientRequest.setHeader("content-length", String(bytes))), 10 * 60_000)
     }),
     submit: reply => Effect.gen(function* () {
       const json = yield* Schema.encode(Schema.parseJson(WorkerReply))(reply).pipe(Effect.mapError(() => failure("Invalid worker reply")))

@@ -3,6 +3,7 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Console, Effect, Layer, Option, Schema } from "effect"
 import { dirname, join, resolve } from "node:path"
 import { fileArtifactStore } from "./artifact-store"
+import { runBuildWorker } from "./build-worker"
 import { runCandidateWorker } from "./candidate-worker"
 import { HostInspectorLive } from "./host-inspector"
 import { nativeInstaller } from "./installer"
@@ -24,15 +25,17 @@ export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type,
     if (Option.isSome(user)) environment.HOME = user.value.home
     const userLayer = Option.match(user, { onNone: () => Layer.empty, onSome: value => Layer.succeed(DisposableDesktopUser, value) })
     const installationRoot = Option.isSome(user) && process.platform === "darwin" ? "/Applications" : join(root, "installation")
+    if (invocation.assignment.work.kind === "build") return yield* runBuildWorker(invocation.assignment).pipe(
+      Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive,
+        nativeSourceBuilder({ root: join(root, "build"), objects: join(root, "objects"), environment }).pipe(Layer.provide(fileArtifactStore(join(root, "objects"))))]))
     return yield* runCandidateWorker(invocation.assignment, { root: join(root, "workspace"), port: invocation.port, model: invocation.model, environment }).pipe(
     Effect.provide([fileArtifactStore(join(root, "objects")), HostInspectorLive, configuredHarnessTools, NativeTerminalDriver,
-      nativeInstaller({ disposable: invocation.disposable, root: installationRoot, environment }),
-      nativeSourceBuilder({ root: join(root, "build"), objects: join(root, "objects"), environment }).pipe(Layer.provide(fileArtifactStore(join(root, "objects"))))]), Effect.provide(userLayer))
+      nativeInstaller({ disposable: invocation.disposable, root: installationRoot, environment })]), Effect.provide(userLayer), Effect.map(result => ({ ...result, output: Option.none() })))
   }).pipe(
     Effect.catchAll(error => Effect.sync(() => {
       const now = new Date().toISOString()
       const detail = `Worker setup: ${error.message}`.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").slice(0, 2400)
-      return { cleanupErrors: error._tag === "CandidateWorkerFailure" ? error.cleanupErrors : [], cases: invocation.assignment.target.cases.map(test => ({ targetId: invocation.assignment.target.target.id,
+      return { output: Option.none(), cleanupErrors: error._tag === "CandidateWorkerFailure" ? error.cleanupErrors : [], cases: invocation.assignment.target.cases.map(test => ({ targetId: invocation.assignment.target.target.id,
         caseId: test.id, harness: test.harness, startedAt: now, endedAt: now, evidence: [], outcome: { status: "blocked" as const, detail } })) }
     })))
   return WorkerReply.make({ schemaVersion: 1, claim: invocation.assignment.claim, result })

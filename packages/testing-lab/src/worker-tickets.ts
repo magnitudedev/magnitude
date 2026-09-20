@@ -2,6 +2,8 @@ import { Context, DateTime, Effect, Layer, Redacted, Schema } from "effect"
 import { randomBytes } from "node:crypto"
 import { Database, type DatabaseSession, decodeRow } from "./database"
 import { InfrastructureFailure, RunPlan } from "./domain"
+import { WorkSpec } from "./execution-plan"
+import { BuildOutput } from "./build-output"
 import { sha256 } from "./snapshot"
 import { WorkAssignment } from "./work-store"
 import { WorkerInvocation } from "./worker-protocol"
@@ -23,7 +25,7 @@ export const WorkerTicketsLive = Layer.effect(WorkerTickets, Effect.gen(function
   const authorize = (session: DatabaseSession, token: Redacted.Redacted<string>, lock: boolean) => Effect.gen(function* () {
     if (!/^[A-Za-z0-9_-]{43}$/.test(Redacted.value(token))) return yield* new WorkerAccessDenied({})
     const rows = yield* session.query(`SELECT t.invocation FROM lab_worker_tickets t
-      JOIN lab_work w ON w.run_id=t.run_id AND w.target_id=t.target_id
+      JOIN lab_work w ON w.run_id=t.run_id AND w.work_id=t.work_id
       JOIN lab_runs r ON r.run_id=t.run_id
       WHERE t.token_digest=$1 AND NOT t.revoked AND w.fence=t.fence AND w.worker=t.worker
       AND w.state='Running' AND w.claim_expires_at > clock_timestamp()
@@ -39,21 +41,21 @@ export const WorkerTicketsLive = Layer.effect(WorkerTickets, Effect.gen(function
       const job = invocation.assignment
       if (job.target.blockers.length || job.plan.request.trust === "untrusted-ci" &&
         (!invocation.disposable || job.target.target.provider === "local" || job.target.target.provider === "spark")) return yield* new WorkerAccessDenied({})
-      const rows = yield* tx.query(`SELECT r.plan,r.deadline FROM lab_work w JOIN lab_runs r USING(run_id)
-        WHERE w.run_id=$1 AND w.target_id=$2 AND w.fence=$3 AND w.worker=$4
+      const rows = yield* tx.query(`SELECT r.plan,r.deadline,w.spec,p.output FROM lab_work w JOIN lab_runs r ON r.run_id=w.run_id LEFT JOIN lab_work p ON p.run_id=w.run_id AND p.work_id=w.producer_id
+        WHERE w.run_id=$1 AND w.work_id=$2 AND w.fence=$3 AND w.worker=$4
         AND w.state='Running' AND w.claim_expires_at > clock_timestamp()
         AND r.state='Running' AND r.deadline > clock_timestamp() FOR UPDATE OF r,w`,
-      [claim.runId, claim.targetId, claim.fence, claim.worker])
+      [claim.runId, claim.workId, claim.fence, claim.worker])
       if (!rows[0]) return yield* new WorkerAccessDenied({})
-      const row = yield* decodeRow(Schema.Struct({ plan: Schema.parseJson(RunPlan), deadline: Schema.DateFromSelf }), rows[0])
-      const target = row.plan.targets.find(target => target.target.id === claim.targetId)
-      if (!target || !Schema.equivalence(WorkAssignment)(invocation.assignment,
-        { claim, plan: row.plan, target, deadline: DateTime.unsafeMake(row.deadline) })) return yield* new WorkerAccessDenied({})
+      const row = yield* decodeRow(Schema.Struct({ plan: Schema.parseJson(RunPlan), spec: Schema.parseJson(WorkSpec), output: Schema.NullOr(Schema.parseJson(BuildOutput)), deadline: Schema.DateFromSelf }), rows[0])
+      const target = row.spec.target
+      if (claim.targetId !== target.target.id || claim.workId !== row.spec.id || !Schema.equivalence(WorkAssignment)(invocation.assignment,
+        { claim, plan: row.plan, work: row.spec, input: row.output ? { kind: "artifacts", digest: row.output.artifactDigest } : row.plan.request.input, target, deadline: DateTime.unsafeMake(row.deadline) })) return yield* new WorkerAccessDenied({})
       const id = WorkerTicketId.make(crypto.randomUUID())
       const token = Redacted.make(randomBytes(32).toString("base64url"))
-      const inserted = yield* tx.query(`INSERT INTO lab_worker_tickets(ticket_id,token_digest,run_id,target_id,fence,worker,invocation)
-        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(run_id,target_id,fence) DO NOTHING RETURNING ticket_id`,
-      [id, sha256(Redacted.value(token)), claim.runId, claim.targetId, claim.fence, claim.worker,
+      const inserted = yield* tx.query(`INSERT INTO lab_worker_tickets(ticket_id,token_digest,run_id,work_id,fence,worker,invocation)
+        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(run_id,work_id,fence) DO NOTHING RETURNING ticket_id`,
+      [id, sha256(Redacted.value(token)), claim.runId, claim.workId, claim.fence, claim.worker,
         yield* Schema.encode(Schema.parseJson(WorkerInvocation))(invocation)])
       // A lost issuer response cannot rotate a credential under an already executing guest.
       if (!inserted[0]) return yield* new WorkerAccessDenied({})

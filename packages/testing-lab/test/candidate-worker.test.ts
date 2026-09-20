@@ -1,3 +1,5 @@
+import { WorkId } from "../src/work-identity"
+import { TestWork } from "../src/execution-plan"
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
@@ -5,19 +7,17 @@ import { DateTime, Deferred, Effect, Fiber, Layer, Option, Schema, Stream } from
 import { join } from "node:path"
 import releasePlan from "../../release/release-plan.json"
 import { ArtifactStore, fileArtifactStore } from "../src/artifact-store"
-import { ArtifactInput } from "../src/inputs"
 import { runCandidateWorker } from "../src/candidate-worker"
 import { cases as allCases, planRun } from "../src/catalog"
-import { AssertionFailure, InfrastructureFailure, RunId, RunRequest } from "../src/domain"
+import { InfrastructureFailure, RunId, RunRequest } from "../src/domain"
 import { Fence } from "../src/lease"
 import { HostInspector } from "../src/host-inspector"
 import { Installer } from "../src/installer"
 import { ProcessExecutor } from "../src/process"
-import { SourceBuilder } from "../src/source-builder"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment, validateTargetResult } from "../src/work-store"
 
-for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "source-success", "source-compile-failure", "source-package-failure", "update-baseline-missing", "update-baseline-invalid", "terminal-missing-runtime"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "runtime-artifacts", "explicit-uninstall", "wrong-version", "corrupt", "cleanup-failure", "cancel", "defect", "update-baseline-missing", "update-baseline-invalid", "terminal-missing-runtime"] as const) test(`artifact worker preserves case results and cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-artifact-worker-" })
   const bytes = new TextEncoder().encode("fixture installer")
@@ -27,22 +27,18 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
       ...(mode === "runtime-artifacts" ? [{ id: "icn-base-darwin-arm64", kind: "icn-base", host: "darwin-arm64", backend: "cpu", filename: "native.tar.gz",
         nativeBuild: "fixture", backendModuleAbi: "fixture", bytes: bytes.length, sha256: sha256(bytes) }] : [])],
   } })
-  const artifactInput = yield* Schema.decodeUnknown(Schema.parseJson(ArtifactInput))(artifactJson)
-  const isSource = mode.startsWith("source-")
-  const json = isSource ? yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40), entries: [] }) : artifactJson
-  let compiled = 0, packaged = 0
-  const sourceFailed = mode === "source-compile-failure" || mode === "source-package-failure"
+  const json = artifactJson
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "worker-artifact-test", owner: "developer",
     ...(mode === "update-baseline-invalid" ? { updateFrom: { kind: "artifacts", digest: sha256(json) } } : {}),
-    input: { kind: isSource ? "source" : "artifacts", digest: sha256(json) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-metal-apple-silicon" },
+    input: { kind: "artifacts", digest: sha256(json) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-metal-apple-silicon" },
     mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 100, idleMinutes: 15 } })
   const plan = yield* planRun(request)
   const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P4", "P5", "I1", "I2", "C1"].includes(c.id)) }
   if (mode === "explicit-uninstall") selected.cases.push(allCases.find(test => test.id === "X1")!)
   if (mode.startsWith("update-baseline-")) selected.cases.push(allCases.find(test => test.id === "U1")!)
   if (mode === "terminal-missing-runtime") selected.cases.push({ ...allCases.find(test => test.id === "H7")!, harness: Option.some("pi"), prerequisites: [] })
-  const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "fixture" },
-    plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
+  const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, workId: WorkId.make(`test:${selected.target.id}`), fence: Fence.make(1), worker: "fixture" },
+    plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${selected.target.id}`), target: selected, producer: Option.none() }), input: plan.request.input, target: selected, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
   const started = yield* Deferred.make<void>()
   let installed = 0, removed = 0
   let nativeState: string | undefined
@@ -74,21 +70,13 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     expect(signature.status).toBe(mode === "runtime-artifacts" ? "failed" : "blocked")
     if (signature.status === "failed") expect(signature.detail).toContain("Missing or ambiguous signature identity")
     expect(result.cases.find(c => c.caseId === "P4")!.outcome.status).toBe("blocked")
-    expect(result.cases.find(c => c.caseId === "C1")!.outcome.status).toBe((mode === "corrupt" || sourceFailed) ? "blocked" : (mode === "wrong-version" || mode === "defect") ? "failed" : "passed")
+    expect(result.cases.find(c => c.caseId === "C1")!.outcome.status).toBe((mode === "corrupt") ? "blocked" : (mode === "wrong-version" || mode === "defect") ? "failed" : "passed")
     if (mode === "wrong-version" || mode === "defect") {
       const failed = result.cases.find(c => c.caseId === "C1")!
       expect(failed.evidence.some(e => e.path.endsWith("C1-shared-failure.json"))).toBe(true)
     }
-    expect(installed).toBe((mode === "corrupt" || sourceFailed) ? 0 : 1)
+    expect(installed).toBe((mode === "corrupt") ? 0 : 1)
     expect(removed).toBe(installed)
-    if (isSource) {
-      const compileOutcome = result.cases.find(c => c.caseId === "P1")!.outcome
-      if (mode === "source-compile-failure" && compileOutcome.status === "failed") expect(compileOutcome.category).toBe("build")
-      expect(compiled).toBe(1)
-      expect(packaged).toBe(mode === "source-compile-failure" ? 0 : 1)
-      expect(result.cases.find(c => c.caseId === "P1")!.outcome.status).toBe(mode === "source-compile-failure" ? "failed" : "passed")
-      expect(result.cases.find(c => c.caseId === "P2")!.outcome.status).toBe(mode === "source-compile-failure" ? "blocked" : mode === "source-package-failure" ? "failed" : "passed")
-    }
     if (nativeState && process.platform !== "win32") {
       expect(Buffer.byteLength(join(nativeState, "application.sock"))).toBeLessThanOrEqual(103)
       expect(yield* fs.exists(nativeState)).toBe(false)
@@ -115,11 +103,6 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
   })
   yield* program.pipe(Effect.provide([
     fileArtifactStore(join(root, "objects")),
-    Layer.succeed(SourceBuilder, { prepare: () => Effect.gen(function* () {
-      const compile = yield* Effect.cached(Effect.suspend(() => { compiled++; return mode === "source-compile-failure" ? Effect.fail(new AssertionFailure({ message: "Compiler fixture failed" })) : Effect.succeed({ detail: "Compiled fixture", evidence: [] }) }))
-      const packageStage = yield* Effect.cached(Effect.suspend(() => { packaged++; return mode === "source-package-failure" ? Effect.fail(new AssertionFailure({ message: "Packager fixture failed" })) : Effect.succeed({ input: artifactInput, evidence: [] }) }))
-      return { compile, package: packageStage, evidence: () => [] }
-    }) }),
     Layer.succeed(HostInspector, { inspect: () => Effect.succeed({ os: "macos", version: "15.5", build: "fixture", arch: "arm64", cpuVendor: "Apple", cpuName: "fixture", machineModel: "fixture", memoryBytes: 1024, gpus: [] }) }),
     Layer.succeed(Installer, { install: candidate => Effect.sync(() => { installed++; return { candidate, root: "fixture", executable: "fixture", cli: "fixture", packageVersion: "0.1.3" } }),
       uninstall: () => Effect.gen(function* () { removed++;

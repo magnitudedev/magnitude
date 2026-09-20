@@ -1,9 +1,11 @@
+import { assignmentInputs } from "./work-store"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
+import { Config, Context, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import { dirname, join, resolve } from "node:path"
+import { outputObjects } from "./build-output"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
-import { Digest, InfrastructureFailure, runInputs } from "./domain"
+import { Digest, InfrastructureFailure } from "./domain"
 import { GuestExecutor } from "./guest-executor"
 import { InputManifest } from "./inputs"
 import { ProcessExecutorLive } from "./process"
@@ -31,7 +33,7 @@ export const runOutwardWorker = (config: typeof OutwardWorkerConfig.Type) => Eff
   yield* fs.writeFileString(join(root, "invocation.json"), yield* Schema.encode(Schema.parseJson(WorkerInvocation))(invocation), { flag: "wx", mode: 0o600 })
   const store = Context.get(yield* Layer.build(fileArtifactStore(join(root, "objects"))), ArtifactStore)
   const journey = Effect.gen(function* () {
-    for (const input of runInputs(invocation.assignment.plan.request)) {
+    for (const input of assignmentInputs(invocation.assignment)) {
       let length = 0
       yield* store.put(input.digest, client.download(input.digest).pipe(Stream.tap(chunk => Effect.gen(function* () {
         length += chunk.byteLength
@@ -65,6 +67,13 @@ const deliverReply = (client: WorkerClient, store: ArtifactStore, fs: FileSystem
   for (const item of reply.result.cases.flatMap(test => test.evidence)) {
     if (evidence.has(item.sha256) && evidence.get(item.sha256) !== item.bytes) return yield* fail("Conflicting evidence byte counts")
     evidence.set(item.sha256, item.bytes)
+  }
+  if (Option.isSome(reply.result.output)) {
+    const packages = yield* outputObjects(reply.result.output.value).pipe(Effect.provideService(ArtifactStore, store))
+    for (const item of packages) {
+      if (evidence.has(item.digest) && evidence.get(item.digest) !== item.bytes) return yield* fail("Conflicting output byte counts")
+      evidence.set(item.digest, item.bytes)
+    }
   }
   for (const [digest, size] of evidence) {
     if (Number((yield* fs.stat(join(root, "objects", digest))).size) !== size) return yield* fail("Local evidence length differs from reply")

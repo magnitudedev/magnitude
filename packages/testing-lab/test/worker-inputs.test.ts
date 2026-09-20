@@ -1,3 +1,6 @@
+import { Option } from "effect"
+import { TestWork } from "../src/execution-plan"
+import { WorkId } from "../src/work-identity"
 import releasePlan from "../../release/release-plan.json"
 import { DateTime, Effect, Layer, Redacted, Schema, Stream } from "effect"
 import { expect, test } from "vitest"
@@ -13,19 +16,21 @@ import { WorkerAccessDenied, WorkerTickets } from "../src/worker-tickets"
 for (const transient of [false, true]) test(`manifest cache coalesces downloads without caching authority or transient failures (${transient})`, () => Effect.runPromise(Effect.gen(function* () {
   const content = new TextEncoder().encode("Assigned bytes")
   const digest = sha256(content)
-  const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "source", commit: "a".repeat(40),
-    entries: [{ kind: "file", path: "file.ts", sha256: digest, bytes: content.length, executable: false }] })
+  const manifest = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
+    schemaVersion: 2, version: "0.1.3", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.3", sourceCommit: "a".repeat(40),
+    artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: content.length, sha256: sha256(content) }],
+  } })
   const oldBytes = "old package"
   const baseline = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ schemaVersion: 1, kind: "artifacts", release: {
     schemaVersion: 2, version: "0.1.2", acnRevision: 1, rpc: releasePlan.rpc, plugins: [], tag: "@magnitudedev/cli@0.1.2", sourceCommit: "b".repeat(40),
     artifacts: [{ id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "magnitude.deb", bytes: oldBytes.length, sha256: sha256(oldBytes) }],
   } })
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "worker-cache-test", owner: "owner", trust: "developer",
-    input: { kind: "source", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", allowSpark: false,
+    input: { kind: "artifacts", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", allowSpark: false,
     limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 10, idleMinutes: 15 } })
   const plan = yield* planRun(request)
-  const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, target: plan.targets[0]!,
-    claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
+  const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!,
+    claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
   let authorized = true, manifestReads = 0, checks = 0, baselineAllowed = true
   const tickets = Layer.succeed(WorkerTickets, { issue: () => Effect.dieMessage("Not used"), withAuthority: () => Effect.dieMessage("Not used"), revoke: () => Effect.void, authorize: () => Effect.suspend(() => {
     checks++

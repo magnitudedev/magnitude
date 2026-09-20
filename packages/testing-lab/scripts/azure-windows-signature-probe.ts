@@ -1,3 +1,5 @@
+import { Fence } from "../src/lease"
+import { WorkId } from "../src/work-identity"
 import { FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Context, DateTime, Effect, Layer, Schema } from "effect"
@@ -22,7 +24,7 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   if (target.os !== "windows" || target.backend !== "cpu" || !["intel", "amd"].includes(target.hardware)) return yield* failure("Diagnostic requires a Windows CPU allocation")
   yield* fs.makeDirectory(root, { recursive: true })
   const allocator = Context.get(yield* Layer.build(azureAllocator(config)), MachineAllocator)
-  const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id,
+  const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
     provider: "azure", resourceName: `ml-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, expiresAt: DateTime.unsafeMake(Date.now() + 60 * 60_000) })
   yield* fs.writeFileString(join(root, "lease.json"), yield* Schema.encode(Schema.parseJson(Allocating))(lease), { flag: "wx" })
   const cleanupErrors: string[] = []

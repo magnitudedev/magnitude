@@ -1,3 +1,5 @@
+import { WorkId } from "../src/work-identity"
+import { TestWork } from "../src/execution-plan"
 import { FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
@@ -39,8 +41,8 @@ BunRuntime.runMain(Effect.gen(function* () {
     : generation ? ["P1", "P2", "P4", "I1", "I2", "I3", "I4", "A1", "A2", "A3", ...(harnesses ? ["A5"] : []), "E1", "E6", "E2", "E3", "E4", ...(harnesses ? ["H1", "H2", "H5", "C4"] : []), "C1", "X1"] : ["P1", "P2", "P4", "P5", "I1", "I2", "I3", "I4", "C1"]
   const selected = { ...original.targets[0]!, cases: ids.flatMap(id => original.targets[0]!.cases.filter(c => c.id === id)) }
   const plan = { ...original, targets: [selected] }
-  const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, fence: Fence.make(1), worker: "local-worker-probe" },
-    plan, target: selected, deadline: DateTime.unsafeMake(Date.now() + (generation ? 45 : 15) * 60_000) })
+  const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: selected.target.id, workId: WorkId.make(`test:${selected.target.id}`), fence: Fence.make(1), worker: "local-worker-probe" },
+    plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${selected.target.id}`), target: selected, producer: Option.none() }), input: plan.request.input, target: selected, deadline: DateTime.unsafeMake(Date.now() + (generation ? 45 : 15) * 60_000) })
   yield* fs.writeFileString(join(root, "assignment.json"), yield* Schema.encode(Schema.parseJson(WorkAssignment))(assignment), { flag: "wx", mode: 0o600 })
   const environment = Object.fromEntries(["PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* Effect.gen(function* () {

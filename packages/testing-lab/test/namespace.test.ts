@@ -1,3 +1,5 @@
+import { Fence } from "../src/lease"
+import { WorkId } from "../src/work-identity"
 import { expect, test } from "vitest"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { namespaceAllocator, type NamespaceImage } from "../src/providers/namespace"
@@ -9,7 +11,7 @@ import { LeaseId, RunId } from "../src/domain"
 
 const target = targets.find(t => t.os === "macos" && t.version === "26")!
 const image: NamespaceImage = { version: "26", selector: "tahoe-slim", catalogCreatedAt: "2026-09-10T08:02:37.522Z", productVersion: "26.6.2", buildVersion: "25G83" }
-const lease = () => new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id,
+const lease = () => new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
   provider: "namespace", resourceName: "magnitude-lab-fixture", expiresAt: DateTime.unsafeMake(Date.now() + 3600_000) })
 const box = (allocation: Allocating) => ({ id: "owned-devbox", name: allocation.resourceName, documented_purpose: "magnitude-lab/v1 " + Schema.encodeSync(Schema.parseJson(MachineTags))({
   schemaVersion: 1, runId: allocation.runId, leaseId: allocation.leaseId, expiresAt: allocation.expiresAt,

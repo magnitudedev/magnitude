@@ -1,3 +1,6 @@
+import { WorkId } from "../src/work-identity"
+import { Option } from "effect"
+import { TestWork } from "../src/execution-plan"
 import releasePlan from "../../release/release-plan.json"
 import { expect, test } from "vitest"
 import { FileSystem } from "@effect/platform"
@@ -47,8 +50,8 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       yield* inputs.upload(request.owner, sha256(baseline), Stream.make(new TextEncoder().encode(baseline)))
       yield* inputs.register(request.owner, { kind: "artifacts", digest: sha256(baseline) })
       const plan = yield* planRun(mode === "foreign-owner" ? { ...request, owner: RunRequest.fields.owner.make("someone-else") } : request)
-      const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: plan.targets[0]!.target.id, fence: Fence.make(1), worker: "transport-fixture" },
-        plan, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
+      const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "transport-fixture" },
+        plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
       const machine = LocalMachine.make({ provider: "local", root: join(root, "guest"), tags: { schemaVersion: 1, runId: assignment.claim.runId,
         leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), expiresAt: assignment.deadline } })
       let executions = 0, uploads = 0
@@ -67,7 +70,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
           const output = mode === "corrupt-evidence" ? "corrupt evidence" : evidence
           yield* fs.writeFileString(join(dirname(args[0]!), "objects", sha256(evidence)), output)
           const now = new Date().toISOString()
-          const result = { cleanupErrors: [], cases: assignment.target.cases.map(c => ({ targetId: assignment.claim.targetId, caseId: c.id, harness: c.harness,
+          const result = { output: Option.none(), cleanupErrors: [], cases: assignment.target.cases.map(c => ({ targetId: assignment.claim.targetId, caseId: c.id, harness: c.harness,
             startedAt: now, endedAt: now, outcome: { status: "passed" as const, detail: "Transport fixture, not product acceptance" },
             evidence: [{ path: "fixture.txt", sha256: sha256(evidence), bytes: evidence.length }] })) }
           if (mode === "missing-case") result.cases.pop()

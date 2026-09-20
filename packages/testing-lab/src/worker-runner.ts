@@ -1,8 +1,11 @@
+import { workerObjectLimits } from "./worker-evidence"
+import { outputObjects } from "./build-output"
+import { assignmentInputs } from "./work-store"
 import { FileSystem } from "@effect/platform"
-import { Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
+import { Context, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import { join, posix, win32 } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
-import { Digest, InfrastructureFailure, Provider, Target, runInputs } from "./domain"
+import { Digest, InfrastructureFailure, Provider, Target } from "./domain"
 import { InputManifest, InputRegistry } from "./inputs"
 import { WorkerTransport } from "./machines"
 import { WorkerRunner } from "./scheduler"
@@ -45,7 +48,7 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
           yield* store.put(digest, yield* inputs.read(owner, digest))
           yield* transport.upload(machine, join(local, "objects", digest), remotePath.join(directory, "objects", digest))
         })
-        for (const input of runInputs(assignment.plan.request)) {
+        for (const input of assignmentInputs(assignment)) {
           yield* inputs.require(owner, input)
           const manifestStream = yield* inputs.read(owner, input.digest)
           let size = 0
@@ -78,6 +81,21 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
           if (evidence.has(item.sha256) && evidence.get(item.sha256) !== item.bytes) return yield* fail("Evidence has conflicting byte counts")
           evidence.set(item.sha256, item.bytes)
         }
+        if (Option.isSome(reply.result.output)) {
+          if (assignment.work.kind !== "build") return yield* fail("A consumer cannot publish build output")
+          const digest = reply.result.output.value.artifactDigest
+          const file = join(local, "produced-manifest.json")
+          yield* transport.download(machine, remotePath.join(directory, "objects", digest), file)
+          if (Number((yield* fs.stat(file)).size) > 16 * 1024 * 1024) return yield* fail("Build manifest exceeds 16 MiB")
+          yield* store.put(digest, fs.stream(file).pipe(Stream.mapError(() => fail("Cannot read produced manifest"))))
+          for (const item of yield* outputObjects(reply.result.output.value)) {
+            if (evidence.has(item.digest) && evidence.get(item.digest) !== item.bytes) return yield* fail("Conflicting build output byte counts")
+            evidence.set(item.digest, item.bytes)
+          }
+        }
+        const limits = workerObjectLimits(assignment.work.kind)
+        if (evidence.size > limits.objectCount || [...evidence.values()].some(bytes => bytes > limits.objectBytes) ||
+          [...evidence.values()].reduce((sum, bytes) => sum + bytes, 0) > limits.attemptBytes) return yield* fail("Worker output exceeds its stage transfer budget")
         for (const [digest, length] of evidence) {
           const file = join(local, `evidence-${digest}`)
           yield* transport.download(machine, remotePath.join(directory, "objects", digest), file)

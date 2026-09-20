@@ -3,7 +3,7 @@ import { InfrastructureFailure, LeaseId, Provider } from "./domain"
 import { Allocating, LeaseStore, type LeaseClaim, type LeaseRecord } from "./lease"
 import { MachineAllocator, type Machine } from "./machines"
 import { RunStore } from "./run-store"
-import { WorkStore, type WorkAssignment, type TargetResult } from "./work-store"
+import { WorkStore, type WorkAssignment, type WorkResult } from "./work-store"
 
 export interface MachineProviders {
   readonly allocators: ReadonlyMap<typeof Provider.Type, MachineAllocator>
@@ -11,7 +11,7 @@ export interface MachineProviders {
 export const MachineProviders = Context.GenericTag<MachineProviders>("@magnitudedev/testing-lab/MachineProviders")
 export interface WorkerRunner {
   /** Executes only this immutable assignment; the runner does not receive cloud credentials. */
-  readonly run: (machine: Machine, assignment: WorkAssignment) => Effect.Effect<TargetResult, InfrastructureFailure>
+  readonly run: (machine: Machine, assignment: WorkAssignment) => Effect.Effect<WorkResult, InfrastructureFailure>
 }
 export const WorkerRunner = Context.GenericTag<WorkerRunner>("@magnitudedev/testing-lab/WorkerRunner")
 export const Reconciliation = Schema.Struct({ released: Schema.Int, errors: Schema.Array(Schema.String) })
@@ -24,9 +24,9 @@ const seconds = 60
 const heartbeat = <A, E, R, E2, R2>(work: Effect.Effect<A, E, R>, beat: Effect.Effect<unknown, E2, R2>) =>
   Effect.raceFirst(work, Effect.forever(Effect.sleep("10 seconds").pipe(Effect.zipRight(beat))).pipe(Effect.interruptible))
 const fail = (message: string) => new InfrastructureFailure({ operation: "scheduler", message })
-const blocked = (assignment: WorkAssignment, detail: string): TargetResult => {
+const blocked = (assignment: WorkAssignment, detail: string): WorkResult => {
   const now = new Date().toISOString()
-  return { cases: assignment.target.cases.map(c => ({ targetId: assignment.target.target.id, caseId: c.id, harness: c.harness,
+  return { output: Option.none(), cases: assignment.target.cases.map(c => ({ targetId: assignment.target.target.id, caseId: c.id, harness: c.harness,
     startedAt: now, endedAt: now, evidence: [], outcome: { status: "blocked", detail } })), cleanupErrors: [] }
 }
 const causeDetail = <E>(cause: Cause.Cause<E>) => {
@@ -70,7 +70,7 @@ export const schedulerLayer = (cleanupTimeout: Duration.DurationInput = "20 minu
         return true
       }
       const run = Effect.gen(function* () {
-        const allocation = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: job.claim.runId,
+        const allocation = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: job.claim.runId, workId: job.claim.workId, workFence: job.claim.fence,
           targetId: target.id, provider: target.provider, resourceName: `ml-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, expiresAt: job.deadline })
         const lease = yield* leases.reserve(allocation, worker, seconds).pipe(Effect.mapError(e => fail(e.message)))
         const claim: LeaseClaim = { leaseId: lease.state.leaseId, fence: lease.fence }

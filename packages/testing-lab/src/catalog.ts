@@ -1,3 +1,4 @@
+import { planExecution } from "./execution-plan"
 import { Effect, Option, Schema } from "effect"
 import { CaseId, Harness, InvalidInput, PlannedCase, RunPlan, RunRequest, Selection, Suite, Target, TargetId } from "./domain"
 
@@ -107,8 +108,8 @@ export const planRun = (request: RunRequest) => Effect.gen(function* () {
       ? ["Spark requires explicit permission for this run and trusted source"] : [] }
   })
   // Admission uses configured rates later; this conservative reservation bounds a worst-case run.
-  const estimate = plans.reduce((sum, p) => sum + (p.target.provider === "spark" ? 0 : p.target.hardware === "rtx-pro-6000" ? 18 : p.target.hardware === "a10" ? 4 : p.target.provider === "namespace" ? 3.6 : 1)
-    * request.limits.deadlineMinutes / 60, 0)
+  const execution = yield* planExecution(request, plans, targets)
+  const estimate = execution.reduce((sum, work) => { const p = work.target; return sum + (p.target.provider === "spark" ? 0 : p.target.hardware === "rtx-pro-6000" ? 18 : p.target.hardware === "a10" ? 4 : p.target.provider === "namespace" ? 3.6 : 1) * request.limits.deadlineMinutes / 60 }, 0)
   return RunPlan.make({ schemaVersion: 1, request, targets: plans,
     artifactHosts: [...new Set(selected.map(t => t.artifactHost))], estimatedComputeUsd: Math.round(estimate * 100) / 100,
   })

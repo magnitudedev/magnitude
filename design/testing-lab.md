@@ -36,8 +36,18 @@ The manifest also includes the canonical archive of the bundled service, whose s
 by ordinary runtime startup. Package admission validates that startup's bundle metadata is complete.
 Build receipts bind the snapshot digest, base commit and native host; final manifests and every
 package byte are verified before the installer can consume them. A base commit alone never
-identifies dirty source. Producer reuse across targets and separate consumer allocation remain
-implementation work; same-machine source probes do not qualify the clean remote consumer gate.
+identifies dirty source. Source runs share one producer for each native artifact host and backend within that run.
+A producer uses a canonical native CPU build host and a separately selected backend toolchain;
+CUDA compilation does not implicitly allocate a GPU or use Spark. Build and test work have distinct
+identities, fenced attempts, credentials and allocations even when they use the same target.
+Consumers cannot start until the producer has published a complete verified package graph and its
+allocation has been released. Publication binds the source digest, commit, host, backend and actual
+producer lease. Build failures block dependent tests without allocating consumer machines.
+Consumers receive only the admitted packages and selected update baseline, never source or an
+inline compiler. Final target reports include the actual shared producer outcomes and receipt,
+then that consumer's outcomes, exactly once per originally selected case. Producer cleanup errors
+are aggregated once and prevent dependent execution. Historical completed reports survive the
+work-identity migration; active old-protocol attempts and leases must drain before migration.
 An update run may additionally bind a previous-release artifact manifest. Its packages are
 frozen and verified like candidate artifacts, registered under the same owner and included in
 the immutable assignment. Admission requires both inputs. Worker transfer authority includes
@@ -119,7 +129,7 @@ Admission is idempotent and reserves a bounded budget. Durable transactional cla
 attempt fences prevent stale workers from committing results. Worker invocation binds the assignment and attempt fence; returned case membership and evidence
 hashes are verified before acceptance. Transfers expose only the owner-authorized input graph.
 Workers receive only scoped run credentials when needed; untrusted source never receives provider credentials or office-network access.
-Worker credentials identify one admitted target attempt. Only their digests are persisted.
+Worker credentials identify one admitted build or test work attempt. Only their digests are persisted.
 Every use checks the current work fence, claim expiry and run state, so cancellation,
 completion or reassignment invalidates access. Issuing another credential for the same
 attempt is rejected rather than silently replacing a credential already delivered to a guest.
@@ -138,7 +148,10 @@ Evidence uploads reserve their declared bytes against an attempt budget before c
 the request. Uploading and verified objects are distinct states. Hash/length verification
 and a fresh authority check precede publication; incomplete uploads cannot satisfy a result.
 Concurrent reservations count toward the same budget, and failed uploads release only their
-own reservation. Expired reservations can be reclaimed without granting evidence authority.
+own reservation. Producers may upload package-sized objects up to 4 GiB within a 16 GiB attempt budget;
+consumers retain a 256 MiB object and 4 GiB attempt evidence limit. A consumer cannot publish build
+output. Complete package graphs must belong to the producing attempt before outward result receipt.
+Expired reservations can be reclaimed without granting evidence authority.
 Guest HTTP clients use one HTTPS coordinator origin (loopback HTTP is permitted for local
 tests), reject redirects and verify downloaded content addresses. Transport errors never
 automatically repeat native test execution. Assignment, transfer and reply sizes and waits
