@@ -1,9 +1,11 @@
 # Azure worker preparation
 
-These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04 CPU
+These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13 and Fedora 44 CPU
 workers for the existing outward worker protocol. A successful deployment is not proof of
-a completed app test. Windows, GPU driver setup, other distributions and Hermes provisioning
-require separate qualification.
+a completed app test. Debian/Fedora preparation is implemented but awaits native qualification.
+Windows, GPU driver setup and RHEL preparation remain separate work. RHEL 10
+requires a Wayland/Xwayland session because [Red Hat removed the X.Org server](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.0_release_notes/removed-features);
+it must not inherit this Xvfb recipe.
 
 Use subscription `5304c4b3-d605-4193-b0cb-766c065acfa6` and resource group `magnitude-ci`
 explicitly; the Azure CLI's default subscription may be different.
@@ -39,6 +41,7 @@ archive length and SHA-256; the renderer rejects HTTP, URL user credentials and 
 
 ```json
 {
+  "distribution": { "os": "ubuntu", "version": "24.04" },
   "adminUsername": "labworker",
   "architecture": "x64",
   "runtime": { "url": "https://…", "sha256": "<64 lowercase hex characters>", "bytes": 123 },
@@ -46,6 +49,33 @@ archive length and SHA-256; the renderer rejects HTTP, URL user credentials and 
   "rustup": { "url": "https://…", "sha256": "<64 lowercase hex characters>", "bytes": 123 }
 }
 ```
+
+Use `distribution: { "os": "debian", "version": "13" }` for Debian or
+`distribution: { "os": "fedora", "version": "44" }` for Fedora. The allocator rejects a
+recipe/target mismatch before allocating; the guest rejects an image/recipe mismatch before
+installing dependencies. Existing Ubuntu recipes must be migrated from `kind: "ubuntu"` to
+`kind: "linux"` with an explicit distribution when deploying this version. Do not change a
+running coordinator merely to migrate the recipe.
+
+The official Debian image pins verified in West US 2 are
+`Debian:debian-13:13-gen2:0.20260914.2601` (x64) and
+`Debian:debian-13:13-arm64:0.20260914.2601` (ARM64). Both use generation 2 and have no
+marketplace purchase plan. These pins establish image availability, not worker qualification.
+Fedora publishes official Azure VHDs for both architectures at its [Cloud download page](https://www.fedoraproject.org/cloud/download/).
+They require a verified import into a versioned Azure gallery image before allocation; the
+allocator already accepts an explicit gallery version ID. No third-party marketplace image
+or additional compute provider is required. Fedora's native packages include
+[Xvfb with xvfb-run](https://packages.fedoraproject.org/pkgs/xorg-x11-server/xorg-x11-server-Xvfb/fedora-44.html)
+and [Openbox](https://packages.fedoraproject.org/pkgs/openbox/openbox/). The pinned Hermes
+release requires Python below 3.14, so Fedora uses its parallel
+[Python 3.13 package](https://packages.fedoraproject.org/pkgs/python3.13/python3.13/); the OS Python is unchanged.
+
+The verified Fedora imports are gallery `magnitude_lab`, definitions `fedora44-x64` and
+`fedora44-arm64`, version `44.1.7`, in `magnitude-ci`. Both are replicated in West US 2.
+These are persistent base images, not qualified application workers. Tag persistent image
+resources with `lab-owner=magnitude-testing-lab-images-v1`. The marker
+`magnitude-testing-lab-v1` is reserved for disposable lease resources with `lab-machine` and
+`lab-lease` metadata; using it on gallery resources prevents cleanup inventory from succeeding.
 
 Node must be a matching Linux tar.xz distribution with Node 24 or newer. Rustup must be a
 matching native executable from a versioned release. The setup installs the repository's
@@ -55,7 +85,7 @@ imports successfully. This is an X11 automation environment; it does not establi
 or physical-display qualification.
 
 ```sh
-bun packages/testing-lab/scripts/prepare-ubuntu-worker.ts \
+bun packages/testing-lab/scripts/prepare-linux-worker.ts \
   /private/path/initialization.json /private/path/cloud-init.yml
 ```
 
@@ -89,7 +119,7 @@ workers stay in West US 2. Pass the database password through a private secure-p
 never a shell argument or Git file. PostgreSQL backup retention is seven days.
 
 Bundle `src/server.ts` with the repository-pinned Bun using `bun build --target=bun`. Place the
-result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh` and `ubuntu-worker.sh` in a private build context.
+result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh` and `linux-worker.sh` in a private build context.
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
@@ -115,8 +145,8 @@ for every object. Conditional writes preserve immutable content addresses, and c
 plus byte limits and SHA-256 verification protect downloads. Source manifests verify owner-scoped
 object metadata in batches so admission does not require a database round trip per source file.
 
-For unattended allocations, use an initialization recipe with `kind: "ubuntu"`, a pinned
-`setup: { file, sha256 }`, `adminUsername`, `architecture`, the existing `node`/`rustup`
+For unattended allocations, use an initialization recipe with `kind: "linux"`, a pinned
+`setup: { file, sha256 }`, `distribution`, `adminUsername`, `architecture`, the existing `node`/`rustup`
 downloads, and `runtime: { account, container, blob, sha256, bytes }`. The runtime blob name
 must be `worker-runtime/<sha256>.tar.gz`. The coordinator uses its managed identity to issue
 a fresh one-hour user-delegation SAS with read permission for only that blob. It validates

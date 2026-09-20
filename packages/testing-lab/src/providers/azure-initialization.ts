@@ -3,26 +3,27 @@ import { Effect, Redacted, Schema } from "effect"
 import { Digest, InfrastructureFailure } from "../domain"
 import { checkedCommand } from "../process"
 import { sha256 } from "../snapshot"
-import { InitializationDownload, renderUbuntuInitialization, UbuntuInitialization } from "./ubuntu-initialization"
+import { InitializationDownload, renderLinuxInitialization, LinuxInitialization } from "./linux-initialization"
 
 const PinnedFile = Schema.Struct({ file: Schema.NonEmptyString, sha256: Digest })
-export const UbuntuAzureInitialization = Schema.Struct({ kind: Schema.Literal("ubuntu"),
+export const LinuxAzureInitialization = Schema.Struct({ kind: Schema.Literal("linux"),
   setup: PinnedFile,
-  adminUsername: UbuntuInitialization.fields.adminUsername,
-  architecture: UbuntuInitialization.fields.architecture,
+  distribution: LinuxInitialization.fields.distribution,
+  adminUsername: LinuxInitialization.fields.adminUsername,
+  architecture: LinuxInitialization.fields.architecture,
   node: InitializationDownload, rustup: InitializationDownload,
   runtime: Schema.Struct({ account: Schema.String.pipe(Schema.pattern(/^[a-z0-9]{3,24}$/)),
     container: Schema.String.pipe(Schema.pattern(/^[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]$/)),
     blob: Schema.String.pipe(Schema.pattern(/^worker-runtime\/[a-f0-9]{64}\.tar\.gz$/)),
     sha256: Digest, bytes: Schema.Int.pipe(Schema.between(1, 1024 ** 3)) }),
 })
-export const AzureInitialization = Schema.Union(PinnedFile, UbuntuAzureInitialization)
+export const AzureInitialization = Schema.Union(PinnedFile, LinuxAzureInitialization)
 export type AzureInitialization = typeof AzureInitialization.Type
 const fail = (message: string) => new InfrastructureFailure({ operation: "azure-initialization", message })
 
 /** Identity pins the recipe and bytes, independently of the short-lived read capability. */
 export const prepareAzureInitialization = (initialization: AzureInitialization, scope: {
-  readonly executable: string; readonly subscription: string; readonly adminUsername: string; readonly architecture: "x64" | "arm64"
+  readonly executable: string; readonly subscription: string; readonly adminUsername: string; readonly architecture: "x64" | "arm64"; readonly os: string; readonly version: string
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const pinned = "kind" in initialization ? initialization.setup : initialization
@@ -31,9 +32,10 @@ export const prepareAzureInitialization = (initialization: AzureInitialization, 
   if (bytes.byteLength > 64 * 1024 || sha256(bytes) !== pinned.sha256) return yield* fail("Worker initialization digest differs from configured runtime")
   if (!("kind" in initialization)) return { customData: Buffer.from(bytes).toString("base64"), identity: pinned.sha256 }
   const recipe = initialization
-  if (recipe.adminUsername !== scope.adminUsername || recipe.architecture !== scope.architecture) return yield* fail("Ubuntu initialization user or architecture differs from allocation")
+  if (recipe.distribution.os !== scope.os || recipe.distribution.version !== scope.version) return yield* fail("Linux initialization distribution differs from allocation")
+  if (recipe.adminUsername !== scope.adminUsername || recipe.architecture !== scope.architecture) return yield* fail("Linux initialization user or architecture differs from allocation")
   if (recipe.runtime.blob !== `worker-runtime/${recipe.runtime.sha256}.tar.gz`) return yield* fail("Runtime blob name differs from its pinned digest")
-  const identity = sha256(yield* Schema.encode(Schema.parseJson(UbuntuAzureInitialization))(recipe))
+  const identity = sha256(yield* Schema.encode(Schema.parseJson(LinuxAzureInitialization))(recipe))
   // Cloud-init has a twenty-minute limit. A one-hour blob-only read grant covers startup;
   // neither storage account keys nor the coordinator identity enter the guest.
   const now = Math.floor(Date.now() / 1000) * 1000
@@ -50,7 +52,7 @@ export const prepareAzureInitialization = (initialization: AzureInitialization, 
     url.searchParams.get("sr") !== "b" || url.searchParams.get("spr") !== "https" || !url.searchParams.get("sig") ||
     !url.searchParams.get("skoid") || !url.searchParams.get("sktid") ||
     Date.parse(url.searchParams.get("se") ?? "") !== Date.parse(expiry)) return yield* fail("Runtime download capability has unexpected scope or expiry")
-  const cloudInit = yield* renderUbuntuInitialization({ adminUsername: recipe.adminUsername, architecture: recipe.architecture,
+  const cloudInit = yield* renderLinuxInitialization({ distribution: recipe.distribution, adminUsername: recipe.adminUsername, architecture: recipe.architecture,
     node: recipe.node, rustup: recipe.rustup,
     runtime: { url: Redacted.make(url.toString()), sha256: recipe.runtime.sha256, bytes: recipe.runtime.bytes },
   }, new TextDecoder().decode(bytes))

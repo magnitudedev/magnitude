@@ -3,13 +3,24 @@ set -euo pipefail
 umask 077
 # This file is installed by cloud-init before any run credential or candidate source arrives.
 . /etc/os-release
-test "$ID" = ubuntu && test "$VERSION_ID" = 24.04
-export DEBIAN_FRONTEND=noninteractive
-# Restarting the Azure agent while its readiness command runs can sever observation.
-# Fresh application processes use the newly installed libraries after preparation.
-export NEEDRESTART_MODE=l
-apt-get update -qq
-apt-get install -y -qq curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
+python3 - "$ID" "$VERSION_ID" <<'CHECK'
+import json,pathlib,sys
+expected=json.loads(pathlib.Path('/etc/magnitude-lab-initialization.json').read_text())['distribution']
+if [expected['os'],expected['version']] != sys.argv[1:]:raise SystemExit('Initialization distribution mismatch')
+CHECK
+case "$ID:$VERSION_ID" in
+  ubuntu:24.04|debian:13)
+    export DEBIAN_FRONTEND=noninteractive
+    # Restarting the Azure agent while its readiness command runs can sever observation.
+    export NEEDRESTART_MODE=l
+    apt-get update -qq
+    apt-get install -y -qq sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
+    ;;
+  fedora:44)
+    dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
+    ;;
+  *) printf '%s\n' 'Unsupported Linux worker distribution' >&2; exit 1 ;;
+esac
 
 python3 - <<'PY'
 import hashlib,json,os,pathlib,platform,pwd,re,shlex,shutil,subprocess,tomllib,urllib.request
@@ -70,6 +81,7 @@ rust_version=tomllib.loads((workspace/'inference/rust-toolchain.toml').read_text
 path=f'{home}/.local/bin:{root}/node-bin/bin:{root}/tooling/node_modules/.bin:{home}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 environment=[f'HOME={home}',f'USER={account.pw_name}',f'LOGNAME={account.pw_name}',f'PATH={path}',
  f'CARGO_HOME={home}/.cargo',f'RUSTUP_HOME={home}/.rustup',f'LAB_BUN_VERSION={config["bunVersion"]}',f'LAB_RUST_VERSION={rust_version}',
+ f'LAB_HERMES_PYTHON={"/usr/bin/python3.13" if config["distribution"]["os"] == "fedora" else "/usr/bin/python3"}',
  f'LAB_HERMES_COMMIT={hermes["commit"]}',f'LAB_HERMES_VERSION={hermes["version"]}',f'LAB_TIRITH_VERSION={hermes["tirith"]["version"]}']
 (root/'download-rustup').rename(root/'rustup-init')
 os.chmod(root/'rustup-init',0o700)
@@ -88,7 +100,7 @@ git -C ../hermes-agent remote add origin https://github.com/NousResearch/hermes-
 git -C ../hermes-agent fetch -q --depth=1 origin "$LAB_HERMES_COMMIT"
 git -C ../hermes-agent checkout -q --detach FETCH_HEAD
 test "$(git -C ../hermes-agent rev-parse HEAD)" = "$LAB_HERMES_COMMIT"
-../python-tools/bin/uv sync --project ../hermes-agent --python /usr/bin/python3 --frozen --no-dev
+../python-tools/bin/uv sync --project ../hermes-agent --python "$LAB_HERMES_PYTHON" --frozen --no-dev
 mkdir ../native-tools
 tar -xzf ../download-tirith -C ../native-tools tirith tirith-package-approval-authority
 # The application intentionally excludes project-local node_modules/.bin from discovery.
@@ -124,7 +136,7 @@ os.chmod('/opt/magnitude-lab-worker',0o755)
 receipt=pathlib.Path('/var/lib/magnitude-lab')
 receipt.mkdir(mode=0o755,exist_ok=True)
 (receipt/'runtime.json').write_text(json.dumps({'runtimeSha256':config['runtime']['sha256'],'nodeSha256':config['node']['sha256'],
- 'rustupSha256':config['rustup']['sha256'],'architecture':config['architecture'],'bunVersion':config['bunVersion'],'rustVersion':rust_version}))
+ 'rustupSha256':config['rustup']['sha256'],'architecture':config['architecture'],'distribution':config['distribution'],'bunVersion':config['bunVersion'],'rustVersion':rust_version}))
 for key in ['runtime','node','tirith']:(root/('download-'+key)).unlink()
 (root/'rustup-init').unlink()
 PY

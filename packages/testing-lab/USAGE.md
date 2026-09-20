@@ -5,8 +5,9 @@ commit or push. The coordinator snapshots the requested input, builds it on one 
 machine, and tests the resulting packages on a different clean machine.
 
 **Current qualification:** the smaller Ubuntu Intel CPU flow has passed locally and in GitHub
-Actions. The first complete nine-suite run returned 63 passes and three harness failures, with
-successful cleanup; fixes are awaiting another native run. Other catalog targets are not
+Actions. The latest complete nine-suite run returned 65 passes and one Hermes file-edit failure.
+Its workers were removed, but an image-tagging mistake also produced a cleanup error; the
+tags are corrected and a clean complete rerun remains required. Other catalog targets are not
 yet ready for routine use. See [coverage and implementation evidence](README.md).
 
 ## Sign in once

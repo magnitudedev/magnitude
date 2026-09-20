@@ -42,7 +42,11 @@ OpenCode declined file access, Hermes wrote a displayed line-number prefix, and 
 copied a numeric marker incorrectly. Fixture requests now specify the absolute path and literal
 replacement arguments; terminal markers use familiar word concatenation. Tool success, exact
 file contents, native interruption and recovery assertions remain unchanged. These clarifications
-still require a complete native rerun. Other platforms and the complete GitHub workflow remain unqualified.
+were exercised in a second complete run: **65 passed, one failed (Hermes file edit)**.
+All OpenCode checks passed. That run also recorded a cleanup inventory error after persistent
+Fedora images were incorrectly tagged as disposable workers. Their ownership tags were corrected
+and the janitor removed the VM; a fresh complete run must pass both tests and cleanup.
+Other platforms and the complete GitHub workflow remain unqualified.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not

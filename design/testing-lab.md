@@ -198,7 +198,9 @@ result and cannot establish acceptance. Reconnecting to wait on an existing run 
 its input or acquires another allocation; reports retain the original run identity.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
 Fresh Azure Linux workers may prepare their trusted runtime through administrator-pinned
-cloud-init configuration or a pinned Ubuntu preparation recipe. The allocator verifies setup
+cloud-init configuration or a pinned Linux preparation recipe. A recipe names its OS distribution
+and version: the allocator rejects a target mismatch before provisioning, and the guest rejects
+an image mismatch before installing dependencies. The allocator verifies setup
 bytes before creating resources and binds the preparation identity to the VM. A renewable recipe
 pins archive identity and issues a fresh one-hour, blob-only read capability per allocation;
 capability renewal does not alter the pinned preparation identity or grant provider credentials.

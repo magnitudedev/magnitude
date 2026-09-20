@@ -145,7 +145,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       const initialization = yield* Option.match(image.initialization, { onNone: () => Effect.void, onSome: setup => Effect.gen(function* () {
         if (image.os !== "Linux") return yield* fail("Cloud initialization is supported only for Linux workers")
         return yield* prepareAzureInitialization(setup, { executable: config.executable, subscription: config.subscription,
-          adminUsername: config.adminUsername, architecture: target.arch }).pipe(
+          adminUsername: config.adminUsername, architecture: target.arch, os: target.os, version: target.version }).pipe(
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, executor))
       }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail("Cannot read configured worker initialization"))) })
       const tags = MachineTags.make({ schemaVersion: 1, runId: lease.runId, leaseId: lease.leaseId, expiresAt: lease.expiresAt })
