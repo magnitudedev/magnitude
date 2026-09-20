@@ -114,8 +114,10 @@ const run = Effect.gen(function* () {
     for (const format of ["deb", "rpm"] as const) artifacts.push((yield* buildLinuxDesktopInstaller({ app, version: compiled.version, revision: compiled.revision,
       arch: target.arch, format, output: join(output, "artifacts") })).artifact)
   } else {
-    const guard = yield* Config.string("LAB_WINDOWS_INSTALL_GUARD")
-    const makensis = yield* Config.string("LAB_WINDOWS_NSIS")
+    const guard = join(output, "MagnitudeInstallGuard.dll")
+    yield* checkedCommand("pwsh.exe", ["-NoProfile", "-NonInteractive", "-File", join(root, "packages/release/scripts/build/windows-installer.ps1"), "-Output", guard],
+      { cwd: Option.some(root), timeoutMs: 10 * 60_000, maxOutputBytes: 8 * 1024 * 1024 })
+    const makensis = "makensis.exe"
     artifacts.push((yield* buildWindowsDesktopInstaller({ app, guard, makensis, version: compiled.version, revision: compiled.revision, output: join(output, "artifacts") })).artifact)
   }
   const manifest = yield* Schema.decodeUnknown(ReleaseManifestSchema)({ schemaVersion: 2, version: compiled.version,

@@ -28,7 +28,13 @@ for (const mode of ["success", "compile-failure", "package-failure", "wrong-prov
     expect(spec.env.LAB_BUILD_BACKEND).toBe(target.backend)
     expect(yield* fs.readFileString(join(Option.getOrThrow(spec.cwd), "dirty.txt"))).toBe("unpublished local change")
     expect(spec.env.HOME).toBe(join(root, "build", "home"))
-    if (phase === "dependencies") expect(spec.args).toEqual(["install", "--frozen-lockfile"])
+    if (phase === "dependencies") {
+      const args = process.platform === "win32"
+        ? yield* Schema.decodeUnknown(Schema.parseJson(Schema.Array(Schema.String)))(Buffer.from(spec.args[spec.args.indexOf("-ArgumentsBase64") + 1]!, "base64").toString())
+        : spec.args
+      expect(args).toEqual(["install", "--frozen-lockfile"])
+      if (process.platform === "win32") expect(spec.executable).toBe("pwsh.exe")
+    }
     const fails = mode === "compile-failure" && phase === "compile" || mode === "package-failure" && phase === "package"
     if (phase === "package" && !fails) {
       const artifact = new TextEncoder().encode("explicit package fixture")

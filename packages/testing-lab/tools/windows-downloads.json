@@ -1,0 +1,72 @@
+{
+  "bun": {
+    "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip",
+    "sha256": "ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405",
+    "bytes": 39807510
+  },
+  "git": {
+    "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/MinGit-2.55.0.5-64-bit.zip",
+    "sha256": "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
+    "bytes": 38989688
+  },
+  "powershell": {
+    "url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x64.zip",
+    "sha256": "02fe458be20493fbdf43f61ea20610b811ee6c738ab1676c61b9cfcd1a33c860",
+    "bytes": 106328873
+  },
+  "ninja": {
+    "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+    "sha256": "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65",
+    "bytes": 291570
+  },
+  "uv": {
+    "url": "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-x86_64-pc-windows-msvc.zip",
+    "sha256": "0a23463216d09c6a72ff80ef5dc5a795f07dc1575cb84d24596c2f124a441b7b",
+    "bytes": 25568726
+  },
+  "pi": {
+    "url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-windows-x64.zip",
+    "sha256": "002fa95b90d521245b9985d8f168caebc237ad56e7e30b319807dee1b2e17e1c",
+    "bytes": 45009021
+  },
+  "opencode": {
+    "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-windows-x64.zip",
+    "sha256": "0ecd7ffc7f26390ce7799e7bcd409e4f11c410144308a6a5b0fcdce63d871006",
+    "bytes": 60718498
+  },
+  "tirith": {
+    "url": "https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-pc-windows-msvc.zip",
+    "sha256": "405aac2815ddf8e1dfd03c914e3cc91b1be21358b2a61bab09c1eae462a89a0b",
+    "bytes": 13928516
+  },
+  "node": {
+    "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip",
+    "sha256": "158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541",
+    "bytes": 37618919
+  },
+  "rustup": {
+    "url": "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-pc-windows-msvc/rustup-init.exe",
+    "sha256": "88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0",
+    "bytes": 13551616
+  },
+  "vsBuildTools": {
+    "url": "https://download.visualstudio.microsoft.com/download/pr/bc92e2cb-33de-4a0c-995d-efa817f16b16/985969f472caad75d993a5cb4c35a6a4271460cc12b343e2433b994d173aa990/vs_BuildTools.exe",
+    "sha256": "985969f472caad75d993a5cb4c35a6a4271460cc12b343e2433b994d173aa990",
+    "bytes": 4478032
+  },
+  "vsChannel": {
+    "url": "https://download.visualstudio.microsoft.com/download/pr/bc92e2cb-33de-4a0c-995d-efa817f16b16/0dbdfd40c17757e64fc9f72cd9954ec8471c04fd8461a77806e5291e23239ac0/VisualStudio.17.Release.chman",
+    "sha256": "fca418ba94ffbcfb7a2b25f10f16f39dd09660568d21eef4bd3f274cb0b27b8c",
+    "bytes": 91781
+  },
+  "cmake": {
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
+    "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
+    "bytes": 54408599
+  },
+  "nsis": {
+    "url": "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip",
+    "sha256": "56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f",
+    "bytes": 2362938
+  }
+}

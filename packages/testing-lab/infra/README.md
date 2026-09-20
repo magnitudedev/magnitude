@@ -3,7 +3,12 @@
 These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13, Fedora 44 and Red Hat 10 CPU
 workers for the existing outward worker protocol. A successful deployment is not proof of
 a completed app test. Debian/Fedora/Red Hat preparation is implemented but awaits complete native app qualification.
-Windows image preparation and GPU driver setup remain separate work.
+Windows runtime/user preparation and GPU driver setup remain separate work. Native Windows
+tool installation is available through `scripts/prepare-windows-tools.ts`: it renders a trusted
+SYSTEM-side script for a disposable x64 guest, with pinned archives, verified VS components and
+OS-partition growth when the allocated disk is larger than the image partition. Its tooling receipt
+is not complete worker readiness. Runtime extraction, Rust/Hermes setup and interactive-user
+preparation still need integration before Windows client targets can be admitted.
 Windows delivery now supports an already prepared interactive desktop user: its configured
 runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
 Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,

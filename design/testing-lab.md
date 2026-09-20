@@ -34,6 +34,9 @@ archives those exact compiled inputs and admits desktop, base and pack bytes tog
 silently substitute a published inference runtime for unpublished source changes.
 The manifest also includes the canonical archive of the bundled service, whose size is consumed
 by ordinary runtime startup. Package admission validates that startup's bundle metadata is complete.
+Windows source phases initialize the compiler through the admitted source's release-owned toolchain
+helper and verify the matching Node import library before native dependency or application builds.
+A preinstalled compiler alone does not establish the required build environment.
 Build receipts bind the snapshot digest, base commit and native host; final manifests and every
 package byte are verified before the installer can consume them. A base commit alone never
 identifies dirty source. Source runs share one producer for each native artifact host and backend within that run.

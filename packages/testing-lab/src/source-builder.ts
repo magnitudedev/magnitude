@@ -48,7 +48,11 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
       })
       const receipts: (typeof Evidence.Type)[] = []
       const invoke = (phase: string, args: readonly string[], extra: Readonly<Record<string, string>> = {}) => Effect.gen(function* () {
-        const result = yield* command(process.execPath, args, { cwd: Option.some(workspace), env: { ...env, ...extra, LAB_BUILD_PHASE: phase },
+        const nativeArgs = process.platform === "win32"
+          ? ["-NoProfile", "-NonInteractive", "-File", join(workspace, "packages/testing-lab/scripts/windows-build.ps1"),
+            "-BunExecutable", process.execPath, "-ArgumentsBase64", Buffer.from(yield* Schema.encode(Schema.parseJson(Schema.Array(Schema.String)))(args)).toString("base64")]
+          : args
+        const result = yield* command(process.platform === "win32" ? "pwsh.exe" : process.execPath, nativeArgs, { cwd: Option.some(workspace), env: { ...env, ...extra, LAB_BUILD_PHASE: phase },
           inheritEnv: false, timeoutMs: 60 * 60_000, maxOutputBytes: 32 * 1024 * 1024 }).pipe(Effect.provideService(ProcessExecutor, executor))
         receipts.push(yield* record(phase, result))
         if (result.exitCode !== 0) return yield* new AssertionFailure({ message: `Source ${phase} exited ${result.exitCode}: ${(result.stderr || result.stdout).slice(-1800)}` })
