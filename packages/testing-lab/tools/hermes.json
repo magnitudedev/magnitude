@@ -1,0 +1,20 @@
+{
+  "version": "0.21.3",
+  "repository": "https://github.com/NousResearch/hermes-agent.git",
+  "commit": "a11bac476bb2a2129fdffca9511d41260fa5f51f",
+  "tirith": {
+    "version": "0.4.2",
+    "downloads": {
+      "x64": {
+        "url": "https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77",
+        "bytes": 15821759
+      },
+      "arm64": {
+        "url": "https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569",
+        "bytes": 14504964
+      }
+    }
+  }
+}

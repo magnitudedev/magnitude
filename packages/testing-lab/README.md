@@ -16,6 +16,18 @@ its terminal diagnostic after cleanup, verified through the ordinary evidence AP
 its Azure resources. Remaining functional cases and other platform images are still required
 before the full matrix is usable. These results qualify the selected Ubuntu flow, not every catalog target.
 
+An expanded Ubuntu artifact run now returns all 46 selected results: 42 passed, one app
+error-presentation check failed, and three OpenCode streaming/session checks remain blocked.
+Its 104 evidence objects (including an empty log) were downloaded and hash-verified after
+worker cleanup. Pi and OpenCode terminal interaction, all recovery scenarios and bundled CLI
+checks passed in that run. Hermes, updates and uninstall were not selected, and this artifact
+run did not compile source. The UI assertion is now fixed and locally tested. OpenCode streaming,
+real tool use and process-restart recovery have subsequently passed against the packaged Mac app.
+Pinned Hermes has also passed programmatic generation/tools/resume and interactive keyboard
+selection, interruption, recovery and normal exit against that app. These changes are wired into
+the worker but have not yet passed the combined Azure run. Update and uninstall completion,
+then qualification of the remaining machines, are still outstanding.
+
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
 mean its provider image or backend has been qualified.

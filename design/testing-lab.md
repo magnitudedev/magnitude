@@ -106,7 +106,11 @@ The nine suites are package, install, app, endpoint, harness, recovery, CLI, upd
 Pi, OpenCode and Hermes are the initial harnesses. Configuration must be produced through the
 product's Connections surface. Bundled CLI connection acceptance additionally exercises
 add, sync, removal and reconnection, inspecting the actual harness configuration after each
-mutation. Command success alone cannot establish endpoint correctness or preservation of
+mutation. Hermes first-run qualification explicitly selects its default model using the bundled
+CLI after UI connection; this tests the existing user action without changing the UI connection
+policy. Its worker installation pins the upstream source and dependencies, including its native
+command scanner, so scanner startup diagnostics cannot masquerade as JSON generation events.
+Command success alone cannot establish endpoint correctness or preservation of
 unrelated provider settings. Endpoint and harness tests attest the requested backend/device;
 CPU fallback fails a Metal/CUDA target. Host identity is collected from native OS and device
 interfaces before test execution; a Windows Server build cannot qualify a Windows client target.
@@ -364,6 +368,14 @@ an exported abort error for that same message, and a distinct completed recovery
 same session. Presentation labels may guide the pinned third-party picker, but canonical native
 provider/model IDs decide acceptance. Failed terminal journeys capture the rendered screen before
 cleanup restores the alternate screen.
+Hermes uses its native end-of-turn observer to distinguish keyboard interruption from completion,
+with distinct turn IDs in the same session (the task ID may remain stable). The interrupted text
+must render before Ctrl-C and be absent from echoed input. Hermes persists an interruption notice,
+so its first assistant record has no successful finish reason; the second must finish with stop and
+contain the rendered recovery answer. The exported billing endpoint must be the local application.
+The observer and streaming display setting are scoped to the privately owned harness home and
+restore its exact configuration after terminal cleanup. Missing or truncated native lifecycle
+records fail acceptance; forced cleanup cannot satisfy normal exit.
 Error scenarios preserve malformed harness files and restore the original fixture bytes
 even after failed assertions. Visible error messages and file-specific repair guidance
 may occupy separate elements. Service failure injection owns only an isolated loopback

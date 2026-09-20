@@ -7,6 +7,7 @@ import { fileFixture } from "./file-fixture"
 import { piSession } from "./pi"
 import { openCode } from "./opencode"
 import { hermes } from "./hermes"
+import { hermesInstallation } from "./installation"
 
 export interface HarnessTools { readonly executable: (harness: Harness) => Effect.Effect<string, InfrastructureFailure> }
 export const HarnessTools = Context.GenericTag<HarnessTools>("@magnitudedev/testing-lab/HarnessTools")
@@ -22,7 +23,7 @@ export const configuredHarnessTools = Layer.effect(HarnessTools, Effect.gen(func
 export const HarnessTurn = Schema.Struct({ sessionId: Schema.NonEmptyString, text: Schema.NonEmptyString,
   streamed: Schema.Boolean, tools: Schema.Array(Schema.String) })
 const fail = (message: string) => new AssertionFailure({ message })
-const versions = { pi: "0.85.1", opencode: "1.18.31", hermes: "0.21.3" } as const
+const versions = { pi: "0.85.1", opencode: "1.18.31", hermes: hermesInstallation.version } as const
 export const harnessSuite = (harness: Harness, model: string, root: string, home: string, environment: Readonly<Record<string, string>>) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executable = yield* (yield* HarnessTools).executable(harness)
@@ -30,7 +31,7 @@ export const harnessSuite = (harness: Harness, model: string, root: string, home
   yield* fs.makeDirectory(evidence, { recursive: true })
   const env = { ...environment, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, ".config"),
     XDG_DATA_HOME: join(home, ".local", "share"), XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
-    PI_CODING_AGENT_DIR: join(home, ".pi", "agent") }
+    PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), HERMES_HOME: join(home, ".hermes") }
   const version = yield* command(executable, ["--version"], { env, inheritEnv: false, timeoutMs: 30_000 })
   if (version.exitCode !== 0 || !new RegExp(`(?:^|[^0-9.])${versions[harness].replaceAll(".", "\\.")}(?:$|[^0-9.])`).test(version.stdout)) {
     return yield* new InfrastructureFailure({ operation: "harness-tools", message: `Expected pinned ${harness} ${versions[harness]}; worker tool is missing or differs` })

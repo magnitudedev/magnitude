@@ -3,6 +3,8 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Layer, Schema } from "effect"
 import { dirname, join } from "node:path"
 import { DesktopDriver, playwrightDesktop } from "../src/desktop-driver"
+import { hermesTerminal } from "../src/harnesses/hermes-terminal"
+import { checkedCommand } from "../src/process"
 import { piTerminal } from "../src/harnesses/pi-terminal"
 import { openCodeModelName, openCodeTerminal } from "../src/harnesses/opencode-terminal"
 import { HarnessTerminalReceipt } from "../src/harnesses/terminal"
@@ -14,7 +16,7 @@ import { AssertionFailure } from "../src/domain"
 BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   yield* assertRuntime
   const root = yield* Config.string("LAB_PROBE_ROOT"), executable = yield* Config.string("LAB_PROBE_EXECUTABLE")
-  const harness = yield* Config.literal("pi", "opencode")("LAB_PROBE_HARNESS")
+  const harness = yield* Config.literal("pi", "opencode", "hermes")("LAB_PROBE_HARNESS")
   const runtime = yield* Config.string("LAB_TERMINAL_NODE_EXECUTABLE"), client = yield* Config.string(`LAB_${harness.toUpperCase()}_EXECUTABLE`)
   const model = yield* Config.string("LAB_PROBE_MODEL_ID")
   const port = yield* Config.integer("LAB_PROBE_PORT").pipe(Config.withDefault(11339))
@@ -34,14 +36,16 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
     yield* desktop.search(model)
     yield* desktop.load(model)
     yield* desktop.connect(harness)
+    if (harness === "hermes") yield* checkedCommand(yield* Config.string("LAB_PROBE_BUNDLED_CLI"), ["connections", "add", "hermes", "--set-model", model], { env: environment, inheritEnv: false })
     const home = join(root, "profile", "harness-home")
     const first = crypto.randomUUID().replaceAll("-", "").slice(0, 8), second = crypto.randomUUID().replaceAll("-", "").slice(0, 8)
     const config = { runtime, executable: client, cwd: evidence, evidence: join(evidence, "terminal"),
-      environment: { ...environment, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+      environment: { ...environment, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), HERMES_HOME: join(home, ".hermes"),
         XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"), XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state") }, model, initialModel: model,
       interrupt: { prompt: `First concatenate READY and ${first} without a space and print that word. Then count from 1 to 10000, one number per line. Do not use tools.`, expected: `READY${first}` },
       recovery: { prompt: `Concatenate DONE and ${second} without a space. Reply only with the resulting word. Do not use tools.`, expected: `DONE${second}` },
     }
+    if (harness === "hermes") return yield* hermesTerminal({ ...config, endpoint: `http://127.0.0.1:${port}/inference/v1` }, message => { cleanup.push(message) })
     if (harness === "pi") return yield* piTerminal(config, message => { cleanup.push(message) })
     const name = yield* openCodeModelName(home, model)
     return yield* openCodeTerminal({ ...config, modelName: name, initialModelName: name }, message => { cleanup.push(message) })
@@ -54,6 +58,6 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
     receipts: result._tag === "Right" ? [result.right] : [],
   }))
   yield* Effect.logInfo(`${harness} terminal evidence: ${evidence}`)
-  if (result._tag === "Left") return yield* result.left
+  if (result._tag === "Left") return yield* Effect.fail(result.left)
   if (cleanup.length) return yield* new AssertionFailure({ message: "Harness terminal cleanup failed" })
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive, NativeTerminalDriver.pipe(Layer.provide(BunContext.layer))])))

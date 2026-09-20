@@ -32,7 +32,7 @@ import { GenerationExecution, observeGeneration } from "./generation-evidence"
 import { admittedRuntimeModules, attestRuntimeModules } from "./runtime-modules"
 import { NodeArchiveExtractor } from "../../release/src/archive"
 import { Installer } from "./installer"
-import { ProcessExecutor } from "./process"
+import { command, CommandOutput, ProcessExecutor } from "./process"
 import { sha256 } from "./snapshot"
 import { publishEvidenceFile } from "./evidence"
 import { inspectPackageIdentity, PackageIdentity } from "./suites/package"
@@ -44,6 +44,7 @@ import { rejectCorruptInstaller } from "./suites/install"
 import { connectionFixture, ConnectionReceipt } from "./harnesses/connection-fixture"
 import { Harness } from "./domain"
 import { harnessSuite, HarnessTools, HarnessTurn } from "./harnesses/suite"
+import { hermesTerminal } from "./harnesses/hermes-terminal"
 import { piTerminal } from "./harnesses/pi-terminal"
 import { openCodeModelName, openCodeTerminal } from "./harnesses/opencode-terminal"
 import { HarnessTerminalReceipt } from "./harnesses/terminal"
@@ -71,6 +72,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
   const target = assignment.target.target
   const cleanupErrors: string[] = []
   const diagnostics = new Map<string, typeof Evidence.Type>()
+  const harnessSetupEvidence: (typeof Evidence.Type)[] = []
   const backendEvidence: (typeof Evidence.Type)[] = []
   const recoveryEvidence: (typeof Evidence.Type)[] = []
   const offlineEvidence: (typeof Evidence.Type)[] = []
@@ -157,8 +159,19 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     }))
     const tools = yield* Effect.serviceOption(HarnessTools)
     const harnessSuites = new Map<Harness, ReturnType<typeof harnessSuite>>()
-    for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(candidateEnvironment.pipe(Effect.flatMap(prepared => harnessSuite(harness, config.model,
-      join(evidenceDirectory, "harness", harness), application.harnessHome, prepared)))))
+    for (const harness of harnesses) harnessSuites.set(harness, yield* Effect.cached(Effect.gen(function* () {
+      const prepared = yield* candidateEnvironment
+      if (harness === "hermes") {
+        // Hermes's first-run guard requires an explicit default selection even when the
+        // provider was connected through the UI. Exercise the product's existing command.
+        const selected = yield* command((yield* installed).cli, ["connections", "add", "hermes", "--set-model", config.model], {
+          env: prepared, inheritEnv: false, timeoutMs: 60_000,
+        })
+        harnessSetupEvidence.push(yield* evidence("H1-hermes-model-selection.json", CommandOutput, selected))
+        if (selected.exitCode !== 0) return yield* new AssertionFailure({ message: "Bundled CLI could not select the Hermes model; inspect retained setup output" })
+      }
+      return yield* harnessSuite(harness, config.model, join(evidenceDirectory, "harness", harness), application.harnessHome, prepared)
+    })))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
       if (fixtureCleanupFailed) return yield* unavailable("Native fixture restoration failed; refusing further operations on an uncertain installation")
       switch (test.id as string) {
@@ -400,7 +413,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             yield* evidence(`${test.id}-${test.harness.value}-turn.json`, HarnessTurn, turn)] })
         }
         case "H7": {
-          if (Option.isNone(test.harness) || test.harness.value === "hermes") return yield* unavailable("Interactive terminal qualification is not yet implemented for this harness")
+          if (Option.isNone(test.harness)) return yield* unavailable("Interactive terminal qualification requires a harness selection")
           const harness = test.harness.value
           const terminal = yield* Effect.serviceOption(TerminalDriver)
           const runtime = config.environment.LAB_TERMINAL_NODE_EXECUTABLE
@@ -411,7 +424,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const first = crypto.randomUUID().replaceAll("-", "").slice(0, 8), second = crypto.randomUUID().replaceAll("-", "").slice(0, 8)
           const terminalConfig = { executable: yield* tools.value.executable(harness), runtime,
             cwd: config.root, evidence: join(evidenceDirectory, "harness", harness, "terminal"), model: config.model, initialModel: config.model,
-            environment: { ...prepared, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+            environment: { ...prepared, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), HERMES_HOME: join(home, ".hermes"),
               XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
               XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
               PATH: `${dirname(runtime)}${target.os === "windows" ? ";" : ":"}${prepared.PATH ?? ""}` },
@@ -419,7 +432,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             recovery: { prompt: `Concatenate DONE and ${second} without a space. Reply only with the resulting word. Do not use tools.`, expected: `DONE${second}` },
           }
           const cleanup = (message: string) => { cleanupErrors.push(`${harness} terminal: ${message}`) }
-          const journey = harness === "pi" ? piTerminal(terminalConfig, cleanup) : openCodeModelName(home, config.model).pipe(
+          const journey = harness === "hermes" ? hermesTerminal({ ...terminalConfig, endpoint: `http://127.0.0.1:${application.port}/inference/v1` }, cleanup)
+            : harness === "pi" ? piTerminal(terminalConfig, cleanup) : openCodeModelName(home, config.model).pipe(
             Effect.flatMap(name => openCodeTerminal({ ...terminalConfig, modelName: name, initialModelName: name }, cleanup)))
           const receipt = yield* journey.pipe(Effect.provideService(TerminalDriver, terminal.value),
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
@@ -483,7 +497,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
 
-      const refs = [...result.evidence, applicationEvidence, ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
+      const refs = [...result.evidence, applicationEvidence, ...(result.harness._tag === "Some" && result.harness.value === "hermes" ? harnessSetupEvidence : []), ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })
@@ -541,7 +555,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     else if (cliCase) for (const name of names) yield* exportFile(`cli/${name}`, cliCase.caseId, 32 * 1024 * 1024, Option.getOrUndefined(cliCase.harness))
   }
   for (const harness of Harness.literals) {
-    for (const file of ["session.jsonl", "aborted.session.json", "recovered.session.json", "streaming.json", "recovered.json", "terminal-output.txt", "terminal-screen.json", "failure-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {
+    for (const file of ["session.jsonl", "lifecycle.jsonl", "selected-model.json", "aborted.session.json", "recovered.session.json", "streaming.json", "recovered.json", "terminal-output.txt", "terminal-screen.json", "failure-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {
       const relative = `harness/${harness}/terminal/${file}`
       if (yield* fs.exists(join(evidenceDirectory, relative))) yield* exportFile(relative, "H7", 32 * 1024 * 1024, harness)
     }
