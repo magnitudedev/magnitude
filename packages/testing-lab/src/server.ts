@@ -4,7 +4,7 @@ import { Config, Console, Context, Effect, Layer, Option, Redacted, Schema } fro
 import { Authenticator, bearerAuthenticator } from "./api"
 import { EntraAuthConfig, entraAuthenticator } from "./entra-auth"
 import { GitHubAuthConfig, githubAuthenticator } from "./github-auth"
-import { fileArtifactStore } from "./artifact-store"
+import { ArtifactStore, fileArtifactStore } from "./artifact-store"
 import { startCoordinator, CoordinatorConfig } from "./coordinator"
 import { databaseLayer } from "./database"
 import { InfrastructureFailure, InvalidInput, Principal, Provider } from "./domain"
@@ -55,14 +55,15 @@ export const configuredCoordinator = Effect.gen(function* () {
     Effect.catchAll(error => Option.isSome(entra) ? entra.value.authenticate(header) : Effect.fail(error)),
   ) })
   const database = databaseLayer(yield* Config.redacted("LAB_DATABASE_URL"))
-  const storage = config.storage.kind === "file" ? fileArtifactStore(config.storage.directory) : azureArtifactStore(config.storage.config).pipe(Layer.provide(FetchHttpClient.layer))
+  const storageConfig = config.storage.kind === "file" ? fileArtifactStore(config.storage.directory) : azureArtifactStore(config.storage.config).pipe(Layer.provide(FetchHttpClient.layer))
+  const storage = Layer.succeed(ArtifactStore, Context.get(yield* Layer.build(storageConfig), ArtifactStore))
   const allocators = new Map<typeof Provider.Type, MachineAllocator>(), transports = new Map<typeof Provider.Type, WorkerTransport>()
   if (Option.isSome(config.namespace)) {
     const namespace = config.namespace.value
     allocators.set("namespace", Context.get(yield* Layer.build(namespaceAllocator(namespace.executable, namespace.images)), MachineAllocator))
     transports.set("namespace", Context.get(yield* Layer.build(namespaceTransport(namespace.executable)), WorkerTransport))
   }
-  if (Option.isSome(config.azure)) allocators.set("azure", Context.get(yield* Layer.build(azureAllocator(config.azure.value.allocation)), MachineAllocator))
+  if (Option.isSome(config.azure)) allocators.set("azure", Context.get(yield* Layer.build(azureAllocator(config.azure.value.allocation).pipe(Layer.provide(storage))), MachineAllocator))
   const runner = Layer.scoped(WorkerRunner, Effect.gen(function* () {
     const byProvider = new Map<typeof Provider.Type, WorkerRunner>()
     if (Option.isSome(config.namespace)) byProvider.set("namespace", Context.get(yield* Layer.build(transportWorkerRunner(config.runtimes.filter(runtime => runtime.provider === "namespace")).pipe(

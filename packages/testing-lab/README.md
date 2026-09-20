@@ -6,19 +6,32 @@ coordinator's HTTPS API has been verified with Entra authentication and private 
 The ordinary artifact-only CLI path has passed 23 Ubuntu 24.04 Intel CPU checks covering
 installation, app model acquisition, Pi connections, real endpoint generation and bundled CLI
 behavior, with JSON/JUnit, authenticated evidence download and verified worker cleanup.
-Separate source producers/clean consumers are implemented and deployed. A normal source run
-compiled successfully but exposed a packaging permission bug; the corrected flow is being
-qualified. Remaining cases, other image qualification and a real CI workflow run are still
-required before the full target matrix can execute.
+The local unpublished-source path and the real GitHub workflow have also passed those 23
+checks: a producer compiles and packages, then a different clean consumer installs the exact
+artifact graph. Both returned passing JSON/JUnit and released their workers. The GitHub run
+also retained 41 independently hash-verified evidence objects. A real coordinator restart
+recovered the same run onto a fresh worker and passed all 23 checks. Setup-failure evidence
+remains downloadable after worker deletion; cancelling a real GitHub build also cleaned up
+its Azure resources. Remaining functional cases and other platform images are still required
+before the full matrix is usable. These results qualify the selected Ubuntu flow, not every catalog target.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
 mean its provider image or backend has been qualified.
 
+The currently qualified path is Ubuntu 24.04 Intel CPU. From the repository root, after
+Azure CLI login to the Magnitude tenant:
+
 ```sh
-bun lab run --source . --target macos-26-arm64-metal-apple-silicon
-bun lab run --source . --profile pr --concurrency 4 --budget 150
-bun lab run --artifacts ./dist/release-manifest.json --target macos-15-arm64-metal-apple-silicon
+export LAB_URL=https://magnitude-lab.lemonpebble-25e896b9.westus2.azurecontainerapps.io
+export LAB_AUTH=entra
+export LAB_ENTRA_TENANT=4581d4bf-a664-4a42-a66a-c842beeec9e7
+export LAB_ENTRA_APPLICATION=b47912ec-a3bb-49f4-ac37-25e06b4f7743
+bun lab run --source . --target ubuntu-24.04-x64-cpu-intel \
+  --suite install,endpoint,cli --harness pi --deadline 180 --budget 25 \
+  --json /tmp/lab-results.json --junit /tmp/lab-junit.xml
+bun lab run --artifacts ./dist/release-manifest.json \
+  --target ubuntu-24.04-x64-cpu-intel --suite install,endpoint,cli --harness pi
 bun lab status --run run-<uuid>
 bun lab wait --run run-<uuid> --json out/run.json --junit out/junit.xml
 bun lab results --run run-<uuid>
@@ -26,7 +39,7 @@ bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-tra
 bun lab cancel --run run-<uuid>
 ```
 
-`LAB_URL` and `LAB_TOKEN` select an authenticated coordinator. The CLI obtains owner/trust
+`LAB_URL` and the selected authentication method identify the coordinator. The CLI obtains owner/trust
 from `/v1/me`, snapshots dirty source and initialized submodules, queries which source objects
 are missing, uploads only those objects, registers the immutable input and submits the run.
 No commit or push is required. Interrupting the waiting CLI leaves the remote run running;
@@ -50,7 +63,7 @@ been connected. Never present an iteration result as a fresh installer qualifica
 The API offers targets, planning, immutable object transfer/input registration, submission,
 status, results and cancellation. Authentication supports server-mapped credentials and
 Entra/GitHub OIDC. Live Entra acquisition and verification have passed against the deployed
-coordinator; an actual GitHub workflow run remains unqualified.
+coordinator. GitHub OIDC has also authenticated a successful real workflow run.
 Owner/trust cannot be escalated by submitting different request fields. PostgreSQL owns run,
 work-attempt and lease state with fencing and bounded infrastructure retries. Test dependencies
 are ordered per harness; a failed prerequisite blocks dependent cases while independent checks

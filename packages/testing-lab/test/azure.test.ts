@@ -2,8 +2,8 @@ import { Fence } from "../src/lease"
 import { WorkId } from "../src/work-identity"
 import { expect, test } from "vitest"
 import { BunContext } from "@effect/platform-bun"
-import { DateTime, Effect, Layer, Option, Schema } from "effect"
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { sha256 } from "../src/snapshot"
@@ -13,6 +13,8 @@ import { MachineAllocator, MachineTags } from "../src/machines"
 import { Allocating } from "../src/lease"
 import { targets } from "../src/catalog"
 import { LeaseId, RunId } from "../src/domain"
+import { ArtifactStore } from "../src/artifact-store"
+import { InitializationDiagnostic } from "../src/providers/initialization-diagnostics"
 const target = targets.find(t => t.os === "ubuntu" && t.hardware === "intel")!
 const subscription = "5304c4b3-d605-4193-b0cb-766c065acfa6"
 const group = `/subscriptions/${subscription}/resourceGroups/magnitude-ci`
@@ -29,9 +31,14 @@ const tags = (l: Allocating) => ({ "lab-owner": "magnitude-testing-lab-v1", "lab
 const resource = (l: Allocating, nic = false) => ({ id: nic ? nicId : vmId, name: nic ? `${name}-nic` : name,
   type: nic ? "Microsoft.Network/networkInterfaces" : "Microsoft.Compute/virtualMachines", tags: tags(l) })
 const output = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: "", exitCode: 0 })
-const run = <A, E>(effect: Effect.Effect<A, E, MachineAllocator>, handler: (spec: CommandSpec) => ReturnType<typeof output>, settings = config) => {
+const run = <A, E>(effect: Effect.Effect<A, E, MachineAllocator>, handler: (spec: CommandSpec) => ReturnType<typeof output>, settings = config, artifacts = new Map<string, Uint8Array>()) => {
   const processes = Layer.succeed(ProcessExecutor, { run: (c: CommandSpec) => Effect.sync(() => handler(c)) })
-  const allocator = azureAllocator(settings).pipe(Layer.provide(Layer.merge(BunContext.layer, processes)))
+  const objects = Layer.succeed(ArtifactStore, { put: (digest, stream) => Effect.gen(function* () {
+    const bytes = Buffer.concat(Array.from(yield* Stream.runCollect(stream)))
+    expect(sha256(bytes)).toBe(digest)
+    artifacts.set(digest, bytes)
+  }), get: digest => Stream.make(artifacts.get(digest)!), exists: digest => Effect.succeed(artifacts.has(digest)) })
+  const allocator = azureAllocator(settings).pipe(Layer.provide(Layer.mergeAll(BunContext.layer, processes, objects)))
   return Effect.runPromise(effect.pipe(Effect.provide(allocator)))
 }
 test("creates private resources in the explicit subscription and reconciles ambiguous VM creation", async () => {
@@ -98,13 +105,14 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
       const settings = { ...config, images: [{ ...config.images[0]!, initialization: Option.some({ file, sha256: digest }) }] }
       const l = lease(), rows: ReturnType<typeof resource>[] = []
       let requests = 0, launched = false, observed = false, diagnostics = false
+      const artifacts = new Map<string, Uint8Array>()
       const result = await run(Effect.flatMap(MachineAllocator, a => a.ensure(l, target)).pipe(Effect.either), spec => {
         requests++
         if (spec.args[0] === "resource") return output(rows)
         if (spec.args[0] === "vm") {
           diagnostics = true
           expect(spec.args).toContain("tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json")
-          return output({ value: [{ message: "private setup diagnostic" }] })
+          return output({ value: [{ message: 'setup diagnostic: https://user:private-password@account.blob.core.windows.net/archive?sig=private-signature Bearer private-token\n{"password":"private-json-password with spaces"}\nLAB_WORKER_TOKEN=private-env-token' }] })
         }
         const method = spec.args[spec.args.indexOf("--method") + 1], url = spec.args[spec.args.indexOf("--url") + 1]!
         if (url.includes("/runCommands/")) {
@@ -133,17 +141,21 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
           rows.push(resource(l))
         }
         return output({})
-      }, settings)
+      }, settings, artifacts)
       expect(result._tag).toBe(mode === "ready" ? "Right" : "Left")
       if (mode === "changed-file" || mode === "oversized") expect(requests).toBe(0)
       else if (mode === "wrong-identity") expect(launched).toBe(false)
       else expect(observed).toBe(true)
       if (diagnostics && result._tag === "Left") {
-        expect(result.left.message).not.toContain("private setup diagnostic")
-        const file = result.left.message.split("private diagnostics: ")[1]!
-        expect(statSync(file).mode & 0o777).toBe(0o600)
-        expect(readFileSync(file, "utf8")).toContain("private setup diagnostic")
-        rmSync(file.slice(0, file.lastIndexOf("/")), { recursive: true, force: true })
+        expect(result.left.message).toContain("retained in run evidence")
+        const evidence = Option.getOrThrow(result.left.evidence)[0]!
+        const bytes = artifacts.get(evidence.sha256)!
+        expect(bytes.byteLength).toBe(evidence.bytes)
+        const retained = Schema.decodeUnknownSync(Schema.parseJson(InitializationDiagnostic))(Buffer.from(bytes).toString())
+        expect(retained.leaseId).toBe(l.leaseId)
+        expect(retained.runId).toBe(l.runId)
+        expect(retained.output).toContain("setup diagnostic:")
+        expect(retained.output).not.toContain("private-")
       }
     } finally { rmSync(directory, { recursive: true, force: true }) }
   })

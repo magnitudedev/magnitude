@@ -93,6 +93,7 @@ export type RunResult = typeof RunResult.Type
 export class InvalidInput extends Schema.TaggedError<InvalidInput>()("InvalidInput", { message: Schema.String }) {}
 export class InfrastructureFailure extends Schema.TaggedError<InfrastructureFailure>()("InfrastructureFailure", {
   operation: Schema.String, message: Schema.String,
+  evidence: Schema.optionalWith(Schema.Array(Evidence), { as: "Option", exact: true }).pipe(Schema.withConstructorDefault(() => Option.none())),
 }) {}
 export class AssertionFailure extends Schema.TaggedError<AssertionFailure>()("AssertionFailure", {
   message: Schema.String,

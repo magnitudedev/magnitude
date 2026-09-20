@@ -11,6 +11,7 @@ import { MachineAllocator } from "../src/machines"
 import { azureAllocator, AzureConfig } from "../src/providers/azure"
 import { checkedCommand, ProcessExecutorLive } from "../src/process"
 import { assertRuntime } from "../src/runtime"
+import { fileArtifactStore } from "../src/artifact-store"
 import { windowsSignatureScript, WindowsSignatureObservation } from "../src/suites/windows-package-trust"
 
 // Native inspection diagnostic only. A Server image cannot qualify a Windows client target.
@@ -23,7 +24,7 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   const target = yield* findTarget(TargetId.make(yield* Config.string("LAB_AZURE_TARGET")))
   if (target.os !== "windows" || target.backend !== "cpu" || !["intel", "amd"].includes(target.hardware)) return yield* failure("Diagnostic requires a Windows CPU allocation")
   yield* fs.makeDirectory(root, { recursive: true })
-  const allocator = Context.get(yield* Layer.build(azureAllocator(config)), MachineAllocator)
+  const allocator = Context.get(yield* Layer.build(azureAllocator(config).pipe(Layer.provide(fileArtifactStore(join(root, "diagnostics"))))), MachineAllocator)
   const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
     provider: "azure", resourceName: `ml-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, expiresAt: DateTime.unsafeMake(Date.now() + 60 * 60_000) })
   yield* fs.writeFileString(join(root, "lease.json"), yield* Schema.encode(Schema.parseJson(Allocating))(lease), { flag: "wx" })

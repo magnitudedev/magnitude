@@ -2,7 +2,8 @@ import { expect, test } from "vitest"
 import { BunContext } from "@effect/platform-bun"
 import { DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { initializeDatabase } from "../src/database"
-import { InfrastructureFailure, RunRequest } from "../src/domain"
+import { Evidence, InfrastructureFailure, RunRequest } from "../src/domain"
+import { sha256 } from "../src/snapshot"
 import { planRun } from "../src/catalog"
 import { LeaseStore } from "../src/lease"
 import { LeaseStoreLive } from "../src/lease-store"
@@ -23,6 +24,7 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout" | 
     const started = yield* Deferred.make<void>()
     const inventory: Machine[] = []
     let allocations = 0, removals = 0
+    const diagnostic = Evidence.make({ path: "evidence/initialization.json", sha256: sha256("log"), bytes: 3 })
     const allocator: MachineAllocator = {
       inventory: () => Effect.sync(() => [...inventory]),
       ensure: (lease, target) => Effect.gen(function* () {
@@ -30,7 +32,7 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout" | 
         const machine: Machine = { provider: "azure", id: "fixture-vm", name: lease.resourceName,
           tags: { schemaVersion: 1, runId: lease.runId, leaseId: lease.leaseId, expiresAt: lease.expiresAt } }
         inventory.push(machine); allocations++
-        if (mode === "ambiguous") return yield* new InfrastructureFailure({ operation: "fixture-create", message: "Connection failed after allocation" })
+        if (mode === "ambiguous") return yield* new InfrastructureFailure({ operation: "fixture-create", message: "Connection failed after allocation", evidence: Option.some([diagnostic]) })
         expect(target.id).toBe(lease.targetId)
         return machine
       }),
@@ -83,7 +85,10 @@ const fixture = (mode: "success" | "ambiguous" | "cancel" | "cleanup-timeout" | 
       expect((yield* leases.list()).every(l => l.state._tag === "Released")).toBe(true)
       const result = Option.getOrThrow(yield* runs.result(run.state.runId))
       expect(result.cases.every(c => c.outcome.status === (mode === "success" ? "passed" : mode === "ambiguous" ? "blocked" : "cancelled"))).toBe(true)
-      if (mode === "ambiguous") expect(result.cases[0]?.outcome.detail).toContain("Connection failed after allocation")
+      if (mode === "ambiguous") {
+        expect(result.cases[0]?.outcome.detail).toContain("Connection failed after allocation")
+        expect(result.cases.every(test => test.evidence[0]?.sha256 === diagnostic.sha256)).toBe(true)
+      }
     }).pipe(Effect.provide(schedulerLayer(mode === "cleanup-timeout" ? "100 millis" : "20 minutes").pipe(Layer.provide(Layer.mergeAll(stores,
       Layer.succeed(MachineProviders, { allocators: new Map([["azure" as const, allocator]]) }), Layer.succeed(WorkerRunner, runner))))))
   }).pipe(Effect.provide(stores))

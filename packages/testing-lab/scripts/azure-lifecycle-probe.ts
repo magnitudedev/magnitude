@@ -14,6 +14,7 @@ import { azureLinuxBootstrap } from "../src/providers/azure-bootstrap"
 import { WorkerLaunch } from "../src/outward-runner"
 import { sha256 } from "../src/snapshot"
 import { assertRuntime } from "../src/runtime"
+import { fileArtifactStore } from "../src/artifact-store"
 
 const fail = (message: string) => new InfrastructureFailure({ operation: "azure-probe", message })
 BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
@@ -24,7 +25,7 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
   const target = yield* findTarget(TargetId.make(yield* Config.string("LAB_AZURE_TARGET")))
   if (target.os !== "ubuntu" || target.arch !== "x64" || target.hardware !== "intel") return yield* fail("This diagnostic qualifies Ubuntu x64 Intel provisioning only")
   yield* fs.makeDirectory(root, { recursive: true })
-  const allocator = Context.get(yield* Layer.build(azureAllocator(config)), MachineAllocator)
+  const allocator = Context.get(yield* Layer.build(azureAllocator(config).pipe(Layer.provide(fileArtifactStore(join(root, "diagnostics"))))), MachineAllocator)
   const lease = new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
     provider: "azure", resourceName: `ml-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, expiresAt: DateTime.unsafeMake(Date.now() + 60 * 60_000) })
   yield* fs.writeFileString(join(root, "lease.json"), yield* Schema.encode(Schema.parseJson(Allocating))(lease))

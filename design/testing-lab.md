@@ -194,7 +194,11 @@ Fatal cloud-init errors or a missing receipt fail admission. Recoverable platfor
 retained in detailed status and cannot substitute for the lab's successful completion receipt.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
-is delivered only after preparation. Preparation failures retain normal lease cleanup ownership.
+is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,
+the coordinator stores bounded setup diagnostics in the artifact store, redacting credentials
+and URL capabilities. Completed blocked cases reference those objects, so the run owner can
+retrieve them after the guest is deleted. Diagnostic collection failure remains visible and
+cannot suppress cleanup or turn preparation failure into success.
 Run and provider credentials must not appear in command arguments, script text or returned provider errors;
 temporary delivery files are private and scoped. Guest launch uses the intended application
 user and a qualified display environment. Service-session execution cannot qualify an

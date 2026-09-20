@@ -6,6 +6,8 @@ import { AzureMachine, MachineAllocator, MachineTags } from "../machines"
 import { checkedCommand, ProcessExecutor } from "../process"
 import { AzureInitialization, prepareAzureInitialization } from "./azure-initialization"
 import { azureInitializationWait } from "./azure-readiness"
+import { ArtifactStore } from "../artifact-store"
+import { retainInitializationDiagnostic } from "./initialization-diagnostics"
 
 const vmApi = "2024-11-01"
 const nicApi = "2024-05-01"
@@ -37,6 +39,7 @@ const VmObservation = Schema.Struct({ properties: Schema.Struct({ provisioningSt
 export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAllocator, Effect.gen(function* () {
   const executor = yield* ProcessExecutor
   const fs = yield* FileSystem.FileSystem
+  const objects = yield* ArtifactStore
   const checked = (...args: Parameters<typeof checkedCommand>) => checkedCommand(...args).pipe(Effect.provideService(ProcessExecutor, executor))
   const groupId = `/subscriptions/${config.subscription}/resourceGroups/${config.resourceGroup}`
   if (!config.subnetId.toLowerCase().startsWith(`${groupId}/providers/microsoft.network/virtualnetworks/`.toLowerCase())) return yield* fail("Worker subnet must belong to the configured subscription and resource group")
@@ -120,16 +123,13 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
     Effect.timeoutFail({ duration: Math.max(1, Math.min(20 * 60_000, DateTime.toEpochMillis(machine.tags.expiresAt) - Date.now())),
     onTimeout: () => fail("Worker initialization exceeded its deadline; allocation remains owned for cleanup") }))
   const initializationDiagnostics = (machine: typeof AzureMachine.Type) => Effect.gen(function* () {
-    // Retain private bounded diagnostics before the scheduler deletes a failed allocation.
-    // Do not put guest output in returned errors: administrator setup may log private URLs.
+    // Publish bounded, redacted diagnostics before deleting the failed allocation.
+    // The run report grants owner access; container-local files do not survive deployment.
     const reply = yield* checked(config.executable, ["vm", "run-command", "invoke", "--subscription", config.subscription,
       "--resource-group", config.resourceGroup, "--name", machine.name, "--command-id", "RunShellScript",
       "--scripts", "tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json", "--only-show-errors", "--output", "json"],
       { timeoutMs: 180_000, maxOutputBytes: 64 * 1024 })
-    const directory = yield* fs.makeTempDirectory({ prefix: "lab-initialization-failure-" })
-    const file = join(directory, `${machine.name}.json`)
-    yield* fs.writeFileString(file, reply.stdout, { mode: 0o600, flag: "wx" })
-    return file
+    return yield* retainInitializationDiagnostic(machine, reply.stdout).pipe(Effect.provideService(ArtifactStore, objects))
   }).pipe(Effect.mapError(() => fail("Could not retain initialization diagnostics")))
   return {
     inventory,
@@ -181,7 +181,8 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       yield* tagDisk(machine, encodedTags)
       if (initialization) yield* waitInitialized(machine, initialization.identity).pipe(
         Effect.catchAll(error => initializationDiagnostics(machine).pipe(Effect.either, Effect.flatMap(diagnostics =>
-          Effect.fail(fail(`${error.message}; ${diagnostics._tag === "Right" ? `private diagnostics: ${diagnostics.right}` : diagnostics.left.message}`))))))
+          Effect.fail(new InfrastructureFailure({ operation: "azure", message: `${error.message}; ${diagnostics._tag === "Right" ? "initialization diagnostics retained in run evidence" : diagnostics.left.message}`,
+            evidence: diagnostics._tag === "Right" ? Option.some([diagnostics.right]) : Option.none() }))))))
       return machine
     }),
     release: machine => Effect.gen(function* () {

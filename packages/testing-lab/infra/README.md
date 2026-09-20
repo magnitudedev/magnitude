@@ -73,8 +73,10 @@ receives only the attempt-scoped credential delivered by the existing Azure boot
 Cloud-init runs before credential delivery. Initialization failure fails allocation;
 the scheduler owns deletion through the normal lease and reconciler. A successful VM
 provisioning state is insufficient: the allocator checks the pinned initialization tag
-and waits for `cloud-init status --wait` to exit successfully. Native setup diagnostics
-are available in `lab-initialize` and `/var/log/cloud-init-output.log` while the VM exists.
+and waits for `cloud-init status --wait` to exit successfully. On preparation failure, bounded cloud-init diagnostics are redacted and retained as run
+evidence before VM deletion. Retrieve their digest through `bun lab evidence`; access is
+limited to the run owner. The guest also retains `lab-initialize` status and
+`/var/log/cloud-init-output.log` during its lifetime.
 
 
 ## Coordinator deployment

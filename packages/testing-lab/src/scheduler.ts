@@ -1,5 +1,5 @@
 import { Cause, Context, DateTime, Duration, Effect, Exit, Layer, Option, Schema } from "effect"
-import { InfrastructureFailure, LeaseId, Provider } from "./domain"
+import { Evidence, InfrastructureFailure, LeaseId, Provider } from "./domain"
 import { Allocating, LeaseStore, type LeaseClaim, type LeaseRecord } from "./lease"
 import { MachineAllocator, type Machine } from "./machines"
 import { RunStore } from "./run-store"
@@ -24,15 +24,19 @@ const seconds = 60
 const heartbeat = <A, E, R, E2, R2>(work: Effect.Effect<A, E, R>, beat: Effect.Effect<unknown, E2, R2>) =>
   Effect.raceFirst(work, Effect.forever(Effect.sleep("10 seconds").pipe(Effect.zipRight(beat))).pipe(Effect.interruptible))
 const fail = (message: string) => new InfrastructureFailure({ operation: "scheduler", message })
-const blocked = (assignment: WorkAssignment, detail: string): WorkResult => {
+const blocked = (assignment: WorkAssignment, detail: string, evidence: readonly (typeof Evidence.Type)[] = []): WorkResult => {
   const now = new Date().toISOString()
   return { output: Option.none(), cases: assignment.target.cases.map(c => ({ targetId: assignment.target.target.id, caseId: c.id, harness: c.harness,
-    startedAt: now, endedAt: now, evidence: [], outcome: { status: "blocked", detail } })), cleanupErrors: [] }
+    startedAt: now, endedAt: now, evidence, outcome: { status: "blocked", detail } })), cleanupErrors: [] }
 }
 const causeDetail = <E>(cause: Cause.Cause<E>) => {
   const error = Cause.failureOption(cause)
   return Option.isSome(error) && Schema.is(InfrastructureFailure)(error.value) ? error.value.message
     : Cause.isInterruptedOnly(cause) ? "Worker was interrupted" : "Worker execution failed; inspect scheduler diagnostics"
+}
+const causeEvidence = <E>(cause: Cause.Cause<E>): readonly (typeof Evidence.Type)[] => {
+  const error = Cause.failureOption(cause)
+  return Option.isSome(error) && Schema.is(InfrastructureFailure)(error.value) ? Option.getOrElse(error.value.evidence, () => []) : []
 }
 export const schedulerLayer = (cleanupTimeout: Duration.DurationInput = "20 minutes") => Layer.effect(Scheduler, Effect.gen(function* () {
   const providers = yield* MachineProviders
@@ -87,7 +91,7 @@ export const schedulerLayer = (cleanupTimeout: Duration.DurationInput = "20 minu
             Effect.interruptible, Effect.timeoutFail({ duration: cleanupTimeout, onTimeout: () => fail("Cleanup timed out; janitor retains responsibility") }), Effect.exit)
           return { outcome, cleaned }
         }))
-        const result = Exit.isSuccess(exit.outcome) ? exit.outcome.value : blocked(job, causeDetail(exit.outcome.cause))
+        const result = Exit.isSuccess(exit.outcome) ? exit.outcome.value : blocked(job, causeDetail(exit.outcome.cause), causeEvidence(exit.outcome.cause))
         const cleanupErrors = Exit.isFailure(exit.cleaned) ? [...result.cleanupErrors, causeDetail(exit.cleaned.cause)] : result.cleanupErrors
         yield* work.finish(job.claim, { ...result, cleanupErrors }).pipe(Effect.mapError(e => fail(e.message)))
       })
