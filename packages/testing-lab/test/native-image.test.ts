@@ -20,6 +20,15 @@ test("reads universal Mach-O architecture tables in both formats and byte orders
     expect((await Effect.runPromise(decodeNativeImage(bytes))).architectures).toEqual(["x64", "arm64"])
   }
 })
+test("identifies PE32 utilities without admitting mismatched machine widths", async () => {
+  const pe = header("pe", "x64"), view = new DataView(pe.buffer)
+  view.setUint16(132, 0x14c, true); view.setUint16(152, 0x10b, true)
+  expect(await Effect.runPromise(decodeNativeImage(pe))).toEqual({ format: "pe", architectures: ["x86"] })
+  view.setUint16(152, 0x20b, true)
+  expect((await Effect.runPromise(decodeNativeImage(pe).pipe(Effect.either)))._tag).toBe("Left")
+  view.setUint16(132, 0x8664, true); view.setUint16(152, 0x10b, true)
+  expect((await Effect.runPromise(decodeNativeImage(pe).pipe(Effect.either)))._tag).toBe("Left")
+})
 test("rejects scripts, truncation, unsupported machines and malformed offsets", async () => {
   const malformed = [new Uint8Array(), new TextEncoder().encode("#!/bin/sh\necho arm64 version 0.1.3\n")]
   const pe = header("pe", "x64"); new DataView(pe.buffer).setUint32(60, 0xfffffff0, true); malformed.push(pe)

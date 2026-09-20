@@ -43,7 +43,7 @@ test("connection errors reveal collapsed file guidance despite presentation chan
       document.querySelector('[role=alert]')!.removeAttribute('hidden')
       setTimeout(() => {
         card.querySelector('details')!.remove()
-        card.insertAdjacentHTML('beforeend', '<p>/isolated/.config/opencode/opencode.json</p>')
+        card.insertAdjacentHTML('beforeend', '<p>Fix invalid configuration in /isolated/.config/opencode/opencode.json</p><ul><li>/isolated/.config/opencode/opencode.json</li></ul>')
         card.setAttribute('data-connected', 'false')
       }, 100)
     }
@@ -51,6 +51,10 @@ test("connection errors reveal collapsed file guidance despite presentation chan
   const refreshed = yield* observeConnectionFailure(page, "opencode", "opencode.json")
   expect(refreshed).toContain("/isolated/.config/opencode/opencode.json")
   expect(yield* Effect.promise(() => page.locator('details').count())).toBe(0)
+  // Error prose is not a substitute for a visible, actionable configuration-file entry.
+  yield* Effect.promise(() => page.getByRole("listitem").evaluate(element => { element.setAttribute("hidden", "") }))
+  expect((yield* observeConnectionFailure(page, "opencode", "opencode.json").pipe(Effect.either))._tag).toBe("Left")
+  yield* Effect.promise(() => page.getByRole("listitem", { includeHidden: true }).evaluate(element => { element.removeAttribute("hidden") }))
   yield* Effect.promise(() => page.evaluate(() => { document.querySelector('button')!.onclick = () => {} }))
   yield* Effect.promise(() => page.getByRole("alert").evaluate(element => { element.textContent = "" }))
   expect((yield* observeConnectionFailure(page, "opencode", "opencode.json").pipe(Effect.either))._tag).toBe("Left")

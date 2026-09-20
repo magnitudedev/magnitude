@@ -235,7 +235,12 @@ Native readiness requires completed cloud-init and the lab setup's final complet
 Fatal cloud-init errors or a missing receipt fail admission. Recoverable platform warnings are
 retained in detailed status and cannot substitute for the lab's successful completion receipt.
 Namespace Mac preparation verifies the locked guest image and interactive user before installing
-the trusted runtime and pinned harness dependencies. A root-owned receipt binds the preparation
+the trusted runtime and pinned harness dependencies. Before candidate delivery, preparation must
+prove that Finder accepts automation used by the real installer layout. On a qualified image with
+existing accessibility authorization, it may approve only the management worker’s exact Finder
+permission dialog through the normal UI. It cannot edit privacy databases, approve unrelated
+prompts or skip packaging checks. The consent observer and probe have bounded lifetimes.
+A root-owned receipt binds the preparation
 recipe; reconciliation verifies that receipt and the live desktop without reinstalling tooling.
 Incomplete preparation requires a fresh worker. Provider credentials stay on the coordinator;
 only a bounded read capability for the pinned runtime enters the guest and is removed after use.

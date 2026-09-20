@@ -75,9 +75,9 @@ export const observeConnectionFailure = (page: Page, name: string, fileName: str
   // Mutation failure can precede the refreshed inspection. Do not click controls from
   // the stale Connected card while the error card is replacing its configuration section.
   await harness.and(page.locator('[data-connected="false"]')).waitFor()
-  const guidance = harness.getByText(fileName, { exact: false })
+  const guidance = harness.getByRole("listitem", { includeHidden: true }).filter({ hasText: fileName })
   // File identity is stable; the disclosure label, styling and placement are not.
-  const disclosure = harness.locator("details").filter({ has: page.getByText(fileName, { exact: false }) })
+  const disclosure = harness.locator("details").filter({ has: page.getByRole("listitem", { includeHidden: true }).filter({ hasText: fileName }) })
   if (await disclosure.count()) {
     if (await disclosure.getAttribute("open") === null) await disclosure.locator(":scope > summary").click()
   }

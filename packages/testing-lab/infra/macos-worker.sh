@@ -29,6 +29,52 @@ if shutil.disk_usage(home).free < 40*1024**3:raise SystemExit('Mac worker has le
 subprocess.run(['sudo','-n','true'],check=True)
 for command in [['xcodebuild','-version'],['xcrun','--find','clang'],['cmake','--version'],['git','--version']]:subprocess.run(command,check=True)
 root.mkdir(mode=0o700)
+# Finder layout is part of the real release build. Namespace starts an Aqua session,
+# but its management process still needs the normal Finder automation consent.
+# Use the image-authorized accessibility interface for that exact dialog only;
+# never edit privacy databases, grant unrelated permissions, or skip layout checks.
+finder_source=root/'finder-consent.swift'
+finder_source.write_text(r'''import AppKit
+import ApplicationServices
+func fail(_ message: String) -> Never { fputs(message + "\n", stderr); exit(1) }
+func value(_ element: AXUIElement, _ key: String) -> AnyObject? { var result: CFTypeRef?; AXUIElementCopyAttributeValue(element, key as CFString, &result); return result }
+func descendants(_ element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
+ if depth > 12 { return [] }
+ return [element] + (value(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).flatMap { descendants($0, depth: depth+1) }
+}
+guard AXIsProcessTrusted() else { fail("Accessibility is not authorized by the worker image") }
+let deadline = Date().addingTimeInterval(40)
+while Date() < deadline {
+ for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.UserNotificationCenter" {
+  let element = AXUIElementCreateApplication(app.processIdentifier)
+  for window in (value(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter({ (value($0, kAXRoleAttribute) as? String) == kAXWindowRole }) {
+   let contents = descendants(window)
+   let prompt = "“vmguest” wants access to control “Finder”. Allowing control will provide access to documents and data in “Finder”, and to perform actions within that app."
+   guard contents.contains(where: { (value($0, kAXValueAttribute) as? String) == prompt }) else { continue }
+   let buttons = contents.filter { (value($0, kAXRoleAttribute) as? String) == kAXButtonRole && (value($0, kAXTitleAttribute) as? String) == "Allow" }
+   guard buttons.count == 1 else { fail("Ambiguous Finder permission dialog") }
+   guard AXUIElementPerformAction(buttons[0], kAXPressAction as CFString) == .success else { fail("Cannot approve Finder permission") }
+   print("Approved Namespace worker Finder automation through the permission dialog")
+   exit(0)
+  }
+ }
+ Thread.sleep(forTimeInterval: 0.2)
+}
+fail("Expected Finder permission dialog did not appear")
+''')
+subprocess.run(['xcrun','swiftc','-typecheck',str(finder_source)],check=True,timeout=120)
+with (root/'finder-consent.log').open('w') as log:
+ helper=subprocess.Popen(['/usr/bin/swift',str(finder_source)],stdout=log,stderr=subprocess.STDOUT)
+ try:
+  subprocess.run(['/usr/bin/osascript','-e','with timeout of 50 seconds','-e',
+   'tell application "Finder" to get name of startup disk','-e','end timeout'],check=True,timeout=60)
+ finally:
+  if helper.poll() is None:helper.terminate()
+  try:helper.wait(timeout=5)
+  except subprocess.TimeoutExpired:helper.kill();helper.wait()
+  log.flush()
+  print((root/'finder-consent.log').read_text())
+finder_source.unlink()
 class HttpsRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,req,fp,code,msg,headers,newurl):
   if not newurl.startswith('https://'):raise SystemExit('Insecure native-tool redirect')

@@ -2,7 +2,12 @@ import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
 import { Architecture, AssertionFailure } from "./domain"
 
-export const NativeImage = Schema.Struct({ format: Schema.Literal("mach-o", "elf", "pe"), architectures: Schema.NonEmptyArray(Architecture) })
+// Installer utilities can be PE32 even when the application target is x64.
+// This is an inspected binary architecture, not another supported application target.
+export const NativeImage = Schema.Union(
+  Schema.Struct({ format: Schema.Literal("mach-o", "elf"), architectures: Schema.NonEmptyArray(Architecture) }),
+  Schema.Struct({ format: Schema.Literal("pe"), architectures: Schema.NonEmptyArray(Schema.Literal("x86", "x64", "arm64")) }),
+)
 export type NativeImage = typeof NativeImage.Type
 /** Architecture inspection only; execution and signature validation are separate acceptance checks. */
 export const decodeNativeImage = (bytes: Uint8Array) => Effect.try({
@@ -35,8 +40,14 @@ export const decodeNativeImage = (bytes: Uint8Array) => Effect.try({
       require(bytes.length >= 64, "DOS header is truncated")
       const pe = view.getUint32(60, true)
       require(pe >= 64 && pe + 26 <= bytes.length, "PE header is outside the bounded header read")
-      require(view.getUint32(pe, true) === 0x00004550 && view.getUint16(pe + 24, true) === 0x20b, "Expected a PE32+ native image")
-      return { format: "pe", architectures: [arch(view.getUint16(pe + 4, true), 0x8664, 0xaa64)] }
+      require(view.getUint32(pe, true) === 0x00004550, "Invalid PE signature")
+      const machine = view.getUint16(pe + 4, true), optional = view.getUint16(pe + 24, true)
+      if (machine === 0x14c) {
+        require(optional === 0x10b, "x86 image must use PE32 headers")
+        return { format: "pe", architectures: ["x86"] }
+      }
+      require(optional === 0x20b, "64-bit image must use PE32+ headers")
+      return { format: "pe", architectures: [arch(machine, 0x8664, 0xaa64)] }
     }
     throw new Error("File has no supported native image header")
   },

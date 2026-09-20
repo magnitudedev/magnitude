@@ -9,7 +9,7 @@ Windows preparation installs pinned tools and runtime dependencies, creates the 
 interactive desktop, removes one-shot login credentials, and verifies live readiness. It is
 integrated with allocation and natively proven on a disposable Windows Server diagnostic;
 Windows 10/11 still require eligible client licensing and their own application qualification.
-GPU driver preparation remains outstanding. CUDA source producers now have a separate pinned
+GPU driver preparation is implemented but native GPU qualification awaits quota. CUDA source producers have a separate pinned
 SDK preparation phase; its native qualification status is recorded in the coverage ledger.
 Windows delivery now supports an already prepared interactive desktop user: its configured
 runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
