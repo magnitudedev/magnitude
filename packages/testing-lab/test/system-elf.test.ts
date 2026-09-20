@@ -15,32 +15,34 @@ test("loader-cache parser requires complete records and preserves ABI choices", 
   }
 })))
 
-for (const mode of ["deb", "rpm", "ambiguous", "ambient", "escape", "wrong-arch", "unowned", "uninstalled", "disallowed"] as const) {
+for (const mode of ["arm-aliases", "deb", "rpm", "ambiguous", "ambient", "escape", "wrong-arch", "unowned", "uninstalled", "disallowed"] as const) {
   test(`system ELF resolver validates cache and package ownership: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-system-elf-" }), file = join(root, "image")
     const bytes = new Uint8Array(64), view = new DataView(bytes.buffer)
-    bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]); view.setUint16(18, mode === "wrong-arch" ? 183 : 62, true)
+    bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]); view.setUint16(18, mode === "wrong-arch" || mode === "arm-aliases" ? 183 : 62, true)
     yield* fs.writeFile(file, bytes)
-    const path = "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    const library = mode === "arm-aliases" ? "ld-linux-aarch64.so.1" : "libc.so.6"
+    const path = mode === "arm-aliases" ? "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" : "/usr/lib/x86_64-linux-gnu/libc.so.6"
     let packageQueries = 0
     const services = Layer.merge(Layer.succeed(FileSystem.FileSystem, { ...fs,
-      realPath: () => Effect.succeed(mode === "escape" ? "/opt/developer/libc.so.6" : path),
+      realPath: candidate => Effect.succeed(mode === "escape" ? "/opt/developer/libc.so.6" : mode === "ambiguous" ? candidate : path),
       stat: () => fs.stat(file), open: (_path, options) => fs.open(file, options),
     }), Layer.succeed(ProcessExecutor, { run: spec => {
       expect(spec.inheritEnv).toBe(false)
       if (spec.executable === "/sbin/ldconfig") {
-        const row = `\tlibc.so.6 (libc6,x86-64) => ${mode === "ambient" ? "/usr/local/lib/libc.so.6" : path}\n`
-        return Effect.succeed({ exitCode: 0, stderr: "", stdout: `${mode === "ambiguous" ? 2 : 1} libs found in cache \`/etc/ld.so.cache'\n${row}${mode === "ambiguous" ? row : ""}` })
+        const row = `\t${library} (libc6,${mode === "arm-aliases" ? "AArch64" : "x86-64"}) => ${mode === "ambient" ? "/usr/local/lib/libc.so.6" : path}\n`
+        const second = mode === "arm-aliases" ? row.replace(path, "/lib/ld-linux-aarch64.so.1") : mode === "ambiguous" ? row.replace(path, "/usr/lib/other/libc.so.6") : ""
+        return Effect.succeed({ exitCode: 0, stderr: "", stdout: `${second ? 2 : 1} libs found in cache \`/etc/ld.so.cache'\n${row}${second}` })
       }
       packageQueries++
       return Effect.succeed({ exitCode: mode === "unowned" ? 1 : 0, stderr: "", stdout: spec.args[0] === "--show"
         ? mode === "uninstalled" ? "config-files" : "installed"
         : mode === "rpm" ? "glibc-2.39-1.x86_64\n" : `libc6:amd64: ${path}\n` })
     } }))
-    const result = yield* Effect.flatMap(SystemElfResolver, service => service.resolve("libc.so.6", "x64")).pipe(
-      Effect.provide(systemElfResolver(mode === "rpm" ? "rpm" : "deb", mode === "disallowed" ? [] : ["libc.so.6"]).pipe(Layer.provide(services))), Effect.either)
-    expect(result._tag).toBe(mode === "deb" || mode === "rpm" ? "Right" : "Left")
+    const result = yield* Effect.flatMap(SystemElfResolver, service => service.resolve(library, mode === "arm-aliases" ? "arm64" : "x64")).pipe(
+      Effect.provide(systemElfResolver(mode === "rpm" ? "rpm" : "deb", mode === "disallowed" ? [] : [library]).pipe(Layer.provide(services))), Effect.either)
+    expect(result._tag).toBe(mode === "deb" || mode === "rpm" || mode === "arm-aliases" ? "Right" : "Left")
     if (result._tag === "Right") expect(result.right).toEqual({ path, package: mode === "rpm" ? "glibc-2.39-1.x86_64" : "libc6:amd64" })
     if (["ambiguous", "ambient", "escape", "wrong-arch", "disallowed"].includes(mode)) expect(packageQueries).toBe(0)
   })).pipe(Effect.provide(BunContext.layer))))

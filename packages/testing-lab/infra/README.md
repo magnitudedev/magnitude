@@ -212,7 +212,10 @@ lease discoverable for cleanup. Windows initialization does not use Linux cloud-
 
 Server 2025 diagnostic preparation is a separate mechanism test, not Windows 10/11 qualification.
 Do not configure a client image until its licensing eligibility is established. The implementation
-does not assert a Windows client license on the user's behalf.
+requires `windowsLicense` on a client image: `visual-studio-dev-test` for verified Visual Studio
+and subscription eligibility, or `multitenant` for verified Windows hosting rights. Only the latter
+emits Azure's `licenseType: Windows_Client`. Omitting this field blocks client allocation before
+resources are created; it is not inferred from credits or image availability.
 
 ### Namespace coordinator authentication
 
@@ -256,5 +259,9 @@ links a shared library against cuBLAS. The phase is retained with normal build e
 environment. CPU and Metal builds do not install this SDK.
 
 This compiler installation does not install a GPU driver or require GPU quota. A10 and RTX PRO
-6000 consumer drivers remain separate preparation work. Linux x64 SDK compilation/linking has
+6000 consumer drivers have separate pinned preparation in `tools/nvidia-drivers.json`. Configure
+that model's OS-specific entry as `gpu` in the initialization recipe. The allocator checks hardware,
+VM family and supported guest OS before provisioning; current recipes permit Ubuntu 24.04 and
+Windows 11, plus Windows Server diagnostics. Driver installation and real CUDA generation remain
+unverified at zero GPU quota. Other catalog OS/GPU combinations require a supported driver recipe. Linux x64 SDK compilation/linking has
 native Azure CPU evidence; Windows and Linux ARM SDK execution remain unverified.

@@ -233,6 +233,10 @@ recipe; reconciliation verifies that receipt and the live desktop without reinst
 Incomplete preparation requires a fresh worker. Provider credentials stay on the coordinator;
 only a bounded read capability for the pinned runtime enters the guest and is removed after use.
 Native dependency failures retain diagnostic evidence before ordinary lease cleanup.
+Windows client allocation requires an operator-verified licensing basis in administrator
+configuration. Multitenant hosting emits Azure's Windows client license declaration; Visual Studio
+dev/test eligibility does not imply that declaration. Credits, image visibility and Server diagnostic
+success cannot establish client entitlement. Non-Windows targets reject client licensing fields.
 Windows preparation separates pinned tooling, trusted runtime dependencies, and the admitted
 user's desktop. Runtime readiness binds the runtime digest, native distribution/architecture and
 user SID. One-shot login credentials are removed at logon before a desktop receipt is published;
@@ -359,8 +363,9 @@ architecture, and records external dependencies only through an explicit system 
 verifies loader resolution and package ownership. A pathname dependency cannot fall back to an
 OS basename lookup when its owned file is missing. Fixture resolvers do not qualify native hosts.
 System resolution admits explicitly allowed names only, requires a unique architecture-matching
-loader-cache record, checks canonical OS-directory ownership and ELF architecture, and records
-the installed DEB/RPM owner. Ambiguous cache or hardware-capability choices block rather than
+loader-cache resolution, checks canonical OS-directory ownership and ELF architecture, and records
+the installed DEB/RPM owner. Multiple cache paths may qualify only when all resolve to the same
+canonical OS file. Distinct cache files or hardware-capability choices block rather than
 guessing loader precedence. Package ownership alone does not prove symbol-version compatibility.
 Version requirements are matched by exact ABI identity against the resolved provider’s version
 definitions, including owned dependencies. Missing or truncated version reports fail; a newer-looking

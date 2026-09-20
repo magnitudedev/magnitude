@@ -53,7 +53,10 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
                 {installed && <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${row.inspection._tag === "Connected" ? "bg-green-600 dark:bg-green-400" : needsAttention ? "bg-orange-500" : "bg-slate-400"}`} />}
                 {!installed ? "Not installed" : row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Could not verify connection" : needsAttention ? "Connection needs repair" : "Not connected"}
               </p>
-              {installed && row.inspection._tag === "Unavailable" && <p className="mt-1 text-xs text-slate-500">{row.inspection.reason}</p>}
+              {installed && row.inspection._tag === "Unavailable" && <div className="mt-1 text-xs text-slate-500">
+                <p>{row.inspection.reason}</p>
+                {row.configurationFiles.length > 0 && <div className="mt-2"><p>Configuration files to check:</p><ul className="mt-1 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono">{file}</li>)}</ul></div>}
+              </div>}
             </div>
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">

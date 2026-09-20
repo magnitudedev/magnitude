@@ -24,7 +24,7 @@ const nicId = `${group}/providers/Microsoft.Network/networkInterfaces/${name}-ni
 const config: AzureConfig = { executable: "az", subscription, resourceGroup: "magnitude-ci", location: "westus2",
   subnetId: `${group}/providers/Microsoft.Network/virtualNetworks/lab/subnets/workers`, adminUsername: "labworker", sshPublicKey: "ssh-ed25519 fixture",
   images: [{ targetId: target.id, image: { publisher: "Canonical", offer: "ubuntu-24_04-lts", sku: "server", version: "24.04.202609040" },
-    size: "Standard_D4s_v6", os: "Linux", diskGb: 128, plan: Option.none(), initialization: Option.none() }] }
+    size: "Standard_D4s_v6", os: "Linux", diskGb: 128, windowsLicense: Option.none(), plan: Option.none(), initialization: Option.none() }] }
 const lease = () => new Allocating({ leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: target.id, workId: WorkId.make(`test:${target.id}`), workFence: Fence.make(1),
   provider: "azure", resourceName: name, expiresAt: DateTime.unsafeMake(Date.now() + 3600_000) })
 const tags = (l: Allocating) => ({ "lab-owner": "magnitude-testing-lab-v1", "lab-machine": name, "lab-lease": Schema.encodeSync(Schema.parseJson(MachineTags))({ schemaVersion: 1, runId: l.runId, leaseId: l.leaseId, expiresAt: l.expiresAt }) })
@@ -161,8 +161,8 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
   })
 }
 
-for (const failRuntime of [false, true]) {
-  test(`Windows allocator routes native preparation and retains failures: ${failRuntime}`, async () => {
+for (const windowsLicense of ["visual-studio-dev-test", "multitenant"] as const) for (const failRuntime of [false, true]) {
+  test(`Windows allocator routes native preparation and retains failures: ${windowsLicense}/${failRuntime}`, async () => {
     const { WindowsAzureInitialization } = await import("../src/providers/azure-initialization")
     const windows = targets.find(t => t.os === "windows" && t.version === "11" && t.hardware === "intel")!
     const directory = mkdtempSync(join(tmpdir(), "lab-windows-init-"))
@@ -174,7 +174,7 @@ for (const failRuntime of [false, true]) {
       const initialization = Schema.decodeUnknownSync(WindowsAzureInitialization)({ kind: "windows", toolsSetup: pin, runtimeSetup: pin, desktopSetup: pin, downloads,
         distribution: { os: "windows", version: "11" }, architecture: "x64", adminUsername: "labworker",
         runtime: { account: "labaccount", container: "artifacts", blob: `worker-runtime/${digest}.tar.gz`, sha256: digest, bytes: 100 } })
-      const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: windows.id, os: "Windows", initialization: Option.some(initialization) }] }
+      const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: windows.id, os: "Windows", windowsLicense: Option.some(windowsLicense), initialization: Option.some(initialization) }] }
       const l = new Allocating({ ...lease(), targetId: windows.id, workId: WorkId.make(`test:${windows.id}`) })
       const rows: ReturnType<typeof resource>[] = [], commands = new Map<string, { tags: Record<string, string> }>()
       const artifacts = new Map<string, Uint8Array>()
@@ -205,7 +205,7 @@ for (const failRuntime of [false, true]) {
         else {
           expect(body.properties.osProfile.customData).toBeUndefined()
           expect(body.properties.osProfile.windowsConfiguration.provisionVMAgent).toBe(true)
-          expect(body.properties.licenseType).toBeUndefined()
+          expect(body.properties.licenseType).toBe(windowsLicense === "multitenant" ? "Windows_Client" : undefined)
           vmTags = body.tags; rows.push(resource(l))
         }
         return output({})
@@ -222,3 +222,15 @@ for (const failRuntime of [false, true]) {
     } finally { rmSync(directory, { recursive: true, force: true }) }
   })
 }
+
+for (const mode of ["missing", "linux"] as const) test(`rejects invalid Windows licensing configuration before allocating: ${mode}`, async () => {
+  const windows = targets.find(t => t.os === "windows" && t.hardware === "intel")!
+  const requested = mode === "missing" ? windows : target
+  const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: requested.id,
+    os: mode === "missing" ? "Windows" : "Linux", windowsLicense: mode === "missing" ? Option.none() : Option.some("multitenant") }] }
+  const l = new Allocating({ ...lease(), targetId: requested.id, workId: WorkId.make(`test:${requested.id}`) })
+  let calls = 0
+  const result = await run(Effect.flatMap(MachineAllocator, allocator => allocator.ensure(l, requested)).pipe(Effect.either), () => { calls++; return output([]) }, settings)
+  expect(result._tag).toBe("Left")
+  expect(calls).toBe(0)
+})

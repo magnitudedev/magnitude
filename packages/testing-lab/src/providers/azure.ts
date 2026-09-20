@@ -22,6 +22,7 @@ const ImageReference = Schema.Union(
 )
 export const AzureImage = Schema.Struct({ targetId: TargetId, image: ImageReference, size: Schema.NonEmptyString,
   os: Schema.Literal("Linux", "Windows"), diskGb: Schema.Int.pipe(Schema.between(64, 2048)),
+  windowsLicense: Schema.optionalWith(Schema.Literal("visual-studio-dev-test", "multitenant"), { as: "Option", exact: true }),
   initialization: Schema.optionalWith(AzureInitialization, { as: "Option", exact: true }),
   plan: Schema.optionalWith(Schema.Struct({ name: Schema.String, product: Schema.String, publisher: Schema.String }), { as: "Option", exact: true }) })
 export type AzureImage = typeof AzureImage.Type
@@ -144,6 +145,8 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       const image = config.images.find(i => i.targetId === target.id)
       if (!image) return yield* fail(`No qualified Azure image for ${target.id}`)
       if ((target.os === "windows") !== (image.os === "Windows")) return yield* fail("Image OS does not match target")
+      if (target.os === "windows" && Option.isNone(image.windowsLicense)) return yield* fail("Windows client allocation requires an operator-verified licensing basis")
+      if (target.os !== "windows" && Option.isSome(image.windowsLicense)) return yield* fail("Windows client licensing cannot be applied to another OS")
       const gpu = Option.flatMap(image.initialization, setup => "kind" in setup ? setup.gpu : Option.none())
       if (Option.isSome(gpu)) {
         if (target.hardware !== gpu.value.model || !(gpu.value.model === "a10" ? /^Standard_NV\d+ads_A10_v5$/.test(image.size) : /^Standard_NC\d+.*RTX.*v6$/i.test(image.size)))
@@ -172,6 +175,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
         const password = `Az!${crypto.randomUUID()}a9`
         const body = { location: config.location, tags: encodedTags, ...(Option.isSome(image.plan) ? { plan: image.plan.value } : {}),
           properties: { hardwareProfile: { vmSize: image.size },
+            ...(Option.contains(image.windowsLicense, "multitenant") ? { licenseType: "Windows_Client" } : {}),
             ...(Option.isSome(gpu) ? { securityProfile: { securityType: "Standard" } } : {}),
             storageProfile: { imageReference: image.image, osDisk: { name: `${machine.name}-os`, createOption: "FromImage", deleteOption: "Delete", diskSizeGB: image.diskGb,
               managedDisk: { storageAccountType: "Premium_LRS" } } },

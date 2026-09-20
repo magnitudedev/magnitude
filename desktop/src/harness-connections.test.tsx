@@ -34,7 +34,7 @@ it("hides stale configuration and all controls for uninstalled harnesses", () =>
 it("keeps connected and unverifiable states distinct from installation", () => {
   expect(render([{ ...installed, inspection: { _tag: "Connected" } }])).toContain("Connected")
   const html = render([{ ...installed, managed: true, inspection: { _tag: "Unavailable", reason: "Permission denied" } }], true)
-  for (const text of ["Could not verify connection", "Permission denied", "Connect", 'disabled=""']) expect(html).toContain(text)
+  for (const text of ["Could not verify connection", "Permission denied", "Configuration files to check", "/private/old-config.json", "Connect", 'disabled=""']) expect(html).toContain(text)
 })
 it("sorts connected installations first and only shows verified configuration paths", () => {
   const connected: DesktopHarnessConnection = { ...installed, id: Schema.decodeUnknownSync(DesktopHarnessConnection.fields.id)("codex"), name: "Codex", inspection: { _tag: "Connected" } }

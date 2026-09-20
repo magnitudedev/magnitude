@@ -15,7 +15,7 @@ test("connection errors reveal collapsed file guidance despite presentation chan
   yield* fs.writeFileString(html, `<!doctype html><body>
     <section data-testid="desktop.page.connections">
       <p role="alert" hidden>Configuration cannot be read; repair the listed file.</p>
-      <article data-testid="desktop.harness.opencode">
+      <article data-testid="desktop.harness.opencode" data-connected="false">
         <button data-testid="desktop.harness-connect" onclick="document.querySelector('[role=alert]').hidden=false">Connect</button>
         <details><summary>A differently worded disclosure</summary><ul><li>/isolated/.config/opencode/opencode.json</li></ul></details>
       </article>
@@ -34,6 +34,24 @@ test("connection errors reveal collapsed file guidance despite presentation chan
     expect(message, attempt).toContain("/isolated/.config/opencode/opencode.json")
     expect(yield* Effect.promise(() => page.getByText("/isolated/.config/opencode/opencode.json", { exact: true }).isVisible())).toBe(true)
   }
+  // Reproduce mutation failure arriving before the new connection inspection.
+  yield* Effect.promise(() => page.evaluate(() => {
+    const card = document.querySelector('article')!
+    card.setAttribute('data-connected', 'true')
+    document.querySelector('[role=alert]')!.setAttribute('hidden', '')
+    document.querySelector('button')!.onclick = () => {
+      document.querySelector('[role=alert]')!.removeAttribute('hidden')
+      setTimeout(() => {
+        card.querySelector('details')!.remove()
+        card.insertAdjacentHTML('beforeend', '<p>/isolated/.config/opencode/opencode.json</p>')
+        card.setAttribute('data-connected', 'false')
+      }, 100)
+    }
+  }))
+  const refreshed = yield* observeConnectionFailure(page, "opencode", "opencode.json")
+  expect(refreshed).toContain("/isolated/.config/opencode/opencode.json")
+  expect(yield* Effect.promise(() => page.locator('details').count())).toBe(0)
+  yield* Effect.promise(() => page.evaluate(() => { document.querySelector('button')!.onclick = () => {} }))
   yield* Effect.promise(() => page.getByRole("alert").evaluate(element => { element.textContent = "" }))
   expect((yield* observeConnectionFailure(page, "opencode", "opencode.json").pipe(Effect.either))._tag).toBe("Left")
 })).pipe(Effect.provide(BunContext.layer))), 20_000)

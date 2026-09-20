@@ -72,6 +72,9 @@ export const observeConnectionFailure = (page: Page, name: string, fileName: str
   await harness.getByTestId(automation.harnessConnect).click()
   const alert = page.getByTestId(automation.page("connections")).getByRole("alert").first()
   await alert.waitFor()
+  // Mutation failure can precede the refreshed inspection. Do not click controls from
+  // the stale Connected card while the error card is replacing its configuration section.
+  await harness.and(page.locator('[data-connected="false"]')).waitFor()
   const guidance = harness.getByText(fileName, { exact: false })
   // File identity is stable; the disclosure label, styling and placement are not.
   const disclosure = harness.locator("details").filter({ has: page.getByText(fileName, { exact: false }) })

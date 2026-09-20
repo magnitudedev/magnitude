@@ -42,11 +42,17 @@ export const systemElfResolver = (manager: "deb" | "rpm", allowedNames: readonly
     if (!allowedNames.includes(name) || !/^[A-Za-z0-9_.+-]+$/.test(name)) return yield* fail(`library is not an admitted OS dependency: ${name}`)
     const matching = (yield* entries).filter(entry => entry.name === name
       && (arch === "x64" ? /(?:^|,)x86-64(?:,|$)/.test(entry.abi) : /(?:^|,)AArch64(?:,|$)/.test(entry.abi)))
-    if (matching.length !== 1) return yield* fail(`no unique architecture-matching loader-cache entry for ${name}`)
-    const entry = matching[0]!
-    if (!systemPath(entry.path)) return yield* fail(`loader cache resolves ${name} outside OS library directories`)
-    const path = yield* fs.realPath(entry.path)
-    if (!systemPath(path) || (yield* fs.stat(path)).type !== "File") return yield* fail(`resolved library escapes OS directories: ${name}`)
+    const paths = yield* Effect.forEach(matching, entry => Effect.gen(function* () {
+      if (!systemPath(entry.path)) return yield* fail(`loader cache resolves ${name} outside OS library directories`)
+      const path = yield* fs.realPath(entry.path)
+      if (!systemPath(path) || (yield* fs.stat(path)).type !== "File") return yield* fail(`resolved library escapes OS directories: ${name}`)
+      return path
+    }))
+    // Debian/Ubuntu ARM publish both the multiarch loader and its /lib alias.
+    // Multiple spellings of one canonical file are not a choice between libraries.
+    const unique = [...new Set(paths)]
+    if (unique.length !== 1) return yield* fail(`no unique architecture-matching loader-cache file for ${name}`)
+    const path = unique[0]!
     const image = yield* inspectNativeImage(path).pipe(Effect.provideService(FileSystem.FileSystem, fs))
     if (image.format !== "elf" || !image.architectures.includes(arch)) return yield* fail(`resolved library has wrong architecture: ${name}`)
     const owner = yield* run(manager === "deb" ? "/usr/bin/dpkg-query" : "/usr/bin/rpm", manager === "deb"
