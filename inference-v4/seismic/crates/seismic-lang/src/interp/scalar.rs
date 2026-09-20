@@ -1,6 +1,6 @@
 //! Scalar operation semantics: every operation is performed at its dtype and rounded once.
-use super::value::S;
 use super::round_to;
+use super::value::S;
 use crate::numeric::{integer_division_is_defined, integer_shift_is_defined, integer_value};
 use crate::sir::Math;
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
@@ -30,7 +30,11 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
         }
         (x, y) if x.is_int() && y.is_int() => {
             let (p, q) = (a.1 as i64, b.1 as i64);
-            let d = if x == y || matches!(op, Shl | Shr) { x } else { hint.filter(|h| h.is_int()).unwrap_or(x) };
+            let d = if x == y || matches!(op, Shl | Shr) {
+                x
+            } else {
+                hint.filter(|h| h.is_int()).unwrap_or(x)
+            };
             let value = |bits: u32| Ok((d, integer_value(d, bits) as f64));
             match op {
                 Eq => Ok(boolean(p == q)),
@@ -46,8 +50,13 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
                     if !integer_division_is_defined(d, Some(p), Some(q)) {
                         return Err("integer division by zero or signed overflow".into());
                     }
-                    let r = if op == Rem { p.checked_rem_euclid(q) } else { p.checked_div_euclid(q) };
-                    r.map(|r| (d, r as f64)).ok_or_else(|| "integer division overflow".to_string())
+                    let r = if op == Rem {
+                        p.checked_rem_euclid(q)
+                    } else {
+                        p.checked_div_euclid(q)
+                    };
+                    r.map(|r| (d, r as f64))
+                        .ok_or_else(|| "integer division overflow".to_string())
                 }
                 Shl | Shr => {
                     if !integer_shift_is_defined(Some(q)) {
@@ -98,7 +107,9 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
 pub(super) fn unary(op: UnaryOp, a: S) -> Result<S, String> {
     match (op, a.0) {
         (UnaryOp::Neg, d) if d.is_float() => Ok((d, -a.1)),
-        (UnaryOp::Neg, d) if d.is_int() => Ok((d, integer_value(d, bits(a.1).wrapping_neg()) as f64)),
+        (UnaryOp::Neg, d) if d.is_int() => {
+            Ok((d, integer_value(d, bits(a.1).wrapping_neg()) as f64))
+        }
         (UnaryOp::Not, DType::Bool) => Ok(boolean(a.1 == 0.0)),
         (UnaryOp::BitNot, d) if d.is_int() => Ok((d, integer_value(d, !bits(a.1)) as f64)),
         (op, d) => Err(format!("unary {op:?} on {}", d.name())),
@@ -135,17 +146,29 @@ pub(super) fn assign(op: AssignOp, current: S, value: S) -> Result<S, String> {
 }
 
 pub(super) fn math(op: Math, args: &[S]) -> Result<S, String> {
-    let arity = if op == Math::Fma { 3 } else if matches!(op, Math::Max | Math::Min) { 2 } else { 1 };
+    let arity = if op == Math::Fma {
+        3
+    } else if matches!(op, Math::Max | Math::Min) {
+        2
+    } else {
+        1
+    };
     if args.len() != arity {
         return Err(format!("{op:?} takes {arity} arguments"));
     }
-    let d = args[1..].iter().fold(args[0].0, |d, a| DType::promote(d, a.0).unwrap_or(d));
+    let d = args[1..]
+        .iter()
+        .fold(args[0].0, |d, a| DType::promote(d, a.0).unwrap_or(d));
     let a = args[0].1;
     Ok(match op {
         Math::Fma => {
             let (b, c) = (args[1].1, args[2].1);
             // Narrow-float operands are exact in f32, so this is the single-rounded f32 result.
-            if d == DType::F32 { (d, (a as f32).mul_add(b as f32, c as f32) as f64) } else { (d, round_to(d, a.mul_add(b, c))) }
+            if d == DType::F32 {
+                (d, (a as f32).mul_add(b as f32, c as f32) as f64)
+            } else {
+                (d, round_to(d, a.mul_add(b, c)))
+            }
         }
         Math::Exp | Math::ExpFast => (d, round_to(d, a.exp())),
         Math::Rsqrt => (d, round_to(d, 1.0 / a.sqrt())),

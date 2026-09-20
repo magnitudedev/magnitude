@@ -23,9 +23,6 @@
 //! concurrent threads) + memory bits / bandwidth`. A piece is one thread (one warp of lanes
 //! that all execute the same body when a participant intrinsic is present), so there is no
 //! intra-piece parallel share.
-use super::accounting::Work;
-use seismic_compiler::selection::quantity::Quantity;
-use seismic_lang::family::SiteId;
 
 pub const IDENTITY: &str = "cuda-estimate-unqualified-v0";
 
@@ -56,22 +53,6 @@ pub struct Totals {
     pub ops: u64,
     pub visits: u64,
     pub memory_bits: u64,
-}
-
-impl Work {
-    pub(crate) fn totals(&self, site: &dyn Fn(SiteId) -> Option<i64>) -> Result<Totals, String> {
-        let sum = |terms: &[Quantity]| {
-            terms.iter().try_fold(0u64, |acc, q| {
-                acc.checked_add(q.eval(site)?)
-                    .ok_or_else(|| "work total overflows u64".to_string())
-            })
-        };
-        Ok(Totals {
-            ops: sum(&self.ops)?,
-            visits: sum(&self.visits)?,
-            memory_bits: sum(&self.memory_bits)?,
-        })
-    }
 }
 
 impl EstimateModel {

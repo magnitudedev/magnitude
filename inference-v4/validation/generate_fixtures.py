@@ -22,7 +22,6 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "results" / "fixtures"
 GENERATORS = (
     ("gguf-codec-reference.json", "gguf_codec_reference.py", ()),
-    ("qwen-attention-reference.json", "qwen_attention_reference.py", ()),
     ("qwen-decoder-reference.json", "qwen_decoder_reference.py", ()),
     ("qwen-recurrent-reference.json", "qwen_recurrent_reference.py", ()),
     ("qwen-rotary-reference.json", "qwen_rotary_reference.py", ()),

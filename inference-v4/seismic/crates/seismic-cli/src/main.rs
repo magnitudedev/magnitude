@@ -1,5 +1,5 @@
 //! `seismic` command-line tool over the structured pipeline:
-//! sources -> `sir::Program` -> joint selection -> the selected witness's MSL.
+//! sources -> semantic program -> logical program -> resolved physical program -> native artifact.
 
 mod bindings;
 mod select;
@@ -20,10 +20,9 @@ const USAGE: &str = "usage:
   seismic emit <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal] [--strategy exact|greedy]
   seismic analyze-search <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
   seismic bindings <file|dir>... --fn <name> [--element NAME=TYPE,...]
-`select`, `emit` and `analyze-search` target Metal unless `--target` is given. `emit` prints
-what the selected witness compiles to: MSL on Metal, the scalar instruction listing of every
-phase on the CPU, the PTX text of every launch on CUDA. An unselected candidate cannot be emitted. Implementation choices are
-compiler-owned.";
+`select`, `emit` and `analyze-search` target Metal unless `--target` is given. `select` prints
+the resolved physical assignment and exact resources. `emit` prints MSL on Metal, PTX on CUDA,
+or the resolved terminal module and physical report on CPU. Implementation choices are compiler-owned.";
 
 /// The default target of `select`, `emit` and `analyze-search`.
 pub const TARGET: &str = "metal";
@@ -38,7 +37,7 @@ pub struct Options {
     pub function: Option<String>,
     pub workload: Workload,
     /// How `select` and `emit` improve the seed.
-    pub strategy: seismic_compiler::selection::Strategy,
+    pub strategy: seismic_compiler::planning::Strategy,
 }
 
 impl Options {
@@ -81,7 +80,9 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
         if !matches!(policy, PrecisionPolicy::Bounded { .. }) {
             *policy = PrecisionPolicy::bounded(Tolerance::EXACT);
         }
-        let PrecisionPolicy::Bounded { default, .. } = policy else { unreachable!() };
+        let PrecisionPolicy::Bounded { default, .. } = policy else {
+            unreachable!()
+        };
         default
     }
     let mut o = Options {
@@ -161,8 +162,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
             }
             "--strategy" => {
                 o.strategy = match value.as_str() {
-                    "exact" => seismic_compiler::selection::Strategy::Exact,
-                    "greedy" => seismic_compiler::selection::Strategy::Greedy,
+                    "exact" => seismic_compiler::planning::Strategy::Exact,
+                    "greedy" => seismic_compiler::planning::Strategy::Greedy,
                     other => {
                         return Err(format!(
                             "bad --strategy `{other}`; expected exact or greedy"
@@ -173,7 +174,11 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
             "--precision" => {
                 o.workload.precision = match value.as_str() {
                     "exact" => PrecisionPolicy::Exact,
-                    "bounded" if matches!(o.workload.precision, PrecisionPolicy::Bounded { .. }) => o.workload.precision,
+                    "bounded"
+                        if matches!(o.workload.precision, PrecisionPolicy::Bounded { .. }) =>
+                    {
+                        o.workload.precision
+                    }
                     "bounded" => PrecisionPolicy::bounded(Tolerance::EXACT),
                     "unconstrained" => PrecisionPolicy::Unconstrained,
                     other => {
@@ -184,7 +189,9 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 }
             }
             "--atol" | "--rtol" | "--relative-floor" => {
-                let parsed: f64 = value.parse().map_err(|_| format!("bad numerical limit `{value}`"))?;
+                let parsed: f64 = value
+                    .parse()
+                    .map_err(|_| format!("bad numerical limit `{value}`"))?;
                 let limit = Limit::new(parsed)?;
                 let tolerance = bounded(&mut o.workload.precision);
                 match arg.as_str() {
@@ -194,16 +201,26 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 }
             }
             "--ulps" => {
-                bounded(&mut o.workload.precision).ulps = Some(value.parse().map_err(|_| format!("bad ULP limit `{value}`"))?);
+                bounded(&mut o.workload.precision).ulps = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("bad ULP limit `{value}`"))?,
+                );
             }
             "--evidence" => {
                 let requirement = match value.as_str() {
                     "proven" => EvidenceRequirement::Proven,
                     "qualified" => EvidenceRequirement::Qualified,
-                    other => return Err(format!("bad --evidence `{other}`; expected proven or qualified")),
+                    other => {
+                        return Err(format!(
+                            "bad --evidence `{other}`; expected proven or qualified"
+                        ))
+                    }
                 };
                 bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { evidence, .. } = &mut o.workload.precision else { unreachable!() };
+                let PrecisionPolicy::Bounded { evidence, .. } = &mut o.workload.precision else {
+                    unreachable!()
+                };
                 *evidence = requirement;
             }
             "--output-tolerance" => {
@@ -212,39 +229,66 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 })?;
                 let fields: Vec<_> = limits.split(':').collect();
                 if fields.len() != 4 || name.trim().is_empty() {
-                    return Err(format!("bad output tolerance `{value}`; expected NAME=ATOL:RTOL:FLOOR:ULPS|-"));
+                    return Err(format!(
+                        "bad output tolerance `{value}`; expected NAME=ATOL:RTOL:FLOOR:ULPS|-"
+                    ));
                 }
                 let parse = |text: &str| -> Result<Limit, String> {
-                    Limit::new(text.parse().map_err(|_| format!("bad numerical limit `{text}`"))?)
+                    Limit::new(
+                        text.parse()
+                            .map_err(|_| format!("bad numerical limit `{text}`"))?,
+                    )
                 };
                 let tolerance = Tolerance {
                     absolute: parse(fields[0])?,
                     relative: parse(fields[1])?,
                     relative_floor: parse(fields[2])?,
-                    ulps: if fields[3] == "-" { None } else { Some(fields[3].parse().map_err(|_| format!("bad ULP limit `{}`", fields[3]))?) },
+                    ulps: if fields[3] == "-" {
+                        None
+                    } else {
+                        Some(
+                            fields[3]
+                                .parse()
+                                .map_err(|_| format!("bad ULP limit `{}`", fields[3]))?,
+                        )
+                    },
                 };
                 bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { outputs, .. } = &mut o.workload.precision else { unreachable!() };
+                let PrecisionPolicy::Bounded { outputs, .. } = &mut o.workload.precision else {
+                    unreachable!()
+                };
                 if outputs.insert(name.trim().into(), tolerance).is_some() {
                     return Err(format!("duplicate output tolerance `{}`", name.trim()));
                 }
             }
             "--input-range" => {
-                let (name, range) = value.split_once('=').ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
-                let (minimum, maximum) = range.split_once("..").ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
+                let (name, range) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
+                let (minimum, maximum) = range
+                    .split_once("..")
+                    .ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
                 let range = InputRange::new(
-                    minimum.parse().map_err(|_| format!("bad range minimum `{minimum}`"))?,
-                    maximum.parse().map_err(|_| format!("bad range maximum `{maximum}`"))?,
+                    minimum
+                        .parse()
+                        .map_err(|_| format!("bad range minimum `{minimum}`"))?,
+                    maximum
+                        .parse()
+                        .map_err(|_| format!("bad range maximum `{maximum}`"))?,
                 )?;
                 bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { inputs, .. } = &mut o.workload.precision else { unreachable!() };
+                let PrecisionPolicy::Bounded { inputs, .. } = &mut o.workload.precision else {
+                    unreachable!()
+                };
                 if inputs.insert(name.trim().into(), range).is_some() {
                     return Err(format!("duplicate input range `{}`", name.trim()));
                 }
             }
             "--allow-special-changes" => {
                 bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { specials, .. } = &mut o.workload.precision else { unreachable!() };
+                let PrecisionPolicy::Bounded { specials, .. } = &mut o.workload.precision else {
+                    unreachable!()
+                };
                 for name in value.split(',') {
                     match name.trim() {
                         "nan" => specials.nan = false,

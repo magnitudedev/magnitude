@@ -1,4 +1,4 @@
-//! Full-model, single-session measurement through the ordinary selected runtime.
+//! Full-model, single-session measurement through the unified runtime pipeline.
 //! The caller supplies only the search budget; this module cannot choose an
 //! implementation. Selection estimates are reported as estimates, never as timings.
 use super::{decoder::Decoder, loading::Model};
@@ -43,122 +43,85 @@ pub struct Dispatch {
     pub threads_per_threadgroup: u64,
     pub device_seconds: f64,
 }
-/// What selection decided for one compiled entry, in units of `estimate_model`.
+/// The resolved physical plan retained by one compiled entry.
 #[derive(Serialize)]
 pub struct EntrySelection {
     pub entry: String,
-    pub status: String,
-    pub estimate: u64,
-    pub seed_estimate: u64,
-    pub lower_bound: u64,
-    pub unresolved: Vec<String>,
+    pub assignment: Vec<Decision>,
+    pub estimated_cost: i64,
+    pub optimal: bool,
+    pub resources: Vec<LaunchResource>,
+    pub capability_fingerprint: String,
+    pub numerical_evidence: String,
+    pub numerical_evidence_identity: Option<String>,
+    pub numerical_reasons: Vec<String>,
     /// Identity of the compiled specialization.
     pub shapes: Vec<(String, i64)>,
     pub elements: Vec<(String, String)>,
-    pub strategy: String,
-    pub model_variables: usize,
-    pub model_factors: usize,
-    /// Wall seconds per phase. `solve` = family + backend hooks + export + seed + search;
-    /// `compile` = instantiate + realize + emit + native compile.
-    pub seconds: PhaseSeconds,
-    pub solve_seconds: f64,
     pub compile_seconds: f64,
-    pub exact_phase: SolverPhase,
-    pub neighborhood_phase: Option<SolverPhase>,
-    pub greedy_sweeps: u32,
-    pub greedy_trials: u64,
-    /// The selected and the seed witness: occurrence -> candidate, site -> value,
-    /// sequence -> cover.
-    pub witness: WitnessRecord,
-    pub seed: WitnessRecord,
 }
 #[derive(Serialize)]
-pub struct PhaseSeconds {
-    pub family: f64,
-    pub backend_hooks: f64,
-    pub export: f64,
-    pub seed: f64,
-    pub search: f64,
-    pub instantiate: f64,
-    pub realize: f64,
-    /// `None` where the backend does not separate emission from native compilation.
-    pub emit: Option<f64>,
-    pub native_compile: f64,
+pub struct Decision {
+    pub choice: u32,
+    pub logical_alternative: u32,
+    pub physical_alternative: u32,
 }
 #[derive(Serialize)]
-pub struct SolverPhase {
-    pub seconds: f64,
-    pub work: u64,
-    pub nodes: u64,
-}
-#[derive(Serialize, PartialEq)]
-pub struct WitnessRecord {
-    pub choices: Vec<(u32, u32)>,
-    pub sites: Vec<(u32, i64)>,
-    pub covers: Vec<(u32, Vec<(u32, u32)>)>,
-}
-impl From<&seismic_lang::family::Witness> for WitnessRecord {
-    fn from(w: &seismic_lang::family::Witness) -> Self {
-        Self {
-            choices: w.choices.iter().map(|(o, c)| (o.0, *c)).collect(),
-            sites: w.sites.iter().map(|(s, v)| (s.0, *v)).collect(),
-            covers: w.covers.iter().map(|(s, c)| (s.0, c.clone())).collect(),
-        }
-    }
+pub struct LaunchResource {
+    pub launch: u64,
+    pub workgroups: [u64; 3],
+    pub device_bytes: u64,
+    pub workgroup_bytes: u64,
+    pub private_bytes_per_participant: u64,
+    pub bindings: u64,
+    pub threads_per_group: u64,
 }
 impl From<seismic_runtime::Selection> for EntrySelection {
     fn from(s: seismic_runtime::Selection) -> Self {
-        let phase = |p: seismic_runtime::Phase| SolverPhase { seconds: p.time.as_secs_f64(), work: p.work, nodes: p.nodes };
-        let t = s.timings;
-        let compile = t.instantiate + t.realize + s.emit.unwrap_or_default() + s.native_compile;
         Self {
-            status: format!("{:?}", s.status),
-            estimate: s.estimate,
-            seed_estimate: s.seed_estimate,
-            lower_bound: s.lower_bound,
-            strategy: format!("{:?}", s.search.strategy),
-            model_variables: s.search.variables,
-            model_factors: s.search.factors,
-            seconds: PhaseSeconds {
-                family: t.family.as_secs_f64(),
-                backend_hooks: t.backend_hooks.as_secs_f64(),
-                export: t.export.as_secs_f64(),
-                seed: t.seed.as_secs_f64(),
-                search: t.search.as_secs_f64(),
-                instantiate: t.instantiate.as_secs_f64(),
-                realize: t.realize.as_secs_f64(),
-                emit: s.emit.map(|d| d.as_secs_f64()),
-                native_compile: s.native_compile.as_secs_f64(),
-            },
-            solve_seconds: t.solve().as_secs_f64(),
-            compile_seconds: compile.as_secs_f64(),
-            exact_phase: phase(s.search.exact),
-            neighborhood_phase: s.search.neighborhood.map(phase),
-            greedy_sweeps: s.search.greedy_sweeps,
-            greedy_trials: s.search.greedy_trials,
-            witness: (&s.witness).into(),
-            seed: (&s.seed).into(),
+            assignment: s
+                .assignment
+                .selections()
+                .iter()
+                .map(|(choice, selection)| Decision {
+                    choice: choice.0,
+                    logical_alternative: selection.logical_alternative,
+                    physical_alternative: selection.physical_alternative,
+                })
+                .collect(),
+            estimated_cost: s.estimated_cost,
+            optimal: s.optimal,
+            resources: s
+                .resources
+                .into_iter()
+                .map(|resource| LaunchResource {
+                    launch: resource.launch.0,
+                    workgroups: resource.workgroups,
+                    device_bytes: resource.device_bytes,
+                    workgroup_bytes: resource.workgroup_bytes,
+                    private_bytes_per_participant: resource.private_bytes_per_participant,
+                    bindings: resource.bindings,
+                    threads_per_group: resource.threads_per_group,
+                })
+                .collect(),
+            capability_fingerprint: s.capability_fingerprint,
+            numerical_evidence: format!("{:?}", s.numerical_assessment.evidence),
+            numerical_evidence_identity: s.numerical_evidence_identity,
+            numerical_reasons: s.numerical_assessment.reasons,
+            compile_seconds: s.compile.as_secs_f64(),
             entry: s.entry,
-            unresolved: s.unresolved,
             shapes: s.shapes,
             elements: s.elements,
         }
     }
 }
-/// The selection records of `decoder`, all under one estimate model.
-pub fn selections(decoder: &Decoder) -> Result<(String, Vec<EntrySelection>), String> {
-    let selections = decoder.selections()?;
-    let estimate_model = selections.first().ok_or("measured decoder retained no selection")?.estimate_model.clone();
-    if selections.iter().any(|s| s.estimate_model != estimate_model) {
-        return Err("decoder entries were selected under different estimate models".into());
-    }
-    Ok((estimate_model, selections.into_iter().map(Into::into).collect()))
+pub fn selections(decoder: &Decoder) -> Result<Vec<EntrySelection>, String> {
+    Ok(decoder.selections()?.into_iter().map(Into::into).collect())
 }
 #[derive(Serialize)]
 pub struct Report {
     pub artifact: String,
     pub backend: String,
-    pub estimate_model: String,
     pub selections: Vec<EntrySelection>,
     pub context_capacity: usize,
     pub prompt: Vec<u32>,
@@ -303,11 +266,10 @@ impl Baseline {
             advance.commit()?;
             decode_components.push(components(observations));
         }
-        let (estimate_model, selections) = selections(&self.decoder)?;
+        let selections = selections(&self.decoder)?;
         Ok(Report {
             artifact: self.artifact.clone(),
             backend: self.backend.clone(),
-            estimate_model,
             selections,
             context_capacity: self.context_capacity,
             prompt: prompt.to_vec(),

@@ -328,9 +328,18 @@ pub(crate) fn signature_of(
             return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
         }
         let ownership = match &p.ty.kind {
-            TypeKind::Shaped { head: ShapedHead::Tensor, .. } => ParamOwnership::Owned,
-            TypeKind::Shaped { head: ShapedHead::SharedTensor, .. } => ParamOwnership::Shared,
-            TypeKind::Shaped { head: ShapedHead::MutTensor, .. } => ParamOwnership::Exclusive,
+            TypeKind::Shaped {
+                head: ShapedHead::Tensor,
+                ..
+            } => ParamOwnership::Owned,
+            TypeKind::Shaped {
+                head: ShapedHead::SharedTensor,
+                ..
+            } => ParamOwnership::Shared,
+            TypeKind::Shaped {
+                head: ShapedHead::MutTensor,
+                ..
+            } => ParamOwnership::Exclusive,
             _ => ParamOwnership::Value,
         };
         let mode = match ownership {
@@ -687,6 +696,7 @@ pub(crate) fn resolve<'a>(
         let family = *family_of_root.entry(r).or_insert_with(|| {
             families.push(ContractFamily {
                 name: declared[i].sig.name.clone(),
+                contract: DefId(i as u32),
                 bodies: Vec::new(),
                 lowerings: Vec::new(),
             });

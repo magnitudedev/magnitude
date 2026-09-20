@@ -369,7 +369,8 @@ impl Parser {
     }
 
     fn param(&mut self) -> PResult<Param> {
-        if matches!((self.peek(), self.peek_at(1)), (Tok::Name(mode), Tok::Name(_)) if mode == "out" || mode == "inout") {
+        if matches!((self.peek(), self.peek_at(1)), (Tok::Name(mode), Tok::Name(_)) if mode == "out" || mode == "inout")
+        {
             return Err(self.error(
                 "`out` and `inout` parameter modes were removed; use an owned return or `&mut tensor`"
                     .into(),
@@ -897,17 +898,17 @@ impl Parser {
                     span: span.to(self.prev_span()),
                 });
             }
-            Tok::Name(name) if name == "owned" && matches!(self.peek_at(1), Tok::Op(Op::LParen)) => {
+            Tok::Name(name)
+                if name == "owned" && matches!(self.peek_at(1), Tok::Op(Op::LParen)) =>
+            {
                 return Err(self.error(
-                    "`owned(...)` traversal was removed; iterate a bounded range with `for`"
-                        .into(),
+                    "`owned(...)` traversal was removed; iterate a bounded range with `for`".into(),
                 ));
             }
             Tok::Name(name) => ExprKind::Name(Ident { name, span }),
             Tok::Kw(Kw::Tile) => {
                 return Err(self.error(
-                    "`tile` allocation is compiler-internal; allocate a logical `tensor`"
-                        .into(),
+                    "`tile` allocation is compiler-internal; allocate a logical `tensor`".into(),
                 ));
             }
             Tok::Op(Op::LParen) => {
@@ -1065,9 +1066,27 @@ mod tests {
         );
         let f = only_fn(&file);
         assert!(f.target.is_none());
-        assert!(matches!(f.signature.params[0].ty.kind, TypeKind::Shaped { head: ShapedHead::Tensor, .. }));
-        assert!(matches!(f.signature.params[1].ty.kind, TypeKind::Shaped { head: ShapedHead::SharedTensor, .. }));
-        assert!(matches!(f.signature.params[2].ty.kind, TypeKind::Shaped { head: ShapedHead::MutTensor, .. }));
+        assert!(matches!(
+            f.signature.params[0].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::Tensor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.signature.params[1].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::SharedTensor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.signature.params[2].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::MutTensor,
+                ..
+            }
+        ));
         assert_eq!(f.signature.params[3].name.name, "to");
     }
 
@@ -1121,7 +1140,13 @@ mod tests {
             "fn prefix[K](x: &tensor[K] f32, result: tensor[K] f32) -> tensor[K] f32:\n    let mut output = result\n    let mut running = f32(0.0)\n    for i in 0..K:\n        running = running + x[i]\n        output[i] = running\n    return output\n",
         );
         let body = &only_fn(&file).body;
-        assert!(matches!(body.stmts[2].kind, StmtKind::For { parallel: false, .. }));
+        assert!(matches!(
+            body.stmts[2].kind,
+            StmtKind::For {
+                parallel: false,
+                ..
+            }
+        ));
         assert!(matches!(body.stmts[3].kind, StmtKind::Return(_)));
     }
 
@@ -1131,7 +1156,12 @@ mod tests {
             "fn transform[N](x: &tensor[N] f32, result: tensor[N] f32, enabled: bool) -> tensor[N] f32 where N >= 1:\n    let mut output = result\n    parallel for i in 0..N:\n        if enabled: output[i] = x[i] + 1.0; output[i] *= 2.0\n        else if N > 1: output[i] = x[i] - 1.0\n        else:\n            output[i] = x[i]\n    return output\n",
         );
         let body = &only_fn(&file).body;
-        let StmtKind::For { body: inline, parallel: true, .. } = &body.stmts[1].kind else {
+        let StmtKind::For {
+            body: inline,
+            parallel: true,
+            ..
+        } = &body.stmts[1].kind
+        else {
             panic!("expected for")
         };
         let StmtKind::If { els: Some(els), .. } = &inline.stmts[0].kind else {
@@ -1198,7 +1228,10 @@ mod tests {
             "fn f():\n    merge (a, b) identity 0:\n        return\n",
             "fn f(x: metal.fragment):\n    return\n",
         ] {
-            assert!(parse(source).is_err(), "retired syntax parsed successfully:\n{source}");
+            assert!(
+                parse(source).is_err(),
+                "retired syntax parsed successfully:\n{source}"
+            );
         }
     }
 }

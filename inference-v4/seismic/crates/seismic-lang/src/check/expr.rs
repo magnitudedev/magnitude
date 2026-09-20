@@ -432,7 +432,9 @@ impl<'a> Checker<'a> {
 
     fn tensor_alloc(&mut self, shape: &[ast::Expr], elem: &ast::Ident, span: Span) -> Option<Expr> {
         let mut allocation = self.tile_alloc(shape, elem, span)?;
-        let Ty::Tile(shaped) = allocation.ty else { unreachable!() };
+        let Ty::Tile(shaped) = allocation.ty else {
+            unreachable!()
+        };
         allocation.ty = Ty::Tensor(shaped);
         Some(allocation)
     }

@@ -127,7 +127,11 @@ fn physical_arrays_cover_logical_tiles_including_empty_and_partial_lanes() {
                     layout.private_elements_per_lane * width
                 );
                 // A group-wide array exists once per group; an item-owned one once per item.
-                let items = if placement == TilePlacement::GroupWide { 1 } else { 4 };
+                let items = if placement == TilePlacement::GroupWide {
+                    1
+                } else {
+                    4
+                };
                 assert_eq!(
                     layout.shared_bytes_per_group,
                     layout.shared_elements_per_item * width * items

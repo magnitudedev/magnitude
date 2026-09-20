@@ -17,7 +17,9 @@ impl Limit {
 
     pub fn new(value: f64) -> Result<Self, String> {
         if !value.is_finite() || value < 0.0 {
-            return Err(format!("precision limit must be finite and nonnegative, got {value}"));
+            return Err(format!(
+                "precision limit must be finite and nonnegative, got {value}"
+            ));
         }
         Ok(Self(if value == 0.0 { 0.0 } else { value }))
     }
@@ -67,11 +69,15 @@ impl Finite {
 }
 
 impl PartialEq for Finite {
-    fn eq(&self, other: &Self) -> bool { self.0.to_bits() == other.0.to_bits() }
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
 }
 impl Eq for Finite {}
 impl Hash for Finite {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.0.to_bits().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
 }
 
 /// Maximum permitted deviation of one observable floating-point element.
@@ -94,8 +100,7 @@ impl Tolerance {
     };
 
     pub fn envelope(self, reference: f64) -> f64 {
-        self.absolute.get()
-            + self.relative.get() * reference.abs().max(self.relative_floor.get())
+        self.absolute.get() + self.relative.get() * reference.abs().max(self.relative_floor.get())
     }
 }
 
@@ -152,7 +157,8 @@ impl InputRange {
         if minimum.get() > maximum.get() {
             return Err(format!(
                 "input range minimum {} exceeds maximum {}",
-                minimum.get(), maximum.get()
+                minimum.get(),
+                maximum.get()
             ));
         }
         Ok(Self { minimum, maximum })
@@ -307,7 +313,10 @@ impl NumericalAssessment {
         if outputs.is_empty() {
             return Err("a qualification must assess at least one observable output".into());
         }
-        if outputs.iter().any(|output| output.evidence != EvidenceClass::Qualified) {
+        if outputs
+            .iter()
+            .any(|output| output.evidence != EvidenceClass::Qualified)
+        {
             return Err("every output of a qualified assessment needs qualified evidence".into());
         }
         Ok(Self {
@@ -334,10 +343,11 @@ impl NumericalAssessment {
                     _ => false,
                 };
                 let validated = match self.evidence {
-                    EvidenceClass::Qualified => self
-                        .validated_policy
-                        .as_ref()
-                        .is_some_and(|validated| policy_is_at_least_as_permissive(policy, validated)),
+                    EvidenceClass::Qualified => {
+                        self.validated_policy.as_ref().is_some_and(|validated| {
+                            policy_is_at_least_as_permissive(policy, validated)
+                        })
+                    }
                     _ => true,
                 };
                 evidence_ok
@@ -355,9 +365,9 @@ impl NumericalAssessment {
                                 && m.maximum_relative <= tolerance.relative.get()
                                 && tolerance.ulps.is_none_or(|limit| m.maximum_ulps <= limit)))
                             && (!specials.nan || m.nan_mismatches == 0)
-                        && (!specials.infinity || m.infinity_mismatches == 0)
-                        && (!specials.signed_zero || m.signed_zero_mismatches == 0)
-                        && (!specials.subnormal || m.subnormal_mismatches == 0)
+                            && (!specials.infinity || m.infinity_mismatches == 0)
+                            && (!specials.signed_zero || m.signed_zero_mismatches == 0)
+                            && (!specials.subnormal || m.subnormal_mismatches == 0)
                     })
             }
         }
@@ -413,8 +423,14 @@ fn policy_is_at_least_as_permissive(
     let names = requested_outputs.keys().chain(validated_outputs.keys());
     names.into_iter().all(|name| {
         looser(
-            requested_outputs.get(name).copied().unwrap_or(*requested_default),
-            validated_outputs.get(name).copied().unwrap_or(*validated_default),
+            requested_outputs
+                .get(name)
+                .copied()
+                .unwrap_or(*requested_default),
+            validated_outputs
+                .get(name)
+                .copied()
+                .unwrap_or(*validated_default),
         )
     })
 }
@@ -430,14 +446,25 @@ fn ordered_f32(value: f32) -> u32 {
 
 fn ordered_bits(bits: u64, width: u32) -> u64 {
     let sign = 1_u64 << (width - 1);
-    let mask = if width == 64 { u64::MAX } else { (1_u64 << width) - 1 };
-    if bits & sign == 0 { bits | sign } else { (!bits) & mask }
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << width) - 1
+    };
+    if bits & sign == 0 {
+        bits | sign
+    } else {
+        (!bits) & mask
+    }
 }
 
 fn float_bits(dtype: DType, value: f32) -> Option<(u64, u32)> {
     match dtype {
         DType::F32 => Some((u64::from(value.to_bits()), 32)),
-        DType::BF16 => Some((u64::from(crate::numeric::bf16_round(value).to_bits() >> 16), 16)),
+        DType::BF16 => Some((
+            u64::from(crate::numeric::bf16_round(value).to_bits() >> 16),
+            16,
+        )),
         DType::F16 => Some((u64::from(crate::numeric::f16_bits(value)), 16)),
         _ => None,
     }
@@ -462,20 +489,36 @@ pub fn ulp_distance_f32(left: f32, right: f32) -> u64 {
     u64::from(ordered_f32(left).abs_diff(ordered_f32(right)))
 }
 
-
 pub fn ulp_distance(dtype: DType, left: f32, right: f32) -> Option<u64> {
-    let ((left, width), (right, other_width)) = (float_bits(dtype, left)?, float_bits(dtype, right)?);
+    let ((left, width), (right, other_width)) =
+        (float_bits(dtype, left)?, float_bits(dtype, right)?);
     (width == other_width).then(|| ordered_bits(left, width).abs_diff(ordered_bits(right, width)))
 }
 
 /// Compare dense values using their published dtype. When `tolerance` is present the report also
 /// counts elementwise violations of the combined absolute/relative envelope, ULP requirement and
 /// special-value policy.
-pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, tolerance: Option<Tolerance>, specials: SpecialPolicy) -> Result<ComparisonReport, String> {
+pub fn compare_dense(
+    reference: &[f64],
+    candidate: &[f64],
+    dtype: DType,
+    tolerance: Option<Tolerance>,
+    specials: SpecialPolicy,
+) -> Result<ComparisonReport, String> {
     if reference.len() != candidate.len() {
-        return Err(format!("comparison length differs: {} reference values, {} candidate values", reference.len(), candidate.len()));
+        return Err(format!(
+            "comparison length differs: {} reference values, {} candidate values",
+            reference.len(),
+            candidate.len()
+        ));
     }
-    let mut report = ComparisonReport { metrics: ErrorMetrics { compared: reference.len() as u64, ..ErrorMetrics::default() }, ..ComparisonReport::default() };
+    let mut report = ComparisonReport {
+        metrics: ErrorMetrics {
+            compared: reference.len() as u64,
+            ..ErrorMetrics::default()
+        },
+        ..ComparisonReport::default()
+    };
     for (index, (&reference, &candidate)) in reference.iter().zip(candidate).enumerate() {
         if !dtype.is_float() {
             if reference != candidate {
@@ -491,7 +534,9 @@ pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, toleran
             if !same_nan {
                 report.metrics.nan_mismatches += 1;
                 report.metrics.differing += 1;
-                if specials.nan { report.beyond_tolerance += 1; }
+                if specials.nan {
+                    report.beyond_tolerance += 1;
+                }
                 report.worst_element.get_or_insert(index);
             }
             continue;
@@ -500,12 +545,15 @@ pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, toleran
             if reference.to_bits() != candidate.to_bits() {
                 report.metrics.infinity_mismatches += 1;
                 report.metrics.differing += 1;
-                if specials.infinity { report.beyond_tolerance += 1; }
+                if specials.infinity {
+                    report.beyond_tolerance += 1;
+                }
                 report.worst_element.get_or_insert(index);
             }
             continue;
         }
-        let signed_zero_mismatch = reference == 0.0 && candidate == 0.0 && reference.to_bits() != candidate.to_bits();
+        let signed_zero_mismatch =
+            reference == 0.0 && candidate == 0.0 && reference.to_bits() != candidate.to_bits();
         if signed_zero_mismatch {
             report.metrics.signed_zero_mismatches += 1;
         }
@@ -514,9 +562,14 @@ pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, toleran
         if subnormal_mismatch {
             report.metrics.subnormal_mismatches += 1;
         }
-        let same = float_bits(dtype, reference).map(|v| v.0) == float_bits(dtype, candidate).map(|v| v.0);
+        let same =
+            float_bits(dtype, reference).map(|v| v.0) == float_bits(dtype, candidate).map(|v| v.0);
         if same {
-            if (signed_zero_mismatch && specials.signed_zero) || (subnormal_mismatch && specials.subnormal) { report.beyond_tolerance += 1; }
+            if (signed_zero_mismatch && specials.signed_zero)
+                || (subnormal_mismatch && specials.subnormal)
+            {
+                report.beyond_tolerance += 1;
+            }
             continue;
         }
         report.metrics.differing += 1;
@@ -534,7 +587,11 @@ pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, toleran
         if let Some(tolerance) = tolerance {
             let envelope = tolerance.envelope(f64::from(reference));
             let ulps_ok = tolerance.ulps.is_none_or(|limit| ulps <= limit);
-            if absolute > envelope || !ulps_ok || (signed_zero_mismatch && specials.signed_zero) || (subnormal_mismatch && specials.subnormal) {
+            if absolute > envelope
+                || !ulps_ok
+                || (signed_zero_mismatch && specials.signed_zero)
+                || (subnormal_mismatch && specials.subnormal)
+            {
                 report.beyond_tolerance += 1;
             }
         }
@@ -544,11 +601,26 @@ pub fn compare_dense(reference: &[f64], candidate: &[f64], dtype: DType, toleran
 
 /// Compare one dense f32 output. This is the common implementation used by qualification and
 /// backend/reference validation; policy checking remains separate from measurement.
-pub fn compare_f32(reference: &[f32], candidate: &[f32], relative_floor: f64) -> Result<(ErrorMetrics, Option<usize>), String> {
+pub fn compare_f32(
+    reference: &[f32],
+    candidate: &[f32],
+    relative_floor: f64,
+) -> Result<(ErrorMetrics, Option<usize>), String> {
     let floor = Limit::new(relative_floor)?;
     let reference: Vec<f64> = reference.iter().map(|value| f64::from(*value)).collect();
     let candidate: Vec<f64> = candidate.iter().map(|value| f64::from(*value)).collect();
-    let report = compare_dense(&reference, &candidate, DType::F32, Some(Tolerance { relative_floor: floor, absolute: Limit::new(f64::MAX)?, relative: Limit::ZERO, ulps: None }), SpecialPolicy::PRESERVE)?;
+    let report = compare_dense(
+        &reference,
+        &candidate,
+        DType::F32,
+        Some(Tolerance {
+            relative_floor: floor,
+            absolute: Limit::new(f64::MAX)?,
+            relative: Limit::ZERO,
+            ulps: None,
+        }),
+        SpecialPolicy::PRESERVE,
+    )?;
     Ok((report.metrics, report.worst_element))
 }
 
@@ -562,7 +634,14 @@ pub fn qualify_f32(
 ) -> Result<NumericalAssessment, String> {
     let reference: Vec<f64> = reference.iter().map(|value| f64::from(*value)).collect();
     let candidate: Vec<f64> = candidate.iter().map(|value| f64::from(*value)).collect();
-    qualify_dense_output(output, &reference, &candidate, DType::F32, policy, attribution)
+    qualify_dense_output(
+        output,
+        &reference,
+        &candidate,
+        DType::F32,
+        policy,
+        attribution,
+    )
 }
 
 /// Construct policy-bound qualification evidence for one observable dense output. A failed
@@ -622,7 +701,12 @@ mod tests {
     #[test]
     fn comparison_distinguishes_special_values_and_ulps() {
         let reference = [0.0, f32::INFINITY, f32::NAN, 1.0];
-        let candidate = [-0.0, f32::NEG_INFINITY, 1.0, f32::from_bits(1.0f32.to_bits() + 1)];
+        let candidate = [
+            -0.0,
+            f32::NEG_INFINITY,
+            1.0,
+            f32::from_bits(1.0f32.to_bits() + 1),
+        ];
         let (metrics, worst) = compare_f32(&reference, &candidate, 1e-30).unwrap();
         assert_eq!(metrics.signed_zero_mismatches, 1);
         assert_eq!(metrics.infinity_mismatches, 1);
@@ -651,12 +735,16 @@ mod tests {
         assert!(assessment.satisfies(&checked));
 
         let mut tighter = checked.clone();
-        let PrecisionPolicy::Bounded { default, .. } = &mut tighter else { unreachable!() };
+        let PrecisionPolicy::Bounded { default, .. } = &mut tighter else {
+            unreachable!()
+        };
         default.relative = Limit::new(0.05).unwrap();
         assert!(!assessment.satisfies(&tighter));
 
         let mut looser = checked.clone();
-        let PrecisionPolicy::Bounded { default, .. } = &mut looser else { unreachable!() };
+        let PrecisionPolicy::Bounded { default, .. } = &mut looser else {
+            unreachable!()
+        };
         default.absolute = Limit::new(0.02).unwrap();
         assert!(assessment.satisfies(&looser));
     }

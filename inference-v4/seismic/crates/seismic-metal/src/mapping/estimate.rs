@@ -49,10 +49,7 @@
 //!                           subgroups from 1 KiB per thread upward.
 //!   local_bytes_per_second  probe: threads streaming their threadgroup slice move 600-900 GB/s in
 //!                           aggregate; a lower bound (that probe is not purely memory-bound)
-use super::accounting::Work;
-use seismic_compiler::selection::quantity::Quantity;
-use crate::execution::SUBGROUP;
-use seismic_lang::family::SiteId;
+const SUBGROUP: u32 = 32;
 
 /// Probe-calibrated on Apple M4 Max, 2026-09-19 (see the module comment for each coefficient).
 pub const IDENTITY: &str = "metal-estimate-probe-calibrated-m4max-20260919-v3";
@@ -135,23 +132,10 @@ pub struct Group {
 
 impl Default for Group {
     fn default() -> Self {
-        Group { subgroups: 1, bytes: 0 }
-    }
-}
-
-impl Work {
-    pub(crate) fn totals(&self, site: &dyn Fn(SiteId) -> Option<i64>) -> Result<Totals, String> {
-        let sum = |terms: &[Quantity]| terms.iter().try_fold(0u64, |acc, q| acc.checked_add(q.eval(site)?).ok_or_else(|| "work total overflows u64".to_string()));
-        Ok(Totals {
-            lane_ops: sum(&self.lane_ops)?,
-            visits: sum(&self.visits)?,
-            matrix_multiplies: sum(&self.matrix_multiplies)?,
-            matrix_transfers: sum(&self.matrix_transfers)?,
-            device_bits: sum(&self.device_bits)?,
-            local_bits: sum(&self.local_bits)?,
-            resident_loads: sum(&self.resident_loads)?,
-            owner_completions: sum(&self.owner_completions)?,
-        })
+        Group {
+            subgroups: 1,
+            bytes: 0,
+        }
     }
 }
 
@@ -164,8 +148,23 @@ impl EstimateModel {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        let positive = [self.launch_ns, self.visit_ns, self.lane_ops_per_second, self.matrix_multiply_ns, self.matrix_transfer_ns, self.device_bytes_per_second, self.local_bytes_per_second, self.private_pressure_bytes, self.resident_load_ns, self.owner_completion_ns];
-        if positive.iter().any(|c| !c.is_finite() || *c <= 0.0) || self.concurrent_lanes < SUBGROUP as u64 || self.matrix_subgroups == 0 || self.threadgroup_pool_bytes == 0 {
+        let positive = [
+            self.launch_ns,
+            self.visit_ns,
+            self.lane_ops_per_second,
+            self.matrix_multiply_ns,
+            self.matrix_transfer_ns,
+            self.device_bytes_per_second,
+            self.local_bytes_per_second,
+            self.private_pressure_bytes,
+            self.resident_load_ns,
+            self.owner_completion_ns,
+        ];
+        if positive.iter().any(|c| !c.is_finite() || *c <= 0.0)
+            || self.concurrent_lanes < SUBGROUP as u64
+            || self.matrix_subgroups == 0
+            || self.threadgroup_pool_bytes == 0
+        {
             return Err("estimate coefficients must be finite and positive, with at least one concurrent subgroup".into());
         }
         Ok(())
@@ -173,7 +172,9 @@ impl EstimateModel {
 
     fn nanoseconds(value: f64) -> Result<u64, String> {
         if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
-            return Err(format!("estimate {value} ns is outside the representable range"));
+            return Err(format!(
+                "estimate {value} ns is outside the representable range"
+            ));
         }
         Ok(value.ceil() as u64)
     }
@@ -186,11 +187,17 @@ impl EstimateModel {
         // over the bytes one threadgroup declares, each running its SIMD groups.
         let resident = match group.bytes {
             0 => u64::MAX,
-            bytes => (self.threadgroup_pool_bytes / bytes).max(1).saturating_mul(group.subgroups.max(1)),
+            bytes => (self.threadgroup_pool_bytes / bytes)
+                .max(1)
+                .saturating_mul(group.subgroups.max(1)),
         };
-        let scalar_concurrency = pieces.clamp(1, (self.concurrent_lanes / SUBGROUP as u64).max(1)).min(resident) as f64;
+        let scalar_concurrency = pieces
+            .clamp(1, (self.concurrent_lanes / SUBGROUP as u64).max(1))
+            .min(resident) as f64;
         let matrix_concurrency = pieces.clamp(1, self.matrix_subgroups).min(resident) as f64;
-        let scalar = (totals.lane_ops as f64 / self.lane_ops_per_second * 1e9 + totals.visits as f64 * self.visit_ns) / scalar_concurrency;
+        let scalar = (totals.lane_ops as f64 / self.lane_ops_per_second * 1e9
+            + totals.visits as f64 * self.visit_ns)
+            / scalar_concurrency;
         let matrix = (totals.matrix_multiplies as f64 * self.matrix_multiply_ns
             + totals.matrix_transfers as f64 * self.matrix_transfer_ns
             + totals.resident_loads as f64 * self.resident_load_ns
@@ -211,8 +218,17 @@ impl EstimateModel {
     }
 
     /// Estimate of one execution scope: `launches` fixed overheads plus its span.
-    pub fn scope_ns(&self, launches: u64, totals: &Totals, pieces: u64, private_bytes: u64, group: Group) -> Result<u64, String> {
-        Self::nanoseconds(launches as f64 * self.launch_ns + self.span(totals, pieces, private_bytes, group))
+    pub fn scope_ns(
+        &self,
+        launches: u64,
+        totals: &Totals,
+        pieces: u64,
+        private_bytes: u64,
+        group: Group,
+    ) -> Result<u64, String> {
+        Self::nanoseconds(
+            launches as f64 * self.launch_ns + self.span(totals, pieces, private_bytes, group),
+        )
     }
 
     /// Estimate of writing and reading back `bits` of tile storage.

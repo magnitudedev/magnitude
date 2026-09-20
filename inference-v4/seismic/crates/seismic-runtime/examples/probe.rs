@@ -1,5 +1,5 @@
 //! Timing probe for one linked entry on Metal: selects, compiles, binds random tensors and
-//! reports the selected witness, its estimate, and measured GPU time per dispatch (best of
+//! reports the resolved physical assignment, its estimate, and measured GPU time per dispatch (best of
 //! several profiled runs) and per invocation inside one batched command buffer.
 //!
 //! usage: probe <source dir>... -- <entry> <K=V,...> <NAME=elem,...|-> [scalar=v,...|-] [name=v:v:...;...|-] [exact]
@@ -167,36 +167,38 @@ fn main() -> Result<(), String> {
         let kernel = kernel.borrow();
         let selection = kernel.selection();
         println!(
-            "estimate {} ns (seed {}), status {:?}",
-            selection.estimate, selection.seed_estimate, selection.status
+            "physical estimate {}, optimal={}, compile={:.3}s",
+            selection.estimated_cost,
+            selection.optimal,
+            selection.compile.as_secs_f64()
         );
         println!(
-            "choices {:?}",
+            "assignment {:?}",
             selection
-                .witness
-                .choices
+                .assignment
+                .selections()
                 .iter()
-                .map(|(o, c)| (o.0, *c))
+                .map(|(choice, alternative)| (choice.0, alternative.0))
                 .collect::<Vec<_>>()
         );
         println!(
-            "sites {:?}",
+            "resources {:?}",
             selection
-                .witness
-                .sites
+                .resources
                 .iter()
-                .map(|(s, v)| (s.0, *v))
+                .map(|resource| (
+                    resource.launch.0,
+                    resource.workgroups,
+                    resource.threads_per_group,
+                    resource.device_bytes,
+                    resource.workgroup_bytes,
+                    resource.private_bytes_per_participant,
+                ))
                 .collect::<Vec<_>>()
         );
         println!(
-            "covers {:?}",
-            selection
-                .witness
-                .covers
-                .iter()
-                .filter(|(_, c)| c.iter().any(|(a, b)| b - a > 1))
-                .map(|(s, c)| (s.0, c.clone()))
-                .collect::<Vec<_>>()
+            "numerics {:?} evidence {:?}",
+            selection.numerical_assessment.evidence, selection.numerical_evidence_identity
         );
     }
     let mut best: Vec<(String, u64, f64)> = Vec::new();

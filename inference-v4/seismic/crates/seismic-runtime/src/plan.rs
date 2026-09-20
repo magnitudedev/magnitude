@@ -6,7 +6,7 @@
 use crate::{Buffer, Device, ExecutionObservation, Kernel};
 #[cfg(target_os = "macos")]
 use crate::{DeviceTimingScope, Executable};
-use seismic_compiler::selection::{Budget, Strategy};
+use seismic_compiler::planning::{Budget, NumericalEvidence, Strategy};
 use seismic_lang::types::Elem;
 use seismic_lang::{family::Workload, precision::PrecisionPolicy, sir::Program};
 use seismic_realization::BufferRole;
@@ -32,7 +32,7 @@ impl CompiledPlan {
     pub fn step_count(&self) -> usize {
         1
     }
-    /// Kernels selected and natively compiled for this plan.
+    /// Kernels planned and natively compiled for this plan.
     pub fn kernel_count(&self) -> usize {
         usize::from(self.enclosing.kernel.borrow().is_some())
     }
@@ -57,7 +57,7 @@ impl CompiledPlan {
     pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
         self.enclosing.prepare(bindings)
     }
-    /// The selected, natively compiled kernel.
+    /// The resolved, natively compiled kernel.
     pub fn kernel(&self) -> Result<Rc<RefCell<Kernel>>, String> {
         self.enclosing.kernel()
     }
@@ -300,9 +300,8 @@ pub struct Settings {
     pub strategy: Strategy,
     /// Observable numerical contract; part of every compiled entry's workload identity.
     pub precision: PrecisionPolicy,
-    /// Whole-witness numerical evidence available to constrained selection. Records that do
-    /// not exactly match this program, specialization and device environment are ignored.
-    pub qualifications: Vec<seismic_compiler::selection::Qualification>,
+    /// Whole-program numerical evidence keyed to complete physical assignments.
+    pub numerical_evidence: Vec<NumericalEvidence>,
 }
 struct Enclosing {
     device: Device,
@@ -313,28 +312,24 @@ struct Enclosing {
     kernel: RefCell<Option<Rc<RefCell<Kernel>>>>,
 }
 impl Enclosing {
-    /// Joint selection, then native compilation of exactly the selected witness. A failed
-    /// selection is an error; nothing is retained and no other kernel substitutes.
+    /// Run the sole logical -> physical -> native pipeline. A failure retains
+    /// nothing and no alternate compilation path substitutes.
     fn kernel(&self) -> Result<Rc<RefCell<Kernel>>, String> {
         if let Some(kernel) = self.kernel.borrow().as_ref() {
             return Ok(kernel.clone());
         }
-        let selected = self
-            .device
-            .select_with_qualifications(
-                &self.program,
-                &self.entry,
-                &self.workload,
-                Budget {
-                    strategy: self.settings.strategy,
-                    ..self.settings.budget
-                },
-                &self.settings.qualifications,
-            )
-            .map_err(|e| format!("{}: {e}", self.entry))?;
         let kernel = Rc::new(RefCell::new(
             self.device
-                .compile_selected(selected)
+                .compile_with_evidence(
+                    &self.program,
+                    &self.entry,
+                    &self.workload,
+                    Budget {
+                        strategy: self.settings.strategy,
+                        ..self.settings.budget
+                    },
+                    &self.settings.numerical_evidence,
+                )
                 .map_err(|e| format!("{}: {e}", self.entry))?,
         ));
         *self.kernel.borrow_mut() = Some(kernel.clone());
@@ -395,7 +390,7 @@ impl Enclosing {
     }
 }
 
-/// Compiles linked entries through joint selection only.
+/// Compiles linked entries through the unified pipeline only.
 pub struct PlanCompiler<'a> {
     device: &'a Device,
     program: Rc<Program>,
@@ -414,7 +409,7 @@ impl<'a> PlanCompiler<'a> {
     pub fn settings(&self) -> Settings {
         self.settings.clone()
     }
-    /// Compilation identity is `(entry, shapes, elements, precision, qualification catalog)`;
+    /// Compilation identity is `(entry, shapes, elements, precision, evidence catalog)`;
     /// one compiler owns an immutable settings snapshot, so cached entries cannot observe a
     /// catalog change.
     pub fn compile_entry(
@@ -449,7 +444,7 @@ impl<'a> PlanCompiler<'a> {
             settings: self.settings.clone(),
             kernel: RefCell::new(None),
         });
-        // Selection, realization, and native compilation are part of plan construction.
+        // Specialization, physical planning, and native compilation are part of plan construction.
         // Binding and execution must not be the first point at which an invalid artifact is
         // discovered.
         enclosing.kernel()?;

@@ -7,7 +7,7 @@ use seismic_engine::{
     },
 };
 use seismic_lang::types::DType;
-use seismic_runtime::{Device, plan::Settings};
+use seismic_runtime::{plan::Settings, Device};
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -18,15 +18,20 @@ fn assert_reference_logits(actual: &[f32], reference: &Value, stage: &str) {
     for (index, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
         let expected = expected.as_f64().unwrap() as f32;
         maximum = maximum.max((actual - expected).abs());
-        assert!(actual.is_finite() && (actual - expected).abs() <= 2e-4 + 0.002 * expected.abs(),
-            "{stage} logit {index}: {actual} != {expected}");
+        assert!(
+            actual.is_finite() && (actual - expected).abs() <= 2e-4 + 0.002 * expected.abs(),
+            "{stage} logit {index}: {actual} != {expected}"
+        );
     }
     eprintln!("decoder {stage}: max_abs={maximum:e}");
 }
 
 fn exercise(device: Device, settings: Settings, routed: bool) {
     let started = std::time::Instant::now();
-    eprintln!("decoder fixture: preparing {} weights (routed={routed})", device.backend());
+    eprintln!(
+        "decoder fixture: preparing {} weights (routed={routed})",
+        device.backend()
+    );
     let fixture: Value = serde_json::from_str(if routed {
         include_str!("../../validation/results/fixtures/qwen-routed-decoder-reference.json")
     } else {
@@ -174,7 +179,11 @@ fn exercise(device: Device, settings: Settings, routed: bool) {
             let imported = importer
                 .import(descriptor, &stored, target)
                 .map_err(|e| e.to_string());
-            eprintln!("decoder fixture: import {} finished after {:.3}s", descriptor.name, import_started.elapsed().as_secs_f64());
+            eprintln!(
+                "decoder fixture: import {} finished after {:.3}s",
+                descriptor.name,
+                import_started.elapsed().as_secs_f64()
+            );
             imported
         },
         settings,
@@ -182,7 +191,10 @@ fn exercise(device: Device, settings: Settings, routed: bool) {
         2,
     )
     .unwrap();
-    eprintln!("decoder fixture: decoder ready after {:.3}s", started.elapsed().as_secs_f64());
+    eprintln!(
+        "decoder fixture: decoder ready after {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
     assert!(decoder.compiled_kernel_count() < 4 * 19);
     let store = decoder.state_store().clone();
     let mut state = store.create().unwrap();
@@ -238,15 +250,31 @@ fn exercise(device: Device, settings: Settings, routed: bool) {
         eprintln!("decoder fixture: two-row sequential prefill then abort");
         let rejected = decoder.prefill(&mut state, &prompt).unwrap();
         let serial_logits = rejected.logits().to_vec();
-        assert_reference_logits(&serial_logits, &reference[1], "two-row prefill before abort");
+        assert_reference_logits(
+            &serial_logits,
+            &reference[1],
+            "two-row prefill before abort",
+        );
         rejected.abort();
-        assert_eq!(state.position(), 0, "aborted prefill must leave the sequence empty");
-        assert_eq!(store.occupied_rows(), 0, "aborted prefill must release both rows");
+        assert_eq!(
+            state.position(),
+            0,
+            "aborted prefill must leave the sequence empty"
+        );
+        assert_eq!(
+            store.occupied_rows(),
+            0,
+            "aborted prefill must release both rows"
+        );
 
         eprintln!("decoder fixture: two-row batched prefill then commit");
         let (prefilled, observation) = decoder.prefill_batched(&mut state, &prompt).unwrap();
         assert!(observation.host_seconds > 0.);
-        assert_eq!(prefilled.logits(), serial_logits, "batched prefill publication differs");
+        assert_eq!(
+            prefilled.logits(),
+            serial_logits,
+            "batched prefill publication differs"
+        );
         assert_reference_logits(prefilled.logits(), &reference[1], "two-row batched prefill");
         prefilled.commit().unwrap();
         assert_eq!(state.position(), 2, "prefill must commit both tokens");
@@ -255,7 +283,11 @@ fn exercise(device: Device, settings: Settings, routed: bool) {
         eprintln!("decoder fixture: decode continuation after two-row prefill");
         let (decoded, observation) = decoder.propose_batched(&mut state, continuation).unwrap();
         assert!(observation.host_seconds > 0.);
-        assert_reference_logits(decoded.logits(), &reference[2], "decode after two-row prefill");
+        assert_reference_logits(
+            decoded.logits(),
+            &reference[2],
+            "decode after two-row prefill",
+        );
         decoded.commit().unwrap();
         assert_eq!(state.position(), 3);
         assert_eq!(store.occupied_rows(), 3);

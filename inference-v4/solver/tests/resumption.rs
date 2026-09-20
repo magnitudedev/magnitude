@@ -1,7 +1,7 @@
 use magnitude_solver::{
-    Domain, Limits, Model, ModelBuilder, Options, Outcome, Search,
     model::{Constraint, Cost},
     result::StopReason,
+    Domain, Limits, Model, ModelBuilder, Options, Outcome, Search,
 };
 use std::{sync::Arc, time::Duration};
 

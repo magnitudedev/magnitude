@@ -351,7 +351,10 @@ impl<T: 'static> Client<T> {
     }
     /// Reserved for release of an existing bounded service resource. Ordinary
     /// control work must use `call`; request handles enqueue this at most once.
-    pub(crate) fn release(&self, action: impl FnOnce(&mut T) -> Result<(), String> + Send + 'static) {
+    pub(crate) fn release(
+        &self,
+        action: impl FnOnce(&mut T) -> Result<(), String> + Send + 'static,
+    ) {
         self.mailbox.cleanup(Box::new(Lifecycle(Box::new(action))));
     }
     pub fn call<R: Send + 'static>(

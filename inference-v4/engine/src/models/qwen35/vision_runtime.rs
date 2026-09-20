@@ -31,9 +31,19 @@ pub struct Features {
 }
 impl Features {
     #[cfg(test)]
-    pub(crate) fn test_fixture(identity: String, rows: usize, width: usize, buffer: Buffer) -> Self {
+    pub(crate) fn test_fixture(
+        identity: String,
+        rows: usize,
+        width: usize,
+        buffer: Buffer,
+    ) -> Self {
         assert_eq!(buffer.len(), rows * width * 4);
-        Self { identity, rows, width, buffer }
+        Self {
+            identity,
+            rows,
+            width,
+            buffer,
+        }
     }
     pub fn identity(&self) -> &str {
         &self.identity

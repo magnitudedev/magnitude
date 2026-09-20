@@ -1,6 +1,6 @@
 use magnitude_solver::{
-    Algorithm, Domain, Limits, ModelBuilder, NeighborhoodOptions, Options, Outcome, Search,
     model::{Arithmetic, Constraint, Cost, LinearTerm, Literal},
+    Algorithm, Domain, Limits, ModelBuilder, NeighborhoodOptions, Options, Outcome, Search,
 };
 use std::sync::Arc;
 
@@ -216,16 +216,14 @@ fn options_are_validated_and_exact_remains_default() {
             2 => c.population_size = 0,
             _ => c.restart_after = 0,
         }
-        assert!(
-            Search::new(
-                Arc::new(ModelBuilder::new().build().unwrap()),
-                Options {
-                    algorithm: Algorithm::Neighborhood(c),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
+        assert!(Search::new(
+            Arc::new(ModelBuilder::new().build().unwrap()),
+            Options {
+                algorithm: Algorithm::Neighborhood(c),
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 }
 

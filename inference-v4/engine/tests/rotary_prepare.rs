@@ -15,7 +15,9 @@ fn exercise(backend: &mut Backend<'_>) {
         .iter()
         .map(|(k, v)| (k.clone(), v.as_i64().unwrap()))
         .collect();
-    let mut tensors = allocate(backend.program(), "rotary_prepare", &shapes, |_| DType::BF16);
+    let mut tensors = allocate(backend.program(), "rotary_prepare", &shapes, |_| {
+        DType::BF16
+    });
     for (name, tensor) in tensors.iter_mut() {
         if let Some(values) = fixture["inputs"][name].as_array() {
             fill(tensor, values.iter().map(|v| v.as_f64().unwrap()));
@@ -25,7 +27,12 @@ fn exercise(backend: &mut Backend<'_>) {
         .params
         .iter()
         .filter(|p| !matches!(p.ty, Ty::Tensor(_)))
-        .map(|p| (p.name.clone(), fixture["scalars"][&p.name].as_f64().unwrap()))
+        .map(|p| {
+            (
+                p.name.clone(),
+                fixture["scalars"][&p.name].as_f64().unwrap(),
+            )
+        })
         .collect();
     backend.run("rotary_prepare", &shapes, &mut tensors, &scalars);
     for (name, expected) in fixture["outputs"].as_object().unwrap() {
@@ -54,8 +61,15 @@ fn reference_rotary_prepare() {
 #[test]
 #[ignore = "requires a Metal device"]
 fn metal_rotary_prepare() {
-    use seismic_runtime::{plan::{PlanCompiler, Settings}, Device};
+    use seismic_runtime::{
+        plan::{PlanCompiler, Settings},
+        Device,
+    };
     let program = seismic_std::program().unwrap();
     let device = Device::metal().unwrap();
-    exercise(&mut Backend::Metal(PlanCompiler::new(&device, &program, Settings::default())));
+    exercise(&mut Backend::Metal(PlanCompiler::new(
+        &device,
+        &program,
+        Settings::default(),
+    )));
 }

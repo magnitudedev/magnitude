@@ -102,7 +102,13 @@ pub fn stmt<'a>(s: &'a Stmt, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
                 }
             }
         }
-        StmtKind::Range { lo, hi, value, body, .. } => {
+        StmtKind::Range {
+            lo,
+            hi,
+            value,
+            body,
+            ..
+        } => {
             expr(lo, nested, f);
             expr(hi, nested, f);
             if let Some(value) = value {

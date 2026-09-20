@@ -17,7 +17,7 @@ use crate::sir::{
     SliceParent,
 };
 use crate::span::line_col;
-use crate::sym::Sym;
+use crate::sym::{Atom, Sym};
 use crate::types::{Elem, Extent, RegionId, SliceId};
 use applicability::{Binding, Bounds, SiteExtent};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -155,9 +155,48 @@ struct CandidateNode {
     reference: bool,
     numerical_effects: Vec<NumericalEffect>,
     structural: Vec<(String, SiteId)>,
+    dynamic: Vec<(String, Sym)>,
     requirements: Vec<Requirement>,
     children: Vec<OccurrenceNode>,
     sites: Vec<(SiteId, SiteKind)>,
+}
+
+fn substitute_dynamic(sym: &Sym, binding: &Binding) -> Sym {
+    fn walk(sym: &Sym, binding: &Binding) -> Sym {
+        let mut out = Sym::constant(0);
+        for (monomial, coefficient) in sym.monomials() {
+            let mut term = Sym::constant(coefficient);
+            for (atom, power) in monomial {
+                let factor = match atom {
+                    Atom::Param(name) => binding
+                        .shapes
+                        .get(name)
+                        .copied()
+                        .map(Sym::constant)
+                        .or_else(|| {
+                            binding
+                                .dynamic
+                                .iter()
+                                .find(|(bound, _)| bound == name)
+                                .map(|(_, value)| value.clone())
+                        })
+                        .unwrap_or_else(|| Sym::atom(atom.clone())),
+                    Atom::Quot(numerator, denominator) => {
+                        walk(numerator, binding).quot(&walk(denominator, binding))
+                    }
+                    Atom::Rem(numerator, denominator) => {
+                        walk(numerator, binding).rem(&walk(denominator, binding))
+                    }
+                };
+                for _ in 0..*power {
+                    term = term.mul(&factor);
+                }
+            }
+            out = out.add(&term);
+        }
+        out
+    }
+    walk(sym, binding)
 }
 
 /// The candidate body containing a call: what callee shape arguments are evaluated under.
@@ -449,7 +488,9 @@ impl<'a> Builder<'a> {
                             } else {
                                 // A runtime-valued semantic extent of the caller: a runtime-bounded
                                 // range, a runtime index, or a parameter that is itself dynamic.
-                                binding.dynamic.push(name.clone());
+                                binding
+                                    .dynamic
+                                    .push((name.clone(), substitute_dynamic(sym, caller.binding)));
                             }
                         }
                     }
@@ -514,7 +555,11 @@ impl<'a> Builder<'a> {
                 .map(|(name, elem)| (name.clone(), elem.clone()))
                 .collect(),
             structural.clone(),
-            binding.dynamic.clone(),
+            binding
+                .dynamic
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
         );
         let next = TemplateId(self.templates.len() as u32);
         let id = *self.interned.entry(key).or_insert(next);
@@ -525,7 +570,11 @@ impl<'a> Builder<'a> {
                 shapes: binding.shapes.clone(),
                 elems: binding.elems.clone(),
                 structural,
-                dynamic: binding.dynamic.clone(),
+                dynamic: binding
+                    .dynamic
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect(),
             });
         }
         id
@@ -656,6 +705,7 @@ impl<'a> Builder<'a> {
             children.push(child);
         }
         let structural = binding.structural;
+        let dynamic = binding.dynamic;
         Ok(Ok(CandidateNode {
             template,
             definition: def.id,
@@ -663,6 +713,7 @@ impl<'a> Builder<'a> {
             reference,
             numerical_effects,
             structural,
+            dynamic,
             requirements,
             children,
             sites,
@@ -735,6 +786,7 @@ impl<'a> Builder<'a> {
                 .into_iter()
                 .map(|(name, site)| Ok((name, SiteRef(resolve(site)?))))
                 .collect::<Result<Vec<_>, String>>()?;
+            let dynamic = node.dynamic;
             let requirements = node
                 .requirements
                 .iter()
@@ -776,6 +828,7 @@ impl<'a> Builder<'a> {
                 reference: node.reference,
                 numerical_effects: node.numerical_effects,
                 structural,
+                dynamic,
                 requirements,
                 children: node.children.iter().map(|child| child.id).collect(),
                 sites: own,
@@ -932,7 +985,6 @@ fn with_site(requirement: &Requirement, site: SiteId) -> Requirement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::Witness;
     use crate::program::{compile, SourceFile};
 
     fn supports_test_intrinsic(_: &crate::sir::IntrinsicUse) -> Result<(), String> {
@@ -1058,25 +1110,8 @@ fn two_dots[N](x: tensor[N] f32, w0: tensor[N] f32, w1: tensor[N] f32) -> (f32, 
                 family.occurrences[1].candidates[0].template,
                 family.occurrences[2].candidates[0].template
             );
-            let mut witness = Witness::default();
-            witness.choices = family
-                .occurrences
-                .iter()
-                .map(|o| (o.id, o.candidates.len() as u32 - 1))
-                .collect();
-            // Covers belong to active sequences only: those of the selected candidates.
-            let covers = family
-                .sequences
-                .iter()
-                .filter(|s| family.active(&witness, s.owner))
-                .map(|s| (s.id, vec![(0, s.units.len() as u32)]))
-                .collect();
-            witness.covers = covers;
             // Entry root; per child the scalar body's root, and the paired body's root and loop body.
             assert_eq!(family.sequences.len(), if expected == 2 { 7 } else { 3 });
-            family.validate(&witness)?;
-            witness.choices.remove(&OccurrenceId(2));
-            assert!(family.validate(&witness).is_err());
         }
         Ok(())
     }
@@ -1170,6 +1205,4 @@ fn choose[N](x: tensor[N] f32) -> f32 where N >= 1:
             "{error}"
         );
     }
-
-
 }

@@ -29,12 +29,22 @@ fn cases() -> Vec<Case> {
             let hex = case["source_hex"].as_str().unwrap();
             Case {
                 encoding: Encoding::try_from(case["encoding"].as_u64().unwrap() as u32).unwrap(),
-                shape: case["shape"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap()).collect(),
+                shape: case["shape"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_u64().unwrap())
+                    .collect(),
                 bytes: (0..hex.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                     .collect(),
-                values: case["values"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect(),
+                values: case["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap() as f32)
+                    .collect(),
             }
         })
         .collect()
@@ -58,7 +68,10 @@ fn reference_gguf_import() {
         for case in cases() {
             let (entry, representation) = block_import(case.encoding).unwrap();
             let count = case.shape.iter().product::<u64>() as usize;
-            let shapes = HashMap::from([("B".to_string(), (count as u64 / case.encoding.block_elements()) as i64)]);
+            let shapes = HashMap::from([(
+                "B".to_string(),
+                (count as u64 / case.encoding.block_elements()) as i64,
+            )]);
             let mut padded = case.bytes.clone();
             padded.resize(padded.len().div_ceil(4) * 4, 0);
             let mut vm = reference::interpreter(&program, width);
@@ -67,8 +80,12 @@ fn reference_gguf_import() {
                 .params
                 .iter()
                 .map(|param| {
-                    let Ty::Tensor(tensor) = &param.ty else { panic!("{entry}.{} is not a tensor", param.name) };
-                    let Elem::Dtype(dtype) = tensor.elem else { panic!("{entry}.{} is not dense", param.name) };
+                    let Ty::Tensor(tensor) = &param.ty else {
+                        panic!("{entry}.{} is not a tensor", param.name)
+                    };
+                    let Elem::Dtype(dtype) = tensor.elem else {
+                        panic!("{entry}.{} is not dense", param.name)
+                    };
                     let shape = reference::extents(tensor, &shapes);
                     let size = shape.iter().product();
                     let mut data = TensorData::dense(dtype, shape, vec![0.; size]);
@@ -81,7 +98,10 @@ fn reference_gguf_import() {
                 })
                 .collect::<Vec<_>>();
             reference::run(&mut vm, entry, &args, &shapes);
-            let planes = planes.into_iter().map(|id| vm.tensors[id].device_bytes().remove(0)).collect();
+            let planes = planes
+                .into_iter()
+                .map(|id| vm.tensors[id].device_bytes().remove(0))
+                .collect();
             let source = vm.add_tensor(TensorData::Packed {
                 repr: seismic_lang::repr::lookup(representation).unwrap(),
                 shape: vec![count],
@@ -111,7 +131,11 @@ fn metal_gguf_residency() {
     }
     impl Bindings for Decode<'_> {
         fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
-            if root == "source" { self.source.plane(plane) } else { Some(self.out) }
+            if root == "source" {
+                self.source.plane(plane)
+            } else {
+                Some(self.out)
+            }
         }
         fn scalar(&self, _: &str) -> Option<f64> {
             Some(0.)
@@ -142,12 +166,25 @@ fn metal_gguf_residency() {
             shape: case.shape.clone(),
             encoding: case.encoding,
         };
-        let resident = importer.import(&descriptor, &stored(case.bytes.len() as u64), DType::BF16).unwrap();
-        let Elem::Repr(name) = resident.element() else { panic!("expected packed resident"); };
+        let resident = importer
+            .import(&descriptor, &stored(case.bytes.len() as u64), DType::BF16)
+            .unwrap();
+        let Elem::Repr(name) = resident.element() else {
+            panic!("expected packed resident");
+        };
         let representation = seismic_lang::repr::lookup(name).unwrap();
-        let payload_bytes = representation.planes().iter().map(|p| p.bytes(count as u64).unwrap()).sum::<u64>();
+        let payload_bytes = representation
+            .planes()
+            .iter()
+            .map(|p| p.bytes(count as u64).unwrap())
+            .sum::<u64>();
         if matches!(case.encoding, Encoding::Q4K | Encoding::Q5K | Encoding::Q6K) {
-            assert_eq!(payload_bytes, case.bytes.len() as u64, "compact {:?} payload", case.encoding);
+            assert_eq!(
+                payload_bytes,
+                case.bytes.len() as u64,
+                "compact {:?} payload",
+                case.encoding
+            );
             assert!(resident.plane("scale").is_none());
             assert!(resident.plane("bias").is_none());
         }
@@ -164,12 +201,27 @@ fn metal_gguf_residency() {
                 ]),
             )
             .unwrap()
-            .execute(&Decode { source: &resident, out: &out })
+            .execute(&Decode {
+                source: &resident,
+                out: &out,
+            })
             .unwrap();
         let mut actual = vec![0; count * 4];
         out.read(&mut actual).unwrap();
-        check(&case, &actual.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>());
-        assert!(importer.import(&descriptor, &stored(case.bytes.len() as u64 + 1), DType::F32).is_err());
+        check(
+            &case,
+            &actual
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(importer
+            .import(
+                &descriptor,
+                &stored(case.bytes.len() as u64 + 1),
+                DType::F32
+            )
+            .is_err());
         std::fs::remove_file(path).unwrap();
     }
 }

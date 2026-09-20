@@ -186,8 +186,10 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                     for i in 0..4 {
                         let w = |name: &str| weights[&format!("b{i}.{name}")];
                         if i % 2 == 0 {
-                            let next_window = tensor(&mut vm, DType::BF16, vec![3, 32], vec![0.; 96]);
-                            let next_delta = tensor(&mut vm, DType::F32, vec![4, 4, 4], vec![0.; 64]);
+                            let next_window =
+                                tensor(&mut vm, DType::BF16, vec![3, 32], vec![0.; 96]);
+                            let next_delta =
+                                tensor(&mut vm, DType::F32, vec![4, 4, 4], vec![0.; 64]);
                             call(
                                 &mut vm,
                                 "qwen_recurrent_sequence",
@@ -235,17 +237,17 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                             );
                             // Fragmented history has nonmonotonic physical placement,
                             // unrelated rows in gaps, and empty spans at both ends.
-                            let spans: Vec<_> = if fragmented {
-                                std::iter::once([0., 0.])
-                                    .chain(
-                                        (0..position)
-                                            .map(|i| [placement[i] as f64, (placement[i] + 1) as f64]),
-                                    )
-                                    .chain(std::iter::once([8., 8.]))
-                                    .collect()
-                            } else {
-                                vec![[0., position as f64]]
-                            };
+                            let spans: Vec<_> =
+                                if fragmented {
+                                    std::iter::once([0., 0.])
+                                        .chain((0..position).map(|i| {
+                                            [placement[i] as f64, (placement[i] + 1) as f64]
+                                        }))
+                                        .chain(std::iter::once([8., 8.]))
+                                        .collect()
+                                } else {
+                                    vec![[0., position as f64]]
+                                };
                             let visible = tensor(
                                 &mut vm,
                                 DType::I32,
@@ -391,7 +393,8 @@ fn selected_readout_matches_full_projection_with_order_duplicates_and_packed_wei
                     vec![4, 64],
                     (0..256)
                         .map(|i| {
-                            seismic_lang::numeric::bf16_round(((i * 11 % 31) as f32 - 15.) / 9.) as f64
+                            seismic_lang::numeric::bf16_round(((i * 11 % 31) as f32 - 15.) / 9.)
+                                as f64
                         })
                         .collect(),
                 )

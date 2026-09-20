@@ -473,27 +473,41 @@ impl<'a> Checker<'a> {
                     });
                 let Ty::Scalar(dtype) = place.ty.clone() else {
                     if op != AssignOp::Assign {
-                        self.error(target.span, "compound assignment requires a scalar element place");
+                        self.error(
+                            target.span,
+                            "compound assignment requires a scalar element place",
+                        );
                         return None;
                     }
                     let value = self.expr(value, None)?;
                     let compatible = match (&value.ty, &place.ty) {
-                        (Ty::Tile(v) | Ty::View(v) | Ty::Tensor(v), Ty::Tensor(d) | Ty::View(d) | Ty::Tile(d)) => {
-                            self.same_axes(v, d) && elem_rounds(&v.elem, &d.elem)
-                        }
+                        (
+                            Ty::Tile(v) | Ty::View(v) | Ty::Tensor(v),
+                            Ty::Tensor(d) | Ty::View(d) | Ty::Tile(d),
+                        ) => self.same_axes(v, d) && elem_rounds(&v.elem, &d.elem),
                         _ => false,
                     };
                     if !compatible {
-                        self.error(value.span, format!("cannot assign {} to {}; convert explicitly", value.ty, place.ty));
+                        self.error(
+                            value.span,
+                            format!(
+                                "cannot assign {} to {}; convert explicitly",
+                                value.ty, place.ty
+                            ),
+                        );
                         return None;
                     }
                     self.forbid_partial(&value, "a tensor slice assignment");
                     let root = self.write(&place, target.span, false)?;
                     if covers || self.covers_whole(&place) {
                         self.unassigned.remove(&root);
-                        self.pending_full_assign.retain(|(variable, _)| *variable != id);
+                        self.pending_full_assign
+                            .retain(|(variable, _)| *variable != id);
                     }
-                    return Some(StmtKind::Publish { value, destination: place });
+                    return Some(StmtKind::Publish {
+                        value,
+                        destination: place,
+                    });
                 };
                 let value = self.expr(value, Some(&Ty::Scalar(dtype)))?;
                 let Some(vd) = value.ty.scalar_dtype() else {
@@ -893,11 +907,18 @@ impl<'a> Checker<'a> {
                 let prior_pending = self.pending_full_assign.clone();
                 let mut pending = Vec::new();
                 for tensor in self.unassigned.iter().copied() {
-                    let (Ty::Tensor(shaped) | Ty::Tile(shaped)) = &self.vars[tensor].ty else { continue };
-                    let prefix = prior_pending.iter().find(|(candidate, _)| *candidate == tensor)
-                        .map(|(_, axes)| axes.clone()).unwrap_or_default();
+                    let (Ty::Tensor(shaped) | Ty::Tile(shaped)) = &self.vars[tensor].ty else {
+                        continue;
+                    };
+                    let prefix = prior_pending
+                        .iter()
+                        .find(|(candidate, _)| *candidate == tensor)
+                        .map(|(_, axes)| axes.clone())
+                        .unwrap_or_default();
                     let axis = prefix.len();
-                    let Some(Extent::Semantic(extent)) = shaped.axes.get(axis) else { continue };
+                    let Some(Extent::Semantic(extent)) = shaped.axes.get(axis) else {
+                        continue;
+                    };
                     if lo_sym.is_zero() && &hi_sym == extent {
                         let mut axes = prefix;
                         axes.push(var);
@@ -956,7 +977,9 @@ impl<'a> Checker<'a> {
                 }];
                 let pending: Vec<_> = self.unassigned.iter().copied().collect();
                 for variable in pending {
-                    let Some(shaped) = self.vars[variable].ty.shaped() else { continue };
+                    let Some(shaped) = self.vars[variable].ty.shaped() else {
+                        continue;
+                    };
                     if super::definitely_initializes_var(
                         &self.vars,
                         &loop_block,
@@ -1350,5 +1373,4 @@ impl<'a> Checker<'a> {
         }
         Some(StmtKind::Return(exprs))
     }
-
 }

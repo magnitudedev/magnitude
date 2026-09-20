@@ -1,5 +1,5 @@
 use super::ActivityReservation;
-use super::{Narrowing, present, propagate_precedence};
+use super::{present, propagate_precedence, Narrowing};
 use crate::model::{Error, Result, VarId};
 use std::collections::BTreeMap;
 

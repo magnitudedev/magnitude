@@ -27,10 +27,16 @@ fn exercise(backend: &mut Backend<'_>) {
             .collect();
         let mut tensors = allocate(backend.program(), "route_topk", &shapes, |_| DType::F32);
         fill(tensors.get_mut("logits").unwrap(), doubles(&case["logits"]));
-        let scalars = HashMap::from([("normalize".into(), f64::from(case["normalize"].as_bool().unwrap()))]);
+        let scalars = HashMap::from([(
+            "normalize".into(),
+            f64::from(case["normalize"].as_bool().unwrap()),
+        )]);
         backend.run("route_topk", &shapes, &mut tensors, &scalars);
         assert_eq!(
-            reference::values(&tensors["routes"]).into_iter().map(|v| v as i64).collect::<Vec<_>>(),
+            reference::values(&tensors["routes"])
+                .into_iter()
+                .map(|v| v as i64)
+                .collect::<Vec<_>>(),
             case["routes"]
                 .as_array()
                 .unwrap()
@@ -38,7 +44,11 @@ fn exercise(backend: &mut Backend<'_>) {
                 .map(|v| v.as_i64().unwrap())
                 .collect::<Vec<_>>()
         );
-        close(&reference::values(&tensors["scores"]), &case["scores"], 2e-7);
+        close(
+            &reference::values(&tensors["scores"]),
+            &case["scores"],
+            2e-7,
+        );
     }
     let shapes = fixture["shape"]
         .as_object()
@@ -46,17 +56,32 @@ fn exercise(backend: &mut Backend<'_>) {
         .iter()
         .map(|(n, v)| (n.clone(), v.as_i64().unwrap()))
         .collect();
-    let mut tensors = allocate(backend.program(), "qwen_routed_suffix", &shapes, |parameter| {
-        if parameter == "SRW" { DType::F32 } else { DType::BF16 }
-    });
+    let mut tensors = allocate(
+        backend.program(),
+        "qwen_routed_suffix",
+        &shapes,
+        |parameter| {
+            if parameter == "SRW" {
+                DType::F32
+            } else {
+                DType::BF16
+            }
+        },
+    );
     for (name, record) in fixture["weights"].as_object().unwrap() {
         fill(tensors.get_mut(name).unwrap(), doubles(&record["values"]));
     }
-    fill(tensors.get_mut("residual").unwrap(), doubles(&fixture["residual"]));
+    fill(
+        tensors.get_mut("residual").unwrap(),
+        doubles(&fixture["residual"]),
+    );
     for case in fixture["cases"].as_array().unwrap() {
         let scalars = HashMap::from([
             ("eps".into(), 1e-6),
-            ("normalize".into(), f64::from(case["normalize"].as_bool().unwrap())),
+            (
+                "normalize".into(),
+                f64::from(case["normalize"].as_bool().unwrap()),
+            ),
         ]);
         backend.run("qwen_routed_suffix", &shapes, &mut tensors, &scalars);
         close(&reference::values(&tensors["out"]), &case["out"], 2e-6);
@@ -72,8 +97,15 @@ fn reference_routed() {
 #[test]
 #[ignore = "requires a Metal device"]
 fn metal_routed() {
-    use seismic_runtime::{plan::{PlanCompiler, Settings}, Device};
+    use seismic_runtime::{
+        plan::{PlanCompiler, Settings},
+        Device,
+    };
     let program = program().unwrap();
     let device = Device::metal().unwrap();
-    exercise(&mut Backend::Metal(PlanCompiler::new(&device, &program, Settings::default())));
+    exercise(&mut Backend::Metal(PlanCompiler::new(
+        &device,
+        &program,
+        Settings::default(),
+    )));
 }

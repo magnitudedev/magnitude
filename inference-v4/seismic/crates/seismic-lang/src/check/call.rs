@@ -4,6 +4,7 @@
 use super::resolve::{ParamOwnership, Sig};
 use super::Checker;
 use crate::intrinsics::{self, Intrinsic, IntrinsicParam, IntrinsicResult, Operation, Semantics};
+use crate::sir::Mode;
 use crate::sir::{
     self, CallId, CallSite, CandidateBinding, DefId, DefKind, Expr, ExprKind, Math, ReduceOp,
     VarId, VarKind,
@@ -11,7 +12,6 @@ use crate::sir::{
 use crate::span::Span;
 use crate::sym::{Atom, Sym};
 use crate::syntax::ast::{self, BinaryOp, ExprKind as A};
-use crate::sir::Mode;
 use crate::types::{DType, Elem, Extent, NativeTy, Shaped, Ty};
 use std::collections::HashMap;
 
@@ -1628,9 +1628,8 @@ impl<'a> Checker<'a> {
                     .map(|slot| &sig.params[slot])
             });
             let hint = param.and_then(|p| p.ty.scalar_dtype()).map(Ty::Scalar);
-            let write_only_candidate = param.is_some_and(|p| {
-                p.mode == Mode::Out || p.ownership == ParamOwnership::Exclusive
-            });
+            let write_only_candidate = param
+                .is_some_and(|p| p.mode == Mode::Out || p.ownership == ParamOwnership::Exclusive);
             args.push(self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?);
         }
 
@@ -1660,14 +1659,28 @@ impl<'a> Checker<'a> {
         candidates.retain(|(d, _, _)| resolved.declared[*d].family == family);
 
         for (argument_ordinal, argument) in args.iter().enumerate() {
-            let Some(root) = self.root_var(argument) else { continue };
-            let VarKind::Param(own_parameter) = self.vars[root].kind else { continue };
-            if self.sig.params[own_parameter].ownership != ParamOwnership::Exclusive { continue; }
-            let forwarded: Vec<_> = candidates.iter().filter_map(|(definition, order, _)| {
-                order.iter().position(|ordinal| *ordinal == argument_ordinal)
-                    .filter(|parameter| resolved.declared[*definition].sig.params[*parameter].ownership == ParamOwnership::Exclusive)
-                    .map(|parameter| (*definition, parameter))
-            }).collect();
+            let Some(root) = self.root_var(argument) else {
+                continue;
+            };
+            let VarKind::Param(own_parameter) = self.vars[root].kind else {
+                continue;
+            };
+            if self.sig.params[own_parameter].ownership != ParamOwnership::Exclusive {
+                continue;
+            }
+            let forwarded: Vec<_> = candidates
+                .iter()
+                .filter_map(|(definition, order, _)| {
+                    order
+                        .iter()
+                        .position(|ordinal| *ordinal == argument_ordinal)
+                        .filter(|parameter| {
+                            resolved.declared[*definition].sig.params[*parameter].ownership
+                                == ParamOwnership::Exclusive
+                        })
+                        .map(|parameter| (*definition, parameter))
+                })
+                .collect();
             if forwarded.len() == candidates.len() {
                 self.summary.init_passes.push((forwarded, own_parameter));
             }
@@ -1676,11 +1689,23 @@ impl<'a> Checker<'a> {
         // An uninitialized owned tensor may cross an exclusive borrow only when every
         // applicable implementation definitely initializes the whole parameter on all paths.
         for (argument_ordinal, argument) in args.iter().enumerate() {
-            let Some(root) = self.root_var(argument).filter(|root| self.unassigned.contains(root)) else { continue };
-            let full = !self.env.enforce || candidates.iter().all(|(definition, order, _)| {
-                order.iter().position(|ordinal| *ordinal == argument_ordinal)
-                    .is_some_and(|parameter| self.env.summaries[*definition].full_init.contains(&parameter))
-            });
+            let Some(root) = self
+                .root_var(argument)
+                .filter(|root| self.unassigned.contains(root))
+            else {
+                continue;
+            };
+            let full = !self.env.enforce
+                || candidates.iter().all(|(definition, order, _)| {
+                    order
+                        .iter()
+                        .position(|ordinal| *ordinal == argument_ordinal)
+                        .is_some_and(|parameter| {
+                            self.env.summaries[*definition]
+                                .full_init
+                                .contains(&parameter)
+                        })
+                });
             if !full {
                 self.error(argument.span, format!("`{}` is uninitialized and `{}` does not initialize that exclusive tensor on every path", self.vars[root].name, name.name));
                 return None;

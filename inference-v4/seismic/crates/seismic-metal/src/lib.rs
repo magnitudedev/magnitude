@@ -1,18 +1,12 @@
 //! Metal backend: MSL printer and runtime.
 
+#[path = "msl_new.rs"]
 pub mod msl;
-pub mod execution;
-pub mod memory;
-pub mod storage;
-pub mod reduction;
 pub mod target;
 
 #[cfg(target_os = "macos")]
 pub mod runtime;
 
-pub mod collective;
-
-pub mod support;
-
-pub mod terminal;
+#[path = "mapping_new.rs"]
 pub mod mapping;
+pub mod physical;

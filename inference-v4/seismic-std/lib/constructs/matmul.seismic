@@ -12,10 +12,11 @@ fn matmul[M, N, K](a: tensor[M, K] T, b: tensor[N, K] U,
             result[i, j] = s
     return result
 
-# The association of the sum is unspecified. Callers opt in by calling this contract
-# with the whole contraction extent; the accumulated result remains a value.
-fn matmul_any_order[M, N, K](a: tensor[M, K] T, b: tensor[N, K] U,
-                             into: tensor[M, N] f32) -> tensor[M, N] f32:
+# The association of the sum is unspecified: this body lets a backend combine partial products
+# (tiles, lanes, partitions). Selection of this second body requires numerical evidence accepted
+# by the compilation policy, exactly like the reassociating bodies of `linear` and `sum_any_order`.
+fn matmul[M, N, K](a: tensor[M, K] T, b: tensor[N, K] U,
+                   into: tensor[M, N] f32) -> tensor[M, N] f32:
     let mut result = into
     for i in 0..M:
         for j in 0..N:

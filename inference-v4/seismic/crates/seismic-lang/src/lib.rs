@@ -1,16 +1,15 @@
-//! The Seismic language: authored execution structure, checked into a structured
-//! IR, selected jointly, then instantiated into the execution IR.
+//! The Seismic language: authored execution structure checked into semantic and
+//! logical programs for constructive physical compilation.
 //!
-//! `syntax` -> `check` -> `sir` -> (`interp` | `family` -> selection -> `instantiate` -> `exec`).
+//! `syntax` -> `check` -> `sir` -> logical specialization -> physical planning.
 
 pub mod abi;
 pub mod check;
-pub mod exec;
 pub mod family;
-pub mod instantiate;
 pub mod interp;
 pub mod intrinsics;
 pub mod layout;
+pub mod logical;
 pub mod numeric;
 pub mod precision;
 pub mod program;

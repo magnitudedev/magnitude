@@ -35,14 +35,18 @@ impl Sym {
     /// Structural traversal for native code generation and resource analysis.
     /// Consumers must not recover this structure by parsing the display string.
     pub fn monomials(&self) -> impl Iterator<Item = (&Monomial, i64)> {
-        self.terms.iter().map(|(monomial, coefficient)| (monomial, *coefficient))
+        self.terms
+            .iter()
+            .map(|(monomial, coefficient)| (monomial, *coefficient))
     }
 
     /// A divisor of every integer value of this polynomial, independent of
     /// parameter bounds. Zero denotes the identically-zero polynomial.
     pub fn coefficient_divisor(&self) -> u64 {
         fn gcd(mut a: u64, mut b: u64) -> u64 {
-            while b != 0 { (a, b) = (b, a % b); }
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
             a
         }
         self.terms.values().fold(0, |g, c| gcd(g, c.unsigned_abs()))
@@ -61,7 +65,11 @@ impl Sym {
                 Some(_) => return None,
             }
         }
-        if c == 0 { None } else { Some((c, rest)) }
+        if c == 0 {
+            None
+        } else {
+            Some((c, rest))
+        }
     }
 
     /// `self / c` when every coefficient is divisible by `c`.
@@ -123,7 +131,11 @@ impl Sym {
         let entry = self.terms.entry(m).or_insert(0);
         *entry += c;
         if *entry == 0 {
-            let key = self.terms.iter().find(|(_, v)| **v == 0).map(|(k, _)| k.clone());
+            let key = self
+                .terms
+                .iter()
+                .find(|(_, v)| **v == 0)
+                .map(|(k, _)| k.clone());
             if let Some(k) = key {
                 self.terms.remove(&k);
             }
@@ -139,7 +151,8 @@ impl Sym {
     }
 
     pub fn neg(&self) -> Sym {
-        Sym { terms: self.terms.iter().map(|(m, c)| (m.clone(), -c)).collect() ,
+        Sym {
+            terms: self.terms.iter().map(|(m, c)| (m.clone(), -c)).collect(),
         }
     }
 
@@ -209,7 +222,9 @@ impl Sym {
                     if rest.is_zero() {
                         return exact;
                     }
-                    return exact.add(&Sym::atom(Atom::Quot(Box::new(rest), Box::new(den.clone()),
+                    return exact.add(&Sym::atom(Atom::Quot(
+                        Box::new(rest),
+                        Box::new(den.clone()),
                     )));
                 }
             }
@@ -237,10 +252,14 @@ impl Sym {
                 if rest.is_zero() {
                     return exact;
                 }
-                if rest.as_constant() == Some(-1) && matches!(&atom, Atom::Param(p) if !p.contains('#')) {
+                if rest.as_constant() == Some(-1)
+                    && matches!(&atom, Atom::Param(p) if !p.contains('#'))
+                {
                     return exact.sub(&Sym::constant(1));
                 }
-                return exact.add(&Sym::atom(Atom::Quot(Box::new(rest), Box::new(den.clone()),
+                return exact.add(&Sym::atom(Atom::Quot(
+                    Box::new(rest),
+                    Box::new(den.clone()),
                 )));
             }
         }
@@ -355,7 +374,11 @@ impl Sym {
         for (m, c) in &self.terms {
             let mut term = Sym::constant(*c);
             for (a, k) in m {
-                let factor = if a == atom { value.clone() } else { Sym::atom(a.clone()) };
+                let factor = if a == atom {
+                    value.clone()
+                } else {
+                    Sym::atom(a.clone())
+                };
                 for _ in 0..*k {
                     term = term.mul(&factor);
                 }
@@ -392,29 +415,46 @@ impl Sym {
     /// Intersect proven expression bounds at every node, including inside
     /// quotient and remainder operands. Facts must hold throughout the domain
     /// supplied by the caller; contradictory facts produce no enclosure.
-    pub fn eval_interval_with(&self, env: &dyn Fn(&str) -> Option<(i64, i64)>,
-        facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
-        fn refine(expression: &Sym, mut range: (i64, i64), facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+    pub fn eval_interval_with(
+        &self,
+        env: &dyn Fn(&str) -> Option<(i64, i64)>,
+        facts: &dyn Fn(&Sym) -> Option<(i64, i64)>,
+    ) -> Option<(i64, i64)> {
+        fn refine(
+            expression: &Sym,
+            mut range: (i64, i64),
+            facts: &dyn Fn(&Sym) -> Option<(i64, i64)>,
+        ) -> Option<(i64, i64)> {
             if let Some((lo, hi)) = facts(expression) {
-                range.0 = range.0.max(lo); range.1 = range.1.min(hi);
+                range.0 = range.0.max(lo);
+                range.1 = range.1.min(hi);
             }
             (range.0 <= range.1).then_some(range)
         }
-        fn atom(a: &Atom, env: &dyn Fn(&str) -> Option<(i64, i64)>,
-            facts: &dyn Fn(&Sym) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+        fn atom(
+            a: &Atom,
+            env: &dyn Fn(&str) -> Option<(i64, i64)>,
+            facts: &dyn Fn(&Sym) -> Option<(i64, i64)>,
+        ) -> Option<(i64, i64)> {
             let range = match a {
                 Atom::Param(name) => env(name)?,
                 Atom::Quot(n, d) | Atom::Rem(n, d) => {
                     let (nl, nh) = n.eval_interval_with(env, facts)?;
                     let (dl, dh) = d.eval_interval_with(env, facts)?;
-                    if nl < 0 || dl <= 0 { return None; }
-                    if matches!(a, Atom::Quot(..)) { (nl / dh, nh / dl) }
-                    else if dl == dh && nl / dl == nh / dl { (nl % dl, nh % dl) }
-                    else {
+                    if nl < 0 || dl <= 0 {
+                        return None;
+                    }
+                    if matches!(a, Atom::Quot(..)) {
+                        (nl / dh, nh / dl)
+                    } else if dl == dh && nl / dl == nh / dl {
+                        (nl % dl, nh % dl)
+                    } else {
                         let mut step = 1;
                         if dl == dh {
                             let (mut a, mut b) = (n.coefficient_divisor(), dl as u64);
-                            while b != 0 { (a, b) = (b, a % b); }
+                            while b != 0 {
+                                (a, b) = (b, a % b);
+                            }
                             step = i64::try_from(a).ok()?;
                         }
                         (0, nh.min(dh - step))
@@ -430,7 +470,12 @@ impl Sym {
             for (a, power) in monomial {
                 let (al, ah) = atom(a, env, facts)?;
                 for _ in 0..*power {
-                    let products = [lo.checked_mul(al)?, lo.checked_mul(ah)?, hi.checked_mul(al)?, hi.checked_mul(ah)?];
+                    let products = [
+                        lo.checked_mul(al)?,
+                        lo.checked_mul(ah)?,
+                        hi.checked_mul(al)?,
+                        hi.checked_mul(ah)?,
+                    ];
                     lo = *products.iter().min()?;
                     hi = *products.iter().max()?;
                 }
@@ -470,7 +515,11 @@ impl Atom {
     pub fn mentions_loop(&self) -> bool {
         match self {
             Atom::Param(p) => p.contains('#'),
-            Atom::Quot(n, d) | Atom::Rem(n, d) => n.params().iter().chain(d.params().iter()).any(|p| p.contains('#')),
+            Atom::Quot(n, d) | Atom::Rem(n, d) => n
+                .params()
+                .iter()
+                .chain(d.params().iter())
+                .any(|p| p.contains('#')),
         }
     }
 
@@ -602,7 +651,10 @@ impl Facts {
     }
 
     pub fn lower_of(&self, a: &Atom) -> Sym {
-        self.lower.get(a).cloned().unwrap_or_else(|| Sym::constant(0))
+        self.lower
+            .get(a)
+            .cloned()
+            .unwrap_or_else(|| Sym::constant(0))
     }
 
     pub fn upper_of(&self, a: &Atom) -> Option<Sym> {
@@ -622,15 +674,29 @@ impl Facts {
     /// Every known upper bound of an atom.
     pub fn uppers_of(&self, a: &Atom) -> Vec<Sym> {
         let mut out: Vec<Sym> = self.upper.get(a).cloned().into_iter().collect();
-        out.extend(self.extra_upper.iter().filter(|(x, _)| x == a).map(|(_, s)| s.clone()),
+        out.extend(
+            self.extra_upper
+                .iter()
+                .filter(|(x, _)| x == a)
+                .map(|(_, s)| s.clone()),
         );
         out
     }
 
     /// Every known nonzero lower bound of an atom.
     pub fn lowers_of(&self, a: &Atom) -> Vec<Sym> {
-        let mut out: Vec<Sym> = self.lower.get(a).cloned().into_iter().filter(|l| !l.is_zero()).collect();
-        out.extend(self.extra_lower.iter().filter(|(x, s)| x == a && !s.is_zero()).map(|(_, s)| s.clone()),
+        let mut out: Vec<Sym> = self
+            .lower
+            .get(a)
+            .cloned()
+            .into_iter()
+            .filter(|l| !l.is_zero())
+            .collect();
+        out.extend(
+            self.extra_lower
+                .iter()
+                .filter(|(x, s)| x == a && !s.is_zero())
+                .map(|(_, s)| s.clone()),
         );
         out
     }
@@ -645,7 +711,9 @@ pub struct Interval {
 
 impl Interval {
     pub fn point(s: Sym) -> Interval {
-        Interval { lo: s.clone(), hi: s ,
+        Interval {
+            lo: s.clone(),
+            hi: s,
         }
     }
 }
@@ -661,7 +729,10 @@ const MAX_STEPS: usize = 4000;
 
 impl<'a> Prover<'a> {
     pub fn new(facts: &'a Facts) -> Prover<'a> {
-        Prover { facts, steps: std::cell::Cell::new(0), seen: std::cell::RefCell::new(std::collections::HashSet::new()) ,
+        Prover {
+            facts,
+            steps: std::cell::Cell::new(0),
+            seen: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -691,17 +762,31 @@ impl<'a> Prover<'a> {
         // This preserves correlations between row/block indices and padded byte
         // extents that independent interval bounds otherwise discard.
         for positive in e.atoms() {
-            let Atom::Quot(a,d) = &positive else {continue};
-            if d.as_constant().is_none_or(|n|n<=0) {continue;}
-            let positive_term=Sym::atom(positive.clone());
-            if e.linear_in(&positive).is_none_or(|(c,_)|c!=1) {continue;}
+            let Atom::Quot(a, d) = &positive else {
+                continue;
+            };
+            if d.as_constant().is_none_or(|n| n <= 0) {
+                continue;
+            }
+            let positive_term = Sym::atom(positive.clone());
+            if e.linear_in(&positive).is_none_or(|(c, _)| c != 1) {
+                continue;
+            }
             for negative in e.atoms() {
-                let Atom::Quot(b,other_d)=&negative else {continue};
-                if d!=other_d || e.linear_in(&negative).is_none_or(|(c,_)|c!= -1) {continue;}
-                let constant=Sym::constant(e.constant_term());
-                let rest=e.sub(&positive_term).add(&Sym::atom(negative.clone())).sub(&constant);
-                if (rest.is_zero() || self.nonneg_steps(rest,depth-1))
-                    && self.nonneg_steps(a.add(&constant.mul(d)).sub(b),depth-1) {
+                let Atom::Quot(b, other_d) = &negative else {
+                    continue;
+                };
+                if d != other_d || e.linear_in(&negative).is_none_or(|(c, _)| c != -1) {
+                    continue;
+                }
+                let constant = Sym::constant(e.constant_term());
+                let rest = e
+                    .sub(&positive_term)
+                    .add(&Sym::atom(negative.clone()))
+                    .sub(&constant);
+                if (rest.is_zero() || self.nonneg_steps(rest, depth - 1))
+                    && self.nonneg_steps(a.add(&constant.mul(d)).sub(b), depth - 1)
+                {
                     return true;
                 }
             }
@@ -721,7 +806,9 @@ impl<'a> Prover<'a> {
                     }
                 }
                 Atom::Rem(n, d) => {
-                    if let Some(rewritten) = self.rewrite_numerator(&e, n, d, &Atom::Quot(n.clone(), d.clone())) {
+                    if let Some(rewritten) =
+                        self.rewrite_numerator(&e, n, d, &Atom::Quot(n.clone(), d.clone()))
+                    {
                         if self.nonneg_steps(rewritten, depth - 1) {
                             return true;
                         }
@@ -735,8 +822,17 @@ impl<'a> Prover<'a> {
             if let Atom::Quot(n, d) = &atom {
                 let iv = self.interval(n);
                 for (bound, want_upper) in [(iv.hi.quot(d), true), (iv.lo.quot(d), false)] {
-                    let signs: Vec<i64> = e.terms.iter().filter(|(m, _)| m.contains_key(&atom)).map(|(_, c)| *c).collect();
-                    let usable = if want_upper { signs.iter().all(|c| *c < 0) } else { signs.iter().all(|c| *c > 0) };
+                    let signs: Vec<i64> = e
+                        .terms
+                        .iter()
+                        .filter(|(m, _)| m.contains_key(&atom))
+                        .map(|(_, c)| *c)
+                        .collect();
+                    let usable = if want_upper {
+                        signs.iter().all(|c| *c < 0)
+                    } else {
+                        signs.iter().all(|c| *c > 0)
+                    };
                     if usable && bound != Sym::atom(atom.clone()) {
                         let substituted = e.subst(&atom, &bound);
                         if substituted != e && self.nonneg_steps(substituted, depth - 1) {
@@ -751,8 +847,17 @@ impl<'a> Prover<'a> {
         // Atoms are nonnegative, so this holds inside products too.
         let mut candidates: Vec<(Atom, bool)> = Vec::new();
         for atom in e.atoms() {
-            let signs: Vec<i64> = e.terms.iter().filter(|(m, _)| m.contains_key(&atom)).map(|(_, c)| *c).collect();
-            let degree_one = e.terms.iter().filter(|(m, _)| m.contains_key(&atom)).all(|(m, _)| m.get(&atom) == Some(&1));
+            let signs: Vec<i64> = e
+                .terms
+                .iter()
+                .filter(|(m, _)| m.contains_key(&atom))
+                .map(|(_, c)| *c)
+                .collect();
+            let degree_one = e
+                .terms
+                .iter()
+                .filter(|(m, _)| m.contains_key(&atom))
+                .all(|(m, _)| m.get(&atom) == Some(&1));
             if !degree_one {
                 continue;
             }
@@ -794,8 +899,8 @@ impl<'a> Prover<'a> {
         }
         for substituted in substitutions {
             if self.nonneg_steps(substituted, depth - 1) {
-                    return true;
-                }
+                return true;
+            }
         }
         false
     }
@@ -976,7 +1081,14 @@ mod tests {
         assert_eq!(p("a").mul(&p("b")), p("b").mul(&p("a")));
         assert_eq!(p("M").scale(8).quot(&Sym::constant(8)), p("M"));
         assert_eq!(p("M").scale(8).rem(&Sym::constant(8)), Sym::constant(0));
-        assert_eq!(p("M").scale(8).add(&Sym::constant(3)).quot(&Sym::constant(8)).to_string(), "M + (3 / 8)");
+        assert_eq!(
+            p("M")
+                .scale(8)
+                .add(&Sym::constant(3))
+                .quot(&Sym::constant(8))
+                .to_string(),
+            "M + (3 / 8)"
+        );
     }
 
     #[test]
@@ -984,7 +1096,10 @@ mod tests {
         // i in [0, M/8 - 1], k in [0, 7]: i*8 + k <= M - 1
         let mut facts = Facts::new();
         let q = p("M").quot(&Sym::constant(8));
-        facts.set_range(Atom::Param("i".into()), Sym::constant(0), q.sub(&Sym::constant(1)),
+        facts.set_range(
+            Atom::Param("i".into()),
+            Sym::constant(0),
+            q.sub(&Sym::constant(1)),
         );
         facts.set_range(Atom::Param("k".into()), Sym::constant(0), Sym::constant(7));
         let prover = Prover::new(&facts);
@@ -998,7 +1113,10 @@ mod tests {
         // kv in [0, H/G - 1]: (kv + 1) * G <= H
         let mut facts = Facts::new();
         let q = p("H").quot(&p("G"));
-        facts.set_range(Atom::Param("kv".into()), Sym::constant(0), q.sub(&Sym::constant(1)),
+        facts.set_range(
+            Atom::Param("kv".into()),
+            Sym::constant(0),
+            q.sub(&Sym::constant(1)),
         );
         let prover = Prover::new(&facts);
         let end = p("kv").add(&Sym::constant(1)).mul(&p("G"));
@@ -1028,7 +1146,11 @@ mod tests {
     fn direct_loop_bound_survives_cyclic_path_bounds() {
         let mut facts = Facts::new();
         let extent = p("P").scale(2).add(&p("S"));
-        facts.set_range(Atom::Param("i".into()), Sym::constant(0), extent.sub(&Sym::constant(1)));
+        facts.set_range(
+            Atom::Param("i".into()),
+            Sym::constant(0),
+            extent.sub(&Sym::constant(1)),
+        );
         facts.add_lower(Atom::Param("i".into()), p("P"));
         facts.add_upper(Atom::Param("P".into()), p("i"));
         assert!(Prover::new(&facts).lt(&p("i"), &extent));
@@ -1037,16 +1159,28 @@ mod tests {
 
     #[test]
     fn padded_byte_words_preserve_quotient_correlations() {
-        let mut facts=Facts::new();
-        facts.set_range_lower(Atom::Param("B".into()),Sym::constant(1));
-        facts.set_range(Atom::Param("block".into()),Sym::constant(0),p("B").sub(&Sym::constant(1)));
-        facts.set_range(Atom::Param("g".into()),Sym::constant(0),Sym::constant(15));
-        let divisor=Sym::constant(4);
-        let extent=p("B").scale(210).add(&Sym::constant(3)).quot(&divisor);
-        let at=p("block").scale(210).add(&Sym::constant(192)).add(&p("g")).quot(&divisor);
-        assert!(Prover::new(&facts).lt(&at,&extent));
-        let invalid=p("block").scale(210).add(&Sym::constant(210)).add(&p("g")).quot(&divisor);
-        assert!(!Prover::new(&facts).lt(&invalid,&extent));
+        let mut facts = Facts::new();
+        facts.set_range_lower(Atom::Param("B".into()), Sym::constant(1));
+        facts.set_range(
+            Atom::Param("block".into()),
+            Sym::constant(0),
+            p("B").sub(&Sym::constant(1)),
+        );
+        facts.set_range(Atom::Param("g".into()), Sym::constant(0), Sym::constant(15));
+        let divisor = Sym::constant(4);
+        let extent = p("B").scale(210).add(&Sym::constant(3)).quot(&divisor);
+        let at = p("block")
+            .scale(210)
+            .add(&Sym::constant(192))
+            .add(&p("g"))
+            .quot(&divisor);
+        assert!(Prover::new(&facts).lt(&at, &extent));
+        let invalid = p("block")
+            .scale(210)
+            .add(&Sym::constant(210))
+            .add(&p("g"))
+            .quot(&divisor);
+        assert!(!Prover::new(&facts).lt(&invalid, &extent));
     }
 
     #[test]
@@ -1055,9 +1189,9 @@ mod tests {
         let group = Sym::constant(32);
         let groups = n.quot(&group);
         let tail = n.rem(&group);
-        let bounds = |name: &str| (name == "N").then_some((0,129));
-        assert_eq!(groups.eval_interval(&bounds), Some((0,4)));
-        assert_eq!(tail.eval_interval(&bounds), Some((0,31)));
+        let bounds = |name: &str| (name == "N").then_some((0, 129));
+        assert_eq!(groups.eval_interval(&bounds), Some((0, 4)));
+        assert_eq!(tail.eval_interval(&bounds), Some((0, 31)));
         for expression in [groups, tail, Sym::constant(129).sub(&n), n.mul(&n)] {
             let (lo, hi) = expression.eval_interval(&bounds).unwrap();
             for value in 0..=129 {
@@ -1076,12 +1210,19 @@ mod tests {
             for modulus in 1..=65i64 {
                 let expression = p("i").scale(multiplier).rem(&Sym::constant(modulus));
                 let (lo, hi) = expression.eval_interval(&|_| Some((0, 255))).unwrap();
-                for i in 0..=255 { assert!((lo..=hi).contains(&((i * multiplier) % modulus))); }
+                for i in 0..=255 {
+                    assert!((lo..=hi).contains(&((i * multiplier) % modulus)));
+                }
             }
         }
         let offset = p("i").scale(16).rem(&Sym::constant(64));
         assert_eq!(offset.eval_interval(&|_| Some((0, 255))), Some((0, 48)));
-        assert_eq!(offset.scale(4).quot(&Sym::constant(32)).eval_interval(&|_| Some((0, 255))), Some((0, 6)));
+        assert_eq!(
+            offset
+                .scale(4)
+                .quot(&Sym::constant(32))
+                .eval_interval(&|_| Some((0, 255))),
+            Some((0, 6))
+        );
     }
-
 }

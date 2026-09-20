@@ -3,7 +3,8 @@
 //! required to build this crate or load hardware-independent tools.
 use libloading::Library;
 use std::{
-    ffi::{CStr, c_char, c_int, c_uint, c_void},
+    ffi::{c_char, c_int, c_uint, c_void, CStr},
+    fmt,
     rc::Rc,
 };
 pub type Handle = *mut c_void;
@@ -66,7 +67,7 @@ driver! {
     error_string: unsafe extern "system" fn(ResultCode,*mut *const c_char)->ResultCode => "cuGetErrorString",
 }
 impl Driver {
-    pub fn check(&self, result: ResultCode, operation: &str) -> Result<(), String> {
+    pub fn check_typed(&self, result: ResultCode, operation: &str) -> Result<(), DriverError> {
         if result == 0 {
             return Ok(());
         }
@@ -78,9 +79,37 @@ impl Driver {
                 "unknown driver error".into()
             }
         };
-        Err(format!("CUDA {operation}: {description} ({result})"))
+        Err(DriverError {
+            operation: operation.into(),
+            code: result,
+            description,
+        })
+    }
+
+    pub fn check(&self, result: ResultCode, operation: &str) -> Result<(), String> {
+        self.check_typed(result, operation)
+            .map_err(|error| error.to_string())
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverError {
+    pub operation: String,
+    pub code: i32,
+    pub description: String,
+}
+
+impl fmt::Display for DriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CUDA {}: {} ({})",
+            self.operation, self.description, self.code
+        )
+    }
+}
+
+impl std::error::Error for DriverError {}
 pub(crate) struct Context {
     pub driver: Rc<Driver>,
     raw: Handle,

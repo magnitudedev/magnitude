@@ -5,6 +5,8 @@ use seismic_lang::{
     sir::Program,
 };
 
+pub mod sweep;
+
 pub fn sources() -> Vec<SourceFile> {
     let embedded: &[(&str, &str)] = &[
         (

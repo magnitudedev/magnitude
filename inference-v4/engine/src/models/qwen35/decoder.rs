@@ -141,7 +141,9 @@ fn generation_selection(output: &ReadoutOutput) -> Result<Option<crate::inputs::
     match output {
         ReadoutOutput::Sample(Selection::Token(token)) => Ok(Some(*token)),
         ReadoutOutput::Sample(Selection::Empty) => Err("empty sampling distribution".into()),
-        ReadoutOutput::Sample(Selection::Nonfinite) => Err("nonfinite sampling distribution".into()),
+        ReadoutOutput::Sample(Selection::Nonfinite) => {
+            Err("nonfinite sampling distribution".into())
+        }
         ReadoutOutput::StateOnly => Ok(None),
         ReadoutOutput::Logits(_) | ReadoutOutput::Selected(_) => {
             unreachable!("generation never requests host logits")
@@ -169,13 +171,17 @@ pub struct ConditionedAdvance<'a> {
     next: super::inputs::InputState,
 }
 impl ConditionedAdvance<'_> {
-    pub fn output(&self) -> &ReadoutOutput { self.advance.output() }
+    pub fn output(&self) -> &ReadoutOutput {
+        self.advance.output()
+    }
     pub fn commit(self) -> Result<(), String> {
         self.advance.commit()?;
         *self.input = self.next;
         Ok(())
     }
-    pub fn abort(self) { self.advance.abort(); }
+    pub fn abort(self) {
+        self.advance.abort();
+    }
 }
 pub struct DecodedAdvance<'a> {
     advance: StateAdvance<'a>,
@@ -262,16 +268,28 @@ impl Decoder {
         &mut self,
         work: &[GenerationWork<'_, super::inputs::InputState>],
     ) -> Result<Vec<Box<dyn Advance>>, Error> {
-        let sequences = work.iter().map(|row| SequenceWork {
-            sequence: row.sequence, position: row.proposal.position(), count: row.proposal.tokens().len(),
-        }).collect::<Vec<_>>();
+        let sequences = work
+            .iter()
+            .map(|row| SequenceWork {
+                sequence: row.sequence,
+                position: row.proposal.position(),
+                count: row.proposal.tokens().len(),
+            })
+            .collect::<Vec<_>>();
         OwnedSequence::prepare_completed_batch_with_semantics(&sequences, |states| {
             let mut selected = Vec::with_capacity(work.len());
             for (row, (state, input)) in work.iter().zip(states.iter_mut()) {
                 let tokens: Vec<_> = row.proposal.tokens().iter().map(|token| token.0).collect();
                 let readout = if row.proposal.needs_sample() {
-                    Readout::Sample { mask: row.mask, sampling: row.proposal.sampling(), seed: row.proposal.seed(), position: row.proposal.sample_position() }
-                } else { Readout::StateOnly };
+                    Readout::Sample {
+                        mask: row.mask,
+                        sampling: row.proposal.sampling(),
+                        seed: row.proposal.seed(),
+                        position: row.proposal.sample_position(),
+                    }
+                } else {
+                    Readout::StateOnly
+                };
                 let advance = self.execute_conditioned(state, input, &tokens, readout)?;
                 let outcome = generation_selection(advance.output());
                 advance.commit()?;
@@ -332,7 +350,13 @@ impl Decoder {
             &[],
             HashMap::new(),
         )?
-        .control_domain("tokens", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
+        .control_domain(
+            "tokens",
+            IntegerRange {
+                min: 0,
+                max: i128::from(g.vocabulary) - 1,
+            },
+        )?;
         let mut blocks = Vec::new();
         let mut components = Vec::new();
         let mut history_rows = Vec::new();
@@ -387,10 +411,22 @@ impl Decoder {
                             ("scale", 1.0 / (g.attention_width as f64).sqrt()),
                         ]),
                     )?;
-                    let mixer =
-                        mixer.control_inputs(&["visible"])?
-                            .control_domain("coordinates", IntegerRange { min: 0, max: i128::from(i32::MAX) })?
-                            .control_domain("destinations", IntegerRange { min: 0, max: history_capacity as i128 - 1 })?;
+                    let mixer = mixer
+                        .control_inputs(&["visible"])?
+                        .control_domain(
+                            "coordinates",
+                            IntegerRange {
+                                min: 0,
+                                max: i128::from(i32::MAX),
+                            },
+                        )?
+                        .control_domain(
+                            "destinations",
+                            IntegerRange {
+                                min: 0,
+                                max: history_capacity as i128 - 1,
+                            },
+                        )?;
                     (mixer, state_index, true)
                 }
                 MixerWeights::Recurrent(r) => {
@@ -524,7 +560,13 @@ impl Decoder {
             &[],
             scalar(&[("epsilon", g.epsilon)]),
         )?
-        .control_domain("selected", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
+        .control_domain(
+            "selected",
+            IntegerRange {
+                min: 0,
+                max: i128::from(g.vocabulary) - 1,
+            },
+        )?;
         let readout = bound(
             "qwen_readout_rows",
             shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
@@ -723,15 +765,22 @@ impl Decoder {
         unique
     }
     pub fn compiled_kernel_count(&self) -> usize {
-        self.unique_compositions().iter().map(|c| c.kernel_count()).sum::<usize>()
+        self.unique_compositions()
+            .iter()
+            .map(|c| c.kernel_count())
+            .sum::<usize>()
             + self.sampler.as_ref().map_or(0, Sampler::kernel_count)
     }
     /// Selection records of every decoder kernel compiled so far, one per compilation.
     pub fn selections(&self) -> Result<Vec<seismic_runtime::Selection>, String> {
-        Ok(self.unique_compositions().into_iter()
+        Ok(self
+            .unique_compositions()
+            .into_iter()
             .map(Composition::selection)
             .collect::<Result<Vec<_>, _>>()?
-            .into_iter().flatten().collect())
+            .into_iter()
+            .flatten()
+            .collect())
     }
     pub fn propose<'a>(
         &mut self,
@@ -805,16 +854,32 @@ impl Decoder {
     }
     /// Advance semantic and numerical state as one accepted transaction.
     pub fn execute_conditioned<'a>(
-        &mut self, state: &'a mut SequenceState, input: &'a mut super::inputs::InputState,
-        tokens: &[u32], readout: Readout<'_>,
+        &mut self,
+        state: &'a mut SequenceState,
+        input: &'a mut super::inputs::InputState,
+        tokens: &[u32],
+        readout: Readout<'_>,
     ) -> Result<ConditionedAdvance<'a>, Error> {
-        if input.position() != state.position() || input.width() as u64 != self.geometry.hidden || !input.belongs_to(&self.device) {
+        if input.position() != state.position()
+            || input.width() as u64 != self.geometry.hidden
+            || !input.belongs_to(&self.device)
+        {
             return Err("conditioned input differs from decoder continuation or owner".into());
         }
         let assembled = input.assemble(tokens)?;
-        let next = input.after(input.position().checked_add(tokens.len()).ok_or("input advance overflow")?)?;
-        let (advance, _, _) = self.propose_impl(state, tokens, false, true, readout, Some(&assembled))?;
-        Ok(ConditionedAdvance { advance, input, next })
+        let next = input.after(
+            input
+                .position()
+                .checked_add(tokens.len())
+                .ok_or("input advance overflow")?,
+        )?;
+        let (advance, _, _) =
+            self.propose_impl(state, tokens, false, true, readout, Some(&assembled))?;
+        Ok(ConditionedAdvance {
+            advance,
+            input,
+            next,
+        })
     }
     fn propose_impl<'a>(
         &mut self,
@@ -1116,8 +1181,8 @@ impl Decoder {
 
 #[cfg(test)]
 mod conditioned_transaction_tests {
-    use super::*;
     use super::super::{inputs::InputState, preparation::InputPlan};
+    use super::*;
     use crate::inputs::TokenId;
     #[test]
     #[ignore = "requires a Metal device"]
@@ -1125,19 +1190,49 @@ mod conditioned_transaction_tests {
         let device = Rc::new(Device::metal().unwrap());
         let store = StateStore::new(device.clone(), 8, 8, vec![], vec![]).unwrap();
         let mut state = store.create().unwrap();
-        let mut input = InputState::new(&device, Rc::new(InputPlan::text(vec![TokenId(7)]).unwrap()), 0, vec![], 3).unwrap();
+        let mut input = InputState::new(
+            &device,
+            Rc::new(InputPlan::text(vec![TokenId(7)]).unwrap()),
+            0,
+            vec![],
+            3,
+        )
+        .unwrap();
         let next = input.after(1).unwrap();
-        let unfinished = ExecutedAdvance { advance: state.begin(1).unwrap(), output: ReadoutOutput::StateOnly };
-        assert!(ConditionedAdvance { advance: unfinished, input: &mut input, next }.commit().is_err());
-        assert_eq!((state.position(), input.position()), (0,0));
+        let unfinished = ExecutedAdvance {
+            advance: state.begin(1).unwrap(),
+            output: ReadoutOutput::StateOnly,
+        };
+        assert!(ConditionedAdvance {
+            advance: unfinished,
+            input: &mut input,
+            next
+        }
+        .commit()
+        .is_err());
+        assert_eq!((state.position(), input.position()), (0, 0));
         for accept in [false, true] {
             let next = input.after(1).unwrap();
             let mut advance = state.begin(1).unwrap();
             // Lifecycle-only completion; this test makes no numerical claim.
             advance.execute(|_| Ok(())).unwrap();
-            let staged = ConditionedAdvance { advance: ExecutedAdvance { advance, output: ReadoutOutput::StateOnly }, input: &mut input, next };
-            if accept { staged.commit().unwrap(); } else { staged.abort(); }
-            assert_eq!((state.position(), input.position()), if accept {(1,1)} else {(0,0)});
+            let staged = ConditionedAdvance {
+                advance: ExecutedAdvance {
+                    advance,
+                    output: ReadoutOutput::StateOnly,
+                },
+                input: &mut input,
+                next,
+            };
+            if accept {
+                staged.commit().unwrap();
+            } else {
+                staged.abort();
+            }
+            assert_eq!(
+                (state.position(), input.position()),
+                if accept { (1, 1) } else { (0, 0) }
+            );
         }
     }
 }

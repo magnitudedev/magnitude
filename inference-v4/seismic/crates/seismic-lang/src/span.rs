@@ -8,11 +8,17 @@ pub struct Span {
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Span {
-        Span { start: start as u32, end: end as u32 }
+        Span {
+            start: start as u32,
+            end: end as u32,
+        }
     }
 
     pub fn to(self, other: Span) -> Span {
-        Span { start: self.start.min(other.start), end: self.end.max(other.end) }
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
     }
 }
 
@@ -33,7 +39,10 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn new(span: Span, message: impl Into<String>) -> Diagnostic {
-        Diagnostic { span, message: message.into() }
+        Diagnostic {
+            span,
+            message: message.into(),
+        }
     }
 
     pub fn render(&self, path: &str, text: &str) -> String {

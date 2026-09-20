@@ -63,6 +63,10 @@ fn elements<'t>(
         if let Ty::Tensor(Shaped {
             elem: Elem::Param(p),
             ..
+        })
+        | Ty::View(Shaped {
+            elem: Elem::Param(p),
+            ..
         }) = &param.ty
         {
             let bound = element(tensor(&param.name, ordinal));
@@ -93,7 +97,7 @@ pub fn run(vm: &mut Interpreter<'_>, name: &str, args: &[Arg], shapes: &HashMap<
     let elements = elements(entry(vm.program, name), |parameter, ordinal| {
         match &args[ordinal] {
             Arg::Tensor(id) => &tensors[*id],
-            Arg::Scalar(_) => panic!("{name}.{parameter} is a tensor"),
+            Arg::Scalar(_) | Arg::Range(..) => panic!("{name}.{parameter} is a tensor"),
         }
     });
     vm.run(name, args, &workload(shapes, &elements))
@@ -110,7 +114,7 @@ pub fn allocate(
         .params
         .iter()
         .filter_map(|param| {
-            let Ty::Tensor(tensor) = &param.ty else {
+            let (Ty::Tensor(tensor) | Ty::View(tensor)) = &param.ty else {
                 return None;
             };
             let dtype = match &tensor.elem {
@@ -183,7 +187,7 @@ impl Backend<'_> {
                     .params
                     .iter()
                     .map(|param| match &param.ty {
-                        Ty::Tensor(_) => {
+                        Ty::Tensor(_) | Ty::View(_) => {
                             let id = vm.add_tensor(tensors[&param.name].clone());
                             ids.push((param.name.clone(), id));
                             Arg::Tensor(id)

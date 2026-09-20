@@ -11,7 +11,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = match args.iter().position(|a| a == "--device") {
         None => "metal".to_string(),
         Some(at) => {
-            let value = args.get(at + 1).cloned().ok_or("--device requires cpu, cuda or metal")?;
+            let value = args
+                .get(at + 1)
+                .cloned()
+                .ok_or("--device requires cpu, cuda or metal")?;
             args.drain(at..at + 2);
             value
         }
@@ -44,13 +47,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seismic_runtime::DeviceFacts::Cpu(facts) => format!("host CPU, {} workers", facts.workers),
         seismic_runtime::DeviceFacts::Cuda(facts) => facts.name,
     };
-    let parse = |s: &str| s.split(',').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+    let parse = |s: &str| {
+        s.split(',')
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+    };
     let prompt = parse(&args[3])?;
     let continuation = parse(&args[4])?;
-    let settings = Settings { precision: precision.clone(), strategy, ..Settings::default() };
+    let settings = Settings {
+        precision: precision.clone(),
+        strategy,
+        ..Settings::default()
+    };
     let result = (|| {
         eprintln!("loading artifact and selecting numerical imports");
-        let mut baseline = Baseline::load(Path::new(&args[1]), device, settings.clone(), args[2].parse().map_err(|e| format!("context: {e}"))?)?;
+        let mut baseline = Baseline::load(
+            Path::new(&args[1]),
+            device,
+            settings.clone(),
+            args[2].parse().map_err(|e| format!("context: {e}"))?,
+        )?;
         eprintln!("starting cold automatic full-model forward");
         baseline.measure(&prompt, &continuation)
     })();

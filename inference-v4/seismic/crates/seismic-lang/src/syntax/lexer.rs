@@ -7,8 +7,16 @@ use super::token::{Kw, Op, Tok, Token};
 use crate::span::{Diagnostic, Span};
 
 pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
-    Lexer { text, bytes: text.as_bytes(), pos: 0, tokens: Vec::new(), indents: vec![0], depth: 0, at_line_start: true }
-        .run()
+    Lexer {
+        text,
+        bytes: text.as_bytes(),
+        pos: 0,
+        tokens: Vec::new(),
+        indents: vec![0],
+        depth: 0,
+        at_line_start: true,
+    }
+    .run()
 }
 
 struct Lexer<'a> {
@@ -31,7 +39,12 @@ impl<'a> Lexer<'a> {
             let c = self.bytes[self.pos];
             match c {
                 b' ' => self.pos += 1,
-                b'\t' => return Err(Diagnostic::new(Span::new(self.pos, self.pos + 1), "tabs are not allowed; use spaces")),
+                b'\t' => {
+                    return Err(Diagnostic::new(
+                        Span::new(self.pos, self.pos + 1),
+                        "tabs are not allowed; use spaces",
+                    ))
+                }
                 b'\r' => self.pos += 1,
                 b'#' => self.skip_comment(),
                 b'\n' => {
@@ -47,22 +60,37 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.depth != 0 {
-            return Err(Diagnostic::new(Span::new(self.pos, self.pos), "unclosed bracket at end of file"));
+            return Err(Diagnostic::new(
+                Span::new(self.pos, self.pos),
+                "unclosed bracket at end of file",
+            ));
         }
         self.push_newline();
         while self.indents.len() > 1 {
             self.indents.pop();
-            self.tokens.push(Token { tok: Tok::Dedent, span: Span::new(self.pos, self.pos) });
+            self.tokens.push(Token {
+                tok: Tok::Dedent,
+                span: Span::new(self.pos, self.pos),
+            });
         }
-        self.tokens.push(Token { tok: Tok::Eof, span: Span::new(self.pos, self.pos) });
+        self.tokens.push(Token {
+            tok: Tok::Eof,
+            span: Span::new(self.pos, self.pos),
+        });
         Ok(self.tokens)
     }
 
     fn push_newline(&mut self) {
-        if matches!(self.tokens.last().map(|t| &t.tok), Some(Tok::Newline) | Some(Tok::Indent) | None) {
+        if matches!(
+            self.tokens.last().map(|t| &t.tok),
+            Some(Tok::Newline) | Some(Tok::Indent) | None
+        ) {
             return;
         }
-        self.tokens.push(Token { tok: Tok::Newline, span: Span::new(self.pos.saturating_sub(1), self.pos) });
+        self.tokens.push(Token {
+            tok: Tok::Newline,
+            span: Span::new(self.pos.saturating_sub(1), self.pos),
+        });
     }
 
     fn handle_line_start(&mut self) -> Result<(), Diagnostic> {
@@ -76,7 +104,12 @@ impl<'a> Lexer<'a> {
                     width += 1;
                     self.pos += 1;
                 }
-                b'\t' => return Err(Diagnostic::new(Span::new(self.pos, self.pos + 1), "tabs are not allowed; use spaces")),
+                b'\t' => {
+                    return Err(Diagnostic::new(
+                        Span::new(self.pos, self.pos + 1),
+                        "tabs are not allowed; use spaces",
+                    ))
+                }
                 b'\r' => self.pos += 1,
                 _ => break,
             }
@@ -102,14 +135,23 @@ impl<'a> Lexer<'a> {
         }
         if width > self.indent() {
             self.indents.push(width);
-            self.tokens.push(Token { tok: Tok::Indent, span: Span::new(start, self.pos) });
+            self.tokens.push(Token {
+                tok: Tok::Indent,
+                span: Span::new(start, self.pos),
+            });
         } else {
             while width < self.indent() {
                 self.indents.pop();
-                self.tokens.push(Token { tok: Tok::Dedent, span: Span::new(start, self.pos) });
+                self.tokens.push(Token {
+                    tok: Tok::Dedent,
+                    span: Span::new(start, self.pos),
+                });
             }
             if width != self.indent() {
-                return Err(Diagnostic::new(Span::new(start, self.pos), "indentation does not match any enclosing block"));
+                return Err(Diagnostic::new(
+                    Span::new(start, self.pos),
+                    "indentation does not match any enclosing block",
+                ));
             }
         }
         Ok(())
@@ -128,32 +170,55 @@ impl<'a> Lexer<'a> {
 
     fn number(&mut self) -> Result<(), Diagnostic> {
         let start = self.pos;
-        if self.bytes[self.pos] == b'0' && self.pos + 1 < self.bytes.len() && (self.bytes[self.pos + 1] == b'x' || self.bytes[self.pos + 1] == b'X') {
+        if self.bytes[self.pos] == b'0'
+            && self.pos + 1 < self.bytes.len()
+            && (self.bytes[self.pos + 1] == b'x' || self.bytes[self.pos + 1] == b'X')
+        {
             self.pos += 2;
             let digits = self.pos;
-            while self.pos < self.bytes.len() && (self.bytes[self.pos].is_ascii_hexdigit() || self.bytes[self.pos] == b'_') {
+            while self.pos < self.bytes.len()
+                && (self.bytes[self.pos].is_ascii_hexdigit() || self.bytes[self.pos] == b'_')
+            {
                 self.pos += 1;
             }
-            let s: String = self.text[digits..self.pos].chars().filter(|c| *c != '_').collect();
-            let value = u64::from_str_radix(&s, 16).map_err(|_| Diagnostic::new(Span::new(start, self.pos), "invalid hexadecimal literal"))?;
-            self.tokens.push(Token { tok: Tok::Int(value), span: Span::new(start, self.pos) });
+            let s: String = self.text[digits..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
+                .collect();
+            let value = u64::from_str_radix(&s, 16).map_err(|_| {
+                Diagnostic::new(Span::new(start, self.pos), "invalid hexadecimal literal")
+            })?;
+            self.tokens.push(Token {
+                tok: Tok::Int(value),
+                span: Span::new(start, self.pos),
+            });
             return Ok(());
         }
         let mut is_float = false;
-        while self.pos < self.bytes.len() && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'_') {
+        while self.pos < self.bytes.len()
+            && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'_')
+        {
             self.pos += 1;
         }
-        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' && self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1].is_ascii_digit() {
+        if self.pos < self.bytes.len()
+            && self.bytes[self.pos] == b'.'
+            && self.pos + 1 < self.bytes.len()
+            && self.bytes[self.pos + 1].is_ascii_digit()
+        {
             is_float = true;
             self.pos += 1;
             while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
         }
-        if self.pos < self.bytes.len() && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E') {
+        if self.pos < self.bytes.len()
+            && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
+        {
             let save = self.pos;
             self.pos += 1;
-            if self.pos < self.bytes.len() && (self.bytes[self.pos] == b'+' || self.bytes[self.pos] == b'-') {
+            if self.pos < self.bytes.len()
+                && (self.bytes[self.pos] == b'+' || self.bytes[self.pos] == b'-')
+            {
                 self.pos += 1;
             }
             if self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
@@ -165,24 +230,39 @@ impl<'a> Lexer<'a> {
                 self.pos = save;
             }
         }
-        let s: String = self.text[start..self.pos].chars().filter(|c| *c != '_').collect();
+        let s: String = self.text[start..self.pos]
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
         let span = Span::new(start, self.pos);
         if is_float {
-            let value: f64 = s.parse().map_err(|_| Diagnostic::new(span, "invalid number literal"))?;
+            let value: f64 = s
+                .parse()
+                .map_err(|_| Diagnostic::new(span, "invalid number literal"))?;
             if !value.is_finite() {
                 return Err(Diagnostic::new(span, "number literal out of range"));
             }
-            self.tokens.push(Token { tok: Tok::Float(value), span });
+            self.tokens.push(Token {
+                tok: Tok::Float(value),
+                span,
+            });
         } else {
-            let value: u64 = s.parse().map_err(|_| Diagnostic::new(span, "integer literal out of range"))?;
-            self.tokens.push(Token { tok: Tok::Int(value), span });
+            let value: u64 = s
+                .parse()
+                .map_err(|_| Diagnostic::new(span, "integer literal out of range"))?;
+            self.tokens.push(Token {
+                tok: Tok::Int(value),
+                span,
+            });
         }
         Ok(())
     }
 
     fn name(&mut self) {
         let start = self.pos;
-        while self.pos < self.bytes.len() && (self.bytes[self.pos].is_ascii_alphanumeric() || self.bytes[self.pos] == b'_') {
+        while self.pos < self.bytes.len()
+            && (self.bytes[self.pos].is_ascii_alphanumeric() || self.bytes[self.pos] == b'_')
+        {
             self.pos += 1;
         }
         let name = &self.text[start..self.pos];
@@ -190,7 +270,10 @@ impl<'a> Lexer<'a> {
             Some(kw) => Tok::Kw(kw),
             None => Tok::Name(name.to_string()),
         };
-        self.tokens.push(Token { tok, span: Span::new(start, self.pos) });
+        self.tokens.push(Token {
+            tok,
+            span: Span::new(start, self.pos),
+        });
     }
 
     fn operator(&mut self) -> Result<(), Diagnostic> {
@@ -242,8 +325,14 @@ impl<'a> Lexer<'a> {
                 b'[' => Op::LBracket,
                 b']' => Op::RBracket,
                 other => {
-                    let ch = self.text[self.pos..].chars().next().unwrap_or(other as char);
-                    return Err(Diagnostic::new(Span::new(start, start + ch.len_utf8()), format!("unexpected character `{ch}`")));
+                    let ch = self.text[self.pos..]
+                        .chars()
+                        .next()
+                        .unwrap_or(other as char);
+                    return Err(Diagnostic::new(
+                        Span::new(start, start + ch.len_utf8()),
+                        format!("unexpected character `{ch}`"),
+                    ));
                 }
             };
             (op, 1)
@@ -252,14 +341,20 @@ impl<'a> Lexer<'a> {
             Op::LParen | Op::LBracket => self.depth += 1,
             Op::RParen | Op::RBracket => {
                 if self.depth == 0 {
-                    return Err(Diagnostic::new(Span::new(start, start + 1), format!("unmatched `{}`", op.text())));
+                    return Err(Diagnostic::new(
+                        Span::new(start, start + 1),
+                        format!("unmatched `{}`", op.text()),
+                    ));
                 }
                 self.depth -= 1;
             }
             _ => {}
         }
         self.pos += len;
-        self.tokens.push(Token { tok: Tok::Op(op), span: Span::new(start, self.pos) });
+        self.tokens.push(Token {
+            tok: Tok::Op(op),
+            span: Span::new(start, self.pos),
+        });
         Ok(())
     }
 }

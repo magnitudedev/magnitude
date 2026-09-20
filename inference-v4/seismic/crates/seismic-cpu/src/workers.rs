@@ -35,7 +35,9 @@ struct Shared {
 
 impl Shared {
     fn lock(&self) -> Result<MutexGuard<'_, State>, String> {
-        self.state.lock().map_err(|_| "a CPU worker panicked while holding the phase state".to_string())
+        self.state
+            .lock()
+            .map_err(|_| "a CPU worker panicked while holding the phase state".to_string())
     }
 }
 
@@ -66,7 +68,9 @@ fn work(shared: &Shared) {
     let mut seen = 0u64;
     loop {
         let job = {
-            let Ok(mut state) = shared.state.lock() else { return };
+            let Ok(mut state) = shared.state.lock() else {
+                return;
+            };
             loop {
                 if state.shutdown {
                     return;
@@ -93,16 +97,26 @@ fn work(shared: &Shared) {
                     // allocation alive and unaliased by the host until all workers report
                     // done. Each worker passes only its own scratch. Distinct pieces of a
                     // `parallel` domain write disjoint storage by the checked source effects.
-                    let status = unsafe { (job.entry)(job.buffers as *const *mut u8, job.scalars as *const u64, scratch.as_mut_ptr().cast(), item) };
+                    let status = unsafe {
+                        (job.entry)(
+                            job.buffers as *const *mut u8,
+                            job.scalars as *const u64,
+                            scratch.as_mut_ptr().cast(),
+                            item,
+                        )
+                    };
                     if status != 0 {
                         job.status.store(status, Ordering::Relaxed);
                     }
                 }
             } else {
-                job.status.store(SCRATCH_ALLOCATION_FAILED, Ordering::Relaxed);
+                job.status
+                    .store(SCRATCH_ALLOCATION_FAILED, Ordering::Relaxed);
             }
         }
-        let Ok(mut state) = shared.state.lock() else { return };
+        let Ok(mut state) = shared.state.lock() else {
+            return;
+        };
         state.running -= 1;
         if state.running == 0 {
             shared.done.notify_all();
@@ -119,15 +133,26 @@ impl Workers {
         let mut threads = Vec::with_capacity(count);
         for ordinal in 0..count {
             let shared = shared.clone();
-            let thread = std::thread::Builder::new().name(format!("seismic-cpu-{ordinal}")).spawn(move || work(&shared)).map_err(|e| format!("CPU worker thread: {e}"))?;
+            let thread = std::thread::Builder::new()
+                .name(format!("seismic-cpu-{ordinal}"))
+                .spawn(move || work(&shared))
+                .map_err(|e| format!("CPU worker thread: {e}"))?;
             threads.push(thread);
         }
-        Ok(Workers { shared, threads, scratch: Vec::new() })
+        Ok(Workers {
+            shared,
+            threads,
+            scratch: Vec::new(),
+        })
     }
 
     /// One worker per unit of available parallelism.
     pub fn host() -> Result<Self, String> {
-        Self::new(std::thread::available_parallelism().map_err(|e| format!("host parallelism: {e}"))?.get())
+        Self::new(
+            std::thread::available_parallelism()
+                .map_err(|e| format!("host parallelism: {e}"))?
+                .get(),
+        )
     }
 
     pub fn count(&self) -> usize {
@@ -136,31 +161,61 @@ impl Workers {
 
     /// Execute `items` work items of one phase and return after all of them completed.
     /// A nonzero status is the first one a work item reported; remaining items still ran.
-    pub(crate) fn run(&mut self, entry: PhaseEntry, buffers: &[*mut u8], scalars: &[u64], items: u64, scratch_bytes: usize) -> Result<i32, String> {
+    pub(crate) fn run(
+        &mut self,
+        entry: PhaseEntry,
+        buffers: &[*mut u8],
+        scalars: &[u64],
+        items: u64,
+        scratch_bytes: usize,
+    ) -> Result<i32, String> {
         if items == 0 {
             return Ok(0);
         }
         if items == 1 {
             if !grow(&mut self.scratch, scratch_bytes) {
-                return Err(format!("CPU scratch allocation of {scratch_bytes} bytes failed"));
+                return Err(format!(
+                    "CPU scratch allocation of {scratch_bytes} bytes failed"
+                ));
             }
             // Same contract as in `work`; the calling thread is the only participant.
-            return Ok(unsafe { entry(buffers.as_ptr(), scalars.as_ptr(), self.scratch.as_mut_ptr().cast(), 0) });
+            return Ok(unsafe {
+                entry(
+                    buffers.as_ptr(),
+                    scalars.as_ptr(),
+                    self.scratch.as_mut_ptr().cast(),
+                    0,
+                )
+            });
         }
         let status = Arc::new(AtomicI32::new(0));
-        let job = Job { entry, buffers: buffers.as_ptr() as usize, scalars: scalars.as_ptr() as usize, items, scratch_bytes, next: Arc::new(AtomicU64::new(0)), status: status.clone() };
+        let job = Job {
+            entry,
+            buffers: buffers.as_ptr() as usize,
+            scalars: scalars.as_ptr() as usize,
+            items,
+            scratch_bytes,
+            next: Arc::new(AtomicU64::new(0)),
+            status: status.clone(),
+        };
         let mut state = self.shared.lock()?;
         state.generation += 1;
         state.job = Some(job);
         state.running = self.threads.len();
         self.shared.wake.notify_all();
         while state.running != 0 {
-            state = self.shared.done.wait(state).map_err(|_| "a CPU worker panicked during a phase".to_string())?;
+            state = self
+                .shared
+                .done
+                .wait(state)
+                .map_err(|_| "a CPU worker panicked during a phase".to_string())?;
         }
         state.job = None;
         drop(state);
         match status.load(Ordering::Relaxed) {
-            SCRATCH_ALLOCATION_FAILED => Err(format!("CPU scratch allocation of {scratch_bytes} bytes per worker failed")),
+            SCRATCH_ALLOCATION_FAILED => Err(format!(
+                "CPU scratch allocation of {scratch_bytes} bytes per worker failed"
+            )),
             status => Ok(status),
         }
     }

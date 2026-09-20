@@ -83,8 +83,11 @@ impl DenseSuffix {
             ("UW".into(), weights.up.element().clone()),
             ("DW".into(), weights.down.element().clone()),
         ]);
-        let plan = PlanCompiler::new(device, program, settings)
-            .compile_entry("qwen_dense_suffix", &shapes, &elements)?;
+        let plan = PlanCompiler::new(device, program, settings).compile_entry(
+            "qwen_dense_suffix",
+            &shapes,
+            &elements,
+        )?;
         Ok(Self {
             plan,
             weights,

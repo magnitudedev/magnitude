@@ -1,12 +1,12 @@
 //! Request-local logical progress. The execution owner prepares numerical rows;
 //! generation accepts them independently after shared physical completion.
-pub mod constraints;
 mod checkpoint;
+pub mod constraints;
 pub mod grammar;
 pub mod sampling;
-pub use checkpoint::Checkpoint;
 use crate::inputs::{InputLayout, TokenId};
 use crate::models::sequence::Advance;
+pub use checkpoint::Checkpoint;
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
@@ -188,8 +188,12 @@ impl Generation {
             pending: None,
         })
     }
-    pub fn prompt(&self) -> &[TokenId] { &self.prompt }
-    pub fn layout(&self) -> &InputLayout { &self.layout }
+    pub fn prompt(&self) -> &[TokenId] {
+        &self.prompt
+    }
+    pub fn layout(&self) -> &InputLayout {
+        &self.layout
+    }
     pub fn processed(&self) -> usize {
         self.processed
     }
@@ -200,7 +204,10 @@ impl Generation {
         &self.generated
     }
     pub fn usage(&self) -> Usage {
-        Usage { prompt_tokens: self.prompt.len(), completion_tokens: self.generated.len() }
+        Usage {
+            prompt_tokens: self.prompt.len(),
+            completion_tokens: self.generated.len(),
+        }
     }
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish

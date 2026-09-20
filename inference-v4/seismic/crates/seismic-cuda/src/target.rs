@@ -3,7 +3,7 @@
 //! Source programs never reason about CUDA versions. This module turns the facts reported by
 //! the installed CUDA driver into the most conservative PTX target that implements the selected
 //! backend operation. The scalar backend currently implements one such operation set: the PTX
-//! 7.0, SM 8.0 baseline. Newer family- and architecture-specific targets are represented here but
+//! 7.1, SM 8.0 baseline. Newer family- and architecture-specific targets are represented here but
 //! are not claimed until their instruction sets and driver requirements are implemented.
 
 use std::fmt;
@@ -185,7 +185,7 @@ pub struct PtxVersion {
 }
 
 impl PtxVersion {
-    pub const V7_0: Self = Self { major: 7, minor: 0 };
+    pub const V7_1: Self = Self { major: 7, minor: 1 };
 }
 
 impl fmt::Display for PtxVersion {
@@ -225,7 +225,7 @@ pub struct PtxTarget {
 
 impl PtxTarget {
     pub const SCALAR_BASELINE: Self = Self {
-        isa: PtxVersion::V7_0,
+        isa: PtxVersion::V7_1,
         architecture: 80,
         tier: TargetTier::Baseline,
     };
@@ -265,9 +265,9 @@ pub struct TargetProfile {
 }
 
 impl TargetProfile {
-    /// PTX 7.0 was introduced with CUDA 11.0. The scalar emitter deliberately uses the SM 8.0
-    /// baseline on newer devices because it does not yet emit any newer ISA operation.
-    const PTX_70_MINIMUM_DRIVER: DriverApiVersion = DriverApiVersion(11_000);
+    /// BF16 conversion in the scalar emitter requires PTX 7.1, introduced with CUDA 11.1.
+    /// The SM 8.0 baseline remains forward-compatible on newer devices.
+    const PTX_71_MINIMUM_DRIVER: DriverApiVersion = DriverApiVersion(11_010);
 
     pub fn from_observation(
         observation: TargetObservation,
@@ -280,11 +280,11 @@ impl TargetProfile {
                 operation_set: "CUDA scalar baseline",
             });
         }
-        if observation.driver_api < Self::PTX_70_MINIMUM_DRIVER {
+        if observation.driver_api < Self::PTX_71_MINIMUM_DRIVER {
             return Err(TargetError::UnsupportedDriver {
                 observed: observation.driver_api,
-                required: Self::PTX_70_MINIMUM_DRIVER,
-                ptx: PtxVersion::V7_0,
+                required: Self::PTX_71_MINIMUM_DRIVER,
+                ptx: PtxVersion::V7_1,
             });
         }
         if limits.max_threads_per_block == 0
@@ -343,7 +343,7 @@ impl TargetProfile {
 
     pub fn synthetic_baseline(limits: TargetLimits) -> Self {
         Self::from_observation(
-            TargetObservation::synthetic((8, 0), 11_000)
+            TargetObservation::synthetic((8, 0), 11_010)
                 .expect("the built-in CUDA baseline observation is valid"),
             limits,
         )
@@ -498,14 +498,14 @@ mod tests {
 
     #[test]
     fn scalar_baseline_is_selected_from_oldest_supported_matrix() {
-        let profile = profile((8, 0), 11_000).unwrap();
+        let profile = profile((8, 0), 11_010).unwrap();
         assert_eq!(
             profile.plan(TargetRequirement::ScalarBaseline),
             Ok(PtxTarget::SCALAR_BASELINE)
         );
         assert_eq!(
             PtxTarget::SCALAR_BASELINE.header(),
-            ".version 7.0\n.target sm_80\n.address_size 64\n\n"
+            ".version 7.1\n.target sm_80\n.address_size 64\n\n"
         );
     }
 
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn supported_hardware_driver_matrix_has_one_honest_emission_target() {
         for (cc, driver) in [
-            ((8, 0), 11_000),
+            ((8, 0), 11_010),
             ((8, 9), 12_000),
             ((9, 0), 12_000),
             ((10, 0), 12_080),
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_every_availability_or_identity_input() {
-        let observation = TargetObservation::synthetic((8, 0), 11_000).unwrap();
+        let observation = TargetObservation::synthetic((8, 0), 11_010).unwrap();
         let baseline = TargetProfile::build(
             observation.clone(),
             LIMITS,

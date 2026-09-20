@@ -32,8 +32,8 @@
 
 use super::super::construct::walk;
 use super::super::{OccurrenceId, ScopeStep, Unit, UnitKind};
-use crate::sir::{Block, Body, Expr, ExprKind, Index, Pattern, Stmt, StmtKind, VarKind};
 use crate::sir::RegionMode;
+use crate::sir::{Block, Body, Expr, ExprKind, Index, Pattern, Stmt, StmtKind, VarKind};
 use crate::types::{Extent, Ty};
 
 /// Units of one block. `UnitKind::Call` carries the body's `CallId` in place of the

@@ -420,8 +420,8 @@ impl<'a> Interpreter<'a> {
                 other => Err(format!("component {index} of {}", other.kind())),
             },
             ExprKind::TileAlloc => {
-                let Ty::Tile(s) = &e.ty else {
-                    return Err("tile allocation without a tile type".into());
+                let (Ty::Tile(s) | Ty::Tensor(s)) = &e.ty else {
+                    return Err("owned allocation without a shaped owned type".into());
                 };
                 let shape = s
                     .axes
@@ -686,15 +686,8 @@ impl<'a> Interpreter<'a> {
             self.dtype_of(s)
         };
         let data = self.gather(s)?;
-        let operation = match op {
-            ReduceOp::Sum => crate::exec::ir::ReduceOp::Sum,
-            ReduceOp::Max => crate::exec::ir::ReduceOp::Max,
-            ReduceOp::Min => crate::exec::ir::ReduceOp::Min,
-            ReduceOp::Argmax => crate::exec::ir::ReduceOp::Argmax,
-        };
-        let contract = crate::exec::reduction::Contract::new(operation, input, true);
         let extent = s.shape[axis];
-        if extent == 0 && !contract.allows_empty_axis() {
+        if extent == 0 && op == ReduceOp::Argmax {
             return Err("argmax requires a nonempty axis".into());
         }
         let outer: usize = s.shape[..axis].iter().product();
@@ -702,7 +695,17 @@ impl<'a> Interpreter<'a> {
         let mut out = Vec::with_capacity(outer * inner);
         for o in 0..outer {
             for i in 0..inner {
-                let mut acc = contract.identity().value();
+                let mut acc = match (op, input) {
+                    (ReduceOp::Sum, _) => 0.0,
+                    (ReduceOp::Min, DType::Bool) => 1.0,
+                    (_, DType::Bool) => 0.0,
+                    (ReduceOp::Min, DType::I32) => f64::from(i32::MAX),
+                    (_, DType::I32) => f64::from(i32::MIN),
+                    (ReduceOp::Min, DType::U32) => f64::from(u32::MAX),
+                    (_, DType::U32) => 0.0,
+                    (ReduceOp::Min, _) => f64::INFINITY,
+                    _ => f64::NEG_INFINITY,
+                };
                 let mut arg = 0usize;
                 for k in 0..extent {
                     let x = data[(o * extent + k) * inner + i];
@@ -727,7 +730,11 @@ impl<'a> Interpreter<'a> {
         }
         let mut shape = s.shape.clone();
         shape.remove(axis);
-        let dtype = contract.output();
+        let dtype = if op == ReduceOp::Argmax {
+            DType::I32
+        } else {
+            input
+        };
         Ok(if shape.is_empty() {
             Value::Scalar(dtype, out[0])
         } else {

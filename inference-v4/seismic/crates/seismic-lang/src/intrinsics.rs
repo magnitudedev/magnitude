@@ -2,10 +2,6 @@
 //! Every admitted operation defines its signature and semantic execution contract
 //! exhaustively. These semantics are not native latency or instruction counts.
 
-use crate::exec::types::{Shaped, Ty};
-use crate::sym::Sym;
-use crate::types::{DType, Elem};
-
 /// Revision of the typed intrinsic registry contract. Backend capability fingerprints retain
 /// this value so cached availability decisions cannot survive a registry semantic change.
 pub const REGISTRY_REVISION: &str = "seismic-intrinsics-v2";
@@ -66,7 +62,7 @@ pub enum Operation {
 pub enum Semantics {
     ParticipantIndex,
     Exchange,
-    Reduction(crate::exec::ir::ReduceOp),
+    Reduction(crate::sir::ReduceOp),
     Fragment {
         rows: u64,
         columns: u64,
@@ -116,9 +112,9 @@ impl Operation {
         match self {
             Self::LaneIndex => Semantics::ParticipantIndex,
             Self::ShuffleIndex => Semantics::Exchange,
-            Self::SimdSum => Semantics::Reduction(crate::exec::ir::ReduceOp::Sum),
-            Self::SimdMax => Semantics::Reduction(crate::exec::ir::ReduceOp::Max),
-            Self::SimdMin => Semantics::Reduction(crate::exec::ir::ReduceOp::Min),
+            Self::SimdSum => Semantics::Reduction(crate::sir::ReduceOp::Sum),
+            Self::SimdMax => Semantics::Reduction(crate::sir::ReduceOp::Max),
+            Self::SimdMin => Semantics::Reduction(crate::sir::ReduceOp::Min),
             Self::Matrix => Semantics::Fragment {
                 rows: 8,
                 columns: 8,
@@ -315,11 +311,4 @@ pub fn lookup_all(backend: &str, capability: &str, name: &str) -> Vec<Intrinsic>
                 && entry.id.name == name
         })
         .collect()
-}
-
-pub fn frag8x8(dtype: DType) -> Ty {
-    Ty::Frag(Shaped::new(
-        vec![Sym::constant(8), Sym::constant(8)],
-        Elem::Dtype(dtype),
-    ))
 }

@@ -103,6 +103,10 @@ impl Program {
 #[derive(Clone, Debug)]
 pub struct ContractFamily {
     pub name: String,
+    /// Canonical source contract for stable parameter names, ordering and
+    /// generic bindings. Implementations may restate equivalent signatures,
+    /// but target capability filtering must not redefine the public contract.
+    pub contract: DefId,
     /// Portable and backend-specific `fn` bodies.
     pub bodies: Vec<DefId>,
     /// Backend `lower` bodies.

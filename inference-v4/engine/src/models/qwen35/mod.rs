@@ -1,17 +1,17 @@
 //! Qwen 3.5 dense and routed architecture contracts, ported from V3.
 pub mod baseline;
-pub mod dense;
 pub mod decoder;
+pub mod dense;
 pub mod gguf;
-pub mod mlx;
+pub mod inputs;
 pub mod loading;
-pub mod program;
+pub mod mlx;
 pub mod preparation;
+pub mod program;
 pub mod service;
 pub mod session;
 pub mod vision;
 pub mod vision_runtime;
-pub mod inputs;
 use crate::weights::{
     descriptor::{ArtifactIdentity, WeightDescriptor},
     Error,

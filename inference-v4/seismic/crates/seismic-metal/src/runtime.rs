@@ -5,11 +5,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLArgumentEncoder, MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLGPUFamily, MTLLanguageVersion,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
+use seismic_realization::executable::ResolvedStorageId;
 use std::ptr::NonNull;
 mod observation;
 pub use observation::{DispatchObservation, Observation};
@@ -24,6 +25,20 @@ pub struct Device {
     identity: std::rc::Rc<()>,
 }
 
+fn binding_available(binding: &crate::msl::Binding, emitted: &Emitted) -> bool {
+    match binding {
+        crate::msl::Binding::Buffer(n) => *n < emitted.buffers.len(),
+        crate::msl::Binding::Scratch(n) => *n < emitted.scratch.len(),
+        crate::msl::Binding::Scalars(offset) => {
+            !emitted.scalars.is_empty() && *offset < emitted.scalar_layout().map_or(0, |l| l.bytes)
+        }
+        crate::msl::Binding::Status => true,
+        crate::msl::Binding::ArgumentTable(members) => members
+            .iter()
+            .all(|(_, binding)| binding_available(binding, emitted)),
+    }
+}
+
 #[derive(Clone)]
 pub struct Buffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -34,7 +49,12 @@ pub struct Buffer {
 
 pub struct Pipeline {
     states: Vec<CompiledLaunch>,
+    /// Recursive executable-plan order flattened exactly once at compilation.
+    /// This is not reconstructed from kernel names or retained launch slots.
+    execution_order: Vec<usize>,
     pub emitted: Emitted,
+    /// Exact ABI-order identities for caller-supplied external buffers.
+    pub buffer_ids: Vec<ResolvedStorageId>,
     /// Buffers the realization needs and the caller does not supply, allocated at compile.
     scratch: Vec<Buffer>,
     identity: std::rc::Rc<()>,
@@ -44,12 +64,22 @@ struct CompiledLaunch {
     index: usize,
     launch: Launch,
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    argument_encoders: Vec<(usize, Retained<ProtocolObject<dyn MTLArgumentEncoder>>)>,
 }
 impl Pipeline {
     /// Selected native dispatches. Absent retained launch slots keep their
     /// identities in the emitted artifact but do not create native pipelines.
     pub fn phase_count(&self) -> usize {
         self.states.len()
+    }
+}
+
+fn execution_order(items: &[crate::msl::ExecutionItem], out: &mut Vec<usize>) {
+    for item in items {
+        match item {
+            crate::msl::ExecutionItem::Phase(launches) => out.extend(launches.iter().copied()),
+            crate::msl::ExecutionItem::Subplan(items) => execution_order(items, out),
+        }
     }
 }
 
@@ -513,6 +543,28 @@ impl Device {
     }
 
     pub fn compile(&self, emitted: Emitted) -> Result<Pipeline, String> {
+        if emitted.buffer_ids.len() != emitted.buffers.len() {
+            return Err("Metal external buffer identities disagree with the emitted ABI".into());
+        }
+        let buffer_ids = emitted.buffer_ids.clone();
+        let mut resolved_order = Vec::new();
+        execution_order(&emitted.execution, &mut resolved_order);
+        if resolved_order.len() != emitted.launches.len()
+            || resolved_order
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != emitted.launches.len()
+            || resolved_order
+                .iter()
+                .any(|index| *index >= emitted.launches.len())
+        {
+            return Err(
+                "Metal executable hierarchy does not cover every resolved launch exactly once"
+                    .into(),
+            );
+        }
         emitted.scalar_layout()?;
         let scalar_slot = emitted
             .buffers
@@ -548,12 +600,10 @@ impl Device {
             return Err("Metal alias condition names an absent invocation binding".into());
         }
         for launch in &emitted.launches {
-            let absent = launch.bindings.iter().any(|binding| match *binding {
-                crate::msl::Binding::Buffer(n) => n >= emitted.buffers.len(),
-                crate::msl::Binding::Scratch(n) => n >= emitted.scratch.len(),
-                crate::msl::Binding::Scalars => emitted.scalars.is_empty(),
-                crate::msl::Binding::Status => false,
-            });
+            let absent = launch
+                .bindings
+                .iter()
+                .any(|binding| !binding_available(binding, &emitted));
             if absent || launch.bindings.len() > crate::msl::MAX_KERNEL_BUFFERS {
                 return Err(format!(
                     "launch `{}` has an invalid buffer table ({} bindings)",
@@ -601,7 +651,9 @@ impl Device {
         {
             return Ok(Pipeline {
                 states: Vec::new(),
+                execution_order: resolved_order,
                 emitted,
+                buffer_ids,
                 scratch,
                 identity: self.identity.clone(),
                 facts: Vec::new(),
@@ -620,7 +672,8 @@ impl Device {
             .map_err(|e| format!("Metal compile failed: {}", e.localizedDescription()))?;
         let mut states = Vec::new();
         let mut facts = Vec::new();
-        for (index, launch) in emitted.launches.iter().enumerate() {
+        for index in resolved_order.iter().copied() {
+            let launch = &emitted.launches[index];
             if launch.threadgroups == 0 {
                 continue;
             }
@@ -628,6 +681,19 @@ impl Device {
             let function = library.newFunctionWithName(&name).ok_or_else(|| {
                 format!("kernel `{}` not found in compiled library", launch.kernel)
             })?;
+            let argument_encoders = launch
+                .bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, binding)| {
+                    matches!(binding, crate::msl::Binding::ArgumentTable(_)).then_some(slot)
+                })
+                .map(|slot| {
+                    // SAFETY: `slot` is taken from the reflected kernel signature just compiled.
+                    let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(slot) };
+                    (slot, encoder)
+                })
+                .collect::<Vec<_>>();
             let state = self
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
@@ -639,6 +705,7 @@ impl Device {
                 max_threads_per_group: state.maxTotalThreadsPerThreadgroup() as u64,
                 static_threadgroup_bytes: state.staticThreadgroupMemoryLength() as u64,
             };
+            let launch = &emitted.launches[index];
             if launch.threads_per_threadgroup == 0
                 || launch.threads_per_threadgroup > physical.max_threads_per_group
             {
@@ -668,11 +735,14 @@ impl Device {
                 index,
                 launch: launch.clone(),
                 state,
+                argument_encoders,
             });
         }
         Ok(Pipeline {
             states,
+            execution_order: resolved_order,
             emitted,
+            buffer_ids,
             scratch,
             identity: self.identity.clone(),
             facts,
@@ -793,6 +863,8 @@ impl Device {
             });
         }
         let status = self.buffer_from(&[0; 4])?;
+        // Retain encoded argument tables until every submitted command completes.
+        let mut argument_buffers = Vec::<Buffer>::new();
         let mut capture = if profile {
             Some(observation::Capture::new(self, dispatch_count)?)
         } else {
@@ -829,11 +901,17 @@ impl Device {
                     buffers,
                     scalars,
                 } = invocation;
-                for compiled in &pipeline.states {
+                for launch_index in &pipeline.execution_order {
+                    let compiled = pipeline
+                        .states
+                        .iter()
+                        .find(|compiled| compiled.index == *launch_index)
+                        .ok_or("Metal executable hierarchy names an uncompiled launch")?;
                     let CompiledLaunch {
                         index: launch_index,
                         launch,
                         state,
+                        argument_encoders,
                     } = compiled;
                     if !profile && encoded == COMMIT_DISPATCHES {
                         if let Some(encoder) = &shared_encoder {
@@ -854,7 +932,7 @@ impl Device {
                         )?,
                         (None, Some(encoder)) => encoder.clone(),
                         (None, None) => {
-                            return Err("Metal submission has no compute encoder".into())
+                            return Err("Metal submission has no compute encoder".into());
                         }
                     };
                     if !profile && (!first || launch.after_barrier) {
@@ -865,10 +943,10 @@ impl Device {
                     // Each kernel declares only the resources it references; its table maps
                     // local buffer index -> invocation resource (validated by `compile`).
                     for (local, binding) in launch.bindings.iter().enumerate() {
-                        match *binding {
+                        match binding {
                             crate::msl::Binding::Buffer(n) => {
                                 let b = buffers
-                                    .get(n)
+                                    .get(*n)
                                     .ok_or("Metal launch binds an absent invocation buffer")?;
                                 unsafe {
                                     encoder.setBuffer_offset_atIndex(
@@ -881,7 +959,7 @@ impl Device {
                             crate::msl::Binding::Scratch(n) => {
                                 let b = pipeline
                                     .scratch
-                                    .get(n)
+                                    .get(*n)
                                     .ok_or("Metal launch binds absent scratch storage")?;
                                 unsafe {
                                     encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, local)
@@ -890,12 +968,70 @@ impl Device {
                             crate::msl::Binding::Status => unsafe {
                                 encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, local)
                             },
-                            crate::msl::Binding::Scalars => {
-                                let bytes = NonNull::new(scalars.as_ptr() as *mut _)
-                                    .ok_or("Metal scalar block has no storage")?;
+                            crate::msl::Binding::Scalars(offset) => {
+                                let remaining = scalars
+                                    .len()
+                                    .checked_sub(*offset)
+                                    .ok_or("Metal scalar binding offset exceeds scalar block")?;
+                                let bytes = NonNull::new(unsafe {
+                                    scalars.as_ptr().add(*offset) as *mut _
+                                })
+                                .ok_or("Metal scalar block has no storage")?;
+                                unsafe { encoder.setBytes_length_atIndex(bytes, remaining, local) };
+                            }
+                            crate::msl::Binding::ArgumentTable(members) => {
+                                let argument_encoder = argument_encoders
+                                    .iter()
+                                    .find(|(slot, _)| *slot == local)
+                                    .map(|(_, encoder)| encoder)
+                                    .ok_or("Metal argument table has no reflected encoder")?;
+                                let argument_buffer =
+                                    self.buffer(argument_encoder.encodedLength())?;
                                 unsafe {
-                                    encoder.setBytes_length_atIndex(bytes, scalars.len(), local)
-                                };
+                                    argument_encoder
+                                        .setArgumentBuffer_offset(Some(&argument_buffer.buffer), 0);
+                                }
+                                for (member, resource) in members {
+                                    let (buffer, offset) = match resource {
+                                        crate::msl::Binding::Buffer(index) => {
+                                            let buffer = buffers.get(*index).ok_or("Metal argument table names absent invocation buffer")?;
+                                            (&buffer.buffer, buffer.offset)
+                                        }
+                                        crate::msl::Binding::Scratch(index) => {
+                                            let buffer = pipeline.scratch.get(*index).ok_or(
+                                                "Metal argument table names absent scratch buffer",
+                                            )?;
+                                            (&buffer.buffer, 0)
+                                        }
+                                        crate::msl::Binding::Status => (&status.buffer, 0),
+                                        crate::msl::Binding::Scalars(_) => {
+                                            return Err(
+                                                "scalar bytes cannot be an argument-table pointer"
+                                                    .into(),
+                                            )
+                                        }
+                                        crate::msl::Binding::ArgumentTable(_) => {
+                                            return Err(
+                                                "nested Metal argument tables are invalid".into()
+                                            )
+                                        }
+                                    };
+                                    unsafe {
+                                        argument_encoder.setBuffer_offset_atIndex(
+                                            Some(buffer),
+                                            offset,
+                                            *member as usize,
+                                        );
+                                    }
+                                }
+                                unsafe {
+                                    encoder.setBuffer_offset_atIndex(
+                                        Some(&argument_buffer.buffer),
+                                        0,
+                                        local,
+                                    );
+                                }
+                                argument_buffers.push(argument_buffer);
                             }
                         }
                     }

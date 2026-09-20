@@ -1,12 +1,9 @@
-use crate::{
-    driver::{Allocation, Context, Driver, Event, Handle, Module},
-    execution::{Execution, Limits},
-    ptx,
-};
-use seismic_lang::abi::ScalarParameter;
-use seismic_realization::{BufferSpec, ScalarProgram};
+use crate::driver::{Allocation, Context, Driver, Event, Handle, Module};
+use seismic_realization::executable::{AbiRole, ResolvedStorageId};
 use std::{
-    ffi::{CStr, c_void},
+    collections::BTreeMap,
+    ffi::{c_void, CStr, CString},
+    fmt,
     rc::Rc,
 };
 
@@ -32,7 +29,7 @@ pub struct Device {
     pub info: DeviceInfo,
     target_profile: crate::target::TargetProfile,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeResources {
     pub registers_per_thread: i32,
     pub local_bytes_per_thread: i32,
@@ -41,6 +38,126 @@ pub struct NativeResources {
     /// Driver occupancy limit for this compiled function and explicit block size;
     /// a capacity constraint, not observed occupancy or a performance score.
     pub max_active_blocks_per_multiprocessor: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeFinalizationError {
+    /// PTX generation/linking or image loading failed. This is not evidence
+    /// that another physical assignment is legal.
+    CodeGeneration { stage: &'static str, detail: String },
+    /// A CUDA driver operation failed independently of assignment resources.
+    Driver(crate::driver::DriverError),
+    /// Host-side runtime preparation failed after successful native emission.
+    RuntimePreparation { stage: &'static str, detail: String },
+    /// Native output contradicted a guarantee already proven by the physical
+    /// program and encoded in PTX launch bounds. This is a compiler/driver
+    /// defect, never a reason to select another physical assignment.
+    Invariant { stage: &'static str, detail: String },
+}
+
+impl fmt::Display for NativeFinalizationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CodeGeneration { stage, detail } => {
+                write!(f, "CUDA {stage} failed: {detail}")
+            }
+            Self::Driver(error) => error.fmt(f),
+            Self::RuntimePreparation { stage, detail } => {
+                write!(f, "CUDA {stage} failed: {detail}")
+            }
+            Self::Invariant { stage, detail } => {
+                write!(f, "CUDA native invariant `{stage}` failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeFinalizationError {}
+
+fn validate_native_invariants(
+    planned_threads_per_block: u32,
+    planned_static_shared_bytes: u32,
+    native: &NativeResources,
+) -> Result<(), NativeFinalizationError> {
+    if native.max_threads_per_block < 0
+        || planned_threads_per_block > native.max_threads_per_block as u32
+    {
+        return Err(NativeFinalizationError::Invariant {
+            stage: "launch bound",
+            detail: format!(
+                "planned .maxntid requires {planned_threads_per_block} threads; loaded function permits {}",
+                native.max_threads_per_block
+            ),
+        });
+    }
+    if native.shared_bytes_per_block < 0
+        || native.shared_bytes_per_block as u32 != planned_static_shared_bytes
+    {
+        return Err(NativeFinalizationError::Invariant {
+            stage: "static shared memory",
+            detail: format!(
+                "physical program planned {planned_static_shared_bytes} bytes; loaded function reports {}",
+                native.shared_bytes_per_block
+            ),
+        });
+    }
+    if native.max_active_blocks_per_multiprocessor == 0 {
+        return Err(NativeFinalizationError::Invariant {
+            stage: "kernel residency",
+            detail: format!(
+                "a launch-bounded kernel has zero residency ({} registers/thread, {} local bytes/thread, {} shared bytes/block)",
+                native.registers_per_thread,
+                native.local_bytes_per_thread,
+                native.shared_bytes_per_block
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_finalization_tests {
+    use super::*;
+
+    fn resources() -> NativeResources {
+        NativeResources {
+            registers_per_thread: 64,
+            local_bytes_per_thread: 4096,
+            max_threads_per_block: 128,
+            shared_bytes_per_block: 0,
+            max_active_blocks_per_multiprocessor: 0,
+        }
+    }
+
+    #[test]
+    fn lower_native_thread_limit_is_a_fatal_invariant() {
+        let error = validate_native_invariants(256, 0, &resources()).unwrap_err();
+        assert!(matches!(error, NativeFinalizationError::Invariant { .. }));
+        assert!(error.to_string().contains("permits 128"));
+    }
+
+    #[test]
+    fn code_generation_failure_is_not_a_resource_refinement() {
+        let error = NativeFinalizationError::CodeGeneration {
+            stage: "PTX linking",
+            detail: "invalid instruction".into(),
+        };
+        assert!(matches!(
+            error,
+            NativeFinalizationError::CodeGeneration { .. }
+        ));
+    }
+
+    #[test]
+    fn unexpected_static_shared_memory_is_a_fatal_invariant() {
+        let mut native = resources();
+        native.max_threads_per_block = 256;
+        native.max_active_blocks_per_multiprocessor = 1;
+        native.shared_bytes_per_block = 16;
+        let error = validate_native_invariants(256, 0, &native).unwrap_err();
+        assert!(matches!(error, NativeFinalizationError::Invariant { .. }));
+        assert!(error.to_string().contains("planned 0 bytes"));
+    }
 }
 /// A checked resident byte range. Clones and subviews retain the allocation and
 /// its private context. Host access is synchronous; handles remain thread-affine.
@@ -180,63 +297,123 @@ impl Device {
     pub fn target_profile(&self) -> &crate::target::TargetProfile {
         &self.target_profile
     }
-    /// Natively compile exactly the realized launches of one selected entry.
-    pub fn compile_launches(
+    /// Compile the immutable result of physical resolution. No mapping,
+    /// allocation, target, or launch decision is made at this boundary.
+    pub fn compile_emitted(
         &self,
-        launches: crate::execution::Launches,
-    ) -> Result<Sequence, String> {
-        self.compile_executions(launches.phases)
-    }
-    /// Consume the complete selected launch sequence, without re-preparing IR.
-    pub fn compile_executions(&self, executions: Vec<Execution>) -> Result<Sequence, String> {
-        if executions.is_empty() {
-            return Err("CUDA execution sequence must have at least one phase".into());
+        emitted: crate::native::Emitted,
+    ) -> Result<PhysicalSequence, NativeFinalizationError> {
+        if emitted.launches.is_empty() {
+            return Err(NativeFinalizationError::Invariant {
+                stage: "physical launch sequence",
+                detail: "resolved CUDA artifact has no launches".into(),
+            });
         }
-        let first = executions[0].program();
-        for execution in &executions {
-            execution.validate_limits(self.execution_limits())?;
-            if execution.program().public_buffer_count != first.public_buffer_count
-                || execution.program().buffers != first.buffers
-                || execution.program().scalars != first.scalars
-            {
-                return Err("CUDA phases must share the same invocation bindings".into());
+        let mut owned = BTreeMap::new();
+        let mut external = Vec::new();
+        for allocation in &emitted.abi {
+            match allocation.role {
+                Some(AbiRole::Parameter { .. } | AbiRole::Result { .. }) => {
+                    external.push(allocation.clone());
+                }
+                Some(AbiRole::InvocationResource { .. }) | None => {
+                    let bytes = usize::try_from(allocation.bytes).map_err(|_| {
+                        NativeFinalizationError::RuntimePreparation {
+                            stage: "resolved allocation",
+                            detail: format!(
+                                "allocation#{} exceeds host address range",
+                                allocation.id.0
+                            ),
+                        }
+                    })?;
+                    let allocation_handle =
+                        Allocation::new(&self.context, bytes).map_err(|detail| {
+                            NativeFinalizationError::RuntimePreparation {
+                                stage: "resolved allocation",
+                                detail,
+                            }
+                        })?;
+                    owned.insert(allocation.id, Rc::new(allocation_handle));
+                }
             }
         }
-        let public_buffers = first.buffers[..first.public_buffer_count].to_vec();
-        let internal = first.buffers[first.public_buffer_count..]
+        external.sort_by_key(|allocation| match allocation.role.as_ref().unwrap() {
+            AbiRole::Parameter {
+                ordinal,
+                path,
+                representation_plane,
+            } => (0, *ordinal, path.clone(), representation_plane.clone()),
+            AbiRole::Result {
+                ordinal,
+                path,
+                representation_plane,
+            } => (1, *ordinal, path.clone(), representation_plane.clone()),
+            AbiRole::InvocationResource { name } => (2, 0, vec![], Some(name.clone())),
+        });
+        let phases = emitted
+            .launches
             .iter()
-            .map(|spec| self.buffer(spec.bytes))
+            .map(|launch| self.compile_physical_launch(launch))
             .collect::<Result<Vec<_>, _>>()?;
-        let phases = executions
-            .into_iter()
-            .map(|execution| self.compile_execution(execution))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Sequence {
+        Ok(PhysicalSequence {
+            name: emitted.name,
             phases,
-            public_buffers,
-            internal,
+            external,
+            owned,
         })
     }
-    fn execution_limits(&self) -> Limits {
-        Limits {
-            max_threads_per_block: self.info.max_threads_per_block,
-            max_grid_x: self.info.max_grid_x,
+
+    fn compile_physical_launch(
+        &self,
+        launch: &crate::native::CudaLaunch,
+    ) -> Result<PhysicalKernel, NativeFinalizationError> {
+        self.target_profile.admits(launch.target).map_err(|error| {
+            NativeFinalizationError::CodeGeneration {
+                stage: "target admission",
+                detail: error.to_string(),
+            }
+        })?;
+        if launch.block != launch.launch_bound {
+            return Err(NativeFinalizationError::Invariant {
+                stage: "launch bound",
+                detail: "PTX .maxntid differs from resolved block geometry".into(),
+            });
         }
-    }
-    fn compile_code(&self, execution: &Execution) -> Result<CompiledCode, String> {
-        execution.validate_limits(self.execution_limits())?;
-        self.target_profile
-            .admits(execution.target_plan().target())
-            .map_err(|error| error.to_string())?;
-        let threads_per_block = execution.dispatch().threads_per_group as u32;
-        let source = ptx::print(execution.target_plan());
-        let context = &self.context;
-        let (image, compilation_log) = crate::driver::compile_image(context, &source)?;
-        let _current = context.enter()?;
-        let driver = &context.driver;
+        let threads = launch
+            .block
+            .into_iter()
+            .try_fold(1u64, |value, axis| value.checked_mul(axis))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| NativeFinalizationError::Invariant {
+                stage: "launch geometry",
+                detail: "resolved CUDA block size overflows the driver ABI".into(),
+            })?;
+        if launch
+            .grid
+            .into_iter()
+            .any(|axis| u32::try_from(axis).is_err())
+        {
+            return Err(NativeFinalizationError::Invariant {
+                stage: "launch geometry",
+                detail: "resolved CUDA grid exceeds the driver ABI".into(),
+            });
+        }
+        let (image, compilation_log) = crate::driver::compile_image(&self.context, &launch.ptx)
+            .map_err(|detail| NativeFinalizationError::CodeGeneration {
+                stage: "PTX linking",
+                detail,
+            })?;
+        let _current =
+            self.context
+                .enter()
+                .map_err(|detail| NativeFinalizationError::RuntimePreparation {
+                    stage: "context entry",
+                    detail,
+                })?;
+        let driver = &self.context.driver;
         let mut raw = std::ptr::null_mut();
         let mut log = vec![0u8; 16384];
-        let mut options = [5, 6]; // CU_JIT_ERROR_LOG_BUFFER, *_SIZE_BYTES
+        let mut options = [5, 6];
         let mut values = [log.as_mut_ptr().cast::<c_void>(), log.len() as *mut c_void];
         let status = unsafe {
             (driver.module_load)(
@@ -247,127 +424,90 @@ impl Device {
                 values.as_mut_ptr(),
             )
         };
-        if let Err(error) = driver.check(status, "native image loading") {
-            let end = log.iter().position(|b| *b == 0).unwrap_or(log.len());
-            return Err(format!("{error}\n{}", String::from_utf8_lossy(&log[..end])));
+        if let Err(error) = driver.check_typed(status, "native image loading") {
+            let end = log.iter().position(|byte| *byte == 0).unwrap_or(log.len());
+            return Err(NativeFinalizationError::CodeGeneration {
+                stage: "native image loading",
+                detail: format!("{error}\n{}", String::from_utf8_lossy(&log[..end])),
+            });
         }
         let module = Module {
             raw,
-            context: context.clone(),
+            context: self.context.clone(),
         };
         let mut function = std::ptr::null_mut();
+        let function_name =
+            CString::new(launch.name.as_str()).map_err(|_| NativeFinalizationError::Invariant {
+                stage: "kernel lookup",
+                detail: "resolved CUDA launch name contains NUL".into(),
+            })?;
         unsafe {
-            driver.check(
-                (driver.module_function)(&mut function, module.raw, c"seismic_kernel".as_ptr()),
-                "kernel lookup",
-            )?;
+            driver
+                .check_typed(
+                    (driver.module_function)(&mut function, module.raw, function_name.as_ptr()),
+                    "kernel lookup",
+                )
+                .map_err(NativeFinalizationError::Driver)?;
         }
-        let attr = |key| -> Result<i32, String> {
-            let mut n = 0;
+        let attr = |key| -> Result<i32, NativeFinalizationError> {
+            let mut value = 0;
             unsafe {
-                driver.check(
-                    (driver.function_attribute)(&mut n, key, function),
-                    "native function attribute",
-                )?;
+                driver
+                    .check_typed(
+                        (driver.function_attribute)(&mut value, key, function),
+                        "native function attribute",
+                    )
+                    .map_err(NativeFinalizationError::Driver)?;
             }
-            Ok(n)
+            Ok(value)
         };
-        let mut active_blocks = 0;
-        unsafe {
-            driver.check(
-                (driver.occupancy_blocks)(
-                    &mut active_blocks,
-                    function,
-                    threads_per_block as i32,
-                    0,
-                ),
-                "compiled-kernel occupancy limit",
-            )?;
-        }
-        let active_blocks = u32::try_from(active_blocks)
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or("compiled CUDA candidate cannot reside on an execution unit")?;
-        let native = NativeResources {
+        let mut native = NativeResources {
             registers_per_thread: attr(4)?,
             local_bytes_per_thread: attr(3)?,
             max_threads_per_block: attr(0)?,
             shared_bytes_per_block: attr(1)?,
-            max_active_blocks_per_multiprocessor: active_blocks,
+            max_active_blocks_per_multiprocessor: 0,
         };
-        if threads_per_block > native.max_threads_per_block as u32 {
-            return Err("CUDA block size exceeds compiled kernel capability".into());
+        let mut active_blocks = 0;
+        unsafe {
+            driver
+                .check_typed(
+                    (driver.occupancy_blocks)(&mut active_blocks, function, threads as i32, 0),
+                    "compiled-kernel occupancy limit",
+                )
+                .map_err(NativeFinalizationError::Driver)?;
         }
-        Ok(CompiledCode {
+        native.max_active_blocks_per_multiprocessor = u32::try_from(active_blocks).unwrap_or(0);
+        validate_native_invariants(threads, 0, &native)?;
+        Ok(PhysicalKernel {
             module,
             function,
+            launch: launch.clone(),
             native,
-            source,
             image: NativeImage {
                 cubin: image,
                 compilation_log,
                 driver_version: self.info.driver_version,
                 compute_capability: self.info.compute_capability,
-                target: execution.target_plan().target(),
+                target: launch.target,
                 target_fingerprint: self.target_profile.fingerprint().to_owned(),
             },
+            timing: [
+                Event::new(&self.context).map_err(|detail| {
+                    NativeFinalizationError::RuntimePreparation {
+                        stage: "timing-event creation",
+                        detail,
+                    }
+                })?,
+                Event::new(&self.context).map_err(|detail| {
+                    NativeFinalizationError::RuntimePreparation {
+                        stage: "timing-event creation",
+                        detail,
+                    }
+                })?,
+            ],
         })
     }
-    /// Compile and allocate exactly the prevalidated selected execution.
-    pub fn compile_execution(&self, execution: Execution) -> Result<Kernel, String> {
-        let CompiledCode {
-            module,
-            function,
-            native,
-            source,
-            image,
-        } = self.compile_code(&execution)?;
-        let context = &self.context;
-        let storage = execution.storage();
-        let table = Allocation::new(context, storage.buffer_table_bytes)?;
-        let scalars = Allocation::new(context, storage.scalar_bytes)?;
-        let scratch = Allocation::new(context, storage.scratch_bytes)?;
-        let statuses = Allocation::new(context, storage.status_bytes)?;
-        Ok(Kernel {
-            module,
-            function,
-            execution,
-            tensors: Vec::new(),
-            table,
-            scalars,
-            scratch,
-            statuses,
-            native,
-            ptx: source,
-            image,
-            ready: false,
-            timing: [Event::new(context)?, Event::new(context)?],
-        })
-    }
-}
-struct CompiledCode {
-    module: Module,
-    function: Handle,
-    native: NativeResources,
-    source: String,
-    image: NativeImage,
-}
-/// Synchronous initial invocation owner. Launch returns only after completion;
-/// all submitted buffers, code and scratch therefore survive every device use.
-pub struct Kernel {
-    module: Module,
-    function: Handle,
-    execution: Execution,
-    tensors: Vec<Buffer>,
-    table: Allocation,
-    scalars: Allocation,
-    scratch: Allocation,
-    statuses: Allocation,
-    ready: bool,
-    timing: [Event; 2],
-    pub native: NativeResources,
-    pub ptx: String,
-    image: NativeImage,
 }
 /// The exact linked image loaded by this kernel. Developer inspection can use
 /// CUDA tooling, but compilation/execution depend only on the installed driver.
@@ -379,152 +519,131 @@ pub struct NativeImage {
     pub target: crate::target::PtxTarget,
     pub target_fingerprint: String,
 }
-impl Kernel {
-    pub fn native_image(&self) -> &NativeImage {
-        &self.image
+
+/// A natively compiled resolved kernel. Its launch geometry and argument order
+/// are copied from the physical artifact and are immutable after compilation.
+pub struct PhysicalKernel {
+    module: Module,
+    function: Handle,
+    launch: crate::native::CudaLaunch,
+    pub native: NativeResources,
+    pub image: NativeImage,
+    timing: [Event; 2],
+}
+
+/// Runtime owner for the direct physical CUDA path. Callers bind only
+/// Parameter/Result allocations; compiler-owned Invocation/Internal storage is
+/// allocated once and never exposed as user ABI.
+pub struct PhysicalSequence {
+    name: String,
+    phases: Vec<PhysicalKernel>,
+    external: Vec<crate::native::CudaAbiAllocation>,
+    owned: BTreeMap<ResolvedStorageId, Rc<Allocation>>,
+}
+
+impl PhysicalSequence {
+    pub fn name(&self) -> &str {
+        &self.name
     }
-    pub fn buffers(&self) -> &[BufferSpec] {
-        &self.execution.program().buffers
+
+    pub fn phase_count(&self) -> usize {
+        self.phases.len()
     }
-    pub fn scalars(&self) -> &[ScalarParameter] {
-        &self.execution.program().scalars
+
+    pub fn external_allocations(&self) -> &[crate::native::CudaAbiAllocation] {
+        &self.external
     }
-    pub fn scratch_bytes(&self) -> usize {
-        self.scratch.bytes
+
+    pub fn ptx_sources(&self) -> impl Iterator<Item = &str> {
+        self.phases.iter().map(|phase| phase.launch.ptx.as_str())
     }
-    pub fn work_items(&self) -> u64 {
-        self.execution.program().work_items
+
+    pub fn native_images(&self) -> impl Iterator<Item = &NativeImage> {
+        self.phases.iter().map(|phase| &phase.image)
     }
-    fn validate(&self, buffers: &[&mut [u8]]) -> Result<(), String> {
-        if buffers.len() != self.execution.program().buffers.len() {
-            return Err("CUDA buffer binding count mismatch".into());
+
+    pub fn execute(&mut self, buffers: &[Buffer], timed: bool) -> Result<Option<f64>, String> {
+        self.execute_with_scalars(buffers, &[], timed)
+    }
+
+    pub fn execute_with_scalars(
+        &mut self,
+        buffers: &[Buffer],
+        scalars: &[f64],
+        timed: bool,
+    ) -> Result<Option<f64>, String> {
+        if buffers.len() != self.external.len() {
+            return Err(format!(
+                "CUDA physical sequence needs {} external allocations, received {}",
+                self.external.len(),
+                buffers.len()
+            ));
         }
-        for (buffer, spec) in buffers.iter().zip(&self.execution.program().buffers) {
-            if buffer.len() < spec.bytes {
-                return Err(format!(
-                    "CUDA buffer {}.{} has {} bytes; needs {}",
-                    spec.parameter,
-                    spec.plane,
-                    buffer.len(),
-                    spec.bytes
-                ));
-            }
-        }
-        Ok(())
-    }
-    /// Bind resident views without copying their contents. Rebinding updates only
-    /// the pointer/scalar tables; ownership remains retained through every launch.
-    pub fn bind(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
-        self.ready = false;
-        if buffers.len() != self.execution.program().buffers.len() {
-            return Err("CUDA resident binding count mismatch".into());
-        }
-        for (buffer, spec) in buffers.iter().zip(&self.execution.program().buffers) {
-            if !Rc::ptr_eq(&buffer.allocation.context, &self.module.context) {
+        let mut pointers = BTreeMap::new();
+        for (spec, buffer) in self.external.iter().zip(buffers) {
+            if !Rc::ptr_eq(&buffer.allocation.context, &self.phases[0].module.context) {
                 return Err("CUDA buffer belongs to a different context".into());
             }
-            if buffer.len < spec.bytes {
+            if buffer.len < spec.bytes as usize {
                 return Err(format!(
-                    "CUDA resident {}.{} needs {} bytes, has {}",
-                    spec.parameter, spec.plane, spec.bytes, buffer.len
+                    "CUDA allocation#{} needs {} bytes, has {}",
+                    spec.id.0, spec.bytes, buffer.len
                 ));
             }
-            if spec.alignment == 0 || buffer.pointer() % spec.alignment as u64 != 0 {
-                return Err("CUDA resident view violates typed storage alignment".into());
+            if spec.alignment == 0 || buffer.pointer() % spec.alignment != 0 {
+                return Err(format!(
+                    "CUDA allocation#{} violates alignment {}",
+                    spec.id.0, spec.alignment
+                ));
             }
+            pointers.insert(spec.id, buffer.pointer());
         }
-        self.execution
-            .program()
-            .conditions
-            .validate_aliases(&self.execution.program().buffers, |i| {
-                (
-                    Rc::as_ptr(&buffers[i].allocation) as usize as u64,
-                    buffers[i].offset as u64,
-                )
-            })?;
-        let words =
-            seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
-        let bytes = words
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>();
-        self.scalars.upload(&bytes)?;
-        let pointers = buffers
-            .iter()
-            .flat_map(|b| b.pointer().to_le_bytes())
-            .collect::<Vec<_>>();
-        self.table.upload(&pointers)?;
-        self.tensors = buffers.to_vec();
-        self.ready = true;
-        Ok(())
-    }
-    pub fn upload(&mut self, buffers: &[&mut [u8]], scalars: &[f64]) -> Result<(), String> {
-        self.ready = false;
-        self.validate(buffers)?;
-        // The first host invocation supplies storage. Subsequent uploads refresh
-        // the current resident bindings rather than allocating per invocation.
-        if self.tensors.is_empty() && !self.execution.program().buffers.is_empty() {
-            self.tensors = self
-                .execution
-                .program()
-                .buffers
+        pointers.extend(
+            self.owned
                 .iter()
-                .map(|spec| {
-                    Ok(Buffer {
-                        allocation: Rc::new(Allocation::new(&self.module.context, spec.bytes)?),
-                        offset: 0,
-                        len: spec.bytes,
-                    })
-                })
-                .collect::<Result<_, String>>()?;
+                .map(|(id, allocation)| (*id, allocation.pointer)),
+        );
+        if !scalars.is_empty() {
+            return Err("CUDA physical sequence has no scalar invocation storage".into());
         }
-        let resident = self.tensors.clone();
-        // Validate scalar values before modifying caller-owned resident contents.
-        seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
-        for ((tensor, buffer), spec) in resident
+        let mut seconds = 0.0;
+        for phase in &mut self.phases {
+            seconds += phase.launch(&pointers, timed)?;
+        }
+        Ok(timed.then_some(seconds))
+    }
+}
+
+impl PhysicalKernel {
+    fn launch(
+        &mut self,
+        allocations: &BTreeMap<ResolvedStorageId, u64>,
+        timed: bool,
+    ) -> Result<f64, String> {
+        let mut arguments = self
+            .launch
+            .bindings
             .iter()
-            .zip(buffers)
-            .zip(&self.execution.program().buffers)
-        {
-            tensor.write(&buffer[..spec.bytes])?;
-        }
-        self.bind(&resident, scalars)
-    }
-    /// Release completed invocation storage while retaining reusable code.
-    pub fn release_bindings(&mut self) {
-        self.ready = false;
-        self.tensors.clear();
-    }
-    pub fn launch(&mut self) -> Result<(), String> {
-        self.launch_inner(false).map(|_| ())
-    }
-    /// CUDA event interval around one kernel in this private context. Excludes
-    /// uploads, status initialization/download and host synchronization. The
-    /// caller owns input reset and the conditioning/repetition protocol.
-    pub fn launch_timed(&mut self) -> Result<f64, String> {
-        self.launch_inner(true)
-    }
-    fn launch_inner(&mut self, timed: bool) -> Result<f64, String> {
-        if !self.ready {
-            return Err("CUDA kernel must have validated inputs uploaded before launch".into());
-        }
-        if self.execution.dispatch().groups as u32 == 0 {
-            return Ok(0.0);
-        }
-        self.ready = false;
-        let context = &self.module.context;
-        let _current = context.enter()?;
-        self.statuses.fill(255)?;
-        let mut arguments = [
-            self.table.pointer,
-            self.scalars.pointer,
-            self.scratch.pointer,
-            self.statuses.pointer,
-        ];
+            .map(|binding| {
+                allocations
+                    .get(&binding.allocation)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "CUDA launch#{} binding#{} names absent allocation#{}",
+                            self.launch.id.0, binding.id.0, binding.allocation.0
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut params = arguments
             .iter_mut()
-            .map(|v| (v as *mut u64).cast::<c_void>())
+            .map(|value| (value as *mut u64).cast::<c_void>())
             .collect::<Vec<_>>();
+        let grid = self.launch.grid.map(|axis| axis as u32);
+        let block = self.launch.block.map(|axis| axis as u32);
+        let context = &self.module.context;
+        let _current = context.enter()?;
         let driver = &context.driver;
         unsafe {
             if timed {
@@ -533,180 +652,43 @@ impl Kernel {
                     "start timing event",
                 )?;
             }
-            let launch = (driver.launch)(
-                self.function,
-                self.execution.dispatch().groups as u32,
-                1,
-                1,
-                self.execution.dispatch().threads_per_group as u32,
-                1,
-                1,
-                0,
-                std::ptr::null_mut(),
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
-            // Even a submission error may report an earlier asynchronous error.
-            // Drain the private context before any owner can release resources.
-            let end_event = if timed {
-                (driver.event_record)(self.timing[1].raw, std::ptr::null_mut())
-            } else {
-                0
-            };
-            let completion = (driver.synchronize)();
-            driver.check(launch, "kernel launch")?;
-            driver.check(completion, "kernel completion")?;
-            driver.check(end_event, "end timing event")?;
-        }
-        let mut statuses = vec![0u8; self.statuses.bytes];
-        self.statuses.download(&mut statuses)?;
-        for (index, bytes) in statuses.chunks_exact(4).enumerate() {
-            let status = i32::from_le_bytes(bytes.try_into().unwrap());
-            if status != 0 {
-                self.ready = false;
-                return Err(format!(
-                    "CUDA work item {index} failed with status {status}; outputs may be partially written"
-                ));
-            }
-        }
-        let mut milliseconds = 0.0f32;
-        if timed {
-            unsafe {
+            driver.check(
+                (driver.launch)(
+                    self.function,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    0,
+                    std::ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "kernel launch",
+            )?;
+            if timed {
                 driver.check(
-                    (driver.event_elapsed)(
-                        &mut milliseconds,
-                        self.timing[0].raw,
-                        self.timing[1].raw,
-                    ),
-                    "elapsed event time",
+                    (driver.event_record)(self.timing[1].raw, std::ptr::null_mut()),
+                    "end timing event",
                 )?;
             }
-            if !milliseconds.is_finite() || milliseconds < 0.0 {
-                return Err("invalid CUDA event duration".into());
-            }
+            driver.check((driver.synchronize)(), "kernel completion")?;
         }
-        self.ready = true;
+        if !timed {
+            return Ok(0.0);
+        }
+        let mut milliseconds = 0.0f32;
+        unsafe {
+            driver.check(
+                (driver.event_elapsed)(&mut milliseconds, self.timing[0].raw, self.timing[1].raw),
+                "elapsed event time",
+            )?;
+        }
+        if !milliseconds.is_finite() || milliseconds < 0.0 {
+            return Err("invalid CUDA event duration".into());
+        }
         Ok(f64::from(milliseconds) * 0.001)
-    }
-    pub fn download(&self, buffers: &mut [&mut [u8]]) -> Result<(), String> {
-        self.validate(buffers)?;
-        if self.tensors.len() != self.execution.program().buffers.len() {
-            return Err("CUDA tensors have not been bound".into());
-        }
-        for ((tensor, buffer), spec) in self
-            .tensors
-            .iter()
-            .zip(buffers)
-            .zip(&self.execution.program().buffers)
-        {
-            tensor.read(&mut buffer[..spec.bytes])?;
-        }
-        Ok(())
-    }
-    pub fn run(&mut self, buffers: &mut [&mut [u8]], scalars: &[f64]) -> Result<(), String> {
-        self.upload(buffers, scalars)?;
-        self.launch()?;
-        self.download(buffers)
-    }
-}
-
-/// An ordered realization of one source kernel's parallel phases. All bindings
-/// validate before the first phase; failures release retained input owners only
-/// after physical completion. Successful earlier writes may remain after failure.
-pub struct Sequence {
-    phases: Vec<Kernel>,
-    public_buffers: Vec<BufferSpec>,
-    /// One invocation-owned publication allocation per retained cross-phase
-    /// value. Every phase receives the same suffix of the pointer table.
-    internal: Vec<Buffer>,
-}
-impl Sequence {
-    pub fn buffers(&self) -> &[BufferSpec] {
-        &self.public_buffers
-    }
-    pub fn scalars(&self) -> &[ScalarParameter] {
-        self.phases[0].scalars()
-    }
-    pub fn ptx_sources(&self) -> impl Iterator<Item = &str> {
-        self.phases.iter().map(|kernel| kernel.ptx.as_str())
-    }
-    pub fn phase_count(&self) -> usize {
-        self.phases.len()
-    }
-    pub fn realizations(&self) -> impl Iterator<Item = (&ScalarProgram, &NativeResources)> {
-        self.phases
-            .iter()
-            .map(|kernel| (kernel.execution.program(), &kernel.native))
-    }
-    /// The CUDA event interval of every launch, in launch order (the timing probe's view).
-    pub fn execute_launches(
-        &mut self,
-        buffers: &[Buffer],
-        scalars: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        if buffers.len() != self.public_buffers.len() {
-            return Err("CUDA sequence public binding count mismatch".into());
-        }
-        let bindings = buffers
-            .iter()
-            .chain(&self.internal)
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = (|| {
-            for kernel in &mut self.phases {
-                kernel.bind(&bindings, scalars)?;
-            }
-            self.phases
-                .iter_mut()
-                .enumerate()
-                .map(|(index, kernel)| {
-                    kernel
-                        .launch_timed()
-                        .map_err(|error| format!("CUDA phase {index}: {error}"))
-                })
-                .collect()
-        })();
-        for kernel in &mut self.phases {
-            kernel.release_bindings();
-        }
-        result
-    }
-    /// Device timing is the sum of per-kernel event intervals, excluding host gaps.
-    pub fn execute(
-        &mut self,
-        buffers: &[Buffer],
-        scalars: &[f64],
-        timed: bool,
-    ) -> Result<Option<f64>, String> {
-        if buffers.len() != self.public_buffers.len() {
-            return Err("CUDA sequence public binding count mismatch".into());
-        }
-        let bindings = buffers
-            .iter()
-            .chain(&self.internal)
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = (|| {
-            for kernel in &mut self.phases {
-                kernel.bind(&bindings, scalars)?;
-            }
-            let mut seconds = 0.0;
-            for (index, kernel) in self.phases.iter_mut().enumerate() {
-                if timed {
-                    seconds += kernel
-                        .launch_timed()
-                        .map_err(|error| format!("CUDA phase {index}: {error}"))?;
-                } else {
-                    kernel
-                        .launch()
-                        .map_err(|error| format!("CUDA phase {index}: {error}"))?;
-                }
-            }
-            Ok(timed.then_some(seconds))
-        })();
-        for kernel in &mut self.phases {
-            kernel.release_bindings();
-        }
-        result
     }
 }

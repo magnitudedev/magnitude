@@ -15,6 +15,7 @@ pub(crate) mod resolve;
 mod stmt;
 
 use crate::intrinsics::CapabilityId;
+use crate::sir::Mode;
 use crate::sir::{
     self, CallSite, DefKind, IntrinsicUse, Predicate, RegionDecl, SliceDecl, SliceParent, Var,
     VarId, VarKind,
@@ -22,7 +23,6 @@ use crate::sir::{
 use crate::span::{Diagnostic, Span};
 use crate::sym::{Atom, Facts, Prover, Sym};
 use crate::syntax::ast;
-use crate::sir::Mode;
 use crate::types::{Extent, RegionId, ResultTy, Shaped, SliceId, Ty};
 use resolve::{Declared, Located, Resolved, Sig};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -787,7 +787,9 @@ pub(crate) fn definitely_initializes_var(
         loops: &[(VarId, Sym)],
     ) -> bool {
         match &point.kind {
-            sir::ExprKind::Var(var) => loops.iter().any(|(loop_var, bound)| loop_var == var && bound == extent),
+            sir::ExprKind::Var(var) => loops
+                .iter()
+                .any(|(loop_var, bound)| loop_var == var && bound == extent),
             _ => {
                 if extent.as_constant() == Some(1) && point.sym.as_ref().is_some_and(Sym::is_zero) {
                     return true;
@@ -815,8 +817,12 @@ pub(crate) fn definitely_initializes_var(
         match index {
             sir::Index::Point(point) => point_covers(vars, point, extent, loops),
             sir::Index::Range { start, end } => {
-                let full = start.as_ref().is_none_or(|start| start.sym.as_ref().is_some_and(Sym::is_zero))
-                    && end.as_ref().is_none_or(|end| end.sym.as_ref() == Some(extent));
+                let full = start
+                    .as_ref()
+                    .is_none_or(|start| start.sym.as_ref().is_some_and(Sym::is_zero))
+                    && end
+                        .as_ref()
+                        .is_none_or(|end| end.sym.as_ref() == Some(extent));
                 full || loops.iter().any(|(var, partitions)| {
                     let width = extent.quot(partitions);
                     if !Prover::new(facts).zero(&width.mul(partitions).sub(extent)) {
@@ -850,7 +856,9 @@ pub(crate) fn definitely_initializes_var(
             return false;
         }
         indices.iter().zip(extents).all(|(index, extent)| {
-            let Extent::Semantic(extent) = extent else { return false };
+            let Extent::Semantic(extent) = extent else {
+                return false;
+            };
             index_covers(vars, index, extent, loops, facts)
         })
         // Omitted trailing indices denote the complete remaining tensor slice.
@@ -864,15 +872,28 @@ pub(crate) fn definitely_initializes_var(
         facts: &Facts,
     ) -> bool {
         block.iter().any(|statement| match &statement.kind {
-            sir::StmtKind::Assign { target, .. } | sir::StmtKind::Publish { destination: target, .. } => {
-                target_covers(vars, target, variable, extents, loops, facts)
-            }
+            sir::StmtKind::Assign { target, .. }
+            | sir::StmtKind::Publish {
+                destination: target,
+                ..
+            } => target_covers(vars, target, variable, extents, loops, facts),
             sir::StmtKind::If { then, els, .. } => {
                 writes(vars, then, variable, extents, loops, facts)
                     && writes(vars, els, variable, extents, loops, facts)
             }
-            sir::StmtKind::Range { var, lo, hi, value: None, body: nested, .. } => {
-                let Some(bound) = hi.sym.clone().filter(|_| lo.sym.as_ref().is_some_and(Sym::is_zero)) else {
+            sir::StmtKind::Range {
+                var,
+                lo,
+                hi,
+                value: None,
+                body: nested,
+                ..
+            } => {
+                let Some(bound) = hi
+                    .sym
+                    .clone()
+                    .filter(|_| lo.sym.as_ref().is_some_and(Sym::is_zero))
+                else {
                     return false;
                 };
                 let mut nested_loops = loops.to_vec();
@@ -904,7 +925,9 @@ fn close_summaries(summaries: &mut [Summary]) {
             }
             for (candidates, own) in summaries[i].init_passes.clone() {
                 if !candidates.is_empty()
-                    && candidates.iter().all(|(callee, parameter)| summaries[*callee].full_init.contains(parameter))
+                    && candidates
+                        .iter()
+                        .all(|(callee, parameter)| summaries[*callee].full_init.contains(parameter))
                     && summaries[i].full_init.insert(own)
                 {
                     changed = true;

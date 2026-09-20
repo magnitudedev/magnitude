@@ -223,6 +223,26 @@ impl TargetProfile {
         &self.fingerprint
     }
 
+    /// Capability-family evidence used by constructive physical planning.
+    /// Exact intrinsic admission remains signature-based below; this only
+    /// prevents the physical target from claiming a family with no admitted
+    /// signature at all.
+    pub fn supports_family(&self, prefix: &str) -> bool {
+        self.signatures.iter().any(|signature| {
+            signature.path == prefix || signature.path.starts_with(&format!("{prefix}."))
+        })
+    }
+
+    pub fn supports_dtype(&self, dtype: DType) -> bool {
+        let spelling = dtype.name();
+        self.signatures.iter().any(|signature| {
+            signature
+                .canonical()
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|token| token == spelling)
+        })
+    }
+
     pub fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         if intrinsic.id.capability.backend != "metal" {
             return Err(format!(

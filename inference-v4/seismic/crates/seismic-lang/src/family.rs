@@ -6,9 +6,8 @@
 //! space: nothing here invents calls, producers, stages, partitions or groupings.
 //! Dynamic repetition (visits, elements, tokens) never creates occurrences or sites.
 //!
-//! Backends add site domains, legality constraints, fusion intervals and cost factors
-//! (`seismic-compiler::selection::Backend`); the solver picks a `Witness`;
-//! `instantiate` reproduces exactly that witness.
+//! Logical specialization consumes this finite authored family and physical
+//! elaboration turns it into backend-owned constructive choices.
 
 use super::sir::IntrinsicUse;
 use super::sir::{CallId, DefId, Program};
@@ -127,6 +126,9 @@ pub struct Candidate {
     pub numerical_effects: Vec<NumericalEffect>,
     /// Caller slice bound to each structural shape parameter of the template.
     pub structural: Vec<(String, SiteRef)>,
+    /// Runtime-valued semantic shape parameters expressed in the caller's
+    /// canonical extent symbols. These bindings are occurrence-specific.
+    pub dynamic: Vec<(String, crate::sym::Sym)>,
     /// Applicability that depends on numbers: holds for the selected site values or the
     /// candidate is unselectable.
     pub requirements: Vec<Requirement>,
@@ -248,17 +250,6 @@ pub struct Obligation {
     pub reason: String,
 }
 
-/// A complete joint assignment: one implementation per active occurrence, a value per
-/// active site, and a contiguous exact cover per active sequence. Inactive occurrences,
-/// sites and sequences are absent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Witness {
-    pub choices: BTreeMap<OccurrenceId, u32>,
-    pub sites: BTreeMap<SiteId, i64>,
-    /// Half-open unit intervals `[start, end)`, ascending, covering every unit once.
-    pub covers: BTreeMap<SequenceId, Vec<(u32, u32)>>,
-}
-
 impl Family {
     pub fn occurrence(&self, id: OccurrenceId) -> &Occurrence {
         &self.occurrences[id.0 as usize]
@@ -270,25 +261,6 @@ impl Family {
 
     pub fn template(&self, id: TemplateId) -> &Template {
         &self.templates[id.0 as usize]
-    }
-
-    /// Whether `candidate` is active under `witness` (it and all its ancestors selected).
-    pub fn active(&self, witness: &Witness, candidate: CandidateRef) -> bool {
-        let mut current = Some(candidate);
-        while let Some(c) = current {
-            if witness.choices.get(&c.occurrence) != Some(&c.candidate) {
-                return false;
-            }
-            current = self.occurrence(c.occurrence).parent;
-        }
-        true
-    }
-
-    /// Structural validity of a witness against this family: exactly one applicable choice
-    /// per active occurrence, values for exactly the active sites, requirements hold, and
-    /// exact contiguous covers for exactly the active sequences. Backend legality is separate.
-    pub fn validate(&self, witness: &Witness) -> Result<(), String> {
-        normalize::validate(self, witness)
     }
 }
 

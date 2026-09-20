@@ -56,7 +56,7 @@ pub struct Importer {
     device: Rc<Device>,
     settings: Settings,
     program: Program,
-    kernels: HashMap<(DType, DType, usize), CompiledPlan>,
+    kernels: HashMap<(DType, DType, usize, bool), CompiledPlan>,
     block_kernels: HashMap<(super::gguf::Encoding, usize), CompiledPlan>,
 }
 impl Importer {
@@ -197,9 +197,14 @@ impl Importer {
                 {
                     input
                 } else {
-                    let key = (tensor.dtype, target, count);
+                    let negative_exp = descriptor.transform == Transform::NegativeExp;
+                    let key = (tensor.dtype, target, count, negative_exp);
                     if !self.kernels.contains_key(&key) {
-                        let entry = "import_weight";
+                        let entry = if negative_exp {
+                            "import_weight_negative_exp"
+                        } else {
+                            "import_weight"
+                        };
                         let plan =
                             PlanCompiler::new(&self.device, &self.program, self.settings.clone())
                                 .compile_entry(
@@ -224,10 +229,7 @@ impl Importer {
                     self.kernels
                         .get_mut(&key)
                         .unwrap()
-                        .execute_buffers(
-                            &[input, output.clone()],
-                            &[f64::from(descriptor.transform == Transform::NegativeExp)],
-                        )
+                        .execute_buffers(&[input, output.clone()], &[])
                         .map_err(invalid)?;
                     output
                 };

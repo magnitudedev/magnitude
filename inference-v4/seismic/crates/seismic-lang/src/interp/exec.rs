@@ -2,6 +2,7 @@
 use super::value::{Backing, Flow, Piece, ResultVal, Shaped, Value};
 use super::{round_to, Arg, Interpreter};
 use crate::family::Workload;
+use crate::sir::Mode;
 use crate::sir::{
     Block, Body, CallId, ContractFamily, DefId, DefKind, Definition, Expr, ExprKind, Merge,
     Pattern, Predicate, Region, RegionSource, SliceParent, Stage, Stmt, StmtKind, VarKind,
@@ -9,7 +10,6 @@ use crate::sir::{
 use crate::span::{line_col, Span};
 use crate::sym::Sym;
 use crate::syntax::ast::AssignOp;
-use crate::sir::Mode;
 use crate::types::{DType, Elem};
 use crate::types::{Extent, SliceId, Ty};
 use std::collections::HashMap;
@@ -184,13 +184,30 @@ impl<'a> Interpreter<'a> {
                     scalar(DType::I32, Some(bound), *v)?
                 }
                 (Arg::Range(start, end), Ty::Range(bound)) => {
-                    let bound = bound.eval(&|n| shapes.get(n).copied()).and_then(|n| u64::try_from(n).ok())
+                    let bound = bound
+                        .eval(&|n| shapes.get(n).copied())
+                        .and_then(|n| u64::try_from(n).ok())
                         .ok_or_else(|| format!("unresolved range bound for `{}`", param.name))?;
-                    let mut first = crate::abi::ScalarParameter::plain(format!("{}_start", param.name), DType::I32);
-                    first.range = Some(crate::abi::RangeScalar { parameter: param.name.clone(), endpoint: crate::abi::RangeEndpoint::Start, bound });
-                    let mut last = crate::abi::ScalarParameter::plain(format!("{}_end", param.name), DType::I32);
-                    last.range = Some(crate::abi::RangeScalar { parameter: param.name.clone(), endpoint: crate::abi::RangeEndpoint::End, bound });
-                    crate::abi::ScalarLayout::words(&[first, last])?.encode(&[*start as f64, *end as f64])?;
+                    let mut first = crate::abi::ScalarParameter::plain(
+                        format!("{}_start", param.name),
+                        DType::I32,
+                    );
+                    first.range = Some(crate::abi::RangeScalar {
+                        parameter: param.name.clone(),
+                        endpoint: crate::abi::RangeEndpoint::Start,
+                        bound,
+                    });
+                    let mut last = crate::abi::ScalarParameter::plain(
+                        format!("{}_end", param.name),
+                        DType::I32,
+                    );
+                    last.range = Some(crate::abi::RangeScalar {
+                        parameter: param.name.clone(),
+                        endpoint: crate::abi::RangeEndpoint::End,
+                        bound,
+                    });
+                    crate::abi::ScalarLayout::words(&[first, last])?
+                        .encode(&[*start as f64, *end as f64])?;
                     Value::Range(*start, *end)
                 }
                 _ => {

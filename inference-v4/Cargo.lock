@@ -1115,14 +1115,13 @@ dependencies = [
  "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
+ "seismic-realization",
 ]
 
 [[package]]
 name = "seismic-compiler"
 version = "0.1.0"
 dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
  "magnitude-solver",
  "seismic-lang",
  "seismic-realization",
@@ -1133,6 +1132,7 @@ name = "seismic-cpu"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
+ "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
@@ -1163,6 +1163,8 @@ dependencies = [
  "llguidance",
  "magnitude-templates",
  "seismic-compiler",
+ "seismic-cpu",
+ "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
  "seismic-runtime",
@@ -1197,7 +1199,6 @@ dependencies = [
 name = "seismic-realization"
 version = "0.1.0"
 dependencies = [
- "cranelift-codegen",
  "seismic-lang",
 ]
 

@@ -390,7 +390,11 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
         let row = sequence
             .prepare_completed(proposal.position(), proposal.tokens().len(), |state| {
                 let mut next = state.begin(proposal.tokens().len())?;
-                next.execute(|b| b.following[0].write(&(token as f32).to_le_bytes()).map_err(Into::into))?;
+                next.execute(|b| {
+                    b.following[0]
+                        .write(&(token as f32).to_le_bytes())
+                        .map_err(Into::into)
+                })?;
                 next.commit()?;
                 Ok(Some(TokenId(token)))
             })

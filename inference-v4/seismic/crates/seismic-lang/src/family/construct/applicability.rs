@@ -15,7 +15,7 @@ pub struct Binding {
     pub shapes: BTreeMap<String, i64>,
     pub structural: Vec<(String, SiteId)>,
     /// Shape parameters bound to a runtime-valued semantic extent of the caller.
-    pub dynamic: Vec<String>,
+    pub dynamic: Vec<(String, Sym)>,
     pub elems: BTreeMap<String, Elem>,
 }
 
@@ -65,7 +65,11 @@ pub fn requirements(
             Predicate::NonNegative(e) | Predicate::Zero(e) | Predicate::NonZero(e) => e,
         };
         let params = e.params();
-        if binding.dynamic.iter().any(|name| params.contains(name)) {
+        if binding
+            .dynamic
+            .iter()
+            .any(|(name, _)| params.contains(name))
+        {
             return Err(format!("{RUNTIME}: `{}`", describe(predicate)));
         }
         let bound: Vec<&(String, SiteId)> = binding

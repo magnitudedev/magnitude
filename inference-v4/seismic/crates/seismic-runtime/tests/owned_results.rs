@@ -1,10 +1,10 @@
 use seismic_lang::{
-    program::{SourceFile, compile},
+    program::{compile, SourceFile},
     types::Elem,
 };
 use seismic_runtime::{
-    Device,
     plan::{PlanCompiler, Settings},
+    Device,
 };
 use std::collections::HashMap;
 
@@ -29,7 +29,11 @@ fn cpu_allocates_and_returns_hidden_tuple_destinations() {
     let elements = HashMap::<String, Elem>::new();
     let mut compiler = PlanCompiler::new(&device, &program, Settings::default());
     let mut plan = compiler.compile_entry("pair", &shapes, &elements).unwrap();
-    assert_eq!(compiler.kernel_count(), 1, "compile_entry must eagerly native-compile");
+    assert_eq!(
+        compiler.kernel_count(),
+        1,
+        "compile_entry must eagerly native-compile"
+    );
     let values = [[1.0_f32, 2.0, 3.0, 4.0], [5.0_f32, 6.0, 7.0, 8.0]];
     let inputs = values
         .iter()
