@@ -10,6 +10,14 @@ export const request = (selection: unknown = { kind: "profile", profile: "pr" })
 })
 
 describe("coverage policy", () => {
+  test("API admission rejects unfinished reuse and historical migration", async () => {
+    const base = request({ kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["update"], harnesses: ["pi"] })
+    for (const candidate of [
+      { ...base, mode: "iterate" as const },
+      { ...base, updateFrom: Option.some({ kind: "artifacts" as const, digest: base.input.digest }) },
+    ]) expect(await Effect.runPromise(planRun(candidate).pipe(Effect.either))).toMatchObject({ _tag: "Left", left: { _tag: "InvalidInput", message: expect.stringContaining("not implemented") } })
+    expect((await Effect.runPromise(planRun(base))).targets[0]!.cases.filter(test => test.suite === "update")).toHaveLength(6)
+  })
   test("expands every agreed combination without excluded platforms", () => {
     expect(targets).toHaveLength(44)
     expect(new Set(targets.map(t => t.id)).size).toBe(44)

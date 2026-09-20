@@ -27,6 +27,11 @@ reference when multiple files share a digest. Azure object transport uses a shar
 and a cached, renewable Entra token. Uploads are hash checked before conditional publication;
 downloads bind an observed ETag, enforce length limits and verify the content hash. Redirects
 are disabled, and authentication failures never become missing-object results.
+Namespace input handoff stages the admitted graph locally with digest verification, then sends
+one coordinator-created archive containing only digest-named regular objects and the invocation.
+It does not issue a provider upload command per source file. Native extraction must succeed before
+worker execution; extraction failures retain redacted diagnostics. The worker still verifies input
+objects when consuming them. Candidate-produced archives are not accepted by this handoff.
 Source candidates compile the release-owned CPU base and the selected host's backend pack alongside
 the desktop. CPU targets need no additional pack; Metal and CUDA targets require their matching
 pack. Compilation receipts bind the selected backend and native build identity. Final packaging
@@ -70,8 +75,10 @@ uses its own validated release manifest and separately scoped origin; it cannot 
 origin. Worker acceptance removes ambient development-installation overrides. An app-only input
 retains ordinary released-runtime acquisition and does not qualify unpublished inference changes.
 
-`iterate` may reuse an owner-scoped lease and build cache. `verify` uses clean source, build output
-and consumer state. Neither mode may touch a developer's normal application data. Local execution
+`verify` uses clean source, build output and consumer state. Warm `iterate` reuse and historical
+`updateFrom` migration are not implemented; CLI and planning admission reject these requests
+before uploading inputs or allocating workers. Source-built private update pairs remain supported.
+No execution may touch a developer's normal application data. Local execution
 requires an isolated profile, and privileged install/uninstall is restricted to disposable hosts.
 Desktop launches explicitly distinguish an isolated profile from an installed OS-user context.
 The driver must not silently rewrite profile or endpoint settings: isolated launch configuration

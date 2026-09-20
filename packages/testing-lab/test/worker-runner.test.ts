@@ -14,7 +14,7 @@ import { InfrastructureFailure, LeaseId, RunId, RunRequest } from "../src/domain
 import { InputRegistry, InputRegistryLive } from "../src/inputs"
 import { Fence } from "../src/lease"
 import { LocalMachine, type WorkerTransport } from "../src/machines"
-import { ProcessExecutorLive } from "../src/process"
+import { command, ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import { WorkerRunner } from "../src/scheduler"
 import { sha256 } from "../src/snapshot"
 import { WorkAssignment } from "../src/work-store"
@@ -23,9 +23,10 @@ import { transportWorkerRunner, WorkerTransports } from "../src/worker-runner"
 import { temporaryDatabase } from "./postgres"
 import { WorkerDiagnostic } from "../src/worker-diagnostics"
 
-for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable", "native-exit"] as const) {
+for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable", "native-exit", "unpack-exit"] as const) {
   test(`transported workers reject unauthorized or mismatched results: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
+    const processes = yield* ProcessExecutor
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-runner-" })
     const database = yield* temporaryDatabase
     const objectLayer = fileArtifactStore(join(root, "coordinator-objects"))
@@ -50,7 +51,11 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       yield* inputs.upload(request.owner, sha256(oldBytes), Stream.make(new TextEncoder().encode(oldBytes)))
       yield* inputs.upload(request.owner, sha256(baseline), Stream.make(new TextEncoder().encode(baseline)))
       yield* inputs.register(request.owner, { kind: "artifacts", digest: sha256(baseline) })
-      const plan = yield* planRun(mode === "foreign-owner" ? { ...request, owner: RunRequest.fields.owner.make("someone-else") } : request)
+      // Transport can still consume an already-admitted graph; new admission separately
+      // rejects historical updates while their complete journey is unavailable.
+      const current = { ...request, updateFrom: Option.none() }
+      const admitted = yield* planRun(mode === "foreign-owner" ? { ...current, owner: RunRequest.fields.owner.make("someone-else") } : current)
+      const plan = { ...admitted, request: { ...admitted.request, updateFrom: request.updateFrom } }
       const assignment = WorkAssignment.make({ claim: { runId: RunId.make(`run-${crypto.randomUUID()}`), targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "transport-fixture" },
         plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!, deadline: DateTime.unsafeMake(Date.now() + 60_000) })
       const machine = LocalMachine.make({ provider: "local", root: join(root, "guest"), tags: { schemaVersion: 1, runId: assignment.claim.runId,
@@ -62,6 +67,8 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
           .pipe(Effect.mapError(e => new InfrastructureFailure({ operation: "fixture-upload", message: e.message }))),
         download: (_machine, remote, local) => fs.copyFile(remote, local).pipe(Effect.mapError(e => new InfrastructureFailure({ operation: "fixture-download", message: e.message }))),
         execute: (_machine, _executable, args) => Effect.gen(function* () {
+          if (_executable === "/usr/bin/tar") return mode === "unpack-exit" ? { exitCode: 2, stdout: "", stderr: "input extraction failed" }
+            : yield* command(_executable, args).pipe(Effect.provideService(ProcessExecutor, processes))
           executions++
           const invocation = yield* fs.readFileString(args[0]!).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(WorkerInvocation))))
           expect(invocation.assignment.claim).toEqual(assignment.claim)
@@ -84,10 +91,11 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
         Effect.provide(transportWorkerRunner([{ provider: "local", artifactHost: "darwin-arm64", executable: "fixture", args: [], root: root,
           disposable: mode === "shared-disposable", port: 11279, model: "fixture" }]).pipe(Layer.provide(Layer.succeed(WorkerTransports, { transports: new Map([["local" as const, transport]]) })))))
       expect(result._tag).toBe(mode === "success" ? "Right" : "Left")
-      expect(executions).toBe(["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode) ? 0 : 1)
+      expect(executions).toBe(["foreign-owner", "untrusted-local", "shared-disposable", "unpack-exit"].includes(mode) ? 0 : 1)
       if (["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode)) expect(uploads).toBe(0)
+      else expect(uploads).toBe(1)
       expect(yield* inputs.missing(request.owner, [sha256(evidence)])).toEqual(mode === "success" ? [] : [sha256(evidence)])
-      if (mode === "native-exit") {
+      if (mode === "native-exit" || mode === "unpack-exit") {
         expect(result._tag).toBe("Left")
         if (result._tag !== "Left") throw new Error("Expected native execution failure")
         const items = Option.getOrThrow(result.left.evidence)
@@ -100,7 +108,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
         expect(Buffer.byteLength(wire)).toBe(items[0]!.bytes)
         const diagnostic = yield* Schema.decodeUnknown(Schema.parseJson(WorkerDiagnostic))(wire)
         expect(diagnostic.runId).toBe(assignment.claim.runId)
-        expect(diagnostic.output).toContain("native startup failed")
+        expect(diagnostic.output).toContain(mode === "native-exit" ? "native startup failed" : "input extraction failed")
         expect(diagnostic.output).not.toContain("private-capability")
         expect(diagnostic.output).not.toContain("private-token")
       }

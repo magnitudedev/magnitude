@@ -36,8 +36,8 @@ test("live coordinator admits API inputs, schedules runs and preserves owner iso
       const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "http-coordinator-run", owner: "owner", input,
         selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", trust: "developer", allowSpark: false,
         limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 5, idleMinutes: 1 } })
-      const missingBaseline = yield* client.submit({ ...request, updateFrom: Option.some({ kind: "artifacts", digest: sha256("unregistered baseline") }) }).pipe(Effect.either)
-      expect(missingBaseline._tag === "Left" && missingBaseline.left.status).toBe(403)
+      const unsupportedBaseline = yield* client.submit({ ...request, updateFrom: Option.some({ kind: "artifacts", digest: sha256("unregistered baseline") }) }).pipe(Effect.either)
+      expect(unsupportedBaseline._tag === "Left" && unsupportedBaseline.left.status).toBe(400)
       const accepted = yield* client.submit(request)
       const id = accepted.state.runId
       expect((yield* client.submit(request)).state.runId).toBe(id)

@@ -71,6 +71,8 @@ export const selectedHarnesses = (selection: typeof Selection.Type): readonly Ha
   : Option.getOrElse(selection.harnesses, (): readonly Harness[] => selection.profile === "quick" ? ["pi"] : ["pi", "opencode", "hermes"])
 
 export const planRun = (request: RunRequest) => Effect.gen(function* () {
+  if (request.mode !== "verify") return yield* new InvalidInput({ message: "Warm worker reuse is not implemented; use verify mode" })
+  if (Option.isSome(request.updateFrom)) return yield* new InvalidInput({ message: "Historical release migration is not implemented; omit updateFrom to test a source-built update pair" })
   const selection = request.selection
   if (selection.kind === "profile" && Option.isSome(selection.harnesses) && selection.profile !== "quick") {
     return yield* new InvalidInput({ message: "Harness overrides apply only to quick; use custom selection to narrow other profiles" })

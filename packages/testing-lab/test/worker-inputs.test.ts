@@ -39,7 +39,8 @@ for (const transient of [false, true]) test(`manifest cache coalesces downloads 
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "worker-cache-test", owner: "owner", trust: "developer",
     input: { kind: "artifacts", digest: sha256(manifest) }, updateFrom: { kind: "artifacts", digest: sha256(baseline) }, selection: { kind: "profile", profile: "quick", target: "ubuntu-24.04-x64-cpu-intel" }, mode: "verify", allowSpark: false,
     limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 10, idleMinutes: 15 } })
-  const plan = yield* planRun(request)
+  // Exercise the worker boundary with an already-admitted graph, independently of current admission policy.
+  const plan = { ...yield* planRun({ ...request, updateFrom: Option.none() }), request }
   const invocation = WorkerInvocation.make({ schemaVersion: 1, disposable: true, port: 11279, model: "fixture", assignment: { plan, work: TestWork.make({ kind: "test", id: WorkId.make(`test:${plan.targets[0]!.target.id}`), target: plan.targets[0]!, producer: Option.none() }), input: plan.request.input, target: plan.targets[0]!,
     claim: { runId: RunId.make("run-00000000-0000-0000-0000-000000000001"), targetId: plan.targets[0]!.target.id, workId: WorkId.make(`test:${plan.targets[0]!.target.id}`), fence: Fence.make(1), worker: "fixture" }, deadline: DateTime.unsafeMake(Date.now() + 60000) } })
   let authorized = true, manifestReads = 0, checks = 0, baselineAllowed = true

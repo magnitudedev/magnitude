@@ -43,10 +43,14 @@ test("requires exactly one source or artifact input", async () => {
   }
 })
 
-test("accepts an explicit previous release for both source and artifact candidates", async () => {
+test("rejects unfinished historical migration before snapshotting or uploading inputs", async () => {
   expect((await Effect.runPromise(parseArguments(["status", "--update-from", "old.json"]).pipe(Effect.either)))._tag).toBe("Left")
   for (const input of ["--source", "--artifacts"]) {
-    const parsed = await Effect.runPromise(parseArguments(["run", input, "candidate", "--update-from", "/tmp/old release/release.json"]))
-    expect(parsed.options.get("update-from")).toBe("/tmp/old release/release.json")
+    expect(await Effect.runPromise(parseArguments(["run", input, "candidate", "--update-from", "/tmp/old release/release.json"]).pipe(Effect.either))).toMatchObject({ _tag: "Left", left: { message: expect.stringContaining("not implemented") } })
   }
+})
+
+test("rejects unsupported execution modes before source preparation", async () => {
+  expect((await Effect.runPromise(parseArguments(["run", "--source", ".", "--mode", "verify"]))).options.get("mode")).toBe("verify")
+  for (const mode of ["iterate", "unknown"]) expect(await Effect.runPromise(parseArguments(["run", "--source", ".", "--mode", mode]).pipe(Effect.either))).toMatchObject({ _tag: "Left" })
 })

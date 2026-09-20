@@ -18,7 +18,8 @@ requested backend, all selected harnesses, CLI, recovery, update, uninstall and 
 
 Excluded from this implementation: macOS Intel, Amazon Linux, Vulkan, new SUSE/Arch/Omarchy/Alpine
 packaging and performance benchmarks. `iterate` warm reuse and historical-release migration are
-unfinished; use clean `verify` mode. Private same-source update testing is not production release
+unfinished and now rejected by CLI/planning admission before upload/allocation; use clean `verify`
+mode. These guards await the next coordinator deployment. Private same-source update testing is not production release
 trust or historical migration qualification.
 
 ## Retained evidence
@@ -45,3 +46,10 @@ Linux qualification runs: x64 `run-45350833-4305-4a1a-91fe-d918aed37992` (seven 
 The completed x64 batch retained 625 unique evidence objects (505,640,921 bytes); all were retrieved and verified after cleanup. Azure inventory contains no resources for that run.
 
 Namespace coordinator credential proof: Azure job execution `ml-namespace-auth-proof-mygx5sp` succeeded using image `sha256:14ee56dc39edd3ccb9065513dc6cf43d6e878057711412d21e95a2805c03a451`. The first diagnostic failed because its parser omitted Devbox’s empty-inventory notice; the real provider already handles that notice. Successful authentication is not packaged Mac qualification. Both job executions and their parent job were removed; subsequent job inventory was empty.
+
+The live Mac source handoff exposed a per-object transfer bottleneck: its 6,353 source objects each
+started a Namespace upload command. The corrected runner sends one verified input bundle; a native
+Mac probe extracted and verified all 3,000 test objects from one upload and removed its temporary
+files. Local transport tests cover ownership, extraction failure diagnostics, claims and corrupt
+evidence; the complete lab suite passes 582 tests (14 skipped), and lab typecheck passes. The new
+handoff is not deployed into the active run and still needs full coordinator qualification.

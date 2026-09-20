@@ -32,7 +32,8 @@ for (const mode of ["success", "desktop-evidence", "desktop-evidence-failure", "
     ...(mode === "update-baseline-invalid" ? { updateFrom: { kind: "artifacts", digest: sha256(json) } } : {}),
     input: { kind: "artifacts", digest: sha256(json) }, selection: { kind: "profile", profile: "quick", target: "macos-15-arm64-metal-apple-silicon" },
     mode: "verify", trust: "developer", allowSpark: false, limits: { concurrency: 1, deadlineMinutes: 60, budgetUsd: 100, idleMinutes: 15 } })
-  const plan = yield* planRun(request)
+  // Exercise the worker boundary with an already-admitted graph, independently of current admission policy.
+  const plan = { ...yield* planRun({ ...request, updateFrom: Option.none() }), request }
   const selected = { ...plan.targets[0]!, cases: plan.targets[0]!.cases.filter(c => ["P1", "P2", "P4", "P5", "I1", "I2", "C1"].includes(c.id)) }
   if (mode === "explicit-uninstall") selected.cases.push(allCases.find(test => test.id === "X1")!)
   if (mode.startsWith("update-baseline-")) selected.cases.push(allCases.find(test => test.id === "U1")!)

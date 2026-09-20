@@ -13,6 +13,7 @@ import { sha256 } from "./snapshot"
 import { WorkClaim, validateTargetResult } from "./work-store"
 import { WorkerInvocation, WorkerReply } from "./worker-protocol"
 import { retainWorkerDiagnostic } from "./worker-diagnostics"
+import { checkedCommand, ProcessExecutor } from "./process"
 
 export const GuestRuntime = Schema.Struct({ provider: Provider, artifactHost: Target.fields.artifactHost,
   executable: Schema.NonEmptyString, args: Schema.Array(Schema.String), root: Schema.NonEmptyString,
@@ -26,6 +27,7 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
   const fs = yield* FileSystem.FileSystem
   const inputs = yield* InputRegistry
   const transports = yield* WorkerTransports
+  const processes = yield* ProcessExecutor
   return {
     run: (machine, assignment) => Effect.scoped(Effect.gen(function* () {
       const selected = runtimes.filter(r => r.provider === machine.provider && r.artifactHost === assignment.target.target.artifactHost)
@@ -45,9 +47,17 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
       const owner = assignment.plan.request.owner
       const program = Effect.gen(function* () {
         const store = yield* ArtifactStore
-        const copyInput = (digest: Digest) => Effect.gen(function* () {
-          yield* store.put(digest, yield* inputs.read(owner, digest))
-          yield* transport.upload(machine, join(local, "objects", digest), remotePath.join(directory, "objects", digest))
+        const copyInput = (digest: Digest) => inputs.read(owner, digest).pipe(Effect.flatMap(bytes => store.put(digest, bytes)))
+        const nativeFailure = (message: string, response: { readonly stdout: string; readonly stderr: string }) => Effect.gen(function* () {
+          const diagnostic = yield* Effect.gen(function* () {
+            const item = yield* retainWorkerDiagnostic(machine, "execution", `${message}\nstdout:\n${response.stdout}\nstderr:\n${response.stderr}`)
+            yield* inputs.upload(owner, item.sha256, fs.stream(join(local, "objects", item.sha256)).pipe(
+              Stream.mapError(() => fail("Cannot retain transported worker diagnostics"))))
+            return item
+          }).pipe(Effect.either)
+          return yield* new InfrastructureFailure({ operation: "worker-transport",
+            message: `${message}; ${diagnostic._tag === "Right" ? "execution diagnostics retained in run evidence" : "could not retain execution diagnostics"}`,
+            evidence: diagnostic._tag === "Right" ? Option.some([diagnostic.right]) : Option.none() })
         })
         for (const input of assignmentInputs(assignment)) {
           yield* inputs.require(owner, input)
@@ -64,26 +74,24 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
           const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : [])
             : artifactObjects(manifest).map(a => a.sha256))]
           yield* store.put(input.digest, Stream.make(bytes))
-          yield* transport.upload(machine, join(local, "objects", input.digest), remotePath.join(directory, "objects", input.digest))
           yield* Effect.forEach(digests, copyInput, { concurrency: 4, discard: true })
         }
         const invocation = WorkerInvocation.make({ schemaVersion: 1, assignment, disposable: runtime.disposable, port: runtime.port, model: runtime.model })
         const job = join(local, "invocation.json")
         yield* fs.writeFileString(job, yield* Schema.encode(Schema.parseJson(WorkerInvocation))(invocation), { mode: 0o600 })
         const remoteJob = remotePath.join(directory, "invocation.json")
-        yield* transport.upload(machine, job, remoteJob)
+        // One provider handoff instead of one remote command per source file. Only the
+        // coordinator-created invocation and digest-verified regular objects enter this archive.
+        const archive = join(local, "input.tar.gz")
+        yield* checkedCommand("tar", [...(process.platform === "darwin" ? ["--no-xattrs"] : []), "-czf", archive, "-C", local, "objects", "invocation.json"],
+          { timeoutMs: Math.max(1, deadline - Date.now()), env: { COPYFILE_DISABLE: "1" } }).pipe(Effect.provideService(ProcessExecutor, processes))
+        const remoteArchive = remotePath.join(directory, "input.tar.gz")
+        yield* transport.upload(machine, archive, remoteArchive)
+        const unpacked = yield* transport.execute(machine, assignment.target.target.os === "windows" ? "C:\\Windows\\System32\\tar.exe" : "/usr/bin/tar",
+          ["-xzf", remoteArchive, "-C", directory], Math.max(1, deadline - Date.now()))
+        if (unpacked.exitCode !== 0) return yield* nativeFailure(`Worker input bundle extraction exited ${unpacked.exitCode}`, unpacked)
         const response = yield* transport.execute(machine, runtime.executable, [...runtime.args, remoteJob], Math.max(1, deadline - Date.now()))
-        if (response.exitCode !== 0) {
-          const diagnostic = yield* Effect.gen(function* () {
-            const item = yield* retainWorkerDiagnostic(machine, "execution", `stdout:\n${response.stdout}\nstderr:\n${response.stderr}`)
-            yield* inputs.upload(owner, item.sha256, fs.stream(join(local, "objects", item.sha256)).pipe(
-              Stream.mapError(() => fail("Cannot retain transported worker diagnostics"))))
-            return item
-          }).pipe(Effect.either)
-          return yield* new InfrastructureFailure({ operation: "worker-transport",
-            message: `Guest worker exited ${response.exitCode} without an accepted result; ${diagnostic._tag === "Right" ? "execution diagnostics retained in run evidence" : "could not retain execution diagnostics"}`,
-            evidence: diagnostic._tag === "Right" ? Option.some([diagnostic.right]) : Option.none() })
-        }
+        if (response.exitCode !== 0) return yield* nativeFailure(`Guest worker exited ${response.exitCode} without an accepted result`, response)
         const reply = yield* Schema.decodeUnknown(Schema.parseJson(WorkerReply))(response.stdout)
         if (!Schema.equivalence(WorkClaim)(assignment.claim, reply.claim)) return yield* fail("Guest result belongs to another assignment or attempt")
         yield* validateTargetResult(assignment.target, reply.result)

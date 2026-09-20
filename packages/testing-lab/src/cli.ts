@@ -32,14 +32,14 @@ const help = `Magnitude testing lab
   bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-trace.zip
   bun lab cancel --run run-<uuid>
 
-Use --update-from old/release-manifest.json to supply the previous installed version for update tests.
+Source update tests build a private version pair; historical release migration is not available.
 Use --artifacts instead of --source to verify packages beside a release manifest.
 Run uploads dirty tracked files and nonignored new files without a commit or push.
 LAB_URL and LAB_TOKEN select the authenticated coordinator. Token identity determines
 ownership and trust. GitHub jobs use LAB_AUTH=github and LAB_OIDC_AUDIENCE instead
 of LAB_TOKEN, with id-token: write permission. Developers can use LAB_AUTH=entra with
 LAB_ENTRA_TENANT and LAB_ENTRA_APPLICATION after Azure CLI login and lab API consent.
-Identity tokens renew during long runs. --mode iterate|verify defaults to verify. --no-wait submits and
+Identity tokens renew during long runs. --mode verify uses clean workers. --no-wait submits and
 returns the run ID. --allow-spark is explicit consent to use the shared office Spark.
 Results exit 0 only when every selected case passed and cleanup completed.
 --suite replaces profile selection and requires explicit comma-separated --target values.
@@ -65,6 +65,8 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
     options.set(name, value)
   }
   if (options.has("update-from") && command !== "run") return yield* new InvalidInput({ message: "--update-from is only valid for run" })
+  if (options.has("update-from")) return yield* new InvalidInput({ message: "Historical release migration is not implemented; omit --update-from to test a source-built update pair" })
+  if (options.has("mode") && options.get("mode") !== "verify") return yield* new InvalidInput({ message: "Only --mode verify is implemented; warm worker reuse is unavailable" })
   if ((options.has("digest") || options.has("output")) && command !== "evidence") return yield* new InvalidInput({ message: "--digest and --output are only valid for evidence" })
   if (command === "run" && options.has("source") === options.has("artifacts")) return yield* new InvalidInput({ message: "Specify exactly one of --source or --artifacts" })
   if ((options.has("json") || options.has("junit")) && (!["run", "wait", "results"].includes(command) || options.has("no-wait"))) return yield* new InvalidInput({ message: "Reports require run, wait or results without --no-wait" })
@@ -156,29 +158,24 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
       kind: "source" as const, digest: snapshot.digest, json: manifestJson(snapshot.manifest),
       digests: [...new Set(snapshot.manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : []))],
     })))
-  const baseline = options.has("update-from") ? Option.some(yield* snapshotArtifacts(options.get("update-from")!, objects)) : Option.none()
   return yield* remote(Effect.gen(function* () {
     const client = yield* LabClient
     const identity = yield* client.identity()
     const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: crypto.randomUUID(), ...identity,
-      input: { kind: prepared.kind, digest: prepared.digest }, ...(Option.isSome(baseline) ? { updateFrom: { kind: "artifacts", digest: baseline.value.digest } } : {}), selection: yield* Schema.encode(Selection)(selection),
+      input: { kind: prepared.kind, digest: prepared.digest }, selection: yield* Schema.encode(Selection)(selection),
       mode: options.get("mode") ?? "verify", allowSpark: options.has("allow-spark"),
       limits: { concurrency: Number(options.get("concurrency") ?? 1), deadlineMinutes: Number(options.get("deadline") ?? 60), budgetUsd: Number(options.get("budget") ?? 25), idleMinutes: 15 },
     })
     const plan = yield* client.plan(request)
     yield* Console.error(`Planned ${plan.targets.length} targets; reserved estimate $${plan.estimatedComputeUsd}; ${prepared.kind} ${prepared.digest}`)
     if (plan.estimatedComputeUsd > request.limits.budgetUsd) return yield* new InvalidInput({ message: "Plan exceeds --budget; no input uploaded or run submitted" })
-    const digests = [...new Set([...prepared.digests, ...Option.toArray(baseline).flatMap(value => value.digests)])]
+    const digests = [...new Set(prepared.digests)]
     const missing: Digest[] = []
     for (let start = 0; start < digests.length; start += 1000) missing.push(...yield* client.missing(digests.slice(start, start + 1000)))
     yield* Console.error(`Uploading ${missing.length} changed objects; ${digests.length - missing.length} already available`)
     yield* Effect.forEach(missing, digest => client.upload(digest, fs.stream(join(objects, digest)).pipe(Stream.mapError(() => new InfrastructureFailure({ operation: "input-upload", message: "Cannot read input object" })))), { concurrency: 4, discard: true })
     yield* client.upload(prepared.digest, Stream.make(new TextEncoder().encode(prepared.json)))
     yield* client.registerInput(request.input)
-    if (Option.isSome(baseline)) {
-      yield* client.upload(baseline.value.digest, Stream.make(new TextEncoder().encode(baseline.value.json)))
-      yield* client.registerInput({ kind: "artifacts", digest: baseline.value.digest })
-    }
     const run = yield* client.submit(request)
     yield* print(RunRecord, run)
     if (options.has("no-wait")) return

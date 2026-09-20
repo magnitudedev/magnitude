@@ -76,9 +76,8 @@ Replace `--source .` with `--artifacts /absolute/path/release-manifest.json`. Ar
 exist beside the manifest. Their bytes are verified and uploaded; this does not rebuild them.
 
 Source update testing builds a private same-source version pair and uses the real updater. This
-does not establish historical release migration or production signing trust. `--update-from`
-admits an explicit previous package graph, but its complete historical updater journey remains
-unfinished. Do not treat that option as verified release compatibility.
+does not establish historical release migration or production signing trust. Historical migration
+is unfinished: `--update-from` is rejected before input upload or resource allocation.
 
 ## Reconnect, inspect or cancel
 
@@ -110,6 +109,6 @@ with explicit targets selects a custom subset. `release` requires trusted final 
 production trust checks. Listing a target with `bun lab targets` does not mean its machine image,
 driver or entire suite is qualified. Avoid `full` until the remaining provider setup is complete.
 
-`verify` uses clean workers. `iterate` is accepted by the protocol, but warm worker/cache reuse is
-not implemented yet. Use `verify` for dependable current behavior. The shared office Spark always
+`verify` uses clean workers. Warm worker/cache reuse is unfinished: `iterate` is rejected before
+input upload or resource allocation. The shared office Spark always
 requires explicit `--allow-spark`; leave it out of normal development runs.
