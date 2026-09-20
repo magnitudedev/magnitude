@@ -66,7 +66,11 @@ export const harnessSuite = (harness: Harness, model: string, root: string, home
   const tools = Effect.gen(function* () {
     const first = yield* initial
     const read = harness === "hermes" ? "read_file" : "read", edit = harness === "hermes" ? "patch" : "edit"
-    const turn = yield* prompt(`Use the ${read} tool to read message.txt, then use the ${edit} tool to replace before with after. Do not change any other file. Reply after the edit.`, Option.some(first.sessionId))
+    const file = join(fixture.directory, "message.txt")
+    const quotedFile = yield* Schema.encode(Schema.parseJson(Schema.String))(file)
+    const replacement = harness === "pi" ? 'oldText="before", newText="after"'
+      : harness === "opencode" ? 'oldString="before", newString="after"' : 'old_string="before", new_string="after"'
+    const turn = yield* prompt(`The existing fixture file is ${quotedFile}. Use the ${read} tool to read that absolute path, then execute the ${edit} tool on the same path with ${replacement}. Line numbers and JSON fields displayed by the read tool are metadata, not file contents; do not include them in the replacement. Preserve the final newline. Do not change any other file. You must execute the tools, not describe the steps. Reply DONE only after the edit succeeds.`, Option.some(first.sessionId))
     if (!turn.tools.includes(read) || !turn.tools.includes(edit)) return yield* fail(`${harness} omitted the required read/edit tools`)
     yield* fixture.verify
     return turn

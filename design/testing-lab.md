@@ -366,8 +366,10 @@ suites resume. The baseline records settings and model file hashes before replac
 must launch a new ready application/service owner at the admitted candidate version without a test
 launch command; a new owner at the old version is recovery from a failed installation, not success.
 Native package-database observation transfers cleanup ownership only within the same installation
-paths and target. The DEB payload check compares extracted admitted files with installed bytes and
-symlinks independently of the updater's own hash check. Post-update generation requires retained
+paths and target. DEB payload checks compare extracted admitted files; RPM checks compare the
+admitted package's SHA-256 file inventory. Both compare installed bytes and symlinks independently
+of the updater's own hash check. Native RPM integrity checks do not establish publisher trust.
+Post-update generation requires retained
 settings and the original model hashes before loading again. Both release versions share one
 scoped runtime origin so an automatically relaunched app can acquire its own admitted runtime.
 An unresolved native handoff forbids further package mutation; disposable allocation cleanup remains

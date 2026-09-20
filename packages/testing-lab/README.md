@@ -1,5 +1,8 @@
 # Magnitude testing lab
 
+Start with [the developer and CI usage guide](USAGE.md) for commands, suite meanings and current
+limitations. This document contains detailed implementation and qualification evidence.
+
 This package is under active implementation. The coordinator protocol, persistence, source
 transport, provider allocation adapters and initial functional drivers exist. The Azure-hosted
 coordinator's HTTPS API has been verified with Entra authentication and private PostgreSQL.
@@ -30,9 +33,16 @@ U1–U5: baseline generation, native replacement and automatic relaunch, exact i
 retained settings/models and generation, and corrupt-update rejection. U6 exposed a fault-fixture
 bug: the fixture rejected the downloader's one-byte probe before any payload transfer. The fixture
 now permits the probe and interrupts the payload; its native HTTP regression passes. Linux login
-registration/removal helpers also passed their native fixtures. The combined clean-source run now
-selects all 66 cases across nine suites and all three harnesses; its result is still pending.
-Other platforms and the complete GitHub workflow remain unqualified.
+registration/removal helpers also passed their native fixtures. The combined clean-source flow
+selects all 66 cases across nine suites and all three harnesses.
+The first combined run has now finished: **63 passed, 3 failed, 0 blocked, cleanup succeeded**.
+All packaging, installation, app, endpoint, recovery, CLI, update and uninstall cases passed.
+The failures were OpenCode/Hermes file-tool instructions and OpenCode's rendered terminal marker:
+OpenCode declined file access, Hermes wrote a displayed line-number prefix, and the terminal model
+copied a numeric marker incorrectly. Fixture requests now specify the absolute path and literal
+replacement arguments; terminal markers use familiar word concatenation. Tool success, exact
+file contents, native interruption and recovery assertions remain unchanged. These clarifications
+still require a complete native rerun. Other platforms and the complete GitHub workflow remain unqualified.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
@@ -1065,3 +1075,9 @@ real `ar` fixtures; full P5 qualification awaits the combined Ubuntu run.
 Debian documents the [binary package container](https://manpages.debian.org/unstable/dpkg-dev/deb.5.en.html)
 and [embedded signature verification](https://manpages.debian.org/testing/debsig-verify/debsig-verify.1.en.html)
 separately from [repository signing](https://www.debian.org/doc/manuals/debian-reference/ch02).
+
+RPM package and update payload verification is implemented, with native RPM 4.18.2 query and
+digest checks exercised against a disposable fixture on the Ubuntu builder. It compares the
+admitted archive and installed file inventory without evaluating query output. This is not yet
+a qualified Fedora/Red Hat application installation or update; production publisher trust still
+requires a configured signing policy.

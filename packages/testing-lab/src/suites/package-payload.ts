@@ -7,7 +7,7 @@ import { InstalledApplication } from "../installer"
 import { checkedCommand } from "../process"
 
 const fail = (message: string) => new AssertionFailure({ message })
-const hashFile = (path: string) => Effect.gen(function* () {
+export const hashFile = (path: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const hash = createHash("sha256")
   yield* fs.stream(path).pipe(Stream.runForEach(bytes => Effect.sync(() => { hash.update(bytes) })))

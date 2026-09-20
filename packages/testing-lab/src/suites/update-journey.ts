@@ -18,6 +18,7 @@ import { EndpointTests, endpointTests, Generation } from "./endpoint"
 import { inspectPackageIdentity, PackageIdentity } from "./package"
 import { observeUpdatedInstallation } from "./update-installation"
 import { PackagePayload, verifyDebPayload } from "./package-payload"
+import { verifyRpmPayload } from "./rpm-package-trust"
 import { UpdateBaseline, verifyUpdateBaseline } from "./update"
 
 const fail = (message: string) => new AssertionFailure({ message })
@@ -119,7 +120,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   const payload = Effect.gen(function* () {
     const driver = yield* session.driver
     yield* record("updated-package", PackageIdentity, yield* inspectPackageIdentity(app, yield* driver.host(), environment))
-    yield* record("updated-payload", PackagePayload, yield* verifyDebPayload(app))
+    yield* record("updated-payload", PackagePayload, yield* (config.target.packageFormat === "rpm" ? verifyRpmPayload(app) : verifyDebPayload(app)))
   })
   const continuation = Effect.gen(function* () {
     const driver = yield* session.driver

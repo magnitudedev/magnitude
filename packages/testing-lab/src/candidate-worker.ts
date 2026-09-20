@@ -59,6 +59,7 @@ import { WorkAssignment, TargetResult } from "./work-store"
 import { prepareUpdateConsumer } from "./update-consumer"
 import { prepareUpdatePair, UpdatePair } from "./update-pair"
 import { updateJourney } from "./suites/update-journey"
+import { inspectRpmPackageTrust, RpmPackageTrust } from "./suites/rpm-package-trust"
 import { UpdateBaseline, verifyUpdateBaseline } from "./suites/update"
 
 export const CandidateWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
@@ -317,6 +318,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             return CaseObservation.make({ detail: "Verified exact installed DEB payload and admitted runtime archives; package is unsigned development output, no publisher trust claimed",
               evidence: [yield* inputEvidence, yield* evidence("P5-debian-package-trust.json", DebianPackageTrust, receipt)] })
           }
+          if (target.packageFormat === "rpm") {
+            const receipt = yield* inspectRpmPackageTrust(yield* installed, release, production).pipe(Effect.provide(NodeArchiveExtractor))
+            return CaseObservation.make({ detail: "Verified installed RPM payload, native package integrity and admitted runtime archives; no production publisher trust claimed",
+              evidence: [yield* inputEvidence, yield* evidence("P5-rpm-package-trust.json", RpmPackageTrust, receipt)] })
+          }
           if (target.os !== "macos" && target.os !== "windows") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
           if (target.os === "windows") {
             const policy = yield* windowsTrustPolicy(production, config.environment)
@@ -480,15 +486,16 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             return yield* unavailable("Terminal tests require qualified harness tools, a TerminalDriver and an absolute LAB_TERMINAL_NODE_EXECUTABLE")
           }
           const home = application.harnessHome, prepared = yield* candidateEnvironment
-          const first = crypto.randomUUID().replaceAll("-", "").slice(0, 8), second = crypto.randomUUID().replaceAll("-", "").slice(0, 8)
           const terminalConfig = { executable: yield* tools.value.executable(harness), runtime,
             cwd: config.root, evidence: join(evidenceDirectory, "harness", harness, "terminal"), model: config.model, initialModel: config.model,
             environment: { ...prepared, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), HERMES_HOME: join(home, ".hermes"),
               XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
               XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
               PATH: `${dirname(runtime)}${target.os === "windows" ? ";" : ":"}${prepared.PATH ?? ""}` },
-            interrupt: { prompt: `First concatenate READY and ${first} without a space and print that word. Then count from 1 to 10000, one number per line. Do not use tools.`, expected: `READY${first}` },
-            recovery: { prompt: `Concatenate DONE and ${second} without a space. Reply only with the resulting word. Do not use tools.`, expected: `DONE${second}` },
+            // The completed marker must be absent from echoed input. Familiar words avoid
+            // turning terminal qualification into an arbitrary numeric-copying test.
+            interrupt: { prompt: "First concatenate SUN and FLOWER without a space and print that uppercase word. Then count from 1 to 10000, one number per line. Do not use tools.", expected: "SUNFLOWER" },
+            recovery: { prompt: "Concatenate RAIN and BOW without a space. Reply only with the resulting uppercase word. Do not use tools.", expected: "RAINBOW" },
           }
           const cleanup = (message: string) => { cleanupErrors.push(`${harness} terminal: ${message}`) }
           const journey = harness === "hermes" ? hermesTerminal({ ...terminalConfig, endpoint: `http://127.0.0.1:${application.port}/inference/v1` }, cleanup)
