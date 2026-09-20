@@ -121,8 +121,8 @@ test("release refuses expiration when ownership changes during shutdown", async 
   expect(commands).not.toContain("expire")
 })
 
-for (const matches of [true, false]) test(`preparation only receives the verified owned guest: image match ${matches}`, async () => {
-  const allocation = lease()
+for (const role of ["build", "test"] as const) for (const matches of [true, false]) test(`preparation receives the verified ${role} guest: image match ${matches}`, async () => {
+  const allocation = new Allocating({ ...lease(), workId: WorkId.make(`${role}:${target.id}`) })
   let prepared = 0
   const executor = Layer.succeed(ProcessExecutor, { run: (command: CommandSpec) => Effect.sync(() => {
     if (command.args[0] === "list") return output(JSON.stringify([box(allocation)]))
@@ -130,9 +130,10 @@ for (const matches of [true, false]) test(`preparation only receives the verifie
     throw new Error("Existing owned guest must not be allocated again")
   }) })
   const result = await Effect.runPromise(Effect.flatMap(MachineAllocator, allocator => allocator.ensure(allocation, target)).pipe(
-    Effect.provide(namespaceAllocator("devbox", [image], (machine, locked) => Effect.sync(() => {
+    Effect.provide(namespaceAllocator("devbox", [image], (machine, locked, workKind) => Effect.sync(() => {
       expect(machine.tags.leaseId).toBe(allocation.leaseId)
       expect(locked).toEqual(image)
+      expect(workKind).toBe(allocation.workId.startsWith("build:") ? "build" : "test")
       prepared++
     })).pipe(Layer.provide(executor))), Effect.either))
   expect(result._tag).toBe(matches ? "Right" : "Left")

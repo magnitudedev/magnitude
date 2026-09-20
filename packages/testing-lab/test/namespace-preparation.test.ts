@@ -9,8 +9,8 @@ import { ProcessExecutor, type CommandSpec } from "../src/process"
 import { NamespacePreparation, prepareNamespaceMachine } from "../src/providers/namespace-preparation"
 import { sha256 } from "../src/snapshot"
 
-for (const mode of ["ready", "failed", "changed-script", "expired"] as const) {
-  test(`Mac preparation ${mode} preserves identity, private delivery and failure evidence`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const workKind of ["build", "test"] as const) for (const mode of ["ready", "failed", "changed-script", "expired"] as const) {
+  test(`Mac ${workKind} preparation ${mode} preserves identity, private delivery and failure evidence`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const directory = yield* fs.makeTempDirectoryScoped({ prefix: "lab-mac-preparation-test-" })
     const setup = "#!/bin/bash\nexit 0\n"
@@ -39,10 +39,12 @@ for (const mode of ["ready", "failed", "changed-script", "expired"] as const) {
       return { exitCode: 0, stdout: "ready", stderr: "" }
     }).pipe(Effect.orDie) })
     yield* Effect.gen(function* () {
-      const result = yield* prepareNamespaceMachine("devbox", recipe, machine, image).pipe(Effect.provide(executor), Effect.either)
+      const result = yield* prepareNamespaceMachine("devbox", recipe, machine, image, workKind).pipe(Effect.provide(executor), Effect.either)
       expect(result._tag).toBe(mode === "ready" ? "Right" : "Left")
       if (mode === "changed-script" || mode === "expired") { expect(commands).toHaveLength(0); return }
       expect(delivered).toContain("secret-signature")
+      const deliveredConfig = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ workKind: Schema.Literal("build", "test") })))(delivered)
+      expect(deliveredConfig.workKind).toBe(workKind)
       expect(commands.some(c => c.args.includes("/bin/rm") && c.args.some(a=>a.endsWith("/config.json")))).toBe(true)
       if (result._tag === "Left") {
         expect(result.left.evidence._tag).toBe("Some")

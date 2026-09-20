@@ -36,3 +36,9 @@ test("PE graph rejects another root, omitted or duplicate contexts and nonlocal 
     expect((await Effect.runPromise(decodePeGraph(json(value), root.Filepath).pipe(Effect.either)))._tag).toBe("Left")
   }
 })
+
+test("PE imports include Windows driver modules such as the print spooler", async () => {
+  const observed = await Effect.runPromise(decodePeImports(json({ Imports: [{ Name: "WINSPOOL.DRV", NumberOfEntries: 1,
+    ImportList: [{ ...symbol, Name: "OpenPrinterW", ModuleName: "WINSPOOL.DRV", DelayImport: true }] }] })))
+  expect(observed).toEqual([{ name: "winspool.drv", linkage: "delay" }])
+})

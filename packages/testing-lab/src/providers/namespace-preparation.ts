@@ -19,20 +19,20 @@ export type NamespacePreparation = typeof NamespacePreparation.Type
 const fail = (message: string) => new InfrastructureFailure({ operation: "namespace-preparation", message })
 
 /** Only the trusted runtime's read capability crosses this boundary, never provider credentials. */
-export const prepareNamespaceMachine = (executable: string, recipe: NamespacePreparation, machine: typeof NamespaceMachine.Type, image: NamespaceImage) => Effect.scoped(Effect.gen(function* () {
+export const prepareNamespaceMachine = (executable: string, recipe: NamespacePreparation, machine: typeof NamespaceMachine.Type, image: NamespaceImage, workKind: "build" | "test") => Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const bytes = yield* fs.readFile(recipe.setup.file)
   if (bytes.byteLength > 64 * 1024 || sha256(bytes) !== recipe.setup.sha256) return yield* fail("Mac preparation script differs from its pin")
   const identity = sha256(yield* Schema.encode(Schema.parseJson(Schema.Struct({ recipe: NamespacePreparation,
-    productVersion: Schema.String, buildVersion: Schema.String })) )({ recipe, productVersion: image.productVersion, buildVersion: image.buildVersion }))
+    productVersion: Schema.String, buildVersion: Schema.String, workKind: Schema.Literal("build", "test") })) )({ recipe, workKind, productVersion: image.productVersion, buildVersion: image.buildVersion }))
   const remaining = DateTime.toEpochMillis(machine.tags.expiresAt) - Date.now()
   if (remaining <= 0) return yield* fail("Mac preparation lease has expired")
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: "lab-mac-preparation-" })
   const remote = `/Users/runner/.magnitude-lab-prepare/${machine.tags.leaseId}`
   const runtime = yield* azureRuntimeDownload(recipe.runtime, { executable: recipe.azureExecutable, subscription: recipe.subscription })
   const config = yield* Schema.encode(Schema.parseJson(Schema.Struct({ identity: Digest, productVersion: Schema.String, buildVersion: Schema.String,
-    bunVersion: Schema.String, runtime: InitializationDownload, node: InitializationDownload, rustup: InitializationDownload, tirith: InitializationDownload })))({
-    identity, productVersion: image.productVersion, buildVersion: image.buildVersion, bunVersion: packageManager.replace(/^bun@/, ""),
+    workKind: Schema.Literal("build", "test"), bunVersion: Schema.String, runtime: InitializationDownload, node: InitializationDownload, rustup: InitializationDownload, tirith: InitializationDownload })))({
+    identity, workKind, productVersion: image.productVersion, buildVersion: image.buildVersion, bunVersion: packageManager.replace(/^bun@/, ""),
     runtime, node: recipe.node, rustup: recipe.rustup, tirith: recipe.tirith,
   })
   yield* fs.writeFile(`${directory}/setup.sh`, bytes, { mode: 0o600 })

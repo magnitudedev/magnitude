@@ -12,7 +12,7 @@ const Image = Schema.Struct({ name: Schema.String, created_at: Schema.String })
 const marker = "magnitude-lab/v1 "
 const failed = (message: string) => new InfrastructureFailure({ operation: "namespace", message })
 export const namespaceAllocator = <R = never>(executable: string, images: ReadonlyArray<NamespaceImage>,
-  prepare?: (machine: typeof NamespaceMachine.Type, image: NamespaceImage) => Effect.Effect<void, InfrastructureFailure, R>) => Layer.effect(MachineAllocator, Effect.gen(function* () {
+  prepare?: (machine: typeof NamespaceMachine.Type, image: NamespaceImage, workKind: "build" | "test") => Effect.Effect<void, InfrastructureFailure, R>) => Layer.effect(MachineAllocator, Effect.gen(function* () {
   const executor = yield* ProcessExecutor
   const preparationContext = yield* Effect.context<R>()
   const checked = (...args: Parameters<typeof checkedCommand>) => checkedCommand(...args).pipe(Effect.provideService(ProcessExecutor, executor))
@@ -55,7 +55,7 @@ export const namespaceAllocator = <R = never>(executable: string, images: Readon
       if (!Schema.equivalence(MachineTags)(machine.tags, tags)) return yield* failed("Namespace resource name belongs to another lease")
       const probe = yield* checked(executable, ["exec", machine.name, "--", "/usr/bin/sw_vers"], { timeoutMs: 120_000 })
       if (!probe.stdout.includes(`ProductVersion:\t\t${image.productVersion}`) || !probe.stdout.includes(`BuildVersion:\t\t${image.buildVersion}`)) return yield* failed("Namespace guest OS does not match the qualified image lock")
-      if (prepare) yield* prepare(machine, image).pipe(Effect.provide(preparationContext))
+      if (prepare) yield* prepare(machine, image, lease.workId.startsWith("build:") ? "build" : "test").pipe(Effect.provide(preparationContext))
       return machine
     }),
     release: machine => Effect.gen(function* () {

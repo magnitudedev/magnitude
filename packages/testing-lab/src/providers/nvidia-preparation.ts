@@ -35,12 +35,17 @@ try {
 `
   return String.raw`set -eu
 python3 - <<'LAB_GPU'
-import base64,hashlib,json,os,pathlib,platform,subprocess,tempfile,urllib.request
+import base64,hashlib,json,os,pathlib,platform,re,subprocess,tempfile,urllib.request
 config=json.loads(base64.b64decode('${encoded}'))
 if os.geteuid()!=0 or platform.machine()!='x86_64':raise SystemExit('GPU preparation requires Linux x64 root')
 class NoRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,*args,**kwargs):return None
 opener=urllib.request.build_opener(NoRedirect)
+def file_digest(path):
+ digest=hashlib.sha256()
+ with path.open('rb') as source:
+  for chunk in iter(lambda:source.read(1024*1024),b''):digest.update(chunk)
+ return digest.hexdigest()
 with tempfile.TemporaryDirectory(prefix='magnitude-nvidia-') as root:
  installer=pathlib.Path(root)/'driver.run'
  digest=hashlib.sha256();total=0
@@ -50,6 +55,14 @@ with tempfile.TemporaryDirectory(prefix='magnitude-nvidia-') as root:
    if total>config['download']['bytes']:raise SystemExit('GPU driver exceeds pinned length')
    digest.update(chunk);output.write(chunk)
  if total!=config['download']['bytes'] or digest.hexdigest()!=config['download']['sha256']:raise SystemExit('GPU driver integrity mismatch')
+ payload=pathlib.Path(root)/'payload'
+ subprocess.run(['/bin/sh',str(installer),'--extract-only','--target',str(payload)],check=True)
+ origins=set()
+ for candidate in payload.rglob('libcuda.so.'+config['version']):
+  if candidate.is_symlink() or not candidate.is_file():continue
+  with candidate.open('rb') as source:header=source.read(20)
+  if header[:6]==b'\x7fELF\x02\x01' and int.from_bytes(header[18:20],'little')==62:origins.add(file_digest(candidate))
+ if len(origins)!=1:raise SystemExit('Pinned installer has no unique x64 CUDA driver payload')
  kernel=platform.release()
  # Headers must match the running image kernel, not the repository's newest kernel.
  subprocess.run(['apt-get','install','-y','build-essential','linux-headers-'+kernel],check=True,env={**os.environ,'DEBIAN_FRONTEND':'noninteractive','NEEDRESTART_MODE':'l'})
@@ -57,6 +70,23 @@ with tempfile.TemporaryDirectory(prefix='magnitude-nvidia-') as root:
  if config['model']=='rtx-pro-6000':args+=['-M','open']
  subprocess.run(args,check=True)
  subprocess.run(['modprobe','nvidia'],check=True)
+ subprocess.run(['ldconfig'],check=True)
+ listing=subprocess.check_output(['ldconfig','-p'],text=True)
+ paths={pathlib.Path(line.split('=>',1)[1].strip()).resolve() for line in listing.splitlines()
+  if re.match(r'\s*libcuda\.so\.1 \([^)]*x86-64[^)]*\) => /',line)}
+ if len(paths)!=1:raise SystemExit('Installed CUDA driver has no unique native loader resolution')
+ library=next(iter(paths)); stat=library.stat()
+ if not re.match(r'^/(?:usr/)?lib(?:64)?/',str(library)) or not library.is_file() or stat.st_uid!=0 or stat.st_mode&0o022:raise SystemExit('Unsafe installed CUDA driver path')
+ library_digest=file_digest(library)
+ if library_digest not in origins:raise SystemExit('Installed CUDA driver differs from the pinned payload')
+ directory=pathlib.Path('/var/lib/magnitude-lab-driver');directory.mkdir(mode=0o755,exist_ok=True)
+ if directory.resolve()!=directory or directory.stat().st_uid!=0 or directory.stat().st_mode&0o022:raise SystemExit('Unsafe driver receipt directory')
+ directory.chmod(0o755)
+ receipt={'schemaVersion':1,'model':config['model'],'version':config['version'],'installerSha256':config['download']['sha256'],
+  'path':str(library),'sha256':library_digest,'bytes':stat.st_size}
+ descriptor=os.open(directory/'receipt.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
+ os.fchmod(descriptor,0o444)
+ with os.fdopen(descriptor,'w') as output:json.dump(receipt,output)
 LAB_GPU
 `
 }).pipe(Effect.mapError(() => new InfrastructureFailure({ operation: "nvidia-preparation", message: "Cannot encode the pinned GPU driver recipe" })))

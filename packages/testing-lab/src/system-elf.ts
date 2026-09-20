@@ -5,6 +5,7 @@ import { AssertionFailure, InfrastructureFailure } from "./domain"
 import { SystemElf, SystemElfResolver } from "./elf-dependency-closure"
 import { inspectNativeImage } from "./native-image"
 import { command, ProcessExecutor } from "./process"
+import { verifyNvidiaDriverReceipt } from "./nvidia-driver-receipt"
 
 export const LoaderCacheEntry = Schema.Struct({ name: Schema.NonEmptyString, abi: Schema.NonEmptyString, path: Schema.NonEmptyString })
 const fail = (message: string) => new AssertionFailure({ message: `System ELF resolution: ${message}` })
@@ -57,7 +58,11 @@ export const systemElfResolver = (manager: "deb" | "rpm", allowedNames: readonly
     if (image.format !== "elf" || !image.architectures.includes(arch)) return yield* fail(`resolved library has wrong architecture: ${name}`)
     const owner = yield* run(manager === "deb" ? "/usr/bin/dpkg-query" : "/usr/bin/rpm", manager === "deb"
       ? ["--search", path] : ["-qf", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n", path])
-    if (owner.exitCode !== 0) return yield* fail(`resolved library is not owned by an installed package: ${path}`)
+    if (owner.exitCode !== 0) {
+      if (name === "libcuda.so.1" && arch === "x64") return SystemElf.make({ path,
+        provenance: yield* verifyNvidiaDriverReceipt(path).pipe(Effect.provideService(FileSystem.FileSystem, fs)) })
+      return yield* fail(`resolved library is not owned by an installed package: ${path}`)
+    }
     let packageName: string
     if (manager === "deb") {
       const suffix = `: ${path}`
@@ -71,7 +76,7 @@ export const systemElfResolver = (manager: "deb" | "rpm", allowedNames: readonly
       packageName = owner.stdout.trim()
       if (!/^[A-Za-z0-9][A-Za-z0-9+._~-]*$/.test(packageName)) return yield* fail(`ambiguous package owner for ${path}`)
     }
-    return SystemElf.make({ path, package: packageName })
+    return SystemElf.make({ path, provenance: { kind: "package", name: packageName } })
   }).pipe(Effect.mapError(error => error._tag === "AssertionFailure" || error._tag === "InfrastructureFailure" ? error
     : new InfrastructureFailure({ operation: "system-elf", message: error.message }))) } satisfies SystemElfResolver
 }))

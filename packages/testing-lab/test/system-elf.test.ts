@@ -43,7 +43,7 @@ for (const mode of ["arm-aliases", "deb", "rpm", "ambiguous", "ambient", "escape
     const result = yield* Effect.flatMap(SystemElfResolver, service => service.resolve(library, mode === "arm-aliases" ? "arm64" : "x64")).pipe(
       Effect.provide(systemElfResolver(mode === "rpm" ? "rpm" : "deb", mode === "disallowed" ? [] : [library]).pipe(Layer.provide(services))), Effect.either)
     expect(result._tag).toBe(mode === "deb" || mode === "rpm" || mode === "arm-aliases" ? "Right" : "Left")
-    if (result._tag === "Right") expect(result.right).toEqual({ path, package: mode === "rpm" ? "glibc-2.39-1.x86_64" : "libc6:amd64" })
+    if (result._tag === "Right") expect(result.right).toEqual({ path, provenance: { kind: "package", name: mode === "rpm" ? "glibc-2.39-1.x86_64" : "libc6:amd64" } })
     if (["ambiguous", "ambient", "escape", "wrong-arch", "disallowed"].includes(mode)) expect(packageQueries).toBe(0)
   })).pipe(Effect.provide(BunContext.layer))))
 }

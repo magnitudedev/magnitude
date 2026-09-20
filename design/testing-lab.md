@@ -237,8 +237,10 @@ Native readiness requires completed cloud-init and the lab setup's final complet
 Fatal cloud-init errors or a missing receipt fail admission. Recoverable platform warnings are
 retained in detailed status and cannot substitute for the lab's successful completion receipt.
 Namespace Mac preparation verifies the locked guest image and interactive user before installing
-the trusted runtime and pinned harness dependencies. Before candidate delivery, preparation must
-prove that Finder accepts automation used by the real installer layout. On a qualified image with
+the trusted runtime and pinned harness dependencies. Preparation binds the admitted build/test
+role into its receipt. Only a package producer must prove, before candidate delivery, that Finder
+accepts automation used by the real installer layout. Clean package consumers do not request
+Finder automation; native installation and app UI checks still run unchanged. On a qualified image with
 existing accessibility authorization, it may approve only the management worker’s exact Finder
 permission dialog through the normal UI. It cannot edit privacy databases, approve unrelated
 prompts or skip packaging checks. The consent observer and probe have bounded lifetimes.
@@ -374,11 +376,15 @@ Origin-relative paths must remain inside the package; empty, ambient and unquali
 fail. Search expansion alone cannot qualify resolved dependencies or system-library availability.
 ELF traversal tracks inherited search context per object, verifies owned files and target
 architecture, and records external dependencies only through an explicit system resolver that
-verifies loader resolution and package ownership. A pathname dependency cannot fall back to an
+verifies loader resolution and installation provenance. A pathname dependency cannot fall back to an
 OS basename lookup when its owned file is missing. Fixture resolvers do not qualify native hosts.
 System resolution admits explicitly allowed names only, requires a unique architecture-matching
 loader-cache resolution, checks canonical OS-directory ownership and ELF architecture, and records
-the installed DEB/RPM owner. Multiple cache paths may qualify only when all resolve to the same
+the installed DEB/RPM owner. An unpackaged x64 CUDA driver may instead carry a root-owned
+receipt that binds its canonical path and current bytes to the exact driver payload extracted
+from the administrator-pinned NVIDIA installer. The receipt must match the trusted runtime’s
+installer version and digest; this exception applies only to `libcuda.so.1` on CUDA targets.
+Other unowned system libraries fail. Multiple cache paths may qualify only when all resolve to the same
 canonical OS file. Distinct cache files or hardware-capability choices block rather than
 guessing loader precedence. Package ownership alone does not prove symbol-version compatibility.
 Version requirements are matched by exact ABI identity against the resolved provider’s version

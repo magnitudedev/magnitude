@@ -3,13 +3,13 @@ import { win32 } from "node:path"
 import { AssertionFailure } from "./domain"
 import { checkedCommand } from "./process"
 
-const dllName = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9_.-]+\.dll$/i))
-const ImportSymbol = Schema.Struct({ Name: Schema.NullOr(Schema.String), ModuleName: dllName,
+const moduleName = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9_.-]+\.(dll|drv)$/i))
+const ImportSymbol = Schema.Struct({ Name: Schema.NullOr(Schema.String), ModuleName: moduleName,
   ImportByOrdinal: Schema.Boolean, Ordinal: Schema.Int, DelayImport: Schema.Boolean })
-const ImportReport = Schema.Struct({ Imports: Schema.Array(Schema.Struct({ Name: dllName,
+const ImportReport = Schema.Struct({ Imports: Schema.Array(Schema.Struct({ Name: moduleName,
   NumberOfEntries: Schema.Int, ImportList: Schema.Array(ImportSymbol) })) })
-export const PeImport = Schema.Struct({ name: dllName, linkage: Schema.Literal("required", "delay") })
-const PeResolution = Schema.Struct({ ModuleName: dllName, Filepath: Schema.NullOr(Schema.NonEmptyString), SearchStrategy: Schema.Int })
+export const PeImport = Schema.Struct({ name: moduleName, linkage: Schema.Literal("required", "delay") })
+const PeResolution = Schema.Struct({ ModuleName: moduleName, Filepath: Schema.NullOr(Schema.NonEmptyString), SearchStrategy: Schema.Int })
 const PeModule = Schema.Struct({ Filepath: Schema.NonEmptyString, Imports: ImportReport.fields.Imports,
   Dependencies: Schema.Array(PeResolution) })
 export type PeModule = typeof PeModule.Type

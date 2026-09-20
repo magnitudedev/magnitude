@@ -62,7 +62,7 @@ export const configuredCoordinator = Effect.gen(function* () {
   if (Option.isSome(config.namespace)) {
     const namespace = config.namespace.value
     allocators.set("namespace", Context.get(yield* Layer.build(namespaceAllocator(namespace.executable, namespace.images,
-      (machine, image) => prepareNamespaceMachine(namespace.executable, namespace.preparation, machine, image).pipe(Effect.provide(storage)))), MachineAllocator))
+      (machine, image, workKind) => prepareNamespaceMachine(namespace.executable, namespace.preparation, machine, image, workKind).pipe(Effect.provide(storage)))), MachineAllocator))
     transports.set("namespace", Context.get(yield* Layer.build(namespaceTransport(namespace.executable)), WorkerTransport))
   }
   if (Option.isSome(config.azure)) allocators.set("azure", Context.get(yield* Layer.build(azureAllocator(config.azure.value.allocation).pipe(Layer.provide(storage))), MachineAllocator))

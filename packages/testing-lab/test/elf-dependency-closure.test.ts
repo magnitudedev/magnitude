@@ -35,14 +35,14 @@ test("ELF graph requires transitive owned libraries and records verified system 
     } }),
     Layer.succeed(SystemElfResolver, { resolve: name => {
       seen.push(name)
-      return name === "libc.so.6" ? Effect.succeed({ path: "/usr/lib/x86_64-linux-gnu/libc.so.6", package: "libc6:amd64" })
+      return name === "libc.so.6" ? Effect.succeed({ path: "/usr/lib/x86_64-linux-gnu/libc.so.6", provenance: { kind: "package" as const, name: "libc6:amd64" } })
         : Effect.fail(new AssertionFailure({ message: `No OS package supplies ${name}` }))
     } }),
   ]))
   const result = yield* graph
   expect(result.files).toHaveLength(3)
   expect(seen).toEqual(["libc.so.6"])
-  expect(result.edges.at(-1)?.resolution).toEqual({ kind: "system", library: { path: "/usr/lib/x86_64-linux-gnu/libc.so.6", package: "libc6:amd64" } })
+  expect(result.edges.at(-1)?.resolution).toEqual({ kind: "system", library: { path: "/usr/lib/x86_64-linux-gnu/libc.so.6", provenance: { kind: "package" as const, name: "libc6:amd64" } } })
   abi = "matching"
   expect((yield* graph).files).toHaveLength(3)
   abi = "missing"

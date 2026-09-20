@@ -5,12 +5,15 @@ import { Architecture, AssertionFailure, InfrastructureFailure } from "./domain"
 import { elfSearch } from "./elf-search"
 import { inspectNativeDependencies } from "./native-dependencies"
 import { attestElfVersions, inspectElfVersions } from "./elf-versions"
+import { NvidiaDriverProvenance } from "./nvidia-driver-receipt"
 
-export const SystemElf = Schema.Struct({ path: Schema.NonEmptyString, package: Schema.NonEmptyString })
+export const SystemElf = Schema.Struct({ path: Schema.NonEmptyString, provenance: Schema.Union(
+  Schema.Struct({ kind: Schema.Literal("package"), name: Schema.NonEmptyString }), NvidiaDriverProvenance,
+) })
 export interface SystemElfResolver {
   readonly resolve: (name: string, arch: typeof Architecture.Type) => Effect.Effect<typeof SystemElf.Type, AssertionFailure | InfrastructureFailure>
 }
-// A provider must verify native loader resolution and OS package ownership. No fallback
+// A provider must verify native loader resolution and installation provenance. No fallback
 // to a builder's arbitrary filesystem or unverified library-name allowlist is supplied.
 export const SystemElfResolver = Context.GenericTag<SystemElfResolver>("@magnitudedev/testing-lab/SystemElfResolver")
 export const ElfDependencyClosure = Schema.Struct({ root: Schema.String, files: Schema.Array(Schema.String),
