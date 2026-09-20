@@ -1,5 +1,6 @@
-# Linux x64 and arm64 installer wheels. Hermes dependencies come from its pinned uv.lock.
+# Linux x64/arm64 and macOS arm64 wheels. Hermes dependencies use its pinned uv.lock.
 uv==0.11.28 \
     --hash=sha256:49fe42df9f42056037473f3876adec1615709b57d3470ed39178ff420f3afb9f \
     --hash=sha256:041e4b80bebc58d7142ac9394370cacd73185fd8d066d6675d14707d83408f6d \
-    --hash=sha256:fab3c31007a611866475824a666f5a721bf0c9335db806355a97fcfba2a6bbb7
+    --hash=sha256:fab3c31007a611866475824a666f5a721bf0c9335db806355a97fcfba2a6bbb7 \
+    --hash=sha256:e9eb317b1cdb249887df77ac232d8a9448f26858b2399f9f2949c6a7b9bedf88

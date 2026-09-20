@@ -120,3 +120,21 @@ test("release refuses expiration when ownership changes during shutdown", async 
   expect(result._tag).toBe("Left")
   expect(commands).not.toContain("expire")
 })
+
+for (const matches of [true, false]) test(`preparation only receives the verified owned guest: image match ${matches}`, async () => {
+  const allocation = lease()
+  let prepared = 0
+  const executor = Layer.succeed(ProcessExecutor, { run: (command: CommandSpec) => Effect.sync(() => {
+    if (command.args[0] === "list") return output(JSON.stringify([box(allocation)]))
+    if (command.args[0] === "exec") return output(`ProductVersion:\t\t${matches ? image.productVersion : "wrong"}\nBuildVersion:\t\t${image.buildVersion}\n`)
+    throw new Error("Existing owned guest must not be allocated again")
+  }) })
+  const result = await Effect.runPromise(Effect.flatMap(MachineAllocator, allocator => allocator.ensure(allocation, target)).pipe(
+    Effect.provide(namespaceAllocator("devbox", [image], (machine, locked) => Effect.sync(() => {
+      expect(machine.tags.leaseId).toBe(allocation.leaseId)
+      expect(locked).toEqual(image)
+      prepared++
+    })).pipe(Layer.provide(executor))), Effect.either))
+  expect(result._tag).toBe(matches ? "Right" : "Left")
+  expect(prepared).toBe(matches ? 1 : 0)
+})

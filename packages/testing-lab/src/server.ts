@@ -12,6 +12,7 @@ import { MachineAllocator, WorkerTransport } from "./machines"
 import { ProcessExecutorLive } from "./process"
 import { azureArtifactStore, AzureArtifactConfig } from "./providers/azure-artifacts"
 import { namespaceAllocator, NamespaceImage, namespaceTransport } from "./providers/namespace"
+import { NamespacePreparation, prepareNamespaceMachine } from "./providers/namespace-preparation"
 import { assertRuntime } from "./runtime"
 import { MachineProviders, WorkerRunner } from "./scheduler"
 import { GuestRuntime, transportWorkerRunner, WorkerTransports } from "./worker-runner"
@@ -26,7 +27,7 @@ export const ServerConfig = Schema.Struct({ coordinator: CoordinatorConfig,
   hostname: Schema.Literal("127.0.0.1", "::1", "0.0.0.0"), port: Schema.Int.pipe(Schema.between(0, 65535)),
   credentials: Schema.Array(Schema.Struct({ tokenEnvironment: Schema.String.pipe(Schema.pattern(/^[A-Z][A-Z0-9_]*$/)), principal: Principal })),
   storage: Schema.Union(Schema.Struct({ kind: Schema.Literal("file"), directory: Schema.NonEmptyString }), Schema.Struct({ kind: Schema.Literal("azure"), config: AzureArtifactConfig })),
-  namespace: Schema.optionalWith(Schema.Struct({ executable: Schema.NonEmptyString, images: Schema.NonEmptyArray(NamespaceImage) }), { as: "Option", exact: true }),
+  namespace: Schema.optionalWith(Schema.Struct({ executable: Schema.NonEmptyString, images: Schema.NonEmptyArray(NamespaceImage), preparation: NamespacePreparation }), { as: "Option", exact: true }),
   azure: Schema.optionalWith(Schema.Struct({ allocation: AzureConfig, workerOrigin: Schema.NonEmptyString }), { as: "Option", exact: true }),
   entra: Schema.optionalWith(EntraAuthConfig, { as: "Option", exact: true }),
   github: Schema.optionalWith(GitHubAuthConfig, { as: "Option", exact: true }),
@@ -60,7 +61,8 @@ export const configuredCoordinator = Effect.gen(function* () {
   const allocators = new Map<typeof Provider.Type, MachineAllocator>(), transports = new Map<typeof Provider.Type, WorkerTransport>()
   if (Option.isSome(config.namespace)) {
     const namespace = config.namespace.value
-    allocators.set("namespace", Context.get(yield* Layer.build(namespaceAllocator(namespace.executable, namespace.images)), MachineAllocator))
+    allocators.set("namespace", Context.get(yield* Layer.build(namespaceAllocator(namespace.executable, namespace.images,
+      (machine, image) => prepareNamespaceMachine(namespace.executable, namespace.preparation, machine, image).pipe(Effect.provide(storage)))), MachineAllocator))
     transports.set("namespace", Context.get(yield* Layer.build(namespaceTransport(namespace.executable)), WorkerTransport))
   }
   if (Option.isSome(config.azure)) allocators.set("azure", Context.get(yield* Layer.build(azureAllocator(config.azure.value.allocation).pipe(Layer.provide(storage))), MachineAllocator))

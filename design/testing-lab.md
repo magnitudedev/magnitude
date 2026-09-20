@@ -223,6 +223,12 @@ capability renewal does not alter the pinned preparation identity or grant provi
 Native readiness requires completed cloud-init and the lab setup's final completion receipt.
 Fatal cloud-init errors or a missing receipt fail admission. Recoverable platform warnings are
 retained in detailed status and cannot substitute for the lab's successful completion receipt.
+Namespace Mac preparation verifies the locked guest image and interactive user before installing
+the trusted runtime and pinned harness dependencies. A root-owned receipt binds the preparation
+recipe; reconciliation verifies that receipt and the live desktop without reinstalling tooling.
+Incomplete preparation requires a fresh worker. Provider credentials stay on the coordinator;
+only a bounded read capability for the pinned runtime enters the guest and is removed after use.
+Native dependency failures retain diagnostic evidence before ordinary lease cleanup.
 Windows preparation separates pinned tooling, trusted runtime dependencies, and the admitted
 user's desktop. Runtime readiness binds the runtime digest, native distribution/architecture and
 user SID. One-shot login credentials are removed at logon before a desktop receipt is published;

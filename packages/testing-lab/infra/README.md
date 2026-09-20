@@ -142,7 +142,7 @@ never a shell argument or Git file. PostgreSQL backup retention is seven days.
 
 Bundle `src/server.ts` with the repository-pinned Bun using `bun build --target=bun`. Place the
 result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh`, `linux-worker.sh`,
-`windows-tools.ps1`, `windows-runtime.ps1` and `windows-desktop.ps1` in a private build context.
+`macos-worker.sh`, `windows-tools.ps1`, `windows-runtime.ps1` and `windows-desktop.ps1` in a private build context.
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
@@ -227,3 +227,19 @@ catalog reads succeed through its explicit credential file. The current CLI reje
 revocable-token credentials for Devbox operations; those diagnostic tokens were revoked. Do not
 substitute `devbox auth check` for a real API check: it reports the local user login, even when
 `NSC_TOKEN_FILE` is configured for another credential.
+
+
+Namespace configuration requires a `preparation` recipe alongside `executable` and the image
+locks. Pin the SHA-256 of `/opt/lab/macos-worker.sh`, the trusted Azure runtime blob, and the
+Node, Rustup and macOS Tirith downloads. `azureExecutable` and `subscription` identify the
+coordinator's existing blob-read authority. Allocation verifies the locked guest version and
+build before preparation; no test source or run credential is sent until readiness succeeds.
+
+The script requires the locked image's `/opt/homebrew/bin/python3`, Xcode, CMake, a non-root
+`runner` account with passwordless sudo, and that same user's active console desktop. It installs
+under `/Users/runner/lab-runtime`; the transport runtime executable is
+`/Users/runner/lab-runtime/worker` with no fixed arguments. Use a separate per-attempt transfer
+root, such as `/Users/runner/lab-work`, and `artifactHost: darwin-arm64`.
+The root-owned readiness receipt binds the preparation recipe. An incomplete installation fails
+and the owned worker is released rather than reused. Preparation failure logs are retained in
+the normal run evidence before cleanup.
