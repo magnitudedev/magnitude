@@ -9,6 +9,7 @@ import type { ChildProcess } from "node:child_process"
 import { join } from "node:path"
 import { desktopEnvironment, DesktopEnvironment } from "./desktop-environment"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
+import { MacLoginRegistration } from "./login-registration"
 
 export const DesktopLaunch = Schema.Struct({ ...DesktopEnvironment.fields, executable: Schema.String, evidence: Schema.String })
 export type DesktopLaunch = typeof DesktopLaunch.Type
@@ -17,6 +18,7 @@ export interface DesktopDriver {
   readonly updates: DesktopUpdates
   readonly verifyLoginStartup: (enabled: boolean) => Effect.Effect<void, AssertionFailure>
   readonly loginStartup: (enabled: boolean) => Effect.Effect<void, AssertionFailure>
+  readonly macLoginRegistration: () => Effect.Effect<MacLoginRegistration, AssertionFailure>
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
   readonly identity: () => Effect.Effect<ApplicationIdentity, AssertionFailure>
   readonly host: () => Effect.Effect<string, AssertionFailure>
@@ -139,6 +141,11 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     updates,
     verifyLoginStartup: enabled => verifyLoginStartup(page, navigate("settings"), enabled),
     loginStartup: enabled => setLoginStartup(page, navigate("settings"), enabled),
+    macLoginRegistration: () => action("Inspect native macOS login registration", () => app.evaluate(({ app }) => {
+      if (process.platform !== "darwin") throw new Error("SMAppService requires macOS")
+      return { executable: process.execPath, status: app.getLoginItemSettings({ type: "mainAppService" }).status, packaged: app.isPackaged }
+    })).pipe(Effect.flatMap(Schema.decodeUnknown(MacLoginRegistration)),
+      Effect.mapError(error => new AssertionFailure({ message: error._tag === "AssertionFailure" ? error.message : "Installed app has no enabled native macOS login registration" }))),
     downloads,
     // Finalize diagnostics before native replacement retires the Playwright connection.
     // The caller separately observes the replacement owner; this proves only the old process exit.

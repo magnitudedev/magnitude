@@ -1070,11 +1070,20 @@ prevents further package mutation. This implementation is deployed for Ubuntu qu
 the clean build completed and the native consumer still under test. No completed U1–U6 pass is
 claimed yet. Payload comparison currently requires DEB; Windows updater control is not connected.
 
-The Linux removal journey enables the real installed-user login entry before capturing app/service
-process identities. It verifies that the process tree exits and the entry is absent or dormant after
-uninstall, then checks the retained preference without toggling it on reinstall. A TryExec guard
-preserves the opt-in while preventing launch of an absent application. These lifecycle changes have
-local test coverage and await the next native cloud run.
+The removal journey enables the real installed-user login entry before capturing app/service
+process identities. Linux `/proc`, macOS `libproc`, and Windows CIM record process creation
+identity and descendants. Verification detects surviving orphans and distinguishes reused PIDs.
+A native Mac fixture has exercised live, orphaned, exited and mismatched-creation-time cases.
+A native Windows Server fixture also passed descendant capture, orphan detection, PID reuse,
+exit verification, registry round-trip/removal and invalid registry-type rejection. This is
+mechanism validation; it does not qualify Windows 10/11 application behavior.
+
+Linux verifies the XDG entry is absent or unchanged and dormant behind TryExec. Windows verifies
+the named user Run entry is absent or unchanged with its executable removed. macOS records enabled
+SMAppService status directly from the running packaged application and verifies its exact bundle
+is absent afterward. That proves it cannot launch, without claiming Apple's database record was
+deleted. Reinstall checks the retained preference without toggling it. Complete Mac/Windows app
+removal qualification remains pending; these changes are not in the active v12 cloud runtime.
 
 ### Debian development package integrity
 

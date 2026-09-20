@@ -531,11 +531,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "X1": {
           const app = yield* installed
           if (loginRemovalSelected) {
-            if (application.mode !== "installed-user" || target.os === "windows" || target.os === "macos") return yield* unavailable("Login/process removal currently requires a qualified installed Linux guest")
+            if (application.mode !== "installed-user") return yield* unavailable("Login/process removal requires a qualified installed desktop user")
             const driver = yield* desktop
             yield* driver.ready()
             yield* driver.loginStartup(true)
-            removalLogin = Option.some(yield* captureRemovalLogin(environment))
+            removalLogin = Option.some(yield* captureRemovalLogin(environment, target.os === "macos" ? Option.some(yield* driver.macLoginRegistration()) : Option.none()))
             removalProcesses = Option.some(yield* captureRemovalProcesses(yield* driver.identity()))
           }
           if (retentionSelected) yield* retainedProfile

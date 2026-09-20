@@ -21,7 +21,7 @@ for (const mode of ["valid", "wrong-initial-version", "wrong-reopened-version", 
       const event = (name: string) => Effect.sync(() => { events.push(`${cycle}:${name}`) })
       return {
         downloads: { begin: () => Effect.die("Unused"), transferring: () => Effect.die("Unused"), failed: () => Effect.die("Unused"), complete: () => Effect.die("Unused"), absent: () => Effect.die("Unused") },
-    verifyLoginStartup: () => Effect.void, loginStartup: () => Effect.void, updates: { action: unused, wait: unused, automatic: enabled => { expect(enabled).toBe(false); return event("manual") } },
+    macLoginRegistration: () => Effect.die("Unused"), verifyLoginStartup: () => Effect.void, loginStartup: () => Effect.void, updates: { action: unused, wait: unused, automatic: enabled => { expect(enabled).toBe(false); return event("manual") } },
         ready: () => event("ready"),
         host: () => Effect.succeed((mode === "wrong-initial-version" && cycle === 1) || (mode === "wrong-reopened-version" && cycle === 2) ? "9.9.9" : "0.1.3"),
         identity: () => Effect.sync(() => Schema.decodeUnknownSync(ApplicationIdentity)({

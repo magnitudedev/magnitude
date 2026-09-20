@@ -234,6 +234,14 @@ Installed-package ownership follows explicit present/absent transitions. Removal
 ownership only after the native uninstaller succeeds; reinstall acquires new ownership.
 Final cleanup removes only the currently owned installation. Dangling package launcher
 symlinks count as removal failures even when their targets no longer exist.
+Removal records the live application/service descendants with native process creation identity.
+Verification checks those same instances after exit, including children orphaned by their parent;
+PID reuse cannot count as a leak. Native inspection errors cannot count as absence. Login removal
+first enables the installed user's real entry. Linux and Windows must then show an absent entry
+or the unchanged command with its executable absent. macOS first records enabled native
+SMAppService status from the packaged application, then requires that exact bundle and executable
+to be absent; this establishes inability to launch, not deletion of Apple's opaque registration.
+Reinstallation checks the saved login preference without silently re-enabling it.
 Fixture replacement serializes removal and installation under the same ownership gate.
 Failed removal retains the previous owner; failed replacement installation leaves no owned
 installation and retains the requested package for an explicit subsequent attempt. Cancellation
