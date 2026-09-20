@@ -505,6 +505,12 @@ required selected case passed and cleanup completed. Tests must demonstrate corr
 source fidelity, cancellation, stale-worker fencing, allocation ambiguity recovery, backend mismatch
 rejection and exact package consumption. Execution on one target never qualifies another.
 
+Linux desktop workers use the distribution's supported display server. A Wayland-only guest starts
+a private compositor and requires an actual logical monitor before launching the worker. Its
+session environment reaches the application and updater children; software composition of the
+test display does not change the selected inference backend. Display processes and sockets are
+released on failure and normal exit, with bounded failure diagnostics retained.
+
 Linux coverage is limited to Ubuntu, Debian, Fedora and Red Hat using existing DEB/RPM artifacts.
 SUSE, Arch, Omarchy and Alpine packaging are future work. Provider credits and quotas do not confer
 Windows licensing, signing identities or GPU availability; these are independently observed gates.

@@ -12,6 +12,7 @@ export const LinuxDistribution = Schema.Union(
   Schema.Struct({ os: Schema.Literal("ubuntu"), version: Schema.Literal("24.04") }),
   Schema.Struct({ os: Schema.Literal("debian"), version: Schema.Literal("13") }),
   Schema.Struct({ os: Schema.Literal("fedora"), version: Schema.Literal("44") }),
+  Schema.Struct({ os: Schema.Literal("redhat"), version: Schema.Literal("10") }),
 )
 export const LinuxInitialization = Schema.Struct({ distribution: LinuxDistribution, adminUsername: Schema.String.pipe(Schema.pattern(/^[a-z][a-z0-9]{1,19}$/)),
   architecture: Schema.Literal("x64", "arm64"), runtime: InitializationDownload, node: InitializationDownload, rustup: InitializationDownload })

@@ -1,17 +1,19 @@
 # Azure worker preparation
 
-These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13 and Fedora 44 CPU
+These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13, Fedora 44 and Red Hat 10 CPU
 workers for the existing outward worker protocol. A successful deployment is not proof of
-a completed app test. Debian/Fedora preparation is implemented but awaits native qualification.
-Windows image preparation, GPU driver setup and RHEL preparation remain separate work.
+a completed app test. Debian/Fedora/Red Hat preparation is implemented but awaits complete native app qualification.
+Windows image preparation and GPU driver setup remain separate work.
 Windows delivery now supports an already prepared interactive desktop user: its configured
 runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
 Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,
 and removes the system-owned launcher and scoped credential. It does not create a login
 session or install build dependencies. The launcher has native Windows Server validation;
 Windows 10/11 app coverage is not established by that diagnostic. RHEL 10
-requires a Wayland/Xwayland session because [Red Hat removed the X.Org server](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.0_release_notes/removed-features);
-it must not inherit this Xvfb recipe.
+uses a private headless GNOME Wayland session because [Red Hat removed the X.Org server](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.0_release_notes/removed-features);
+the worker waits for a logical monitor before starting. Its compositor and sockets are removed on
+exit. Bounded compositor logs accompany failed execution. Electron inherits `XDG_SESSION_TYPE=wayland`;
+no inference backend override is applied. See [Electron’s native Wayland behavior](https://www.electronjs.org/blog/tech-talk-wayland).
 
 Use subscription `5304c4b3-d605-4193-b0cb-766c065acfa6` and resource group `magnitude-ci`
 explicitly; the Azure CLI's default subscription may be different.
@@ -57,7 +59,8 @@ archive length and SHA-256; the renderer rejects HTTP, URL user credentials and 
 ```
 
 Use `distribution: { "os": "debian", "version": "13" }` for Debian or
-`distribution: { "os": "fedora", "version": "44" }` for Fedora. The allocator rejects a
+`distribution: { "os": "fedora", "version": "44" }` for Fedora, or
+`distribution: { "os": "redhat", "version": "10" }` for Red Hat (including its 10.x minor versions). The allocator rejects a
 recipe/target mismatch before allocating; the guest rejects an image/recipe mismatch before
 installing dependencies. Existing Ubuntu recipes must be migrated from `kind: "ubuntu"` to
 `kind: "linux"` with an explicit distribution when deploying this version. Do not change a
@@ -76,6 +79,13 @@ and [Openbox](https://packages.fedoraproject.org/pkgs/openbox/openbox/). The pin
 release requires Python below 3.14, so Fedora uses its parallel
 [Python 3.13 package](https://packages.fedoraproject.org/pkgs/python3.13/python3.13/); the OS Python is unchanged.
 
+The Red Hat x64 image pin `RedHat:RHEL:10_2-gen2:10.2.2026080415` is available in West US 2,
+uses generation 2, and has no marketplace purchase plan. A disposable native probe installed
+the recipe's packages, created a GNOME Wayland logical monitor, mapped a real GTK window,
+and verified display socket cleanup. A deliberate worker exit 17 preserved that exit and left
+no compositor process or private socket directory. This proves the desktop mechanism, not packaged-app
+or inference qualification. Red Hat's recipe omits the removed X11 screensaver library.
+
 The verified Fedora imports are gallery `magnitude_lab`, definitions `fedora44-x64` and
 `fedora44-arm64`, version `44.1.7`, in `magnitude-ci`. Both are replicated in West US 2.
 These are persistent base images, not qualified application workers. Tag persistent image
@@ -86,9 +96,9 @@ resources with `lab-owner=magnitude-testing-lab-images-v1`. The marker
 Node must be a matching Linux tar.xz distribution with Node 24 or newer. Rustup must be a
 matching native executable from a versioned release. The setup installs the repository's
 pinned Bun and Rust toolchain, frozen lab dependencies, locked Pi/OpenCode clients, build
-dependencies, and an Xvfb/Openbox/D-Bus desktop session. It verifies that the outward worker
-imports successfully. This is an X11 automation environment; it does not establish Wayland
-or physical-display qualification.
+dependencies and a private desktop session: Xvfb/Openbox/D-Bus on Ubuntu, Debian and Fedora;
+GNOME/Wayland/D-Bus on Red Hat 10. It verifies that the outward worker imports successfully.
+Neither virtual desktop establishes physical-display qualification.
 
 ```sh
 bun packages/testing-lab/scripts/prepare-linux-worker.ts \

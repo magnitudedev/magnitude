@@ -52,7 +52,7 @@ export const localAllocator = (directory: string) => Layer.effect(MachineAllocat
 export const localTransport = Layer.effect(WorkerTransport, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executor = yield* ProcessExecutor
-  const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  const environment = Object.fromEntries(["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const verify = (machine: typeof LocalMachine.Type) => Effect.gen(function* () {
     if ((yield* fs.realPath(machine.root)) !== resolve(machine.root)) return yield* failed("Local worker root was replaced")
     const tags = yield* fs.readFileString(join(machine.root, marker)).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(MachineTags))))

@@ -6,7 +6,10 @@ umask 077
 python3 - "$ID" "$VERSION_ID" <<'CHECK'
 import json,pathlib,sys
 expected=json.loads(pathlib.Path('/etc/magnitude-lab-initialization.json').read_text())['distribution']
-if [expected['os'],expected['version']] != sys.argv[1:]:raise SystemExit('Initialization distribution mismatch')
+actual_os={'rhel':'redhat'}.get(sys.argv[1],sys.argv[1])
+actual_version=sys.argv[2]
+version_matches=actual_version==expected['version'] or (expected['os']=='redhat' and actual_version.startswith(expected['version']+'.'))
+if expected['os']!=actual_os or not version_matches:raise SystemExit('Initialization distribution mismatch')
 CHECK
 case "$ID:$VERSION_ID" in
   ubuntu:24.04|debian:13)
@@ -14,10 +17,15 @@ case "$ID:$VERSION_ID" in
     # Restarting the Azure agent while its readiness command runs can sever observation.
     export NEEDRESTART_MODE=l
     apt-get update -qq
-    apt-get install -y -qq sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
+    apt-get install -y -qq sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils lsof nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
     ;;
   fedora:44)
-    dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
+    dnf -y install sudo curl-minimal ca-certificates python3 python3-pip python3.13 python3.13-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config fakeroot dpkg rpm-build binutils lsof nftables polkit xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 openbox gtk3 nss alsa-lib mesa-libgbm libXScrnSaver libXtst libffi-devel
+    ;;
+  rhel:10|rhel:10.*)
+    # RHEL consumers install RPMs built on the canonical Ubuntu producer. They do
+    # not need an additional repository just to install Debian packaging tools.
+    dnf -y install sudo curl ca-certificates python3 python3-pip python3-devel git xz tar gcc gcc-c++ make cmake clang-devel openssl-devel pkgconf-pkg-config rpm-build binutils lsof nftables polkit dbus-daemon gnome-shell gtk3 nss alsa-lib mesa-libgbm mesa-dri-drivers libXtst libffi-devel python3-gobject-base
     ;;
   *) printf '%s\n' 'Unsupported Linux worker distribution' >&2; exit 1 ;;
 esac
@@ -121,6 +129,7 @@ test "$(tirith --version)" = "tirith $LAB_TIRITH_VERSION"
 bun -e 'await import("./packages/testing-lab/src/outward-worker.ts")'
 '''],cwd=workspace,check=True)
 # The root provisioning process remains private; package-building children need standard modes.
+display_command='exec dbus-run-session -- /bin/bash /opt/magnitude-lab-wayland-worker' if config['distribution']['os']=='redhat' else 'exec xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- /bin/bash /opt/magnitude-lab-display-worker'
 launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 022',
  'export PATH='+shlex.quote(path),
  'export CARGO_HOME='+shlex.quote(str(home/'.cargo')),
@@ -130,7 +139,7 @@ launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 022',
  'export LAB_OPENCODE_EXECUTABLE='+shlex.quote(str(home/'.local/bin/opencode')),
  'export LAB_HERMES_EXECUTABLE='+shlex.quote(str(home/'.local/bin/hermes')),
  'cd '+shlex.quote(str(workspace)),
- 'exec xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- /bin/bash /opt/magnitude-lab-display-worker',''])
+ display_command,''])
 pathlib.Path('/opt/magnitude-lab-worker').write_text(launcher)
 os.chmod('/opt/magnitude-lab-worker',0o755)
 receipt=pathlib.Path('/var/lib/magnitude-lab')
@@ -149,5 +158,49 @@ trap 'kill "$window_manager" 2>/dev/null || true; wait "$window_manager" 2>/dev/
 bun packages/testing-lab/src/outward-worker.ts
 SCRIPT
 chmod 0755 /opt/magnitude-lab-display-worker
+cat > /opt/magnitude-lab-wayland-worker <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$(mktemp -d /tmp/magnitude-lab-wayland.XXXXXXXX)
+chmod 0700 "$XDG_RUNTIME_DIR"
+export XDG_SESSION_TYPE=wayland
+export WAYLAND_DISPLAY=wayland-lab
+unset DISPLAY
+compositor=''
+cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ -f "$XDG_RUNTIME_DIR/compositor.log" ]; then
+    tail -c 16384 "$XDG_RUNTIME_DIR/compositor.log" >&2
+  fi
+  if [ -n "$compositor" ]; then
+    kill "$compositor" 2>/dev/null || true
+    wait "$compositor" 2>/dev/null || true
+  fi
+  rm -rf -- "$XDG_RUNTIME_DIR"
+}
+trap cleanup EXIT
+# Software composition affects the test display, not the inference backend.
+LIBGL_ALWAYS_SOFTWARE=1 gnome-shell --wayland --headless --virtual-monitor 1600x1000 --wayland-display "$WAYLAND_DISPLAY" >"$XDG_RUNTIME_DIR/compositor.log" 2>&1 &
+compositor=$!
+export LAB_COMPOSITOR_PID="$compositor"
+python3 - <<'READY'
+import os,pathlib,time
+from gi.repository import Gio
+deadline=time.monotonic()+60
+socket=pathlib.Path(os.environ['XDG_RUNTIME_DIR'])/os.environ['WAYLAND_DISPLAY']
+while time.monotonic()<deadline:
+ os.kill(int(os.environ['LAB_COMPOSITOR_PID']),0)
+ try:
+  bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+  state=bus.call_sync('org.gnome.Mutter.DisplayConfig','/org/gnome/Mutter/DisplayConfig','org.gnome.Mutter.DisplayConfig','GetCurrentState',None,None,Gio.DBusCallFlags.NONE,1000,None).unpack()
+  if socket.is_socket() and len(state[2])>0:break
+ except Exception:pass
+ time.sleep(0.25)
+else:raise SystemExit('Wayland compositor did not publish a logical monitor')
+READY
+bun packages/testing-lab/src/outward-worker.ts
+SCRIPT
+chmod 0755 /opt/magnitude-lab-wayland-worker
 rm /etc/magnitude-lab-initialization.json
 printf '%s\n' ready > /var/lib/magnitude-lab/ready

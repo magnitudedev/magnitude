@@ -20,7 +20,7 @@ import { NativeTerminalDriver } from "./terminal"
 import { NetworkControlPlane } from "./network-fault"
 
 export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type, root: string) => Effect.gen(function* () {
-  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL", "LAB_TERMINAL_NODE_EXECUTABLE"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
+  const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL", "LAB_TERMINAL_NODE_EXECUTABLE"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
   const result = yield* Effect.gen(function* () {
     const user = yield* qualifyGuestUser(invocation.assignment.target.target.provider, invocation.disposable, environment)
     if (Option.isSome(user)) environment.HOME = user.value.home

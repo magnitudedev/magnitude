@@ -34,7 +34,7 @@ test("rejects non-HTTPS or credential-bearing download origins and unbounded inp
   expect(() => Schema.decodeUnknownSync(LinuxInitialization)({ ...config, distribution: { os: "alpine", version: "13" } })).toThrow()
 })
 
-for (const [os, version] of [["debian", "13"], ["fedora", "44"]] as const) test(`${os} preparation preserves its identity and rejects an incorrectly supplied guest`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const [os, version] of [["debian", "13"], ["fedora", "44"], ["redhat", "10"]] as const) test(`${os} preparation preserves its identity and rejects an incorrectly supplied guest`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-distribution-" })
   const settings = yield* Schema.decodeUnknown(LinuxInitialization)({ ...config, distribution: { os, version } })
@@ -44,7 +44,7 @@ for (const [os, version] of [["debian", "13"], ["fedora", "44"]] as const) test(
   yield* fs.writeFileString(`${root}/config.json`, rendered.write_files[0].content)
   const check = rendered.write_files[1].content.split("<<'CHECK'\n")[1].split("\nCHECK\n")[0]
     .replace("'/etc/magnitude-lab-initialization.json'", "sys.argv[3]").replace("sys.argv[1:]", "sys.argv[1:3]")
-  for (const [guestOs, guestVersion, expected] of [[os, version, "Right"], ["ubuntu", "24.04", "Left"], [os, "12", "Left"]]) {
+  for (const [guestOs, guestVersion, expected] of [[os === "redhat" ? "rhel" : os, version, "Right"], [os === "redhat" ? "rhel" : os, `${version}.2`, os === "redhat" ? "Right" : "Left"], ["ubuntu", "24.04", "Left"], [os, "12", "Left"]]) {
     const result = yield* checkedCommand("python3", ["-c", check, guestOs!, guestVersion!, `${root}/config.json`]).pipe(Effect.either)
     expect(result._tag).toBe(expected)
   }
@@ -59,10 +59,11 @@ test("the generated guest launcher preserves package directory permissions", () 
   const python = script.split("python3 - <<'PY'\n")[1]!.split("\nPY\n")[0]!
   const rendered = yield* checkedCommand("python3", ["-c", `import ast,pathlib,shlex,sys
 tree=ast.parse(sys.argv[1])
-node=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='launcher' for t in n.targets))
+nodes=[n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in ('display_command','launcher') for t in n.targets)]
+config={'distribution':{'os':'ubuntu'}}
 root=home=workspace=pathlib.Path(sys.argv[2])
 path=str(root)+':/usr/bin:/bin'
-exec(compile(ast.Module(body=[node],type_ignores=[]),'<launcher>','exec'))
+exec(compile(ast.Module(body=nodes,type_ignores=[]),'<launcher>','exec'))
 print(launcher)`, python, root])
   yield* fs.writeFileString(`${root}/xvfb-run`, "#!/bin/sh\nmkdir package-control\numask\n", { mode: 0o755 })
   const observed = yield* checkedCommand("/bin/bash", ["-c", `umask 077\n${rendered.stdout}`])
