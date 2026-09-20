@@ -58,6 +58,7 @@ test("a source producer publishes verified packages to separate consumers and ne
     yield* registry.register(request.owner, request.input)
     const plan = yield* planRun(request), run = yield* runs.submit(plan)
     expect(plan.estimatedComputeUsd).toBe(3)
+    expect((yield* runs.progress(run.state.runId)).stages.map(stage => stage.state)).toEqual(["Queued", "Queued", "Queued"])
     const build = Option.getOrThrow(yield* work.claim("builder", 60))
     expect(build.work.kind).toBe("build")
     expect(build.target.cases.map(test => test.id)).toEqual(["P1", "P2"])
@@ -66,6 +67,9 @@ test("a source producer publishes verified packages to separate consumers and ne
       runId: job.claim.runId, workId: job.claim.workId, workFence: job.claim.fence, targetId: job.claim.targetId,
       provider: "azure", resourceName: `fixture-${crypto.randomUUID()}`, expiresAt: job.deadline }), job.claim.worker, 60)
     const producer = yield* allocate(build)
+    const active = (yield* runs.progress(run.state.runId)).stages[0]!
+    expect(active).toMatchObject({ id: build.claim.workId, kind: "build", state: "Running", attempts: 1 })
+    expect(active.leases[0]).toMatchObject({ id: producer.state.leaseId, state: "Allocating" })
     const ticket = yield* credentials.issue(WorkerInvocation.make({ schemaVersion: 1, assignment: build, disposable: true, port: 11279, model: "fixture" }))
     const packageBytes = "exact native package fixture", packageDigest = sha256(packageBytes)
     const artifact = (kind: string, filename: string, extra = {}) => ({ id: filename, kind, host: "linux-x64-gnu", filename, sha256: packageDigest, bytes: packageBytes.length, ...extra })

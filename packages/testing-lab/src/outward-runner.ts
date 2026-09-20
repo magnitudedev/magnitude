@@ -13,8 +13,11 @@ import { GuestRuntime } from "./worker-runner"
 
 export const WorkerLaunch = Schema.Struct({ executable: Schema.NonEmptyString, args: Schema.Array(Schema.String), root: Schema.NonEmptyString,
   origin: Schema.NonEmptyString, token: Schema.Redacted(Schema.NonEmptyString), deadline: Schema.DateTimeUtc })
+export const WorkerExit = Schema.Struct({ state: Schema.Literal("Succeeded", "Failed", "TimedOut", "Canceled"),
+  code: Schema.optionalWith(Schema.Int, { as: "Option", exact: true }) })
 export interface WorkerBootstrap {
   /** Start once and return after delivery. Provider credentials stay in this privileged adapter. */
+  readonly poll: (machine: Machine) => Effect.Effect<Option.Option<typeof WorkerExit.Type>, InfrastructureFailure>
   readonly start: (machine: Machine, launch: typeof WorkerLaunch.Type) => Effect.Effect<void, InfrastructureFailure>
 }
 export interface WorkerBootstraps { readonly providers: ReadonlyMap<typeof Provider.Type, WorkerBootstrap> }
@@ -53,12 +56,26 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
           Effect.interruptible, Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => fail("Worker credential revocation timed out") }),
           Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Worker credential: ${error.message}`) }))))
         yield* bootstrap.start(machine, WorkerLaunch.make({ executable: runtime.executable, args: runtime.args, root, origin: origin.origin, token: ticket.token, deadline: DateTime.unsafeMake(deadline) }))
+        let checkedAt = 0
         for (;;) {
           yield* tickets.authorize(ticket.token)
           const reply = yield* results.read(assignment.claim)
           if (Option.isSome(reply)) {
             yield* validateTargetResult(assignment.target, reply.value.result)
             return reply.value.result
+          }
+          if (Date.now() - checkedAt >= 10_000) {
+            const exited = yield* bootstrap.poll(machine)
+            checkedAt = Date.now()
+            if (Option.isSome(exited)) {
+              // Receipt may commit between the first database read and provider observation.
+              const delivered = yield* results.read(assignment.claim)
+              if (Option.isSome(delivered)) {
+                yield* validateTargetResult(assignment.target, delivered.value.result)
+                return delivered.value.result
+              }
+              return yield* fail(`Guest process ended ${exited.value.state}${Option.match(exited.value.code, { onNone: () => "", onSome: code => ` (exit ${code})` })} without an accepted result`)
+            }
           }
           yield* Effect.sleep(config.pollMs)
         }

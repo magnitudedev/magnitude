@@ -1,7 +1,9 @@
 import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { Database, decodeRow } from "./database"
-import { InfrastructureFailure, RunId, RunPlan, RunRequest, RunResult } from "./domain"
+import { InfrastructureFailure, LeaseId, Provider, RunId, RunPlan, RunRequest, RunResult } from "./domain"
+import { RunProgress } from "./progress"
+import { WorkId } from "./work-identity"
 import { targets } from "./catalog"
 import { planExecution, WorkSpec } from "./execution-plan"
 import { sha256 } from "./snapshot"
@@ -23,6 +25,7 @@ export interface RunStore {
   readonly submit: (plan: RunPlan) => Effect.Effect<RunRecord, InfrastructureFailure | AdmissionRejected>
   readonly get: (id: RunId) => Effect.Effect<RunRecord, InfrastructureFailure | RunNotFound>
   readonly cancel: (id: RunId) => Effect.Effect<RunRecord, InfrastructureFailure | RunNotFound>
+  readonly progress: (id: RunId) => Effect.Effect<RunProgress, InfrastructureFailure | RunNotFound>
   readonly result: (id: RunId) => Effect.Effect<Option.Option<RunResult>, InfrastructureFailure | RunNotFound>
 }
 export const RunStore = Context.GenericTag<RunStore>("@magnitudedev/testing-lab/RunStore")
@@ -75,6 +78,22 @@ export const runStoreLayer = (accountBudgetUsd: number) => Layer.effect(RunStore
       if (!rows[0]) return yield* new RunNotFound({ runId: id })
       return yield* record(rows[0])
     }),
+    progress: id => db.transaction(tx => Effect.gen(function* () {
+      const rows = yield* tx.query("SELECT * FROM lab_runs WHERE run_id=$1", [id])
+      if (!rows[0]) return yield* new RunNotFound({ runId: id })
+      const run = yield* record(rows[0])
+      const stages = yield* tx.query("SELECT spec,state,attempts FROM lab_work WHERE run_id=$1 ORDER BY work_id", [id])
+      const work = yield* decodeRow(Schema.Array(Schema.Struct({ spec: Schema.parseJson(WorkSpec), state: Schema.Literal("Queued", "Running", "Finished"), attempts: Schema.Int })), stages)
+      const observed = yield* tx.query("SELECT work_id,lease_id,provider,resource_name,state FROM lab_leases WHERE run_id=$1 ORDER BY work_fence,lease_id", [id])
+      const leases = yield* decodeRow(Schema.Array(Schema.Struct({ work_id: WorkId, lease_id: LeaseId, provider: Provider, resource_name: Schema.String,
+        state: Schema.Literal("Allocating", "Ready", "Releasing", "Released") })), observed)
+      return RunProgress.make({ runId: id, state: run.state._tag, deadline: run.deadline, stages: work.map(item => ({
+        id: item.spec.id, kind: item.spec.kind, targetId: item.spec.target.target.id,
+        backend: item.spec.kind === "build" ? item.spec.backend : item.spec.target.target.backend,
+        state: item.state, attempts: item.attempts, producer: item.spec.kind === "test" ? item.spec.producer : Option.none(),
+        leases: leases.filter(lease => lease.work_id === item.spec.id).map(lease => ({ id: lease.lease_id, provider: lease.provider, machine: lease.resource_name, state: lease.state })),
+      })) })
+    })),
     result: id => Effect.gen(function* () {
       const rows = yield* db.query("SELECT result FROM lab_runs WHERE run_id=$1", [id])
       if (!rows[0]) return yield* new RunNotFound({ runId: id })

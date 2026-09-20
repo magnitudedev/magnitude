@@ -1,6 +1,6 @@
 import { FetchHttpClient, FileSystem, HttpClient, HttpServer } from "@effect/platform"
 import { BunContext, BunHttpServer, BunRuntime } from "@effect/platform-bun"
-import { Config, Context, Effect, Layer, Option, Schema, Scope, Stream } from "effect"
+import { Config, Context, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { join } from "node:path"
 import { snapshotArtifacts } from "../src/artifact-input"
 import { fileArtifactStore } from "../src/artifact-store"
@@ -8,7 +8,7 @@ import { planRun } from "../src/catalog"
 import { initializeDatabase } from "../src/database"
 import { AssertionFailure, LeaseId, RunRequest } from "../src/domain"
 import { LocalMachine } from "../src/machines"
-import { outwardWorkerRunner, type WorkerBootstrap, WorkerBootstraps } from "../src/outward-runner"
+import { outwardWorkerRunner, type WorkerBootstrap, WorkerBootstraps, WorkerExit } from "../src/outward-runner"
 import { WorkerRunner } from "../src/scheduler"
 import { InputRegistry, InputRegistryLive } from "../src/inputs"
 import { deliverOutwardWorkerResult, runOutwardWorker } from "../src/outward-worker"
@@ -62,7 +62,8 @@ const program = Effect.scoped(Effect.gen(function* () {
     const scope = yield* Effect.scope
     const guestServices = yield* Effect.context<FileSystem.FileSystem | ProcessExecutor | HttpClient.HttpClient | Scope.Scope>()
     let guestRoot = ""
-    const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { start: (_machine, launch) => Effect.gen(function* () {
+    let guestExit: Option.Option<typeof WorkerExit.Type> = Option.none()
+    const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { poll: () => Effect.sync(() => guestExit), start: (_machine, launch) => Effect.gen(function* () {
       guestRoot = launch.root
       const guest = Effect.gen(function* () {
         const client = yield* WorkerClient
@@ -76,7 +77,7 @@ const program = Effect.scoped(Effect.gen(function* () {
         yield* fs.writeFileString(join(root, "delivery-recovery.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ passed: Schema.Boolean, recoveredWithoutExecutor: Schema.Boolean, cleanedBeforeDelivery: Schema.Boolean })))({ passed: true, recoveredWithoutExecutor: true, cleanedBeforeDelivery: true }))
         return reply
       })
-      yield* guest.pipe(Effect.provide(workerClientLayer(launch.origin, launch.token)), Effect.provide(guestServices), Effect.forkIn(scope))
+      yield* guest.pipe(Effect.onExit(exit => Effect.sync(() => { guestExit = Option.some(WorkerExit.make({ state: Exit.isSuccess(exit) ? "Succeeded" : "Failed", code: Option.some(Exit.isSuccess(exit) ? 0 : 1) })) })), Effect.provide(workerClientLayer(launch.origin, launch.token)), Effect.provide(guestServices), Effect.forkIn(scope))
     }) }]]) })
     const runner = Context.get(yield* Layer.build(outwardWorkerRunner({ origin, pollMs: 100, runtimes: [{ provider: "local", artifactHost: "darwin-arm64", root: join(root, "guest"),
       executable: "bun", args: ["src/outward-worker.ts"], disposable: false, port: 11429, model: "qwen3.5-4b:gguf:q4" }] }).pipe(Layer.provide(bootstrap))), WorkerRunner)

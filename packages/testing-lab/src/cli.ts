@@ -1,3 +1,4 @@
+import { RunProgress, formatProgress } from "./progress"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
@@ -124,7 +125,7 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     const id = yield* Schema.decodeUnknown(RunId)(yield* required("run"))
     return yield* remote(Effect.gen(function* () {
       const client = yield* LabClient
-      if (command === "status") return yield* print(RunRecord, yield* client.get(id))
+      if (command === "status") return yield* print(RunProgress, yield* client.progress(id))
       if (command === "cancel") return yield* print(RunRecord, yield* client.cancel(id))
       const result = yield* client.result(id)
       if (Option.isNone(result)) { yield* Console.error("Run is still in progress"); process.exitCode = 2; return }
@@ -167,12 +168,15 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     yield* print(RunRecord, run)
     if (options.has("no-wait")) return
     yield* Console.error(`Waiting for ${run.state.runId}; interrupting this client leaves the remote run active. Use lab cancel to stop it.`)
+    let previousProgress = ""
     for (;;) {
       const result = yield* client.result(run.state.runId)
       if (Option.isSome(result)) {
         yield* completed(result.value)
         return
       }
+      const progress = formatProgress(yield* client.progress(run.state.runId))
+      if (progress !== previousProgress) { yield* Console.error(progress); previousProgress = progress }
       yield* Effect.sleep("3 seconds")
     }
   }))

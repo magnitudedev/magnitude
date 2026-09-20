@@ -1,5 +1,5 @@
 import { BunContext } from "@effect/platform-bun"
-import { DateTime, Effect, Layer, Redacted, Schema } from "effect"
+import { DateTime, Effect, Layer, Option, Redacted, Schema } from "effect"
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { expect, test } from "vitest"
 import { LeaseId, RunId } from "../src/domain"
@@ -13,7 +13,7 @@ const name = "ml-123456789abc"
 const id = `/subscriptions/${config.subscription}/resourceGroups/magnitude-ci/providers/Microsoft.Compute/virtualMachines/${name}`
 const machine = () => AzureMachine.make({ provider: "azure", id, name, tags: MachineTags.make({ schemaVersion: 1,
   runId: RunId.make(`run-${crypto.randomUUID()}`), leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`), expiresAt: DateTime.unsafeMake(Date.now() + 60_000) }) })
-const launch = () => WorkerLaunch.make({ executable: "/usr/bin/printf", args: ["%s\\n", "quote' space $HOME $(exit 42) `exit 43`"],
+const launch = () => WorkerLaunch.make({ executable: "/bin/sh", args: ["-c", "printf '%s\\n' \"$1\"; umask", "lab-worker", "quote' space $HOME $(exit 42) `exit 43`"],
   root: "/tmp/lab attempt'", origin: "https://lab.example.com", token: Redacted.make("fixture-worker-secret"), deadline: DateTime.unsafeMake(Date.now() + 60_000) })
 const output = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: "", exitCode: 0 })
 
@@ -58,6 +58,24 @@ for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "exp
     const executed = await Effect.runPromise(checkedCommand("/bin/sh", ["-c", script.replace(userSwitch, "")], {
       inheritEnv: false, env: { LAB_WORKER_TOKEN: Redacted.value(invocation.token) },
     }).pipe(Effect.provide(ProcessExecutorLive)))
-    expect(executed.stdout).toBe(`${invocation.args[1]}\n`)
+    expect(executed.stdout).toBe(`${invocation.args[3]}\n0022\n`)
   }
 })
+
+for (const state of ["Pending", "Running", "Succeeded", "Failed", "TimedOut", "Canceled", "missing-view", "foreign-command"] as const) test(`Azure native execution observation: ${state}`, () => Effect.runPromise(Effect.gen(function* () {
+  const vm = machine()
+  const executor = Layer.succeed(ProcessExecutor, { run: spec => Effect.gen(function* () {
+    expect(spec.args).toContain("GET")
+    expect(spec.args[spec.args.indexOf("--url") + 1]).toBe(`https://management.azure.com${id}/runCommands/lab-worker?api-version=2024-11-01&$expand=instanceView`)
+    return { exitCode: 0, stderr: "", stdout: yield* Schema.encode(Schema.parseJson(Schema.Unknown))({ id: `${id}/runCommands/${state === "foreign-command" ? "another-command" : "lab-worker"}`, properties: {
+      provisioningState: "Succeeded", ...(state === "missing-view" ? {} : { instanceView: { executionState: state === "foreign-command" ? "Succeeded" : state,
+        exitCode: state === "Failed" ? 17 : 0, output: "must not expose provider output or protected values", error: "private diagnostic fixture" } }),
+    } }) }
+  }).pipe(Effect.orDie) })
+  const observed = yield* azureLinuxBootstrap(config).pipe(Effect.flatMap(bootstrap => bootstrap.poll(vm)), Effect.provide(executor), Effect.either)
+  if (state === "foreign-command") expect(observed._tag).toBe("Left")
+  else if (observed._tag === "Right") {
+    expect(observed.right._tag).toBe(["Pending", "Running", "missing-view"].includes(state) ? "None" : "Some")
+    if (observed.right._tag === "Some") expect(observed.right.value).toEqual({ state, code: Option.some(state === "Failed" ? 17 : 0) })
+  } else expect.fail("Execution observation unexpectedly failed")
+}).pipe(Effect.provide(BunContext.layer))))

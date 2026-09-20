@@ -174,7 +174,14 @@ The outward runner validates allocation ownership and trust before issuing a gue
 delivers it through a provider bootstrap, and waits for the immutable receipt within the
 allocation deadline. Credential revocation runs on success, failure, timeout and cancellation.
 Revocation failures remain separate cleanup errors when a valid test result exists; the
-scheduler retains responsibility for releasing the allocated machine.
+scheduler retains responsibility for releasing the allocated machine. Provider-native process
+termination without a received result is an infrastructure failure, including exit zero. A final
+receipt read resolves the race between delivery and exit observation. Read-only status observation
+may retry transient transport failures; it never reruns native execution. Provider output is not
+copied into public errors or allowed to expose the guest credential.
+Run progress exposes owner-authorized build/test stages, attempt counts, dependency identities
+and current allocation states. The CLI emits stage changes while waiting; progress is not a test
+result and cannot establish acceptance.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
 Fresh Azure Linux workers may prepare their trusted runtime through administrator-pinned
 cloud-init configuration. The allocator verifies its digest and size before creating resources,

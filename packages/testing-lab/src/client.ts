@@ -1,3 +1,4 @@
+import { RunProgress } from "./progress"
 import { HttpClient, HttpClientRequest } from "@effect/platform"
 import { Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { Digest, InfrastructureFailure, Input, ObjectBatch, Principal, RunId, RunPlan, RunRequest, RunResult, Target } from "./domain"
@@ -17,6 +18,7 @@ export interface LabClient {
   readonly submit: (request: RunRequest) => Effect.Effect<RunRecord, LabApiError>
   readonly get: (id: RunId) => Effect.Effect<RunRecord, LabApiError>
   readonly cancel: (id: RunId) => Effect.Effect<RunRecord, LabApiError>
+  readonly progress: (id: RunId) => Effect.Effect<RunProgress, LabApiError>
   readonly result: (id: RunId) => Effect.Effect<Option.Option<RunResult>, LabApiError>
   readonly evidence: (id: RunId, digest: Digest) => Stream.Stream<Uint8Array, LabApiError>
 }
@@ -69,6 +71,7 @@ export const labClientLayer = (origin: string, token: Effect.Effect<Redacted.Red
     plan: request => read(RunPlan, "/v1/runs/plan", Option.some(request), true),
     submit: request => read(RunRecord, "/v1/runs", Option.some(request), true),
     get: id => read(RunRecord, `/v1/runs/${encodeURIComponent(id)}`),
+    progress: id => read(RunProgress, `/v1/runs/${encodeURIComponent(id)}/progress`),
     cancel: id => read(RunRecord, `/v1/runs/${encodeURIComponent(id)}/cancel`, Option.none(), true),
     evidence: (id, digest) => Stream.unwrap(send(`/v1/runs/${encodeURIComponent(id)}/evidence/${digest}`, Option.none()).pipe(Effect.map(response =>
       verifiedArtifactContent(digest, response.stream.pipe(Stream.mapError(() => new InfrastructureFailure({ operation: "evidence-download", message: "Evidence download interrupted" }))), 256 * 1024 * 1024).pipe(

@@ -1,3 +1,4 @@
+import { RunProgress } from "./progress"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
 import { timingSafeEqual } from "node:crypto"
@@ -88,6 +89,7 @@ export const api = HttpRouter.empty.pipe(
     return yield* HttpServerResponse.schemaJson(RunRecord)(run, { status: 201 })
   })),
   HttpRouter.get("/v1/runs/:id", ownedRun.pipe(Effect.flatMap(({ run }) => HttpServerResponse.schemaJson(RunRecord)(run)))),
+  HttpRouter.get("/v1/runs/:id/progress", ownedRun.pipe(Effect.flatMap(({ id, store }) => store.progress(id)), Effect.flatMap(HttpServerResponse.schemaJson(RunProgress)))),
   HttpRouter.get("/v1/runs/:id/results", Effect.gen(function* () {
     const { id, store } = yield* ownedRun
     const result = yield* store.result(id)

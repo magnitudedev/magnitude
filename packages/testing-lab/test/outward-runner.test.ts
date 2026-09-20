@@ -13,7 +13,7 @@ import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 import { WorkerResults } from "../src/worker-results"
 import { WorkerAccessDenied, WorkerTicketId, WorkerTickets } from "../src/worker-tickets"
 
-for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "deadline", "foreign-lease", "untrusted-local", "shared-disposable"] as const) test(`outward runner preserves result and credential cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "deadline", "foreign-lease", "untrusted-local", "shared-disposable", "guest-failed", "late-receipt"] as const) test(`outward runner preserves result and credential cleanup for ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const request = yield* Schema.decodeUnknown(RunRequest)({ schemaVersion: 1, idempotencyKey: "outward-runner-test", owner: "fixture", trust: mode === "untrusted-local" ? "untrusted-ci" : "developer", mode: "verify", allowSpark: false,
     input: { kind: "source", digest: "a".repeat(64) }, selection: { kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel"], suites: ["package"], harnesses: ["pi"] },
     limits: { concurrency: 1, deadlineMinutes: 5, budgetUsd: 10, idleMinutes: 15 } })
@@ -35,10 +35,10 @@ for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "dea
     revoke: () => Effect.suspend(() => { revoked++; return mode === "revoke-error" ? Effect.fail(new InfrastructureFailure({ operation: "fixture-revoke", message: "Revocation failed" })) : Effect.void }),
     authorize: () => revoked ? Effect.fail(new WorkerAccessDenied({})) : Effect.succeed(invocation), withAuthority: () => Effect.dieMessage("Unused fixture method") })
   const results = Layer.succeed(WorkerResults, { submit: () => Effect.dieMessage("Unused fixture method"), read: () => Effect.sync(() => {
-    reads++; return mode === "deadline" || reads === 1 ? Option.none() : Option.some(reply)
+    reads++; return mode === "deadline" || mode === "guest-failed" || reads === 1 ? Option.none() : Option.some(reply)
   }) })
   const inputs = Layer.succeed(InputRegistry, { require: () => Effect.void, register: () => Effect.void, missing: () => Effect.succeed([]), upload: () => Effect.void, read: () => Effect.dieMessage("Unused fixture method") })
-  const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { start: (_machine, launch) => Effect.gen(function* () {
+  const bootstrap = Layer.succeed(WorkerBootstraps, { providers: new Map<"local", WorkerBootstrap>([["local", { poll: () => Effect.succeed(mode === "guest-failed" || mode === "late-receipt" ? Option.some({ state: "Failed" as const, code: Option.some(17) }) : Option.none()), start: (_machine, launch) => Effect.gen(function* () {
     expect(launch.root).toBe(`/tmp/worker-fixture/${machine.tags.leaseId}/attempt-1`)
     expect(launch.token).toEqual(token)
     yield* Deferred.succeed(started, undefined)
@@ -54,7 +54,8 @@ for (const mode of ["success", "revoke-error", "bootstrap-error", "cancel", "dea
       yield* Fiber.interrupt(fiber)
     } else {
       const result = yield* executing.pipe(Effect.either)
-      expect(result._tag).toBe(mode === "success" || mode === "revoke-error" ? "Right" : "Left")
+      expect(result._tag).toBe(mode === "success" || mode === "revoke-error" || mode === "late-receipt" ? "Right" : "Left")
+      if (mode === "guest-failed" && result._tag === "Left") expect(result.left.message).toContain("exit 17")
       if (result._tag === "Right") { expect(result.right.cases).toEqual(reply.result.cases); expect(result.right.cleanupErrors.length).toBe(mode === "revoke-error" ? 1 : 0) }
     }
     expect(issued).toBe(mode === "foreign-lease" || mode === "untrusted-local" || mode === "shared-disposable" ? 0 : 1)
