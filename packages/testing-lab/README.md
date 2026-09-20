@@ -965,7 +965,7 @@ environment. This is a public expected publisher identity, not a signing credent
 malformed value blocks verification. Every native signature must satisfy that Developer ID team
 and contain a secure timestamp; the installed app must pass stapler validation and Gatekeeper
 assessment. No candidate is re-signed and no host trust settings are changed. The production path
-has fixture coverage but has not been qualified with a production-signed release. Linux P5 verification remains outstanding; the Windows implementation is described below.
+has fixture coverage but has not been qualified with a production-signed release. DEB development integrity verification is implemented below; RPM P5 verification remains outstanding. The Windows implementation is described below.
 
 Real local macOS verification at `/tmp/ml-signature-worker-20260919/result.json` passed nine
 selected cases, including 37 signature records covering the app, CPU base and Metal pack; cleanup
@@ -1038,3 +1038,17 @@ process identities. It verifies that the process tree exits and the entry is abs
 uninstall, then checks the retained preference without toggling it on reinstall. A TryExec guard
 preserves the opt-in while preventing launch of an absent application. These lifecycle changes have
 local test coverage and await the next native cloud run.
+
+### Debian development package integrity
+
+P5 verifies the installed DEB payload against the admitted package using SHA-256 and exact symlink
+targets, and independently reads the admitted runtime archives. It reports the standard unsigned
+DEB layout as development integrity with `productionTrusted: false`. Embedded signatures and
+production verification require a publisher policy and stay blocked; malformed or unknown archive
+layouts fail. This matches the distinction between local development integrity and publisher trust
+on other platforms. It does not claim APT repository verification. Native archive classification has
+real `ar` fixtures; full P5 qualification awaits the combined Ubuntu run.
+
+Debian documents the [binary package container](https://manpages.debian.org/unstable/dpkg-dev/deb.5.en.html)
+and [embedded signature verification](https://manpages.debian.org/testing/debsig-verify/debsig-verify.1.en.html)
+separately from [repository signing](https://www.debian.org/doc/manuals/debian-reference/ch02).

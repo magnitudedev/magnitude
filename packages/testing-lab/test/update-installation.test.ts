@@ -8,10 +8,11 @@ import { targets } from "../src/catalog"
 import { InstalledApplication } from "../src/installer"
 import { ProcessExecutor } from "../src/process"
 import { sha256 } from "../src/snapshot"
-import { observeUpdatedInstallation, verifyUpdatedDebPayload } from "../src/suites/update-installation"
+import { observeUpdatedInstallation } from "../src/suites/update-installation"
+import { verifyDebPayload } from "../src/suites/package-payload"
 
 const target = targets.find(value => value.id === "ubuntu-24.04-x64-cpu-intel")!
-for (const mode of ["exact", "changed-file", "changed-link", "file-became-link", "changed-package"] as const) test(`updated payload comparison rejects divergence: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const mode of ["exact", "changed-file", "changed-link", "file-became-link", "directory-became-link", "changed-package"] as const) test(`updated payload comparison rejects divergence: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-update-payload-" }).pipe(Effect.flatMap(fs.realPath))
   const directory = join(root, "installed")
@@ -22,13 +23,17 @@ for (const mode of ["exact", "changed-file", "changed-link", "file-became-link",
     yield* fs.rename(join(directory, "file"), join(root, "outside-file"))
     yield* fs.symlink(join(root, "outside-file"), join(directory, "file"))
   }
+  if (mode === "directory-became-link") {
+    yield* fs.rename(directory, join(root, "outside-directory"))
+    yield* fs.symlink(join(root, "outside-directory"), directory)
+  }
   const path = join(root, "candidate.deb"), archive = "admitted package"
   yield* fs.writeFileString(path, mode === "changed-package" ? "mutated archive" : archive)
   const candidate = yield* Schema.decodeUnknown(Candidate)({ target, version: "1.2.4", path,
     artifact: { id: "desktop-linux-x64", kind: "desktop", host: "linux-x64-gnu", filename: "Magnitude.deb", bytes: archive.length, sha256: sha256(archive) } })
   const app = InstalledApplication.make({ candidate, root: directory, executable: join(directory, "file"), cli: join(directory, "file"), packageVersion: "1.2.4-44" })
   let extracted = false
-  const result = yield* verifyUpdatedDebPayload(app).pipe(Effect.provideService(ProcessExecutor, {
+  const result = yield* verifyDebPayload(app).pipe(Effect.provideService(ProcessExecutor, {
     // Only the extraction boundary is synthetic; comparisons use actual files and links.
     run: spec => Effect.gen(function* () {
       expect(spec.executable).toBe("dpkg-deb")

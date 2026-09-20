@@ -43,4 +43,14 @@ test("download controls survive rewording and distinguish transfer, failure, ret
   yield* controls.complete(model)
   expect((yield* controls.transferring(model).pipe(Effect.either))._tag).toBe("Left")
   expect((yield* controls.failed(model).pipe(Effect.either))._tag).toBe("Left")
+  yield* Effect.promise(() => page.getByTestId(`desktop.model.${model}`).evaluate(element => {
+    element.setAttribute("data-acquisition-state", "NotInstalled")
+    element.querySelector<HTMLButtonElement>('[data-testid="desktop.model-download"]')!.onclick = () => {
+      element.setAttribute("data-acquisition-state", "InstallFailed")
+      element.querySelector<HTMLElement>('[role="alert"]')!.hidden = false
+    }
+  }))
+  const failedStart = yield* controls.begin(model).pipe(Effect.either)
+  expect(failedStart._tag).toBe("Left")
+  if (failedStart._tag === "Left") expect(failedStart.left.message).toContain("Network unavailable")
 })).pipe(Effect.provide(BunContext.layer))), 20000)

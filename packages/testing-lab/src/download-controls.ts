@@ -25,10 +25,16 @@ export const playwrightDownloads = (page: Page): DesktopDownloads => {
   }, { id: automation.model(model), states }, { timeout })
   return {
     begin: model => action("Start model download", async () => {
+      const previous = await card(model).getAttribute("data-acquisition-state")
       await card(model).getByTestId(automation.modelDownload).click({ timeout: 120000 })
-      // A retry must leave the previous failed occurrence before completion/error observation begins.
-      const state = await wait(model, ["Installing", "Installed", "UpdateAvailable"], 60000)
-      await state.dispose()
+      // A retry must leave the previous failed occurrence; a fresh immediate failure is terminal.
+      const states = ["Installing", "Installed", "UpdateAvailable", ...(previous === "InstallFailed" ? [] : ["InstallFailed"])]
+      const state = await wait(model, states, 60000).catch(async error => {
+        const alerts = (await card(model).getByRole("alert").allTextContents()).join("; ")
+        throw new Error(alerts || (error instanceof Error ? error.message : "Download did not start"))
+      })
+      try { if (await state.jsonValue() === "InstallFailed") throw new Error((await card(model).getByRole("alert").allTextContents()).join("; ") || "Model download failed immediately") }
+      finally { await state.dispose() }
     }),
     transferring: model => action("Observe an incomplete model transfer", async () => {
       const handle = await page.waitForFunction(({ id, progressId }) => {

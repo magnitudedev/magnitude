@@ -16,7 +16,8 @@ import { admittedModelFiles, ModelFileReceipt, verifyModelFiles } from "../model
 import { UpdatePair } from "../update-pair"
 import { EndpointTests, endpointTests, Generation } from "./endpoint"
 import { inspectPackageIdentity, PackageIdentity } from "./package"
-import { observeUpdatedInstallation, UpdatedPayload, verifyUpdatedDebPayload } from "./update-installation"
+import { observeUpdatedInstallation } from "./update-installation"
+import { PackagePayload, verifyDebPayload } from "./package-payload"
 import { UpdateBaseline, verifyUpdateBaseline } from "./update"
 
 const fail = (message: string) => new AssertionFailure({ message })
@@ -41,7 +42,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   const profile = join(config.root, "profile"), endpoint = join(state, "application.sock")
   const environment = yield* runtimeEnvironment(pair.previousRelease, config.target.artifactHost, { ...config.environment,
     MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_DESKTOP_STATE_DIR: state,
-    NODE_EXTRA_CA_CERTS: fixture.caPath, SSL_CERT_FILE: fixture.caPath }, [config.acceptance.candidate])
+    NODE_EXTRA_CA_CERTS: fixture.caPath }, [config.acceptance.candidate])
   let handoffAttempted = false, handoffSettled = false
   // Registered before child sessions: stop all app owners before restoring the primary package.
   yield* Effect.addFinalizer(() => Effect.gen(function* () {
@@ -87,6 +88,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
     yield* record("baseline", UpdateBaseline, yield* verifyUpdateBaseline(session, pair.previous.version))
     const driver = yield* session.driver
     yield* driver.search(config.model)
+    yield* driver.download(config.model)
     yield* driver.load(config.model)
     yield* record("baseline-generation", Generation, yield* endpoints.generate)
     yield* record("baseline-model-files", ModelFileReceipt, yield* verifyModelFiles(profile, yield* modelFiles))
@@ -117,7 +119,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   const payload = Effect.gen(function* () {
     const driver = yield* session.driver
     yield* record("updated-package", PackageIdentity, yield* inspectPackageIdentity(app, yield* driver.host(), environment))
-    yield* record("updated-payload", UpdatedPayload, yield* verifyUpdatedDebPayload(app))
+    yield* record("updated-payload", PackagePayload, yield* verifyDebPayload(app))
   })
   const continuation = Effect.gen(function* () {
     const driver = yield* session.driver

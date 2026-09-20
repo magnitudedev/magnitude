@@ -1,3 +1,4 @@
+import { DebianPackageTrust, inspectDebianPackageTrust } from "./suites/debian-package-trust"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { dirname, isAbsolute, join } from "node:path"
@@ -188,9 +189,6 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       updaterScope = Option.none()
       yield* Scope.close(owned, Exit.void)
     })
-    yield* Scope.addFinalizer(scope, closeUpdater.pipe(Effect.catchAllCause(() => Effect.sync(() => {
-      fixtureCleanupFailed = true; cleanupErrors.push("Updater fixture scope did not close cleanly")
-    }))))
     const updater = yield* Effect.cached(Effect.gen(function* () {
       if (Option.isNone(admitted.updateAcceptance)) return yield* unavailable("Scheduled updater execution requires an admitted source-built acceptance pair")
       const cleanupStart = cleanupErrors.length
@@ -202,6 +200,11 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       yield* installed
       const owned = yield* Scope.make()
       updaterScope = Option.some(owned)
+      // Register after installation ownership: LIFO cleanup must stop the update app
+      // and restore the primary package before the outer installer removes that package.
+      yield* Scope.addFinalizer(scope, closeUpdater.pipe(Effect.catchAllCause(() => Effect.sync(() => {
+        fixtureCleanupFailed = true; cleanupErrors.push("Updater fixture scope did not close cleanly")
+      }))))
       return yield* updateJourney({ acceptance: admitted.updateAcceptance.value, target, root: join(config.root, "update-journey"),
         evidence: join(evidenceDirectory, "update-journey"), environment, port: application.port, model: config.model }, yield* installation,
         (name, schema, value) => evidence(`${activeUpdateCase}-${name}.json`, schema, value).pipe(Effect.tap(item => Effect.sync(() => {
@@ -248,7 +251,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
               const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
                 : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
               const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
-              const updateEnvironment = { ...baselineEnvironment, ...(Option.isSome(restored) ? { NODE_EXTRA_CA_CERTS: restored.value.fixture.caPath, SSL_CERT_FILE: restored.value.fixture.caPath } : {}), MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
+              const updateEnvironment = { ...baselineEnvironment, ...(Option.isSome(restored) ? { NODE_EXTRA_CA_CERTS: restored.value.fixture.caPath } : {}), MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
               const updateSession = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
                 evidence: join(evidenceDirectory, "update-baseline"), port: application.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
               const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
@@ -304,12 +307,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", MacPackageDependencies, report)] })
         }
         case "P5": {
-          if (target.os !== "macos" && target.os !== "windows") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
           const production = assignment.plan.request.selection.kind === "profile" && assignment.plan.request.selection.profile === "release"
           const release = (yield* manifest).release
           if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
             return yield* unavailable("Complete signature verification requires the admitted native runtime archives")
           }
+          if (target.packageFormat === "deb") {
+            const receipt = yield* inspectDebianPackageTrust(yield* installed, release, production).pipe(Effect.provide(NodeArchiveExtractor))
+            return CaseObservation.make({ detail: "Verified exact installed DEB payload and admitted runtime archives; package is unsigned development output, no publisher trust claimed",
+              evidence: [yield* inputEvidence, yield* evidence("P5-debian-package-trust.json", DebianPackageTrust, receipt)] })
+          }
+          if (target.os !== "macos" && target.os !== "windows") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
           if (target.os === "windows") {
             const policy = yield* windowsTrustPolicy(production, config.environment)
             const receipt = yield* inspectWindowsPackageTrust(yield* installed, release, policy, config.environment).pipe(Effect.provide(NodeArchiveExtractor))

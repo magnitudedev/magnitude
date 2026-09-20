@@ -30,7 +30,7 @@ export const nativeInstaller = (config: typeof InstallerConfig.Type) => Layer.ef
   const run = (executable: string, args: readonly string[], timeoutMs = 300_000, environment = config.environment) => command(executable, args, { env: environment,
     inheritEnv: false, timeoutMs }).pipe(Effect.provideService(ProcessExecutor, executor))
   const checked = (executable: string, args: readonly string[]) => run(executable, args).pipe(Effect.flatMap(result => result.exitCode === 0 ? Effect.succeed(result.stdout)
-    : Effect.fail(fail(`${executable} exited ${result.exitCode}: ${(result.stderr || result.stdout).slice(-1800)}`))))
+    : Effect.fail(fail(`${executable} exited ${result.exitCode}:\nstdout: ${result.stdout.slice(-2400)}\nstderr: ${result.stderr.slice(-2400)}`))))
   // Start-Process -Wait includes the NSIS uninstaller's copied child process.
   const windowsInstaller = (path: string) => run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
     '$ErrorActionPreference = "Stop"; $p = Start-Process -FilePath $env:LAB_NATIVE_INSTALLER -ArgumentList "/S" -PassThru -Wait; exit $p.ExitCode'],

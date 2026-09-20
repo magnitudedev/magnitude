@@ -36,7 +36,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const profile = join(evidence, "profile"), port = 11439
     const environment = { PATH: process.env.PATH ?? "", HOME: join(evidence, "home"), TMPDIR: process.env.TMPDIR ?? "/tmp", USER: process.env.USER ?? "",
       MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: String(port), MAGNITUDE_DESKTOP_STATE_DIR: state,
-      NODE_EXTRA_CA_CERTS: fixture.caPath, SSL_CERT_FILE: fixture.caPath, MAGNITUDE_SHELL_ENV_INHERITED: "1" }
+      NODE_EXTRA_CA_CERTS: fixture.caPath, MAGNITUDE_SHELL_ENV_INHERITED: "1" }
     yield* fs.makeDirectory(environment.HOME, { recursive: true, mode: 0o700 })
     return yield* Effect.gen(function* () {
       const installer = yield* Installer

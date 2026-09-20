@@ -276,6 +276,13 @@ unsigned code. A changed catalog-signed file can appear unsigned; that is not ev
 embedded-signature rejection. Negative native fixtures select an observed embedded signature and
 change a covered PE section while preserving the signature structure.
 These checks do not establish SmartScreen reputation or qualify a client OS from a Server probe.
+Debian development package trust verifies the admitted archive digest and length, compares every
+installed payload file and symlink against native DEB extraction, and rehashes the admitted runtime
+archives. A native archive listing must identify the standard unsigned container layout. Embedded
+signatures require an independent expected-publisher policy and cannot be silently accepted as
+unsigned; unknown members fail classification. Evidence explicitly records Unsigned and
+productionTrusted=false. This does not establish APT repository trust, and production DEB trust
+remains blocked until its publisher policy is configured.
 Native dependency inspection preserves required, weak and delayed imports and platform loader
 search paths. A missing or malformed tool report cannot become an empty successful graph.
 Reading declarations does not establish dependency closure: acceptance must resolve the complete
