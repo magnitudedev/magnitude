@@ -1,6 +1,6 @@
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{allocate, fill, Backend, TensorData, WIDTHS};
+use reference::{allocate, fill, Backend, TensorData};
 use seismic_lang::types::DType;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -51,20 +51,20 @@ fn exercise(backend: &mut Backend<'_>) {
                     "accepted {name} must remain unchanged"
                 );
             }
-            for (name, value) in step.as_object().unwrap() {
-                if name == "hidden" {
-                    continue;
-                }
+            // The entry publishes its owned results: next_window, next_delta
+            // and the residual out are result leaves 0, 1 and 2.
+            let published: [(&str, &str); 3] = [
+                ("window", "result0"),
+                ("delta", "result1"),
+                ("out", "result2"),
+            ];
+            for (name, leaf) in published {
+                let value = &step.as_object().unwrap()[name];
                 let expected = doubles(value).map(|v| v as f32).collect::<Vec<_>>();
-                let published = if name == "window" || name == "delta" {
-                    format!("next_{name}")
-                } else {
-                    name.clone()
-                };
-                let TensorData::Dense { dtype, .. } = &tensors[&published] else {
+                let TensorData::Dense { dtype, .. } = &tensors[leaf] else {
                     panic!()
                 };
-                let actual = reference::values(&tensors[&published]);
+                let actual = reference::values(&tensors[leaf]);
                 assert_eq!(actual.len(), expected.len());
                 let mut maximum = 0f32;
                 for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
@@ -86,8 +86,8 @@ fn exercise(backend: &mut Backend<'_>) {
                 );
             }
             // Accept the step: the published successor becomes the recurrent state.
-            for name in ["window", "delta"] {
-                let next = tensors[&format!("next_{name}")].clone();
+            for (name, leaf) in [("window", "result0"), ("delta", "result1")] {
+                let next = tensors[leaf].clone();
                 tensors.insert(name.into(), next);
             }
         }
@@ -96,9 +96,7 @@ fn exercise(backend: &mut Backend<'_>) {
 #[test]
 fn reference_recurrent_step() {
     let program = seismic_engine::models::qwen35::program::program().unwrap();
-    for width in WIDTHS {
-        exercise(&mut Backend::Interpreter(&program, width));
-    }
+    exercise(&mut Backend::Interpreter(&program, HashMap::new()));
 }
 #[test]
 #[ignore = "requires a Metal device"]

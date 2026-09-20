@@ -38,6 +38,12 @@ Numerical admissibility is a hard solver constraint. Performance is optimized on
 admissible family. Evidence is whole-witness evidence and does not transfer to a different program,
 entry, specialization, witness, backend environment, corpus, or compiler method.
 
+Transfers compose through nested schedules, repeated loops, reductions, calls, and dtype
+conversions; the composed assessment of the selected assignment is checked against the caller's
+policy as one constraint. When no admissible assignment exists, the complete planning model is
+reported infeasible; the compiler does not infer a cause from a rejected probe assignment. Search
+effort limits optimization only and cannot turn a feasible program into a no-incumbent failure.
+
 A qualification retains the exact bounded policy used for elementwise checking. It may satisfy a
 later policy only when every tolerance and special-value requirement is at least as permissive and
 the input-domain facts are identical. Aggregate maxima alone never reconstruct a combined

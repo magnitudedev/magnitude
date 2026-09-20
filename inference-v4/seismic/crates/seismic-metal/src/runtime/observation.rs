@@ -1,5 +1,6 @@
-//! Optional native qualification timestamps. No selection or model construction
-//! consumes this module. One sampled compute encoder identifies each dispatch.
+//! Optional native qualification timestamps. One sampled compute encoder
+//! identifies each dispatch; no selection or model construction consumes it.
+#![allow(dead_code)]
 use super::*;
 use objc2_foundation::NSRange;
 use objc2_metal::{

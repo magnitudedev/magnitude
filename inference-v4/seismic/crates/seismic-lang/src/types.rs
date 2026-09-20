@@ -1,5 +1,10 @@
-//! Types of structured Seismic. Semantic extents, structural extents and native
-//! geometry are distinct authorities and never collapse into one integer.
+//! Canonical value types, paths, and the canonical leaf traversal.
+//!
+//! `ValueType` is the single canonical type language used by interfaces, calls,
+//! the ABI, result allocation, and binding. Ownership (owned tensor / shared
+//! view / exclusive mutable view) is a *signature* property carried next to the
+//! type, never a type variant: a tensor is one semantic leaf however it is
+//! accessed.
 
 use crate::sym::Sym;
 use std::fmt;
@@ -70,7 +75,7 @@ impl DType {
     }
 }
 
-/// Element type of a tensor or tile.
+/// Element type of a tensor.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     Dtype(DType),
@@ -101,49 +106,97 @@ impl fmt::Display for Elem {
     }
 }
 
-/// A static region binder within one definition body (index into `sir::Body::slices`).
-/// All dynamic visits of the binder share this identity and one numerical site.
+/// Identity of a runtime-determined extent. At the logical level a
+/// `RuntimeExtent` carries its value and capacity; at the checked
+/// level extents are symbolic over shape parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SliceId(pub u32);
-
-/// A static region within one definition body (index into `sir::Body::regions`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RegionId(pub u32);
+pub struct RuntimeExtentId(pub u32);
 
 /// Extent of one axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Extent {
-    /// A problem dimension; numerically usable.
-    Semantic(Sym),
-    /// The width of a slice. Never a source number in portable code. A shape parameter of a
-    /// helper bound to a structural argument is substituted by this at the call occurrence.
-    Structural(SliceId),
+pub enum ExtentExpr {
+    Static(u64),
+    /// A symbolic expression over shape parameters (the checked-level form).
+    Sym(Sym),
+    /// A runtime extent allocated by logical construction.
+    Runtime(RuntimeExtentId),
 }
 
-impl Extent {
-    pub fn semantic(&self) -> Option<&Sym> {
+impl ExtentExpr {
+    pub fn as_static(&self) -> Option<u64> {
         match self {
-            Extent::Semantic(s) => Some(s),
-            Extent::Structural(_) => None,
+            ExtentExpr::Static(n) => Some(*n),
+            ExtentExpr::Sym(s) => s.as_constant().and_then(|c| u64::try_from(c).ok()),
+            ExtentExpr::Runtime(_) => None,
+        }
+    }
+
+    pub fn sym(&self) -> Option<&Sym> {
+        match self {
+            ExtentExpr::Sym(s) => Some(s),
+            _ => None,
         }
     }
 }
 
+impl fmt::Display for ExtentExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExtentExpr::Static(n) => write!(f, "{n}"),
+            ExtentExpr::Sym(s) => write!(f, "{s}"),
+            ExtentExpr::Runtime(id) => write!(f, "runtime#{}", id.0),
+        }
+    }
+}
+
+/// A nonempty list; tuple components are never empty (an empty source result
+/// canonicalizes to `Void`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Shaped {
-    pub axes: Vec<Extent>,
+pub struct NonEmpty<T>(Vec<T>);
+
+impl<T> NonEmpty<T> {
+    pub fn new(items: Vec<T>) -> Option<NonEmpty<T>> {
+        (!items.is_empty()).then(|| NonEmpty(items))
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn first(&self) -> &T {
+        &self.0[0]
+    }
+}
+
+/// Semantic shape of a tensor value: one semantic leaf, one or more physical
+/// planes when the element is a packed representation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TensorType {
+    pub axes: Vec<ExtentExpr>,
     pub elem: Elem,
     /// For a packed representation: the axis along which packets run.
     pub packed_axis: Option<usize>,
 }
 
-impl Shaped {
-    pub fn new(axes: Vec<Extent>, elem: Elem) -> Shaped {
+impl TensorType {
+    pub fn new(axes: Vec<ExtentExpr>, elem: Elem) -> TensorType {
         let packed_axis = match elem {
             Elem::Repr(_) => Some(axes.len().saturating_sub(1)),
             _ => None,
         };
-        Shaped {
+        TensorType {
             axes,
             elem,
             packed_axis,
@@ -155,80 +208,60 @@ impl Shaped {
     }
 }
 
-/// One value per visit of the producing region, keeping its slice correspondence.
+/// A backend-owned opaque value (`metal.simdgroup_matrix` fragments). Capability
+/// values cannot cross portable boundaries or the public ABI.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ResultTy {
-    /// The region that introduced the partition. A region traversing earlier results and
-    /// yielding new values has a new `producer` but the same `origin`.
-    pub origin: RegionId,
-    pub producer: RegionId,
-    /// The origin's binders, in order. Consumers must bind the same arity.
-    pub binders: Vec<SliceId>,
-    /// Member schema; structural axes refer to `binders` (or enclosing slices).
-    pub member: Ty,
-}
-
-/// A backend-owned opaque operand (`metal.simdgroup_matrix(f32)`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NativeTy {
+pub struct CapabilityValueType {
     pub target: String,
     pub name: String,
-    pub shape: Vec<Sym>,
+    pub shape: Vec<ExtentExpr>,
     pub elem: Option<Elem>,
 }
 
+/// The canonical value type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Ty {
+pub enum ValueType {
     Scalar(DType),
     /// `i32` refined to `0 <= i < bound`.
-    Index(Sym),
-    /// External storage.
-    Tensor(Shaped),
-    /// Borrowed selection of a tensor or tile.
-    View(Shaped),
-    /// Owned logical block.
-    Tile(Shaped),
-    /// `range[N]`, retaining its semantic upper bound.
-    Range(Sym),
-    Slice(SliceId),
-    /// Tile coordinate over a structural axis (binder of `owned`/`axis`). Coordinates over
-    /// semantic axes are `Index`.
-    Coord(SliceId),
-    Result(Box<ResultTy>),
-    Tuple(Vec<Ty>),
+    Index {
+        bound: ExtentExpr,
+    },
+    /// A bounded logical half-open range value.
+    Range {
+        bound: ExtentExpr,
+    },
+    Tensor(TensorType),
+    Tuple(NonEmpty<ValueType>),
+    CapabilityValue(CapabilityValueType),
+    /// The canonical form of an empty result or tuple. Creates no graph data
+    /// value or storage; a void boundary retains transport/completion only.
     Void,
-    Native(NativeTy),
 }
 
-impl Ty {
-    pub fn shaped(&self) -> Option<&Shaped> {
+impl ValueType {
+    pub fn shaped(&self) -> Option<&TensorType> {
         match self {
-            Ty::Tensor(s) | Ty::View(s) | Ty::Tile(s) => Some(s),
+            ValueType::Tensor(s) => Some(s),
             _ => None,
         }
     }
 
     pub fn scalar_dtype(&self) -> Option<DType> {
         match self {
-            Ty::Scalar(d) => Some(*d),
-            Ty::Index(_) => Some(DType::I32),
+            ValueType::Scalar(d) => Some(*d),
+            ValueType::Index { .. } => Some(DType::I32),
             _ => None,
         }
     }
-}
 
-impl fmt::Display for Extent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Extent::Semantic(s) => write!(f, "{s}"),
-            Extent::Structural(s) => write!(f, "slice#{}", s.0),
-        }
+    pub fn is_void(&self) -> bool {
+        matches!(self, ValueType::Void)
     }
 }
 
-impl fmt::Display for Ty {
+impl fmt::Display for ValueType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn shape(s: &Shaped) -> String {
+        fn shape(s: &TensorType) -> String {
             format!(
                 "[{}] {}",
                 s.axes
@@ -240,16 +273,11 @@ impl fmt::Display for Ty {
             )
         }
         match self {
-            Ty::Scalar(d) => write!(f, "{}", d.name()),
-            Ty::Index(n) => write!(f, "index[{n}]"),
-            Ty::Tensor(s) => write!(f, "tensor{}", shape(s)),
-            Ty::View(s) => write!(f, "view{}", shape(s)),
-            Ty::Tile(s) => write!(f, "tile{}", shape(s)),
-            Ty::Range(bound) => write!(f, "range[{bound}]"),
-            Ty::Slice(s) => write!(f, "slice#{}", s.0),
-            Ty::Coord(s) => write!(f, "coord(slice#{})", s.0),
-            Ty::Result(r) => write!(f, "result#{}<{}>", r.origin.0, r.member),
-            Ty::Tuple(items) => write!(
+            ValueType::Scalar(d) => write!(f, "{}", d.name()),
+            ValueType::Index { bound } => write!(f, "index[{bound}]"),
+            ValueType::Range { bound } => write!(f, "range[{bound}]"),
+            ValueType::Tensor(s) => write!(f, "tensor{}", shape(s)),
+            ValueType::Tuple(items) => write!(
                 f,
                 "({})",
                 items
@@ -258,8 +286,75 @@ impl fmt::Display for Ty {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Ty::Void => write!(f, "void"),
-            Ty::Native(n) => write!(f, "{}.{}", n.target, n.name),
+            ValueType::CapabilityValue(n) => write!(f, "{}.{}", n.target, n.name),
+            ValueType::Void => write!(f, "void"),
         }
     }
+}
+
+/// Ordinal path of one component of a value: tuple nesting and ordinal paths
+/// are preserved; names never define identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ValuePath(pub Vec<u32>);
+
+impl fmt::Display for ValuePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("()");
+        }
+        let joined = self.0.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        joined.join(".").fmt(f)
+    }
+}
+
+impl ValuePath {
+    pub fn extend(&self, index: u32) -> ValuePath {
+        let mut out = self.0.clone();
+        out.push(index);
+        ValuePath(out)
+    }
+}
+
+/// One semantic leaf of a canonical type, as seen by interfaces, calls, the
+/// ABI, result allocation, and binding. Range is one semantic leaf (two ABI
+/// scalar fields); a tensor is one semantic leaf (one or more planes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leaf<'a> {
+    Scalar(DType),
+    Index(&'a ExtentExpr),
+    Range(&'a ExtentExpr),
+    Tensor(&'a TensorType),
+}
+
+/// The one canonical leaf traversal. `Err` names a capability value, which
+/// cannot cross a portable boundary or the public ABI. `Void` has no leaves.
+pub fn canonical_leaves(ty: &ValueType) -> Result<Vec<(ValuePath, Leaf<'_>)>, String> {
+    let mut out = Vec::new();
+    fn walk<'a>(
+        ty: &'a ValueType,
+        path: &ValuePath,
+        out: &mut Vec<(ValuePath, Leaf<'a>)>,
+    ) -> Result<(), String> {
+        match ty {
+            ValueType::Scalar(d) => out.push((path.clone(), Leaf::Scalar(*d))),
+            ValueType::Index { bound } => out.push((path.clone(), Leaf::Index(bound))),
+            ValueType::Range { bound } => out.push((path.clone(), Leaf::Range(bound))),
+            ValueType::Tensor(s) => out.push((path.clone(), Leaf::Tensor(s))),
+            ValueType::Tuple(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk(item, &path.extend(i as u32), out)?;
+                }
+            }
+            ValueType::CapabilityValue(n) => {
+                return Err(format!(
+                    "a `{}.{}` capability value cannot cross a portable boundary or the public ABI",
+                    n.target, n.name
+                ))
+            }
+            ValueType::Void => {}
+        }
+        Ok(())
+    }
+    walk(ty, &ValuePath::default(), &mut out)?;
+    Ok(out)
 }

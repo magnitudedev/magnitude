@@ -1,14 +1,28 @@
-//! Effective Metal target profile: the normalized intersection of observed device/compiler
-//! support, the source intrinsic registry, and realizations this backend can actually emit.
+//! Effective Metal target profile: the exact intersection of observed
+//! device/compiler support with the source intrinsic registry and the
+//! signatures this backend can actually emit.
+//!
+//! A signature is registered only when typing, reference meaning, detection,
+//! legalization, resources, numerics, and emission are complete:
+//! `metal.subgroup.{lane_index,shuffle,simd_sum,simd_max,simd_min}` are
+//! registered. `metal.matrix` is observed by the device probes but is NOT
+//! registered until fragment emission is complete; authored uses of an
+//! unregistered signature are removed before planning with reasons, and the
+//! portable bodies remain.
 
 use seismic_lang::{
-    intrinsics::Operation,
+    intrinsics::{self, CapabilitySignature, IntrinsicId},
     sir::IntrinsicUse,
-    types::{DType, Elem, Ty},
+    types::{DType, Elem, ValueType},
 };
+use std::collections::BTreeSet;
 
-pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-metal-realizations-v2";
+pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-metal-realizations-v3";
 pub const COMPILER_PROBE_REVISION: &str = "seismic-metal-compile-probes-v1";
+/// Identity of this backend's cost model: the probe-calibrated estimate
+/// model, carried with its provenance. Uncalibrated costs affect ranking
+/// only, never legality.
+pub const COST_MODEL_IDENTITY: &str = crate::mapping::estimate::IDENTITY;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MatrixCombination {
@@ -17,56 +31,101 @@ pub struct MatrixCombination {
     pub right: DType,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SignatureType {
-    Integer,
-    Float(DType),
-    Fragment8x8(DType),
-    Matrix2(DType),
-    Void,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Signature {
-    path: String,
-    arguments: Vec<SignatureType>,
-    result: SignatureType,
-}
-
-impl SignatureType {
-    fn canonical(&self) -> String {
-        match self {
-            Self::Integer => "i32".into(),
-            Self::Float(dtype) => dtype.name().into(),
-            Self::Fragment8x8(dtype) => format!("fragment8x8<{}>", dtype.name()),
-            Self::Matrix2(dtype) => format!("matrix2<{}>", dtype.name()),
-            Self::Void => "void".into(),
-        }
-    }
-}
-
-impl Signature {
-    fn canonical(&self) -> String {
-        format!(
-            "{}({})->{}",
-            self.path,
-            self.arguments
-                .iter()
-                .map(SignatureType::canonical)
-                .collect::<Vec<_>>()
-                .join(","),
-            self.result.canonical()
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The exact effective signature set of one observed device: registry
+/// signatures this backend registers (subgroup collective dtypes admitted by
+/// native compile probes). Matrix signatures stay absent until fragment
+/// emission is complete.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TargetProfile {
-    signatures: Vec<Signature>,
+    signatures: Vec<CapabilitySignature>,
     fingerprint: String,
 }
 
 impl TargetProfile {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_evidence(
+        observation: &str,
+        scalar_dtypes: &[DType],
+        matrix_dtypes: &[DType],
+        _matrix_combinations: &[MatrixCombination],
+        max_threads: u64,
+        max_threadgroup_bytes: u64,
+        max_buffer_bytes: u64,
+        private_budget_bytes: u64,
+    ) -> Self {
+        // Registered signatures: the registry's metal.subgroup entries whose
+        // dtype survived the native compile probe, and the logical
+        // metal.matrix matmul entries whose dtypes survived it.
+        let mut signatures = Vec::new();
+        for entry in intrinsics::capabilities() {
+            if entry.id.capability.backend != "metal" {
+                continue;
+            }
+            let admitted = match entry.id.capability.name.as_str() {
+                "subgroup" => {
+                    entry.arguments.iter().all(|argument| match argument {
+                        ValueType::Scalar(dtype) => scalar_dtypes.contains(dtype),
+                        _ => false,
+                    }) && match &entry.result {
+                        ValueType::Scalar(dtype) => scalar_dtypes.contains(dtype),
+                        _ => false,
+                    }
+                }
+                "matrix" => {
+                    // The logical matmul signatures: every dtype the entry
+                    // mentions must have survived the matrix probe.
+                    let dtypes_of = |ty: &ValueType| match ty {
+                        ValueType::Tensor(tensor) => match &tensor.elem {
+                            Elem::Dtype(dtype) => Some(*dtype),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    entry
+                        .arguments
+                        .iter()
+                        .chain([&entry.result])
+                        .filter_map(dtypes_of)
+                        .all(|dtype| matrix_dtypes.contains(&dtype))
+                }
+                _ => continue,
+            };
+            if admitted {
+                signatures.push(entry);
+            }
+        }
+        signatures.sort_by(|a, b| a.id.path().cmp(&b.id.path()));
+        signatures.dedup_by(|a, b| a.id == b.id);
+        let identity = signatures
+            .iter()
+            .map(|signature| {
+                format!(
+                    "{}({})->{}",
+                    signature.id.path(),
+                    signature
+                        .arguments
+                        .iter()
+                        .map(|argument| argument_type_name(argument))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    argument_type_name(&signature.result)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let fingerprint = format!(
+            "seismic-metal-target-v3;observation={observation};probe={COMPILER_PROBE_REVISION};\
+             registry={};backend={BACKEND_IMPLEMENTATION_REVISION};cost={COST_MODEL_IDENTITY};\
+             threads={max_threads};threadgroup={max_threadgroup_bytes};buffer={max_buffer_bytes};\
+             private={private_budget_bytes};signatures={identity}",
+            intrinsics::REGISTRY_REVISION,
+        );
+        Self {
+            signatures,
+            fingerprint,
+        }
+    }
+
     pub fn synthetic(
         max_threads: u64,
         max_threadgroup_bytes: u64,
@@ -77,33 +136,7 @@ impl TargetProfile {
             "synthetic-metal-baseline",
             &[DType::F16, DType::F32],
             &[DType::F16, DType::F32],
-            &[
-                MatrixCombination {
-                    accumulator: DType::F16,
-                    left: DType::F16,
-                    right: DType::F16,
-                },
-                MatrixCombination {
-                    accumulator: DType::F32,
-                    left: DType::F16,
-                    right: DType::F16,
-                },
-                MatrixCombination {
-                    accumulator: DType::F32,
-                    left: DType::F16,
-                    right: DType::F32,
-                },
-                MatrixCombination {
-                    accumulator: DType::F32,
-                    left: DType::F32,
-                    right: DType::F16,
-                },
-                MatrixCombination {
-                    accumulator: DType::F32,
-                    left: DType::F32,
-                    right: DType::F32,
-                },
-            ],
+            &[],
             max_threads,
             max_threadgroup_bytes,
             max_buffer_bytes,
@@ -111,138 +144,17 @@ impl TargetProfile {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_evidence(
-        observation: &str,
-        scalar_dtypes: &[DType],
-        matrix_dtypes: &[DType],
-        matrix_combinations: &[MatrixCombination],
-        max_threads: u64,
-        max_threadgroup_bytes: u64,
-        max_buffer_bytes: u64,
-        private_budget_bytes: u64,
-    ) -> Self {
-        let mut signatures = Vec::new();
-        let mut push = |path: &str, arguments: Vec<SignatureType>, result: SignatureType| {
-            signatures.push(Signature {
-                path: path.into(),
-                arguments,
-                result,
-            });
-        };
-        push("metal.subgroup.lane_index", vec![], SignatureType::Integer);
-        for &dtype in scalar_dtypes {
-            let float = SignatureType::Float(dtype);
-            push(
-                "metal.subgroup.shuffle",
-                vec![float.clone(), SignatureType::Integer],
-                float.clone(),
-            );
-            for name in ["simd_sum", "simd_max", "simd_min"] {
-                push(
-                    &format!("metal.subgroup.{name}"),
-                    vec![float.clone()],
-                    float.clone(),
-                );
-            }
-        }
-        for &dtype in matrix_dtypes {
-            let fragment = SignatureType::Fragment8x8(dtype);
-            let matrix = SignatureType::Matrix2(dtype);
-            push("metal.matrix.simdgroup_matrix", vec![], fragment.clone());
-            for name in ["simdgroup_load", "simdgroup_load_t"] {
-                push(
-                    &format!("metal.matrix.{name}"),
-                    vec![
-                        fragment.clone(),
-                        matrix.clone(),
-                        SignatureType::Integer,
-                        SignatureType::Integer,
-                    ],
-                    SignatureType::Void,
-                );
-            }
-            push(
-                "metal.matrix.simdgroup_store",
-                vec![
-                    fragment,
-                    matrix,
-                    SignatureType::Integer,
-                    SignatureType::Integer,
-                ],
-                SignatureType::Void,
-            );
-        }
-        for combination in matrix_combinations {
-            push(
-                "metal.matrix.simdgroup_multiply_accumulate",
-                vec![
-                    SignatureType::Fragment8x8(combination.accumulator),
-                    SignatureType::Fragment8x8(combination.left),
-                    SignatureType::Fragment8x8(combination.right),
-                    SignatureType::Fragment8x8(combination.accumulator),
-                ],
-                SignatureType::Void,
-            );
-            push(
-                "metal.matrix.matmul",
-                vec![
-                    SignatureType::Matrix2(combination.left),
-                    SignatureType::Matrix2(combination.right),
-                ],
-                SignatureType::Matrix2(combination.accumulator),
-            );
-            push(
-                "metal.matrix.matmul_add",
-                vec![
-                    SignatureType::Matrix2(combination.left),
-                    SignatureType::Matrix2(combination.right),
-                    SignatureType::Matrix2(combination.accumulator),
-                ],
-                SignatureType::Matrix2(combination.accumulator),
-            );
-        }
-        signatures.sort_by_key(Signature::canonical);
-        signatures.dedup();
-        let signature_identity = signatures
-            .iter()
-            .map(Signature::canonical)
-            .collect::<Vec<_>>()
-            .join("|");
-        let fingerprint = format!(
-            "seismic-metal-target-v2;observation={observation};probe={COMPILER_PROBE_REVISION};registry={};backend={BACKEND_IMPLEMENTATION_REVISION};threads={max_threads};threadgroup={max_threadgroup_bytes};buffer={max_buffer_bytes};private={private_budget_bytes};signatures={signature_identity}",
-            seismic_lang::intrinsics::REGISTRY_REVISION,
-        );
-        Self {
-            signatures,
-            fingerprint,
-        }
-    }
-
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
 
-    /// Capability-family evidence used by constructive physical planning.
-    /// Exact intrinsic admission remains signature-based below; this only
-    /// prevents the physical target from claiming a family with no admitted
-    /// signature at all.
-    pub fn supports_family(&self, prefix: &str) -> bool {
-        self.signatures.iter().any(|signature| {
-            signature.path == prefix || signature.path.starts_with(&format!("{prefix}."))
-        })
+    /// The exact effective signature ids (planning capability coverage).
+    pub fn effective_signatures(&self) -> BTreeSet<IntrinsicId> {
+        self.signatures.iter().map(|s| s.id.clone()).collect()
     }
 
-    pub fn supports_dtype(&self, dtype: DType) -> bool {
-        let spelling = dtype.name();
-        self.signatures.iter().any(|signature| {
-            signature
-                .canonical()
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .any(|token| token == spelling)
-        })
-    }
-
+    /// Exact intrinsic admission: the use must match a registered signature's
+    /// id and concrete argument/result types.
     pub fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         if intrinsic.id.capability.backend != "metal" {
             return Err(format!(
@@ -251,184 +163,96 @@ impl TargetProfile {
                 intrinsic.id.capability.backend
             ));
         }
-        let signature = classify(intrinsic).ok_or_else(|| {
-            format!(
-                "invalid exact intrinsic use `{}` with arguments {:?} and result {}",
-                intrinsic.id.path(),
-                intrinsic.arguments,
-                intrinsic.result
-            )
-        })?;
-        self.signatures
-            .contains(&signature)
-            .then_some(())
-            .ok_or_else(|| {
-                format!(
-                "effective Metal target profile does not support exact intrinsic signature `{}`",
-                signature.canonical()
-            )
-            })
-    }
-}
-
-fn scalar(ty: &Ty) -> Option<SignatureType> {
-    match ty {
-        Ty::Scalar(dtype) if dtype.is_float() => Some(SignatureType::Float(*dtype)),
-        Ty::Scalar(DType::I32) => Some(SignatureType::Integer),
-        Ty::Index(_) => Some(SignatureType::Integer),
-        _ => None,
-    }
-}
-
-fn fragment(ty: &Ty) -> Option<SignatureType> {
-    match ty {
-        Ty::Native(native)
-            if native.target == "metal"
-                && native.name == "simdgroup_matrix"
-                && native.shape.len() == 2
-                && native
-                    .shape
+        let registered = self.signatures.iter().any(|signature| {
+            signature.id == intrinsic.id
+                && signature.arguments.len() == intrinsic.arguments.len()
+                && signature
+                    .arguments
                     .iter()
-                    .all(|extent| extent.as_constant() == Some(8)) =>
-        {
-            match native.elem.as_ref() {
-                Some(Elem::Dtype(dtype)) => Some(SignatureType::Fragment8x8(*dtype)),
-                _ => None,
-            }
+                    .zip(&intrinsic.arguments)
+                    .all(|(a, b)| concrete_matches(a, b))
+                && concrete_matches(&signature.result, &intrinsic.result)
+        });
+        if registered {
+            Ok(())
+        } else {
+            Err(format!(
+                "effective Metal target profile does not support exact intrinsic signature \
+                 `{}` (registered signatures: {})",
+                intrinsic.id.path(),
+                if self.signatures.is_empty() {
+                    "none".into()
+                } else {
+                    self.signatures
+                        .iter()
+                        .map(|s| s.id.path())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ))
         }
-        _ => None,
     }
 }
 
-fn matrix(ty: &Ty) -> Option<SignatureType> {
+fn argument_type_name(ty: &ValueType) -> String {
     match ty {
-        Ty::Tile(shape) | Ty::View(shape) => Some(shape),
-        _ => None,
-    }
-    .and_then(|shape| {
-        if shape.rank() != 2 {
-            return None;
-        }
-        match shape.elem {
-            Elem::Dtype(dtype) => Some(SignatureType::Matrix2(dtype)),
-            _ => None,
-        }
-    })
-}
-
-fn logical_matrix(ty: &Ty) -> Option<SignatureType> {
-    match ty {
-        Ty::Tensor(shape) | Ty::Tile(shape) | Ty::View(shape) if shape.rank() == 2 => {
-            match shape.elem {
-                Elem::Dtype(dtype) => Some(SignatureType::Matrix2(dtype)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn classify(intrinsic: &IntrinsicUse) -> Option<Signature> {
-    let path = intrinsic.id.path();
-    let (arguments, result) = match intrinsic.operation {
-        Operation::LaneIndex => (vec![], scalar(&intrinsic.result)?),
-        Operation::ShuffleIndex => match intrinsic.arguments.as_slice() {
-            [value, index] => (
-                vec![scalar(value)?, scalar(index)?],
-                scalar(&intrinsic.result)?,
-            ),
-            _ => return None,
+        ValueType::Scalar(d) => d.name().into(),
+        ValueType::Index { .. } => "i32".into(),
+        ValueType::Range { .. } => "range".into(),
+        ValueType::Tensor(s) => match &s.elem {
+            seismic_lang::types::Elem::Dtype(d) => format!("tensor2<{}>", d.name()),
+            _ => "tensor2<repr>".into(),
         },
-        Operation::SimdSum | Operation::SimdMax | Operation::SimdMin => {
-            let [value] = intrinsic.arguments.as_slice() else {
-                return None;
-            };
-            (vec![scalar(value)?], scalar(&intrinsic.result)?)
+        ValueType::Tuple(_) => "tuple".into(),
+        ValueType::CapabilityValue(n) => format!("capability.{}.{}", n.target, n.name),
+        ValueType::Void => "void".into(),
+    }
+}
+
+/// Concrete type match against a registry signature type: scalars match
+/// exactly; symbolic tensor patterns match by rank and element.
+fn concrete_matches(pattern: &ValueType, concrete: &ValueType) -> bool {
+    match (pattern, concrete) {
+        (ValueType::Scalar(a), ValueType::Scalar(b)) => a == b,
+        (ValueType::Tensor(pattern_tensor), ValueType::Tensor(concrete_tensor)) => {
+            pattern_tensor.rank() == concrete_tensor.rank()
+                && pattern_tensor.elem == concrete_tensor.elem
+                || (matches!(pattern_tensor.elem, seismic_lang::types::Elem::Param(_))
+                    && pattern_tensor.rank() == concrete_tensor.rank()
+                    && matches!(concrete_tensor.elem, seismic_lang::types::Elem::Dtype(_)))
         }
-        Operation::Matrix => {
-            if !intrinsic.arguments.is_empty() {
-                return None;
-            }
-            (vec![], fragment(&intrinsic.result)?)
-        }
-        Operation::MatrixLoad | Operation::MatrixLoadTranspose | Operation::MatrixStore => {
-            let [frag, tile, row, column] = intrinsic.arguments.as_slice() else {
-                return None;
-            };
-            (
-                vec![
-                    fragment(frag)?,
-                    matrix(tile)?,
-                    scalar(row)?,
-                    scalar(column)?,
-                ],
-                if intrinsic.result == Ty::Void {
-                    SignatureType::Void
-                } else {
-                    return None;
-                },
-            )
-        }
-        Operation::MatrixMultiplyAccumulate => {
-            let [accumulator, left, right, result] = intrinsic.arguments.as_slice() else {
-                return None;
-            };
-            (
-                vec![
-                    fragment(accumulator)?,
-                    fragment(left)?,
-                    fragment(right)?,
-                    fragment(result)?,
-                ],
-                if intrinsic.result == Ty::Void {
-                    SignatureType::Void
-                } else {
-                    return None;
-                },
-            )
-        }
-        Operation::MatrixMatmul => {
-            let [left, right] = intrinsic.arguments.as_slice() else {
-                return None;
-            };
-            (
-                vec![logical_matrix(left)?, logical_matrix(right)?],
-                logical_matrix(&intrinsic.result)?,
-            )
-        }
-        Operation::MatrixMatmulAdd => {
-            let [left, right, accumulator] = intrinsic.arguments.as_slice() else {
-                return None;
-            };
-            (
-                vec![
-                    logical_matrix(left)?,
-                    logical_matrix(right)?,
-                    logical_matrix(accumulator)?,
-                ],
-                logical_matrix(&intrinsic.result)?,
-            )
-        }
-    };
-    Some(Signature {
-        path,
-        arguments,
-        result,
-    })
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::intrinsics::{CapabilityId, IntrinsicId};
+    use seismic_lang::intrinsics::CapabilityId;
     use seismic_lang::sym::Sym;
-    use seismic_lang::types::{Extent, Shaped};
+    use seismic_lang::types::{ExtentExpr, TensorType};
+
+    fn intrinsic(
+        family: &str,
+        name: &str,
+        arguments: Vec<ValueType>,
+        result: ValueType,
+    ) -> IntrinsicUse {
+        IntrinsicUse {
+            id: IntrinsicId {
+                capability: CapabilityId::new("metal", family),
+                name: name.into(),
+            },
+            arguments,
+            result,
+        }
+    }
 
     #[test]
-    fn fingerprint_tracks_exact_signature_and_software_intersection() {
+    fn fingerprint_tracks_exact_signature_intersection() {
         let base = TargetProfile::from_evidence(
             "msl=3.2@probe;families=metal3,apple9@query",
-            &[DType::F16, DType::F32],
+            &[DType::F16],
             &[DType::F16],
             &[MatrixCombination {
                 accumulator: DType::F16,
@@ -443,12 +267,8 @@ mod tests {
         let wider = TargetProfile::from_evidence(
             "msl=3.2@probe;families=metal3,apple9@query",
             &[DType::F16, DType::F32],
-            &[DType::F16, DType::F32],
-            &[MatrixCombination {
-                accumulator: DType::F16,
-                left: DType::F16,
-                right: DType::F16,
-            }],
+            &[DType::F16],
+            &[],
             1024,
             32 * 1024,
             1 << 30,
@@ -456,34 +276,14 @@ mod tests {
         );
         assert_ne!(base.fingerprint(), wider.fingerprint());
         for identity in [
-            seismic_lang::intrinsics::REGISTRY_REVISION,
+            intrinsics::REGISTRY_REVISION,
             BACKEND_IMPLEMENTATION_REVISION,
             COMPILER_PROBE_REVISION,
+            COST_MODEL_IDENTITY,
         ] {
             assert!(base.fingerprint().contains(identity));
         }
-        assert!(base.fingerprint().contains("private=131072"));
-        assert!(base
-            .fingerprint()
-            .contains("metal.subgroup.simd_sum(f32)->f32"));
-    }
-
-    fn intrinsic(operation: Operation, arguments: Vec<Ty>, result: Ty) -> IntrinsicUse {
-        let (family, name) = match operation {
-            Operation::SimdSum => ("subgroup", "simd_sum"),
-            Operation::MatrixMatmul => ("matrix", "matmul"),
-            Operation::MatrixMatmulAdd => ("matrix", "matmul_add"),
-            _ => unreachable!("unsupported test intrinsic"),
-        };
-        IntrinsicUse {
-            id: IntrinsicId {
-                capability: CapabilityId::new("metal", family),
-                name: name.into(),
-            },
-            operation,
-            arguments,
-            result,
-        }
+        assert!(base.fingerprint().contains("signatures="));
     }
 
     #[test]
@@ -500,44 +300,28 @@ mod tests {
         );
         assert!(profile
             .supports_intrinsic(&intrinsic(
-                Operation::SimdSum,
-                vec![Ty::Scalar(DType::F32)],
-                Ty::Scalar(DType::F32),
+                "subgroup",
+                "simd_sum",
+                vec![ValueType::Scalar(DType::F32)],
+                ValueType::Scalar(DType::F32),
             ))
             .is_ok());
         assert!(profile
             .supports_intrinsic(&intrinsic(
-                Operation::SimdSum,
-                vec![Ty::Scalar(DType::BF16)],
-                Ty::Scalar(DType::BF16),
+                "subgroup",
+                "simd_sum",
+                vec![ValueType::Scalar(DType::BF16)],
+                ValueType::Scalar(DType::BF16),
             ))
             .unwrap_err()
             .contains("does not support exact intrinsic signature"));
-        assert!(profile
-            .supports_intrinsic(&intrinsic(
-                Operation::SimdSum,
-                vec![Ty::Scalar(DType::F32)],
-                Ty::Scalar(DType::F16),
-            ))
-            .unwrap_err()
-            .contains("does not support exact intrinsic signature"));
-    }
-
-    fn matrix(rows: i64, columns: i64, dtype: DType) -> Ty {
-        Ty::Tensor(Shaped::new(
-            vec![
-                Extent::Semantic(Sym::constant(rows)),
-                Extent::Semantic(Sym::constant(columns)),
-            ],
-            Elem::Dtype(dtype),
-        ))
     }
 
     #[test]
-    fn logical_matrix_admission_is_derived_from_exact_mma_evidence() {
+    fn matrix_signatures_register_with_their_probed_dtypes() {
         let profile = TargetProfile::from_evidence(
             "synthetic-observation",
-            &[],
+            &[DType::F32],
             &[DType::F16, DType::F32],
             &[MatrixCombination {
                 accumulator: DType::F32,
@@ -549,22 +333,53 @@ mod tests {
             1 << 30,
             128 * 1024,
         );
+        let matrix = |elem| {
+            ValueType::Tensor(TensorType::new(
+                vec![
+                    ExtentExpr::Sym(Sym::param("rows")),
+                    ExtentExpr::Sym(Sym::param("columns")),
+                ],
+                elem,
+            ))
+        };
+        let inner = |elem| {
+            ValueType::Tensor(TensorType::new(
+                vec![
+                    ExtentExpr::Sym(Sym::param("rows")),
+                    ExtentExpr::Sym(Sym::param("inner")),
+                ],
+                elem,
+            ))
+        };
+        let columns = |elem| {
+            ValueType::Tensor(TensorType::new(
+                vec![
+                    ExtentExpr::Sym(Sym::param("inner")),
+                    ExtentExpr::Sym(Sym::param("columns")),
+                ],
+                elem,
+            ))
+        };
+        let f16 = seismic_lang::types::Elem::Dtype(DType::F16);
+        let f32 = seismic_lang::types::Elem::Dtype(DType::F32);
         assert!(profile
             .supports_intrinsic(&intrinsic(
-                Operation::MatrixMatmulAdd,
-                vec![
-                    matrix(9, 17, DType::F16),
-                    matrix(17, 11, DType::F16),
-                    matrix(9, 11, DType::F32),
-                ],
-                matrix(9, 11, DType::F32),
+                "matrix",
+                "matmul",
+                vec![inner(f16.clone()), columns(f16.clone())],
+                matrix(f32.clone()),
             ))
             .is_ok());
+        // A dtype the probe did not admit stays unsupported.
         assert!(profile
             .supports_intrinsic(&intrinsic(
-                Operation::MatrixMatmul,
-                vec![matrix(8, 8, DType::F32), matrix(8, 8, DType::F32)],
-                matrix(8, 8, DType::F32),
+                "matrix",
+                "matmul",
+                vec![
+                    inner(seismic_lang::types::Elem::Dtype(DType::BF16)),
+                    columns(seismic_lang::types::Elem::Dtype(DType::BF16))
+                ],
+                matrix(f32.clone()),
             ))
             .unwrap_err()
             .contains("does not support exact intrinsic signature"));

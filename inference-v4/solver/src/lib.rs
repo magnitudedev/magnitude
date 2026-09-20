@@ -5,9 +5,9 @@ pub mod result;
 pub mod scheduling;
 pub mod search;
 pub use model::Domain;
-pub use model::{Model, ModelBuilder, VarId};
-pub use result::{FeasibleSolution, Outcome, Progress, Solution};
-pub use search::{Algorithm, Limits, NeighborhoodOptions, Options, Policy, Search, Stats};
+pub use model::{FactorId, Model, ModelBuilder, VarId};
+pub use result::{Budgeted, FeasibleAssignment, FeasibleSolution, Outcome, Progress, Solution};
+pub use search::{Algorithm, Budget, Limits, NeighborhoodOptions, Options, Policy, Search, Stats};
 
 pub use model::{Error, Result};
 pub mod bounds;

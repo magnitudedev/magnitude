@@ -1,10 +1,15 @@
-//! Metal target configuration for executable planning.
+//! Metal target configuration and the pipeline `Backend` implementation.
 
 #[path = "mapping/estimate.rs"]
-mod estimate;
+pub mod estimate;
+
 pub use estimate::{EstimateModel, Group, Totals, IDENTITY};
 
-use seismic_lang::sir::IntrinsicUse;
+use crate::physical::{self, MetalDialect, StrategyLimits};
+use seismic_lang::{logical::LogicalProgram, sir::IntrinsicUse};
+use seismic_realization::executable::{
+    EffectiveTargetProfile, PlanFamily, ResolvedLaunch, TargetLimits,
+};
 
 pub const TARGET: &str = "metal";
 pub const MAX_GROUPS: u64 = 65_535;
@@ -27,13 +32,94 @@ impl Limits {
             max_private_bytes: device.profile.private_storage_budget_bytes.value,
         }
     }
+
+    pub fn synthetic() -> Self {
+        Self {
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_bytes: 32 * 1024,
+            max_private_bytes: CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
+        }
+    }
 }
 
+/// The Metal backend: the effective target profile (exact signatures and
+/// limits).
 pub struct Metal {
-    pub(crate) limits: Limits,
-    pub(crate) target_profile: crate::target::TargetProfile,
-    pub(crate) executable_target_profile:
-        seismic_realization::executable::ExecutableTargetProfile<crate::physical::MetalCapability>,
+    target_profile: crate::target::TargetProfile,
+    executable_target_profile: EffectiveTargetProfile,
+}
+
+impl Metal {
+    pub fn new(limits: Limits) -> Result<Self, String> {
+        if limits.max_threads_per_threadgroup < u64::from(SUBGROUP)
+            || i64::try_from(limits.max_threads_per_threadgroup).is_err()
+            || i64::try_from(limits.max_threadgroup_bytes).is_err()
+        {
+            return Err(format!(
+                "Metal needs at least {SUBGROUP} threads per threadgroup; the target offers {}",
+                limits.max_threads_per_threadgroup
+            ));
+        }
+        let target_profile = crate::target::TargetProfile::synthetic(
+            limits.max_threads_per_threadgroup,
+            limits.max_threadgroup_bytes,
+            u64::MAX,
+            limits.max_private_bytes,
+        );
+        Ok(Self::from_profile(limits, target_profile))
+    }
+
+    fn from_profile(limits: Limits, target_profile: crate::target::TargetProfile) -> Self {
+        let executable_target_profile = EffectiveTargetProfile {
+            backend: TARGET.into(),
+            capability_fingerprint: target_profile.fingerprint().into(),
+            toolchain_fingerprint: format!(
+                "{};{}",
+                crate::target::BACKEND_IMPLEMENTATION_REVISION,
+                crate::target::COMPILER_PROBE_REVISION
+            ),
+            effective_signatures: target_profile.effective_signatures(),
+            limits: TargetLimits {
+                max_participants: limits.max_threads_per_threadgroup.min(i64::MAX as u64) as i64,
+                max_workgroups_axis: [MAX_GROUPS.min(i64::MAX as u64) as i64; 3],
+                max_workgroup_bytes: limits.max_threadgroup_bytes.min(i64::MAX as u64) as i64,
+                max_explicit_private_bytes: limits.max_private_bytes.min(i64::MAX as u64) as i64,
+                max_direct_bindings: (crate::msl::MAX_KERNEL_BUFFERS - 3) as i64,
+                max_argument_table_bytes: 1 << 16,
+                max_device_bytes: i64::MAX,
+            },
+        };
+        Self {
+            target_profile,
+            executable_target_profile,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn from_device(device: &crate::runtime::DeviceInfo) -> Result<Self, String> {
+        let limits = Limits::from_device(device);
+        let target_profile = crate::target::TargetProfile::from_evidence(
+            &device.capability_fingerprint(),
+            &device.profile.scalar_dtypes.value,
+            &device.profile.matrix_dtypes.value,
+            &device.profile.matrix_combinations.value,
+            device.max_threads_per_threadgroup,
+            device.max_threadgroup_bytes,
+            device.max_buffer_bytes,
+            device.profile.private_storage_budget_bytes.value,
+        );
+        Ok(Self::from_profile(limits, target_profile))
+    }
+
+    pub fn target_profile(&self) -> &crate::target::TargetProfile {
+        &self.target_profile
+    }
+
+    /// The effective target profile of the realization layer (exact
+    /// signatures and hard limits).
+    pub fn executable_profile(&self) -> &EffectiveTargetProfile {
+        &self.executable_target_profile
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -56,102 +142,8 @@ impl<'a> MetalCompiler<'a> {
     }
 }
 
-fn physical_capabilities(
-    target: &crate::target::TargetProfile,
-) -> std::collections::BTreeSet<crate::physical::MetalCapability> {
-    let mut capabilities =
-        std::collections::BTreeSet::from([crate::physical::MetalCapability::Scalar]);
-    if target.supports_family("metal.subgroup") {
-        capabilities.insert(crate::physical::MetalCapability::Simdgroup);
-    }
-    if target.supports_family("metal.matrix") {
-        capabilities.insert(crate::physical::MetalCapability::SimdgroupMatrix);
-    }
-    if target.supports_dtype(seismic_lang::types::DType::BF16) {
-        capabilities.insert(crate::physical::MetalCapability::BFloat);
-    }
-    capabilities
-}
-
-impl Metal {
-    pub fn new(limits: Limits, estimate: EstimateModel) -> Result<Self, String> {
-        if limits.max_threads_per_threadgroup < SUBGROUP as u64
-            || i64::try_from(limits.max_threads_per_threadgroup).is_err()
-            || i64::try_from(limits.max_threadgroup_bytes).is_err()
-        {
-            return Err(format!(
-                "Metal needs at least {} threads per threadgroup; the target offers {}",
-                SUBGROUP, limits.max_threads_per_threadgroup
-            ));
-        }
-        estimate.validate()?;
-        let target_profile = crate::target::TargetProfile::synthetic(
-            limits.max_threads_per_threadgroup,
-            limits.max_threadgroup_bytes,
-            u64::MAX,
-            limits.max_private_bytes,
-        );
-        let executable_target_profile = seismic_realization::executable::ExecutableTargetProfile {
-            target: TARGET.into(),
-            capability_fingerprint: target_profile.fingerprint().into(),
-            toolchain_fingerprint: format!(
-                "{};{}",
-                crate::target::BACKEND_IMPLEMENTATION_REVISION,
-                crate::target::COMPILER_PROBE_REVISION
-            ),
-            limits: seismic_realization::executable::ExecutableTargetLimits {
-                max_allocation_bytes: i64::MAX as u64,
-                max_device_bytes: i64::MAX as u64,
-                max_workgroup_bytes: limits.max_threadgroup_bytes,
-                max_private_bytes_per_participant: limits.max_private_bytes,
-                max_bindings_per_launch: crate::msl::MAX_KERNEL_BUFFERS as u64,
-                max_registers_per_kernel: i64::MAX as u64,
-                max_workgroups: [MAX_GROUPS; 3],
-                max_participants_per_workgroup: limits.max_threads_per_threadgroup,
-            },
-            capabilities: physical_capabilities(&target_profile),
-        };
-        Ok(Self {
-            limits,
-            target_profile,
-            executable_target_profile,
-        })
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn from_device(device: &crate::runtime::DeviceInfo) -> Result<Self, String> {
-        let mut backend = Self::new(
-            Limits::from_device(device),
-            EstimateModel::from_device(device),
-        )?;
-        backend.target_profile = crate::target::TargetProfile::from_evidence(
-            &device.capability_fingerprint(),
-            &device.profile.scalar_dtypes.value,
-            &device.profile.matrix_dtypes.value,
-            &device.profile.matrix_combinations.value,
-            device.max_threads_per_threadgroup,
-            device.max_threadgroup_bytes,
-            device.max_buffer_bytes,
-            device.profile.private_storage_budget_bytes.value,
-        );
-        backend.executable_target_profile.capability_fingerprint =
-            backend.target_profile.fingerprint().into();
-        backend.executable_target_profile.capabilities =
-            physical_capabilities(&backend.target_profile);
-        backend
-            .executable_target_profile
-            .limits
-            .max_allocation_bytes = device.max_buffer_bytes;
-        Ok(backend)
-    }
-
-    pub fn target_profile(&self) -> &crate::target::TargetProfile {
-        &self.target_profile
-    }
-}
-
 impl seismic_compiler::pipeline::Backend for Metal {
-    type Dialect = crate::physical::MetalDialect;
+    type Dialect = MetalDialect;
     type EncodedLaunch = crate::msl::EncodedLaunch;
     type NativeArtifact = crate::msl::Emitted;
 
@@ -166,22 +158,22 @@ impl seismic_compiler::pipeline::Backend for Metal {
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         self.target_profile.supports_intrinsic(intrinsic)
     }
-    fn target_profile(
-        &self,
-    ) -> &seismic_realization::executable::ExecutableTargetProfile<
-        <Self::Dialect as seismic_realization::executable::ExecutableDialect>::Capability,
-    > {
+    fn target_profile(&self) -> &EffectiveTargetProfile {
         &self.executable_target_profile
     }
-    fn elaborate(
-        &self,
-        logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<seismic_realization::executable::PlanFamily<Self::Dialect>, String> {
-        crate::physical::elaborate(logical, self.limits.max_threads_per_threadgroup)
+    fn elaborate(&self, logical: &LogicalProgram) -> Result<PlanFamily<Self::Dialect>, String> {
+        physical::elaborate(
+            logical,
+            &self.executable_target_profile,
+            StrategyLimits {
+                max_participants: self.executable_target_profile.limits.max_participants,
+            },
+        )
+        .map_err(|error| error.to_string())
     }
     fn encode_launch(
         &self,
-        launch: &seismic_realization::executable::ResolvedLaunch<Self::Dialect>,
+        launch: &ResolvedLaunch<Self::Dialect>,
     ) -> Result<Self::EncodedLaunch, String> {
         crate::msl::encode_launch(launch)
     }
@@ -195,7 +187,7 @@ impl seismic_compiler::pipeline::Backend for Metal {
 
 #[cfg(target_os = "macos")]
 impl seismic_compiler::pipeline::Backend for MetalCompiler<'_> {
-    type Dialect = crate::physical::MetalDialect;
+    type Dialect = MetalDialect;
     type EncodedLaunch = crate::msl::EncodedLaunch;
     type NativeArtifact = crate::runtime::Pipeline;
 
@@ -211,22 +203,15 @@ impl seismic_compiler::pipeline::Backend for MetalCompiler<'_> {
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         self.planner.target_profile.supports_intrinsic(intrinsic)
     }
-    fn target_profile(
-        &self,
-    ) -> &seismic_realization::executable::ExecutableTargetProfile<
-        <Self::Dialect as seismic_realization::executable::ExecutableDialect>::Capability,
-    > {
+    fn target_profile(&self) -> &EffectiveTargetProfile {
         &self.planner.executable_target_profile
     }
-    fn elaborate(
-        &self,
-        logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<seismic_realization::executable::PlanFamily<Self::Dialect>, String> {
-        crate::physical::elaborate(logical, self.planner.limits.max_threads_per_threadgroup)
+    fn elaborate(&self, logical: &LogicalProgram) -> Result<PlanFamily<Self::Dialect>, String> {
+        seismic_compiler::pipeline::Backend::elaborate(&self.planner, logical)
     }
     fn encode_launch(
         &self,
-        launch: &seismic_realization::executable::ResolvedLaunch<Self::Dialect>,
+        launch: &ResolvedLaunch<Self::Dialect>,
     ) -> Result<Self::EncodedLaunch, String> {
         crate::msl::encode_launch(launch)
     }
@@ -234,6 +219,7 @@ impl seismic_compiler::pipeline::Backend for MetalCompiler<'_> {
         &self,
         encoded: seismic_compiler::pipeline::EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
     ) -> Result<Self::NativeArtifact, String> {
-        self.device.compile(crate::msl::assemble(encoded)?)
+        let emitted = seismic_compiler::pipeline::Backend::assemble(&self.planner, encoded)?;
+        self.device.compile(emitted)
     }
 }

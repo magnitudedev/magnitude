@@ -1,276 +1,365 @@
-//! The joint selection family of one entry on one target for one workload:
-//! guarded static call occurrences with their applicable authored implementations,
-//! numerical sites, and ordered execution-unit sequences. Target-neutral.
+//! Occurrence applicability: which authored implementations of one contract
+//! are applicable at one call occurrence on one effective target.
 //!
-//! This is a finite description of what the authors supplied. It is not a rewriting
-//! space: nothing here invents calls, producers, stages, partitions or groupings.
-//! Dynamic repetition (visits, elements, tokens) never creates occurrences or sites.
-//!
-//! Logical specialization consumes this finite authored family and physical
-//! elaboration turns it into backend-owned constructive choices.
+//! Portable bodies and same-backend lowerings are peer semantic alternatives,
+//! a backend helper is reachable only from the same backend, and every
+//! candidate must satisfy its `where` predicates (under the occurrence's bound
+//! shapes), its caller-element requirements, and the effective capability
+//! environment.
 
-use super::sir::IntrinsicUse;
-use super::sir::{CallId, DefId, Program};
-use super::types::{Elem, RegionId, SliceId};
-use crate::precision::NumericalEffect;
-use crate::precision::PrecisionPolicy;
-use std::collections::BTreeMap;
+use crate::intrinsics::{CapabilityId, NumericalTransfer};
+use crate::logical::ImplementationKind;
+use crate::sir::{
+    CandidateBinding, CheckedCall, DefId, DefKind, Definition, IntrinsicUse, Predicate, Program,
+};
+use crate::sym::Sym;
+use crate::types::{Elem, ExtentExpr};
+use std::collections::BTreeSet;
 
-mod construct;
-mod normalize;
-
-pub use construct::construct;
-
-/// Effective backend environment used while constructing a selectable family. The callback
-/// answers for one exact, typed intrinsic use after hardware, driver/toolchain and backend
-/// implementation support have been intersected. There is deliberately no permissive default:
-/// every production caller must supply the environment it will actually execute on.
-pub struct TargetEnvironment<'a> {
-    pub target: &'a str,
-    pub capability_fingerprint: &'a str,
-    pub supports_intrinsic: &'a dyn Fn(&IntrinsicUse) -> Result<(), String>,
-}
-
-/// Concrete semantic specialization of an entry. Every field is part of selection identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct Workload {
-    pub shapes: BTreeMap<String, i64>,
-    pub elems: BTreeMap<String, Elem>,
-    pub precision: PrecisionPolicy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TemplateId(pub u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OccurrenceId(pub u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SiteId(pub u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SequenceId(pub u32);
-
-/// A candidate of an occurrence: `(occurrence, ordinal into its candidates)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CandidateRef {
-    pub occurrence: OccurrenceId,
-    pub candidate: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct Family {
-    pub entry: String,
-    pub target: String,
-    /// Exact effective capability identity used to remove unsupported candidates.
-    pub capability_fingerprint: String,
-    pub workload: Workload,
-    /// Whether realization may exercise numerical freedoms (for unconstrained exploration or
-    /// one accepted qualified witness). Strict construction keeps conditional freedoms such as
-    /// unordered reduction on their reference-preserving form.
-    pub allow_numerical_effects: bool,
-    /// Interned specialized bodies. Two occurrences of one definition under equal
-    /// bindings share a template and keep separate choices, sites and costs.
-    pub templates: Vec<Template>,
-    /// `occurrences[0]` is the entry: its candidates are all applicable portable bodies,
-    /// same-target function bodies, and same-target lowerings.
-    pub occurrences: Vec<Occurrence>,
-    pub sites: Vec<Site>,
-    /// `(refinement, refined)`: the width site of a binder over an enclosing slice of the same
-    /// body (`parallel [r] in rows:`) and the width site of that slice. A refinement
-    /// partitions the pieces of the refined binder, so its value divides the refined value.
-    pub refinements: Vec<(SiteId, SiteId)>,
-    pub sequences: Vec<Sequence>,
-    /// Supported-looking candidates the construction could not analyze. Never silently
-    /// dropped: selection reports them and cannot claim full-family coverage.
-    pub obligations: Vec<Obligation>,
-}
-
-/// One definition specialized to concrete semantic shapes/elements and a pattern of
-/// structural shape arguments (`structural` lists shape parameters bound to caller slices).
-#[derive(Clone, Debug)]
-pub struct Template {
-    pub id: TemplateId,
-    pub definition: DefId,
-    pub shapes: BTreeMap<String, i64>,
-    pub elems: BTreeMap<String, Elem>,
-    pub structural: Vec<String>,
-    /// Shape parameters bound to a runtime-valued semantic extent of the caller (the length
-    /// of a runtime-bounded range such as visible history). Semantic, numerically usable,
-    /// not static and never a site: the value is the caller's extent expression at the call
-    /// occurrence. Predicates over such a parameter are undecidable at selection, so a
-    /// candidate whose applicability depends on one is inapplicable.
-    pub dynamic: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Occurrence {
-    pub id: OccurrenceId,
-    /// The candidate whose body contains this call; `None` for the entry.
-    pub parent: Option<CandidateRef>,
-    /// The call within the parent's template body; `None` for the entry.
-    pub call: Option<CallId>,
-    pub family: usize,
-    /// Every applicable authored implementation. Empty means missing coverage on this path
-    /// (the parent candidate is then unselectable; at the entry it is an error).
-    pub candidates: Vec<Candidate>,
-    /// Inapplicable definitions with the reason, for inspection.
-    pub rejected: Vec<(DefId, String)>,
-}
-
+/// One candidate of an occurrence: a definition plus how its generic
+/// parameters bind at this call.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub template: TemplateId,
-    /// The function or lowering declaration that contributes this candidate.
-    pub via: DefId,
-    /// Whether this is the portable semantic reference body of the function family.
-    pub reference: bool,
-    /// Numerical freedoms requiring evidence when this is not the reference computation.
-    pub numerical_effects: Vec<NumericalEffect>,
-    /// Caller slice bound to each structural shape parameter of the template.
-    pub structural: Vec<(String, SiteRef)>,
-    /// Runtime-valued semantic shape parameters expressed in the caller's
-    /// canonical extent symbols. These bindings are occurrence-specific.
-    pub dynamic: Vec<(String, crate::sym::Sym)>,
-    /// Applicability that depends on numbers: holds for the selected site values or the
-    /// candidate is unselectable.
-    pub requirements: Vec<Requirement>,
-    pub children: Vec<OccurrenceId>,
-    pub sites: Vec<SiteId>,
-    pub sequences: Vec<SequenceId>,
+    pub definition: DefId,
+    pub kind: ImplementationKind,
+    /// Callee shape parameter -> symbolic extent in the caller's space.
+    pub shape_args: Vec<(String, Sym)>,
+    /// Callee element parameter -> concrete element.
+    pub elem_args: Vec<(String, Elem)>,
+    /// Caller element parameters that must equal these concrete elements.
+    pub requires_elems: Vec<(String, Elem)>,
+    /// Argument expression ordinal for each candidate parameter. The logical
+    /// boundary requires every candidate of an occurrence to share the
+    /// contract's positional order.
+    pub arg_order: Vec<usize>,
 }
 
 impl Candidate {
-    /// Whether selecting this implementation requires non-reference evidence. Reassociation is
-    /// conditional: strict realization can retain authored order, so it is not evidence-requiring
-    /// by itself. Approximate primitives and backend intrinsics execute different operations.
-    pub fn requires_numerical_evidence(&self) -> bool {
-        !self.reference
-            || self.numerical_effects.iter().any(|effect| {
-                matches!(
-                    effect,
-                    NumericalEffect::ApproximateTranscendental(_)
-                        | NumericalEffect::BackendIntrinsic { .. }
+    fn of(program: &Program, binding: &CandidateBinding) -> Option<Candidate> {
+        let definition = program.definition(binding.definition);
+        let kind = kind_of(program, definition)?;
+        Some(Candidate {
+            definition: binding.definition,
+            kind,
+            shape_args: binding.shape_args.clone(),
+            elem_args: binding.elem_args.clone(),
+            requires_elems: binding.requires_elems.clone(),
+            arg_order: binding.arg_order.clone(),
+        })
+    }
+}
+
+fn kind_of(program: &Program, definition: &Definition) -> Option<ImplementationKind> {
+    let _ = program;
+    match definition.kind {
+        DefKind::Body { target: None } => Some(ImplementationKind::PortableBody),
+        DefKind::Body { target: Some(_) } => Some(ImplementationKind::BackendBody),
+        DefKind::Lower { .. } => Some(ImplementationKind::Lowering),
+    }
+}
+
+/// Whether a definition is reachable on `target`.
+fn reachable_on(kind: ImplementationKind, definition: &Definition, target: &str) -> bool {
+    match kind {
+        ImplementationKind::PortableBody => true,
+        ImplementationKind::BackendBody | ImplementationKind::Lowering => {
+            definition.kind.target() == Some(target)
+        }
+    }
+}
+
+/// The candidates a checked call occurrence carries, filtered to the effective
+/// target (portable bodies stay; backend bodies and lowerings apply only on
+/// their own backend).
+pub fn candidates_of_call(program: &Program, call: &CheckedCall, target: &str) -> Vec<Candidate> {
+    call.bindings
+        .iter()
+        .filter_map(|binding| Candidate::of(program, binding))
+        .filter(|candidate| {
+            reachable_on(
+                candidate.kind,
+                program.definition(candidate.definition),
+                target,
+            )
+        })
+        .collect()
+}
+
+/// The candidates of the entry itself: every body and lowering of the family
+/// reachable on the target, plus the definitions unreachable on it (with the
+/// reason, for applicability reports). The entry's generic parameters bind to
+/// the workload's concrete shapes/elements.
+pub fn entry_candidates(
+    program: &Program,
+    family: usize,
+    target: &str,
+) -> (Vec<Candidate>, Vec<(DefId, String)>) {
+    let family = &program.families[family];
+    let mut out = Vec::new();
+    let mut rejected = Vec::new();
+    for id in family.bodies.iter().chain(family.lowerings.iter()) {
+        let definition = program.definition(*id);
+        let Some(kind) = kind_of(program, definition) else {
+            continue;
+        };
+        if !reachable_on(kind, definition, target) {
+            rejected.push((
+                *id,
+                format!(
+                    "`{}` is authored for `{}` and is not reachable on `{}`",
+                    definition.name,
+                    definition.kind.target().unwrap_or_default(),
+                    target
+                ),
+            ));
+            continue;
+        }
+        let shape_args = definition
+            .shape_params
+            .iter()
+            .map(|p| (p.clone(), Sym::param(p)))
+            .collect();
+        let elem_args = definition
+            .elem_params
+            .iter()
+            .map(|p| (p.clone(), Elem::Param(p.clone())))
+            .collect();
+        let arg_order = (0..definition.params.len()).collect();
+        out.push(Candidate {
+            definition: *id,
+            kind,
+            shape_args,
+            elem_args,
+            requires_elems: Vec::new(),
+            arg_order,
+        });
+    }
+    (out, rejected)
+}
+
+/// One applicable alternative of an occurrence.
+#[derive(Clone, Debug)]
+pub struct ResolvedAlternative {
+    pub candidate: Candidate,
+    pub required_capabilities: BTreeSet<CapabilityId>,
+    pub authored_numerical_effects: Vec<NumericalTransfer>,
+}
+
+/// The applicability answer for one occurrence.
+#[derive(Clone, Debug, Default)]
+pub struct OccurrenceAlternatives {
+    pub alternatives: Vec<ResolvedAlternative>,
+    /// Inapplicable definitions with the reason, for inspection and reports.
+    pub rejected: Vec<(DefId, String)>,
+}
+
+/// Evaluate applicability of `candidates` at one occurrence.
+///
+/// `caller_shape` answers the concrete value of one caller shape parameter
+/// (`None` when it is runtime-determined or unknown); `caller_elem` answers
+/// the concrete element of one caller element parameter. A predicate over a
+/// value that is not concretely known is undecidable, so the candidate is
+/// inapplicable.
+pub fn applicable(
+    program: &Program,
+    target: &str,
+    supports_intrinsic: &dyn Fn(&IntrinsicUse) -> Result<(), String>,
+    candidates: &[Candidate],
+    caller_shape: &dyn Fn(&str) -> Option<i64>,
+    caller_elem: &dyn Fn(&str) -> Option<Elem>,
+) -> OccurrenceAlternatives {
+    let _ = target;
+    let mut out = OccurrenceAlternatives::default();
+    for candidate in candidates {
+        let definition = program.definition(candidate.definition);
+        if let Err(reason) = predicates_hold(definition, candidate, caller_shape) {
+            out.rejected.push((candidate.definition, reason));
+            continue;
+        }
+        if let Err(reason) = elements_hold(candidate, caller_elem) {
+            out.rejected.push((candidate.definition, reason));
+            continue;
+        }
+        let mut required = BTreeSet::new();
+        for capability in &definition.requires {
+            required.insert(capability.clone());
+        }
+        let mut supported = true;
+        for use_ in &definition.intrinsic_uses {
+            required.insert(use_.id.capability.clone());
+            if let Err(reason) = supports_intrinsic(use_) {
+                out.rejected.push((
+                    candidate.definition,
+                    format!("capability `{}`: {reason}", use_.id.path()),
+                ));
+                supported = false;
+                break;
+            }
+        }
+        if !supported {
+            continue;
+        }
+        out.alternatives.push(ResolvedAlternative {
+            candidate: candidate.clone(),
+            required_capabilities: required,
+            authored_numerical_effects: authored_effects(definition, &definition.intrinsic_uses),
+        });
+    }
+    out
+}
+
+/// Substitute the candidate's shape bindings into the definition's `where`
+/// predicates and decide them under the caller's concrete shapes.
+fn predicates_hold(
+    definition: &Definition,
+    candidate: &Candidate,
+    caller_shape: &dyn Fn(&str) -> Option<i64>,
+) -> Result<(), String> {
+    for predicate in &definition.predicates {
+        let bound = |name: &str| -> Option<Sym> {
+            candidate
+                .shape_args
+                .iter()
+                .find(|(p, _)| p == name)
+                .map(|(_, sym)| sym.clone())
+        };
+        let substituted = match predicate {
+            Predicate::NonNegative(expr) => substitute(expr, &bound),
+            Predicate::Zero(expr) => substitute(expr, &bound),
+            Predicate::NonZero(expr) => substitute(expr, &bound),
+        };
+        let eval = |expr: &Sym| -> Result<i64, String> {
+            expr.eval(caller_shape).ok_or_else(|| {
+                format!(
+                    "the `where` predicate `{expr}` depends on a value that is not a concrete shape at this occurrence"
                 )
             })
+        };
+        match predicate {
+            Predicate::NonNegative(expr) => {
+                let value = eval(&substituted).map_err(|reason| {
+                    format!("predicate `0 <= {expr}` is undecidable: {reason}")
+                })?;
+                if value < 0 {
+                    return Err(format!(
+                        "predicate `0 <= {expr}` fails: the bound value is {value}"
+                    ));
+                }
+            }
+            Predicate::Zero(expr) => {
+                let value = eval(&substituted).map_err(|reason| {
+                    format!("predicate `{expr} == 0` is undecidable: {reason}")
+                })?;
+                if value != 0 {
+                    return Err(format!(
+                        "predicate `{expr} == 0` fails: the bound value is {value}"
+                    ));
+                }
+            }
+            Predicate::NonZero(expr) => {
+                let value = eval(&substituted).map_err(|reason| {
+                    format!("predicate `{expr} != 0` is undecidable: {reason}")
+                })?;
+                if value == 0 {
+                    return Err(format!(
+                        "predicate `{expr} != 0` fails: the bound value is 0"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Substitute the candidate's bound shape parameters into one predicate
+/// expression; unbound parameters are kept symbolic (and therefore
+/// undecidable).
+fn substitute(expr: &Sym, bound: &dyn Fn(&str) -> Option<Sym>) -> Sym {
+    let mut out = Sym::constant(0);
+    for (monomial, coefficient) in expr.monomials() {
+        let mut term = Sym::constant(coefficient);
+        for (atom, power) in monomial {
+            let atom_value = match atom {
+                crate::sym::Atom::Param(name) => {
+                    bound(name).unwrap_or_else(|| Sym::atom(atom.clone()))
+                }
+                crate::sym::Atom::Quot(..) | crate::sym::Atom::Rem(..) => Sym::atom(atom.clone()),
+            };
+            for _ in 0..*power {
+                term = term.mul(&atom_value);
+            }
+        }
+        out = out.add(&term);
+    }
+    out
+}
+
+/// The caller element parameters this candidate requires must be bound to
+/// exactly these concrete elements.
+fn elements_hold(
+    candidate: &Candidate,
+    caller_elem: &dyn Fn(&str) -> Option<Elem>,
+) -> Result<(), String> {
+    for (param, required) in &candidate.requires_elems {
+        match caller_elem(param) {
+            None => {
+                return Err(format!(
+                    "element parameter `{param}` is not concrete at this occurrence"
+                ))
+            }
+            Some(actual) if &actual != required => {
+                return Err(format!(
+                    "requires `{param} = {required}` but the occurrence binds `{actual}`"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The authored numerical effects of one alternative. The portable reference
+/// body contributes the registry's reference numerics; its capability uses
+/// carry their registry transfer. A non-reference authored implementation
+/// (backend body or lowering) starts with `Unknown` whole-candidate
+/// equivalence.
+fn authored_effects(definition: &Definition, uses: &[IntrinsicUse]) -> Vec<NumericalTransfer> {
+    match definition.kind {
+        DefKind::Body { target: None } => uses
+            .iter()
+            .map(|use_| {
+                crate::intrinsics::lookup(
+                    &use_.id.capability.backend,
+                    &use_.id.capability.name,
+                    &use_.id.name,
+                )
+                .into_iter()
+                .find(|signature| {
+                    signature.arguments == use_.arguments && signature.result == use_.result
+                })
+                .map(|signature| signature.numerical)
+                .unwrap_or(NumericalTransfer::Capability {
+                    signature: use_.id.clone(),
+                    bound: None,
+                })
+            })
+            .collect(),
+        DefKind::Body { target: Some(_) } | DefKind::Lower { .. } => {
+            vec![NumericalTransfer::Unknown {
+                reason: format!(
+                    "`{}` is a non-reference authored implementation; whole-candidate numerical equivalence starts unknown",
+                    definition.name
+                ),
+            }]
+        }
     }
 }
 
-/// A site visible from a candidate: its own, or one owned by an ancestor candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SiteRef(pub SiteId);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Requirement {
-    /// Site value is a multiple of `unit` (atom / packet alignment from a `where`).
-    Multiple {
-        site: SiteId,
-        unit: i64,
-    },
-    AtLeast {
-        site: SiteId,
-        value: i64,
-    },
-    AtMost {
-        site: SiteId,
-        value: i64,
-    },
-    Equal {
-        site: SiteId,
-        value: i64,
-    },
-    /// `full(P)`: the site value divides the slice's parent extent.
-    Divides {
-        site: SiteId,
-        extent: i64,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub struct Site {
-    pub id: SiteId,
-    pub owner: CandidateRef,
-    pub kind: SiteKind,
-    /// Static semantic extent of the partitioned domain when known (upper bound for a
-    /// runtime extent). Widths range over `1..=extent`; backends narrow the domain.
-    pub extent: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SiteKind {
-    /// Width of a `parallel`/`ordered`/`pipeline` binder over a domain or refinement.
-    Width { region: RegionId, slice: SliceId },
-    /// Partition count of a `merge` region axis.
-    Parts { region: RegionId, slice: SliceId },
-}
-
-/// The normalized execution units of one block, in authored order.
-#[derive(Clone, Debug)]
-pub struct Sequence {
-    pub id: SequenceId,
-    pub owner: CandidateRef,
-    /// Path of the block inside the template body: region/stage/branch steps from the root.
-    pub scope: Vec<ScopeStep>,
-    pub units: Vec<Unit>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ScopeStep {
-    Region(RegionId),
-    Stage(usize),
-    Then(usize),
-    Else(usize),
-    Loop(usize),
-}
-
-#[derive(Clone, Debug)]
-pub struct Unit {
-    /// Statement ordinals of the normalized block this unit covers (contiguous).
-    pub statements: std::ops::Range<usize>,
-    pub kind: UnitKind,
-    /// Completion that must hold before the next unit starts (stage/region boundary at
-    /// this scope). A fused interval may cross it only with a realization preserving it.
-    pub completion_after: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnitKind {
-    /// Tile-valued binding or state update computed elementwise over its axes.
-    Elementwise,
-    /// Reduction, scalar work, or other local computation that is not elementwise.
-    Local,
-    /// Static call occurrence whose implementation is selected from its linked family.
-    Call(OccurrenceId),
-    Publish,
-    Region(RegionId),
-    Stage(usize),
-}
-
-#[derive(Clone, Debug)]
-pub struct Obligation {
-    pub occurrence: OccurrenceId,
-    pub definition: DefId,
-    pub reason: String,
-}
-
-impl Family {
-    pub fn occurrence(&self, id: OccurrenceId) -> &Occurrence {
-        &self.occurrences[id.0 as usize]
+/// The concrete extent environment of one specialization, for predicate
+/// evaluation: shape parameter name -> concrete value when static.
+pub fn static_shape_of(extent: &ExtentExpr) -> Option<i64> {
+    match extent {
+        ExtentExpr::Static(n) => Some(*n as i64),
+        _ => None,
     }
-
-    pub fn candidate(&self, r: CandidateRef) -> &Candidate {
-        &self.occurrence(r.occurrence).candidates[r.candidate as usize]
-    }
-
-    pub fn template(&self, id: TemplateId) -> &Template {
-        &self.templates[id.0 as usize]
-    }
-}
-
-/// Program handle used by consumers that need definition bodies for a template.
-pub fn body<'a>(
-    program: &'a Program,
-    family: &Family,
-    template: TemplateId,
-) -> &'a super::sir::Body {
-    &program
-        .definition(family.template(template).definition)
-        .body
 }

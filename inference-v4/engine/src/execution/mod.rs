@@ -3,7 +3,7 @@
 use crate::weights::residency::ResidentWeight;
 use seismic_lang::{
     sir::Param,
-    types::{DType, Elem, Extent, Shaped, Ty},
+    types::{DType, Elem, ExtentExpr, TensorType, ValueType},
 };
 use seismic_runtime::{
     plan::{Bindings, CompiledPlan, InvocationResults, PlanCompiler, StepObservation, Submission},
@@ -35,22 +35,24 @@ impl IntegerRange {
     }
 }
 /// Entry parameters carry only semantic extents; a slice width has no caller value.
-fn extents(tensor: &Shaped, shapes: &HashMap<String, i64>) -> Result<Vec<usize>, String> {
+fn extents(tensor: &TensorType, shapes: &HashMap<String, i64>) -> Result<Vec<usize>, String> {
     tensor
         .axes
         .iter()
         .map(|axis| match axis {
-            Extent::Semantic(extent) => extent
+            ExtentExpr::Sym(extent) => extent
                 .eval(&|p| shapes.get(p).copied())
                 .and_then(|v| usize::try_from(v).ok())
                 .ok_or_else(|| "unresolved entry tensor shape".to_string()),
-            Extent::Structural(_) => Err("entry tensor has a structural extent".into()),
+            ExtentExpr::Static(_) | ExtentExpr::Runtime(_) => {
+                Err("entry tensor extent is not a shape parameter".into())
+            }
         })
         .collect()
 }
-fn tensor<'a>(params: &'a [Param], name: &str) -> Option<&'a Shaped> {
+fn tensor<'a>(params: &'a [Param], name: &str) -> Option<&'a TensorType> {
     params.iter().find_map(|p| match &p.ty {
-        Ty::Tensor(t) | Ty::View(t) if p.name == name => Some(t),
+        ValueType::Tensor(t) if p.name == name => Some(t),
         _ => None,
     })
 }
@@ -94,7 +96,7 @@ impl Composition {
             if !weight.belongs_to(compiler.device()) {
                 return Err(format!("weight {name} belongs to another resource domain").into());
             }
-            let (Ty::Tensor(t) | Ty::View(t)) = &params
+            let ValueType::Tensor(t) = &params
                 .iter()
                 .find(|p| &p.name == name)
                 .ok_or_else(|| format!("unknown weight {name}"))?
@@ -140,7 +142,7 @@ impl Composition {
             }
         }
         for Param { name, ty, .. } in params {
-            if matches!(ty, Ty::Tensor(_) | Ty::View(_))
+            if matches!(ty, ValueType::Tensor(_))
                 && !weights.contains_key(name)
                 && !external.contains(name)
                 && !intermediates.contains(name)
@@ -151,14 +153,14 @@ impl Composition {
         for name in scalars.keys() {
             if !params
                 .iter()
-                .any(|p| &p.name == name && matches!(p.ty, Ty::Scalar(_)))
+                .any(|p| &p.name == name && matches!(p.ty, ValueType::Scalar(_)))
             {
                 return Err(format!("invalid scalar {name}").into());
             }
         }
         let runtime_scalars = params
             .iter()
-            .filter(|p| matches!(p.ty, Ty::Scalar(_)) && !scalars.contains_key(&p.name))
+            .filter(|p| matches!(p.ty, ValueType::Scalar(_)) && !scalars.contains_key(&p.name))
             .map(|p| p.name.clone())
             .collect::<HashSet<_>>();
         let mut control_types = HashMap::new();
@@ -166,11 +168,13 @@ impl Composition {
             if !external.contains(name) {
                 continue;
             }
-            let (Ty::Tensor(tensor) | Ty::View(tensor)) = ty else {
+            let ValueType::Tensor(tensor) = ty else {
                 continue;
             };
             let element = match &tensor.elem {
-                Elem::Param(parameter) => elements.get(parameter).ok_or("unbound control dtype")?,
+                Elem::Param(parameter) => elements
+                    .get(parameter.as_str())
+                    .ok_or("unbound control dtype")?,
                 element => element,
             };
             let Elem::Dtype(dtype @ (DType::I32 | DType::U32)) = element else {
@@ -187,9 +191,9 @@ impl Composition {
             if weights.contains_key(name) || external.contains(name) {
                 continue;
             }
-            if let Ty::Tensor(t) | Ty::View(t) = ty {
+            if let ValueType::Tensor(t) = ty {
                 let element = match &t.elem {
-                    Elem::Param(p) => elements.get(p).ok_or("unbound scratch dtype")?,
+                    Elem::Param(p) => elements.get(p.as_str()).ok_or("unbound scratch dtype")?,
                     e => e,
                 };
                 let Elem::Dtype(dtype) = element else {

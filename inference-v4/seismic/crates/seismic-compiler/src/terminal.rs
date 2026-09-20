@@ -1,1266 +1,740 @@
-//! Backend-neutral physical scalar instruction lowering.
+//! Physical primitive formation and common legalization/numerics.
 //!
-//! Schedule construction supplies all value and storage mappings. This module
-//! lowers only a verified scheduling-normal `LogicalTask::body`; calls,
-//! iteration, reductions, placement, participation and linking are absent.
+//! This module forms physical
+//! primitives from logical `PrimitiveApplication`s against the intrinsic
+//! registry, classifies every safety obligation as statically proved or
+//! runtime checked, declares the reduction strategy vocabulary and the
+//! universal portable strategies, and composes numerical transfers.
+//! Reductions are consumed by reduction strategies
+//! (`map_reduction`), loops/conditionals/calls by the structured schedule
+//! builders (`schedule_loop`/`schedule_if`/`invoke`), and aggregates are
+//! leaf-lowered or explicitly stored — they never reach scalar-only emitters.
+//!
+//! The formation API here is written against the logical layer
+//! (`seismic-lang`) and the portable vocabulary this module owns. The
+//! consuming family builder (`map_primitive`/`map_reduction`/`fuse`/`split`/
+//! `schedule_if`/`schedule_loop`/`invoke`/`discharge`/`complete_result`/
+//! `finish_alternative`) and `PhysicalPrimitive` live in the realization
+//! layer; the objects produced here are exactly its inputs.
+
+pub mod legalization;
+pub mod numerics;
+pub mod reduction;
+
+#[cfg(test)]
+mod tests;
+
+pub use legalization::{
+    discharge, discharge_precondition, CheckPredicate, GraphFacts, InactiveBehavior,
+    ObligationDischarge, RuntimeCheck, SafetyKind, StaticProof, StatusWrite,
+};
+pub use legalization::{
+    registry_math_is_versioned, universal_form, universal_numerical, DataAccess, LayoutTransform,
+    LegalizationBug, LinearLoopOp, SeismicMathReference, UniversalForm, UniversalLegalization,
+    SEISMIC_MATH, SEISMIC_MATH_IDENTITY, SEISMIC_MATH_VERSION,
+};
+pub use numerics::{
+    compose, compose_all, default_tolerance, satisfies_policy, unit_roundoff,
+    AssignmentFingerprint, CapabilitySignatureId, CountExpr, EvidenceKey, NumericalEvidence,
+    NumericalTransfer, PolicyDecision, ToolchainId, WorkloadFingerprint,
+};
+pub use reduction::{
+    reassociable, reduction_identity, universal as universal_reduction_strategy,
+    ReassociationAdmission, ReductionAdmissionError, ReductionIdentity, ReductionPrecondition,
+    ReductionResources, ReductionStrategy, ReductionStrategyKind, ReductionTopology, TieRule,
+};
 
 use seismic_lang::{
-    intrinsics::Operation,
+    intrinsics::{atomic_dtype, IntrinsicId},
     logical::{
-        LocalStorageId, LocalValueId, LocalViewId, LogicalBlock, LogicalConditionalCase,
-        LogicalExpr, LogicalExprKind, LogicalIndex, LogicalOperationKind, LogicalPattern,
-        LogicalTask, LogicalTaskGraph, OperandId, StorageRef, Type, ValueRef,
+        AtomicOperation, BoundaryInputKind, BoundaryResultKind, CarriedSlot, ChoiceId,
+        GraphValueId, JoinSlot, LogicalNode, LogicalNodeKind, LogicalRange, LogicalStorageId,
+        LoopNode, NodeId, PrimitiveOp, ReductionNode, SafetyObligation, StateJoin,
     },
-    precision::NumericalEffect,
-    sir,
     span::Span,
-    sym::Sym,
-    syntax::ast::{AssignOp, BinaryOp, UnaryOp},
-    types::DType,
+    types::{canonical_leaves, DType, Elem, ExtentExpr, Leaf, TensorType, ValueType},
 };
-use seismic_realization::executable::{
-    AccessMode, ExecutableDialect, InstructionConsequences, InstructionResources, PhysicalAccess,
-    ResolvedStorageId, StorageId,
+
+// ---------------------------------------------------------------------------
+// Universal arbitrary-rank iteration
+// ---------------------------------------------------------------------------
+
+/// The one common linear/runtime iteration geometry is hosted in
+/// `seismic-realization::dispatch`; this module re-exports it. The universal
+/// map retains extents, keeps an overflow-checked row-major total (the exact
+/// runtime product for runtime domains, with the checked capacity bound),
+/// carries the physical linear participant count (`participants`, a planning
+/// expression defaulting to one), one-pass or grid-stride traversal,
+/// delinearization for every logical axis, and a tail mask. Logical rank is
+/// not native grid rank. Ordered axes are ascending serial loops inside each
+/// independent point; zero work is a retained launch condition skipped by the
+/// runtime, and zero native grids are never submitted.
+pub use seismic_realization::dispatch::{
+    LaunchCondition, LinearIterationMap, LinearMapError, LinearTotal, Traversal,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ScalarValueId(pub u32);
+// ---------------------------------------------------------------------------
+// Consequences of universal forms
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ValueBindingKey {
-    Input(u32),
-    Local(LocalValueId),
-    Result(u32),
-}
+/// Live SSA values and emitted statements per universal kernel are bounded so
+/// the native contract guarantees at least one resident participant: the
+/// universal mapping splits kernels at this threshold instead of emitting an
+/// unbounded kernel.
+pub const UNIVERSAL_MAX_LIVE_SSA: u32 = 4096;
 
-impl From<&ValueRef> for ValueBindingKey {
-    fn from(value: &ValueRef) -> Self {
-        match value {
-            ValueRef::Input(port) => Self::Input(*port),
-            ValueRef::Local(value) => Self::Local(*value),
-            ValueRef::Result(port) => Self::Result(*port),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScalarStorageBinding {
-    pub storage: StorageId,
-    pub plane: Vec<String>,
-}
-
-/// Schedule-owned physical bindings for one task. The lowering pass neither
-/// allocates storage nor chooses an addressing/participation strategy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ScalarBindings {
-    pub values: BTreeMap<ValueBindingKey, ScalarValueId>,
-    pub operands: BTreeMap<OperandId, ScalarValueId>,
-    pub storage: BTreeMap<StorageRef, Vec<ScalarStorageBinding>>,
-    pub views: BTreeMap<LocalViewId, Vec<ScalarStorageBinding>>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ScalarCapabilitySet(pub BTreeSet<String>);
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ScalarLayout {
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScalarInstruction {
-    pub result: Option<ScalarValueId>,
-    pub kind: ScalarInstructionKind,
-    consequences: InstructionConsequences<ScalarCapabilitySet>,
-    pub span: Span,
-}
-
-impl ScalarInstruction {
-    pub fn consequences(&self) -> &InstructionConsequences<ScalarCapabilitySet> {
-        &self.consequences
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ScalarLiteral {
-    Int(i64),
-    Float(u64),
-    Bool(bool),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ScalarIndex {
-    Point(ScalarValueId),
-    Coordinate(ScalarValueId),
-    Slice(u32),
-    Range {
-        start: Option<ScalarValueId>,
-        end: Option<ScalarValueId>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageOperation {
-    Construct,
-    Fill,
-    Snapshot,
-    Decode,
-    Materialize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConditionalCase {
-    pub predicates: Vec<(ScalarValueId, bool)>,
-    pub value: ScalarValueId,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ScalarInstructionKind {
-    NoOp,
-    Literal(ScalarLiteral),
-    Shape(Sym),
-    Tuple(Vec<ScalarValueId>),
-    Range(ScalarValueId, ScalarValueId),
-    Field {
-        value: ScalarValueId,
-        index: usize,
-    },
-    Storage {
-        operation: StorageOperation,
-        bindings: Vec<ScalarStorageBinding>,
-        inputs: Vec<ScalarValueId>,
-        fill_bits: Option<u64>,
-    },
-    View {
-        view: LocalViewId,
-        base: ScalarValueId,
-    },
-    Index {
-        base: ScalarValueId,
-        indices: Vec<ScalarIndex>,
-    },
-    Cast {
-        dtype: DType,
-        value: ScalarValueId,
-    },
-    Unary {
-        op: UnaryOp,
-        value: ScalarValueId,
-    },
-    Binary {
-        op: BinaryOp,
-        lhs: ScalarValueId,
-        rhs: ScalarValueId,
-    },
-    Math {
-        op: sir::Math,
-        arguments: Vec<ScalarValueId>,
-    },
-    Select {
-        condition: ScalarValueId,
-        then_value: ScalarValueId,
-        else_value: ScalarValueId,
-    },
-    Extent {
-        base: ScalarValueId,
-        axis: usize,
-    },
-    Intrinsic {
-        operation: Operation,
-        arguments: Vec<ScalarValueId>,
-    },
-    Accessor {
-        base: ScalarValueId,
-        name: String,
-    },
-    Geometry {
-        base: ScalarValueId,
-        axis: usize,
-        valid: bool,
-    },
-    Atomic {
-        op: BinaryOp,
-        place: ScalarValueId,
-        value: ScalarValueId,
-    },
-    Assign {
-        target: ScalarValueId,
-        op: AssignOp,
-        value: ScalarValueId,
-    },
-    Publish {
-        value: ScalarValueId,
-        destination: ScalarValueId,
-    },
-    Conditional {
-        condition: ScalarValueId,
-        then_body: Vec<ScalarInstruction>,
-        else_body: Vec<ScalarInstruction>,
-    },
-    ConditionalMerge {
-        cases: Vec<ConditionalCase>,
-    },
-    Yield(Vec<ScalarValueId>),
-    Return {
-        port: u32,
-        path: Vec<u32>,
-        value: ScalarValueId,
-        transfer: bool,
-    },
-}
-
-/// Fully concrete scalar instruction consumed by native encoders. Symbolic
-/// shapes and template storage identities cannot cross this boundary.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedScalarInstruction {
-    pub result: Option<ScalarValueId>,
-    pub kind: ResolvedScalarInstructionKind,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedScalarStorageBinding {
-    pub storage: ResolvedStorageId,
-    pub plane: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ResolvedScalarInstructionKind {
-    NoOp,
-    Literal(ScalarLiteral),
-    Shape(i64),
-    Tuple(Vec<ScalarValueId>),
-    Range(ScalarValueId, ScalarValueId),
-    Field {
-        value: ScalarValueId,
-        index: usize,
-    },
-    Storage {
-        operation: StorageOperation,
-        bindings: Vec<ResolvedScalarStorageBinding>,
-        inputs: Vec<ScalarValueId>,
-        fill_bits: Option<u64>,
-    },
-    View {
-        view: LocalViewId,
-        base: ScalarValueId,
-    },
-    Index {
-        base: ScalarValueId,
-        indices: Vec<ScalarIndex>,
-    },
-    Cast {
-        dtype: DType,
-        value: ScalarValueId,
-    },
-    Unary {
-        op: UnaryOp,
-        value: ScalarValueId,
-    },
-    Binary {
-        op: BinaryOp,
-        lhs: ScalarValueId,
-        rhs: ScalarValueId,
-    },
-    Math {
-        op: sir::Math,
-        arguments: Vec<ScalarValueId>,
-    },
-    Select {
-        condition: ScalarValueId,
-        then_value: ScalarValueId,
-        else_value: ScalarValueId,
-    },
-    Extent {
-        base: ScalarValueId,
-        axis: usize,
-    },
-    Intrinsic {
-        operation: Operation,
-        arguments: Vec<ScalarValueId>,
-    },
-    Accessor {
-        base: ScalarValueId,
-        name: String,
-    },
-    Geometry {
-        base: ScalarValueId,
-        axis: usize,
-        valid: bool,
-    },
-    Atomic {
-        op: BinaryOp,
-        place: ScalarValueId,
-        value: ScalarValueId,
-    },
-    Assign {
-        target: ScalarValueId,
-        op: AssignOp,
-        value: ScalarValueId,
-    },
-    Publish {
-        value: ScalarValueId,
-        destination: ScalarValueId,
-    },
-    Conditional {
-        condition: ScalarValueId,
-        then_body: Vec<ResolvedScalarInstruction>,
-        else_body: Vec<ResolvedScalarInstruction>,
-    },
-    ConditionalMerge {
-        cases: Vec<ConditionalCase>,
-    },
-    Yield(Vec<ScalarValueId>),
-    Return {
-        port: u32,
-        path: Vec<u32>,
-        value: ScalarValueId,
-        transfer: bool,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScalarDialect;
-
-impl ExecutableDialect for ScalarDialect {
-    type TemplateInstruction = ScalarInstruction;
-    type ResolvedInstruction = ResolvedScalarInstruction;
-    type TemplateLayout = ScalarLayout;
-    type ResolvedLayout = ScalarLayout;
-    type Capability = ScalarCapabilitySet;
-
-    fn consequences(
-        instruction: &Self::TemplateInstruction,
-    ) -> InstructionConsequences<Self::Capability> {
-        instruction.consequences.clone()
-    }
-
-    fn resolve_instruction(
-        instruction: &Self::TemplateInstruction,
-        symbols: &BTreeMap<String, i64>,
-        storage: &BTreeMap<StorageId, ResolvedStorageId>,
-    ) -> Result<Self::ResolvedInstruction, String> {
-        resolve_scalar_instruction(instruction, symbols, storage)
-    }
-
-    fn resolve_layout(
-        layout: &Self::TemplateLayout,
-        _symbols: &BTreeMap<String, i64>,
-    ) -> Result<Self::ResolvedLayout, String> {
-        Ok(layout.clone())
-    }
-}
-
-pub fn resolve_scalar_instruction(
-    instruction: &ScalarInstruction,
-    symbols: &BTreeMap<String, i64>,
-    storage: &BTreeMap<StorageId, ResolvedStorageId>,
-) -> Result<ResolvedScalarInstruction, String> {
-    use ResolvedScalarInstructionKind as R;
-    use ScalarInstructionKind as T;
-    let resolve_nested = |values: &[ScalarInstruction]| {
-        values
-            .iter()
-            .map(|value| resolve_scalar_instruction(value, symbols, storage))
-            .collect::<Result<Vec<_>, _>>()
+/// Consequences of one universal primitive mapping: no private/workgroup
+/// bytes, `direct_bindings` direct leaf bindings (a descriptor/argument table
+/// is the indirect-binding alternative when the target's direct-binding limit is
+/// lower), device bytes for cross-launch materialized tensors, bounded code
+/// shape, no required capability, and `Exact` numerics. The native contract's
+/// admissible domain admits any reflected maximum resident participant count
+/// of at least one, so the resolved geometry `min(preferred, native_max)`
+/// always guarantees a resident participant.
+pub fn universal_consequences(
+    direct_bindings: u32,
+    device_bytes: u64,
+) -> seismic_realization::executable::PhysicalConsequences {
+    use seismic_realization::executable::{
+        CostEstimate, HardResources, NativeResourceContract, PhysicalConsequences,
     };
-    let kind = match &instruction.kind {
-        T::NoOp => R::NoOp,
-        T::Literal(value) => R::Literal(value.clone()),
-        T::Shape(value) => R::Shape(
-            value
-                .eval(&|name| symbols.get(name).copied())
-                .ok_or_else(|| format!("unresolved scalar shape `{value}`"))?,
-        ),
-        T::Tuple(values) => R::Tuple(values.clone()),
-        T::Range(start, end) => R::Range(*start, *end),
-        T::Field { value, index } => R::Field {
-            value: *value,
-            index: *index,
+    PhysicalConsequences {
+        hard: HardResources {
+            explicit_private_bytes: 0,
+            explicit_workgroup_bytes: 0,
+            explicit_device_bytes: device_bytes,
+            direct_bindings,
+            static_code_units: u64::from(UNIVERSAL_MAX_LIVE_SSA),
+            ..HardResources::default()
         },
-        T::Storage {
-            operation,
-            bindings,
-            inputs,
-            fill_bits,
-        } => R::Storage {
-            operation: *operation,
-            bindings: bindings
+        native_contract: NativeResourceContract {
+            max_resident_participants: (1, u64::MAX),
+            native_subgroup_width: None,
+        },
+        cost: CostEstimate(0),
+        numerical: NumericalTransfer::Exact,
+        capability: None,
+    }
+}
+
+/// Consequences of one capability-routed formation: the exact required
+/// capability signature (planning kills the alternative against
+/// `EffectiveTargetProfile::effective_signatures` using exactly this field),
+/// an unqualified capability transfer pending the signature's own bound, and
+/// no other hard resources.
+pub fn capability_required_consequences(
+    intrinsic: IntrinsicId,
+    arguments: Vec<ValueType>,
+) -> seismic_realization::executable::PhysicalConsequences {
+    use seismic_realization::executable::{
+        CostEstimate, HardResources, NativeResourceContract, PhysicalConsequences,
+    };
+    PhysicalConsequences {
+        hard: HardResources::default(),
+        native_contract: NativeResourceContract {
+            max_resident_participants: (1, u64::MAX),
+            native_subgroup_width: None,
+        },
+        cost: CostEstimate(0),
+        numerical: NumericalTransfer::Capability {
+            signature: CapabilitySignatureId::new(intrinsic.clone(), arguments),
+            bound: None,
+        },
+        capability: Some(intrinsic),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Physical primitive formation
+// ---------------------------------------------------------------------------
+
+/// One canonical leaf of an operand or result, as formed for typed SSA or
+/// storage binding. Aggregates are leaf-lowered through the one canonical
+/// traversal; a tensor is one semantic leaf (one or more representation
+/// planes).
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeafDType {
+    Scalar(DType),
+    Index(ExtentExpr),
+    Range(ExtentExpr),
+    TensorPlane(TensorType),
+}
+
+impl LeafDType {
+    fn of(ty: &ValueType) -> Result<Vec<(seismic_lang::types::ValuePath, LeafDType)>, String> {
+        let leaves = canonical_leaves(ty)?;
+        Ok(leaves
+            .into_iter()
+            .map(|(path, leaf)| {
+                let dtype = match leaf {
+                    Leaf::Scalar(d) => LeafDType::Scalar(d),
+                    Leaf::Index(bound) => LeafDType::Index(bound.clone()),
+                    Leaf::Range(bound) => LeafDType::Range(bound.clone()),
+                    Leaf::Tensor(s) => LeafDType::TensorPlane(s.clone()),
+                };
+                (path, dtype)
+            })
+            .collect())
+    }
+}
+
+/// One formed operand: its graph value, canonical type, and leaf-lowered
+/// slots.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormedOperand {
+    pub value: GraphValueId,
+    pub ty: ValueType,
+    pub leaves: Vec<(seismic_lang::types::ValuePath, LeafDType)>,
+}
+
+/// One logical primitive application formed as a physical primitive: the
+/// exact universal form, operand/result leaf slots, the elementwise iteration
+/// domain, discharged obligations, and the `Exact` universal transfer. This
+/// is the input of the realization layer's `map_primitive` legalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormedPrimitive {
+    pub node: NodeId,
+    pub op: PrimitiveOp,
+    pub operands: Vec<FormedOperand>,
+    /// The canonical result types, one per node output (real types, never
+    /// empty: dialect legalization classifies on them).
+    pub results: Vec<ValueType>,
+    /// Leaf-lowered result slots through the canonical traversal.
+    pub result_leaves: Vec<(seismic_lang::types::ValuePath, LeafDType)>,
+    /// The universal physical form (16.1 row).
+    pub form: UniversalForm,
+    /// The elementwise/aggregate iteration domain, when this primitive
+    /// computes over a shape.
+    pub iteration: Option<LinearIterationMap>,
+    /// Every obligation of the node, consumed exactly once.
+    pub obligations: Vec<(SafetyObligation, ObligationDischarge)>,
+    /// The universal column is exact relative to the registry reference.
+    pub numerical: NumericalTransfer,
+    pub span: Span,
+}
+
+impl FormedPrimitive {
+    /// The exact physical primitive offered to the dialect for legalization:
+    /// the registry operation plus the real canonical operand/result types.
+    pub fn physical_primitive(&self) -> seismic_realization::executable::PhysicalPrimitive {
+        seismic_realization::executable::PhysicalPrimitive {
+            op: self.op.clone(),
+            inputs: self
+                .operands
                 .iter()
-                .map(|binding| {
-                    Ok(ResolvedScalarStorageBinding {
-                        storage: storage.get(&binding.storage).copied().ok_or_else(|| {
-                            format!(
-                                "scalar instruction names absent storage#{}",
-                                binding.storage.0
-                            )
-                        })?,
-                        plane: binding.plane.clone(),
-                    })
+                .map(|operand| operand.ty.clone())
+                .collect(),
+            results: self.results.clone(),
+        }
+    }
+
+    /// The iteration domain of this mapping, or the single-visit serial map
+    /// when the primitive computes inside its containing structure.
+    pub fn iteration_or_serial(&self) -> LinearIterationMap {
+        self.iteration
+            .clone()
+            .unwrap_or_else(LinearIterationMap::serial)
+    }
+}
+
+/// Why formation failed. Reductions, loops, conditionals, and calls are not
+/// primitives: they are routed to the corresponding family-builder API.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormationError {
+    /// The node is consumed by a structured builder, not `map_primitive`.
+    NotAPrimitive { route: &'static str },
+    /// A capability application: the alternative is legal only through the
+    /// exact effective capability signature (or the portable reference body).
+    RequiresCapability { intrinsic: IntrinsicId },
+    /// The elementwise domain's checked total overflows: the alternative is
+    /// infeasible.
+    InfeasibleGeometry(LinearMapError),
+    /// The alternative is inapplicable for this portable reason (for example
+    /// a capability value crossing a call boundary).
+    Inapplicable(String),
+    /// A closed-registry violation that cannot occur for a checked program.
+    Bug(String),
+}
+
+impl std::fmt::Display for FormationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormationError::NotAPrimitive { route } => {
+                write!(f, "this node is consumed by `{route}`, not map_primitive")
+            }
+            FormationError::RequiresCapability { intrinsic } => write!(
+                f,
+                "capability `{}` has no portable physical opcode; the exact effective signature \
+                 or the portable reference body must supply this alternative",
+                intrinsic.path()
+            ),
+            FormationError::InfeasibleGeometry(error) => write!(f, "infeasible geometry: {error}"),
+            FormationError::Inapplicable(reason) => write!(f, "inapplicable: {reason}"),
+            FormationError::Bug(reason) => write!(f, "compiler bug in formation: {reason}"),
+        }
+    }
+}
+impl std::error::Error for FormationError {}
+
+/// The elementwise iteration domain of one formed primitive: the shape of the
+/// first tensor among operands and results. Address expressions, checked
+/// accesses, allocations, and atomics compute inside the containing
+/// iteration, not their own.
+fn iteration_domain(
+    form: &UniversalForm,
+    operands: &[FormedOperand],
+    results: &[ValueType],
+    result_leaves: &[(seismic_lang::types::ValuePath, LeafDType)],
+) -> Option<Vec<ExtentExpr>> {
+    match form {
+        UniversalForm::LayoutAddress { .. }
+        | UniversalForm::CheckedAccess { .. }
+        | UniversalForm::StorageAllocation
+        | UniversalForm::SerializedAtomic { .. }
+        | UniversalForm::PackedPlaneRead { .. } => None,
+        _ => operands
+            .iter()
+            .find_map(|operand| operand.ty.shaped().map(|s| s.axes.clone()))
+            .or_else(|| {
+                results
+                    .iter()
+                    .find_map(|ty| ty.shaped().map(|s| s.axes.clone()))
+            })
+            .or_else(|| {
+                result_leaves.iter().find_map(|(_, leaf)| match leaf {
+                    LeafDType::TensorPlane(s) => Some(s.axes.clone()),
+                    _ => None,
                 })
-                .collect::<Result<Vec<_>, String>>()?,
-            inputs: inputs.clone(),
-            fill_bits: *fill_bits,
-        },
-        T::View { view, base } => R::View {
-            view: *view,
-            base: *base,
-        },
-        T::Index { base, indices } => R::Index {
-            base: *base,
-            indices: indices.clone(),
-        },
-        T::Cast { dtype, value } => R::Cast {
-            dtype: *dtype,
-            value: *value,
-        },
-        T::Unary { op, value } => R::Unary {
-            op: *op,
-            value: *value,
-        },
-        T::Binary { op, lhs, rhs } => R::Binary {
-            op: *op,
-            lhs: *lhs,
-            rhs: *rhs,
-        },
-        T::Math { op, arguments } => R::Math {
-            op: *op,
-            arguments: arguments.clone(),
-        },
-        T::Select {
-            condition,
-            then_value,
-            else_value,
-        } => R::Select {
-            condition: *condition,
-            then_value: *then_value,
-            else_value: *else_value,
-        },
-        T::Extent { base, axis } => R::Extent {
-            base: *base,
-            axis: *axis,
-        },
-        T::Intrinsic {
-            operation,
-            arguments,
-        } => R::Intrinsic {
-            operation: *operation,
-            arguments: arguments.clone(),
-        },
-        T::Accessor { base, name } => R::Accessor {
-            base: *base,
-            name: name.clone(),
-        },
-        T::Geometry { base, axis, valid } => R::Geometry {
-            base: *base,
-            axis: *axis,
-            valid: *valid,
-        },
-        T::Atomic { op, place, value } => R::Atomic {
-            op: *op,
-            place: *place,
-            value: *value,
-        },
-        T::Assign { target, op, value } => R::Assign {
-            target: *target,
-            op: *op,
-            value: *value,
-        },
-        T::Publish { value, destination } => R::Publish {
-            value: *value,
-            destination: *destination,
-        },
-        T::Conditional {
-            condition,
-            then_body,
-            else_body,
-        } => R::Conditional {
-            condition: *condition,
-            then_body: resolve_nested(then_body)?,
-            else_body: resolve_nested(else_body)?,
-        },
-        T::ConditionalMerge { cases } => R::ConditionalMerge {
-            cases: cases.clone(),
-        },
-        T::Yield(values) => R::Yield(values.clone()),
-        T::Return {
-            port,
-            path,
-            value,
-            transfer,
-        } => R::Return {
-            port: *port,
-            path: path.clone(),
-            value: *value,
-            transfer: *transfer,
-        },
+            }),
+    }
+}
+
+/// Form one logical primitive node as a physical primitive. The node kind is
+/// matched exhaustively: reductions, loops, conditionals, and calls are
+/// routed to their builders and never formed as scalar primitives.
+pub fn form_primitive(
+    node_id: NodeId,
+    node: &LogicalNode,
+    facts: &GraphFacts,
+) -> Result<FormedPrimitive, FormationError> {
+    let application = match &node.kind {
+        LogicalNodeKind::Primitive(application) => application,
+        LogicalNodeKind::Reduction(_) => {
+            return Err(FormationError::NotAPrimitive {
+                route: "map_reduction",
+            });
+        }
+        LogicalNodeKind::Loop(_) => {
+            return Err(FormationError::NotAPrimitive {
+                route: "schedule_loop",
+            });
+        }
+        LogicalNodeKind::If(_) => {
+            return Err(FormationError::NotAPrimitive {
+                route: "schedule_if",
+            });
+        }
+        LogicalNodeKind::Call(_) => return Err(FormationError::NotAPrimitive { route: "invoke" }),
     };
-    Ok(ResolvedScalarInstruction {
-        result: instruction.result,
-        kind,
-        span: instruction.span,
+    let operands =
+        node.inputs
+            .iter()
+            .map(|value| {
+                let ty =
+                    facts.types.get(value).cloned().ok_or_else(|| {
+                        FormationError::Bug(format!("operand {value:?} has no type"))
+                    })?;
+                let leaves = LeafDType::of(&ty).map_err(FormationError::Inapplicable)?;
+                Ok(FormedOperand {
+                    value: *value,
+                    ty,
+                    leaves,
+                })
+            })
+            .collect::<Result<Vec<_>, FormationError>>()?;
+    let results: Vec<ValueType> = node
+        .outputs
+        .iter()
+        .map(|output| output.ty.clone())
+        .collect();
+    let result_leaves: Vec<(seismic_lang::types::ValuePath, LeafDType)> = node
+        .outputs
+        .iter()
+        .map(|output| Ok(LeafDType::of(&output.ty).map_err(FormationError::Inapplicable)?))
+        .collect::<Result<Vec<_>, FormationError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let form = match legalization::universal_form(
+        &application.op,
+        &operands
+            .iter()
+            .map(|operand| operand.ty.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|bug| FormationError::Bug(bug.0))?
+    {
+        UniversalLegalization::Form(form) => form,
+        UniversalLegalization::RequiresCapability { intrinsic } => {
+            return Err(FormationError::RequiresCapability { intrinsic });
+        }
+    };
+    let iteration = iteration_domain(&form, &operands, &results, &result_leaves)
+        .map(|axes| {
+            LinearIterationMap::linear(&axes, &facts.runtime_extents)
+                .map_err(FormationError::InfeasibleGeometry)
+        })
+        .transpose()?;
+    let obligations = node
+        .safety
+        .iter()
+        .map(|obligation| (obligation.clone(), discharge(obligation, facts, node.span)))
+        .collect();
+    Ok(FormedPrimitive {
+        node: node_id,
+        op: application.op.clone(),
+        operands,
+        results,
+        result_leaves,
+        form,
+        iteration,
+        obligations,
+        numerical: NumericalTransfer::Exact,
+        span: node.span,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Universal node constructors (inputs of the family builder)
+// ---------------------------------------------------------------------------
+
+/// The universal physical description of one reduction occurrence: its exact
+/// strategy plus discharged preconditions. Consumed by `map_reduction`.
+#[derive(Clone, Debug)]
+pub struct UniversalReduction {
+    pub operand: GraphValueId,
+    pub axis: usize,
+    pub strategy: ReductionStrategy,
+    pub preconditions: Vec<(ReductionPrecondition, ObligationDischarge)>,
+}
+
+/// The universal physical description of one loop occurrence. Consumed by
+/// `schedule_loop`.
+#[derive(Clone, Debug)]
+pub struct UniversalLoop {
+    pub kind: seismic_lang::sir::LoopKind,
+    pub range: LogicalRange,
+    /// Independent loops: the universal linear map over the iteration domain.
+    /// Ordered loops have no participant domain (ascending serial repeat).
+    pub iteration: Option<LinearIterationMap>,
+    /// An independent loop whose visits update storage atomically is
+    /// serialized by the universal atomic-add strategy: exactly one
+    /// participant traverses the domain, performing the exact
+    /// load/add/round/store.
+    pub serialized_for_atomic: bool,
+    /// Ordered loops carry every changed captured value.
+    pub carries: Vec<CarriedSlot>,
+    /// Cross-visit state joins of an independent loop.
+    pub joins: Vec<(LogicalStorageId, StateJoin)>,
+}
+
+/// The universal physical description of one conditional occurrence.
+/// Consumed by `schedule_if`. Aggregate joins are leaf-lowered or
+/// materialized; the condition is one retained predicate.
+#[derive(Clone, Debug)]
+pub struct UniversalIf {
+    pub condition: GraphValueId,
+    pub joins: Vec<JoinSlot>,
+}
+
+/// One canonical leaf of a call boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryLeafSlot {
+    pub path: seismic_lang::types::ValuePath,
+    pub kind: BoundarySlotKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ScalarProgram {
-    task: seismic_lang::logical::TaskId,
-    instructions: Vec<ScalarInstruction>,
-    operand_values: BTreeMap<OperandId, ScalarValueId>,
-    value_types: BTreeMap<ScalarValueId, Type>,
+pub enum BoundarySlotKind {
+    Value(GraphValueId),
+    Storage(LogicalStorageId),
+    State(LogicalStorageId),
 }
 
-impl ScalarProgram {
-    pub fn task(&self) -> seismic_lang::logical::TaskId {
-        self.task
-    }
+/// The universal physical description of one call occurrence: a synchronous
+/// nested plan whose boundary leaves reference caller transports directly.
+/// Consumed by `invoke`.
+#[derive(Clone, Debug)]
+pub struct UniversalCall {
+    pub choice: ChoiceId,
+    pub synchronous: bool,
+    pub inputs: Vec<BoundaryLeafSlot>,
+    pub results: Vec<BoundaryLeafSlot>,
+}
 
-    pub fn instructions(&self) -> &[ScalarInstruction] {
-        &self.instructions
-    }
+/// The universal physical description of any logical node: exactly one
+/// variant per node kind, exhaustive.
+#[derive(Clone, Debug)]
+pub enum UniversalNode {
+    Primitive(FormedPrimitive),
+    Reduction(UniversalReduction),
+    Loop(UniversalLoop),
+    If(UniversalIf),
+    Call(UniversalCall),
+}
 
-    pub fn operand_value(&self, operand: OperandId) -> Option<ScalarValueId> {
-        self.operand_values.get(&operand).copied()
-    }
-
-    pub fn value_type(&self, value: ScalarValueId) -> Option<&Type> {
-        self.value_types.get(&value)
+/// Form the universal physical description of one node of a task graph.
+/// Primitive applications become physical primitives; reductions, loops,
+/// conditionals, and calls become the descriptions their family-builder APIs
+/// consume.
+pub fn universal_node(
+    node_id: NodeId,
+    node: &LogicalNode,
+    facts: &GraphFacts,
+) -> Result<UniversalNode, FormationError> {
+    match &node.kind {
+        LogicalNodeKind::Primitive(_) => Ok(UniversalNode::Primitive(form_primitive(
+            node_id, node, facts,
+        )?)),
+        LogicalNodeKind::Reduction(reduction) => {
+            universal_reduction(node, reduction, facts).map(UniversalNode::Reduction)
+        }
+        LogicalNodeKind::Loop(loop_node) => {
+            universal_loop(node, loop_node, facts).map(UniversalNode::Loop)
+        }
+        LogicalNodeKind::If(if_node) => Ok(UniversalNode::If(UniversalIf {
+            condition: if_node.condition,
+            joins: if_node.joins.clone(),
+        })),
+        LogicalNodeKind::Call(call) => universal_call(call, facts).map(UniversalNode::Call),
     }
 }
 
-pub fn lower_task(
-    graph: &LogicalTaskGraph,
-    task: &LogicalTask,
-    bindings: &ScalarBindings,
-) -> Result<ScalarProgram, String> {
-    if graph.task(task.id) != Some(task) {
-        return Err(format!(
-            "task#{} is not owned by graph#{}",
-            task.id.0, graph.id.0
-        ));
+fn universal_reduction(
+    node: &LogicalNode,
+    reduction: &ReductionNode,
+    facts: &GraphFacts,
+) -> Result<UniversalReduction, FormationError> {
+    let operand_type = facts
+        .types
+        .get(&reduction.operand)
+        .cloned()
+        .ok_or_else(|| FormationError::Bug("a reduction operand has no type".into()))?;
+    let shaped = operand_type
+        .shaped()
+        .ok_or_else(|| FormationError::Bug("a reduction operand is not a tensor".into()))?
+        .clone();
+    if reduction.axis >= shaped.rank() {
+        return Err(FormationError::Bug(format!(
+            "reduction axis {} is outside the operand rank {}",
+            reduction.axis,
+            shaped.rank()
+        )));
     }
-    for input in &task.inputs {
-        if !bindings.operands.contains_key(input) {
-            return Err(format!(
-                "task#{} input operand#{} has no physical value",
-                task.id.0, input.0
-            ));
-        }
+    if let Elem::Repr(repr) = &shaped.elem {
+        return Err(FormationError::Bug(format!(
+            "a packed representation `{repr}` cannot be reduced"
+        )));
     }
-    let mut value_types = BTreeMap::new();
-    for (operand, value) in &bindings.operands {
-        let ty = &graph
-            .operand(*operand)
-            .ok_or_else(|| format!("binding names absent operand#{}", operand.0))?
-            .ty;
-        value_types.insert(*value, ty.clone());
-    }
-    for (key, value) in &bindings.values {
-        let ty = match key {
-            ValueBindingKey::Input(port) => graph.inputs.get(*port as usize).map(|port| &port.ty),
-            ValueBindingKey::Result(port) => graph.results.get(*port as usize).map(|port| &port.ty),
-            ValueBindingKey::Local(local) => graph.values.get(local.0 as usize),
-        }
-        .ok_or_else(|| format!("value binding {key:?} has no logical type"))?;
-        value_types.insert(*value, ty.clone());
-    }
-    let mut lowerer = Lowerer {
-        graph,
-        task,
-        bindings,
-        values: bindings.values.clone(),
-        operand_values: bindings.operands.clone(),
-        instructions: Vec::new(),
-        next_value: bindings
-            .values
-            .values()
-            .chain(bindings.operands.values())
-            .map(|value| value.0)
-            .max()
-            .map_or(0, |value| value + 1),
-        pending_numerical: task.numerical_semantics.clone(),
-        value_types,
-    };
-    lowerer.block(&task.body.operations)?;
-    if lowerer.instructions.is_empty() {
-        lowerer.emit(
-            None,
-            ScalarInstructionKind::NoOp,
-            vec![],
-            None,
-            Span::default(),
-        );
-    }
-    if !lowerer.pending_numerical.is_empty() {
-        return Err(format!(
-            "task#{} has unattached numerical semantics",
-            task.id.0
-        ));
-    }
-    let mut returned =
-        lowerer
-            .instructions
-            .iter()
-            .filter_map(|instruction| match instruction.kind {
-                ScalarInstructionKind::Return { value, .. } => Some(value),
-                _ => None,
-            });
-    for operand in &task.outputs {
-        let logical = graph.operand(*operand).ok_or_else(|| {
-            format!(
-                "task#{} names absent output operand#{}",
-                task.id.0, operand.0
-            )
-        })?;
-        let value = lowerer
-            .values
-            .get(&ValueBindingKey::from(&logical.value))
-            .copied()
-            .or_else(|| returned.next())
-            .ok_or_else(|| format!("task#{} did not produce operand#{}", task.id.0, operand.0))?;
-        lowerer.operand_values.insert(*operand, value);
-    }
-    Ok(ScalarProgram {
-        task: task.id,
-        instructions: lowerer.instructions,
-        operand_values: lowerer.operand_values,
-        value_types: lowerer.value_types,
+    let strategy =
+        reduction::universal(reduction, &shaped).map_err(|reason| FormationError::Bug(reason))?;
+    let preconditions = strategy
+        .preconditions
+        .iter()
+        .cloned()
+        .map(|precondition| {
+            let discharge = discharge_precondition(&precondition, facts, node.span);
+            (precondition, discharge)
+        })
+        .collect();
+    Ok(UniversalReduction {
+        operand: reduction.operand,
+        axis: reduction.axis,
+        strategy,
+        preconditions,
     })
 }
 
-struct Lowerer<'a> {
-    graph: &'a LogicalTaskGraph,
-    task: &'a LogicalTask,
-    bindings: &'a ScalarBindings,
-    values: BTreeMap<ValueBindingKey, ScalarValueId>,
-    operand_values: BTreeMap<OperandId, ScalarValueId>,
-    instructions: Vec<ScalarInstruction>,
-    next_value: u32,
-    pending_numerical: Vec<NumericalEffect>,
-    value_types: BTreeMap<ScalarValueId, Type>,
+fn universal_loop(
+    node: &LogicalNode,
+    loop_node: &LoopNode,
+    facts: &GraphFacts,
+) -> Result<UniversalLoop, FormationError> {
+    let joins: Vec<(LogicalStorageId, StateJoin)> = node
+        .state_outputs
+        .iter()
+        .filter_map(|token| token.join.clone().map(|join| (token.storage, join)))
+        .collect();
+    // The universal atomic strategy serializes the containing independent
+    // domain; every admitted atomic operation must be registry-legal.
+    let serialized_for_atomic = joins
+        .iter()
+        .any(|(_, join)| matches!(join, StateJoin::Atomic { .. }));
+    if serialized_for_atomic {
+        for (_, join) in &joins {
+            if let StateJoin::Atomic { operations } = join {
+                for AtomicOperation { op, dtype, .. } in operations {
+                    if !atomic_dtype(*dtype) {
+                        return Err(FormationError::Bug(format!(
+                            "atomic {} is undefined for {}",
+                            op.name(),
+                            dtype.name()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    let iteration = match loop_node.kind {
+        seismic_lang::sir::LoopKind::Ordered => None,
+        seismic_lang::sir::LoopKind::Independent => {
+            let map = LinearIterationMap::linear(
+                &[loop_node.range.bound.clone()],
+                &facts.runtime_extents,
+            )
+            .map_err(FormationError::InfeasibleGeometry)?;
+            if serialized_for_atomic {
+                Some(LinearIterationMap::serialized(&map))
+            } else {
+                Some(map)
+            }
+        }
+    };
+    Ok(UniversalLoop {
+        kind: loop_node.kind,
+        range: loop_node.range.clone(),
+        iteration,
+        serialized_for_atomic,
+        carries: loop_node.carried.clone(),
+        joins,
+    })
 }
 
-impl Lowerer<'_> {
-    fn fresh(&mut self, ty: Type) -> ScalarValueId {
-        let value = ScalarValueId(self.next_value);
-        self.next_value += 1;
-        self.value_types.insert(value, ty);
-        value
-    }
-
-    fn emit(
-        &mut self,
-        result: Option<ScalarValueId>,
-        kind: ScalarInstructionKind,
-        accesses: Vec<PhysicalAccess>,
-        capability: Option<ScalarCapabilitySet>,
-        span: Span,
-    ) {
-        let numerical = std::mem::take(&mut self.pending_numerical);
-        self.instructions.push(ScalarInstruction {
-            result,
+fn universal_call(
+    call: &seismic_lang::logical::CallNode,
+    facts: &GraphFacts,
+) -> Result<UniversalCall, FormationError> {
+    let mut inputs = Vec::new();
+    for input in &call.boundary_inputs {
+        let kind = match &input.kind {
+            BoundaryInputKind::Value(value) => {
+                let ty = facts.types.get(value).ok_or_else(|| {
+                    FormationError::Bug("a call boundary value has no type".into())
+                })?;
+                if matches!(ty, ValueType::CapabilityValue(_)) {
+                    // A capability value crosses only a same-launch fused
+                    // boundary; the universal call alternative is not fused.
+                    return Err(FormationError::Inapplicable(format!(
+                        "a capability value cannot cross the call boundary at {}",
+                        input.path
+                    )));
+                }
+                BoundarySlotKind::Value(*value)
+            }
+            BoundaryInputKind::Shared { state, .. }
+            | BoundaryInputKind::Exclusive { state, .. }
+            | BoundaryInputKind::Move { state, .. } => {
+                let storage = facts.states.get(state).copied().ok_or_else(|| {
+                    FormationError::Bug("a call boundary state token has no storage".into())
+                })?;
+                BoundarySlotKind::State(storage)
+            }
+        };
+        inputs.push(BoundaryLeafSlot {
+            path: input.path.clone(),
             kind,
-            consequences: InstructionConsequences {
-                accesses,
-                capability,
-                numerical,
-                resources: InstructionResources {
-                    registers: u32::from(result.is_some()),
-                    private_bytes: 0,
-                    workgroup_bytes: 0,
-                },
-            },
-            span,
         });
     }
-
-    fn block(&mut self, block: &LogicalBlock) -> Result<(), String> {
-        for operation in block {
-            match &operation.kind {
-                LogicalOperationKind::Bind { pattern, value } => {
-                    let value = self.expr(value)?;
-                    self.bind(pattern, value)?;
-                }
-                LogicalOperationKind::Assign { target, op, value } => {
-                    let accesses = self
-                        .expr_storage(target)
-                        .map(|storage| self.storage_access(&storage, AccessMode::Write))
-                        .transpose()?
-                        .unwrap_or_default();
-                    let target = self.expr(target)?;
-                    let value = self.expr(value)?;
-                    self.emit(
-                        None,
-                        ScalarInstructionKind::Assign {
-                            target,
-                            op: *op,
-                            value,
-                        },
-                        accesses,
-                        None,
-                        operation.span,
-                    );
-                }
-                LogicalOperationKind::If {
-                    condition,
-                    then,
-                    els,
-                } => {
-                    let condition = self.expr(condition)?;
-                    let then_body = self.nested(then)?;
-                    let else_body = self.nested(els)?;
-                    let accesses = nested_accesses(&then_body, &else_body);
-                    self.emit(
-                        None,
-                        ScalarInstructionKind::Conditional {
-                            condition,
-                            then_body,
-                            else_body,
-                        },
-                        accesses,
-                        None,
-                        operation.span,
-                    );
-                }
-                LogicalOperationKind::Publish { value, destination } => {
-                    let accesses = self
-                        .expr_storage(destination)
-                        .map(|storage| self.storage_access(&storage, AccessMode::Write))
-                        .transpose()?
-                        .unwrap_or_default();
-                    let value = self.expr(value)?;
-                    let destination = self.expr(destination)?;
-                    self.emit(
-                        None,
-                        ScalarInstructionKind::Publish { value, destination },
-                        accesses,
-                        None,
-                        operation.span,
-                    );
-                }
-                LogicalOperationKind::Yield(values) => {
-                    let values = self.exprs(values)?;
-                    self.emit(
-                        None,
-                        ScalarInstructionKind::Yield(values),
-                        vec![],
-                        None,
-                        operation.span,
-                    );
-                }
-                LogicalOperationKind::Return(writes) => {
-                    for write in writes {
-                        let value = self.expr(&write.value)?;
-                        let accesses = if matches!(write.value.ty, Type::Tensor(_)) {
-                            self.storage_access(
-                                &StorageRef::Result {
-                                    port: write.port,
-                                    path: Vec::new(),
-                                },
-                                AccessMode::Write,
-                            )?
-                        } else {
-                            vec![]
-                        };
-                        self.emit(
-                            None,
-                            ScalarInstructionKind::Return {
-                                port: write.port,
-                                path: write.path.clone(),
-                                value,
-                                transfer: write.transfer,
-                            },
-                            accesses,
-                            None,
-                            operation.span,
-                        );
-                    }
-                }
-                LogicalOperationKind::ConditionalMerge { binder, cases } => {
-                    let cases = cases
-                        .iter()
-                        .map(|case| self.case(case))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let ty = self
-                        .graph
-                        .values
-                        .get(binder.0 as usize)
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!("conditional merge binder#{} has no type", binder.0)
-                        })?;
-                    let result = self.fresh(ty);
-                    self.values.insert(ValueBindingKey::Local(*binder), result);
-                    self.emit(
-                        Some(result),
-                        ScalarInstructionKind::ConditionalMerge { cases },
-                        vec![],
-                        None,
-                        operation.span,
-                    );
-                }
-                LogicalOperationKind::Expr(value) => {
-                    self.expr(value)?;
-                }
-                LogicalOperationKind::Reduction { .. } => {
-                    return Err("logical reduction requires an explicit physical reduction".into())
-                }
-                LogicalOperationKind::Region(_)
-                | LogicalOperationKind::Stages(_)
-                | LogicalOperationKind::For { .. }
-                | LogicalOperationKind::Coordinates { .. }
-                | LogicalOperationKind::Members { .. } => {
-                    return Err("scalar lowering received a scheduling construct".into())
-                }
+    let mut results = Vec::new();
+    for result in &call.boundary_results {
+        let kind = match &result.kind {
+            BoundaryResultKind::Value(value) => BoundarySlotKind::Value(*value),
+            BoundaryResultKind::Storage { storage, .. } => BoundarySlotKind::Storage(*storage),
+            BoundaryResultKind::State(token) => {
+                let storage = facts.states.get(token).copied().ok_or_else(|| {
+                    FormationError::Bug("a call result state token has no storage".into())
+                })?;
+                BoundarySlotKind::State(storage)
             }
-        }
-        Ok(())
-    }
-
-    fn nested(&mut self, block: &LogicalBlock) -> Result<Vec<ScalarInstruction>, String> {
-        let outer = std::mem::take(&mut self.instructions);
-        let values = self.values.clone();
-        self.block(block)?;
-        self.values = values;
-        Ok(std::mem::replace(&mut self.instructions, outer))
-    }
-
-    fn bind(&mut self, pattern: &LogicalPattern, value: ScalarValueId) -> Result<(), String> {
-        match pattern {
-            LogicalPattern::Value(local) => {
-                self.values.insert(ValueBindingKey::Local(*local), value);
-            }
-            LogicalPattern::Tuple(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    let ty = pattern_type(self.graph, item)?;
-                    let field = self.fresh(ty);
-                    self.emit(
-                        Some(field),
-                        ScalarInstructionKind::Field { value, index },
-                        vec![],
-                        None,
-                        Span::default(),
-                    );
-                    self.bind(item, field)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn case(&mut self, case: &LogicalConditionalCase) -> Result<ConditionalCase, String> {
-        let value = *self
-            .operand_values
-            .get(&case.value)
-            .ok_or_else(|| format!("operand#{} has no physical value", case.value.0))?;
-        let predicates = case
-            .predicates
-            .iter()
-            .map(|predicate| Ok((self.expr(&predicate.condition)?, predicate.when_true)))
-            .collect::<Result<_, String>>()?;
-        Ok(ConditionalCase { predicates, value })
-    }
-
-    fn expr(&mut self, expression: &LogicalExpr) -> Result<ScalarValueId, String> {
-        let span = expression.span;
-        let (kind, accesses, capability) = match &expression.kind {
-            LogicalExprKind::Value(value) => {
-                return self
-                    .values
-                    .get(&ValueBindingKey::from(value))
-                    .copied()
-                    .ok_or_else(|| format!("missing physical value for {value:?}"))
-            }
-            LogicalExprKind::Coordinate(value) => {
-                return self
-                    .values
-                    .get(&ValueBindingKey::Local(*value))
-                    .copied()
-                    .ok_or_else(|| format!("missing coordinate local#{}", value.0))
-            }
-            LogicalExprKind::Int(value) => (
-                ScalarInstructionKind::Literal(ScalarLiteral::Int(*value)),
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Float(value) => (
-                ScalarInstructionKind::Literal(ScalarLiteral::Float(*value)),
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Bool(value) => (
-                ScalarInstructionKind::Literal(ScalarLiteral::Bool(*value)),
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Shape(value) => {
-                (ScalarInstructionKind::Shape(value.clone()), vec![], None)
-            }
-            LogicalExprKind::Tuple(values) => (
-                ScalarInstructionKind::Tuple(self.exprs(values)?),
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Range(lo, hi) => (
-                ScalarInstructionKind::Range(self.expr(lo)?, self.expr(hi)?),
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Field(value, index) => (
-                ScalarInstructionKind::Field {
-                    value: self.expr(value)?,
-                    index: *index,
-                },
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Construct { storage } => {
-                self.storage_op(StorageOperation::Construct, *storage, vec![], None)?
-            }
-            LogicalExprKind::Filled {
-                storage,
-                like,
-                value,
-            } => {
-                let like = self.expr(like)?;
-                self.storage_op(StorageOperation::Fill, *storage, vec![like], Some(*value))?
-            }
-            LogicalExprKind::View { view, base } => {
-                let base = self.expr(base)?;
-                (
-                    ScalarInstructionKind::View { view: *view, base },
-                    self.view_access(*view, AccessMode::Read)?,
-                    None,
-                )
-            }
-            LogicalExprKind::Index { base, indices } => {
-                let accesses = self
-                    .expr_storage(base)
-                    .map(|storage| self.storage_access(&storage, AccessMode::Read))
-                    .transpose()?
-                    .unwrap_or_default();
-                let base = self.expr(base)?;
-                let indices = indices
-                    .iter()
-                    .map(|index| self.index(index))
-                    .collect::<Result<_, _>>()?;
-                (
-                    ScalarInstructionKind::Index { base, indices },
-                    accesses,
-                    None,
-                )
-            }
-            LogicalExprKind::Snapshot { storage, source } => {
-                let source = self.expr(source)?;
-                self.storage_op(StorageOperation::Snapshot, *storage, vec![source], None)?
-            }
-            LogicalExprKind::Decode { storage, source } => {
-                let source = self.expr(source)?;
-                self.storage_op(StorageOperation::Decode, *storage, vec![source], None)?
-            }
-            LogicalExprKind::Materialize { storage, value } => {
-                let value = self.expr(value)?;
-                self.storage_op(StorageOperation::Materialize, *storage, vec![value], None)?
-            }
-            LogicalExprKind::Cast { dtype, expr } => {
-                let value = self.expr(expr)?;
-                (
-                    ScalarInstructionKind::Cast {
-                        dtype: *dtype,
-                        value,
-                    },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Unary { op, expr } => {
-                let value = self.expr(expr)?;
-                (
-                    ScalarInstructionKind::Unary { op: *op, value },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Binary { op, lhs, rhs } => {
-                let lhs = self.expr(lhs)?;
-                let rhs = self.expr(rhs)?;
-                (
-                    ScalarInstructionKind::Binary { op: *op, lhs, rhs },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Math { op, args } => (
-                ScalarInstructionKind::Math {
-                    op: *op,
-                    arguments: self.exprs(args)?,
-                },
-                vec![],
-                None,
-            ),
-            LogicalExprKind::Select { cond, then, els } => {
-                let condition = self.expr(cond)?;
-                let then_value = self.expr(then)?;
-                let else_value = self.expr(els)?;
-                (
-                    ScalarInstructionKind::Select {
-                        condition,
-                        then_value,
-                        else_value,
-                    },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Extent { base, axis } => {
-                let base = self.expr(base)?;
-                (
-                    ScalarInstructionKind::Extent { base, axis: *axis },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Intrinsic { operation, args } => {
-                let mut accesses = Vec::new();
-                for (ordinal, argument) in args.iter().enumerate() {
-                    if let Some(storage) = self.expr_storage(argument) {
-                        let mode = if operation.writes_arguments().contains(&ordinal) {
-                            AccessMode::ReadWrite
-                        } else {
-                            AccessMode::Read
-                        };
-                        accesses.extend(self.storage_access(&storage, mode)?);
-                    }
-                }
-                (
-                    ScalarInstructionKind::Intrinsic {
-                        operation: *operation,
-                        arguments: self.exprs(args)?,
-                    },
-                    accesses,
-                    Some(ScalarCapabilitySet(self.task.capabilities.clone())),
-                )
-            }
-            LogicalExprKind::Accessor { base, name } => {
-                let base = self.expr(base)?;
-                (
-                    ScalarInstructionKind::Accessor {
-                        base,
-                        name: name.clone(),
-                    },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Geometry { base, axis, valid } => {
-                let base = self.expr(base)?;
-                (
-                    ScalarInstructionKind::Geometry {
-                        base,
-                        axis: *axis,
-                        valid: *valid,
-                    },
-                    vec![],
-                    None,
-                )
-            }
-            LogicalExprKind::Atomic { op, place, value } => {
-                let accesses = self
-                    .expr_storage(place)
-                    .map(|storage| self.storage_access(&storage, AccessMode::Atomic))
-                    .transpose()?
-                    .unwrap_or_default();
-                let place = self.expr(place)?;
-                let value = self.expr(value)?;
-                (
-                    ScalarInstructionKind::Atomic {
-                        op: *op,
-                        place,
-                        value,
-                    },
-                    accesses,
-                    None,
-                )
-            }
-            LogicalExprKind::Call { .. } => return Err("scalar lowering received a call".into()),
-            LogicalExprKind::Reduce { .. } => {
-                return Err("scalar lowering received an unresolved reduction".into())
-            }
-            LogicalExprKind::Region(_) => return Err("scalar lowering received a region".into()),
         };
-        let result = self.fresh(expression.ty.clone());
-        self.emit(Some(result), kind, accesses, capability, span);
-        Ok(result)
+        results.push(BoundaryLeafSlot {
+            path: result.path.clone(),
+            kind,
+        });
     }
+    Ok(UniversalCall {
+        choice: call.choice,
+        synchronous: true,
+        inputs,
+        results,
+    })
+}
 
-    fn exprs(&mut self, values: &[LogicalExpr]) -> Result<Vec<ScalarValueId>, String> {
-        values.iter().map(|value| self.expr(value)).collect()
-    }
+// ---------------------------------------------------------------------------
+// Formation → builder wiring (composition with the realization layer)
+// ---------------------------------------------------------------------------
 
-    fn index(&mut self, index: &LogicalIndex) -> Result<ScalarIndex, String> {
-        Ok(match index {
-            LogicalIndex::Point(value) => ScalarIndex::Point(self.expr(value)?),
-            LogicalIndex::Coordinate(value) => ScalarIndex::Coordinate(
-                *self
-                    .values
-                    .get(&ValueBindingKey::Local(*value))
-                    .ok_or_else(|| format!("missing coordinate local#{}", value.0))?,
-            ),
-            LogicalIndex::Slice(slice) => ScalarIndex::Slice(*slice),
-            LogicalIndex::Range { start, end } => ScalarIndex::Range {
-                start: start.as_ref().map(|value| self.expr(value)).transpose()?,
-                end: end.as_ref().map(|value| self.expr(value)).transpose()?,
-            },
-        })
-    }
+use seismic_realization::executable::{
+    AlternativeBuilder, BuilderError, DispositionReceipt, EffectiveTargetProfile,
+    ExecutableDialect, InactiveBehavior as BuilderInactive, Legalized, NodeRef,
+    ObligationDisposition, ObligationRef,
+};
 
-    fn storage_op(
-        &self,
-        operation: StorageOperation,
-        storage: LocalStorageId,
-        inputs: Vec<ScalarValueId>,
-        fill_bits: Option<u64>,
-    ) -> Result<
-        (
-            ScalarInstructionKind,
-            Vec<PhysicalAccess>,
-            Option<ScalarCapabilitySet>,
-        ),
-        String,
-    > {
-        let key = StorageRef::Local(storage);
-        let bindings = self
-            .bindings
-            .storage
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| format!("missing physical storage for local#{}", storage.0))?;
-        let mode = if matches!(
-            operation,
-            StorageOperation::Construct | StorageOperation::Fill | StorageOperation::Materialize
-        ) {
-            AccessMode::Write
-        } else {
-            AccessMode::ReadWrite
-        };
-        Ok((
-            ScalarInstructionKind::Storage {
-                operation,
-                bindings: bindings.clone(),
-                inputs,
-                fill_bits,
-            },
-            accesses(&bindings, mode),
-            None,
-        ))
-    }
-
-    fn storage_access(
-        &self,
-        storage: &StorageRef,
-        mode: AccessMode,
-    ) -> Result<Vec<PhysicalAccess>, String> {
-        self.bindings
-            .storage
-            .get(storage)
-            .map(|bindings| accesses(bindings, mode))
-            .ok_or_else(|| format!("missing physical storage mapping for {storage:?}"))
-    }
-
-    fn view_access(
-        &self,
-        view: LocalViewId,
-        mode: AccessMode,
-    ) -> Result<Vec<PhysicalAccess>, String> {
-        self.bindings
-            .views
-            .get(&view)
-            .map(|bindings| accesses(bindings, mode))
-            .ok_or_else(|| format!("missing physical view mapping for view#{}", view.0))
-    }
-
-    fn expr_storage(&self, expression: &LogicalExpr) -> Option<StorageRef> {
-        match &expression.kind {
-            LogicalExprKind::Construct { storage }
-            | LogicalExprKind::Filled { storage, .. }
-            | LogicalExprKind::Snapshot { storage, .. }
-            | LogicalExprKind::Decode { storage, .. }
-            | LogicalExprKind::Materialize { storage, .. } => Some(StorageRef::Local(*storage)),
-            LogicalExprKind::View { view, .. } => self
-                .graph
-                .views
-                .get(view.0 as usize)
-                .map(|view| view.storage.clone()),
-            LogicalExprKind::Value(ValueRef::Input(port))
-                if matches!(expression.ty, Type::Tensor(_)) =>
-            {
-                Some(StorageRef::Input {
-                    port: *port,
-                    path: vec![],
-                })
+/// Legalize one formed primitive against a dialect and consume it with the
+/// family builder's `map_primitive` transition. The physical primitive
+/// carries the real canonical operand/result types from the logical node;
+/// the iteration domain is the formed elementwise map, or the single-visit
+/// serial map when the primitive computes inside its containing structure.
+///
+/// A dialect `Inapplicable` of a capability-routed formation is the
+/// capability route (the alternative lives only behind the exact effective
+/// signature); a universal primitive legalizing as `Inapplicable` is a
+/// compiler bug.
+pub fn legalize_and_map_primitive<D: ExecutableDialect>(
+    builder: &mut AlternativeBuilder<D>,
+    target: &EffectiveTargetProfile,
+    node: NodeRef,
+    formed: &FormedPrimitive,
+) -> Result<(), BuilderError> {
+    let legalized = D::legalize(&formed.physical_primitive(), target);
+    if legalized.ops().is_none() {
+        return Err(match &formed.op {
+            PrimitiveOp::Capability(intrinsic) => FormationError::RequiresCapability {
+                intrinsic: intrinsic.clone(),
             }
-            LogicalExprKind::Value(ValueRef::Result(port))
-                if matches!(expression.ty, Type::Tensor(_)) =>
-            {
-                Some(StorageRef::Result {
-                    port: *port,
-                    path: vec![],
-                })
-            }
-            LogicalExprKind::Field(base, _)
-            | LogicalExprKind::Index { base, .. }
-            | LogicalExprKind::Accessor { base, .. }
-            | LogicalExprKind::Geometry { base, .. } => self.expr_storage(base),
-            _ => None,
-        }
+            .to_string(),
+            _ => FormationError::Bug(
+                "a universal primitive mapping legalized as inapplicable".into(),
+            )
+            .to_string(),
+        });
     }
+    builder.map_primitive(node, formed.iteration_or_serial(), legalized)
 }
 
-fn accesses(bindings: &[ScalarStorageBinding], mode: AccessMode) -> Vec<PhysicalAccess> {
-    bindings
-        .iter()
-        .map(|binding| PhysicalAccess {
-            storage: binding.storage,
-            mode,
-        })
-        .collect()
-}
-
-fn pattern_type(graph: &LogicalTaskGraph, pattern: &LogicalPattern) -> Result<Type, String> {
-    match pattern {
-        LogicalPattern::Value(local) => graph
-            .values
-            .get(local.0 as usize)
-            .cloned()
-            .ok_or_else(|| format!("pattern local#{} has no type", local.0)),
-        LogicalPattern::Tuple(items) => items
-            .iter()
-            .map(|item| pattern_type(graph, item))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Type::Tuple),
-    }
-}
-
-fn nested_accesses(
-    then_body: &[ScalarInstruction],
-    else_body: &[ScalarInstruction],
-) -> Vec<PhysicalAccess> {
-    let mut values = then_body
-        .iter()
-        .chain(else_body)
-        .flat_map(|instruction| instruction.consequences.accesses.iter().cloned())
-        .collect::<Vec<_>>();
-    values.sort_by_key(|access| (access.storage, mode_order(access.mode)));
-    values.dedup_by(|a, b| a.storage == b.storage && a.mode == b.mode);
-    values
-}
-
-fn mode_order(mode: AccessMode) -> u8 {
-    match mode {
-        AccessMode::Read => 0,
-        AccessMode::Write => 1,
-        AccessMode::ReadWrite => 2,
-        AccessMode::Atomic => 3,
-    }
+/// Consume one classified safety obligation with the family builder's
+/// `discharge` transition. A statically proved classification becomes the
+/// builder's proved disposition (no check is planned and none may be
+/// emitted); a runtime-checked classification legalizes its planned predicate
+/// through the dialect; a statically impossible classification makes the
+/// alternative inapplicable.
+pub fn discharge_with_builder<D: ExecutableDialect>(
+    builder: &mut AlternativeBuilder<D>,
+    obligation: ObligationRef,
+    classified: &ObligationDischarge,
+    legalize_predicate: impl FnOnce(&CheckPredicate) -> Legalized<D::Op>,
+) -> Result<DispositionReceipt, BuilderError> {
+    let disposition = match classified {
+        ObligationDischarge::StaticallyProved(proof) => ObligationDisposition::StaticallyProved {
+            reason: proof.reason(),
+        },
+        ObligationDischarge::RuntimeChecked(check) => ObligationDisposition::RuntimeChecked {
+            predicate: legalize_predicate(&check.predicate),
+            inactive: match check.inactive {
+                InactiveBehavior::SkipOperation => BuilderInactive::Skip,
+            },
+        },
+        ObligationDischarge::StaticallyImpossible(reason) => return Err(reason.clone()),
+    };
+    builder.discharge(obligation, disposition)
 }

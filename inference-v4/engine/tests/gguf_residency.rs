@@ -1,13 +1,13 @@
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{Arg, TensorData, WIDTHS};
+use reference::{Arg, TensorData};
 use seismic_engine::weights::{
     descriptor::{Stored, Transform, WeightDescriptor},
     gguf::Encoding,
     residency::{block_import, Importer},
     source::FileSource,
 };
-use seismic_lang::types::{DType, Elem, Ty};
+use seismic_lang::types::{DType, Elem, ValueType};
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 struct Case {
@@ -64,7 +64,7 @@ fn check(case: &Case, actual: &[f32]) {
 #[test]
 fn reference_gguf_import() {
     let program = seismic_std::program().unwrap();
-    for width in WIDTHS {
+    {
         for case in cases() {
             let (entry, representation) = block_import(case.encoding).unwrap();
             let count = case.shape.iter().product::<u64>() as usize;
@@ -74,13 +74,13 @@ fn reference_gguf_import() {
             )]);
             let mut padded = case.bytes.clone();
             padded.resize(padded.len().div_ceil(4) * 4, 0);
-            let mut vm = reference::interpreter(&program, width);
+            let mut vm = reference::interpreter(&program);
             let mut planes = Vec::new();
             let args = reference::entry(&program, entry)
                 .params
                 .iter()
                 .map(|param| {
-                    let Ty::Tensor(tensor) = &param.ty else {
+                    let ValueType::Tensor(tensor) = &param.ty else {
                         panic!("{entry}.{} is not a tensor", param.name)
                     };
                     let Elem::Dtype(dtype) = tensor.elem else {
@@ -111,7 +111,7 @@ fn reference_gguf_import() {
             reference::run(
                 &mut vm,
                 "import_weight",
-                &[Arg::Tensor(source), Arg::Tensor(out), Arg::Scalar(0.)],
+                &[Arg::Tensor(source), Arg::Tensor(out)],
                 &HashMap::from([("N".to_string(), count as i64)]),
             );
             check(&case, &reference::values(&vm.tensors[out]));

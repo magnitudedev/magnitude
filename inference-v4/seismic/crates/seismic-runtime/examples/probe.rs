@@ -1,6 +1,6 @@
 //! Timing probe for one linked entry on Metal: selects, compiles, binds random tensors and
-//! reports the resolved physical assignment, its estimate, and measured GPU time per dispatch (best of
-//! several profiled runs) and per invocation inside one batched command buffer.
+//! reports the resolved physical assignment, its estimate, and measured time per invocation
+//! (best of several observed runs) and per invocation inside one sequential batch.
 //!
 //! usage: probe <source dir>... -- <entry> <K=V,...> <NAME=elem,...|-> [scalar=v,...|-] [name=v:v:...;...|-] [exact]
 use seismic_lang::interp::{Rng, TensorData};
@@ -8,7 +8,7 @@ use seismic_lang::program::{collect_files, compile};
 use seismic_lang::repr;
 use seismic_lang::sir::Mode;
 use seismic_lang::types::{DType, Elem};
-use seismic_lang::types::{Extent, Ty};
+use seismic_lang::types::{ExtentExpr, ValueType};
 use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
 use seismic_runtime::{Buffer, Device};
 use std::collections::HashMap;
@@ -95,29 +95,35 @@ fn main() -> Result<(), String> {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut buffers = HashMap::new();
     for param in &definition.params {
-        let Ty::Tensor(shaped) = &param.ty else {
+        let ValueType::Tensor(shaped) = &param.ty else {
             continue;
         };
         let shape = shaped
             .axes
             .iter()
             .map(|axis| match axis {
-                Extent::Semantic(sym) => sym
+                ExtentExpr::Sym(sym) => sym
                     .eval(&|n| shapes.get(n).copied())
                     .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| format!("{}: unresolved extent {sym}", param.name)),
-                Extent::Structural(_) => Err(format!("{}: structural entry extent", param.name)),
+                ExtentExpr::Static(value) => usize::try_from(*value)
+                    .map_err(|_| format!("{}: extent exceeds address range", param.name)),
+                ExtentExpr::Runtime(_) => {
+                    Err(format!("{}: runtime-dependent entry extent", param.name))
+                }
             })
             .collect::<Result<Vec<_>, String>>()?;
         let elem = match &shaped.elem {
-            Elem::Param(p) => elems.get(p).ok_or_else(|| format!("unbound element {p}"))?,
+            Elem::Param(p) => elems
+                .get(p.as_str())
+                .ok_or_else(|| format!("unbound element {p}"))?,
             concrete => concrete,
         };
         let mut tensor = match elem {
             Elem::Dtype(dtype) => TensorData::random_dense(&mut rng, *dtype, shape),
             Elem::Repr(name) => TensorData::random_packed(
                 &mut rng,
-                repr::lookup(name).ok_or("unknown representation")?,
+                repr::lookup(name.as_str()).ok_or("unknown representation")?,
                 shape,
             ),
             Elem::Param(p) => return Err(format!("element {p} is not concrete")),
@@ -128,7 +134,9 @@ fn main() -> Result<(), String> {
                 TensorData::Packed { .. } => 0,
             };
             for flat in 0..count {
-                tensor.set(flat, values[flat % values.len()]);
+                tensor
+                    .set(flat, values[flat % values.len()])
+                    .map_err(|e| e.to_string())?;
             }
         }
         let _ = param.mode != Mode::In;
@@ -178,7 +186,15 @@ fn main() -> Result<(), String> {
                 .assignment
                 .selections()
                 .iter()
-                .map(|(choice, alternative)| (choice.0, alternative.0))
+                .map(|(choice, alternative)| {
+                    (
+                        *choice,
+                        (
+                            alternative.logical_alternative,
+                            alternative.physical_alternative,
+                        ),
+                    )
+                })
                 .collect::<Vec<_>>()
         );
         println!(
@@ -201,29 +217,22 @@ fn main() -> Result<(), String> {
             selection.numerical_assessment.evidence, selection.numerical_evidence_identity
         );
     }
-    let mut best: Vec<(String, u64, f64)> = Vec::new();
+    let mut best_host = f64::INFINITY;
+    let mut best_device = f64::INFINITY;
     for _ in 0..12 {
         let steps = plan.execute_observed(&bound)?;
-        let dispatches: Vec<_> = steps.into_iter().flat_map(|s| s.dispatches).collect();
-        if best.is_empty() {
-            best = dispatches
-                .iter()
-                .map(|d| (d.kernel.clone(), d.threadgroups, d.device_seconds))
-                .collect();
-        }
-        for (slot, d) in best.iter_mut().zip(&dispatches) {
-            slot.2 = slot.2.min(d.device_seconds);
+        for step in steps {
+            best_host = best_host.min(step.execution.host_seconds);
+            if let Some(seconds) = step.execution.device_seconds {
+                best_device = best_device.min(seconds);
+            }
         }
     }
-    for (kernel, groups, seconds) in &best {
-        println!("  {kernel:<36} tg={groups:<6} best {:.1} us", seconds * 1e6);
+    println!("best host {:.1} us", best_host * 1e6);
+    if best_device.is_finite() {
+        println!("best device {:.1} us", best_device * 1e6);
     }
-    println!(
-        "profiled sum {:.1} us",
-        best.iter().map(|b| b.2).sum::<f64>() * 1e6
-    );
     let mut batched = f64::INFINITY;
-    // Long command buffers keep the GPU at its steady clocks, as a batched forward does.
     for _ in 0..8 {
         let mut submission = plan.prepare(&bound)?;
         for _ in 1..200 {

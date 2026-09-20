@@ -4,14 +4,11 @@
 //! buffers. The CPU backend is always available and therefore serves as the
 //! workspace gate that every mapped construct reaches a real native encoder.
 
-use seismic_compiler::{
-    pipeline,
-    planning::{Budget, Strategy},
-};
+use seismic_compiler::pipeline::Workload;
+use seismic_compiler::{pipeline, planning::Budget};
 use seismic_cpu::mapping::Cpu;
 use seismic_cuda::mapping::Cuda;
 use seismic_lang::{
-    family::Workload,
     precision::PrecisionPolicy,
     types::{DType, Elem},
 };
@@ -110,7 +107,6 @@ fn active_qwen_corpus_reaches_native_cpu_encoding() {
             Budget {
                 work: 200_000,
                 time: None,
-                strategy: Strategy::Greedy,
             },
         )
         .unwrap_or_else(|error| panic!("{entry}: {error}"));
@@ -140,7 +136,6 @@ fn active_qwen_corpus_reaches_resolved_cuda_ptx() {
             Budget {
                 work: 200_000,
                 time: None,
-                strategy: Strategy::Greedy,
             },
         )
         .unwrap_or_else(|error| panic!("{entry}: {error}"));
@@ -165,7 +160,6 @@ fn active_qwen_corpus_reaches_resolved_msl() {
             Budget {
                 work: 200_000,
                 time: None,
-                strategy: Strategy::Greedy,
             },
         )
         .unwrap_or_else(|error| panic!("{entry}: {error}"));

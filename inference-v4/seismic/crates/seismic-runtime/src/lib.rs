@@ -1,28 +1,35 @@
 //! Native resource ownership and invocation. Numerical work stays in compiled
 //! Seismic. Native executables are produced only by the unified logical ->
-//! physical -> native compiler pipeline.
+//! family -> solve -> resolve -> encode pipeline.
 //!
-//! Metal, the CPU and CUDA are the backends on the structured pipeline. The CUDA driver is
-//! loaded at run time, so opening a CUDA device fails cleanly on a host without one.
-//! `BackendDevice`, `Storage`, `Executable` and `DeviceFacts` are closed
-//! sums: a backend rejoins by adding one variant to each and one arm to every `match` on them
-//! (all of them are in this file and in `plan.rs`).
-//! The Metal variants exist on macOS only; the CPU and CUDA variants exist everywhere.
+//! Metal, the CPU and CUDA are the backends on the structured pipeline. Each
+//! backend runtime validates the retained root ABI (sizes, alignment, alias
+//! rules over actual byte ranges), allocates the exact planned
+//! arena/results/status blocks, binds retained IDs, evaluates the retained
+//! execution expressions, skips zero-work launches, and interprets the
+//! retained structured execution tree. This crate is the device facade over
+//! those embedded runtimes: one `Device`/`Buffer`/`Kernel` surface with no
+//! retry, candidate, or strategy API.
+//!
+//! The CUDA driver is loaded at run time, so opening a CUDA device fails
+//! cleanly on a host without one. `BackendDevice`, `Storage`, `Executable`
+//! and `DeviceFacts` are closed sums: a backend rejoins by adding one variant
+//! to each and one arm to every `match` on them (all of them are in this file
+//! and in `plan.rs`). The Metal variants exist on macOS only; the CPU and
+//! CUDA variants exist everywhere.
 
 mod error;
 pub use error::Error;
 pub mod memory;
 pub mod plan;
-pub use seismic_compiler::planning::{Budget, NumericalEvidence, Strategy};
+pub use seismic_compiler::pipeline::Workload;
+use seismic_compiler::pipeline::{self, Compiled};
+pub use seismic_compiler::planning::{Budget, NumericalEvidence};
 use seismic_lang::abi::ScalarParameter;
-use seismic_lang::family::Workload;
 use seismic_lang::sir::Program;
-use seismic_realization::{
-    executable::{
-        AbiRole, ExecutableDialect, PlanAssignment, ResolvedLaunchId, ResolvedPlan,
-        ResolvedScheduleItem, StorageScope,
-    },
-    BufferSpec, InvocationConditions,
+use seismic_realization::executable::{
+    self as realization, AbiRole, BufferBindingId, ExecutableDialect, ExecutionExpr,
+    ResolvedLaunchId, ResolvedPlan, ResolvedSchedule, ResolvedStep,
 };
 use std::rc::Rc;
 
@@ -34,14 +41,14 @@ enum BackendDevice {
     /// A private, thread-affine driver context.
     Cuda(Rc<seismic_cuda::Device>),
 }
-/// The worker pool of one CPU device. Execution is synchronous, so one phase runs at a time.
+/// The worker pool of one CPU device. Execution is synchronous, so one launch runs at a time.
 struct CpuDevice {
     workers: std::cell::RefCell<seismic_cpu::Workers>,
 }
 /// Facts of the host a CPU device executes on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuInfo {
-    /// Worker threads that execute the pieces of a root `parallel` phase.
+    /// Worker threads that execute the pieces of one independent domain.
     pub workers: u64,
 }
 #[derive(Clone)]
@@ -67,6 +74,34 @@ struct Allocation {
     bytes: usize,
     _charge: memory::Charge,
 }
+
+/// One public buffer binding of the retained root ABI, in ABI buffer order.
+/// The dense plane is presented as `""` for source-level binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferSpec {
+    pub parameter: String,
+    pub plane: String,
+    pub role: BindingRole,
+    pub binding: BufferBindingId,
+    pub bytes: usize,
+    pub alignment: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindingRole {
+    Parameter,
+    Result { path: Vec<u32> },
+}
+
+/// The retained root ABI in bindable form: public buffers in ABI order,
+/// result buffer bindings in ABI result order, scalar fields in encoding
+/// order, and the alias rules over binding ids.
+pub(crate) struct Binding {
+    buffers: Vec<BufferSpec>,
+    result_bindings: Vec<BufferBindingId>,
+    scalars: Vec<ScalarParameter>,
+    alias_rules: Vec<realization::AliasRule>,
+}
+
 enum Executable {
     #[cfg(target_os = "macos")]
     Metal {
@@ -87,8 +122,8 @@ enum Executable {
 pub enum DeviceTimingScope {
     /// Complete Metal command buffer interval, including its encoded dependencies.
     CommandBuffer,
-    /// Wall time of the phases of a CPU kernel on the worker pool, after binding.
-    CpuPhases,
+    /// Wall time of the launches of a CPU kernel on the worker pool, after binding.
+    CpuLaunches,
     /// Sum of the per-launch CUDA event intervals, excluding host gaps.
     CudaLaunches,
 }
@@ -113,8 +148,25 @@ pub struct DispatchProfile {
     pub device_seconds: f64,
 }
 
-/// Auditable report projected directly from the resolved executable plan. It
-/// is not a second selection representation.
+/// One selected implementation alternative at a call occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlternativeSelection {
+    pub logical_alternative: u32,
+    pub physical_alternative: u32,
+}
+/// The solver's implementation assignment, retained for reporting.
+#[derive(Clone, Debug, Default)]
+pub struct PlanAssignment {
+    selections: Vec<(u32, AlternativeSelection)>,
+}
+impl PlanAssignment {
+    pub fn selections(&self) -> &[(u32, AlternativeSelection)] {
+        &self.selections
+    }
+}
+
+/// Auditable report projected directly from the resolved plan. It is not a
+/// second selection representation.
 #[derive(Clone, Debug)]
 pub struct Selection {
     pub entry: String,
@@ -124,6 +176,8 @@ pub struct Selection {
     pub resources: Vec<LaunchResources>,
     pub capability_fingerprint: String,
     pub numerical_assessment: seismic_lang::precision::NumericalAssessment,
+    /// Identity of the evidence the assessment carries: the resolved
+    /// toolchain fingerprint and evidence class.
     pub numerical_evidence_identity: Option<String>,
     /// Static shape and element bindings of the compiled specialization (its identity).
     pub shapes: Vec<(String, i64)>,
@@ -135,75 +189,210 @@ pub struct Selection {
 #[derive(Clone, Debug)]
 pub struct LaunchResources {
     pub launch: ResolvedLaunchId,
-    pub workgroups: [u64; 3],
+    /// Grid geometry when it is statically determined; geometry that depends
+    /// on runtime extents or scalars stays symbolic.
+    pub workgroups: Option<[u64; 3]>,
     pub device_bytes: u64,
     pub workgroup_bytes: u64,
     pub private_bytes_per_participant: u64,
     pub bindings: u64,
-    pub threads_per_group: u64,
+    pub threads_per_group: Option<u64>,
 }
 
 pub struct Kernel {
-    conditions: InvocationConditions,
     executable: Executable,
-    buffers: Vec<BufferSpec>,
-    scalars: Vec<ScalarParameter>,
+    binding: Binding,
     selection: Selection,
 }
 
+/// Evaluate a retained execution expression statically. Runtime-extent
+/// references resolve transitively; scalar references are unknown here.
+fn eval_static(
+    expr: &ExecutionExpr,
+    extents: &dyn Fn(seismic_lang::types::RuntimeExtentId) -> Option<ExecutionExpr>,
+) -> Option<u64> {
+    Some(match expr {
+        ExecutionExpr::Const(value) => *value,
+        ExecutionExpr::Extent(id) => {
+            let resolved = extents(*id)?;
+            eval_static(&resolved, extents)?
+        }
+        ExecutionExpr::AbiScalar { .. } | ExecutionExpr::ExecutorScalar(_) => return None,
+        ExecutionExpr::Add(left, right) => {
+            eval_static(left, extents)?.checked_add(eval_static(right, extents)?)?
+        }
+        ExecutionExpr::Sub(left, right) => {
+            eval_static(left, extents)?.checked_sub(eval_static(right, extents)?)?
+        }
+        ExecutionExpr::Mul(left, right) => {
+            eval_static(left, extents)?.checked_mul(eval_static(right, extents)?)?
+        }
+        ExecutionExpr::CeilDiv(left, right) => {
+            eval_static(left, extents)?.div_ceil(eval_static(right, extents)?)
+        }
+        ExecutionExpr::Div(left, right) => {
+            eval_static(left, extents)?.checked_div(eval_static(right, extents)?)?
+        }
+        ExecutionExpr::Rem(left, right) => {
+            eval_static(left, extents)?.checked_rem(eval_static(right, extents)?)?
+        }
+        ExecutionExpr::Min(left, right) => {
+            eval_static(left, extents)?.min(eval_static(right, extents)?)
+        }
+    })
+}
+
+/// Collect the retained root ABI in bindable form. Parameter names come from
+/// the entry interface: ABI parameter ordinals are interface param ordinals.
+fn binding<D: ExecutableDialect, A>(compiled: &Compiled<D, A>) -> Result<Binding, String> {
+    let abi = &compiled.physical.abi;
+    let interface = compiled
+        .logical
+        .choice(compiled.logical.entry_choice)
+        .interface
+        .clone();
+    let mut buffers = Vec::with_capacity(abi.buffers.len());
+    for buffer in &abi.buffers {
+        let (parameter, role) = match buffer.role {
+            AbiRole::Parameter { ordinal } => {
+                let name = interface
+                    .params
+                    .get(ordinal as usize)
+                    .map(|param| param.name.clone())
+                    .ok_or_else(|| {
+                        "compiler bug: an ABI parameter names no interface parameter".to_string()
+                    })?;
+                (name, BindingRole::Parameter)
+            }
+            AbiRole::Result => (
+                buffer
+                    .path
+                    .0
+                    .iter()
+                    .map(|ordinal| ordinal.to_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                BindingRole::Result {
+                    path: buffer.path.0.clone(),
+                },
+            ),
+        };
+        buffers.push(BufferSpec {
+            parameter,
+            plane: match buffer.plane.as_str() {
+                "dense" => String::new(),
+                plane => plane.to_string(),
+            },
+            role,
+            binding: buffer.binding,
+            bytes: usize::try_from(buffer.bytes)
+                .map_err(|_| "an ABI buffer exceeds the host address range".to_string())?,
+            alignment: usize::try_from(buffer.alignment)
+                .map_err(|_| "an ABI alignment exceeds the host address range".to_string())?,
+        });
+    }
+    let result_bindings = abi
+        .results
+        .iter()
+        .filter_map(|result| match result {
+            realization::ResultBinding::Buffer { binding, .. } => Some(*binding),
+            realization::ResultBinding::Scalar { .. }
+            | realization::ResultBinding::Range { .. } => None,
+        })
+        .collect();
+    let scalars = abi
+        .scalars
+        .fields
+        .iter()
+        .map(|field| field.parameter.clone())
+        .collect();
+    Ok(Binding {
+        buffers,
+        result_bindings,
+        scalars,
+        alias_rules: abi.alias_rules.clone(),
+    })
+}
+
 fn selection<D: ExecutableDialect, A>(
-    compiled: &seismic_compiler::pipeline::Compiled<D, A>,
+    compiled: &Compiled<D, A>,
     compile: std::time::Duration,
 ) -> Selection {
     fn resources<D: ExecutableDialect>(
         plan: &ResolvedPlan<D>,
+        schedule: &ResolvedSchedule<D>,
         output: &mut Vec<LaunchResources>,
     ) {
-        let device_bytes = plan
-            .device_storage()
-            .allocations
-            .iter()
-            .filter(|storage| storage.scope == StorageScope::Device)
-            .map(|storage| storage.bytes)
-            .sum();
-        for item in plan.items().iter() {
-            match item {
-                ResolvedScheduleItem::Phase(phase) => {
-                    for launch in phase.launches.iter() {
-                        output.push(LaunchResources {
-                            launch: launch.id,
-                            workgroups: launch.geometry.workgroups,
-                            device_bytes,
-                            workgroup_bytes: launch.kernel.resources.workgroup_bytes,
-                            private_bytes_per_participant: launch.kernel.resources.private_bytes,
-                            bindings: launch.binding_groups.len() as u64,
-                            threads_per_group: launch
-                                .geometry
-                                .participants_per_workgroup
-                                .iter()
-                                .product(),
-                        });
-                    }
+        for step in schedule.steps.iter() {
+            match step {
+                ResolvedStep::Launch(launch) => {
+                    let extent_of = |id: seismic_lang::types::RuntimeExtentId| {
+                        plan.runtime_extents.get(id).cloned()
+                    };
+                    let workgroups = launch
+                        .geometry
+                        .workgroups
+                        .iter()
+                        .map(|expr| eval_static(expr, &extent_of))
+                        .collect::<Option<Vec<_>>>()
+                        .map(|axes| [axes[0], axes[1], axes[2]]);
+                    let threads_per_group = launch
+                        .geometry
+                        .participants_per_workgroup
+                        .iter()
+                        .map(|expr| eval_static(expr, &extent_of))
+                        .product();
+                    output.push(LaunchResources {
+                        launch: launch.id,
+                        workgroups,
+                        device_bytes: plan.internal_arena.bytes,
+                        workgroup_bytes: launch.kernel.resources.workgroup_bytes,
+                        private_bytes_per_participant: launch
+                            .kernel
+                            .resources
+                            .private_bytes_per_participant,
+                        bindings: launch.bindings.len() as u64,
+                        threads_per_group,
+                    });
                 }
-                ResolvedScheduleItem::Subplan(subplan) => resources(&subplan.plan, output),
+                ResolvedStep::Call(call) => resources(plan, &call.body.schedule, output),
+                ResolvedStep::If(if_step) => {
+                    resources(plan, &if_step.then_schedule, output);
+                    resources(plan, &if_step.else_schedule, output);
+                }
+                ResolvedStep::Repeat(repeat) => resources(plan, &repeat.body, output),
             }
         }
     }
-    let mut launch_resources = Vec::new();
-    resources(&compiled.physical, &mut launch_resources);
     let physical = &compiled.physical;
+    let mut launch_resources = Vec::new();
+    resources(physical, &physical.entry.schedule, &mut launch_resources);
     Selection {
         entry: compiled.logical.entry.clone(),
-        assignment: physical.identity().assignment.clone(),
-        estimated_cost: physical.estimated_cost(),
-        optimal: physical.optimal(),
+        assignment: PlanAssignment {
+            selections: physical
+                .identity
+                .selections
+                .iter()
+                .map(|(choice, selected)| {
+                    (
+                        choice.0,
+                        AlternativeSelection {
+                            logical_alternative: selected.0,
+                            physical_alternative: selected.1,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        estimated_cost: i64::try_from(physical.estimated_cost).unwrap_or(i64::MAX),
+        optimal: physical.optimal,
         resources: launch_resources,
-        capability_fingerprint: compiled.logical.capability_fingerprint.clone(),
-        numerical_assessment: physical.numerical_assessment().clone(),
+        capability_fingerprint: compiled.logical.target.capability_fingerprint.clone(),
+        numerical_assessment: physical.numerical.clone(),
         numerical_evidence_identity: Some(format!(
-            "{}:{}",
-            physical.identity().precision.method_revision,
-            physical.identity().precision.evidence_domain
+            "{}:{:?}",
+            physical.identity.toolchain_fingerprint, physical.numerical.evidence
         )),
         shapes: compiled
             .logical
@@ -213,7 +402,7 @@ fn selection<D: ExecutableDialect, A>(
             .collect(),
         elements: compiled
             .logical
-            .elems
+            .elements
             .iter()
             .map(|(name, element)| (name.clone(), element.to_string()))
             .collect(),
@@ -266,7 +455,6 @@ impl Device {
     #[cfg(target_os = "macos")]
     pub fn metal() -> Result<Self, String> {
         Ok(Self(
-            #[cfg(target_os = "macos")]
             BackendDevice::Metal(Rc::new(seismic_metal::runtime::Device::open()?)),
             Rc::default(),
         ))
@@ -308,9 +496,9 @@ impl Device {
         buffer.write(bytes)?;
         Ok(buffer)
     }
-    /// Compile through the sole specialization -> physical planning -> native
-    /// pipeline for this device. No selected or partially lowered artifact is
-    /// exposed at the runtime boundary.
+    /// Compile through the sole specialization -> family -> solve -> resolve
+    /// -> encode pipeline for this device. No selected or partially lowered
+    /// artifact is exposed at the runtime boundary.
     pub fn compile(
         &self,
         program: &Program,
@@ -332,133 +520,62 @@ impl Device {
         evidence: &[NumericalEvidence],
     ) -> Result<Kernel, String> {
         let started = std::time::Instant::now();
-        match &self.0 {
+        let compiled = match &self.0 {
             #[cfg(target_os = "macos")]
             BackendDevice::Metal(device) => {
-                let backend = seismic_metal::mapping::MetalCompiler::from_device(device)
-                    .map_err(|error| error.to_string())?;
-                let compiled = seismic_compiler::pipeline::compile(
-                    program, entry, workload, &backend, evidence, budget,
-                )
-                .map_err(|error| error.to_string())?;
-                let selection = selection(&compiled, started.elapsed());
+                let backend = seismic_metal::mapping::MetalCompiler::from_device(device)?;
+                let compiled =
+                    pipeline::compile(program, entry, workload, &backend, evidence, budget)
+                        .map_err(|error| error.to_string())?;
+                let bound = binding(&compiled)?;
+                let report = selection(&compiled, started.elapsed());
                 let pipeline = compiled.native;
-                let conditions = InvocationConditions::from_executable(
-                    &compiled.physical,
-                    &pipeline.emitted.buffer_ids,
-                )?;
-                let buffers = pipeline.emitted.buffers.clone();
-                let scalars = pipeline.emitted.scalars.clone();
-                Ok(Kernel {
-                    conditions,
+                Kernel {
+                    binding: bound,
                     executable: Executable::Metal {
                         device: device.clone(),
                         pipeline: Box::new(pipeline),
                     },
-                    buffers,
-                    scalars,
-                    selection,
-                })
+                    selection: report,
+                }
             }
             BackendDevice::Cpu(device) => {
                 let workers = device.workers.borrow().count() as u64;
-                let backend =
-                    seismic_cpu::mapping::Cpu::host(workers).map_err(|error| error.to_string())?;
-                let compiled = seismic_compiler::pipeline::compile(
-                    program, entry, workload, &backend, evidence, budget,
-                )
-                .map_err(|error| error.to_string())?;
-                let selection = selection(&compiled, started.elapsed());
+                let backend = seismic_cpu::mapping::Cpu::host(workers)?;
+                let compiled =
+                    pipeline::compile(program, entry, workload, &backend, evidence, budget)
+                        .map_err(|error| error.to_string())?;
+                let bound = binding(&compiled)?;
+                let report = selection(&compiled, started.elapsed());
                 let seismic_cpu::physical::NativeArtifact { kernel } = compiled.native;
-                let conditions = InvocationConditions::from_executable(
-                    &compiled.physical,
-                    kernel.external_ids(),
-                )?;
-                let buffers = kernel.buffers().to_vec();
-                let scalars = kernel.scalars().to_vec();
-                Ok(Kernel {
-                    conditions,
+                Kernel {
+                    binding: bound,
                     executable: Executable::Cpu {
                         device: device.clone(),
                         kernel: Box::new(kernel),
                     },
-                    buffers,
-                    scalars,
-                    selection,
-                })
+                    selection: report,
+                }
             }
             BackendDevice::Cuda(device) => {
-                let backend =
-                    seismic_cuda::CudaCompiler::new(device).map_err(|error| error.to_string())?;
-                let compiled = seismic_compiler::pipeline::compile(
-                    program, entry, workload, &backend, evidence, budget,
-                )
-                .map_err(|error| error.to_string())?;
-                let selection = selection(&compiled, started.elapsed());
+                let backend = seismic_cuda::CudaCompiler::new(device)?;
+                let compiled =
+                    pipeline::compile(program, entry, workload, &backend, evidence, budget)
+                        .map_err(|error| error.to_string())?;
+                let bound = binding(&compiled)?;
+                let report = selection(&compiled, started.elapsed());
                 let sequence = compiled.native;
-                let ids = sequence
-                    .external_allocations()
-                    .iter()
-                    .map(|allocation| allocation.id)
-                    .collect::<Vec<_>>();
-                let conditions = InvocationConditions::from_executable(&compiled.physical, &ids)?;
-                let buffers = sequence
-                    .external_allocations()
-                    .iter()
-                    .map(|allocation| {
-                        let abi = allocation
-                            .role
-                            .as_ref()
-                            .ok_or_else(|| "public CUDA allocation has no ABI role".to_string())?;
-                        let (parameter, plane, role) = match abi {
-                            AbiRole::Parameter {
-                                ordinal,
-                                representation_plane,
-                                ..
-                            } => (
-                                format!("parameter_{ordinal}"),
-                                representation_plane.clone().unwrap_or_default(),
-                                seismic_realization::BufferRole::Parameter,
-                            ),
-                            AbiRole::Result {
-                                ordinal,
-                                path,
-                                representation_plane,
-                            } => (
-                                format!("result_{ordinal}"),
-                                representation_plane.clone().unwrap_or_default(),
-                                seismic_realization::BufferRole::Result { path: path.clone() },
-                            ),
-                            AbiRole::InvocationResource { name } => {
-                                return Err(format!(
-                                    "invocation resource `{name}` escaped into the public CUDA ABI"
-                                ));
-                            }
-                        };
-                        Ok(BufferSpec {
-                            parameter,
-                            plane,
-                            role,
-                            bytes: usize::try_from(allocation.bytes)
-                                .map_err(|_| "CUDA ABI allocation exceeds host address range")?,
-                            alignment: usize::try_from(allocation.alignment)
-                                .map_err(|_| "CUDA ABI alignment exceeds host address range")?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let scalars = Vec::new();
-                Ok(Kernel {
-                    conditions,
+                Kernel {
+                    binding: bound,
                     executable: Executable::Cuda {
                         _device: device.clone(),
                         sequence: Box::new(sequence),
                     },
-                    buffers,
-                    scalars,
-                    selection,
-                })
+                    selection: report,
+                }
             }
-        }
+        };
+        Ok(compiled)
     }
 }
 impl Buffer {
@@ -473,7 +590,6 @@ impl Buffer {
     #[cfg(target_os = "macos")]
     fn metal(&self) -> Result<&seismic_metal::runtime::Buffer, String> {
         match &self.0 {
-            #[cfg(target_os = "macos")]
             Storage::Metal(buffer) => Ok(buffer),
             _ => Err(format!(
                 "a {} buffer is bound to a Metal kernel",
@@ -599,60 +715,101 @@ impl Buffer {
     }
 }
 impl Kernel {
-    /// The logical specialization and resolved physical planning report retained
-    /// for this kernel.
+    /// The resolved physical planning report retained for this kernel.
     pub fn selection(&self) -> &Selection {
         &self.selection
     }
-    /// Invocation conditions of the resolved execution, checked before every submission.
-    /// Byte sizes and typed alignment are checked by the native binding path.
-    fn validate_invocation(&self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
-        if buffers.len() != self.buffers.len() || scalars.len() != self.scalars.len() {
+    /// Public buffer bindings of the retained root ABI, in ABI order.
+    pub fn buffers(&self) -> &[BufferSpec] {
+        &self.binding.buffers
+    }
+    /// Scalar fields of the retained root ABI, in encoding order.
+    pub fn scalars(&self) -> &[ScalarParameter] {
+        &self.binding.scalars
+    }
+    /// Retained native launches of the structured schedule.
+    pub fn launch_count(&self) -> usize {
+        match &self.executable {
+            #[cfg(target_os = "macos")]
+            Executable::Metal { pipeline, .. } => pipeline.emitted.launches.len(),
+            Executable::Cpu { kernel, .. } => kernel.launch_count(),
+            Executable::Cuda { sequence, .. } => sequence.launch_count(),
+        }
+    }
+    /// Invocation contract of the resolved execution, checked before every
+    /// submission: binding counts, byte sizes against the retained ABI, and
+    /// the root alias rules over actual byte ranges. Typed alignment is
+    /// checked by the native binding path.
+    pub(crate) fn validate_invocation(
+        &self,
+        buffers: &[Buffer],
+        scalars: &[f64],
+    ) -> Result<(), String> {
+        let specs = &self.binding.buffers;
+        if buffers.len() != specs.len() || scalars.len() != self.binding.scalars.len() {
             return Err("invocation binding count differs from the retained entry ABI".into());
         }
-        for &index in self.conditions.independent_buffers() {
-            if buffers
-                .iter()
-                .enumerate()
-                .any(|(other, b)| other != index && buffers[index].shares_allocation(b))
-            {
+        for (spec, buffer) in specs.iter().zip(buffers) {
+            if buffer.len() < spec.bytes {
                 return Err(format!(
-                    "private intermediate {} aliases another entry argument",
-                    self.buffers[index].parameter
+                    "binding {}.{} needs {} bytes; {} are bound",
+                    spec.parameter,
+                    if spec.plane.is_empty() {
+                        "dense"
+                    } else {
+                        &spec.plane
+                    },
+                    spec.bytes,
+                    buffer.len()
                 ));
             }
         }
-        self.conditions.validate_aliases(&self.buffers, |i| {
-            (
-                Rc::as_ptr(&buffers[i].1) as usize as u64,
-                buffers[i].2 as u64,
-            )
-        })
-    }
-    #[cfg(target_os = "macos")]
-    pub fn metal_pipeline_facts(&self) -> Option<&[seismic_metal::runtime::PipelineFacts]> {
-        match &self.executable {
-            #[cfg(target_os = "macos")]
-            Executable::Metal { pipeline, .. } => Some(&pipeline.facts),
-            Executable::Cpu { .. } | Executable::Cuda { .. } => None,
+        let locate = |binding: BufferBindingId| -> Option<(usize, &Buffer)> {
+            specs
+                .iter()
+                .position(|spec| spec.binding == binding)
+                .and_then(|ordinal| buffers.get(ordinal).map(|buffer| (ordinal, buffer)))
+        };
+        for rule in &self.binding.alias_rules {
+            let (left, right) = match *rule {
+                realization::AliasRule::MayOverlap { left, right } => (left, right),
+                realization::AliasRule::MustDisjoint { left, right } => (left, right),
+            };
+            let (Some((_, left_buffer)), Some((_, right_buffer))) = (locate(left), locate(right))
+            else {
+                continue;
+            };
+            let (left_bytes, right_bytes) = (
+                specs
+                    .iter()
+                    .find(|spec| spec.binding == left)
+                    .map(|spec| spec.bytes)
+                    .unwrap_or(0),
+                specs
+                    .iter()
+                    .find(|spec| spec.binding == right)
+                    .map(|spec| spec.bytes)
+                    .unwrap_or(0),
+            );
+            if left_bytes == 0 || right_bytes == 0 {
+                continue;
+            }
+            let overlapping = left_buffer.shares_allocation(right_buffer)
+                && left_buffer.allocation_offset()
+                    < right_buffer.allocation_offset().saturating_add(right_bytes)
+                && right_buffer.allocation_offset()
+                    < left_buffer.allocation_offset().saturating_add(left_bytes);
+            if overlapping && matches!(rule, realization::AliasRule::MustDisjoint { .. }) {
+                return Err(format!(
+                    "bound buffers of bindings {left:?} and {right:?} overlap but must be disjoint"
+                ));
+            }
         }
-    }
-    pub fn phase_count(&self) -> usize {
-        match &self.executable {
-            #[cfg(target_os = "macos")]
-            Executable::Metal { pipeline, .. } => pipeline.phase_count(),
-            Executable::Cpu { kernel, .. } => kernel.phase_count(),
-            Executable::Cuda { sequence, .. } => sequence.phase_count(),
-        }
-    }
-    pub fn buffers(&self) -> &[BufferSpec] {
-        &self.buffers
-    }
-    pub fn scalars(&self) -> &[ScalarParameter] {
-        &self.scalars
+        Ok(())
     }
     /// Synchronous completion boundary. Physical resources remain owned until
-    /// completion, including failures. This is not yet a batched submission plan.
+    /// completion, including failures. Tensor results are written into the
+    /// invocation's result buffers.
     pub fn execute(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
         self.invoke(buffers, scalars, false).map(|_| ())
     }
@@ -669,83 +826,20 @@ impl Kernel {
             device_scope: Some(self.timing_scope()),
         })
     }
-    /// One execution with a sampled encoder per dispatch (native stage timestamps).
-    /// The per-dispatch intervals are a qualification aid; the command interval of this
-    /// run includes the per-encoder boundaries and is not a throughput sample.
+    /// One observed execution. The backend runtimes retain no per-dispatch
+    /// native telemetry; the dispatch list is empty.
     pub fn execute_profiled(
         &mut self,
         buffers: &[Buffer],
         scalars: &[f64],
     ) -> Result<(ExecutionObservation, Vec<DispatchProfile>), String> {
-        let start = std::time::Instant::now();
-        self.validate_invocation(buffers, scalars)?;
-        match &mut self.executable {
-            #[cfg(target_os = "macos")]
-            Executable::Metal { device, pipeline } => {
-                let buffers = buffers
-                    .iter()
-                    .map(Buffer::metal)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let scalars = pipeline.emitted.encode_scalars(scalars)?;
-                let observation = device.profile(pipeline, &buffers, &scalars)?;
-                let dispatches = observation
-                    .dispatches
-                    .into_iter()
-                    .map(|d| {
-                        let launch = pipeline
-                            .emitted
-                            .launches
-                            .get(d.launch)
-                            .ok_or("profiled dispatch names an absent launch")?;
-                        Ok(DispatchProfile {
-                            launch: d.launch,
-                            kernel: d.kernel,
-                            threadgroups: launch.threadgroups,
-                            threads_per_threadgroup: launch.threads_per_threadgroup,
-                            device_seconds: d.elapsed_ns as f64 * 1e-9,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok((
-                    ExecutionObservation {
-                        host_seconds: start.elapsed().as_secs_f64(),
-                        device_seconds: Some(observation.command_seconds),
-                        device_scope: Some(DeviceTimingScope::CommandBuffer),
-                    },
-                    dispatches,
-                ))
-            }
-            // A CPU kernel has no native per-dispatch timestamps: the phases are timed whole.
-            Executable::Cpu { device, kernel } => {
-                let seconds = run_cpu(device, kernel, buffers, scalars)?;
-                Ok((
-                    ExecutionObservation {
-                        host_seconds: start.elapsed().as_secs_f64(),
-                        device_seconds: Some(seconds),
-                        device_scope: Some(DeviceTimingScope::CpuPhases),
-                    },
-                    Vec::new(),
-                ))
-            }
-            // CUDA reports the event intervals of its launches as one sum.
-            Executable::Cuda { sequence, .. } => {
-                let seconds = run_cuda(sequence, buffers, scalars, true)?;
-                Ok((
-                    ExecutionObservation {
-                        host_seconds: start.elapsed().as_secs_f64(),
-                        device_seconds: seconds,
-                        device_scope: Some(DeviceTimingScope::CudaLaunches),
-                    },
-                    Vec::new(),
-                ))
-            }
-        }
+        Ok((self.execute_observed(buffers, scalars)?, Vec::new()))
     }
     fn timing_scope(&self) -> DeviceTimingScope {
         match &self.executable {
             #[cfg(target_os = "macos")]
             Executable::Metal { .. } => DeviceTimingScope::CommandBuffer,
-            Executable::Cpu { .. } => DeviceTimingScope::CpuPhases,
+            Executable::Cpu { .. } => DeviceTimingScope::CpuLaunches,
             Executable::Cuda { .. } => DeviceTimingScope::CudaLaunches,
         }
     }
@@ -756,53 +850,83 @@ impl Kernel {
         timed: bool,
     ) -> Result<Option<f64>, String> {
         self.validate_invocation(buffers, scalars)?;
+        let specs = self.binding.buffers.clone();
+        let result_bindings = self.binding.result_bindings.clone();
         match &mut self.executable {
             #[cfg(target_os = "macos")]
             Executable::Metal { device, pipeline } => {
-                let buffers = buffers
+                let parameters: Vec<&seismic_metal::runtime::Buffer> = specs
                     .iter()
-                    .map(Buffer::metal)
+                    .zip(buffers)
+                    .filter(|(spec, _)| matches!(spec.role, BindingRole::Parameter))
+                    .map(|(_, buffer)| buffer.metal())
                     .collect::<Result<Vec<_>, _>>()?;
-                let scalars = pipeline.emitted.encode_scalars(scalars)?;
-                device
-                    .run(pipeline, &buffers, &scalars, 1)
-                    .map(|seconds| timed.then_some(seconds))
+                let invocation = seismic_metal::runtime::Invocation {
+                    pipeline,
+                    buffers: parameters,
+                    scalars: scalars.to_vec(),
+                };
+                let outcome = device.run(&invocation)?;
+                // Copy the runtime-allocated result planes into the bound buffers.
+                for (binding, result) in result_bindings.iter().zip(&outcome.results) {
+                    if let Some((spec, bound)) = specs
+                        .iter()
+                        .zip(buffers)
+                        .find(|(spec, _)| spec.binding == *binding)
+                    {
+                        let bytes = result.read(spec.bytes);
+                        bound.metal()?.write(&bytes);
+                    }
+                }
+                Ok(None)
             }
             Executable::Cpu { device, kernel } => {
-                run_cpu(device, kernel, buffers, scalars).map(|seconds| timed.then_some(seconds))
+                let parameters: Vec<&seismic_cpu::Buffer> = specs
+                    .iter()
+                    .zip(buffers)
+                    .filter(|(spec, _)| matches!(spec.role, BindingRole::Parameter))
+                    .map(|(_, buffer)| buffer.cpu())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut workers = device
+                    .workers
+                    .try_borrow_mut()
+                    .map_err(|_| "the CPU device is already executing")?;
+                let start = std::time::Instant::now();
+                let outputs = kernel
+                    .run(&mut workers, &parameters, scalars)
+                    .map_err(|failure| failure.to_string())?;
+                for (path, plane, bytes) in &outputs.buffers {
+                    let plane = match plane.as_str() {
+                        "dense" => "",
+                        other => other,
+                    };
+                    for (spec, bound) in specs.iter().zip(buffers) {
+                        if let BindingRole::Result { path: result_path } = &spec.role {
+                            if result_path.as_slice() == path.0.as_slice() && spec.plane == plane {
+                                bound.cpu()?.write(bytes)?;
+                            }
+                        }
+                    }
+                }
+                let _ = timed;
+                Ok(Some(start.elapsed().as_secs_f64()))
             }
-            Executable::Cuda { sequence, .. } => run_cuda(sequence, buffers, scalars, timed),
+            Executable::Cuda { sequence, .. } => {
+                let bound: Vec<seismic_cuda::Buffer> = buffers
+                    .iter()
+                    .map(Buffer::cuda)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let status = sequence
+                    .execute(&bound, scalars, timed)
+                    .map_err(|error| error.to_string())?;
+                if let Some(status) = status {
+                    return Err(format!(
+                        "CUDA invocation failed a safety check (status field {}, kind {})",
+                        status.field, status.kind
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
-}
-fn run_cuda(
-    sequence: &mut seismic_cuda::PhysicalSequence,
-    buffers: &[Buffer],
-    scalars: &[f64],
-    timed: bool,
-) -> Result<Option<f64>, String> {
-    let buffers = buffers
-        .iter()
-        .map(Buffer::cuda)
-        .collect::<Result<Vec<_>, _>>()?;
-    sequence.execute_with_scalars(&buffers, scalars, timed)
-}
-/// Run every phase of a CPU kernel to completion; returns the wall seconds of the phases.
-fn run_cpu(
-    device: &CpuDevice,
-    kernel: &mut seismic_cpu::Kernel,
-    buffers: &[Buffer],
-    scalars: &[f64],
-) -> Result<f64, String> {
-    let buffers = buffers
-        .iter()
-        .map(Buffer::cpu)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut workers = device
-        .workers
-        .try_borrow_mut()
-        .map_err(|_| "the CPU device is already executing")?;
-    let start = std::time::Instant::now();
-    kernel.run(&mut workers, &buffers, scalars)?;
-    Ok(start.elapsed().as_secs_f64())
 }

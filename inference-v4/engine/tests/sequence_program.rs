@@ -2,8 +2,8 @@
 //! and supplies no implementation choices to the runtime compiler.
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{Arg, Interpreter, TensorData, WIDTHS};
-use seismic_lang::types::{DType, Elem, Ty};
+use reference::{Arg, Interpreter, TensorData};
+use seismic_lang::types::{DType, Elem, ValueType};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -13,9 +13,9 @@ fn tensor(vm: &mut Interpreter<'_>, dtype: DType, shape: Vec<usize>, values: Vec
 
 #[test]
 fn packed_embedding_publishes_bf16_before_residual_cast() {
-    for width in WIDTHS {
+    {
         let p = seismic_engine::models::qwen35::program::program().unwrap();
-        let mut vm = reference::interpreter(&p, width);
+        let mut vm = reference::interpreter(&p);
         // Three distinct rows, one affine group each. Values require BF16 rounding.
         let scales = [0x3d81u16, 0x3e03, 0x3e85];
         let biases = [0xbf00u16, 0xbe80, 0x3e00];
@@ -33,20 +33,14 @@ fn packed_embedding_publishes_bf16_before_residual_cast() {
             ],
         });
         let tokens = tensor(&mut vm, DType::I32, vec![3], vec![2., 0., 2.]);
-        let embedded = tensor(&mut vm, DType::BF16, vec![3, 64], vec![0.; 192]);
-        let out = tensor(&mut vm, DType::F32, vec![3, 64], vec![0.; 192]);
-        call(
+        let results = call(
             &mut vm,
             "qwen_embedding_rows",
             &[("M", 3), ("V", 3), ("D", 64)],
-            &[
-                ("table", table),
-                ("tokens", tokens),
-                ("embedded", embedded),
-                ("out", out),
-            ],
+            &[("table", table), ("tokens", tokens)],
             &[],
         );
+        let (embedded, out) = (results[0], results[1]);
         let mut rounded = false;
         for (row, token) in [2, 0, 2].into_iter().enumerate() {
             for column in 0..64 {
@@ -71,13 +65,13 @@ fn call(
     dims: &[(&str, i64)],
     bindings: &[(&str, usize)],
     scalars: &[(&str, f64)],
-) {
+) -> Vec<usize> {
     let shapes: HashMap<_, _> = dims.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let mut args = Vec::new();
     for param in &reference::entry(vm.program, entry).params {
         let name = &param.name;
         match &param.ty {
-            Ty::Tensor(t) => {
+            ValueType::Tensor(t) => {
                 let id = if let Some((_, id)) = bindings.iter().find(|(n, _)| n == name) {
                     *id
                 } else {
@@ -91,7 +85,7 @@ fn call(
                 };
                 args.push(Arg::Tensor(id));
             }
-            Ty::Scalar(_) => args.push(Arg::Scalar(
+            ValueType::Scalar(_) => args.push(Arg::Scalar(
                 scalars
                     .iter()
                     .find(|(n, _)| n == name)
@@ -101,7 +95,36 @@ fn call(
             _ => panic!("unexpected parameter"),
         }
     }
-    reference::run(vm, entry, &args, &shapes);
+    // Element parameters no argument carries (the activation dtype) default
+    // to BF16, like the generic parameter default above.
+    let extra: HashMap<String, Elem> = reference::entry(vm.program, entry)
+        .elem_params
+        .iter()
+        .map(|p| (p.clone(), Elem::Dtype(DType::BF16)))
+        .collect();
+    let value = reference::run_with_elements(vm, entry, &args, &shapes, &extra);
+    // Owned tensor result leaves, appended to the tensor table in leaf order.
+    fn leaves(value: &reference::InterpValue, vm: &mut Interpreter<'_>) -> Vec<usize> {
+        match value {
+            reference::InterpValue::Tuple(items) => {
+                items.iter().flat_map(|item| leaves(item, vm)).collect()
+            }
+            reference::InterpValue::Tensor(shaped) => {
+                use seismic_lang::interp::value::Backing;
+                if let Backing::Owned(dense) = &shaped.backing {
+                    vec![vm.add_tensor(TensorData::dense(
+                        dense.borrow().dtype,
+                        shaped.shape.clone(),
+                        dense.borrow().data.clone(),
+                    ))]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+    leaves(&value, vm)
 }
 fn check_logits(vm: &Interpreter<'_>, id: usize, step: &Value) {
     for (i, v) in step["logits"].as_array().unwrap().iter().enumerate() {
@@ -115,7 +138,7 @@ fn check_logits(vm: &Interpreter<'_>, id: usize, step: &Value) {
 }
 #[test]
 fn multirow_prefill_and_continuation_match_v3_equations() {
-    for width in WIDTHS {
+    {
         let p = seismic_engine::models::qwen35::program::program().unwrap();
         let fixture: Value = serde_json::from_str(include_str!(
             "../../validation/results/fixtures/qwen-decoder-reference.json"
@@ -125,7 +148,7 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
         for fragmented in [false, true] {
             let placement = if fragmented { [5, 1, 7] } else { [0, 1, 2] };
             for chunks in [vec![3], vec![2, 1], vec![1, 2], vec![1, 1, 1]] {
-                let mut vm = reference::interpreter(&p, width);
+                let mut vm = reference::interpreter(&p);
                 let mut weights = HashMap::new();
                 for (name, w) in fixture["weights"].as_object().unwrap() {
                     let f32_weight = ["convolution", "rate", "time_bias", "query_norm", "key_norm"]
@@ -171,26 +194,19 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                         .map(|s| s["token"].as_f64().unwrap())
                         .collect();
                     let tokens = tensor(&mut vm, DType::I32, vec![m], tokens);
-                    let hidden = tensor(&mut vm, DType::F32, vec![m, 8], vec![0.; m * 8]);
-                    call(
+                    let mut hidden = tensor(&mut vm, DType::F32, vec![m, 8], vec![0.; m * 8]);
+                    let results = call(
                         &mut vm,
                         "qwen_embedding_rows",
                         &[("M", m as i64), ("V", 32), ("D", 8)],
-                        &[
-                            ("table", weights["embedding"]),
-                            ("tokens", tokens),
-                            ("out", hidden),
-                        ],
+                        &[("table", weights["embedding"]), ("tokens", tokens)],
                         &[],
                     );
+                    hidden = results[1];
                     for i in 0..4 {
                         let w = |name: &str| weights[&format!("b{i}.{name}")];
                         if i % 2 == 0 {
-                            let next_window =
-                                tensor(&mut vm, DType::BF16, vec![3, 32], vec![0.; 96]);
-                            let next_delta =
-                                tensor(&mut vm, DType::F32, vec![4, 4, 4], vec![0.; 64]);
-                            call(
+                            let results = call(
                                 &mut vm,
                                 "qwen_recurrent_sequence",
                                 &[
@@ -203,7 +219,6 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                 ],
                                 &[
                                     ("hidden", hidden),
-                                    ("out", hidden),
                                     ("input_norm", w("input_norm")),
                                     ("qkv_weight", w("qkv")),
                                     ("gate_weight", w("gate")),
@@ -216,8 +231,6 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                     ("output_weight", w("output")),
                                     ("window", states[i].0),
                                     ("delta", states[i].1),
-                                    ("next_window", next_window),
-                                    ("next_delta", next_delta),
                                 ],
                                 &[
                                     ("epsilon", 1e-6),
@@ -225,7 +238,9 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                     ("grouped", 1.),
                                 ],
                             );
-                            states[i] = (next_window, next_delta);
+                            // Results: next_window, next_delta, then the residual out.
+                            states[i] = (results[0], results[1]);
+                            hidden = results[2];
                         } else {
                             let coords = tensor(
                                 &mut vm,
@@ -264,7 +279,7 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                     .map(|i| placement[i] as f64)
                                     .collect(),
                             );
-                            call(
+                            let results = call(
                                 &mut vm,
                                 "qwen_attention_sequence",
                                 &[
@@ -281,7 +296,6 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                 ],
                                 &[
                                     ("hidden", hidden),
-                                    ("out", hidden),
                                     ("input_norm", w("input_norm")),
                                     ("query_gate_weight", w("query_gate")),
                                     ("key_weight", w("key")),
@@ -297,14 +311,14 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                                 ],
                                 &[("base", 1e6), ("epsilon", 1e-6), ("scale", 0.25)],
                             );
+                            hidden = results[0];
                         }
-                        call(
+                        let results = call(
                             &mut vm,
                             "qwen_dense_suffix",
                             &[("M", m as i64), ("H", 8), ("F", 12)],
                             &[
                                 ("residual", hidden),
-                                ("out", hidden),
                                 ("norm", w("ff_norm")),
                                 ("gate_weight", w("ff_gate")),
                                 ("up_weight", w("ff_up")),
@@ -312,6 +326,8 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                             ],
                             &[("eps", 1e-6)],
                         );
+                        // The residual out is the last result leaf.
+                        hidden = results[6];
                         for row in 0..m {
                             for (j, v) in fixture["steps"][position + row]["block_outputs"][i]
                                 .as_array()
@@ -329,8 +345,7 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                             }
                         }
                     }
-                    let logits = tensor(&mut vm, DType::F32, vec![1, 32], vec![0.; 32]);
-                    call(
+                    let results = call(
                         &mut vm,
                         "qwen_readout_rows",
                         &[("M", m as i64), ("V", 32), ("D", 8)],
@@ -338,10 +353,10 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
                             ("hidden", hidden),
                             ("norm", weights["output_norm"]),
                             ("weight", weights["embedding"]),
-                            ("logits", logits),
                         ],
                         &[("epsilon", 1e-6)],
                     );
+                    let logits = results[1];
                     position += m;
                     check_logits(&vm, logits, &fixture["steps"][position - 1]);
                 }
@@ -352,10 +367,10 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
 
 #[test]
 fn selected_readout_matches_full_projection_with_order_duplicates_and_packed_weights() {
-    for width in WIDTHS {
+    {
         let p = seismic_engine::models::qwen35::program::program().unwrap();
         for packed in [false, true] {
-            let mut vm = reference::interpreter(&p, width);
+            let mut vm = reference::interpreter(&p);
             let hidden = tensor(
                 &mut vm,
                 DType::F32,
@@ -399,19 +414,14 @@ fn selected_readout_matches_full_projection_with_order_duplicates_and_packed_wei
                         .collect(),
                 )
             };
-            let full = tensor(&mut vm, DType::F32, vec![1, 4], vec![0.; 4]);
-            call(
+            let results = call(
                 &mut vm,
                 "qwen_readout_rows",
                 &[("M", 2), ("V", 4), ("D", 64)],
-                &[
-                    ("hidden", hidden),
-                    ("norm", norm),
-                    ("weight", weight),
-                    ("logits", full),
-                ],
+                &[("hidden", hidden), ("norm", norm), ("weight", weight)],
                 &[("epsilon", 1e-6)],
             );
+            let full = results[1];
             for ids in [vec![3, 0, 3, 1], vec![2], vec![0, 1, 2, 3]] {
                 let selected = tensor(
                     &mut vm,

@@ -1,42 +1,36 @@
-//! Metal runtime: device, compiled pipelines, buffers, submission, timing.
+//! Metal runtime: device, compiled pipelines, buffers, structured
+//! submission, and reflection.
+//!
+//! The runtime consumes the retained structured execution tree: it validates
+//! bindings, allocates the exact arena/results/status/slot/extent blocks,
+//! evaluates retained execution expressions, skips zero-work launches
+//! (zero-size native grids are never submitted), submits retained order, and
+//! reports status after synchronous completion. It compiles no candidates,
+//! retries nothing, and reconstructs no control flow. Alias validation is the
+//! root-ABI `validate_alias_rules`; the assembly alias union is deleted.
 
-use crate::msl::{Emitted, Launch};
+use crate::msl::{Emitted, ExecutionItem, LaunchBinding};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLArgumentEncoder, MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLGPUFamily, MTLLanguageVersion,
-    MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
-use seismic_realization::executable::ResolvedStorageId;
+use seismic_realization::executable::{BufferBindingId, ExecutionExpr, ResolvedExecutorScalar};
+use seismic_realization::validate_alias_rules;
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 mod observation;
 pub use observation::{DispatchObservation, Observation};
-
-/// Dispatches per committed command buffer of an unprofiled batch.
-const COMMIT_DISPATCHES: usize = 64;
 
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     info: DeviceInfo,
     identity: std::rc::Rc<()>,
-}
-
-fn binding_available(binding: &crate::msl::Binding, emitted: &Emitted) -> bool {
-    match binding {
-        crate::msl::Binding::Buffer(n) => *n < emitted.buffers.len(),
-        crate::msl::Binding::Scratch(n) => *n < emitted.scratch.len(),
-        crate::msl::Binding::Scalars(offset) => {
-            !emitted.scalars.is_empty() && *offset < emitted.scalar_layout().map_or(0, |l| l.bytes)
-        }
-        crate::msl::Binding::Status => true,
-        crate::msl::Binding::ArgumentTable(members) => members
-            .iter()
-            .all(|(_, binding)| binding_available(binding, emitted)),
-    }
 }
 
 #[derive(Clone)]
@@ -47,45 +41,25 @@ pub struct Buffer {
     identity: std::rc::Rc<()>,
 }
 
-pub struct Pipeline {
-    states: Vec<CompiledLaunch>,
-    /// Recursive executable-plan order flattened exactly once at compilation.
-    /// This is not reconstructed from kernel names or retained launch slots.
-    execution_order: Vec<usize>,
-    pub emitted: Emitted,
-    /// Exact ABI-order identities for caller-supplied external buffers.
-    pub buffer_ids: Vec<ResolvedStorageId>,
-    /// Buffers the realization needs and the caller does not supply, allocated at compile.
-    scratch: Vec<Buffer>,
-    identity: std::rc::Rc<()>,
-    pub facts: Vec<PipelineFacts>,
-}
+/// One compiled launch: its native pipeline state.
 struct CompiledLaunch {
-    index: usize,
-    launch: Launch,
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    argument_encoders: Vec<(usize, Retained<ProtocolObject<dyn MTLArgumentEncoder>>)>,
-}
-impl Pipeline {
-    /// Selected native dispatches. Absent retained launch slots keep their
-    /// identities in the emitted artifact but do not create native pipelines.
-    pub fn phase_count(&self) -> usize {
-        self.states.len()
-    }
 }
 
-fn execution_order(items: &[crate::msl::ExecutionItem], out: &mut Vec<usize>) {
-    for item in items {
-        match item {
-            crate::msl::ExecutionItem::Phase(launches) => out.extend(launches.iter().copied()),
-            crate::msl::ExecutionItem::Subplan(items) => execution_order(items, out),
-        }
-    }
+pub struct Pipeline {
+    states: Vec<Option<CompiledLaunch>>,
+    /// The retained structured execution tree (never flattened away).
+    pub emitted: Emitted,
+    /// Native-reflected facts per launch: telemetry and evaluation of the
+    /// selected native-resource contract only; they never change an
+    /// algorithm, mapping, layout, or candidate.
+    pub facts: Vec<PipelineFacts>,
+    identity: std::rc::Rc<()>,
 }
 
+/// Native-reflected facts of one launch (telemetry only).
 #[derive(Clone, Debug)]
 pub struct PipelineFacts {
-    /// Original retained launch slot; inactive slots have no native facts.
     pub launch: usize,
     pub kernel: String,
     pub execution_width: u64,
@@ -93,15 +67,27 @@ pub struct PipelineFacts {
     pub static_threadgroup_bytes: u64,
 }
 
-/// A fully bound invocation retained through synchronous batch completion.
+/// A fully bound invocation: caller-supplied ABI parameter buffers (in
+/// parameter-ordinal order) and scalar values (in ABI scalar order).
 pub struct Invocation<'a> {
     pub pipeline: &'a Pipeline,
     pub buffers: Vec<&'a Buffer>,
-    pub scalars: Vec<u8>,
+    pub scalars: Vec<f64>,
 }
 
-/// How a target fact was established. Absence of an observation is never treated as proof that
-/// a feature is unsupported.
+/// The execution outcome: allocated/updated result buffers by ABI result
+/// order, and per-dispatch telemetry when requested.
+pub struct Outcome {
+    pub results: Vec<Buffer>,
+    pub dispatches: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Device observation (unchanged probes)
+// ---------------------------------------------------------------------------
+
+/// How a target fact was established. Absence of an observation is never
+/// treated as proof that a feature is unsupported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provenance {
     DeviceQuery,
@@ -131,8 +117,8 @@ impl<T> Observed<T> {
     }
 }
 
-/// Vendor families are observations used to derive capabilities; they are never source-language
-/// capability names.
+/// Vendor families are observations used to derive capabilities; they are
+/// never source-language capability names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MetalFamily {
     Metal3,
@@ -186,30 +172,27 @@ impl MetalLanguageVersion {
     }
 }
 
-/// Facts which affect legality, emission, or qualification. This deliberately contains no
-/// TensorOps claims: the current emitter cannot generate those operations, and family or language
-/// support alone would not prove an individual operation signature usable.
+/// Facts which affect legality, emission, or qualification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetalProfile {
     pub families: Observed<Vec<MetalFamily>>,
-    /// Highest language version accepted by a source compilation probe using this device.
     pub language: Observed<MetalLanguageVersion>,
-    /// Provenance for the quantitative fields retained directly on `DeviceInfo`.
     pub device_limits_provenance: Provenance,
-    /// Metal exposes no private-stack limit. This is a conservative compiler budget, not a device
-    /// limit, and its provenance must remain visible to selection and cache identity.
+    /// Metal exposes no private-stack limit; a conservative compiler budget.
     pub private_storage_budget_bytes: Observed<u64>,
     /// Exact scalar collective dtypes accepted by a native compile probe.
     pub scalar_dtypes: Observed<Vec<seismic_lang::types::DType>>,
-    /// Exact legacy SIMD-group matrix element types accepted for declaration/load/store.
+    /// Exact legacy SIMD-group matrix element types accepted for
+    /// declaration/load/store (observed; matrix stays unregistered until
+    /// fragment emission is complete).
     pub matrix_dtypes: Observed<Vec<seismic_lang::types::DType>>,
-    /// Exact multiply-accumulate type combinations accepted by the native compiler.
+    /// Exact multiply-accumulate type combinations accepted by the native
+    /// compiler (observed; unregistered).
     pub matrix_combinations: Observed<Vec<crate::target::MatrixCombination>>,
 }
 
 impl MetalProfile {
-    /// Canonical capability-and-limit identity. Device marketing name and registry identity are
-    /// intentionally excluded.
+    /// Canonical capability-and-limit identity.
     pub fn fingerprint(&self) -> String {
         let mut family_values = self.families.value.clone();
         family_values.sort_unstable();
@@ -258,7 +241,8 @@ impl MetalProfile {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "families={families}@{};msl={}@{};scalar={scalar}@{};matrix={matrix}@{};mma={combinations}@{};limits@{};private-budget={}@{}",
+            "families={families}@{};msl={}@{};scalar={scalar}@{};matrix={matrix}@{};\
+             mma={combinations}@{};limits@{};private-budget={}@{}",
             self.families.provenance.fingerprint(),
             self.language.value.fingerprint(),
             self.language.provenance.fingerprint(),
@@ -281,15 +265,13 @@ pub struct DeviceInfo {
     pub max_threads_per_threadgroup: u64,
     pub max_threadgroup_bytes: u64,
     pub max_buffer_bytes: u64,
-    /// Unavailable unless obtained from an authoritative device query.
     pub cores: Option<u32>,
     pub recommended_working_set_bytes: u64,
     pub profile: MetalProfile,
 }
 
 impl DeviceInfo {
-    /// Feature legality identity. It intentionally excludes architecture and device identity so
-    /// equal capability profiles compare equal across devices.
+    /// Feature legality identity (excludes device identity).
     pub fn capability_fingerprint(&self) -> String {
         format!(
             "seismic-metal-profile-v1;{};unified={};threads={};threadgroup={};buffer={}",
@@ -301,8 +283,7 @@ impl DeviceInfo {
         )
     }
 
-    /// Qualification and tuning identity. Architecture and the queried working-set budget can
-    /// affect performance even when two devices expose the same capability profile.
+    /// Qualification and tuning identity.
     pub fn target_fingerprint(&self) -> String {
         format!(
             "{};architecture={};working-set={}",
@@ -328,7 +309,6 @@ fn observe_device(device: &ProtocolObject<dyn MTLDevice>) -> Result<DeviceInfo, 
         max_threads_per_threadgroup: size.width as u64,
         max_threadgroup_bytes: device.maxThreadgroupMemoryLength() as u64,
         max_buffer_bytes: device.maxBufferLength() as u64,
-        // Working-set limits do not determine execution-unit count.
         cores: None,
         recommended_working_set_bytes: device.recommendedMaxWorkingSetSize(),
         profile: MetalProfile {
@@ -371,8 +351,6 @@ fn observed_families(device: &ProtocolObject<dyn MTLDevice>) -> Vec<MetalFamily>
     families
 }
 
-/// Probe only the language standard itself. Successfully compiling this source does not establish
-/// support for TensorOps, a data type, or any other optional intrinsic family.
 fn probe_language_version(device: &ProtocolObject<dyn MTLDevice>) -> Option<MetalLanguageVersion> {
     const SOURCE: &str = "#include <metal_stdlib>\nusing namespace metal;\nkernel void seismic_language_probe(device uint* output [[buffer(0)]]) { output[0] = 0; }\n";
     let source = NSString::from_str(SOURCE);
@@ -439,7 +417,10 @@ fn probe_scalar_dtypes(
                 language,
                 "seismic_scalar_probe",
                 &format!(
-                    "#include <metal_stdlib>\nusing namespace metal;\nkernel void seismic_scalar_probe(device {ty}* values [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {{ {ty} x = values[0]; values[0] = simd_shuffle(simd_sum(x) + simd_max(x) + simd_min(x), lane); }}\n"
+                    "#include <metal_stdlib>\nusing namespace metal;\nkernel void \
+                     seismic_scalar_probe(device {ty}* values [[buffer(0)]], \
+                     uint lane [[thread_index_in_simdgroup]]) {{ {ty} x = values[0]; \
+                     values[0] = simd_shuffle(simd_sum(x) + simd_max(x) + simd_min(x), lane); }}\n"
                 ),
             )
         })
@@ -458,7 +439,11 @@ fn probe_matrix_signatures(
     let transfer_source = |dtype: DType| {
         let ty = metal_dtype(dtype).expect("matrix transfer probe dtype");
         format!(
-            "#include <metal_stdlib>\nusing namespace metal;\nkernel void seismic_matrix_transfer_probe(device {ty}* a [[buffer(0)]], device {ty}* c [[buffer(1)]]) {{ simdgroup_matrix<{ty}, 8, 8> f; simdgroup_load(f, a, 8); simdgroup_load(f, a, 8, ulong2(0, 0), true); simdgroup_store(f, c, 8); }}\n"
+            "#include <metal_stdlib>\nusing namespace metal;\nkernel void \
+             seismic_matrix_transfer_probe(device {ty}* a [[buffer(0)]], \
+             device {ty}* c [[buffer(1)]]) {{ simdgroup_matrix<{ty}, 8, 8> f; \
+             simdgroup_load(f, a, 8); simdgroup_load(f, a, 8, ulong2(0, 0), true); \
+             simdgroup_store(f, c, 8); }}\n"
         )
     };
     let source = |accumulator: DType, left: DType, right: DType| {
@@ -468,7 +453,13 @@ fn probe_matrix_signatures(
             metal_dtype(right).expect("matrix probe right"),
         );
         format!(
-            "#include <metal_stdlib>\nusing namespace metal;\nkernel void seismic_matrix_probe(device {left}* a [[buffer(0)]], device {right}* b [[buffer(1)]], device {accumulator}* c [[buffer(2)]]) {{ simdgroup_matrix<{left}, 8, 8> af; simdgroup_matrix<{right}, 8, 8> bf; simdgroup_matrix<{accumulator}, 8, 8> cf; simdgroup_matrix<{accumulator}, 8, 8> df; simdgroup_load(af, a, 8); simdgroup_load(bf, b, 8); simdgroup_load(cf, c, 8); simdgroup_multiply_accumulate(df, af, bf, cf); simdgroup_store(df, c, 8); }}\n"
+            "#include <metal_stdlib>\nusing namespace metal;\nkernel void \
+             seismic_matrix_probe(device {left}* a [[buffer(0)]], device {right}* b \
+             [[buffer(1)]], device {accumulator}* c [[buffer(2)]]) {{ \
+             simdgroup_matrix<{left}, 8, 8> af; simdgroup_matrix<{right}, 8, 8> bf; \
+             simdgroup_matrix<{accumulator}, 8, 8> cf; simdgroup_matrix<{accumulator}, 8, 8> df; \
+             simdgroup_load(af, a, 8); simdgroup_load(bf, b, 8); simdgroup_load(cf, c, 8); \
+             simdgroup_multiply_accumulate(df, af, bf, cf); simdgroup_store(df, c, 8); }}\n"
         )
     };
     let matrix_dtypes = dtypes
@@ -503,6 +494,10 @@ fn probe_matrix_signatures(
     }
     (matrix_dtypes, combinations)
 }
+
+// ---------------------------------------------------------------------------
+// Compilation
+// ---------------------------------------------------------------------------
 
 impl Device {
     pub fn open() -> Result<Device, String> {
@@ -542,550 +537,517 @@ impl Device {
         Ok(b)
     }
 
+    /// Compile every emitted launch once; statically skipped launches retain
+    /// their identity without a native pipeline.
     pub fn compile(&self, emitted: Emitted) -> Result<Pipeline, String> {
-        if emitted.buffer_ids.len() != emitted.buffers.len() {
-            return Err("Metal external buffer identities disagree with the emitted ABI".into());
-        }
-        let buffer_ids = emitted.buffer_ids.clone();
-        let mut resolved_order = Vec::new();
-        execution_order(&emitted.execution, &mut resolved_order);
-        if resolved_order.len() != emitted.launches.len()
-            || resolved_order
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != emitted.launches.len()
-            || resolved_order
-                .iter()
-                .any(|index| *index >= emitted.launches.len())
-        {
-            return Err(
-                "Metal executable hierarchy does not cover every resolved launch exactly once"
-                    .into(),
-            );
-        }
-        emitted.scalar_layout()?;
-        let scalar_slot = emitted
-            .buffers
-            .len()
-            .checked_add(emitted.scratch.len())
-            .ok_or("Metal argument slot overflow")?;
-        let status_slot = scalar_slot
-            .checked_add(usize::from(!emitted.scalars.is_empty()))
-            .ok_or("Metal argument slot overflow")?;
-        if emitted.status_slot.is_some_and(|slot| slot != status_slot) {
-            return Err("Metal status binding differs from the selected invocation ABI".into());
-        }
-        if emitted.scratch.len() != emitted.scratch_bindings.len()
-            || emitted
-                .scratch
-                .iter()
-                .zip(&emitted.scratch_bindings)
-                .any(|(&bytes, binding)| bytes != binding.bytes)
-        {
-            return Err("Metal scratch allocations differ from their selected bindings".into());
-        }
-        if emitted
-            .buffers
-            .iter()
-            .chain(&emitted.scratch_bindings)
-            .any(|binding| !binding.alignment.is_power_of_two())
-        {
-            return Err("Metal buffer bindings require nonzero power-of-two alignment".into());
-        }
-        if emitted.alias_pairs.iter().any(|&(left, right, _)| {
-            left >= emitted.buffers.len() || right >= emitted.buffers.len()
-        }) {
-            return Err("Metal alias condition names an absent invocation binding".into());
-        }
-        for launch in &emitted.launches {
-            let absent = launch
-                .bindings
-                .iter()
-                .any(|binding| !binding_available(binding, &emitted));
-            if absent || launch.bindings.len() > crate::msl::MAX_KERNEL_BUFFERS {
-                return Err(format!(
-                    "launch `{}` has an invalid buffer table ({} bindings)",
-                    launch.kernel,
-                    launch.bindings.len()
-                ));
-            }
-            if let Some(dispatch) = &launch.dispatch {
-                if *dispatch
-                    != seismic_realization::dispatch::GroupDispatch::new(
-                        dispatch.work_items,
-                        dispatch.lanes_per_item,
-                        dispatch.items_per_group,
-                    )?
-                    || launch.threadgroups != dispatch.groups
-                    || launch.threads_per_threadgroup != dispatch.threads_per_group
-                {
-                    return Err("Metal launch differs from its selected dispatch geometry".into());
-                }
-            }
-            usize::try_from(launch.threadgroups)
-                .map_err(|_| "Metal grid exceeds native dimensions")?;
-            usize::try_from(launch.threads_per_threadgroup)
-                .map_err(|_| "Metal group exceeds native dimensions")?;
-        }
-        // Preserve every declared scratch slot, including empty split storage.
-        // Removing one would shift the scalar and status arguments of all launches.
-        let scratch = emitted
-            .scratch_bindings
-            .iter()
-            .map(|binding| {
-                let buffer = self.buffer(binding.bytes)?;
-                if buffer.allocation_alignment() < binding.alignment as u64 {
-                    return Err(
-                        "Metal scratch allocation violates its selected binding alignment".into(),
-                    );
-                }
-                Ok(buffer)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if emitted
+        let statically_empty = |launch: &crate::msl::EmittedLaunch| launch.skipped;
+        let any_source = emitted
             .launches
             .iter()
-            .all(|launch| launch.threadgroups == 0)
-        {
-            return Ok(Pipeline {
-                states: Vec::new(),
-                execution_order: resolved_order,
-                emitted,
-                buffer_ids,
-                scratch,
-                identity: self.identity.clone(),
-                facts: Vec::new(),
-            });
-        }
-        let source = NSString::from_str(&emitted.source);
-        let options = MTLCompileOptions::new();
-        options.setLanguageVersion(self.info.profile.language.value.native());
-        // Keep the macOS 13 API floor. Default Metal fast math may erase
-        // publication casts and reassociate explicitly ordered operations.
-        #[allow(deprecated)]
-        options.setFastMathEnabled(false);
-        let library = self
-            .device
-            .newLibraryWithSource_options_error(&source, Some(&options))
-            .map_err(|e| format!("Metal compile failed: {}", e.localizedDescription()))?;
-        let mut states = Vec::new();
+            .any(|launch| !statically_empty(launch));
+        let mut states: Vec<Option<CompiledLaunch>> =
+            (0..emitted.launches.len()).map(|_| None).collect();
         let mut facts = Vec::new();
-        for index in resolved_order.iter().copied() {
-            let launch = &emitted.launches[index];
-            if launch.threadgroups == 0 {
-                continue;
-            }
-            let name = NSString::from_str(&launch.kernel);
-            let function = library.newFunctionWithName(&name).ok_or_else(|| {
-                format!("kernel `{}` not found in compiled library", launch.kernel)
-            })?;
-            let argument_encoders = launch
-                .bindings
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, binding)| {
-                    matches!(binding, crate::msl::Binding::ArgumentTable(_)).then_some(slot)
-                })
-                .map(|slot| {
-                    // SAFETY: `slot` is taken from the reflected kernel signature just compiled.
-                    let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(slot) };
-                    (slot, encoder)
-                })
-                .collect::<Vec<_>>();
-            let state = self
+        if any_source {
+            let source = NSString::from_str(&emitted.source);
+            let options = MTLCompileOptions::new();
+            options.setLanguageVersion(self.info.profile.language.value.native());
+            // Keep the macOS 13 API floor. Default fast math may reassociate
+            // explicitly ordered operations and erase publication casts.
+            #[allow(deprecated)]
+            options.setFastMathEnabled(false);
+            let library = self
                 .device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|e| format!("pipeline creation failed: {}", e.localizedDescription()))?;
-            let physical = PipelineFacts {
-                launch: index,
-                kernel: launch.kernel.clone(),
-                execution_width: state.threadExecutionWidth() as u64,
-                max_threads_per_group: state.maxTotalThreadsPerThreadgroup() as u64,
-                static_threadgroup_bytes: state.staticThreadgroupMemoryLength() as u64,
-            };
-            let launch = &emitted.launches[index];
-            if launch.threads_per_threadgroup == 0
-                || launch.threads_per_threadgroup > physical.max_threads_per_group
-            {
-                return Err(format!(
-                    "{} requests {} threads but native pipeline permits {}",
-                    launch.kernel, launch.threads_per_threadgroup, physical.max_threads_per_group
-                ));
-            }
-            if launch.declared_threadgroup_bytes > self.device.maxThreadgroupMemoryLength() as u64
-                || physical.static_threadgroup_bytes
-                    > self.device.maxThreadgroupMemoryLength() as u64
-            {
-                return Err("native pipeline threadgroup storage exceeds device capacity".into());
-            }
-            if let Some(dispatch) = &launch.dispatch {
-                if physical.execution_width != dispatch.lanes_per_item
-                    || launch.threadgroups != dispatch.groups
-                    || launch.threads_per_threadgroup != dispatch.threads_per_group
-                {
+                .newLibraryWithSource_options_error(&source, Some(&options))
+                .map_err(|e| format!("Metal compile failed: {}", e.localizedDescription()))?;
+            for (index, launch) in emitted.launches.iter().enumerate() {
+                if statically_empty(launch) {
+                    continue;
+                }
+                let name = NSString::from_str(&launch.kernel);
+                let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                    format!("kernel `{}` not found in compiled library", launch.kernel)
+                })?;
+                let state = self
+                    .device
+                    .newComputePipelineStateWithFunction_error(&function)
+                    .map_err(|e| {
+                        format!("pipeline creation failed: {}", e.localizedDescription())
+                    })?;
+                // Reflection: telemetry and native-contract evaluation only.
+                let execution_width = state.threadExecutionWidth() as u64;
+                let max_threads = state.maxTotalThreadsPerThreadgroup() as u64;
+                if let ExecutionExpr::Const(participants) = launch.participants {
+                    if participants == 0 || participants > max_threads {
+                        return Err(format!(
+                            "{} requests {participants} threads but the native pipeline \
+                             permits {max_threads}",
+                            launch.kernel
+                        ));
+                    }
+                }
+                if launch.threadgroup_bytes > self.device.maxThreadgroupMemoryLength() as u64 {
                     return Err(
-                        "native pipeline/launch differs from declared subgroup realization".into(),
+                        "native pipeline threadgroup storage exceeds device capacity".into(),
                     );
                 }
+                facts.push(PipelineFacts {
+                    launch: index,
+                    kernel: launch.kernel.clone(),
+                    execution_width,
+                    max_threads_per_group: max_threads,
+                    static_threadgroup_bytes: state.staticThreadgroupMemoryLength() as u64,
+                });
+                states[index] = Some(CompiledLaunch { state });
             }
-            facts.push(physical);
-            states.push(CompiledLaunch {
-                index,
-                launch: launch.clone(),
-                state,
-                argument_encoders,
-            });
         }
         Ok(Pipeline {
             states,
-            execution_order: resolved_order,
             emitted,
-            buffer_ids,
-            scratch,
-            identity: self.identity.clone(),
             facts,
-        })
-    }
-
-    /// Submit every launch of the pipeline `repeat` times, in order, in one command buffer, and
-    /// wait. Returns GPU time in seconds for the whole command buffer.
-    pub fn run(
-        &self,
-        pipeline: &Pipeline,
-        buffers: &[&Buffer],
-        scalars: &[u8],
-        repeat: usize,
-    ) -> Result<f64, String> {
-        self.run_many(
-            &[Invocation {
-                pipeline,
-                buffers: buffers.to_vec(),
-                scalars: scalars.to_vec(),
-            }],
-            repeat,
-        )
-    }
-
-    /// Validate every binding before submission, encode in source order, and
-    /// retain one error status through the entire command buffer. Later dispatches
-    /// cannot erase an earlier failure. Physical completion precedes return.
-    pub fn run_many(&self, invocations: &[Invocation<'_>], repeat: usize) -> Result<f64, String> {
-        Ok(self.submit(invocations, repeat, false)?.command_seconds)
-    }
-
-    /// Optional qualification: one sampled compute encoder per dispatch. Its
-    /// stage interval differs from the uninstrumented command-buffer interval.
-    /// Unsupported native counters are reported; no substituted clock is used.
-    pub fn profile(
-        &self,
-        pipeline: &Pipeline,
-        buffers: &[&Buffer],
-        scalars: &[u8],
-    ) -> Result<Observation, String> {
-        self.submit(
-            &[Invocation {
-                pipeline,
-                buffers: buffers.to_vec(),
-                scalars: scalars.to_vec(),
-            }],
-            1,
-            true,
-        )
-    }
-
-    fn submit(
-        &self,
-        invocations: &[Invocation<'_>],
-        repeat: usize,
-        profile: bool,
-    ) -> Result<Observation, String> {
-        if repeat == 0 || invocations.is_empty() {
-            return Err("Metal batch and repeat count must be nonempty".into());
-        }
-        let mut dispatch_count = 0usize;
-        for invocation in invocations {
-            let Invocation {
-                pipeline,
-                buffers,
-                scalars,
-            } = invocation;
-            self.validate_pipeline(pipeline)?;
-            if buffers.len() != pipeline.emitted.buffers.len() {
-                return Err("Metal buffer binding count mismatch".into());
-            }
-            for (buffer, slot) in buffers.iter().zip(&pipeline.emitted.buffers) {
-                self.validate_buffer(buffer)?;
-                if buffer.allocation_alignment() < slot.alignment as u64
-                    || !buffer.offset.is_multiple_of(slot.alignment)
-                {
-                    return Err("Metal resident view violates typed storage alignment".into());
-                }
-                if buffer.len() < slot.bytes {
-                    return Err(format!(
-                        "Metal buffer {}.{} has {} bytes; needs {}",
-                        slot.parameter,
-                        slot.plane,
-                        buffer.len(),
-                        slot.bytes
-                    ));
-                }
-            }
-            for (a, b, exact_allowed) in &pipeline.emitted.alias_pairs {
-                let (left, right) = (buffers[*a], buffers[*b]);
-                let (left_size, right_size) = (
-                    pipeline.emitted.buffers[*a].bytes,
-                    pipeline.emitted.buffers[*b].bytes,
-                );
-                if std::ptr::eq(left.raw(), right.raw())
-                    && left_size != 0
-                    && right_size != 0
-                    && left.offset < right.offset + right_size
-                    && right.offset < left.offset + left_size
-                    && !(*exact_allowed && left.offset == right.offset && left_size == right_size)
-                {
-                    return Err("pointwise partition binding has unsafe overlapping storage".into());
-                }
-            }
-            pipeline.emitted.scalar_layout()?.validate_bytes(scalars)?;
-            dispatch_count = dispatch_count
-                .checked_add(pipeline.phase_count())
-                .ok_or("Metal dispatch count overflow")?;
-        }
-        let dispatch_count = dispatch_count
-            .checked_mul(repeat)
-            .ok_or("Metal repetition overflow")?;
-        if dispatch_count == 0 {
-            return Ok(Observation {
-                command_seconds: 0.0,
-                dispatches: Vec::new(),
-            });
-        }
-        let status = self.buffer_from(&[0; 4])?;
-        // Retain encoded argument tables until every submitted command completes.
-        let mut argument_buffers = Vec::<Buffer>::new();
-        let mut capture = if profile {
-            Some(observation::Capture::new(self, dispatch_count)?)
-        } else {
-            None
-        };
-        let open = || -> Result<_, String> {
-            let command = self
-                .queue
-                .commandBuffer()
-                .ok_or("could not create a command buffer")?;
-            let encoder = if profile {
-                None
-            } else {
-                Some(
-                    command
-                        .computeCommandEncoder()
-                        .ok_or("could not create a compute encoder")?,
-                )
-            };
-            Ok((command, encoder))
-        };
-        // Submission rule: an unprofiled batch is committed in command buffers of
-        // `COMMIT_DISPATCHES` dispatches, in source order on the one queue, so the device
-        // executes the head of the batch while the host encodes the rest. Completion, error
-        // and status checks still cover the whole batch before return.
-        let mut committed = Vec::new();
-        let (mut command, mut shared_encoder) = open()?;
-        let mut encoded = 0usize;
-        let mut first = true;
-        for _ in 0..repeat {
-            for (invocation_index, invocation) in invocations.iter().enumerate() {
-                let Invocation {
-                    pipeline,
-                    buffers,
-                    scalars,
-                } = invocation;
-                for launch_index in &pipeline.execution_order {
-                    let compiled = pipeline
-                        .states
-                        .iter()
-                        .find(|compiled| compiled.index == *launch_index)
-                        .ok_or("Metal executable hierarchy names an uncompiled launch")?;
-                    let CompiledLaunch {
-                        index: launch_index,
-                        launch,
-                        state,
-                        argument_encoders,
-                    } = compiled;
-                    if !profile && encoded == COMMIT_DISPATCHES {
-                        if let Some(encoder) = &shared_encoder {
-                            encoder.endEncoding();
-                        }
-                        command.commit();
-                        committed.push(command);
-                        (command, shared_encoder) = open()?;
-                        (encoded, first) = (0, true);
-                    }
-                    encoded += 1;
-                    let encoder = match (&mut capture, &shared_encoder) {
-                        (Some(capture), _) => capture.encoder(
-                            &command,
-                            invocation_index,
-                            *launch_index,
-                            &launch.kernel,
-                        )?,
-                        (None, Some(encoder)) => encoder.clone(),
-                        (None, None) => {
-                            return Err("Metal submission has no compute encoder".into());
-                        }
-                    };
-                    if !profile && (!first || launch.after_barrier) {
-                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-                    }
-                    first = false;
-                    encoder.setComputePipelineState(state);
-                    // Each kernel declares only the resources it references; its table maps
-                    // local buffer index -> invocation resource (validated by `compile`).
-                    for (local, binding) in launch.bindings.iter().enumerate() {
-                        match binding {
-                            crate::msl::Binding::Buffer(n) => {
-                                let b = buffers
-                                    .get(*n)
-                                    .ok_or("Metal launch binds an absent invocation buffer")?;
-                                unsafe {
-                                    encoder.setBuffer_offset_atIndex(
-                                        Some(&b.buffer),
-                                        b.offset,
-                                        local,
-                                    )
-                                };
-                            }
-                            crate::msl::Binding::Scratch(n) => {
-                                let b = pipeline
-                                    .scratch
-                                    .get(*n)
-                                    .ok_or("Metal launch binds absent scratch storage")?;
-                                unsafe {
-                                    encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, local)
-                                };
-                            }
-                            crate::msl::Binding::Status => unsafe {
-                                encoder.setBuffer_offset_atIndex(Some(&status.buffer), 0, local)
-                            },
-                            crate::msl::Binding::Scalars(offset) => {
-                                let remaining = scalars
-                                    .len()
-                                    .checked_sub(*offset)
-                                    .ok_or("Metal scalar binding offset exceeds scalar block")?;
-                                let bytes = NonNull::new(unsafe {
-                                    scalars.as_ptr().add(*offset) as *mut _
-                                })
-                                .ok_or("Metal scalar block has no storage")?;
-                                unsafe { encoder.setBytes_length_atIndex(bytes, remaining, local) };
-                            }
-                            crate::msl::Binding::ArgumentTable(members) => {
-                                let argument_encoder = argument_encoders
-                                    .iter()
-                                    .find(|(slot, _)| *slot == local)
-                                    .map(|(_, encoder)| encoder)
-                                    .ok_or("Metal argument table has no reflected encoder")?;
-                                let argument_buffer =
-                                    self.buffer(argument_encoder.encodedLength())?;
-                                unsafe {
-                                    argument_encoder
-                                        .setArgumentBuffer_offset(Some(&argument_buffer.buffer), 0);
-                                }
-                                for (member, resource) in members {
-                                    let (buffer, offset) = match resource {
-                                        crate::msl::Binding::Buffer(index) => {
-                                            let buffer = buffers.get(*index).ok_or("Metal argument table names absent invocation buffer")?;
-                                            (&buffer.buffer, buffer.offset)
-                                        }
-                                        crate::msl::Binding::Scratch(index) => {
-                                            let buffer = pipeline.scratch.get(*index).ok_or(
-                                                "Metal argument table names absent scratch buffer",
-                                            )?;
-                                            (&buffer.buffer, 0)
-                                        }
-                                        crate::msl::Binding::Status => (&status.buffer, 0),
-                                        crate::msl::Binding::Scalars(_) => {
-                                            return Err(
-                                                "scalar bytes cannot be an argument-table pointer"
-                                                    .into(),
-                                            )
-                                        }
-                                        crate::msl::Binding::ArgumentTable(_) => {
-                                            return Err(
-                                                "nested Metal argument tables are invalid".into()
-                                            )
-                                        }
-                                    };
-                                    unsafe {
-                                        argument_encoder.setBuffer_offset_atIndex(
-                                            Some(buffer),
-                                            offset,
-                                            *member as usize,
-                                        );
-                                    }
-                                }
-                                unsafe {
-                                    encoder.setBuffer_offset_atIndex(
-                                        Some(&argument_buffer.buffer),
-                                        0,
-                                        local,
-                                    );
-                                }
-                                argument_buffers.push(argument_buffer);
-                            }
-                        }
-                    }
-                    let grid = MTLSize {
-                        width: launch.threadgroups as usize,
-                        height: 1,
-                        depth: 1,
-                    };
-                    let group = MTLSize {
-                        width: launch.threads_per_threadgroup as usize,
-                        height: 1,
-                        depth: 1,
-                    };
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
-                    if profile {
-                        encoder.endEncoding();
-                    }
-                }
-            }
-        }
-        if let Some(encoder) = shared_encoder {
-            encoder.endEncoding();
-        }
-        command.commit();
-        committed.push(command);
-        for command in &committed {
-            command.waitUntilCompleted();
-            if let Some(e) = command.error() {
-                return Err(format!(
-                    "command buffer failed: {}",
-                    e.localizedDescription()
-                ));
-            }
-        }
-        if status.read(4) != [0; 4] {
-            return Err("Metal invocation encountered an out-of-bounds view".into());
-        }
-        Ok(Observation {
-            // First start to last end on the one queue, including any wait for the host.
-            command_seconds: committed
-                .last()
-                .zip(committed.first())
-                .map_or(0.0, |(last, first)| {
-                    last.GPUEndTime() - first.GPUStartTime()
-                }),
-            dispatches: capture
-                .map(|capture| capture.finish(self))
-                .transpose()?
-                .unwrap_or_default(),
+            identity: self.identity.clone(),
         })
     }
 }
 
+// ---------------------------------------------------------------------------
+// Execution over the retained structured tree
+// ---------------------------------------------------------------------------
+
+/// One in-flight command buffer: launches within a `Repeat` visit share it;
+/// visits are committed and completed before the binder slot is rebound.
+struct Submission {
+    command: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+}
+
+impl Submission {
+    fn open() -> Result<Self, String> {
+        Ok(Self {
+            command: None,
+            encoder: None,
+        })
+    }
+
+    fn encoder(
+        &mut self,
+        device: &Device,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, String> {
+        if self.encoder.is_none() {
+            let command = device
+                .queue
+                .commandBuffer()
+                .ok_or("could not create a command buffer")?;
+            let encoder = command
+                .computeCommandEncoder()
+                .ok_or("could not create a compute encoder")?;
+            self.command = Some(command);
+            self.encoder = Some(encoder);
+        }
+        Ok(self.encoder.clone().expect("the encoder is open"))
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
+        if let Some(command) = self.command.take() {
+            command.commit();
+            command.waitUntilCompleted();
+            if let Some(error) = command.error() {
+                return Err(format!(
+                    "command buffer failed: {}",
+                    error.localizedDescription()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        // Never release an open encoder without ending it.
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
+        if let Some(command) = self.command.take() {
+            command.commit();
+        }
+    }
+}
+
+/// Retained-expression evaluation environment.
+struct Exec<'a> {
+    pipeline: &'a Pipeline,
+    /// ABI buffer binding → resident buffer.
+    bindings: BTreeMap<BufferBindingId, Buffer>,
+    /// Scalar slot block (shared memory; CPU-visible).
+    slots: Buffer,
+    /// Runtime-extent values.
+    extents: Vec<u64>,
+    /// ABI scalar value for a leaf path; single-scalar layouts only
+    /// (multi-scalar layouts need ordinal-qualified ABI paths).
+    scalar_of_path: Box<dyn Fn(&seismic_lang::types::ValuePath) -> Result<f64, String> + 'a>,
+}
+
 impl Device {
+    /// Validate bindings, allocate the exact planned blocks, evaluate the
+    /// retained execution tree, submit in retained order, and report status
+    /// after synchronous completion.
+    pub fn run(&self, invocation: &Invocation<'_>) -> Result<Outcome, String> {
+        let pipeline = invocation.pipeline;
+        self.validate_pipeline(pipeline)?;
+        let emitted = &pipeline.emitted;
+        let abi = &emitted.abi;
+        // Caller-supplied parameter buffers, in parameter-ordinal order.
+        let parameters = abi
+            .buffers
+            .iter()
+            .filter(|buffer| {
+                matches!(
+                    buffer.role,
+                    seismic_realization::executable::AbiRole::Parameter { .. }
+                )
+            })
+            .count();
+        if invocation.buffers.len() != parameters {
+            return Err(format!(
+                "Metal invocation binds {} buffers; the ABI names {parameters} parameters",
+                invocation.buffers.len()
+            ));
+        }
+        let mut bindings: BTreeMap<BufferBindingId, Buffer> = BTreeMap::new();
+        let mut parameter_buffers = invocation.buffers.iter();
+        for buffer in &abi.buffers {
+            match buffer.role {
+                seismic_realization::executable::AbiRole::Parameter { .. } => {
+                    let supplied = parameter_buffers
+                        .next()
+                        .ok_or("the invocation supplies every ABI parameter")?;
+                    self.validate_buffer(supplied)?;
+                    if supplied.allocation_alignment() < buffer.alignment as u64
+                        || supplied.offset % buffer.alignment as usize != 0
+                    {
+                        return Err(format!(
+                            "Metal parameter `{}` violates its {}-byte binding alignment",
+                            buffer.path, buffer.alignment
+                        ));
+                    }
+                    if supplied.len() < buffer.bytes as usize {
+                        return Err(format!(
+                            "Metal parameter `{}` has {} bytes; needs {}",
+                            buffer.path,
+                            supplied.len(),
+                            buffer.bytes
+                        ));
+                    }
+                    bindings.insert(buffer.binding, (*supplied).clone());
+                }
+                seismic_realization::executable::AbiRole::Result => {}
+            }
+        }
+        // Scalar encoding (validated against the ABI layout).
+        abi.scalars.encode(&invocation.scalars)?;
+        // Scalar leaves resolve by path; only single-scalar layouts are
+        // unambiguous today.
+        let scalar_snapshot = invocation.scalars.clone();
+        let scalar_of_path = move |path: &seismic_lang::types::ValuePath| -> Result<f64, String> {
+            if path.0.is_empty() && scalar_snapshot.len() == 1 {
+                Ok(scalar_snapshot[0])
+            } else if path.0.is_empty() && scalar_snapshot.is_empty() {
+                Err("compiler bug: an ABI scalar transport names no scalar field".into())
+            } else {
+                Err("compiler bug: an ABI scalar transport needs an ordinal-qualified path".into())
+            }
+        };
+        // Result buffers are runtime-allocated by path/plane and bound by
+        // every launch that writes them.
+        for buffer in &abi.buffers {
+            if matches!(
+                buffer.role,
+                seismic_realization::executable::AbiRole::Result
+            ) {
+                let allocated = self.buffer(buffer.bytes as usize)?;
+                bindings.insert(buffer.binding, allocated);
+            }
+        }
+        // Root-ABI alias validation over actual byte ranges (parameters and
+        // allocated results; distinct allocations are disjoint by identity).
+        // Allocation identity is the native buffer object; two views of one
+        // allocation share it and their byte ranges decide the overlap.
+        let locate = |binding: BufferBindingId| -> Result<Option<(u64, u64, u64)>, String> {
+            let Some(buffer) = bindings.get(&binding) else {
+                // A result binding: runtime-allocated, disjoint by construction.
+                return Ok(None);
+            };
+            Ok(Some((
+                buffer.raw() as *const _ as u64,
+                buffer.offset as u64,
+                buffer.len as u64,
+            )))
+        };
+        validate_alias_rules(abi, locate)?;
+        // Planned blocks.
+        let arena = self.buffer(emitted.arena_bytes as usize)?;
+        let slots = self.buffer(emitted.slot_count.saturating_mul(4))?;
+        slots.write(&vec![0u8; emitted.slot_count * 4]);
+        // Evaluate the retained runtime-extent expressions.
+        let mut exec = Exec {
+            pipeline,
+            bindings,
+            slots: slots.clone(),
+            extents: Vec::new(),
+            scalar_of_path: Box::new(scalar_of_path),
+        };
+        let mut extents = vec![0u64; emitted.extent_count];
+        for (id, expr) in emitted.runtime_extents.clone() {
+            let value = exec.expr(&expr)?;
+            if (id.0 as usize) < extents.len() {
+                extents[id.0 as usize] = value;
+            }
+        }
+        exec.extents = extents.clone();
+        let extent_buffer = self.buffer(emitted.extent_count.saturating_mul(8))?;
+        {
+            let words = unsafe {
+                std::slice::from_raw_parts_mut(
+                    extent_buffer.contents().as_ptr() as *mut u64,
+                    emitted.extent_count,
+                )
+            };
+            words.copy_from_slice(&extents);
+        }
+        let status_fields = abi
+            .status
+            .as_ref()
+            .map(|status| status.fields.len())
+            .unwrap_or(0);
+        let status = self.buffer(status_fields.saturating_mul(4))?;
+        if status_fields > 0 {
+            status.write(&vec![0u8; status_fields * 4]);
+        }
+        // Submit the retained structured order. A `Repeat` rebinds its binder
+        // slot between visits, so each visit's work is committed (and
+        // completed) before the next visit is encoded; launches within one
+        // visit share one command buffer.
+        let mut submission = Submission::open()?;
+        let mut dispatches = 0usize;
+        let walked = self.walk(
+            &exec,
+            &emitted.execution,
+            &mut submission,
+            &arena,
+            &extent_buffer,
+            &status,
+            &mut dispatches,
+        );
+        let flushed = submission.flush();
+        walked?;
+        flushed?;
+        exec.assert_status(&status)?;
+        // Status: first error reported after synchronous completion.
+        if status_fields > 0 {
+            let bytes = status.read(status_fields * 4);
+            for (index, word) in bytes.chunks_exact(4).enumerate() {
+                let code = u32::from_le_bytes(word.try_into().unwrap());
+                if code != 0 {
+                    let field = abi
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.fields.get(index));
+                    return Err(format!(
+                        "Metal invocation failed a safety check (status field#{index}, code \
+                         {code}, node {:?})",
+                        field.map(|f| (f.node.node.0, f.index))
+                    ));
+                }
+            }
+        }
+        // Tensor results were allocated and bound above; scalar/index/range
+        // results decode from the compiler-owned result scalar block, which
+        // the runtime does not yet own.
+        let mut results = Vec::new();
+        for binding in &abi.results {
+            match binding {
+                seismic_realization::executable::ResultBinding::Buffer { binding, .. } => {
+                    let buffer = exec
+                        .bindings
+                        .get(binding)
+                        .cloned()
+                        .ok_or_else(|| format!("result buffer#{binding:?} is not bound"))?;
+                    results.push(buffer);
+                }
+                seismic_realization::executable::ResultBinding::Scalar { .. }
+                | seismic_realization::executable::ResultBinding::Range { .. } => {
+                    return Err(
+                        "scalar/index/range result decoding from the result scalar block is \
+                         not implemented"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(Outcome {
+            results,
+            dispatches,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        &self,
+        exec: &Exec<'_>,
+        items: &[ExecutionItem],
+        submission: &mut Submission,
+        arena: &Buffer,
+        extents: &Buffer,
+        status: &Buffer,
+        dispatches: &mut usize,
+    ) -> Result<(), String> {
+        for item in items {
+            match item {
+                ExecutionItem::Launch(index) => {
+                    let launch = exec
+                        .pipeline
+                        .emitted
+                        .launches
+                        .get(*index)
+                        .ok_or_else(|| format!("launch#{index} is absent"))?;
+                    // Zero work is a retained launch condition: zero-size
+                    // native grids are never submitted.
+                    let work_items = exec.expr(&launch.work_items)?;
+                    if work_items == 0 {
+                        continue;
+                    }
+                    let participants = exec.expr(&launch.participants)?.max(1);
+                    let workgroups = work_items.div_ceil(participants).max(1);
+                    let compiled = exec
+                        .pipeline
+                        .states
+                        .get(*index)
+                        .and_then(|state| state.as_ref())
+                        .ok_or_else(|| {
+                            format!(
+                                "launch#{index} `{}` has no compiled pipeline",
+                                launch.kernel
+                            )
+                        })?;
+                    let encoder = submission.encoder(self)?;
+                    encoder.setComputePipelineState(&compiled.state);
+                    // Storage members bind at sequential indices (the emitter's
+                    // declaration order); the shared blocks bind at their fixed
+                    // reserved indices.
+                    let mut next_index = 0u32;
+                    for binding in &launch.bindings {
+                        match binding {
+                            LaunchBinding::Buffer { binding, .. } => {
+                                let buffer = exec.bindings.get(binding).ok_or_else(|| {
+                                    format!("ABI buffer#{binding:?} is not bound")
+                                })?;
+                                unsafe {
+                                    encoder.setBuffer_offset_atIndex(
+                                        Some(buffer.raw()),
+                                        buffer.offset,
+                                        next_index as usize,
+                                    )
+                                };
+                                next_index += 1;
+                            }
+                            LaunchBinding::Arena { offset, .. } => {
+                                unsafe {
+                                    encoder.setBuffer_offset_atIndex(
+                                        Some(&arena.buffer),
+                                        *offset as usize,
+                                        next_index as usize,
+                                    )
+                                };
+                                next_index += 1;
+                            }
+                            LaunchBinding::Slots => unsafe {
+                                encoder.setBuffer_offset_atIndex(
+                                    Some(&exec.slots.buffer),
+                                    0,
+                                    crate::msl::SLOT_BUFFER_INDEX as usize,
+                                )
+                            },
+                            LaunchBinding::Extents => unsafe {
+                                encoder.setBuffer_offset_atIndex(
+                                    Some(&extents.buffer),
+                                    0,
+                                    crate::msl::EXTENT_BUFFER_INDEX as usize,
+                                )
+                            },
+                            LaunchBinding::Status => unsafe {
+                                encoder.setBuffer_offset_atIndex(
+                                    Some(&status.buffer),
+                                    0,
+                                    crate::msl::STATUS_BUFFER_INDEX as usize,
+                                )
+                            },
+                        }
+                    }
+                    if *dispatches > 0 {
+                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                    }
+                    let grid = MTLSize {
+                        width: workgroups as usize,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let group = MTLSize {
+                        width: participants as usize,
+                        height: 1,
+                        depth: 1,
+                    };
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+                    *dispatches += 1;
+                }
+                ExecutionItem::Call(children) => {
+                    // Nested calls share the root buffers and arena; the child
+                    // body was encoded against the same resolved storages.
+                    self.walk(
+                        exec, children, submission, arena, extents, status, dispatches,
+                    )?;
+                }
+                ExecutionItem::If {
+                    condition,
+                    then_steps,
+                    else_steps,
+                } => {
+                    // Exactly one retained predicate; exactly one branch.
+                    if exec.scalar(condition)? != 0 {
+                        self.walk(
+                            exec, then_steps, submission, arena, extents, status, dispatches,
+                        )?;
+                    } else {
+                        self.walk(
+                            exec, else_steps, submission, arena, extents, status, dispatches,
+                        )?;
+                    }
+                }
+                ExecutionItem::Repeat {
+                    binder,
+                    start,
+                    end,
+                    body,
+                } => {
+                    // Ascending half-open range; the binder slot is rebound
+                    // before each visit, and each visit's work completes
+                    // before the next is encoded.
+                    let start = exec.scalar(start)?;
+                    let end = exec.scalar(end)?;
+                    for value in start..end {
+                        submission.flush()?;
+                        exec.write_slot(binder.0, value as u32)?;
+                        self.walk(exec, body, submission, arena, extents, status, dispatches)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_buffer(&self, buffer: &Buffer) -> Result<(), String> {
         if !std::rc::Rc::ptr_eq(&self.identity, &buffer.identity) {
             return Err("Metal buffer belongs to a different device owner".into());
@@ -1100,10 +1062,131 @@ impl Device {
     }
 }
 
+impl Exec<'_> {
+    /// Evaluate one retained execution expression.
+    fn expr(&self, expression: &ExecutionExpr) -> Result<u64, String> {
+        Ok(match expression {
+            ExecutionExpr::Const(value) => *value,
+            ExecutionExpr::Extent(id) => self
+                .extents
+                .get(id.0 as usize)
+                .copied()
+                .ok_or_else(|| format!("runtime extent#{id:?} has no evaluated value"))?,
+            ExecutionExpr::AbiScalar { path, .. } => {
+                let value = (self.scalar_of_path)(path)?;
+                value as u64
+            }
+            ExecutionExpr::ExecutorScalar(slot) => self.slot_word(slot.0)? as u64,
+            ExecutionExpr::Add(a, b) => self
+                .expr(a)?
+                .checked_add(self.expr(b)?)
+                .ok_or("execution expression overflows")?,
+            ExecutionExpr::Sub(a, b) => self
+                .expr(a)?
+                .checked_sub(self.expr(b)?)
+                .ok_or("execution expression underflows")?,
+            ExecutionExpr::Mul(a, b) => self
+                .expr(a)?
+                .checked_mul(self.expr(b)?)
+                .ok_or("execution expression overflows")?,
+            ExecutionExpr::CeilDiv(a, b) => {
+                let (a, b) = (self.expr(a)?, self.expr(b)?);
+                if b == 0 {
+                    return Err("execution expression divides by zero".into());
+                }
+                a.div_ceil(b)
+            }
+            ExecutionExpr::Div(a, b) => {
+                let (a, b) = (self.expr(a)?, self.expr(b)?);
+                if b == 0 {
+                    return Err("execution expression divides by zero".into());
+                }
+                a / b
+            }
+            ExecutionExpr::Rem(a, b) => {
+                let (a, b) = (self.expr(a)?, self.expr(b)?);
+                if b == 0 {
+                    return Err("execution expression divides by zero".into());
+                }
+                a % b
+            }
+            ExecutionExpr::Min(a, b) => self.expr(a)?.min(self.expr(b)?),
+        })
+    }
+
+    fn scalar(&self, scalar: &ResolvedExecutorScalar) -> Result<i64, String> {
+        match scalar {
+            ResolvedExecutorScalar::Abi { path, .. } => {
+                let value = (self.scalar_of_path)(path)?;
+                Ok(value as i64)
+            }
+            ResolvedExecutorScalar::Result { .. } => {
+                Err("a result scalar cannot be read as an executor control value".into())
+            }
+            ResolvedExecutorScalar::Slot { slot, .. } => Ok(self.slot_word(slot.0)? as i32 as i64),
+            ResolvedExecutorScalar::Computed { expr, .. } => Ok(self.expr(expr)? as i64),
+        }
+    }
+
+    /// Write one executor-scalar slot (a `Repeat` binder rebind).
+    fn write_slot(&self, slot: u64, word: u32) -> Result<(), String> {
+        let contents = self.slots.contents();
+        let words = unsafe {
+            std::slice::from_raw_parts_mut(
+                contents.as_ptr() as *mut u32,
+                self.pipeline.emitted.slot_count,
+            )
+        };
+        let entry = words
+            .get_mut(slot as usize)
+            .ok_or_else(|| format!("executor slot#{slot} is outside the planned block"))?;
+        *entry = word;
+        Ok(())
+    }
+
+    /// Report the first failing status field after synchronous completion.
+    fn assert_status(&self, status: &Buffer) -> Result<(), String> {
+        let Some(binding) = self.pipeline.emitted.abi.status.as_ref() else {
+            return Ok(());
+        };
+        let bytes = status.read(binding.fields.len() * 4);
+        for (index, word) in bytes.chunks_exact(4).enumerate() {
+            let code = u32::from_le_bytes(word.try_into().unwrap());
+            if code != 0 {
+                let field = binding.fields.get(index);
+                return Err(format!(
+                    "Metal invocation failed a safety check (status field#{index}, code \
+                     {code}, node {:?})",
+                    field.map(|field| (field.node.node.0, field.index))
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn slot_word(&self, slot: u64) -> Result<u32, String> {
+        let words = unsafe {
+            std::slice::from_raw_parts(
+                self.slots.contents().as_ptr() as *const u32,
+                self.pipeline.emitted.slot_count,
+            )
+        };
+        words
+            .get(slot as usize)
+            .copied()
+            .ok_or_else(|| format!("executor slot#{slot} is outside the planned block"))
+    }
+}
+
 impl Buffer {
-    /// Alignment of this allocation's GPU virtual address, independent of the
-    /// CPU mapping and any retained view offset. A missing address proves only
-    /// byte alignment; it does not justify an assumed page or SIMD alignment.
+    /// The CPU-visible contents pointer at this view's offset.
+    pub(crate) fn contents(&self) -> std::ptr::NonNull<u8> {
+        std::ptr::NonNull::new(unsafe {
+            (self.buffer.contents().as_ptr() as *mut u8).add(self.offset)
+        })
+        .expect("a shared Metal buffer has contents")
+    }
+    /// Alignment of this allocation's GPU virtual address.
     pub fn allocation_alignment(&self) -> u64 {
         let address = self.buffer.gpuAddress();
         if address == 0 {
@@ -1136,20 +1219,6 @@ impl Buffer {
         &self.buffer
     }
 
-    /// Fill from bytes at an offset.
-    pub fn write_at(&self, offset: usize, bytes: &[u8]) {
-        assert!(offset
-            .checked_add(bytes.len())
-            .is_some_and(|end| end <= self.len));
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (self.buffer.contents().as_ptr() as *mut u8).add(self.offset + offset),
-                bytes.len(),
-            )
-        };
-    }
-
     pub fn write(&self, bytes: &[u8]) {
         assert!(bytes.len() <= self.len);
         unsafe {
@@ -1172,114 +1241,5 @@ impl Buffer {
             )
         };
         out
-    }
-}
-
-#[cfg(test)]
-mod profile_tests {
-    use super::*;
-
-    fn synthetic_info(name: &str, registry_id: u64) -> DeviceInfo {
-        DeviceInfo {
-            name: name.into(),
-            architecture_name: "synthetic-apple".into(),
-            registry_id,
-            unified_memory: true,
-            max_threads_per_threadgroup: 1024,
-            max_threadgroup_bytes: 32 * 1024,
-            max_buffer_bytes: 1 << 30,
-            cores: None,
-            recommended_working_set_bytes: 8 << 30,
-            profile: MetalProfile {
-                // Deliberately unordered and repeated: fingerprinting is canonical.
-                families: Observed::new(
-                    vec![
-                        MetalFamily::Apple(9),
-                        MetalFamily::Metal3,
-                        MetalFamily::Apple(9),
-                    ],
-                    Provenance::DeviceQuery,
-                ),
-                language: Observed::new(MetalLanguageVersion::V3_2, Provenance::CompileProbe),
-                device_limits_provenance: Provenance::DeviceQuery,
-                private_storage_budget_bytes: Observed::new(
-                    crate::mapping::CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
-                    Provenance::ConservativeAssumption,
-                ),
-                scalar_dtypes: Observed::new(
-                    vec![
-                        seismic_lang::types::DType::F16,
-                        seismic_lang::types::DType::F32,
-                    ],
-                    Provenance::CompileProbe,
-                ),
-                matrix_dtypes: Observed::new(
-                    vec![
-                        seismic_lang::types::DType::F16,
-                        seismic_lang::types::DType::F32,
-                    ],
-                    Provenance::CompileProbe,
-                ),
-                matrix_combinations: Observed::new(
-                    vec![crate::target::MatrixCombination {
-                        accumulator: seismic_lang::types::DType::F32,
-                        left: seismic_lang::types::DType::F16,
-                        right: seismic_lang::types::DType::F16,
-                    }],
-                    Provenance::CompileProbe,
-                ),
-            },
-        }
-    }
-
-    #[test]
-    fn capability_fingerprint_excludes_device_identity() {
-        let left = synthetic_info("Marketing Name A", 11);
-        let right = synthetic_info("Marketing Name B", 99);
-        assert_eq!(
-            left.capability_fingerprint(),
-            right.capability_fingerprint()
-        );
-        assert_eq!(left.target_fingerprint(), right.target_fingerprint());
-        assert!(!left.capability_fingerprint().contains("Marketing"));
-
-        let mut different_architecture = right;
-        different_architecture.architecture_name = "synthetic-apple-next".into();
-        assert_eq!(
-            left.capability_fingerprint(),
-            different_architecture.capability_fingerprint()
-        );
-        assert_ne!(
-            left.target_fingerprint(),
-            different_architecture.target_fingerprint()
-        );
-    }
-
-    #[test]
-    fn capability_fingerprint_tracks_language_and_provenance() {
-        let baseline = synthetic_info("device", 1);
-        let mut language = baseline.clone();
-        language.profile.language.value = MetalLanguageVersion::V4_0;
-        assert_ne!(
-            baseline.capability_fingerprint(),
-            language.capability_fingerprint()
-        );
-
-        let fingerprint = baseline.capability_fingerprint();
-        assert!(fingerprint.contains("msl=3.2@probe"));
-        assert!(fingerprint.contains("private-budget=131072@assumption"));
-        assert!(fingerprint.contains("families=metal3,apple9@query"));
-    }
-
-    #[test]
-    fn selection_uses_the_profile_bound_private_budget() {
-        let mut info = synthetic_info("device", 1);
-        info.profile.private_storage_budget_bytes.value = 96 * 1024;
-        let limits = crate::mapping::Limits::from_device(&info);
-        assert_eq!(limits.max_private_bytes, 96 * 1024);
-        assert_eq!(
-            info.profile.private_storage_budget_bytes.provenance,
-            Provenance::ConservativeAssumption
-        );
     }
 }

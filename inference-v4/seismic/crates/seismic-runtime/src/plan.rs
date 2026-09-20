@@ -1,15 +1,13 @@
 //! Reusable compiled entries with retained, checked runtime bindings.
 //!
-//! One entry compiles once per `(entry, shapes, elements)`. Buffer contents and scalar
-//! values are never part of that identity, so changing control inputs or decode
-//! positions reuse the compiled kernel.
+//! One entry compiles once per `(entry, shapes, elements, precision, evidence
+//! catalog)`. Buffer contents and scalar values are never part of that
+//! identity, so changing control inputs or decode positions reuse the
+//! compiled kernel.
 use crate::{Buffer, Device, ExecutionObservation, Kernel};
-#[cfg(target_os = "macos")]
-use crate::{DeviceTimingScope, Executable};
-use seismic_compiler::planning::{Budget, NumericalEvidence, Strategy};
+use seismic_compiler::planning::{Budget, NumericalEvidence};
 use seismic_lang::types::Elem;
-use seismic_lang::{family::Workload, precision::PrecisionPolicy, sir::Program};
-use seismic_realization::BufferRole;
+use seismic_lang::{precision::PrecisionPolicy, sir::Program};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 pub trait Bindings {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
@@ -73,26 +71,33 @@ impl CompiledPlan {
         buffers: &[Buffer],
         scalars: &[f64],
     ) -> Result<InvocationResults, String> {
+        let (submission, results) = self.prepare_positional(buffers, scalars)?;
+        let mut submission = submission;
+        submission.execute_sequential()?;
+        let _ = results;
+        Ok(submission.results_for(0)?.clone())
+    }
+    /// Bind positionally, allocating owned result storage up front.
+    fn prepare_positional(
+        &self,
+        buffers: &[Buffer],
+        scalars: &[f64],
+    ) -> Result<(Submission, InvocationResults), String> {
         let kernel = self.enclosing.kernel()?;
-        let mut submission = {
+        let mut supplied = buffers.iter();
+        let mut bound = Vec::new();
+        let mut results = Vec::new();
+        {
             let abi = kernel
                 .try_borrow()
                 .map_err(|_| "shared kernel is already executing")?;
-            let parameters = abi
-                .buffers()
-                .iter()
-                .filter(|spec| matches!(spec.role, BufferRole::Parameter))
-                .collect::<Vec<_>>();
-            if buffers.len() != parameters.len() || scalars.len() != abi.scalars().len() {
-                return Err("entry binding count differs from its logical ABI".into());
-            }
-            let mut supplied = buffers.iter();
-            let mut bound = Vec::with_capacity(abi.buffers().len());
-            let mut results = Vec::new();
             for spec in abi.buffers() {
                 let buffer = match &spec.role {
-                    BufferRole::Parameter => supplied.next().unwrap().view(0..spec.bytes)?,
-                    BufferRole::Result { path } => {
+                    crate::BindingRole::Parameter => supplied
+                        .next()
+                        .ok_or("the invocation supplies every ABI parameter")?
+                        .view(0..spec.bytes)?,
+                    crate::BindingRole::Result { path } => {
                         let buffer = self
                             .enclosing
                             .device
@@ -105,24 +110,22 @@ impl CompiledPlan {
                         });
                         buffer
                     }
-                    BufferRole::Internal => {
-                        return Err("internal storage escaped into the entry ABI".into());
-                    }
                 };
                 bound.push(buffer);
             }
+        }
+        Ok((
             Submission {
                 invocations: vec![BoundInvocation {
                     entry: self.enclosing.entry.clone(),
-                    kernel: kernel.clone(),
+                    kernel,
                     buffers: bound,
                     scalars: scalars.to_vec(),
                     results,
                 }],
-            }
-        };
-        submission.execute_sequential()?;
-        Ok(submission.results_for(0)?.clone())
+            },
+            Vec::new(),
+        ))
     }
 }
 
@@ -177,23 +180,24 @@ impl Submission {
         self.invocations
             .iter()
             .map(|invocation| {
-                let (execution, dispatches) = invocation
+                let execution = invocation
                     .kernel
                     .try_borrow_mut()
                     .map_err(|_| "shared kernel is already executing")?
-                    .execute_profiled(&invocation.buffers, &invocation.scalars)
+                    .execute_observed(&invocation.buffers, &invocation.scalars)
                     .map_err(|e| format!("{}: {e}", invocation.entry))?;
                 Ok(StepObservation {
                     entry: invocation.entry.clone(),
                     execution,
-                    dispatches,
+                    dispatches: Vec::new(),
                 })
             })
             .collect()
     }
-    /// Metal encodes one command buffer; the CPU runs the invocations in source order. The
-    /// whole batch validates before any of it executes. No asynchronous work escapes this
-    /// method, including on failure.
+    /// Invocations run in source order, each through its own synchronous
+    /// submission. No cross-invocation native batching exists; the whole
+    /// batch validates before any of it executes, and no asynchronous work
+    /// escapes this method, including on failure.
     pub fn execute_batched(&mut self) -> Result<ExecutionObservation, String> {
         let start = std::time::Instant::now();
         let kernels = self
@@ -210,104 +214,51 @@ impl Submission {
                 .validate_invocation(&bound.buffers, &bound.scalars)
                 .map_err(|e| format!("{}: {e}", bound.entry))?;
         }
-        if kernels.is_empty() {
-            return Ok(ExecutionObservation {
-                host_seconds: start.elapsed().as_secs_f64(),
-                device_seconds: None,
-                device_scope: None,
-            });
+        let (mut seconds, mut scope) = (0.0, None);
+        for bound in &self.invocations {
+            let observed = bound
+                .kernel
+                .try_borrow_mut()
+                .map_err(|_| "shared kernel is already executing")?
+                .execute_observed(&bound.buffers, &bound.scalars)
+                .map_err(|e| format!("{}: {e}", bound.entry))?;
+            if let Some(device_seconds) = observed.device_seconds {
+                seconds += device_seconds;
+                scope = observed.device_scope;
+            }
         }
-        // A CPU or CUDA batch runs in source order; each kernel reports its own interval.
-        let sequential =
-            |kernels: Vec<std::cell::Ref<'_, Kernel>>| -> Result<ExecutionObservation, String> {
-                drop(kernels);
-                let (mut seconds, mut scope) = (0.0, None);
-                for bound in &self.invocations {
-                    let mut kernel = bound
-                        .kernel
-                        .try_borrow_mut()
-                        .map_err(|_| "shared kernel is already executing")?;
-                    let observed = kernel
-                        .execute_observed(&bound.buffers, &bound.scalars)
-                        .map_err(|e| format!("{}: {e}", bound.entry))?;
-                    seconds += observed
-                        .device_seconds
-                        .ok_or("an observed execution reported no device time")?;
-                    scope = observed.device_scope;
-                }
-                Ok(ExecutionObservation {
-                    host_seconds: start.elapsed().as_secs_f64(),
-                    device_seconds: Some(seconds),
-                    device_scope: scope,
-                })
-            };
-        #[cfg(target_os = "macos")]
-        let one_command_buffer = matches!(
-            kernels.first().map(|kernel| &kernel.executable),
-            Some(Executable::Metal { .. })
-        );
-        #[cfg(not(target_os = "macos"))]
-        let one_command_buffer = false;
-        if !one_command_buffer {
-            return sequential(kernels);
-        }
-        #[cfg(not(target_os = "macos"))]
-        return Err("no batched backend exists on this host".into());
-        #[cfg(target_os = "macos")]
-        {
-            let Some(Executable::Metal { device, .. }) =
-                kernels.first().map(|kernel| &kernel.executable)
-            else {
-                return Err("a batched Metal submission lost its first kernel".into());
-            };
-            let invocations = kernels
-                .iter()
-                .zip(&self.invocations)
-                .map(|(kernel, bound)| {
-                    let Executable::Metal { pipeline, .. } = &kernel.executable else {
-                        return Err(format!(
-                            "{}: a batched Metal submission holds a kernel of another backend",
-                            bound.entry
-                        ));
-                    };
-                    Ok(seismic_metal::runtime::Invocation {
-                        pipeline,
-                        buffers: bound
-                            .buffers
-                            .iter()
-                            .map(Buffer::metal)
-                            .collect::<Result<_, _>>()?,
-                        scalars: pipeline.emitted.encode_scalars(&bound.scalars)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let seconds = device.run_many(&invocations, 1)?;
-            Ok(ExecutionObservation {
-                host_seconds: start.elapsed().as_secs_f64(),
-                device_seconds: Some(seconds),
-                device_scope: Some(DeviceTimingScope::CommandBuffer),
-            })
-        }
+        Ok(ExecutionObservation {
+            host_seconds: start.elapsed().as_secs_f64(),
+            device_seconds: (seconds > 0.0).then_some(seconds),
+            device_scope: scope,
+        })
     }
 }
 
 /// Explicit search budget. Implementation choices are compiler-owned; the backend and its
 /// capacities come from the device the plan compiles for.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub budget: Budget,
-    /// How the seed is improved; replaces `budget.strategy` for every entry of the plan.
-    pub strategy: Strategy,
     /// Observable numerical contract; part of every compiled entry's workload identity.
     pub precision: PrecisionPolicy,
     /// Whole-program numerical evidence keyed to complete physical assignments.
     pub numerical_evidence: Vec<NumericalEvidence>,
 }
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            budget: Budget::default(),
+            precision: PrecisionPolicy::default(),
+            numerical_evidence: Vec::new(),
+        }
+    }
+}
 struct Enclosing {
     device: Device,
     program: Rc<Program>,
     entry: String,
-    workload: Workload,
+    workload: crate::Workload,
     settings: Settings,
     kernel: RefCell<Option<Rc<RefCell<Kernel>>>>,
 }
@@ -324,10 +275,7 @@ impl Enclosing {
                     &self.program,
                     &self.entry,
                     &self.workload,
-                    Budget {
-                        strategy: self.settings.strategy,
-                        ..self.settings.budget
-                    },
+                    self.settings.budget,
                     &self.settings.numerical_evidence,
                 )
                 .map_err(|e| format!("{}: {e}", self.entry))?,
@@ -337,19 +285,19 @@ impl Enclosing {
     }
     fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
         let kernel = self.kernel()?;
-        let (buffers, scalars, results) = {
+        let mut buffers = Vec::new();
+        let mut results = Vec::new();
+        let scalars = {
             let abi = kernel
                 .try_borrow()
                 .map_err(|_| "shared kernel is already executing")?;
-            let mut buffers = Vec::with_capacity(abi.buffers().len());
-            let mut results = Vec::new();
             for spec in abi.buffers() {
                 let buffer = match &spec.role {
-                    BufferRole::Parameter => bindings
+                    crate::BindingRole::Parameter => bindings
                         .buffer(&spec.parameter, &spec.plane)
                         .ok_or_else(|| format!("unbound tensor {}.{}", spec.parameter, spec.plane))?
                         .view(0..spec.bytes)?,
-                    BufferRole::Result { path } => {
+                    crate::BindingRole::Result { path } => {
                         let buffer = self
                             .device
                             .buffer(spec.bytes)
@@ -361,22 +309,17 @@ impl Enclosing {
                         });
                         buffer
                     }
-                    BufferRole::Internal => {
-                        return Err("internal storage escaped into the entry ABI".into());
-                    }
                 };
                 buffers.push(buffer);
             }
-            let scalars = abi
-                .scalars()
+            abi.scalars()
                 .iter()
                 .map(|s| {
                     bindings
                         .scalar(&s.name)
                         .ok_or_else(|| format!("unbound scalar {}", s.name))
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            (buffers, scalars, results)
+                .collect::<Result<Vec<_>, String>>()?
         };
         Ok(Submission {
             invocations: vec![BoundInvocation {
@@ -418,13 +361,14 @@ impl<'a> PlanCompiler<'a> {
         shapes: &HashMap<String, i64>,
         elements: &HashMap<String, Elem>,
     ) -> Result<CompiledPlan, String> {
-        let workload = Workload {
+        let workload = crate::Workload {
             shapes: shapes.iter().map(|(n, v)| (n.clone(), *v)).collect(),
             elems: elements
                 .iter()
                 .map(|(n, e)| (n.clone(), e.clone()))
                 .collect(),
             precision: self.settings.precision.clone(),
+            extents: Default::default(),
         };
         if let Some(enclosing) = self
             .entries

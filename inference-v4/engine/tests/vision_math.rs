@@ -1,14 +1,14 @@
 //! Semantic precision tests; no native-selection or performance claim.
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{Arg, TensorData, WIDTHS};
+use reference::{Arg, TensorData};
 use seismic_lang::types::DType;
 use std::collections::HashMap;
 #[test]
 fn layer_norm_centers_in_f32_then_publishes_bf16() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_std::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let source = vec![1001., 1002., 1003., 1004., 7., 7., 7., 7.];
         let scales = vec![1., 2., -1., 0.5];
         let shifts = vec![0.25, -0.5, 1., -2.];
@@ -42,9 +42,9 @@ fn layer_norm_centers_in_f32_then_publishes_bf16() {
 }
 #[test]
 fn affine_bias_precedes_compact_publication() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_std::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let x = vm.add_tensor(TensorData::dense(DType::BF16, vec![1, 2], vec![1., 1.]));
         let weight = vm.add_tensor(TensorData::dense(
             DType::F32,
@@ -78,9 +78,9 @@ fn affine_bias_precedes_compact_publication() {
 
 #[test]
 fn vision_patch_order_and_position_add_preserve_compact_publications() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_engine::models::qwen35::program::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let values = (0..24).map(|i| i as f64 + 0.03125).collect::<Vec<_>>();
         let pixels = vm.add_tensor(TensorData::dense(
             DType::F32,
@@ -166,9 +166,9 @@ fn vision_patch_order_and_position_add_preserve_compact_publications() {
 
 #[test]
 fn vision_rotary_preserves_heads_axes_and_unrotated_values() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_engine::models::qwen35::program::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let (rows, heads, width) = (6usize, 3usize, 12usize);
         let positions = [[0i32, 0], [0, 1], [1, 0], [1, 1], [7, 19], [19, 7]];
         let values = (0..rows * 3 * heads * width)
@@ -246,10 +246,10 @@ fn vision_rotary_preserves_heads_axes_and_unrotated_values() {
 }
 #[test]
 fn vision_attention_includes_future_rows_and_keeps_heads_independent() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_engine::models::qwen35::program::program().unwrap();
         for nonzero in [false, true] {
-            let mut vm = reference::interpreter(&program, slice_width);
+            let mut vm = reference::interpreter(&program);
             let (rows, heads, width) = (3usize, 2usize, 4usize);
             let queries = (0..24)
                 .map(|i| if nonzero { (i % 7) as f32 / 8. } else { 0. })
@@ -323,9 +323,9 @@ fn vision_attention_includes_future_rows_and_keeps_heads_independent() {
 
 #[test]
 fn tanh_gelu_matches_declared_variant_across_tails_and_zero() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_std::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let values: Vec<f64> = (-160..=160)
             .map(|i| i as f64 / 16.)
             .chain([-100., -0.00001, 0.00001, 100.])
@@ -376,8 +376,8 @@ fn full_vision_merger_matches_independent_v3_equation_fixture() {
 }
 
 fn check_vision_reference(entry: &str, fixture: &str) {
-    for slice_width in WIDTHS {
-        use seismic_lang::types::{Elem, Ty};
+    {
+        use seismic_lang::types::{Elem, ValueType};
         let reference: serde_json::Value = serde_json::from_str(fixture).unwrap();
         let dimensions: HashMap<String, i64> = reference["dimensions"]
             .as_object()
@@ -386,13 +386,13 @@ fn check_vision_reference(entry: &str, fixture: &str) {
             .map(|(k, v)| (k.clone(), v.as_i64().unwrap()))
             .collect();
         let program = seismic_engine::models::qwen35::program::program().unwrap();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let mut args = Vec::new();
         let mut output = None;
         for param in &reference::entry(&program, entry).params {
             let name = &param.name;
             match &param.ty {
-                Ty::Tensor(t) => {
+                ValueType::Tensor(t) => {
                     let shape = reference::extents(t, &dimensions);
                     let dtype = match t.elem {
                         Elem::Dtype(d) => d,
@@ -414,7 +414,7 @@ fn check_vision_reference(entry: &str, fixture: &str) {
                     }
                     args.push(Arg::Tensor(id));
                 }
-                Ty::Scalar(_) => {
+                ValueType::Scalar(_) => {
                     assert_eq!(name, "epsilon");
                     args.push(Arg::Scalar(1e-6));
                 }
@@ -434,7 +434,7 @@ fn check_vision_reference(entry: &str, fixture: &str) {
 
 #[test]
 fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
-    for slice_width in WIDTHS {
+    {
         let program = seismic_engine::models::qwen35::program::program().unwrap();
         for dtype in [DType::F32, DType::BF16] {
             let round = |x: f32| match dtype {
@@ -454,7 +454,7 @@ fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
                 .map(|i| round(((i * 7 % 23) as f32 - 11.) / 16.))
                 .collect();
             let biases: Vec<f32> = (0..merged).map(|i| round(i as f32 / 32.)).collect();
-            let mut vm = reference::interpreter(&program, slice_width);
+            let mut vm = reference::interpreter(&program);
             let mut tensor = |shape, values: &[f32]| {
                 vm.add_tensor(TensorData::dense(
                     dtype,
@@ -520,7 +520,7 @@ fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
 
 #[test]
 fn erf_gelu_matches_python_oracle_at_boundaries_small_values_and_tails() {
-    for slice_width in WIDTHS {
+    {
         use seismic_lang::program::{compile, SourceFile};
         let reference: Vec<[f64; 3]> = serde_json::from_str(include_str!(
             "../../validation/results/fixtures/erf-gelu-reference.json"
@@ -529,7 +529,7 @@ fn erf_gelu_matches_python_oracle_at_boundaries_small_values_and_tails() {
         let mut sources = seismic_std::sources();
         sources.push(SourceFile {
             path: "erf-test.seismic".into(),
-            text: "fn erf_test[M, N](x: tensor[M, N] f32, out out: tensor[M, N] f32):\n    parallel [rows] in 0..M:\n        for row in rows:\n            publish erf_values(f32(x[row])) to out[row]\n".into(),
+            text: "fn erf_test[M, N](x: &tensor[M, N] f32, out: &mut tensor[M, N] f32):\n    parallel for row in 0..M:\n        out[row] = erf_values(to_owned(f32(x[row])))\n".into(),
         });
         let program = compile(&sources).unwrap_or_else(|errors| {
             panic!(
@@ -544,7 +544,7 @@ fn erf_gelu_matches_python_oracle_at_boundaries_small_values_and_tails() {
         let mut values: Vec<f64> = reference.iter().map(|row| row[0]).collect();
         values.extend([-0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN]);
         let n = values.len();
-        let mut vm = reference::interpreter(&program, slice_width);
+        let mut vm = reference::interpreter(&program);
         let x = vm.add_tensor(TensorData::dense(DType::F32, vec![1, n], values));
         let erf = vm.add_tensor(TensorData::dense(DType::F32, vec![1, n], vec![0.; n]));
         let gelu = vm.add_tensor(TensorData::dense(DType::F32, vec![1, n], vec![0.; n]));

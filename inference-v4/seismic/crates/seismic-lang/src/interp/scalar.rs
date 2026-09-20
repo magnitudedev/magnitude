@@ -1,8 +1,8 @@
 //! Scalar operation semantics: every operation is performed at its dtype and rounded once.
 use super::round_to;
 use super::value::S;
+use crate::intrinsics::MathOp;
 use crate::numeric::{integer_division_is_defined, integer_shift_is_defined, integer_value};
-use crate::sir::Math;
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::DType;
 
@@ -145,10 +145,10 @@ pub(super) fn assign(op: AssignOp, current: S, value: S) -> Result<S, String> {
     Ok((d, round_to(d, r)))
 }
 
-pub(super) fn math(op: Math, args: &[S]) -> Result<S, String> {
-    let arity = if op == Math::Fma {
+pub(super) fn math(op: MathOp, args: &[S]) -> Result<S, String> {
+    let arity = if op == MathOp::Fma {
         3
-    } else if matches!(op, Math::Max | Math::Min) {
+    } else if matches!(op, MathOp::Max | MathOp::Min) {
         2
     } else {
         1
@@ -161,7 +161,7 @@ pub(super) fn math(op: Math, args: &[S]) -> Result<S, String> {
         .fold(args[0].0, |d, a| DType::promote(d, a.0).unwrap_or(d));
     let a = args[0].1;
     Ok(match op {
-        Math::Fma => {
+        MathOp::Fma => {
             let (b, c) = (args[1].1, args[2].1);
             // Narrow-float operands are exact in f32, so this is the single-rounded f32 result.
             if d == DType::F32 {
@@ -170,13 +170,13 @@ pub(super) fn math(op: Math, args: &[S]) -> Result<S, String> {
                 (d, round_to(d, a.mul_add(b, c)))
             }
         }
-        Math::Exp | Math::ExpFast => (d, round_to(d, a.exp())),
-        Math::Rsqrt => (d, round_to(d, 1.0 / a.sqrt())),
-        Math::Sqrt => (d, round_to(d, a.sqrt())),
-        Math::Log => (d, round_to(d, a.ln())),
-        Math::Sin => (d, round_to(d, a.sin())),
-        Math::Cos => (d, round_to(d, a.cos())),
-        Math::Abs => {
+        MathOp::Exp | MathOp::ExpFast => (d, round_to(d, a.exp())),
+        MathOp::Rsqrt => (d, round_to(d, 1.0 / a.sqrt())),
+        MathOp::Sqrt => (d, round_to(d, a.sqrt())),
+        MathOp::Log => (d, round_to(d, a.ln())),
+        MathOp::Sin => (d, round_to(d, a.sin())),
+        MathOp::Cos => (d, round_to(d, a.cos())),
+        MathOp::Abs => {
             if d == DType::I32 {
                 (d, f64::from((a as i32).wrapping_abs()))
             } else if d.is_int() {
@@ -185,7 +185,7 @@ pub(super) fn math(op: Math, args: &[S]) -> Result<S, String> {
                 (d, round_to(d, a.abs()))
             }
         }
-        Math::Max => (d, a.max(args[1].1)),
-        Math::Min => (d, a.min(args[1].1)),
+        MathOp::Max => (d, a.max(args[1].1)),
+        MathOp::Min => (d, a.min(args[1].1)),
     })
 }

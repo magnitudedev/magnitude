@@ -93,10 +93,15 @@ impl TensorData {
         }
     }
 
-    pub fn set(&mut self, flat: usize, value: f64) {
+    pub fn set(&mut self, flat: usize, value: f64) -> Result<(), String> {
         match self {
-            TensorData::Dense { dtype, data, .. } => data[flat] = round_to(*dtype, value),
-            TensorData::Packed { .. } => panic!("cannot store into a packed tensor"),
+            TensorData::Dense { dtype, data, .. } => {
+                data[flat] = round_to(*dtype, value);
+                Ok(())
+            }
+            TensorData::Packed { .. } => {
+                Err("packed representations are readable and decodable but not writable".into())
+            }
         }
     }
 

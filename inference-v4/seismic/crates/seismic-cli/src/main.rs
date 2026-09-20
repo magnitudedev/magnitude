@@ -4,7 +4,7 @@
 mod bindings;
 mod select;
 
-use seismic_lang::family::Workload;
+use seismic_compiler::pipeline::Workload;
 use seismic_lang::precision::{EvidenceRequirement, InputRange, Limit, PrecisionPolicy, Tolerance};
 use seismic_lang::program::{collect_files, compile};
 use seismic_lang::sir::Program;
@@ -16,8 +16,8 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   seismic check <file|dir>...
   seismic print <file|dir>...
-  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--precision exact|bounded|unconstrained] [--atol V] [--rtol V] [--relative-floor V] [--ulps N] [--output-tolerance NAME=ATOL:RTOL:FLOOR:ULPS|-] [--input-range NAME=MIN..MAX] [--allow-special-changes nan,infinity,signed-zero,subnormal] [--evidence proven|qualified] [--target cpu|cuda|metal] [--strategy exact|greedy]
-  seismic emit <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal] [--strategy exact|greedy]
+  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--extent NAME=V,...] [--precision exact|bounded|unconstrained] [--atol V] [--rtol V] [--relative-floor V] [--ulps N] [--output-tolerance NAME=ATOL:RTOL:FLOOR:ULPS|-] [--input-range NAME=MIN..MAX] [--allow-special-changes nan,infinity,signed-zero,subnormal] [--evidence proven|qualified] [--target cpu|cuda|metal]
+  seismic emit <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
   seismic analyze-search <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
   seismic bindings <file|dir>... --fn <name> [--element NAME=TYPE,...]
 `select`, `emit` and `analyze-search` target Metal unless `--target` is given. `select` prints
@@ -36,8 +36,6 @@ pub struct Options {
     pub target: String,
     pub function: Option<String>,
     pub workload: Workload,
-    /// How `select` and `emit` improve the seed.
-    pub strategy: seismic_compiler::planning::Strategy,
 }
 
 impl Options {
@@ -90,7 +88,6 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
         target: TARGET.into(),
         function: None,
         workload: Workload::default(),
-        strategy: Default::default(),
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -138,6 +135,27 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                     }
                 }
             }
+            "--extent" => {
+                for binding in value.split(',') {
+                    let (name, extent) = binding.split_once('=').ok_or_else(|| {
+                        format!("bad extent binding `{binding}`; expected NAME=V")
+                    })?;
+                    let extent: i64 = extent
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("bad extent value `{extent}`"))?;
+                    if extent < 0 {
+                        return Err(format!("extent `{name}` must be nonnegative"));
+                    }
+                    if o.workload
+                        .extents
+                        .insert(name.trim().to_string(), extent)
+                        .is_some()
+                    {
+                        return Err(format!("duplicate extent binding {name}"));
+                    }
+                }
+            }
             "--element" => {
                 for binding in value.split(',') {
                     let (name, element) = binding.split_once('=').ok_or_else(|| {
@@ -157,17 +175,6 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                         .is_some()
                     {
                         return Err(format!("duplicate element binding {name}"));
-                    }
-                }
-            }
-            "--strategy" => {
-                o.strategy = match value.as_str() {
-                    "exact" => seismic_compiler::planning::Strategy::Exact,
-                    "greedy" => seismic_compiler::planning::Strategy::Greedy,
-                    other => {
-                        return Err(format!(
-                            "bad --strategy `{other}`; expected exact or greedy"
-                        ))
                     }
                 }
             }

@@ -1,7 +1,7 @@
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{allocate, fill, Backend, WIDTHS};
-use seismic_lang::types::{DType, Ty};
+use reference::{allocate, fill, Backend};
+use seismic_lang::types::{DType, ValueType};
 use serde_json::Value;
 use std::collections::HashMap;
 fn exercise(backend: &mut Backend<'_>) {
@@ -26,7 +26,7 @@ fn exercise(backend: &mut Backend<'_>) {
     let scalars = reference::entry(backend.program(), "rotary_prepare")
         .params
         .iter()
-        .filter(|p| !matches!(p.ty, Ty::Tensor(_)))
+        .filter(|p| !matches!(p.ty, ValueType::Tensor(_)))
         .map(|p| {
             (
                 p.name.clone(),
@@ -54,9 +54,7 @@ fn exercise(backend: &mut Backend<'_>) {
 #[test]
 fn reference_rotary_prepare() {
     let program = seismic_std::program().unwrap();
-    for width in WIDTHS {
-        exercise(&mut Backend::Interpreter(&program, width));
-    }
+    exercise(&mut Backend::Interpreter(&program, HashMap::new()));
 }
 #[test]
 #[ignore = "requires a Metal device"]

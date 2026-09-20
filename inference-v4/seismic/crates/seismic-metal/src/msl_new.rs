@@ -1,262 +1,2009 @@
-//! Mechanical MSL encoding of resolved executable launches.
+//! Mechanical MSL encoding of resolved Metal launches.
+//!
+//! Each launch is encoded once. The printer accepts `MetalOp` exhaustively
+//! and makes no allocation, geometry, synchronization, algorithm, or
+//! precision decision: iteration comes from the resolved launch's geometry
+//! (the common arbitrary-rank grid-stride mapping), storage from the resolved
+//! binding groups, and guards from the planned discharges. There is no
+//! assembly alias union: boundaries already name caller storage, and alias
+//! validation is the root-ABI `validate_alias_rules`. Produced (output)
+//! values resolve through the launch's own value bindings, which carry node
+//! outputs after inputs.
 
-use crate::physical::{MetalDialect, ResolvedMetalInstruction, ResolvedMetalLayout};
-use seismic_compiler::{
-    pipeline::{EncodedPlan, EncodedScheduleItem},
-    terminal::{
-        ResolvedScalarInstructionKind as I, ScalarIndex, ScalarLiteral, ScalarValueId,
-        StorageOperation,
-    },
+use crate::physical::{
+    AccessLayout, AddrExpr, BoolOp, ConstValue, DivRemOp, Dst, Guard, GuardPredicate, IndexRef,
+    MetalDialect, MetalOp, ReduceResult, ShiftOp, Src, UnaryOp, ValueRef,
 };
+use seismic_compiler::pipeline::EncodedPlan;
 use seismic_lang::{
-    abi::ScalarParameter,
-    logical::{LocalViewTransform, Type},
-    repr,
-    syntax::ast::{AssignOp, BinaryOp, UnaryOp},
-    types::DType,
+    intrinsics::AtomicOp,
+    logical::GraphValueId,
+    types::{DType, RuntimeExtentId},
 };
-use seismic_realization::{
-    dispatch::{GroupDispatch, TileDeclaration},
-    executable::{
-        AbiRole, AccessMode, BindingGroupKind, ResolvedAxisMap, ResolvedBindingGroup,
-        ResolvedKernelStep, ResolvedLaunch, ResolvedOperandTransport, ResolvedPhysicalAddress,
-        ResolvedStorage, ResolvedStorageId, ResolvedValueTransport, StorageScope,
-    },
-    BufferRole, BufferSpec,
+use seismic_realization::executable::{
+    AccessMode, BarrierScope, BufferBindingId, ExecutionExpr, ResolvedAbi, ResolvedExecutorScalar,
+    ResolvedKernelStep, ResolvedLaunch, ResolvedSchedule, ResolvedStep, ResolvedStorage,
+    ResolvedStorageId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Fixed extra buffer indices after the binding-group slots.
+pub const SLOT_BUFFER_INDEX: u32 = 26;
+pub const EXTENT_BUFFER_INDEX: u32 = 27;
+pub const STATUS_BUFFER_INDEX: u32 = 28;
 pub const MAX_KERNEL_BUFFERS: usize = 31;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Emitted {
-    pub source: String,
-    pub launches: Vec<Launch>,
-    pub execution: Vec<ExecutionItem>,
-    pub buffers: Vec<BufferSpec>,
-    /// Exact resolved storage identity for each entry in `buffers`.
-    pub buffer_ids: Vec<ResolvedStorageId>,
-    pub scalars: Vec<ScalarParameter>,
-    pub scratch: Vec<usize>,
-    pub scratch_bindings: Vec<BufferSpec>,
-    pub status_slot: Option<usize>,
-    pub alias_pairs: Vec<(usize, usize, bool)>,
-}
-
-impl Emitted {
-    pub fn scalar_layout(&self) -> Result<seismic_lang::abi::ScalarLayout, String> {
-        seismic_lang::abi::ScalarLayout::natural(&self.scalars)
-    }
-
-    pub fn encode_scalars(&self, values: &[f64]) -> Result<Vec<u8>, String> {
-        self.scalar_layout()?.encode(values)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExecutionItem {
-    Phase(Vec<usize>),
-    Subplan(Vec<ExecutionItem>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Launch {
-    pub kernel: String,
-    pub threadgroups: u64,
-    pub threads_per_threadgroup: u64,
-    pub after_barrier: bool,
-    pub dispatch: Option<GroupDispatch>,
-    pub tiles: Vec<TileDeclaration>,
-    pub declared_threadgroup_bytes: u64,
-    pub bindings: Vec<Binding>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Binding {
-    Buffer(usize),
-    Scratch(usize),
-    Scalars(usize),
-    Status,
-    ArgumentTable(Vec<(u32, Binding)>),
-}
-
-#[derive(Clone, Debug)]
-enum SymbolicBinding {
-    Storage(ResolvedStorageId),
-    ArgumentTable(Vec<(u32, ResolvedStorageId)>),
-}
-
+/// Per-launch encoding: the resolved launch itself (geometry and binding
+/// groups are retained execution data); MSL is rendered at assembly, when the
+/// full plan context is available.
 #[derive(Clone, Debug)]
 pub struct EncodedLaunch {
-    source: String,
-    kernel: String,
-    threadgroups: u64,
-    threads_per_threadgroup: u64,
-    declared_threadgroup_bytes: u64,
-    bindings: Vec<SymbolicBinding>,
-    storage: BTreeMap<ResolvedStorageId, ResolvedStorage<MetalDialect>>,
+    pub launch: ResolvedLaunch<MetalDialect>,
 }
 
+/// One native buffer binding of an emitted launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchBinding {
+    /// A public root-ABI buffer.
+    Buffer {
+        binding: BufferBindingId,
+        access: AccessMode,
+    },
+    /// A slice of the internal device arena.
+    Arena { offset: u64, access: AccessMode },
+    /// The planned executor-scalar slot block (4 bytes per slot).
+    Slots,
+    /// The retained runtime-extent block (8 bytes per extent id).
+    Extents,
+    /// The root status block.
+    Status,
+}
+
+/// The encoded native artifact: sources, launches, the structured execution
+/// tree, the root ABI, and the planned blocks the runtime owns.
+#[derive(Clone, Debug)]
+pub struct Emitted {
+    pub source: String,
+    pub launches: Vec<EmittedLaunch>,
+    pub execution: Vec<ExecutionItem>,
+    pub abi: ResolvedAbi<MetalDialect>,
+    pub arena_bytes: u64,
+    /// Resolved executor-scalar slot count (4 bytes each).
+    pub slot_count: usize,
+    /// Runtime-extent count (8 bytes each).
+    pub extent_count: usize,
+    /// Retained runtime-extent values (execution expressions, never
+    /// capacities), for runtime evaluation.
+    pub runtime_extents: Vec<(RuntimeExtentId, ExecutionExpr)>,
+    /// Per launch: which resolved executor slots its ops write (diagnostics).
+    pub launch_slots_written: Vec<BTreeSet<u64>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmittedLaunch {
+    pub kernel: String,
+    pub work_items: ExecutionExpr,
+    pub participants: ExecutionExpr,
+    pub bindings: Vec<LaunchBinding>,
+    pub threadgroup_bytes: u64,
+    /// A statically skipped launch (zero work): retained identity, no
+    /// native pipeline.
+    pub skipped: bool,
+}
+
+/// Encoded mirror of the resolved structured schedule (never flattened away).
+/// `If`/`Repeat` retain their control scalars so the runtime evaluates them
+/// directly; nothing is reconstructed from kernel names.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecutionItem {
+    Launch(usize),
+    Call(Vec<ExecutionItem>),
+    If {
+        condition: ResolvedExecutorScalar,
+        then_steps: Vec<ExecutionItem>,
+        else_steps: Vec<ExecutionItem>,
+    },
+    Repeat {
+        binder: seismic_realization::executable::ResolvedExecutorScalarId,
+        start: ResolvedExecutorScalar,
+        end: ResolvedExecutorScalar,
+        body: Vec<ExecutionItem>,
+    },
+}
+
+/// Encode one resolved launch (retained; MSL rendering happens in
+/// `assemble` with full plan context).
 pub fn encode_launch(launch: &ResolvedLaunch<MetalDialect>) -> Result<EncodedLaunch, String> {
-    let kernel = format!("seismic_metal_{}", launch.id.0);
-    let mut source = String::new();
-    let mut declarations = Vec::new();
-    let mut symbolic = Vec::new();
-    for group in &launch.binding_groups {
-        encode_binding_group(
-            group,
-            launch,
-            &kernel,
-            &mut source,
-            &mut declarations,
-            &mut symbolic,
-        )?;
+    if launch.bindings.len() > MAX_KERNEL_BUFFERS {
+        return Err(format!(
+            "launch#{} binds {} groups; Metal permits {MAX_KERNEL_BUFFERS} buffers",
+            launch.id.0,
+            launch.bindings.len()
+        ));
     }
-    declarations.push("uint3 tg_pos [[threadgroup_position_in_grid]]".into());
-    declarations.push("uint3 tid [[thread_position_in_threadgroup]]".into());
-    source.push_str(&format!(
-        "kernel void {kernel}(\n    {}\n) {{\n",
-        declarations.join(",\n    ")
-    ));
-    for group in &launch.binding_groups {
-        if group.kind == BindingGroupKind::ArgumentTable {
-            for binding in group.members.iter() {
-                source.push_str(&format!(
-                    "  auto s{} = seismic_arguments_{}.s{};\n",
-                    binding.storage.0, group.id.0, binding.storage.0
-                ));
-            }
+    for group in &launch.bindings {
+        let top = group.slot as usize + group.members.len();
+        let reserved = [SLOT_BUFFER_INDEX, EXTENT_BUFFER_INDEX, STATUS_BUFFER_INDEX]
+            .into_iter()
+            .map(|index| index as usize)
+            .min()
+            .unwrap();
+        if top > reserved {
+            return Err(format!(
+                "launch#{} binding group at slot {} exceeds the reserved Metal buffer table",
+                launch.id.0, group.slot
+            ));
         }
     }
-    let mut renderer = Renderer::new(launch);
-    for step in launch.kernel.steps.iter() {
-        renderer.step(step)?;
-    }
-    for line in renderer.lines {
-        source.push_str("  ");
-        source.push_str(&line);
-        source.push('\n');
-    }
-    source.push_str("}\n\n");
-    let threadgroups = launch.geometry.workgroups.iter().try_fold(1u64, |a, b| {
-        a.checked_mul(*b).ok_or("Metal workgroup count overflow")
-    })?;
-    let threads_per_threadgroup = launch
-        .geometry
-        .participants_per_workgroup
-        .iter()
-        .try_fold(1u64, |a, b| {
-            a.checked_mul(*b).ok_or("Metal participant count overflow")
-        })?;
     Ok(EncodedLaunch {
-        source,
-        kernel,
-        threadgroups,
-        threads_per_threadgroup,
-        declared_threadgroup_bytes: launch.kernel.resources.workgroup_bytes,
-        bindings: symbolic,
-        storage: launch
-            .storage
-            .values()
-            .cloned()
-            .map(|value| (value.id, value))
-            .collect(),
+        launch: launch.clone(),
     })
 }
 
-fn encode_binding_group(
-    group: &ResolvedBindingGroup,
-    launch: &ResolvedLaunch<MetalDialect>,
-    kernel: &str,
-    source: &mut String,
-    declarations: &mut Vec<String>,
-    bindings: &mut Vec<SymbolicBinding>,
-) -> Result<(), String> {
-    match group.kind {
-        BindingGroupKind::Direct => {
-            let binding = group.members.iter().next().unwrap();
-            let storage = storage(launch, binding.storage)?;
-            declarations.push(resource_declaration(storage, binding.access, group.slot));
-            bindings.push(SymbolicBinding::Storage(storage.id));
+/// Assemble the native artifact: render MSL for every encoded launch, mirror
+/// the structured execution tree, and collect the planned blocks.
+pub fn assemble(encoded: EncodedPlan<MetalDialect, EncodedLaunch>) -> Result<Emitted, String> {
+    let resolved = &encoded.resolved;
+    let mut sources = String::from(
+        "#include <metal_stdlib>\nusing namespace metal;\n#pragma clang fp contract(off)\n\n",
+    );
+    // Rendered launches keyed by resolved launch id (the execution tree
+    // addresses launches by that identity).
+    let mut rendered: BTreeMap<u64, (EmittedLaunch, BTreeSet<u64>)> = BTreeMap::new();
+    for step in &encoded.steps {
+        assemble_step(step, resolved, &mut sources, &mut rendered)?;
+    }
+    let mut launches = Vec::new();
+    let mut launch_slots_written = Vec::new();
+    let mut next = 0u64;
+    for (id, (launch, slots)) in rendered {
+        while next < id {
+            launches.push(placeholder_launch(next));
+            launch_slots_written.push(BTreeSet::new());
+            next += 1;
         }
-        BindingGroupKind::ArgumentTable => {
-            let table = format!("SeismicArguments_{}_{}", kernel, group.id.0);
-            source.push_str(&format!("struct {table} {{\n"));
-            let mut members = Vec::new();
-            for (member, binding) in group.members.iter().enumerate() {
-                let storage = storage(launch, binding.storage)?;
-                source.push_str(&format!(
-                    "  {} {}* s{} [[id({member})]];\n",
-                    address_space(binding.access),
-                    storage_pointer_type(&storage.layout),
-                    storage.id.0,
-                ));
-                members.push((member as u32, storage.id));
+        launches.push(launch);
+        launch_slots_written.push(slots);
+        next = id + 1;
+    }
+    let extent_count = resolved.runtime_extents.len();
+    let slot_count = schedule_slot_max(&resolved.entry.schedule);
+    Ok(Emitted {
+        source: sources,
+        launches,
+        execution: execution_tree(&encoded.steps)?,
+        abi: resolved.abi.clone(),
+        arena_bytes: resolved.internal_arena.bytes,
+        slot_count,
+        extent_count,
+        runtime_extents: resolved
+            .runtime_extents
+            .ids()
+            .zip(resolved.runtime_extents.iter())
+            .map(|(id, expr)| (id, expr.clone()))
+            .collect(),
+        launch_slots_written,
+    })
+}
+
+fn placeholder_launch(_id: u64) -> EmittedLaunch {
+    // A statically skipped launch (zero work) retains its identity without a
+    // native pipeline.
+    EmittedLaunch {
+        kernel: String::new(),
+        work_items: ExecutionExpr::Const(0),
+        participants: ExecutionExpr::Const(1),
+        bindings: Vec::new(),
+        threadgroup_bytes: 0,
+        skipped: true,
+    }
+}
+
+/// The highest resolved executor-scalar slot id referenced anywhere in one
+/// schedule tree (runtime-written binder slots included).
+fn schedule_slot_max(schedule: &ResolvedSchedule<MetalDialect>) -> usize {
+    let mut max = 0usize;
+    fn transport_max(
+        transport: &seismic_realization::executable::ResolvedTransport,
+        max: &mut usize,
+    ) {
+        match transport {
+            seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                ResolvedExecutorScalar::Slot { slot, .. },
+            ) => *max = (*max).max(slot.0 as usize + 1),
+            seismic_realization::executable::ResolvedTransport::Tuple(items) => {
+                for item in items.iter() {
+                    transport_max(item, max);
+                }
             }
-            source.push_str("};\n\n");
-            declarations.push(format!(
-                "constant {table}& seismic_arguments_{} [[buffer({})]]",
-                group.id.0, group.slot
-            ));
-            bindings.push(SymbolicBinding::ArgumentTable(members));
+            _ => {}
         }
     }
-    Ok(())
+    fn walk(schedule: &ResolvedSchedule<MetalDialect>, max: &mut usize) {
+        for step in schedule.steps.iter() {
+            match step {
+                ResolvedStep::Launch(launch) => {
+                    for group in &launch.bindings {
+                        for kernel_step in launch.kernel.steps.iter() {
+                            if let ResolvedKernelStep::Mapped { bindings, .. } = kernel_step {
+                                for (_, transport) in bindings {
+                                    transport_max(transport, max);
+                                }
+                            }
+                        }
+                        let _ = group;
+                    }
+                }
+                ResolvedStep::Call(call) => {
+                    for transport in call
+                        .boundary
+                        .inputs
+                        .values()
+                        .chain(call.boundary.results.values())
+                    {
+                        transport_max(transport, max);
+                    }
+                    walk(&call.body.schedule, max);
+                }
+                ResolvedStep::If(if_step) => {
+                    transport_max(
+                        &seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                            if_step.condition.clone(),
+                        ),
+                        max,
+                    );
+                    walk(&if_step.then_schedule, max);
+                    walk(&if_step.else_schedule, max);
+                }
+                ResolvedStep::Repeat(repeat) => {
+                    *max = (*max).max(repeat.binder.0 as usize + 1);
+                    walk(&repeat.body, max);
+                }
+            }
+        }
+    }
+    walk(schedule, &mut max);
+    max
 }
 
-fn storage(
-    launch: &ResolvedLaunch<MetalDialect>,
-    id: ResolvedStorageId,
-) -> Result<&ResolvedStorage<MetalDialect>, String> {
-    launch
-        .storage
-        .values()
-        .find(|storage| storage.id == id)
-        .ok_or_else(|| format!("resolved launch omits storage#{}", id.0))
+/// Mirror the encoded plan's structured steps (launch identities retained,
+/// dynamic control never flattened away).
+fn execution_tree(
+    steps: &[seismic_compiler::pipeline::EncodedStep<MetalDialect, EncodedLaunch>],
+) -> Result<Vec<ExecutionItem>, String> {
+    let mut out = Vec::new();
+    for step in steps {
+        out.push(match step {
+            seismic_compiler::pipeline::EncodedStep::Launch { .. } => {
+                ExecutionItem::Launch(launch_index_of(step)?)
+            }
+            seismic_compiler::pipeline::EncodedStep::Call { encoded, .. } => {
+                ExecutionItem::Call(execution_tree(&encoded.steps)?)
+            }
+            seismic_compiler::pipeline::EncodedStep::If {
+                resolved,
+                then_steps,
+                else_steps,
+            } => ExecutionItem::If {
+                condition: resolved.condition.clone(),
+                then_steps: execution_tree(then_steps)?,
+                else_steps: execution_tree(else_steps)?,
+            },
+            seismic_compiler::pipeline::EncodedStep::Repeat { resolved, body } => {
+                ExecutionItem::Repeat {
+                    binder: resolved.binder,
+                    start: resolved.range.start.clone(),
+                    end: resolved.range.end.clone(),
+                    body: execution_tree(body)?,
+                }
+            }
+        });
+    }
+    Ok(out)
 }
 
-fn address_space(access: AccessMode) -> &'static str {
-    match access {
-        AccessMode::Read => "const device",
-        AccessMode::Write | AccessMode::ReadWrite | AccessMode::Atomic => "device",
+fn launch_index_of(
+    step: &seismic_compiler::pipeline::EncodedStep<MetalDialect, EncodedLaunch>,
+) -> Result<usize, String> {
+    match step {
+        seismic_compiler::pipeline::EncodedStep::Launch { encoded, .. } => {
+            Ok(encoded.launch.id.0 as usize)
+        }
+        _ => Err("internal: a launch step carries an encoded launch".into()),
     }
 }
 
-fn resource_declaration(
+/// Render one step (recursively), appending kernel sources and launch specs.
+fn assemble_step(
+    step: &seismic_compiler::pipeline::EncodedStep<MetalDialect, EncodedLaunch>,
+    resolved: &seismic_realization::executable::ResolvedPlan<MetalDialect>,
+    sources: &mut String,
+    rendered: &mut BTreeMap<u64, (EmittedLaunch, BTreeSet<u64>)>,
+) -> Result<(), String> {
+    match step {
+        seismic_compiler::pipeline::EncodedStep::Launch {
+            resolved: launch, ..
+        } => {
+            let output = render_launch(launch, resolved)?;
+            sources.push_str(&output.source);
+            rendered.insert(
+                launch.id.0,
+                (
+                    EmittedLaunch {
+                        kernel: output.kernel,
+                        work_items: launch.work_items.clone(),
+                        participants: launch.geometry.participants_per_workgroup[0].clone(),
+                        bindings: output.bindings,
+                        threadgroup_bytes: launch.kernel.resources.workgroup_bytes,
+                        skipped: false,
+                    },
+                    output.slots_written,
+                ),
+            );
+            Ok(())
+        }
+        seismic_compiler::pipeline::EncodedStep::Call { encoded, .. } => {
+            for child in &encoded.steps {
+                assemble_step(child, resolved, sources, rendered)?;
+            }
+            Ok(())
+        }
+        seismic_compiler::pipeline::EncodedStep::If {
+            then_steps,
+            else_steps,
+            ..
+        } => {
+            for child in then_steps.iter().chain(else_steps) {
+                assemble_step(child, resolved, sources, rendered)?;
+            }
+            Ok(())
+        }
+        seismic_compiler::pipeline::EncodedStep::Repeat { body, .. } => {
+            for child in body {
+                assemble_step(child, resolved, sources, rendered)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+struct RenderedLaunch {
+    source: String,
+    kernel: String,
+    bindings: Vec<LaunchBinding>,
+    slots_written: BTreeSet<u64>,
+}
+
+/// One launch input binding: (value, resolved transport).
+type ResolvedBinding = (
+    GraphValueId,
+    seismic_realization::executable::ResolvedTransport,
+);
+
+struct Renderer {
+    /// Every resolved storage bound by this launch → pointer name.
+    pointers: BTreeMap<ResolvedStorageId, String>,
+    bindings: Vec<LaunchBinding>,
+    lines: Vec<String>,
+    mapped: Vec<ResolvedBinding>,
+    /// Resolved executor slots this launch's ops write.
+    slots_written: SlotsWritten,
+    /// Counter for decode temporaries.
+    temporaries: u32,
+}
+
+fn render_launch(
+    launch: &ResolvedLaunch<MetalDialect>,
+    plan: &seismic_realization::executable::ResolvedPlan<MetalDialect>,
+) -> Result<RenderedLaunch, String> {
+    let kernel = format!("seismic_metal_{}", launch.id.0);
+    let mut renderer = Renderer {
+        pointers: BTreeMap::new(),
+        bindings: Vec::new(),
+        lines: Vec::new(),
+        mapped: Vec::new(),
+        slots_written: SlotsWritten::default(),
+        temporaries: 0,
+    };
+    // Resource declarations: one pointer per binding-group member at
+    // successive indices, then the shared slot/extent/status blocks. The
+    // member's access mode comes from the resolved binding group (parameter
+    // ownership on the root transports).
+    let mut declarations = Vec::new();
+    let mut next_index = 0u32;
+    for group in &launch.bindings {
+        match group.kind {
+            seismic_realization::executable::BindingGroupKind::Direct => {
+                for member in group.members.iter() {
+                    let storage = plan.storage.get(member.storage).ok_or_else(|| {
+                        format!("resolved storage#{} is absent", member.storage.0)
+                    })?;
+                    let name = format!("b{next_index}");
+                    let dtype = layout_dtype(&storage.layout);
+                    let address = match member.access {
+                        AccessMode::Read => "const device",
+                        _ => "device",
+                    };
+                    declarations.push(format!(
+                        "{address} {}* {name} [[buffer({next_index})]]",
+                        dtype_name(dtype)
+                    ));
+                    renderer.bindings.push(binding_of(storage, member.access)?);
+                    renderer.pointers.insert(storage.id, name.clone());
+                    next_index += 1;
+                }
+            }
+            seismic_realization::executable::BindingGroupKind::ArgumentTable => {
+                return Err(format!(
+                    "compiler bug: launch#{} binds an argument table; no current Metal \
+                     strategy emits one (a table is a hard resource of the alternative that \
+                     declares it)",
+                    launch.id.0
+                ));
+            }
+        }
+    }
+    declarations.push(format!(
+        "constant uint* seismic_slots [[buffer({SLOT_BUFFER_INDEX})]]"
+    ));
+    renderer.bindings.push(LaunchBinding::Slots);
+    declarations.push(format!(
+        "constant ulong* seismic_extents [[buffer({EXTENT_BUFFER_INDEX})]]"
+    ));
+    renderer.bindings.push(LaunchBinding::Extents);
+    if plan.abi.status.is_some() {
+        declarations.push(format!(
+            "device uint* seismic_status [[buffer({STATUS_BUFFER_INDEX})]]"
+        ));
+        renderer.bindings.push(LaunchBinding::Status);
+    }
+    declarations.push("uint3 tg_pos [[threadgroup_position_in_grid]]".into());
+    declarations.push("uint3 tid [[thread_position_in_threadgroup]]".into());
+    declarations.push("uint3 tpg [[threads_per_threadgroup]]".into());
+    declarations.push("uint3 tgn [[threadgroups_per_grid]]".into());
+    declarations.push("uint simd_lane [[thread_index_in_simdgroup]]".into());
+    let mut source = format!(
+        "kernel void {kernel}(\n    {}\n) {{\n",
+        declarations.join(",\n    ")
+    );
+    // Planned workgroup storage: a statically sized threadgroup array the
+    // resolved plan's staged allocations own; emitters address it by offset.
+    if launch.kernel.resources.workgroup_bytes > 0 {
+        let words = launch.kernel.resources.workgroup_bytes / 4;
+        source.push_str(&format!(
+            "  threadgroup float seismic_wg[{words}];\n  \
+             (void)seismic_wg[0];\n"
+        ));
+    }
+    // Grid-stride prologue over the launch's retained work-item total (the
+    // common arbitrary-rank mapping; rank is not the native grid rank).
+    let total = expr_string(&launch.work_items);
+    source.push_str(&format!(
+        "  uint seismic_gid = tg_pos.x * tpg.x + tid.x;\n  \
+         uint seismic_stride = tpg.x * tgn.x;\n  \
+         for (uint seismic_lin = seismic_gid; seismic_lin < {total}; \
+         seismic_lin += seismic_stride) {{\n"
+    ));
+    for step in launch.kernel.steps.iter() {
+        renderer.step(step)?;
+    }
+    for line in &renderer.lines {
+        source.push_str("    ");
+        source.push_str(line);
+        source.push('\n');
+    }
+    source.push_str("  }\n}\n\n");
+    Ok(RenderedLaunch {
+        source,
+        kernel,
+        bindings: renderer.bindings,
+        slots_written: renderer.slots_written.0.clone(),
+    })
+}
+
+fn binding_of(
     storage: &ResolvedStorage<MetalDialect>,
     access: AccessMode,
-    slot: u32,
-) -> String {
-    let address = if matches!(storage.provenance.abi, Some(AbiRole::Parameter { .. }))
-        && matches!(storage.layout, ResolvedMetalLayout::Scalar { .. })
-    {
-        "constant"
-    } else {
-        address_space(access)
-    };
-    format!(
-        "{} {}* s{} [[buffer({slot})]]",
-        address,
-        storage_pointer_type(&storage.layout),
-        storage.id.0,
-    )
+) -> Result<LaunchBinding, String> {
+    Ok(match storage.placement {
+        seismic_realization::executable::ResolvedStoragePlacement::Abi { binding } => {
+            LaunchBinding::Buffer { binding, access }
+        }
+        seismic_realization::executable::ResolvedStoragePlacement::Arena { offset } => {
+            LaunchBinding::Arena { offset, access }
+        }
+        placement => {
+            return Err(format!(
+                "compiler bug: {:?} storage entered a Metal device binding group",
+                placement.scope()
+            ));
+        }
+    })
 }
 
-fn storage_pointer_type(layout: &ResolvedMetalLayout) -> &'static str {
+fn layout_dtype(layout: &crate::physical::ResolvedMetalLayout) -> DType {
     match layout {
-        ResolvedMetalLayout::Scalar { .. } => "uchar",
-        _ => scalar_type(layout),
+        crate::physical::ResolvedMetalLayout::Dense { dtype, .. } => *dtype,
+        crate::physical::ResolvedMetalLayout::PackedPlane { dtype, .. } => *dtype,
     }
 }
 
-fn scalar_type(layout: &ResolvedMetalLayout) -> &'static str {
-    match layout {
-        ResolvedMetalLayout::Dense { dtype, .. }
-        | ResolvedMetalLayout::PackedPlane { dtype, .. } => dtype_name(*dtype),
-        ResolvedMetalLayout::Scalar { parameters, .. } => parameters
-            .first()
-            .map(|parameter| dtype_name(parameter.dtype))
-            .unwrap_or("uchar"),
+/// A tiny cell for the slots-written set (cleared into the result).
+#[derive(Default)]
+struct SlotsWritten(BTreeSet<u64>);
+
+impl Renderer {
+    fn step(&mut self, step: &ResolvedKernelStep<MetalDialect>) -> Result<(), String> {
+        match step {
+            ResolvedKernelStep::Mapped {
+                iteration,
+                bindings,
+                ops,
+            } => {
+                self.delinearize(iteration)?;
+                self.mapped = bindings.clone();
+                for op in ops.iter() {
+                    self.op(op)?;
+                }
+                Ok(())
+            }
+            ResolvedKernelStep::Barrier { scope } => {
+                match scope {
+                    BarrierScope::Subgroup => self.line("simdgroup_barrier();"),
+                    BarrierScope::Workgroup => {
+                        self.line("threadgroup_barrier(mem_flags::mem_threadgroup);")
+                    }
+                }
+                Ok(())
+            }
+            ResolvedKernelStep::Publish { storage } => {
+                let name = self
+                    .pointers
+                    .get(storage)
+                    .cloned()
+                    .unwrap_or_else(|| format!("storage#{}", storage.0));
+                self.line(format!("/* publish {name} (retained transport) */"));
+                Ok(())
+            }
+            ResolvedKernelStep::PublishScalar { slot } => {
+                self.slots_written.0.insert(slot.0);
+                Ok(())
+            }
+        }
+    }
+
+    /// Per-axis coordinate variables: delinearization of the linear coordinate
+    /// into every logical axis (arbitrary rank; the last axis is fastest).
+    fn delinearize(
+        &mut self,
+        iteration: &seismic_realization::dispatch::LinearIterationMap,
+    ) -> Result<(), String> {
+        let rank = iteration.extents.len();
+        if rank == 0 {
+            return Ok(());
+        }
+        let mut rest = "seismic_lin".to_string();
+        for axis in 0..rank {
+            // The row-major stride of this axis: the product of the following
+            // extents.
+            let mut stride = AddrExpr::Const(1);
+            for following in iteration.extents[axis + 1..].iter() {
+                stride = AddrExpr::Mul(Box::new(stride), Box::new(extent_addr_of(following)?));
+            }
+            let divisor = addr_expr_string(&stride);
+            if divisor == "1" {
+                self.line(format!("uint c{axis} = {rest}; uint seismic_r{axis} = 0u;"));
+            } else {
+                self.line(format!(
+                    "uint c{axis} = {rest} / {divisor}; uint seismic_r{axis} = {rest} % {divisor};"
+                ));
+            }
+            rest = format!("seismic_r{axis}");
+        }
+        Ok(())
+    }
+
+    /// Flat row-major entry index of one view element over its axes: the
+    /// element address expression (slice offsets included).
+    fn entry_expr(
+        &mut self,
+        layout: &AccessLayout,
+        indices: &[IndexRef],
+    ) -> Result<String, String> {
+        self.address(layout, indices)
+    }
+
+    /// One operand's device pointer plus its layout's base offset (slice
+    /// points and range starts), as a single addressable expression.
+    fn based_pointer(&mut self, binding: &(usize, AccessLayout)) -> Result<String, String> {
+        let pointer = self.operand_pointer(binding.0)?;
+        if binding.1.offset.is_empty() {
+            return Ok(pointer);
+        }
+        let mut offset = String::new();
+        for (stride, value) in &binding.1.offset {
+            let term = format!("{} * ({})", addr_expr_string(stride), self.value(*value)?);
+            offset = if offset.is_empty() {
+                term
+            } else {
+                format!("{offset} + {term}")
+            };
+        }
+        Ok(format!("{pointer} + {offset}"))
+    }
+
+    /// Decoded f32 value of one packed element: the code from the words
+    /// plane combined with the representation's coefficient planes. The
+    /// single-rounding `fma` matches the reference combine exactly.
+    fn packed_decode_value(
+        &mut self,
+        operand: usize,
+        repr: &str,
+        entry: String,
+    ) -> Result<String, String> {
+        use seismic_lang::repr::{CodeInterpretation, Coefficient, PlaneEncoding};
+        let representation = seismic_lang::repr::lookup(repr)
+            .ok_or_else(|| format!("unknown representation `{repr}`"))?;
+        let plane_ordinal = |name: &str| {
+            representation
+                .plane_index(name)
+                .ok_or_else(|| format!("representation `{repr}` has no `{name}` plane"))
+        };
+        let bits = representation.bits;
+        let per_word = 32 / bits;
+        let mask = (1u32 << bits) - 1;
+        // Raw code field from the words plane.
+        let words = self.plane_pointer(operand, plane_ordinal("words")?)?;
+        let temp = self.temporaries;
+        self.temporaries += 1;
+        let raw = format!("seismic_pk{temp}");
+        self.line(format!(
+            "uint {raw} = ({words}[({entry}) / {per_word}] >> ((({entry}) % {per_word}) * {bits})) & {mask}u;"
+        ));
+        let code = match &representation.code {
+            CodeInterpretation::Unsigned => format!("float({raw})"),
+            CodeInterpretation::TwosComplement => {
+                format!("float((int({raw}) << (32 - {bits})) >> (32 - {bits}))")
+            }
+            CodeInterpretation::Offset(zero) => format!("float(int({raw}) - {zero})"),
+            CodeInterpretation::Table(table) => {
+                let values = table
+                    .iter()
+                    .map(|value| format!("int({value})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let table_name = format!("seismic_tbl{temp}");
+                self.line(format!("constant int {table_name}[] = {{ {values} }};"));
+                format!("float({table_name}[{raw}])")
+            }
+        };
+        // One coefficient plane read (dense scale/factor plane or packed
+        // coefficients plane), converted to f32.
+        let plane_read = |renderer: &mut Renderer, plane_name: &str, plane_entry: String| {
+            let ordinal = plane_ordinal(plane_name)?;
+            let pointer = renderer.plane_pointer(operand, ordinal)?;
+            let representation = seismic_lang::repr::lookup(repr).expect("looked up above");
+            let plane = representation
+                .planes()
+                .into_iter()
+                .find(|candidate| candidate.name == plane_name)
+                .ok_or_else(|| format!("`{repr}` has no plane `{plane_name}`"))?;
+            Ok(match &plane.encoding {
+                PlaneEncoding::Dense(dtype) => match dtype {
+                    seismic_lang::types::DType::F32 => {
+                        format!("float({pointer}[{plane_entry}])")
+                    }
+                    seismic_lang::types::DType::F16 => {
+                        format!("float({pointer}[{plane_entry}])")
+                    }
+                    seismic_lang::types::DType::BF16 => {
+                        format!("as_type<float>(as_type<uint>({pointer}[{plane_entry}]) << 16)")
+                    }
+                    other => {
+                        return Err(format!(
+                            "a coefficient plane of dtype {other:?} is not floating"
+                        ));
+                    }
+                },
+                PlaneEncoding::Packed { bits, .. } => {
+                    let per_word = 32 / bits;
+                    let mask = (1u32 << bits) - 1;
+                    format!(
+                        "float(({pointer}[({plane_entry}) / {per_word}] >> ((({plane_entry}) % {per_word}) * {bits})) & {mask}u)"
+                    )
+                }
+            })
+        };
+        let scale = match representation.coefficient(false) {
+            Some(Coefficient::Direct { plane }) => {
+                let plane_entry = format!("(({entry}) / {})", plane.group);
+                plane_read(self, plane.name, plane_entry)?
+            }
+            Some(Coefficient::Product {
+                factor,
+                coefficients,
+                field,
+                sign,
+            }) => {
+                let factor_entry = format!("(({entry}) / {})", factor.group);
+                let factor_value = plane_read(self, factor.name, factor_entry)?;
+                let coeff_entry = format!(
+                    "((({entry}) / {}) * {} + {field})",
+                    coefficients.group, coefficients.fields
+                );
+                let coeff_value = plane_read(self, coefficients.name, coeff_entry)?;
+                format!("({factor_value} * {coeff_value} * float({sign}))")
+            }
+            None => "1.0".into(),
+        };
+        Ok(match representation.coefficient(true) {
+            Some(Coefficient::Direct { plane }) => {
+                let plane_entry = format!("(({entry}) / {})", plane.group);
+                let bias = plane_read(self, plane.name, plane_entry)?;
+                format!("fma({scale}, {code}, {bias})")
+            }
+            Some(Coefficient::Product { factor, .. }) => {
+                let plane_entry = format!("(({entry}) / {})", factor.group);
+                let bias = plane_read(self, factor.name, plane_entry)?;
+                format!("fma({scale}, {code}, {bias})")
+            }
+            None => format!("({scale} * {code})"),
+        })
+    }
+
+    fn line(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+
+    fn op(&mut self, op: &MetalOp) -> Result<(), String> {
+        use MetalOp::*;
+        match op {
+            View | Alloc => Ok(()),
+            Const { into, value, dtype } => {
+                let name = self.fresh_ssa(*into)?;
+                self.line(format!(
+                    "{} {name} = {};",
+                    dtype_name(*dtype),
+                    const_expr(*value, *dtype)
+                ));
+                Ok(())
+            }
+            ExtentOf { value, into } => {
+                let name = self.fresh_ssa(*into)?;
+                self.line(format!("int {name} = int({});", addr_expr_string(value)));
+                Ok(())
+            }
+            Select {
+                condition,
+                then,
+                otherwise,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let condition = self.value(*condition)?;
+                let then = self.src(then)?;
+                let otherwise = self.src(otherwise)?;
+                self.line(format!(
+                    "{} {name} = ({condition}) ? {then} : {otherwise};",
+                    dtype_name(*dtype)
+                ));
+                Ok(())
+            }
+            Compare {
+                op: rel,
+                lhs,
+                rhs,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let lhs = self.src(lhs)?;
+                let rhs = self.src(rhs)?;
+                let cast = comparison_cast(*dtype);
+                self.line(format!(
+                    "bool {name} = {cast}({lhs}) {} {cast}({rhs});",
+                    rel_symbol(*rel)
+                ));
+                Ok(())
+            }
+            BoolLogic { op, operands, into } => {
+                let name = self.fresh_ssa(*into)?;
+                let expression = match (op, operands.as_slice()) {
+                    (BoolOp::Not, [operand]) => format!("!{}", self.value(*operand)?),
+                    (BoolOp::And, operands) => self.values(operands)?.join(" && "),
+                    (BoolOp::Or, operands) => self.values(operands)?.join(" || "),
+                    _ => return Err("compiler bug: bool logic arity".into()),
+                };
+                self.line(format!("bool {name} = {expression};"));
+                Ok(())
+            }
+            IntOp {
+                op,
+                lhs,
+                rhs,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let lhs = self.src(lhs)?;
+                let rhs = self.src(rhs)?;
+                self.line(format!(
+                    "{} {name} = as_type<{}>(as_type<uint>({lhs}) {} as_type<uint>({rhs}));",
+                    dtype_name(*dtype),
+                    dtype_name(*dtype),
+                    int_symbol(*op),
+                ));
+                Ok(())
+            }
+            IntDivRem {
+                op,
+                lhs,
+                rhs,
+                into,
+                dtype,
+                guard,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let lhs = self.src(lhs)?;
+                let rhs = self.src(rhs)?;
+                // Euclidean division/remainder (r in 0..|rhs|), exactly the
+                // registry semantics.
+                let body = match op {
+                    DivRemOp::Div => format!(
+                        "int seismic_r = as_type<int>({lhs}) % as_type<int>({rhs}); \
+                         if (seismic_r < 0) seismic_r += (as_type<int>({rhs}) < 0 ? \
+                         -as_type<int>({rhs}) : as_type<int>({rhs})); \
+                         {} {name} = {}((as_type<int>({lhs}) - seismic_r) / as_type<int>({rhs}));",
+                        dtype_name(*dtype),
+                        dtype_name(*dtype),
+                    ),
+                    DivRemOp::Rem => format!(
+                        "int seismic_r = as_type<int>({lhs}) % as_type<int>({rhs}); \
+                         if (seismic_r < 0) seismic_r += (as_type<int>({rhs}) < 0 ? \
+                         -as_type<int>({rhs}) : as_type<int>({rhs})); \
+                         {} {name} = {}(seismic_r);",
+                        dtype_name(*dtype),
+                        dtype_name(*dtype),
+                    ),
+                };
+                self.guarded(guard, body)
+            }
+            Shift {
+                op,
+                value,
+                amount,
+                into,
+                dtype,
+                guard,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let value = self.src(value)?;
+                let amount = self.src(amount)?;
+                let body = match op {
+                    ShiftOp::Shl => format!(
+                        "{} {name} = as_type<{}>(as_type<uint>({value}) << uint({amount}));",
+                        dtype_name(*dtype),
+                        dtype_name(*dtype),
+                    ),
+                    ShiftOp::Shr => match dtype {
+                        DType::U32 => {
+                            format!("uint {name} = as_type<uint>({value}) >> uint({amount});")
+                        }
+                        _ => format!("int {name} = as_type<int>({value}) >> uint({amount});"),
+                    },
+                };
+                self.guarded(guard, body)
+            }
+            Unary {
+                op,
+                operand,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let operand = self.src(operand)?;
+                let body = match (op, dtype.is_float()) {
+                    (UnaryOp::Neg, true) => {
+                        format!("{} {name} = -{operand};", dtype_name(*dtype))
+                    }
+                    (UnaryOp::Neg, false) => format!(
+                        "{dtype} {name} = as_type<{dtype}>(0u - as_type<uint>({operand}));",
+                        dtype = dtype_name(*dtype),
+                    ),
+                    (UnaryOp::BitNot, _) => {
+                        format!("{} {name} = ~{operand};", dtype_name(*dtype))
+                    }
+                    (UnaryOp::Not, _) => format!("bool {name} = !{operand};"),
+                };
+                self.line(body);
+                Ok(())
+            }
+            FloatOp {
+                op,
+                lhs,
+                rhs,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let lhs = self.src(lhs)?;
+                let rhs = self.src(rhs)?;
+                let expression = match op {
+                    crate::physical::FloatArith::Add => format!("{lhs} + {rhs}"),
+                    crate::physical::FloatArith::Sub => format!("{lhs} - {rhs}"),
+                    crate::physical::FloatArith::Mul => format!("{lhs} * {rhs}"),
+                    crate::physical::FloatArith::Div => format!("{lhs} / {rhs}"),
+                    crate::physical::FloatArith::Rem => format!("fmod({lhs}, {rhs})"),
+                };
+                self.line(format!("{} {name} = {expression};", dtype_name(*dtype)));
+                Ok(())
+            }
+            Fma {
+                a,
+                b,
+                c,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let a = self.src(a)?;
+                let b = self.src(b)?;
+                let c = self.src(c)?;
+                self.line(format!(
+                    "{} {name} = fma({a}, {b}, {c});",
+                    dtype_name(*dtype)
+                ));
+                Ok(())
+            }
+            Math {
+                op,
+                args,
+                into,
+                dtype,
+                reference,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let mut rendered = Vec::new();
+                for arg in args {
+                    rendered.push(self.src(arg)?);
+                }
+                let call = math_call(*op, &rendered, *dtype)?;
+                self.line(format!(
+                    "{} {name} = {call}; /* seismic_math {}-v{} */",
+                    dtype_name(*dtype),
+                    reference.identity,
+                    reference.version,
+                ));
+                Ok(())
+            }
+            Cast {
+                from,
+                to,
+                operand,
+                into,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let operand = self.src(operand)?;
+                self.line(format!(
+                    "{} {name} = {};",
+                    dtype_name(*to),
+                    cast_expr(*from, *to, &operand)
+                ));
+                Ok(())
+            }
+            RangeEndpoint {
+                start,
+                operand,
+                into,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let slot = self.tuple_slot(*operand, usize::from(!*start))?;
+                let slot = slot.0.to_string();
+                self.line(format!("int {name} = {};", slot_read(&slot, DType::I32)));
+                Ok(())
+            }
+            TupleGet {
+                operand,
+                index,
+                into,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let slot = self.tuple_slot(*operand, *index)?;
+                let slot = slot.0.to_string();
+                let dtype = self.binding_dtype(*operand)?;
+                self.line(format!(
+                    "{} {name} = {};",
+                    dtype_name(dtype),
+                    slot_read(&slot, dtype)
+                ));
+                Ok(())
+            }
+            MatrixMatmul {
+                left,
+                right,
+                into,
+                accumulate,
+                k,
+                dtype,
+                ..
+            } => {
+                // One output element per participant (launch coordinates
+                // c0/c1 over [M, N]); the exact ascending-k fma chain the
+                // reference body defines.
+                let left_pointer = self.based_pointer(left)?;
+                let right_pointer = self.based_pointer(right)?;
+                let into_pointer = self.based_pointer(into)?;
+                let left_stride = addr_expr_string(&left.1.strides[0]);
+                let right_stride = addr_expr_string(&right.1.strides[0]);
+                let into_stride = addr_expr_string(&into.1.strides[1]);
+                let into_row_stride = addr_expr_string(&into.1.strides[0]);
+                let k_length = addr_expr_string(k);
+                let dtype_name = dtype_name(*dtype);
+                let initial = if *accumulate {
+                    format!("float({into_pointer}[c0 * {into_row_stride} + c1 * {into_stride}])")
+                } else {
+                    "0.0f".into()
+                };
+                self.line(format!("float mm_acc = {initial};"));
+                self.line(format!(
+                    "for (uint mm_k = 0; mm_k < {k_length}u; mm_k++) \
+                     mm_acc = fma(float({left_pointer}[c0 * {left_stride} + mm_k]), \
+                     float({right_pointer}[c1 * {right_stride} + mm_k]), mm_acc);"
+                ));
+                self.line(format!(
+                    "{into_pointer}[c0 * {into_row_stride} + c1 * {into_stride}] \
+                     = {dtype_name}(mm_acc);"
+                ));
+                Ok(())
+            }
+            PackedDecode { .. } => {
+                Err("compiler bug: packed decode emission is not implemented".into())
+            }
+            PackedElementRead {
+                operand,
+                layout,
+                indices,
+                repr,
+                into,
+                guard,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                // Flat entry over the view's axes at the given indices.
+                let entry = self.entry_expr(layout, indices)?;
+                let value = self.packed_decode_value(*operand, repr, entry)?;
+                let body = format!("float {name} = {value};");
+                self.guarded(guard, body)
+            }
+            SerialFor {
+                binder,
+                length,
+                body,
+            } => {
+                let binder_name = self.fresh_ssa(*binder)?;
+                let length = addr_expr_string(length);
+                self.line(format!(
+                    "for (int {binder_name} = 0; {binder_name} < {length}; {binder_name}++) {{"
+                ));
+                for op in body.iter() {
+                    self.op(op)?;
+                }
+                self.line("}");
+                Ok(())
+            }
+            Branch {
+                condition,
+                then_ops,
+                else_ops,
+            } => {
+                let condition = self.value(*condition)?;
+                self.line(format!("if ({condition}) {{"));
+                for op in then_ops.iter() {
+                    self.op(op)?;
+                }
+                if else_ops.is_empty() {
+                    self.line("}");
+                } else {
+                    self.line("} else {");
+                    for op in else_ops.iter() {
+                        self.op(op)?;
+                    }
+                    self.line("}");
+                }
+                Ok(())
+            }
+            PackedPlaneRead {
+                operand,
+                plane,
+                dtype,
+                into,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let pointer = self.plane_pointer(*operand, *plane)?;
+                self.line(format!(
+                    "{} {name} = {}[seismic_lin];",
+                    dtype_name(*dtype),
+                    pointer
+                ));
+                Ok(())
+            }
+            ReadElement {
+                operand,
+                layout,
+                indices,
+                dtype,
+                into,
+                guard,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                let body = format!("{} {name} = {}[{address}];", dtype_name(*dtype), pointer);
+                self.guarded(guard, body)
+            }
+            WriteElement {
+                operand,
+                layout,
+                indices,
+                value,
+                dtype,
+                guard,
+            } => {
+                let value = self.src(value)?;
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                let body = format!("{pointer}[{address}] = {value};");
+                let _ = dtype;
+                self.guarded(guard, body)
+            }
+            StoreResult {
+                value,
+                dst,
+                layout,
+                indices,
+                dtype,
+            } => {
+                let value = self.value(*value)?;
+                let (pointer, address) = self.dst_location(dst, layout, indices)?;
+                self.line(format!("{pointer}[{address}] = {value};"));
+                let _ = dtype;
+                Ok(())
+            }
+            LinearLoop {
+                op: loop_op,
+                source,
+                dst,
+                dst_layout,
+                dtype,
+                fill,
+            } => {
+                let dst_address = self.address(
+                    dst_layout,
+                    &(0..dst_layout.strides.len())
+                        .map(IndexRef::Axis)
+                        .collect::<Vec<_>>(),
+                )?;
+                let dst_pointer = self.dst_base(dst)?;
+                match (source, fill) {
+                    (Some((source_operand, source_layout)), _) => {
+                        let source_address = self.address(
+                            source_layout,
+                            &(0..source_layout.strides.len())
+                                .map(IndexRef::Axis)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        let source_pointer = self.operand_pointer(*source_operand)?;
+                        self.line(format!(
+                            "{dst_pointer}[{dst_address}] = {source_pointer}[{source_address}];"
+                        ));
+                    }
+                    (None, Some(value)) => {
+                        self.line(format!(
+                            "{dst_pointer}[{dst_address}] = {};",
+                            const_expr(*value, *dtype)
+                        ));
+                    }
+                    (None, None) => match loop_op {
+                        seismic_compiler::terminal::LinearLoopOp::Fill => {
+                            return Err("compiler bug: a fill loop carries its value".into());
+                        }
+                        _ => return Err("compiler bug: a snapshot loop carries its source".into()),
+                    },
+                }
+                Ok(())
+            }
+            AtomicSerial {
+                op,
+                operand,
+                layout,
+                indices,
+                value,
+                dtype,
+                guard,
+            } => {
+                // Serialized domain: the exact load/combine/round/store sequence.
+                let value = self.src(value)?;
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                let name = dtype_name(*dtype);
+                // `add` rounds once at the element type. `max`/`min` select one
+                // operand; floats compare widened so `bfloat` needs no overload,
+                // and Metal `max`/`min` ignore a NaN operand like the reference.
+                let combined = match (op, dtype) {
+                    (seismic_lang::intrinsics::AtomicOp::Add, _) => {
+                        format!("{name}(seismic_a + {value})")
+                    }
+                    (seismic_lang::intrinsics::AtomicOp::Max, DType::I32 | DType::U32) => {
+                        format!("max(seismic_a, {value})")
+                    }
+                    (seismic_lang::intrinsics::AtomicOp::Min, DType::I32 | DType::U32) => {
+                        format!("min(seismic_a, {value})")
+                    }
+                    (seismic_lang::intrinsics::AtomicOp::Max, _) => {
+                        format!("{name}(max(float(seismic_a), float({value})))")
+                    }
+                    (seismic_lang::intrinsics::AtomicOp::Min, _) => {
+                        format!("{name}(min(float(seismic_a), float({value})))")
+                    }
+                };
+                let body = format!(
+                    "{{ {name} seismic_a = {pointer}[{address}]; \
+                     {name} seismic_b = {combined}; \
+                     {pointer}[{address}] = seismic_b; }}"
+                );
+                self.guarded(guard, body)
+            }
+            AtomicDevice {
+                op,
+                operand,
+                layout,
+                indices,
+                value,
+                dtype,
+                guard,
+            } => {
+                let value = self.src(value)?;
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                let body = match dtype {
+                    DType::I32 | DType::U32 => {
+                        let atomic = if *dtype == DType::I32 {
+                            "atomic_int"
+                        } else {
+                            "atomic_uint"
+                        };
+                        let operation = match op {
+                            AtomicOp::Add => "add",
+                            AtomicOp::Max => "max",
+                            AtomicOp::Min => "min",
+                        };
+                        format!(
+                            "{{ device {atomic}* seismic_p = reinterpret_cast<device {atomic}*>(&{pointer}[{address}]); \
+                             atomic_fetch_{operation}_explicit(seismic_p, {value}, memory_order_relaxed); }}"
+                        )
+                    }
+                    DType::F32 => {
+                        let combined = match op {
+                            AtomicOp::Add => "seismic_a + float(seismic_v)",
+                            AtomicOp::Max => "max(seismic_a, float(seismic_v))",
+                            AtomicOp::Min => "min(seismic_a, float(seismic_v))",
+                        };
+                        format!(
+                            "{{ device atomic_uint* seismic_p = reinterpret_cast<device atomic_uint*>(&{pointer}[{address}]); \
+                             float seismic_v = float({value}); \
+                             uint seismic_expected = atomic_load_explicit(seismic_p, memory_order_relaxed); \
+                             while (true) {{ float seismic_a = as_type<float>(seismic_expected); \
+                               uint seismic_desired = as_type<uint>({combined}); \
+                               if (atomic_compare_exchange_weak_explicit(seismic_p, &seismic_expected, seismic_desired, memory_order_relaxed, memory_order_relaxed)) break; }} }}"
+                        )
+                    }
+                    _ => {
+                        return Err(format!(
+                            "compiler bug: device atomic emission received {}",
+                            dtype.name()
+                        ));
+                    }
+                };
+                self.guarded(guard, body)
+            }
+            ReduceSerial {
+                op,
+                operand,
+                layout,
+                axis,
+                axis_length,
+                input_dtype,
+                accumulator,
+                result,
+                guard,
+            } => self.reduce(
+                op,
+                *operand,
+                layout,
+                *axis,
+                axis_length,
+                *input_dtype,
+                *accumulator,
+                result,
+                guard,
+                false,
+            ),
+            BlockedReduce {
+                op,
+                operand,
+                layout,
+                axis,
+                axis_length,
+                lanes,
+                input_dtype: _,
+                accumulator,
+                result,
+                nonempty,
+            } => self.blocked_reduce(
+                op,
+                *operand,
+                layout,
+                *axis,
+                axis_length,
+                *lanes,
+                *accumulator,
+                result,
+                nonempty,
+            ),
+            SubgroupReduce {
+                op,
+                operand,
+                layout,
+                axis,
+                axis_length,
+                input_dtype,
+                accumulator,
+                result,
+                guard,
+            } => self.reduce(
+                op,
+                *operand,
+                layout,
+                *axis,
+                axis_length,
+                *input_dtype,
+                *accumulator,
+                result,
+                guard,
+                true,
+            ),
+            SubgroupLaneIndex { into } => {
+                let name = self.fresh_ssa(*into)?;
+                self.line(format!("int {name} = int(simd_lane);"));
+                Ok(())
+            }
+            SubgroupShuffle {
+                value,
+                index,
+                into,
+                dtype,
+            } => {
+                let name = self.fresh_ssa(*into)?;
+                let value = self.src(value)?;
+                let index = self.src(index)?;
+                self.line(format!(
+                    "{} {name} = simd_shuffle({value}, uint({index}));",
+                    dtype_name(*dtype)
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// The universal (serial) or subgroup reduction fold. One participant per
+    /// output; the reduced axis is folded in ascending coordinates with
+    /// registry accumulator/identity/tie semantics; exactly one publication.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce(
+        &mut self,
+        op: &seismic_lang::intrinsics::ReduceOp,
+        operand: usize,
+        layout: &AccessLayout,
+        axis: usize,
+        axis_length: &AddrExpr,
+        input_dtype: DType,
+        accumulator: DType,
+        result: &ReduceResult,
+        guard: &Option<Guard>,
+        subgroup: bool,
+    ) -> Result<(), String> {
+        use seismic_lang::intrinsics::ReduceOp::*;
+        let operand_pointer = self.operand_pointer(operand)?;
+        // Operand coordinates: the iteration's outer axes plus the
+        // reduced-axis fold variable at the reduced position.
+        let mut indices = Vec::new();
+        let mut outer = 0usize;
+        for position in 0..layout.strides.len() {
+            if position == axis {
+                indices.push(IndexRef::ReducedAxis);
+            } else {
+                indices.push(IndexRef::Axis(outer));
+                outer += 1;
+            }
+        }
+        let address = self.address(layout, &indices)?;
+        let load = format!("{operand_pointer}[{address}]");
+        let acc = dtype_name(accumulator);
+        let length = addr_expr_string(axis_length);
+        let lane = if subgroup { "simd_lane" } else { "0u" };
+        let lane_stride = if subgroup { " + 32u" } else { "" };
+        let fold_load = format!("{acc}({load})");
+        let body = match op {
+            Sum => format!(
+                "{acc} seismic_acc = 0; \
+                 for (uint seismic_k = {lane}; seismic_k < {length}; seismic_k{lane_stride}) \
+                 {{ seismic_acc = {acc}(seismic_acc + {fold_load}); }}"
+            ),
+            Max => {
+                if subgroup {
+                    return Err(
+                        "compiler bug: subgroup simd_max emission is pending; only simd_sum \
+                         subgroup reductions are offered"
+                            .into(),
+                    );
+                }
+                format!(
+                    "{acc} seismic_acc = {fold_load}; \
+                     for (uint seismic_k = 1u; seismic_k < {length}; seismic_k += 1u) \
+                     {{ seismic_acc = max(seismic_acc, {fold_load}); }}"
+                )
+            }
+            Min => {
+                if subgroup {
+                    return Err(
+                        "compiler bug: subgroup simd_min emission is pending; only simd_sum \
+                         subgroup reductions are offered"
+                            .into(),
+                    );
+                }
+                format!(
+                    "{acc} seismic_acc = {fold_load}; \
+                     for (uint seismic_k = 1u; seismic_k < {length}; seismic_k += 1u) \
+                     {{ seismic_acc = min(seismic_acc, {fold_load}); }}"
+                )
+            }
+            Argmax => {
+                if subgroup {
+                    unreachable!("argmax never reassociates")
+                }
+                format!(
+                    "{acc} seismic_acc = {fold_load}; int seismic_best = 0; \
+                     for (uint seismic_k = 1u; seismic_k < {length}; seismic_k += 1u) \
+                     {{ {acc} seismic_v = {fold_load}; \
+                     if (seismic_v > seismic_acc) {{ seismic_acc = seismic_v; \
+                     seismic_best = int(seismic_k); }} }}"
+                )
+            }
+        };
+        let collective = if subgroup {
+            format!("seismic_acc = simd_sum(seismic_acc);")
+        } else {
+            String::new()
+        };
+        let publish = match result {
+            ReduceResult::Scalar { value } => {
+                let resolved = self.resolved_slot_of(*value)?;
+                self.slots_written.0.insert(resolved.0);
+                format!(
+                    "seismic_slots[{}] = {};",
+                    resolved.0,
+                    slot_write("seismic_acc", accumulator)
+                )
+            }
+            ReduceResult::Tensor {
+                dst,
+                layout: result_layout,
+                indices,
+                dtype,
+            } => {
+                let value = match op {
+                    Argmax => "int(seismic_best)".to_string(),
+                    _ => {
+                        if *dtype != accumulator {
+                            format!("{dtype}(seismic_acc)", dtype = dtype_name(*dtype))
+                        } else {
+                            "seismic_acc".to_string()
+                        }
+                    }
+                };
+                let (pointer, address) = self.dst_location(dst, result_layout, indices)?;
+                format!("{pointer}[{address}] = {value};")
+            }
+        };
+        let _ = input_dtype;
+        self.guarded(guard, format!("{{ {body} {collective} {publish} }}"))
+    }
+
+    /// The interleaved blocked cover: this visit's lane (the iteration's
+    /// last axis) folds its strided share ascending, publishes its partial
+    /// into workgroup storage, and lane zero combines all partials in lane
+    /// order (a one-level tree).
+    fn blocked_reduce(
+        &mut self,
+        op: &seismic_lang::intrinsics::ReduceOp,
+        operand: usize,
+        layout: &AccessLayout,
+        axis: usize,
+        axis_length: &AddrExpr,
+        lanes: u32,
+        accumulator: DType,
+        result: &ReduceResult,
+        nonempty: &Option<Guard>,
+    ) -> Result<(), String> {
+        use seismic_lang::intrinsics::ReduceOp::*;
+        let operand_pointer = self.operand_pointer(operand)?;
+        let rank = layout.strides.len();
+        let lane_axis = rank.saturating_sub(1);
+        let mut indices = Vec::new();
+        let mut outer = 0usize;
+        for position in 0..rank {
+            if position == axis {
+                indices.push(IndexRef::ReducedAxis);
+            } else {
+                indices.push(IndexRef::Axis(outer));
+                outer += 1;
+            }
+        }
+        let address = self.address(layout, &indices)?;
+        let load = format!("{operand_pointer}[{address}]");
+        let acc = dtype_name(accumulator);
+        let length = addr_expr_string(axis_length);
+        let lane = format!("c{lane_axis}");
+        let fold_load = format!("{acc}({load})");
+        let identity = match op {
+            Sum => "0".to_string(),
+            // An empty lane share folds to the identity; the nonempty
+            // precondition guard covers a fully empty axis.
+            Max => "-INFINITY".to_string(),
+            Min => "INFINITY".to_string(),
+            Argmax => unreachable!("argmax is rejected before blocked reduction emission"),
+        };
+        let fold = match op {
+            Sum => format!(
+                "{acc} seismic_acc = {identity}; \
+                 for (uint seismic_k = {lane}; seismic_k < {length}; seismic_k += {lanes}u) \
+                 {{ seismic_acc = {acc}(seismic_acc + {fold_load}); }}"
+            ),
+            Max => format!(
+                "{acc} seismic_acc = {identity}; \
+                 for (uint seismic_k = {lane}; seismic_k < {length}; seismic_k += {lanes}u) \
+                 {{ seismic_acc = max(seismic_acc, {fold_load}); }}"
+            ),
+            Min => format!(
+                "{acc} seismic_acc = {identity}; \
+                 for (uint seismic_k = {lane}; seismic_k < {length}; seismic_k += {lanes}u) \
+                 {{ seismic_acc = min(seismic_acc, {fold_load}); }}"
+            ),
+            Argmax => {
+                return Err(
+                    "compiler bug: argmax never reassociates; a blocked cover is not offered"
+                        .into(),
+                );
+            }
+        };
+        let combine = match op {
+            Sum => "seismic_acc = seismic_acc + seismic_wg[seismic_i];".to_string(),
+            Max => "seismic_acc = max(seismic_acc, seismic_wg[seismic_i]);".to_string(),
+            Min => "seismic_acc = min(seismic_acc, seismic_wg[seismic_i]);".to_string(),
+            Argmax => unreachable!("checked above"),
+        };
+        let publish = match result {
+            ReduceResult::Scalar { value } => {
+                let resolved = self.resolved_slot_of(*value)?;
+                self.slots_written.0.insert(resolved.0);
+                format!(
+                    "seismic_slots[{}] = {};",
+                    resolved.0,
+                    slot_write("seismic_acc", accumulator)
+                )
+            }
+            ReduceResult::Tensor {
+                dst,
+                layout: result_layout,
+                indices,
+                dtype,
+            } => {
+                let value = if *dtype != accumulator {
+                    format!("{dtype}(seismic_acc)", dtype = dtype_name(*dtype))
+                } else {
+                    "seismic_acc".to_string()
+                };
+                let (pointer, address) = self.dst_location(dst, result_layout, indices)?;
+                format!("{pointer}[{address}] = {value};")
+            }
+        };
+        let body = format!(
+            "{{ {fold} \
+             seismic_wg[{lane}] = seismic_acc; \
+             threadgroup_barrier(mem_flags::mem_threadgroup); \
+             if ({lane} == 0u) {{ \
+               {acc} seismic_acc = 0; \
+               for (uint seismic_i = 0u; seismic_i < {lanes}u; seismic_i += 1u) {{ {combine} }} \
+               {publish} \
+             }} }}"
+        );
+        self.guarded(nonempty, body)
+    }
+
+    // -- expression helpers ---------------------------------------------------
+
+    fn fresh_ssa(&mut self, into: ValueRef) -> Result<String, String> {
+        match into {
+            ValueRef::Ssa(n) => Ok(format!("s{n}")),
+            ValueRef::Operand(_) | ValueRef::Axis(_) => {
+                Err("compiler bug: an opcode result must be a fresh SSA slot".into())
+            }
+        }
+    }
+
+    fn values(&self, references: &[ValueRef]) -> Result<Vec<String>, String> {
+        references.iter().map(|r| self.value(*r)).collect()
+    }
+
+    fn value(&self, reference: ValueRef) -> Result<String, String> {
+        match reference {
+            ValueRef::Ssa(n) => Ok(format!("s{n}")),
+            ValueRef::Axis(n) => Ok(format!("c{n}")),
+            ValueRef::Operand(k) => {
+                let (_, transport) = self
+                    .mapped
+                    .get(k)
+                    .ok_or_else(|| format!("operand binding#{k} is absent"))?;
+                match transport {
+                    seismic_realization::executable::ResolvedTransport::Kernel(_) => Err(format!(
+                        "compiler bug: operand binding#{k} is kernel-local SSA; the \
+                             strategy must reference it as SSA"
+                    )),
+                    seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                        ResolvedExecutorScalar::Slot { slot, dtype },
+                    ) => Ok(slot_read(&slot.0.to_string(), *dtype)),
+                    seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                        ResolvedExecutorScalar::Abi { .. },
+                    ) => Err(
+                        "compiler bug: an ABI-scalar transport reached a kernel; ABI scalar \
+                         fields need ordinal-qualified paths (interface request)"
+                            .into(),
+                    ),
+                    _ => Err(format!("operand binding#{k} does not transport a scalar")),
+                }
+            }
+        }
+    }
+
+    fn src(&self, source: &Src) -> Result<String, String> {
+        match source {
+            Src::Scalar(reference) => self.value(*reference),
+            Src::Element {
+                operand,
+                layout,
+                indices,
+            } => {
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                Ok(format!("{pointer}[{address}]"))
+            }
+        }
+    }
+
+    fn operand_pointer(&self, operand: usize) -> Result<String, String> {
+        let (_, transport) = self
+            .mapped
+            .get(operand)
+            .cloned()
+            .ok_or_else(|| format!("operand binding#{operand} is absent"))?;
+        match transport {
+            seismic_realization::executable::ResolvedTransport::Storage(views) => {
+                let view = views.first();
+                self.pointer_of(view.storage)
+            }
+            _ => Err(format!(
+                "compiler bug: tensor operand binding#{operand} does not transport storage"
+            )),
+        }
+    }
+
+    fn plane_pointer(&self, operand: usize, plane: usize) -> Result<String, String> {
+        let (_, transport) = self
+            .mapped
+            .get(operand)
+            .cloned()
+            .ok_or_else(|| format!("operand binding#{operand} is absent"))?;
+        match transport {
+            seismic_realization::executable::ResolvedTransport::Storage(views) => {
+                let view = views
+                    .iter()
+                    .nth(plane)
+                    .ok_or_else(|| format!("plane#{plane} is absent from the operand transport"))?;
+                self.pointer_of(view.storage)
+            }
+            _ => Err("compiler bug: a packed operand transports storage planes".into()),
+        }
+    }
+
+    fn pointer_of(&self, storage: ResolvedStorageId) -> Result<String, String> {
+        self.pointers
+            .get(&storage)
+            .cloned()
+            .ok_or_else(|| format!("resolved storage#{} has no launch binding", storage.0))
+    }
+
+    fn binding_dtype(&self, operand: usize) -> Result<DType, String> {
+        let (_, transport) = self
+            .mapped
+            .get(operand)
+            .cloned()
+            .ok_or_else(|| format!("operand binding#{operand} is absent"))?;
+        match transport {
+            seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                ResolvedExecutorScalar::Slot { dtype, .. },
+            ) => Ok(dtype),
+            _ => Err("compiler bug: a scalar operand transports through a slot".into()),
+        }
+    }
+
+    fn tuple_slot(
+        &self,
+        operand: usize,
+        index: usize,
+    ) -> Result<seismic_realization::executable::ResolvedExecutorScalarId, String> {
+        let (_, transport) = self
+            .mapped
+            .get(operand)
+            .cloned()
+            .ok_or_else(|| format!("operand binding#{operand} is absent"))?;
+        match transport {
+            seismic_realization::executable::ResolvedTransport::Tuple(items) => {
+                match items.iter().nth(index) {
+                    Some(seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                        ResolvedExecutorScalar::Slot { slot, .. },
+                    )) => Ok(*slot),
+                    _ => Err("compiler bug: a tuple leaf transports through a slot".into()),
+                }
+            }
+            _ => Err("compiler bug: a tuple operand transports as a tuple".into()),
+        }
+    }
+
+    /// The resolved executor slot of one produced scalar value, from the
+    /// launch's own value bindings.
+    fn resolved_slot_of(
+        &self,
+        value: GraphValueId,
+    ) -> Result<seismic_realization::executable::ResolvedExecutorScalarId, String> {
+        match self.transport_of_value(value)? {
+            seismic_realization::executable::ResolvedTransport::ExecutorScalar(
+                ResolvedExecutorScalar::Slot { slot, .. },
+            ) => Ok(*slot),
+            _ => Err(format!(
+                "compiler bug: produced scalar value#{value:?} does not transport through a \
+                 slot"
+            )),
+        }
+    }
+
+    /// The resolved transport bound for one value of the mapped block.
+    fn transport_of_value(
+        &self,
+        value: GraphValueId,
+    ) -> Result<&seismic_realization::executable::ResolvedTransport, String> {
+        self.mapped
+            .iter()
+            .find(|(bound, _)| *bound == value)
+            .map(|(_, transport)| transport)
+            .ok_or_else(|| {
+                format!(
+                    "compiler bug: produced value#{value:?} has no binding in its launch; the \
+                     resolver binds node outputs after inputs"
+                )
+            })
+    }
+
+    /// The (pointer, address) of one destination.
+    fn dst_location(
+        &self,
+        dst: &Dst,
+        layout: &AccessLayout,
+        indices: &[IndexRef],
+    ) -> Result<(String, String), String> {
+        match dst {
+            Dst::Operand(operand) => {
+                let address = self.address(layout, indices)?;
+                let pointer = self.operand_pointer(*operand)?;
+                Ok((pointer, address))
+            }
+            Dst::Produced(value) => {
+                let address = self.address(layout, indices)?;
+                match self.transport_of_value(*value)? {
+                    seismic_realization::executable::ResolvedTransport::Storage(views) => {
+                        let view = views.first();
+                        let pointer = self.pointer_of(view.storage)?;
+                        Ok((pointer, address))
+                    }
+                    _ => Err(format!(
+                        "compiler bug: produced tensor value#{value:?} does not transport \
+                         storage"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn dst_base(&self, dst: &Dst) -> Result<String, String> {
+        match dst {
+            Dst::Operand(operand) => self.operand_pointer(*operand),
+            Dst::Produced(value) => match self.transport_of_value(*value)? {
+                seismic_realization::executable::ResolvedTransport::Storage(views) => {
+                    self.pointer_of(views.first().storage)
+                }
+                _ => Err(format!(
+                    "compiler bug: produced tensor value#{value:?} does not transport storage"
+                )),
+            },
+        }
+    }
+
+    /// The element address of one layout at the given indices.
+    fn address(&self, layout: &AccessLayout, indices: &[IndexRef]) -> Result<String, String> {
+        let mut terms = Vec::new();
+        for (stride, value) in &layout.offset {
+            terms.push(format!(
+                "{} * ({})",
+                addr_expr_string(stride),
+                self.value(*value)?
+            ));
+        }
+        for (axis, index) in indices.iter().enumerate() {
+            let stride = layout
+                .strides
+                .get(axis)
+                .ok_or_else(|| format!("index#{axis} has no layout stride"))?;
+            let factor = addr_expr_string(stride);
+            let coordinate = match index {
+                IndexRef::Value(value) => self.value(*value)?,
+                IndexRef::Axis(n) => format!("c{n}"),
+                IndexRef::ReducedAxis => "seismic_k".into(),
+            };
+            if factor == "1" {
+                terms.push(format!("({coordinate})"));
+            } else {
+                terms.push(format!("{factor} * ({coordinate})"));
+            }
+        }
+        if terms.is_empty() {
+            Ok("0".into())
+        } else {
+            Ok(terms.join(" + "))
+        }
+    }
+
+    /// Emit one guarded statement: every predicate must hold, else the first
+    /// error is recorded in the planned status field.
+    fn guarded(&mut self, guard: &Option<Guard>, body: String) -> Result<(), String> {
+        match guard {
+            None => {
+                self.line(body);
+                Ok(())
+            }
+            Some(guard) => {
+                let mut predicates = Vec::new();
+                for predicate in &guard.predicates {
+                    predicates.push(self.predicate(predicate)?);
+                }
+                let condition = if predicates.is_empty() {
+                    "true".into()
+                } else {
+                    predicates.join(" && ")
+                };
+                self.line(format!(
+                    "if ({condition}) {{ {body} }} else {{ \
+                     if (seismic_status[{}] == 0u) seismic_status[{}] = {}; }}",
+                    guard.status,
+                    guard.status,
+                    guard_code(&guard.predicates)
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn predicate(&self, predicate: &GuardPredicate) -> Result<String, String> {
+        Ok(match predicate {
+            GuardPredicate::IndexInBounds { index, extent } => {
+                let index = self.value(*index)?;
+                format!(
+                    "({index} >= 0 && uint({index}) < {})",
+                    addr_expr_string(extent)
+                )
+            }
+            GuardPredicate::RangeInBounds { start, end, extent } => {
+                let start = self.value(*start)?;
+                let end = self.value(*end)?;
+                let bound = addr_expr_string(extent);
+                format!(
+                    "({start} >= 0 && uint({start}) < {bound} && {end} >= 0 && uint({end}) < {bound})"
+                )
+            }
+            GuardPredicate::DivisorNonZero { value } => {
+                format!("({} != 0)", self.value(*value)?)
+            }
+            GuardPredicate::DivisionSafe { lhs, rhs } => format!(
+                "({rhs} != 0 && ({lhs} != (-2147483647 - 1) || {rhs} != -1))",
+                lhs = self.value(*lhs)?,
+                rhs = self.value(*rhs)?,
+            ),
+            GuardPredicate::ShiftInRange { value } => {
+                let value = self.value(*value)?;
+                format!("({value} >= 0 && {value} < 32)")
+            }
+            GuardPredicate::ProductFits { factors, bits } => {
+                if *bits >= 64 {
+                    "true".into()
+                } else {
+                    let product = factors
+                        .iter()
+                        .map(addr_expr_string)
+                        .collect::<Vec<_>>()
+                        .join(" * ");
+                    format!("((1u{product}) < (1ul << {bits}))")
+                }
+            }
+            GuardPredicate::ExtentPositive { extent } => {
+                format!("({} > 0)", addr_expr_string(extent))
+            }
+        })
+    }
+}
+fn extent_addr_of(extent: &seismic_lang::types::ExtentExpr) -> Result<AddrExpr, String> {
+    match extent {
+        seismic_lang::types::ExtentExpr::Static(n) => Ok(AddrExpr::Const(*n)),
+        seismic_lang::types::ExtentExpr::Runtime(id) => Ok(AddrExpr::Extent(*id)),
+        seismic_lang::types::ExtentExpr::Sym(sym) => sym
+            .as_constant()
+            .and_then(|c| u64::try_from(c).ok())
+            .map(AddrExpr::Const)
+            .ok_or_else(|| "unresolved symbolic extent in the iteration map".to_string()),
+    }
+}
+
+fn addr_expr_string(expr: &AddrExpr) -> String {
+    match expr {
+        AddrExpr::Const(n) => format!("{n}u"),
+        AddrExpr::Extent(id) => format!("uint(seismic_extents[{}])", id.0),
+        AddrExpr::Mul(a, b) => format!("({} * {})", addr_expr_string(a), addr_expr_string(b)),
+    }
+}
+
+fn expr_string(expr: &ExecutionExpr) -> String {
+    match expr {
+        ExecutionExpr::Const(n) => format!("{n}u"),
+        ExecutionExpr::Extent(id) => format!("uint(seismic_extents[{}])", id.0),
+        ExecutionExpr::AbiScalar { .. } => "0u /* abi scalar */".into(),
+        ExecutionExpr::ExecutorScalar(slot) => format!("seismic_slots[{}]", slot.0),
+        ExecutionExpr::Add(a, b) => format!("({} + {})", expr_string(a), expr_string(b)),
+        ExecutionExpr::Sub(a, b) => format!("({} - {})", expr_string(a), expr_string(b)),
+        ExecutionExpr::Mul(a, b) => format!("({} * {})", expr_string(a), expr_string(b)),
+        ExecutionExpr::CeilDiv(a, b) => format!(
+            "({} + {} - 1) / {}",
+            expr_string(a),
+            expr_string(b),
+            expr_string(b)
+        ),
+        ExecutionExpr::Div(a, b) => format!("({} / {})", expr_string(a), expr_string(b)),
+        ExecutionExpr::Rem(a, b) => format!("({} % {})", expr_string(a), expr_string(b)),
+        ExecutionExpr::Min(a, b) => format!("min({}, {})", expr_string(a), expr_string(b)),
     }
 }
 
@@ -271,1725 +2018,125 @@ fn dtype_name(dtype: DType) -> &'static str {
     }
 }
 
-struct Renderer<'a> {
-    launch: &'a ResolvedLaunch<MetalDialect>,
-    lines: Vec<String>,
-    indent: usize,
-    values: BTreeMap<ScalarValueId, String>,
-    tuples: BTreeMap<ScalarValueId, Vec<ScalarValueId>>,
-    tensors: BTreeMap<ScalarValueId, TensorValue>,
-    places: BTreeMap<ScalarValueId, String>,
-    declared: BTreeSet<ScalarValueId>,
-    history: Vec<String>,
-}
-
-#[derive(Clone)]
-struct TensorValue {
-    planes: Vec<TensorPlane>,
-    accessor: Option<PacketAccessor>,
-}
-
-#[derive(Clone)]
-struct PacketAccessor {
-    representation: String,
-    name: String,
-}
-
-#[derive(Clone)]
-struct TensorPlane {
-    storage: ResolvedStorageId,
-    offset: String,
-    strides: Vec<u64>,
-}
-
-impl<'a> Renderer<'a> {
-    fn new(launch: &'a ResolvedLaunch<MetalDialect>) -> Self {
-        Self {
-            launch,
-            lines: Vec::new(),
-            indent: 0,
-            values: BTreeMap::new(),
-            tuples: BTreeMap::new(),
-            tensors: BTreeMap::new(),
-            places: BTreeMap::new(),
-            declared: BTreeSet::new(),
-            history: Vec::new(),
+fn const_expr(value: ConstValue, dtype: DType) -> String {
+    match (value, dtype) {
+        (ConstValue::Int(v), DType::I32) => format!("int({v})"),
+        (ConstValue::Int(v), DType::U32) => format!("uint({v})"),
+        (ConstValue::Int(v), DType::Bool) => format!("{}", v != 0),
+        (ConstValue::Float(bits), DType::F32) => {
+            format!("as_type<float>(uint({bits:#010x}u))")
         }
-    }
-
-    fn line(&mut self, line: impl Into<String>) {
-        self.lines
-            .push(format!("{}{}", "  ".repeat(self.indent), line.into()));
-    }
-
-    fn step(&mut self, step: &ResolvedKernelStep<MetalDialect>) -> Result<(), String> {
-        match step {
-            ResolvedKernelStep::MappedTask {
-                mapping,
-                bindings,
-                instructions,
-                ..
-            } => {
-                let first = instructions.iter().next().unwrap();
-                for (axis, map) in mapping.axes.iter().enumerate() {
-                    let values = first.axis_values.get(axis).cloned().unwrap_or_default();
-                    let components = first
-                        .axis_component_extents
-                        .get(axis)
-                        .cloned()
-                        .unwrap_or_default();
-                    let extent = mapping.logical_extents[axis];
-                    match map {
-                        ResolvedAxisMap::Grid {
-                            workgroup_axis,
-                            participant_axis,
-                            mode,
-                            ..
-                        } => {
-                            let coordinate = format!(
-                                "(long(tg_pos[{workgroup_axis}]) * long({}) + long(tid[{participant_axis}]))",
-                                self.launch.geometry.participants_per_workgroup[*participant_axis as usize]
-                            );
-                            match mode {
-                                seismic_realization::executable::ResolvedGridMapping::OnePass => {
-                                    self.bind_axis(&values, &components, &coordinate)?;
-                                    self.line(format!("if ({coordinate} < {extent}l) {{"));
-                                }
-                                seismic_realization::executable::ResolvedGridMapping::GridStride { stride } => {
-                                    let grid = format!("grid_{}_{}", first.task.0, axis);
-                                    self.line(format!("for (long {grid} = {coordinate}; {grid} < {extent}l; {grid} += {stride}l) {{"));
-                                    self.bind_axis(&values, &components, &grid)?;
-                                }
-                            }
-                            self.indent += 1;
-                        }
-                        ResolvedAxisMap::Serial { .. } => {
-                            let coordinate = format!("axis_{}_{}", first.task.0, axis);
-                            self.line(format!(
-                                "for (long {coordinate} = 0; {coordinate} < {extent}l; ++{coordinate}) {{"
-                            ));
-                            self.indent += 1;
-                            self.bind_axis(&values, &components, &coordinate)?;
-                        }
-                        ResolvedAxisMap::SubgroupLane { .. } => {
-                            self.bind_axis(&values, &components, "long(tid.x & 31u)")?;
-                        }
-                    }
-                }
-                for (value, bindings) in &first.value_bindings {
-                    self.tensors.insert(
-                        *value,
-                        self.tensor_from_ids(bindings.iter().map(|binding| binding.storage))?,
-                    );
-                }
-                self.bind_inputs(first, bindings)?;
-                self.bind_tensor_outputs(first, bindings)?;
-                for instruction in instructions.iter() {
-                    self.instruction(instruction)?;
-                }
-                self.store_outputs(first, bindings)?;
-                for map in mapping.axes.iter().rev() {
-                    if matches!(
-                        map,
-                        ResolvedAxisMap::Grid { .. } | ResolvedAxisMap::Serial { .. }
-                    ) {
-                        self.indent = self.indent.saturating_sub(1);
-                        self.line("}");
-                    }
-                }
-            }
-            ResolvedKernelStep::Barrier { scope, .. } => self.line(match scope {
-                seismic_realization::executable::BarrierScope::Subgroup => {
-                    "simdgroup_barrier(mem_flags::mem_device);"
-                }
-                seismic_realization::executable::BarrierScope::Workgroup => {
-                    "threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);"
-                }
-            }),
-            ResolvedKernelStep::Publish { .. } => {}
+        (ConstValue::Float(bits), DType::F16) => {
+            format!("as_type<half>(ushort({bits:#010x} & 0xffffu))")
         }
-        Ok(())
-    }
-
-    fn instruction(&mut self, instruction: &ResolvedMetalInstruction) -> Result<(), String> {
-        self.history.push(format!("{:?}", instruction.scalar.kind));
-        let result = instruction.scalar.result;
-        let expression = match &instruction.scalar.kind {
-            I::NoOp => return Ok(()),
-            I::Literal(ScalarLiteral::Int(value)) => Some(format!("{value}l")),
-            I::Literal(ScalarLiteral::Float(bits)) => {
-                Some(format!("double({:?})", f64::from_bits(*bits)))
-            }
-            I::Literal(ScalarLiteral::Bool(value)) => Some(value.to_string()),
-            I::Shape(value) => Some(format!("{value}l")),
-            I::Tuple(values) => {
-                self.tuples.insert(
-                    result.ok_or("tuple instruction has no result")?,
-                    values.clone(),
-                );
-                None
-            }
-            I::Range(lo, hi) => {
-                self.tuples.insert(
-                    result.ok_or("range instruction has no result")?,
-                    vec![*lo, *hi],
-                );
-                None
-            }
-            I::Field { value, index } => Some(self.field(*value, *index)?),
-            I::Storage {
-                operation,
-                bindings,
-                inputs,
-                fill_bits,
-            } => {
-                let result = result.ok_or("storage instruction has no result")?;
-                let tensor =
-                    self.tensor_from_ids(bindings.iter().map(|binding| binding.storage))?;
-                match operation {
-                    StorageOperation::Construct => {}
-                    StorageOperation::Fill => {
-                        let bits = fill_bits.ok_or("fill operation has no value bits")?;
-                        for plane in &tensor.planes {
-                            let storage = self.storage(plane.storage)?;
-                            let elements = layout_elements(&storage.layout);
-                            self.line(format!(
-                                "for (ulong fill = 0; fill < {elements}ul; ++fill) s{}[fill] = {}({:?});",
-                                plane.storage.0,
-                                scalar_type(&storage.layout),
-                                f64::from_bits(bits)
-                            ));
-                        }
-                    }
-                    StorageOperation::Snapshot | StorageOperation::Materialize => {
-                        let source = self
-                            .tensors
-                            .get(inputs.first().ok_or("storage copy has no source")?)
-                            .cloned()
-                            .ok_or("storage copy source is not a tensor")?;
-                        self.copy_tensor(&tensor, &source)?;
-                    }
-                    StorageOperation::Decode => {
-                        let source = self
-                            .tensors
-                            .get(inputs.first().ok_or("packed decode has no source")?)
-                            .cloned()
-                            .ok_or("packed decode source is not a tensor")?;
-                        let destination = tensor
-                            .planes
-                            .first()
-                            .ok_or("packed decode destination has no plane")?;
-                        let elements = layout_elements(&self.storage(destination.storage)?.layout);
-                        let decoded = self.decode_element(&source, "decode")?;
-                        self.line(format!(
-                            "for (ulong decode = 0; decode < {elements}ul; ++decode) s{}[decode] = {decoded};",
-                            destination.storage.0
-                        ));
-                    }
-                }
-                self.tensors.insert(result, tensor);
-                None
-            }
-            I::View { view, base } => {
-                let logical = instruction
-                    .views
-                    .get(view)
-                    .ok_or("Metal view descriptor is absent")?;
-                let mut tensor = match self.tensors.get(base).cloned() {
-                    Some(tensor) => tensor,
-                    None => self.tensor_from_ids(
-                        instruction
-                            .view_bindings
-                            .get(view)
-                            .ok_or("Metal view has no resolved storage binding")?
-                            .iter()
-                            .map(|binding| binding.storage),
-                    )?,
-                };
-                match &logical.transform {
-                    LocalViewTransform::Identity => {}
-                    LocalViewTransform::Transpose { permutation } => {
-                        for plane in &mut tensor.planes {
-                            plane.strides = permutation
-                                .iter()
-                                .map(|axis| {
-                                    plane
-                                        .strides
-                                        .get(*axis as usize)
-                                        .copied()
-                                        .ok_or("Metal transpose axis is out of bounds")
-                                })
-                                .collect::<Result<_, _>>()?;
-                        }
-                    }
-                    LocalViewTransform::Reshape { .. } => {
-                        let Type::Tensor(result_ty) = instruction
-                            .value_types
-                            .get(&result.ok_or("view has no result")?)
-                            .ok_or("view result type is absent")?
-                        else {
-                            return Err("reshape view result is not a tensor".into());
-                        };
-                        for plane in &mut tensor.planes {
-                            let storage = self.storage(plane.storage)?;
-                            plane.strides = compact_strides(&result_ty.shape, storage)?;
-                        }
-                    }
-                }
-                self.tensors
-                    .insert(result.ok_or("view has no result")?, tensor);
-                None
-            }
-            I::Index { base, indices } => {
-                let mut tensor = match self.tensors.get(base).cloned() {
-                    Some(tensor) => tensor,
-                    None if !instruction.access_bindings.is_empty() => self
-                        .tensor_from_ids(instruction.access_bindings.iter().copied())?,
-                    None => return Err(
-                        format!(
-                            "Metal task#{} index base value#{} is not a tensor; known tensors {:?}; type {:?}; inputs {:?}; operand values {:?}; history {:?}",
-                            instruction.task.0,
-                            base.0,
-                            self.tensors.keys().collect::<Vec<_>>(),
-                            instruction.value_types.get(base),
-                            instruction.input_operands,
-                            instruction.operand_values,
-                            self.history,
-                        )
-                    ),
-                };
-                for plane in &mut tensor.planes {
-                    let mut offset = plane.offset.clone();
-                    let mut retained = Vec::new();
-                    for (axis, stride) in plane.strides.iter().copied().enumerate() {
-                        match indices.get(axis) {
-                            Some(ScalarIndex::Point(value))
-                            | Some(ScalarIndex::Coordinate(value)) => {
-                                offset = format!(
-                                    "({offset} + ulong({}) * {stride}ul)",
-                                    self.value(*value)
-                                );
-                            }
-                            Some(ScalarIndex::Range { start, .. }) => {
-                                if let Some(start) = start {
-                                    offset = format!(
-                                        "({offset} + ulong({}) * {stride}ul)",
-                                        self.value(*start)
-                                    );
-                                }
-                                retained.push(stride);
-                            }
-                            Some(ScalarIndex::Slice(_)) | None => retained.push(stride),
-                        }
-                    }
-                    plane.offset = offset;
-                    plane.strides = retained;
-                }
-                let result = result.ok_or("index has no result")?;
-                if matches!(instruction.value_types.get(&result), Some(Type::Tensor(_))) {
-                    self.tensors.insert(result, tensor);
-                    None
-                } else {
-                    let plane = tensor.planes.first().ok_or("indexed tensor has no plane")?;
-                    let expression = if tensor.accessor.is_some() {
-                        self.accessor_element(&tensor, &plane.offset)?
-                    } else {
-                        format!("s{}[{}]", plane.storage.0, plane.offset)
-                    };
-                    if tensor.accessor.is_none() {
-                        self.places.insert(result, expression.clone());
-                    }
-                    Some(expression)
-                }
-            }
-            I::Cast { dtype, value } => {
-                Some(format!("{}({})", dtype_name(*dtype), self.value(*value)))
-            }
-            I::Unary { op, value } => Some(format!("({}{})", unary(*op), self.value(*value))),
-            I::Binary { op, lhs, rhs } => Some(format!(
-                "({} {} {})",
-                self.value(*lhs),
-                binary(*op),
-                self.value(*rhs)
-            )),
-            I::Math { op, arguments } => Some(render_math(*op, arguments, &self.values)?),
-            I::Select {
-                condition,
-                then_value,
-                else_value,
-            } => Some(format!(
-                "({} ? {} : {})",
-                self.value(*condition),
-                self.value(*then_value),
-                self.value(*else_value)
-            )),
-            I::Extent { base, axis } => {
-                let Type::Tensor(tensor) = instruction
-                    .value_types
-                    .get(base)
-                    .ok_or("extent base type is absent")?
-                else {
-                    return Err("extent base is not a tensor".into());
-                };
-                let extent = tensor
-                    .shape
-                    .get(*axis)
-                    .and_then(|value| value.as_constant())
-                    .ok_or("resolved Metal extent remained symbolic")?;
-                Some(format!("{extent}l"))
-            }
-            I::Intrinsic {
-                operation,
-                arguments,
-            } => self.render_intrinsic(*operation, arguments, instruction, result)?,
-            I::Accessor { base, name } => {
-                let mut tensor = self
-                    .tensors
-                    .get(base)
-                    .cloned()
-                    .ok_or("packet accessor base is not a tensor")?;
-                let Type::Tensor(base_ty) = instruction
-                    .value_types
-                    .get(base)
-                    .ok_or("packet accessor base type is absent")?
-                else {
-                    return Err("packet accessor base is not tensor-typed".into());
-                };
-                let seismic_lang::types::Elem::Repr(representation) = &base_ty.elem else {
-                    return Err("packet accessor requires represented storage".into());
-                };
-                tensor.accessor = Some(PacketAccessor {
-                    representation: representation.clone(),
-                    name: name.clone(),
-                });
-                if let Some(Type::Tensor(result_ty)) =
-                    result.and_then(|id| instruction.value_types.get(&id))
-                {
-                    let strides = compact_shape_strides(&result_ty.shape)?;
-                    for plane in &mut tensor.planes {
-                        plane.strides = strides.clone();
-                    }
-                }
-                self.tensors
-                    .insert(result.ok_or("packet accessor has no result")?, tensor);
-                None
-            }
-            I::Geometry {
-                base,
-                axis,
-                valid: _,
-            } => {
-                let Type::Tensor(tensor) = instruction
-                    .value_types
-                    .get(base)
-                    .ok_or("geometry base type is absent")?
-                else {
-                    return Err("geometry base is not a tensor".into());
-                };
-                let extent = tensor
-                    .shape
-                    .get(*axis)
-                    .and_then(|value| value.as_constant())
-                    .ok_or("resolved Metal geometry remained symbolic")?;
-                Some(format!("{extent}l"))
-            }
-            I::Atomic { op, place, value } => {
-                let target = self
-                    .places
-                    .get(place)
-                    .cloned()
-                    .ok_or("atomic target is not an indexed place")?;
-                let function = match op {
-                    BinaryOp::Add => "atomic_fetch_add_explicit",
-                    BinaryOp::BitAnd => "atomic_fetch_and_explicit",
-                    BinaryOp::BitOr => "atomic_fetch_or_explicit",
-                    BinaryOp::BitXor => "atomic_fetch_xor_explicit",
-                    _ => return Err(format!("unsupported Metal atomic operator `{}`", op.text())),
-                };
-                let dtype = match instruction.value_types.get(place) {
-                    Some(Type::Scalar(dtype)) => *dtype,
-                    _ => return Err("atomic place has no scalar dtype".into()),
-                };
-                if dtype.is_float() && *op != BinaryOp::Add {
-                    return Err("Metal floating atomics support addition only".into());
-                }
-                let atomic = match dtype {
-                    DType::I32 => "atomic_int",
-                    DType::U32 => "atomic_uint",
-                    DType::F32 => "atomic_float",
-                    _ => return Err(format!("Metal has no atomic {} storage", dtype.name())),
-                };
-                self.line(format!(
-                    "{function}(reinterpret_cast<device {atomic}*>(&({target})), {}({}), memory_order_relaxed);",
-                    dtype_name(dtype),
-                    self.value(*value)
-                ));
-                None
-            }
-            I::Assign { target, op, value } => {
-                let target = self
-                    .places
-                    .get(target)
-                    .cloned()
-                    .ok_or("assignment target is not an indexed place")?;
-                self.line(format!("{target} {} {};", assign(*op), self.value(*value)));
-                None
-            }
-            I::Publish { value, destination } => {
-                let destination = self
-                    .places
-                    .get(destination)
-                    .cloned()
-                    .ok_or("publication destination is not an indexed place")?;
-                self.line(format!("{destination} = {};", self.value(*value)));
-                None
-            }
-            I::Conditional {
-                condition,
-                then_body,
-                else_body,
-            } => {
-                for nested in then_body.iter().chain(else_body) {
-                    if let Some(value) = nested.result {
-                        if self.declared.contains(&value) {
-                            continue;
-                        }
-                        if let Some(ty @ (Type::Scalar(_) | Type::Index { .. })) =
-                            instruction.value_types.get(&value)
-                        {
-                            self.line(format!("{} v{};", type_name(ty)?, value.0));
-                            self.values.insert(value, format!("v{}", value.0));
-                            self.declared.insert(value);
-                        }
-                    }
-                }
-                self.line(format!("if ({}) {{", self.value(*condition)));
-                self.indent += 1;
-                for nested in then_body {
-                    self.resolved_scalar(nested, instruction)?;
-                }
-                self.indent -= 1;
-                self.line("} else {");
-                self.indent += 1;
-                for nested in else_body {
-                    self.resolved_scalar(nested, instruction)?;
-                }
-                self.indent -= 1;
-                self.line("}");
-                None
-            }
-            I::ConditionalMerge { cases } => Some(self.render_merge(cases)?),
-            I::Yield(_) | I::Return { .. } => None,
-        };
-        if let (Some(result), Some(expression)) = (result, expression) {
-            let ty = instruction
-                .value_types
-                .get(&result)
-                .ok_or_else(|| format!("value#{} has no type", result.0))?;
-            let name = format!("v{}", result.0);
-            if self.declared.contains(&result) {
-                self.line(format!("{name} = {expression};"));
-            } else {
-                self.line(format!("{} {name} = {expression};", type_name(ty)?));
-                self.declared.insert(result);
-            }
-            self.values.insert(result, name);
-        }
-        Ok(())
-    }
-
-    fn bind_inputs(
-        &mut self,
-        instruction: &ResolvedMetalInstruction,
-        bindings: &[ResolvedOperandTransport],
-    ) -> Result<(), String> {
-        for binding in bindings.iter() {
-            if !instruction.input_operands.contains(&binding.operand) {
-                continue;
-            }
-            let value = instruction
-                .operand_values
-                .get(&binding.operand)
-                .copied()
-                .ok_or_else(|| {
-                    format!("input operand#{} has no scalar value", binding.operand.0)
-                })?;
-            let ty = instruction
-                .value_types
-                .get(&value)
-                .ok_or("input operand value has no type")?;
-            self.bind_transport_value(value, ty, &binding.transport)?;
-        }
-        Ok(())
-    }
-
-    fn store_outputs(
-        &mut self,
-        instruction: &ResolvedMetalInstruction,
-        bindings: &[ResolvedOperandTransport],
-    ) -> Result<(), String> {
-        for binding in bindings.iter() {
-            if !instruction.output_operands.contains(&binding.operand) {
-                continue;
-            }
-            let value = instruction
-                .operand_values
-                .get(&binding.operand)
-                .copied()
-                .ok_or_else(|| {
-                    format!("output operand#{} has no scalar value", binding.operand.0)
-                })?;
-            let ty = instruction
-                .value_types
-                .get(&value)
-                .ok_or("output operand value has no type")?;
-            self.store_transport_value(value, ty, &binding.transport)?;
-        }
-        Ok(())
-    }
-
-    fn bind_tensor_outputs(
-        &mut self,
-        instruction: &ResolvedMetalInstruction,
-        bindings: &[ResolvedOperandTransport],
-    ) -> Result<(), String> {
-        for binding in bindings.iter() {
-            if !instruction.output_operands.contains(&binding.operand) {
-                continue;
-            }
-            let Some(value) = instruction.operand_values.get(&binding.operand).copied() else {
-                continue;
-            };
-            if !matches!(instruction.value_types.get(&value), Some(Type::Tensor(_))) {
-                continue;
-            }
-            if let ResolvedValueTransport::Storage(ids) = &binding.transport {
-                self.tensors
-                    .insert(value, self.tensor_from_ids(ids.iter().copied())?);
-            }
-        }
-        Ok(())
-    }
-
-    fn bind_transport_value(
-        &mut self,
-        value: ScalarValueId,
-        ty: &Type,
-        transport: &ResolvedValueTransport,
-    ) -> Result<(), String> {
-        match (ty, transport) {
-            (Type::Void, ResolvedValueTransport::Void) => {}
-            (Type::Tuple(types), ResolvedValueTransport::Tuple(fields))
-                if types.len() == fields.len() =>
-            {
-                let synthetic = types
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ty)| {
-                        let field = ScalarValueId(value.0.wrapping_add(0x4000_0000 + index as u32));
-                        self.bind_transport_value(field, ty, fields.iter().nth(index).unwrap())?;
-                        Ok(field)
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                self.tuples.insert(value, synthetic);
-            }
-            (Type::Tensor(_), ResolvedValueTransport::Storage(ids)) => {
-                self.tensors
-                    .insert(value, self.tensor_from_ids(ids.iter().copied())?);
-            }
-            (Type::Range { .. }, ResolvedValueTransport::Storage(ids)) if ids.len() == 1 => {
-                let storage = *ids.iter().next().unwrap();
-                let start = ScalarValueId(value.0.wrapping_add(0x6000_0000));
-                let end = ScalarValueId(value.0.wrapping_add(0x6000_0001));
-                self.values
-                    .insert(start, self.scalar_storage_field(storage, 0)?);
-                self.values
-                    .insert(end, self.scalar_storage_field(storage, 1)?);
-                self.tuples.insert(value, vec![start, end]);
-            }
-            (_, ResolvedValueTransport::Storage(ids)) if ids.len() == 1 => {
-                let storage = *ids.iter().next().unwrap();
-                self.values
-                    .insert(value, self.scalar_storage_field(storage, 0)?);
-            }
-            (_, ResolvedValueTransport::Kernel(_)) => {
-                return Err("Metal kernel-value input transport has no local producer".into())
-            }
-            _ => return Err("Metal operand transport disagrees with its value type".into()),
-        }
-        Ok(())
-    }
-
-    fn store_transport_value(
-        &mut self,
-        value: ScalarValueId,
-        ty: &Type,
-        transport: &ResolvedValueTransport,
-    ) -> Result<(), String> {
-        match (ty, transport) {
-            (Type::Void, ResolvedValueTransport::Void) => {}
-            (Type::Tuple(types), ResolvedValueTransport::Tuple(fields))
-                if types.len() == fields.len() =>
-            {
-                let values = self
-                    .tuples
-                    .get(&value)
-                    .cloned()
-                    .ok_or("tuple output has no fields")?;
-                for ((ty, transport), value) in types.iter().zip(fields.iter()).zip(values) {
-                    self.store_transport_value(value, ty, transport)?;
-                }
-            }
-            (Type::Tensor(tensor_ty), ResolvedValueTransport::Storage(ids)) => {
-                let source = self
-                    .tensors
-                    .get(&value)
-                    .cloned()
-                    .ok_or("tensor output has no physical value")?;
-                let destination = self.tensor_from_ids(ids.iter().copied())?;
-                let aliases = source.planes.len() == destination.planes.len()
-                    && source.planes.iter().zip(&destination.planes).all(
-                        |(source, destination)| {
-                            source.storage == destination.storage
-                                && source.offset == destination.offset
-                        },
-                    );
-                if !aliases {
-                    self.copy_tensor_elements(
-                        &destination,
-                        &source,
-                        resolved_elements(&tensor_ty.shape)?,
-                    )?;
-                }
-            }
-            (Type::Range { .. }, ResolvedValueTransport::Storage(ids)) if ids.len() == 1 => {
-                let storage = ids.iter().next().unwrap();
-                let fields = self
-                    .tuples
-                    .get(&value)
-                    .cloned()
-                    .ok_or("range output has no endpoints")?;
-                if fields.len() != 2 {
-                    return Err("range output must have two endpoints".into());
-                }
-                for (index, field) in fields.into_iter().enumerate() {
-                    let place = self.scalar_storage_place(*storage, index)?;
-                    self.line(format!("{place} = {};", self.value(field)));
-                }
-            }
-            (_, ResolvedValueTransport::Storage(ids)) if ids.len() == 1 => {
-                let storage = *ids.iter().next().unwrap();
-                let place = self.scalar_storage_place(storage, 0)?;
-                self.line(format!("{place} = {};", self.value(value)));
-            }
-            (_, ResolvedValueTransport::Kernel(_)) => {}
-            _ => return Err("Metal output transport disagrees with its value type".into()),
-        }
-        Ok(())
-    }
-
-    fn tensor_from_ids(
-        &self,
-        ids: impl IntoIterator<Item = ResolvedStorageId>,
-    ) -> Result<TensorValue, String> {
-        let planes = ids
-            .into_iter()
-            .map(|id| {
-                let storage = self.storage(id)?;
-                let (byte_offset, strides) = match &storage.provenance.address {
-                    ResolvedPhysicalAddress::DenseAffine {
-                        byte_offset,
-                        byte_strides,
-                    } => {
-                        let bytes = layout_element_bytes(&storage.layout);
-                        (
-                            byte_offset / bytes,
-                            byte_strides.iter().map(|stride| stride / bytes).collect(),
-                        )
-                    }
-                    ResolvedPhysicalAddress::Representation {
-                        logical_strides, ..
-                    } => (0, logical_strides.clone()),
-                };
-                Ok(TensorPlane {
-                    storage: id,
-                    offset: format!("{byte_offset}ul"),
-                    strides,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(TensorValue {
-            planes,
-            accessor: None,
-        })
-    }
-
-    fn storage(&self, id: ResolvedStorageId) -> Result<&ResolvedStorage<MetalDialect>, String> {
-        self.launch
-            .storage
-            .values()
-            .find(|storage| storage.id == id)
-            .ok_or_else(|| format!("Metal instruction names absent storage#{}", id.0))
-    }
-
-    fn render_intrinsic(
-        &mut self,
-        operation: seismic_lang::intrinsics::Operation,
-        arguments: &[ScalarValueId],
-        instruction: &ResolvedMetalInstruction,
-        result: Option<ScalarValueId>,
-    ) -> Result<Option<String>, String> {
-        use seismic_lang::intrinsics::Operation;
-        let argument = |index: usize| {
-            arguments
-                .get(index)
-                .map(|value| self.value(*value))
-                .ok_or_else(|| format!("{} intrinsic argument {index} is absent", operation.name()))
-        };
-        Ok(match operation {
-            Operation::LaneIndex => Some("int(tid.x & 31u)".into()),
-            Operation::ShuffleIndex => Some(format!(
-                "simd_shuffle({}, uint({}))",
-                argument(0)?,
-                argument(1)?
-            )),
-            Operation::SimdSum => Some(format!("simd_sum({})", argument(0)?)),
-            Operation::SimdMax => Some(format!("simd_max({})", argument(0)?)),
-            Operation::SimdMin => Some(format!("simd_min({})", argument(0)?)),
-            Operation::Matrix => {
-                let result = result.ok_or("matrix declaration has no result")?;
-                let ty = instruction
-                    .value_types
-                    .get(&result)
-                    .ok_or("matrix declaration result type is absent")?;
-                let name = format!("v{}", result.0);
-                self.line(format!("{} {name};", type_name(ty)?));
-                self.values.insert(result, name);
-                None
-            }
-            Operation::MatrixLoad | Operation::MatrixLoadTranspose => {
-                let fragment = argument(0)?;
-                let tensor = self
-                    .tensors
-                    .get(arguments.get(1).ok_or("matrix load has no tensor")?)
-                    .ok_or("matrix load operand is not a tensor")?;
-                let plane = tensor
-                    .planes
-                    .first()
-                    .ok_or("matrix load tensor has no plane")?;
-                let leading = plane.strides.first().copied().unwrap_or(1);
-                let row = argument(2)?;
-                let column = argument(3)?;
-                if operation == Operation::MatrixLoadTranspose {
-                    self.line(format!("simdgroup_load({fragment}, s{} + {}, {leading}ul, ulong2(ulong({column}), ulong({row})), true);", plane.storage.0, plane.offset));
-                } else {
-                    self.line(format!("simdgroup_load({fragment}, s{} + {}, {leading}ul, ulong2(ulong({column}), ulong({row})));", plane.storage.0, plane.offset));
-                }
-                None
-            }
-            Operation::MatrixStore => {
-                let fragment = argument(0)?;
-                let tensor = self
-                    .tensors
-                    .get(arguments.get(1).ok_or("matrix store has no tensor")?)
-                    .ok_or("matrix store operand is not a tensor")?;
-                let plane = tensor
-                    .planes
-                    .first()
-                    .ok_or("matrix store tensor has no plane")?;
-                let leading = plane.strides.first().copied().unwrap_or(1);
-                self.line(format!("simdgroup_store({fragment}, s{} + {}, {leading}ul, ulong2(ulong({}), ulong({})));", plane.storage.0, plane.offset, argument(3)?, argument(2)?));
-                None
-            }
-            Operation::MatrixMultiplyAccumulate => {
-                self.line(format!(
-                    "simdgroup_multiply_accumulate({}, {}, {}, {});",
-                    argument(0)?,
-                    argument(1)?,
-                    argument(2)?,
-                    argument(3)?
-                ));
-                None
-            }
-            Operation::MatrixMatmul | Operation::MatrixMatmulAdd => {
-                let result = result.ok_or("logical matrix intrinsic has no result")?;
-                let output = self
-                    .tensors
-                    .get(&result)
-                    .cloned()
-                    .ok_or("logical matrix result has no bound output storage")?;
-                let left = self
-                    .tensors
-                    .get(arguments.first().ok_or("matmul has no left operand")?)
-                    .cloned()
-                    .ok_or("matmul left operand is not a tensor")?;
-                let right = self
-                    .tensors
-                    .get(arguments.get(1).ok_or("matmul has no right operand")?)
-                    .cloned()
-                    .ok_or("matmul right operand is not a tensor")?;
-                let Type::Tensor(output_ty) = instruction
-                    .value_types
-                    .get(&result)
-                    .ok_or("matmul result type is absent")?
-                else {
-                    return Err("matmul result is not tensor-typed".into());
-                };
-                let Type::Tensor(left_ty) = instruction
-                    .value_types
-                    .get(&arguments[0])
-                    .ok_or("matmul left type is absent")?
-                else {
-                    return Err("matmul left operand is not tensor-typed".into());
-                };
-                let extent = |shape: &[seismic_lang::sym::Sym], axis: usize| {
-                    shape
-                        .get(axis)
-                        .and_then(|extent| extent.as_constant())
-                        .and_then(|extent| u64::try_from(extent).ok())
-                        .ok_or("resolved matmul extent remained symbolic")
-                };
-                let (m, n, k) = (
-                    extent(&output_ty.shape, 0)?,
-                    extent(&output_ty.shape, 1)?,
-                    extent(&left_ty.shape, 1)?,
-                );
-                let (a, b, c) = (
-                    left.planes
-                        .first()
-                        .ok_or("matmul left tensor has no plane")?,
-                    right
-                        .planes
-                        .first()
-                        .ok_or("matmul right tensor has no plane")?,
-                    output
-                        .planes
-                        .first()
-                        .ok_or("matmul result tensor has no plane")?,
-                );
-                if a.strides.len() != 2 || b.strides.len() != 2 || c.strides.len() != 2 {
-                    return Err("logical matrix intrinsic requires rank-two operands".into());
-                }
-                self.line(format!("for (ulong mm_m = 0; mm_m < {m}ul; ++mm_m) {{"));
-                self.indent += 1;
-                self.line(format!("for (ulong mm_n = 0; mm_n < {n}ul; ++mm_n) {{"));
-                self.indent += 1;
-                let initial = if operation == Operation::MatrixMatmulAdd {
-                    format!(
-                        "float(s{}[{} + mm_m * {}ul + mm_n * {}ul])",
-                        c.storage.0, c.offset, c.strides[0], c.strides[1]
-                    )
-                } else {
-                    "0.0f".into()
-                };
-                self.line(format!("float mm_acc = {initial};"));
-                self.line(format!("for (ulong mm_k = 0; mm_k < {k}ul; ++mm_k) mm_acc = fma(float(s{}[{} + mm_m * {}ul + mm_k * {}ul]), float(s{}[{} + mm_n * {}ul + mm_k * {}ul]), mm_acc);", a.storage.0, a.offset, a.strides[0], a.strides[1], b.storage.0, b.offset, b.strides[0], b.strides[1]));
-                self.line(format!(
-                    "s{}[{} + mm_m * {}ul + mm_n * {}ul] = mm_acc;",
-                    c.storage.0, c.offset, c.strides[0], c.strides[1]
-                ));
-                self.indent -= 1;
-                self.line("}");
-                self.indent -= 1;
-                self.line("}");
-                None
-            }
-        })
-    }
-
-    fn render_merge(
-        &self,
-        cases: &[seismic_compiler::terminal::ConditionalCase],
-    ) -> Result<String, String> {
-        let mut cases = cases.iter().rev();
-        let last = cases.next().ok_or("conditional merge has no cases")?;
-        let mut expression = self.value(last.value);
-        for case in cases {
-            let condition = if case.predicates.is_empty() {
-                "true".into()
-            } else {
-                case.predicates
-                    .iter()
-                    .map(|(value, expected)| {
-                        if *expected {
-                            format!("bool({})", self.value(*value))
-                        } else {
-                            format!("!bool({})", self.value(*value))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" && ")
-            };
-            expression = format!(
-                "(({condition}) ? {} : {expression})",
-                self.value(case.value)
-            );
-        }
-        Ok(expression)
-    }
-
-    fn accessor_element(&self, tensor: &TensorValue, index: &str) -> Result<String, String> {
-        let accessor = tensor
-            .accessor
-            .as_ref()
-            .ok_or("tensor has no packet accessor")?;
-        let representation = repr::lookup(&accessor.representation)
-            .ok_or_else(|| format!("unknown representation `{}`", accessor.representation))?;
-        if accessor.name == "scale" || accessor.name == "bias" {
-            let coefficient = representation
-                .coefficient(accessor.name == "bias")
-                .ok_or_else(|| format!("representation has no `{}` coefficient", accessor.name))?;
-            self.coefficient(
-                tensor,
-                &format!("(({index}) * {}ul)", representation.group),
-                &coefficient,
-            )
-        } else {
-            let plane = representation
-                .plane(&accessor.name)
-                .ok_or_else(|| format!("unknown physical plane `{}`", accessor.name))?;
-            self.raw_plane(tensor, plane.name, index)
-        }
-    }
-
-    fn decode_element(&self, tensor: &TensorValue, index: &str) -> Result<String, String> {
-        let representation_name = tensor
-            .planes
-            .iter()
-            .find_map(|plane| match &self.storage(plane.storage).ok()?.layout {
-                ResolvedMetalLayout::PackedPlane { representation, .. } => Some(representation),
-                _ => None,
-            })
-            .ok_or("packed decode source has no representation")?;
-        let representation = repr::lookup(representation_name)
-            .ok_or_else(|| format!("unknown representation `{representation_name}`"))?;
-        let logical = format!(
-            "({} + ulong({index}))",
-            tensor
-                .planes
-                .first()
-                .ok_or("packed tensor has no planes")?
-                .offset
-        );
-        let code = self.packed_plane(
-            tensor,
-            "words",
-            &logical,
-            representation.bits,
-            &representation.code,
-        )?;
-        let scale = self.coefficient(
-            tensor,
-            &logical,
-            &representation
-                .coefficient(false)
-                .ok_or("representation has no scale")?,
-        )?;
-        let bias = representation
-            .coefficient(true)
-            .map(|coefficient| self.coefficient(tensor, &logical, &coefficient))
-            .transpose()?
-            .unwrap_or_else(|| "0.0f".into());
-        Ok(format!("fma(float({code}), float({scale}), float({bias}))"))
-    }
-
-    fn coefficient(
-        &self,
-        tensor: &TensorValue,
-        logical: &str,
-        coefficient: &repr::Coefficient,
-    ) -> Result<String, String> {
-        match coefficient {
-            repr::Coefficient::Direct { plane } => self.raw_plane(
-                tensor,
-                plane.name,
-                &format!("(ulong({logical}) / {}ul)", plane.group),
-            ),
-            repr::Coefficient::Product {
-                factor,
-                coefficients,
-                field,
-                sign,
-            } => {
-                let factor_value = self.raw_plane(
-                    tensor,
-                    factor.name,
-                    &format!("(ulong({logical}) / {}ul)", factor.group),
-                )?;
-                let entry = format!(
-                    "((ulong({logical}) / {}ul) * {}ul + {}ul)",
-                    coefficients.group, coefficients.fields, field
-                );
-                let repr::PlaneEncoding::Packed {
-                    bits,
-                    interpretation,
-                } = &coefficients.encoding
-                else {
-                    return Err("hierarchical coefficient plane is not packed".into());
-                };
-                let value =
-                    self.packed_plane(tensor, coefficients.name, &entry, *bits, interpretation)?;
-                Ok(format!(
-                    "(float({factor_value}) * float({value}) * {}.0f)",
-                    sign
-                ))
-            }
-        }
-    }
-
-    fn raw_plane(&self, tensor: &TensorValue, name: &str, index: &str) -> Result<String, String> {
-        let plane = tensor.planes.iter().find(|plane| {
-            matches!(&self.storage(plane.storage).ok().map(|s| &s.layout), Some(ResolvedMetalLayout::PackedPlane { plane: candidate, .. }) if candidate == name)
-        }).ok_or_else(|| format!("packed tensor has no `{name}` plane"))?;
-        Ok(format!("s{}[ulong({index})]", plane.storage.0))
-    }
-
-    fn packed_plane(
-        &self,
-        tensor: &TensorValue,
-        name: &str,
-        index: &str,
-        bits: u32,
-        interpretation: &repr::CodeInterpretation,
-    ) -> Result<String, String> {
-        let bit = format!("(ulong({index}) * {bits}ul)");
-        let low = self.raw_plane(tensor, name, &format!("({bit} / 32ul)"))?;
-        let high = self.raw_plane(tensor, name, &format!("({bit} / 32ul + 1ul)"))?;
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-        let shift = format!("uint({bit} % 32ul)");
-        let raw = format!("uint((({shift} + {bits}u <= 32u) ? ({low} >> {shift}) : (({low} >> {shift}) | ({high} << (32u - {shift})))) & {mask}u)");
-        Ok(decode_code(&raw, bits, interpretation))
-    }
-
-    fn scalar_storage_place(
-        &self,
-        id: ResolvedStorageId,
-        field_index: usize,
-    ) -> Result<String, String> {
-        let storage = self.storage(id)?;
-        let ResolvedMetalLayout::Scalar { parameters, .. } = &storage.layout else {
-            return Err(format!("storage#{} is not scalar storage", id.0));
-        };
-        let layout = seismic_lang::abi::ScalarLayout::natural(parameters)?;
-        let field = layout
-            .fields
-            .get(field_index)
-            .ok_or_else(|| format!("storage#{} has no scalar field {field_index}", id.0))?;
-        let qualifier = if matches!(storage.provenance.abi, Some(AbiRole::Parameter { .. })) {
-            "constant"
-        } else {
-            "device"
-        };
-        Ok(format!(
-            "(*reinterpret_cast<{qualifier} {}*>(s{} + {}ul))",
-            dtype_name(field.parameter.dtype),
-            id.0,
-            field.offset
-        ))
-    }
-
-    fn scalar_storage_field(
-        &self,
-        id: ResolvedStorageId,
-        field_index: usize,
-    ) -> Result<String, String> {
-        self.scalar_storage_place(id, field_index)
-    }
-
-    fn copy_tensor(
-        &mut self,
-        destination: &TensorValue,
-        source: &TensorValue,
-    ) -> Result<(), String> {
-        if destination.planes.len() != source.planes.len() {
-            return Err("Metal tensor copy representation planes differ".into());
-        }
-        for (destination, source) in destination.planes.iter().zip(&source.planes) {
-            let elements = layout_elements(&self.storage(destination.storage)?.layout);
-            self.line(format!(
-                "for (ulong copy = 0; copy < {elements}ul; ++copy) s{}[{} + copy] = s{}[{} + copy];",
-                destination.storage.0, destination.offset, source.storage.0, source.offset
-            ));
-        }
-        Ok(())
-    }
-
-    fn copy_tensor_elements(
-        &mut self,
-        destination: &TensorValue,
-        source: &TensorValue,
-        elements: u64,
-    ) -> Result<(), String> {
-        if destination.planes.len() != source.planes.len() {
-            return Err("Metal tensor copy representation planes differ".into());
-        }
-        for (destination, source) in destination.planes.iter().zip(&source.planes) {
-            self.line(format!(
-                "for (ulong copy = 0; copy < {elements}ul; ++copy) s{}[{} + copy] = s{}[{} + copy];",
-                destination.storage.0, destination.offset, source.storage.0, source.offset
-            ));
-        }
-        Ok(())
-    }
-
-    fn resolved_scalar(
-        &mut self,
-        scalar: &seismic_compiler::terminal::ResolvedScalarInstruction,
-        parent: &ResolvedMetalInstruction,
-    ) -> Result<(), String> {
-        let mut wrapped = parent.clone();
-        wrapped.scalar = scalar.clone();
-        self.instruction(&wrapped)
-    }
-
-    fn bind_axis(
-        &mut self,
-        values: &[ScalarValueId],
-        components: &[u64],
-        coordinate: &str,
-    ) -> Result<(), String> {
-        if values.len() != components.len() {
-            return Err("Metal logical-axis binders disagree with component extents".into());
-        }
-        for (index, (value, extent)) in values.iter().zip(components).enumerate() {
-            let trailing = components[index + 1..]
-                .iter()
-                .try_fold(1u64, |product, extent| product.checked_mul(*extent))
-                .ok_or("Metal coordinate component stride overflow")?;
-            let expression = if trailing == 1 {
-                format!("(({coordinate}) % {extent}ul)")
-            } else {
-                format!("((({coordinate}) / {trailing}ul) % {extent}ul)")
-            };
-            self.values.insert(*value, format!("v{}", value.0));
-            self.line(format!("long v{} = long({expression});", value.0));
-        }
-        Ok(())
-    }
-
-    fn value(&self, value: ScalarValueId) -> String {
-        self.values
-            .get(&value)
-            .cloned()
-            .unwrap_or_else(|| format!("v{}", value.0))
-    }
-
-    fn field(&self, value: ScalarValueId, index: usize) -> Result<String, String> {
-        let fields = self
-            .tuples
-            .get(&value)
-            .ok_or_else(|| format!("value#{} is not an aggregate", value.0))?;
-        fields
-            .get(index)
-            .map(|value| self.value(*value))
-            .ok_or_else(|| "aggregate field is out of bounds".into())
+        (ConstValue::Bool(b), _) => format!("{}", b),
+        _ => "0".into(),
     }
 }
 
-fn type_name(ty: &Type) -> Result<&'static str, String> {
-    match ty {
-        Type::Scalar(dtype) => Ok(dtype_name(*dtype)),
-        Type::Index { .. } => Ok("long"),
-        Type::CapabilityValue { name, elem, .. } if name.contains("simdgroup_matrix") => elem
-            .as_ref()
-            .and_then(|elem| elem.read_dtype())
-            .map(|dtype| match dtype {
-                DType::F16 => "simdgroup_matrix<half, 8, 8>",
-                DType::BF16 => "simdgroup_matrix<bfloat, 8, 8>",
-                DType::F32 => "simdgroup_matrix<float, 8, 8>",
-                _ => "simdgroup_matrix<float, 8, 8>",
-            })
-            .ok_or("Metal matrix capability value has no element dtype".into()),
-        _ => Err(format!(
-            "Metal value declaration has non-scalar type {ty:?}"
-        )),
+fn slot_read(slot: &str, dtype: DType) -> String {
+    match dtype {
+        DType::F32 => format!("as_type<float>(seismic_slots[{slot}])"),
+        DType::F16 => format!("as_type<half>(ushort(seismic_slots[{slot}] & 0xffffu))"),
+        DType::I32 => format!("as_type<int>(seismic_slots[{slot}])"),
+        DType::U32 => format!("seismic_slots[{slot}]"),
+        DType::Bool => format!("seismic_slots[{slot}] != 0u"),
+        DType::BF16 => format!("as_type<bfloat>(ushort(seismic_slots[{slot}] & 0xffffu))"),
     }
 }
 
-fn layout_elements(layout: &ResolvedMetalLayout) -> u64 {
-    match layout {
-        ResolvedMetalLayout::Dense { elements, .. }
-        | ResolvedMetalLayout::PackedPlane { elements, .. } => *elements,
-        ResolvedMetalLayout::Scalar { .. } => 1,
+fn slot_write(value: &str, dtype: DType) -> String {
+    match dtype {
+        DType::F32 => format!("as_type<uint>({value})"),
+        DType::F16 => format!("uint(as_type<ushort>(half({value})))"),
+        DType::I32 => format!("as_type<uint>({value})"),
+        DType::U32 => format!("{value}"),
+        DType::Bool => format!("uint({value})"),
+        DType::BF16 => format!("uint(as_type<ushort>(bfloat({value})))"),
     }
 }
 
-fn layout_element_bytes(layout: &ResolvedMetalLayout) -> u64 {
-    match layout {
-        ResolvedMetalLayout::Dense { dtype, .. }
-        | ResolvedMetalLayout::PackedPlane { dtype, .. } => u64::from(dtype.bytes()),
-        ResolvedMetalLayout::Scalar { bytes, .. } => *bytes,
-    }
-}
-
-fn compact_strides(
-    shape: &[seismic_lang::sym::Sym],
-    storage: &ResolvedStorage<MetalDialect>,
-) -> Result<Vec<u64>, String> {
-    let mut stride = 1u64;
-    let mut result = vec![0; shape.len()];
-    for axis in (0..shape.len()).rev() {
-        result[axis] = stride;
-        let extent = shape[axis]
-            .as_constant()
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or("resolved Metal reshape has a symbolic extent")?;
-        stride = stride
-            .checked_mul(extent)
-            .ok_or("Metal reshape stride overflow")?;
-    }
-    if stride > layout_elements(&storage.layout) {
-        return Err("Metal reshape exceeds its physical storage".into());
-    }
-    Ok(result)
-}
-
-fn compact_shape_strides(shape: &[seismic_lang::sym::Sym]) -> Result<Vec<u64>, String> {
-    let mut stride = 1u64;
-    let mut result = vec![0; shape.len()];
-    for axis in (0..shape.len()).rev() {
-        result[axis] = stride;
-        let extent = shape[axis]
-            .as_constant()
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or("resolved Metal tensor shape remained symbolic")?;
-        stride = stride
-            .checked_mul(extent)
-            .ok_or("Metal tensor stride overflow")?;
-    }
-    Ok(result)
-}
-
-fn resolved_elements(shape: &[seismic_lang::sym::Sym]) -> Result<u64, String> {
-    Ok(shape.iter().try_fold(1u64, |elements, extent| {
-        let extent = extent
-            .as_constant()
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or("resolved Metal tensor shape remained symbolic")?;
-        elements
-            .checked_mul(extent)
-            .ok_or("Metal tensor element count overflow")
-    })?)
-}
-
-fn decode_code(raw: &str, bits: u32, interpretation: &repr::CodeInterpretation) -> String {
-    match interpretation {
-        repr::CodeInterpretation::Unsigned => raw.into(),
-        repr::CodeInterpretation::Offset(zero) => format!("(int({raw}) - {zero})"),
-        repr::CodeInterpretation::TwosComplement => {
-            format!("(int(uint({raw}) << {}u) >> {}u)", 32 - bits, 32 - bits)
-        }
-        repr::CodeInterpretation::Table(table) => {
-            let mut expression = table.last().copied().unwrap_or(0).to_string();
-            for (index, value) in table.iter().copied().enumerate().rev().skip(1) {
-                expression = format!("(uint({raw}) == {index}u ? {value} : {expression})");
-            }
-            expression
-        }
-    }
-}
-
-fn assign(op: AssignOp) -> &'static str {
-    op.text()
-}
-
-fn unary(op: UnaryOp) -> &'static str {
+fn rel_symbol(op: crate::physical::RelOp) -> &'static str {
+    use crate::physical::RelOp::*;
     match op {
-        UnaryOp::Neg => "-",
-        UnaryOp::Not => "!",
-        UnaryOp::BitNot => "~",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
     }
 }
 
-fn binary(op: BinaryOp) -> &'static str {
-    op.text()
+fn comparison_cast(dtype: DType) -> &'static str {
+    match dtype {
+        DType::U32 => "uint",
+        _ => "int",
+    }
 }
 
-fn render_math(
-    op: seismic_lang::sir::Math,
-    arguments: &[ScalarValueId],
-    values: &BTreeMap<ScalarValueId, String>,
+fn int_symbol(op: crate::physical::IntOp) -> &'static str {
+    use crate::physical::IntOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+    }
+}
+
+fn math_call(
+    op: seismic_lang::intrinsics::MathOp,
+    args: &[String],
+    dtype: DType,
 ) -> Result<String, String> {
-    let value = |index: usize| {
-        arguments
-            .get(index)
-            .map(|id| {
-                values
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("v{}", id.0))
-            })
-            .ok_or("math argument is absent")
-    };
-    use seismic_lang::sir::Math;
+    use seismic_lang::intrinsics::MathOp::*;
+    let name = dtype_name(dtype);
     Ok(match op {
-        Math::Fma => format!("fma({}, {}, {})", value(0)?, value(1)?, value(2)?),
-        Math::Max => format!("max({}, {})", value(0)?, value(1)?),
-        Math::Min => format!("min({}, {})", value(0)?, value(1)?),
-        Math::Exp => format!("exp({})", value(0)?),
-        Math::ExpFast => format!("fast::exp({})", value(0)?),
-        Math::Rsqrt => format!("rsqrt({})", value(0)?),
-        Math::Sqrt => format!("sqrt({})", value(0)?),
-        Math::Log => format!("log({})", value(0)?),
-        Math::Sin => format!("sin({})", value(0)?),
-        Math::Cos => format!("cos({})", value(0)?),
-        Math::Abs => format!("abs({})", value(0)?),
+        Fma => format!("fma({}, {}, {})", args[0], args[1], args[2]),
+        Exp => format!("exp({}({}))", name, args[0]),
+        ExpFast => format!("fast::exp({}({}))", name, args[0]),
+        Rsqrt => format!("rsqrt({}({}))", name, args[0]),
+        Sqrt => format!("sqrt({}({}))", name, args[0]),
+        Log => format!("log({}({}))", name, args[0]),
+        Sin => format!("sin({}({}))", name, args[0]),
+        Cos => format!("cos({}({}))", name, args[0]),
+        Abs => match dtype {
+            d if d.is_int() => format!("abs({})", args[0]),
+            _ => format!("fabs({}({}))", name, args[0]),
+        },
+        Max => format!("max({}, {})", args[0], args[1]),
+        Min => format!("min({}, {})", args[0], args[1]),
     })
 }
 
-pub fn assemble(encoded: EncodedPlan<MetalDialect, EncodedLaunch>) -> Result<Emitted, String> {
-    let mut sources = String::from("#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\n#pragma clang fp contract(off)\nusing namespace metal;\n\n");
-    let mut launches = Vec::new();
-    let mut storage = BTreeMap::new();
-    collect_storage_and_source(&encoded, &mut storage, &mut sources);
-    let mut aliases = Aliases::default();
-    collect_aliases(&encoded, &mut aliases)?;
-    let (
-        buffers,
-        buffer_ids,
-        buffer_slots,
-        scratch_bindings,
-        scratch_slots,
-        scalars,
-        scalar_storage,
-    ) = allocation_tables(&storage, &mut aliases)?;
-    let execution = flatten_plan(
-        encoded,
-        &mut launches,
-        &buffer_slots,
-        &scratch_slots,
-        &scalar_storage,
-    )?;
-    Ok(Emitted {
-        source: sources,
-        launches,
-        execution,
-        buffers,
-        buffer_ids,
-        scalars,
-        scratch: scratch_bindings
-            .iter()
-            .map(|binding| binding.bytes)
-            .collect(),
-        scratch_bindings,
-        status_slot: None,
-        alias_pairs: vec![],
-    })
-}
-
-fn collect_storage_and_source(
-    plan: &EncodedPlan<MetalDialect, EncodedLaunch>,
-    storage: &mut BTreeMap<ResolvedStorageId, ResolvedStorage<MetalDialect>>,
-    source: &mut String,
-) {
-    for item in &plan.items {
-        match item {
-            EncodedScheduleItem::Phase(phase) => {
-                for launch in &phase.launches {
-                    storage.extend(launch.storage.clone());
-                    source.push_str(&launch.source);
-                }
-            }
-            EncodedScheduleItem::Subplan(subplan) => {
-                collect_storage_and_source(&subplan.encoded, storage, source)
-            }
-        }
+fn cast_expr(from: DType, to: DType, operand: &str) -> String {
+    if from.is_int() && to.is_int() {
+        // Integer-to-integer casts preserve the low 32 bits.
+        return format!("as_type<{}>(as_type<uint>({operand}))", dtype_name(to));
+    }
+    match to {
+        DType::Bool => format!("{operand} != 0"),
+        DType::I32 => format!("int(clamp(trunc(float({operand})), -2147483648.0f, 2147483647.0f))"),
+        DType::U32 => format!("uint(clamp(trunc(float({operand})), 0.0f, 4294967295.0f))"),
+        DType::F32 | DType::F16 | DType::BF16 => format!("{}({operand})", dtype_name(to)),
     }
 }
 
-#[derive(Default)]
-struct Aliases(BTreeMap<ResolvedStorageId, ResolvedStorageId>);
-
-impl Aliases {
-    fn find(&mut self, value: ResolvedStorageId) -> ResolvedStorageId {
-        let parent = self.0.get(&value).copied().unwrap_or(value);
-        if parent == value {
-            value
-        } else {
-            let root = self.find(parent);
-            self.0.insert(value, root);
-            root
-        }
-    }
-    fn union(&mut self, a: ResolvedStorageId, b: ResolvedStorageId) {
-        let (a, b) = (self.find(a), self.find(b));
-        if a != b {
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            self.0.insert(hi, lo);
-        }
-    }
-}
-
-fn collect_aliases(
-    plan: &EncodedPlan<MetalDialect, EncodedLaunch>,
-    aliases: &mut Aliases,
-) -> Result<(), String> {
-    for item in &plan.items {
-        if let EncodedScheduleItem::Subplan(subplan) = item {
-            for binding in subplan
-                .resolved
-                .inputs
-                .iter()
-                .chain(&subplan.resolved.results)
-            {
-                alias_transport(&binding.caller, &binding.callee, aliases)?;
-            }
-            collect_aliases(&subplan.encoded, aliases)?;
-        }
-    }
-    Ok(())
-}
-
-fn alias_transport(
-    a: &ResolvedValueTransport,
-    b: &ResolvedValueTransport,
-    aliases: &mut Aliases,
-) -> Result<(), String> {
-    match (a, b) {
-        (ResolvedValueTransport::Void, ResolvedValueTransport::Void) => {}
-        (ResolvedValueTransport::Storage(a), ResolvedValueTransport::Storage(b))
-            if a.len() == b.len() =>
-        {
-            for (a, b) in a.iter().zip(b.iter()) {
-                aliases.union(*a, *b);
-            }
-        }
-        (ResolvedValueTransport::Tuple(a), ResolvedValueTransport::Tuple(b))
-            if a.len() == b.len() =>
-        {
-            for (a, b) in a.iter().zip(b.iter()) {
-                alias_transport(a, b, aliases)?;
-            }
-        }
-        _ => return Err("call boundary transport shapes differ".into()),
-    }
-    Ok(())
-}
-
-type Slots = BTreeMap<ResolvedStorageId, usize>;
-
-fn allocation_tables(
-    storage: &BTreeMap<ResolvedStorageId, ResolvedStorage<MetalDialect>>,
-    aliases: &mut Aliases,
-) -> Result<
-    (
-        Vec<BufferSpec>,
-        Vec<ResolvedStorageId>,
-        Slots,
-        Vec<BufferSpec>,
-        Slots,
-        Vec<ScalarParameter>,
-        BTreeMap<ResolvedStorageId, usize>,
-    ),
-    String,
-> {
-    let mut roots = BTreeMap::new();
-    for (id, value) in storage {
-        roots
-            .entry(aliases.find(*id))
-            .or_insert_with(|| value.clone());
-    }
-    let mut scalar_roots = roots
-        .iter()
-        .filter(|(_, value)| {
-            matches!(value.provenance.abi, Some(AbiRole::Parameter { .. }))
-                && matches!(value.layout, ResolvedMetalLayout::Scalar { .. })
-        })
-        .collect::<Vec<_>>();
-    scalar_roots.sort_by_key(|(_, value)| abi_key(value));
-    let mut scalars = Vec::new();
-    let mut scalar_field_indices = BTreeMap::new();
-    for (root, value) in scalar_roots {
-        let ResolvedMetalLayout::Scalar { parameters, .. } = &value.layout else {
-            unreachable!()
+fn guard_code(predicates: &[GuardPredicate]) -> u32 {
+    // Status codes mirror the safety-kind taxonomy (first error wins).
+    for predicate in predicates {
+        return match predicate {
+            GuardPredicate::IndexInBounds { .. } => 1,
+            GuardPredicate::RangeInBounds { .. } => 2,
+            GuardPredicate::DivisorNonZero { .. } => 3,
+            GuardPredicate::DivisionSafe { .. } => 4,
+            GuardPredicate::ShiftInRange { .. } => 5,
+            GuardPredicate::ProductFits { .. } => 6,
+            GuardPredicate::ExtentPositive { .. } => 7,
         };
-        scalar_field_indices.insert(*root, scalars.len());
-        scalars.extend(parameters.iter().cloned());
     }
-    let scalar_layout = seismic_lang::abi::ScalarLayout::natural(&scalars)?;
-    let mut scalar_storage = scalar_field_indices
-        .into_iter()
-        .map(|(root, field)| (root, scalar_layout.fields[field].offset))
-        .collect::<BTreeMap<_, _>>();
-    let mut external = roots
-        .iter()
-        .filter(|(_, value)| {
-            value.scope == StorageScope::External
-                && !(matches!(value.provenance.abi, Some(AbiRole::Parameter { .. }))
-                    && matches!(value.layout, ResolvedMetalLayout::Scalar { .. }))
-        })
-        .collect::<Vec<_>>();
-    external.sort_by_key(|(_, value)| abi_key(value));
-    let mut buffers = Vec::new();
-    let mut buffer_ids = Vec::new();
-    let mut buffer_slots = BTreeMap::new();
-    for (slot, (root, value)) in external.into_iter().enumerate() {
-        buffers.push(buffer_spec(value)?);
-        buffer_ids.push(*root);
-        buffer_slots.insert(*root, slot);
-    }
-    let mut scratch = Vec::new();
-    let mut scratch_slots = BTreeMap::new();
-    for (root, value) in roots
-        .iter()
-        .filter(|(_, value)| value.scope == StorageScope::Device)
-    {
-        let slot = scratch.len();
-        scratch.push(BufferSpec {
-            parameter: format!("internal_{}", root.0),
-            plane: plane(value),
-            role: BufferRole::Internal,
-            bytes: value.bytes as usize,
-            alignment: value.alignment as usize,
-        });
-        scratch_slots.insert(*root, slot);
-    }
-    let ids = storage.keys().copied().collect::<Vec<_>>();
-    for id in ids {
-        let root = aliases.find(id);
-        if let Some(slot) = buffer_slots.get(&root).copied() {
-            buffer_slots.insert(id, slot);
-        }
-        if let Some(slot) = scratch_slots.get(&root).copied() {
-            scratch_slots.insert(id, slot);
-        }
-        if let Some(offset) = scalar_storage.get(&root).copied() {
-            scalar_storage.insert(id, offset);
-        }
-    }
-    Ok((
-        buffers,
-        buffer_ids,
-        buffer_slots,
-        scratch,
-        scratch_slots,
-        scalars,
-        scalar_storage,
-    ))
-}
-
-fn abi_key(storage: &ResolvedStorage<MetalDialect>) -> (u8, u32, Vec<u32>, String) {
-    match &storage.provenance.abi {
-        Some(AbiRole::Parameter {
-            ordinal,
-            path,
-            representation_plane,
-        }) => (
-            0,
-            *ordinal,
-            path.clone(),
-            representation_plane.clone().unwrap_or_default(),
-        ),
-        Some(AbiRole::Result {
-            ordinal,
-            path,
-            representation_plane,
-        }) => (
-            1,
-            *ordinal,
-            path.clone(),
-            representation_plane.clone().unwrap_or_default(),
-        ),
-        _ => (2, 0, vec![], String::new()),
-    }
-}
-
-fn plane(storage: &ResolvedStorage<MetalDialect>) -> String {
-    match &storage.layout {
-        ResolvedMetalLayout::PackedPlane { plane, .. } => plane.clone(),
-        _ => String::new(),
-    }
-}
-
-fn buffer_spec(storage: &ResolvedStorage<MetalDialect>) -> Result<BufferSpec, String> {
-    let (parameter, role) = match &storage.provenance.abi {
-        Some(AbiRole::Parameter { ordinal, .. }) => {
-            (format!("parameter_{ordinal}"), BufferRole::Parameter)
-        }
-        Some(AbiRole::Result { ordinal, path, .. }) => (
-            format!("result_{ordinal}"),
-            BufferRole::Result { path: path.clone() },
-        ),
-        _ => return Err("external Metal storage has no parameter/result ABI role".into()),
-    };
-    Ok(BufferSpec {
-        parameter,
-        plane: plane(storage),
-        role,
-        bytes: storage.bytes as usize,
-        alignment: storage.alignment as usize,
-    })
-}
-
-fn flatten_plan(
-    plan: EncodedPlan<MetalDialect, EncodedLaunch>,
-    launches: &mut Vec<Launch>,
-    buffers: &Slots,
-    scratch: &Slots,
-    scalar_storage: &BTreeMap<ResolvedStorageId, usize>,
-) -> Result<Vec<ExecutionItem>, String> {
-    let mut execution = Vec::new();
-    for item in plan.items {
-        match item {
-            EncodedScheduleItem::Phase(phase) => {
-                let mut indices = Vec::new();
-                for launch in phase.launches {
-                    let index = launches.len();
-                    indices.push(index);
-                    let bindings = launch
-                        .bindings
-                        .into_iter()
-                        .map(|binding| runtime_binding(binding, buffers, scratch, scalar_storage))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    launches.push(Launch {
-                        kernel: launch.kernel,
-                        threadgroups: launch.threadgroups,
-                        threads_per_threadgroup: launch.threads_per_threadgroup,
-                        after_barrier: index != 0,
-                        dispatch: None,
-                        tiles: vec![],
-                        declared_threadgroup_bytes: launch.declared_threadgroup_bytes,
-                        bindings,
-                    });
-                }
-                execution.push(ExecutionItem::Phase(indices));
-            }
-            EncodedScheduleItem::Subplan(subplan) => execution.push(ExecutionItem::Subplan(
-                flatten_plan(*subplan.encoded, launches, buffers, scratch, scalar_storage)?,
-            )),
-        }
-    }
-    Ok(execution)
-}
-
-fn runtime_binding(
-    binding: SymbolicBinding,
-    buffers: &Slots,
-    scratch: &Slots,
-    scalar_storage: &BTreeMap<ResolvedStorageId, usize>,
-) -> Result<Binding, String> {
-    let one = |id| {
-        if let Some(offset) = scalar_storage.get(&id).copied() {
-            return Ok(Binding::Scalars(offset));
-        }
-        buffers
-            .get(&id)
-            .copied()
-            .map(Binding::Buffer)
-            .or_else(|| scratch.get(&id).copied().map(Binding::Scratch))
-            .ok_or_else(|| format!("storage#{} has no runtime allocation", id.0))
-    };
-    match binding {
-        SymbolicBinding::Storage(id) => one(id),
-        SymbolicBinding::ArgumentTable(values) => Ok(Binding::ArgumentTable(
-            values
-                .into_iter()
-                .map(|(member, id)| Ok((member, one(id)?)))
-                .collect::<Result<_, String>>()?,
-        )),
-    }
+    0
 }

@@ -1,1257 +1,1936 @@
-//! CPU construction of the executable physical contract.
+//! CPU physical planning: the sealed `CpuOp` opcode vocabulary, the
+//! `CpuDialect` legalization of the full portable matrix, and
+//! the universal CPU strategies over the common family builder.
 //!
-//! Every logical task becomes an explicit native launch. Values that cross a
-//! launch or call boundary use retained storage transports; no native stage is
-//! allowed to invent placement, scheduling, or call bindings.
+//! Universal portable `Inapplicable` is a compiler bug and never occurs: every
+//! registry primitive legalizes to exactly one opcode. Capability applications
+//! have no CPU opcode (this backend offers no backend intrinsics), so they
+//! route to the capability path and are inapplicable on this target.
+//!
+//! Emission convention of `CpuOp` operand/result positions: a mapped launch
+//! binds the consumed nodes' input values (node order, then input order —
+//! including kernel-internal edges of a fused set) followed by their output
+//! values. `operands`/`results` index that combined binding list.
 
+use crate::mapping::{self, Limits, PARTICIPANTS_PARAMETER};
 use seismic_compiler::{
     pipeline::{Backend, EncodedPlan},
     terminal::{
-        self, ResolvedScalarInstruction, ScalarBindings, ScalarCapabilitySet, ScalarInstruction,
-        ScalarStorageBinding, ScalarValueId, ValueBindingKey,
+        self, discharge as classify_obligation, form_primitive, reduction_identity,
+        universal_consequences, universal_node, CheckPredicate, GraphFacts, LayoutTransform,
+        LinearIterationMap, LinearLoopOp, ObligationDischarge, ReductionIdentity,
+        ReductionStrategy, SeismicMathReference, UniversalNode,
     },
 };
+use seismic_lang::syntax::ast::{BinaryOp, UnaryOp};
 use seismic_lang::{
+    intrinsics::{MathOp, PlaneField, PrimitiveId, ReduceOp},
     logical::{
-        LogicalDependencyKind, LogicalEndpoint, LogicalProgram, LogicalTaskGraph, OperandId,
-        StorageRef, TensorType, Type, ValueRef,
+        self, Access, GraphRegion, GraphValueId, JoinSlot, LogicalNode, LogicalNodeKind,
+        LogicalProgram, LogicalStorageId, NodeId, PrimitiveOp, ReductionNode, RegionInput,
+        RegionResult, RuntimeExtent, TaskGraph,
     },
     repr,
+    sir::{Literal, LoopKind},
     sym::Sym,
-    types::{DType, Elem},
+    types::{DType, Elem, ExtentExpr, NonEmpty, RuntimeExtentId, TensorType, ValueType},
 };
 use seismic_realization::executable::{
-    self as exec, AbiRole, AccessMode, AxisMap, BindingGroupKind, BindingGroupTemplate, BindingId,
-    BindingTemplate, DependencyTransport, DispatchTemplate, ExecutableDialect,
-    ExecutableTargetLimits, ExecutableTargetProfile, KernelStep, KernelTemplate, KernelValueId,
-    LaunchId, LaunchTemplate, NonEmpty, OperandTransportTemplate, ParticipantMap, PhaseId,
-    PhaseTemplate, PhysicalAddressTemplate, PhysicalStorageProvenance, PhysicalSubrangeTemplate,
-    PlanFamily, PlanFamilyBuilder, Replication, ResolvedStorageId, ScheduleBuilder, StorageId,
-    StorageScope, StorageTemplate, ValueTransportTemplate,
+    self as exec, AlternativeBuilder, BuilderError, EffectiveTargetProfile, ExecutableDialect,
+    InvariantReport, Legalized, ObligationRef, PhysicalConsequences, PhysicalPrimitive, PlanFamily,
+    PlanFamilyBuilder, PlanValues, RegionPath, ResolvedLaunch,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use seismic_realization::executable::{
+    BoundaryLeaf, ExecutorPredicateTemplate, ExecutorRangeTemplate, FusedStrategyTemplate, NodeRef,
+    PhysicalCarryTemplate, PhysicalJoinTemplate, ReductionStrategyTemplate, RegionStep,
+    StorageViewTemplate, TransportTemplate,
+};
+use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CpuDialect;
+// ---------------------------------------------------------------------------
+// The sealed CPU opcode vocabulary
+// ---------------------------------------------------------------------------
+
+/// A typed constant in the S-value model (value bits + result dtype).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstValue {
+    Int(i64),
+    /// `f64` bits.
+    FloatBits(u64),
+    Bool(bool),
+}
+
+/// One planned runtime-check predicate. Operand positions index the launch
+/// binding list; extent expressions are retained (static values or runtime
+/// extents).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckKind {
+    IndexInBounds {
+        index: u16,
+        extent: ExtentExpr,
+    },
+    RangeInBounds {
+        start: u16,
+        end: u16,
+        extent: ExtentExpr,
+    },
+    DivisorNonZero {
+        value: u16,
+    },
+    DivisionSafe {
+        lhs: u16,
+        rhs: u16,
+    },
+    ShiftInRange {
+        value: u16,
+    },
+    ProductFits {
+        factors: Vec<ExtentExpr>,
+        bits: u8,
+    },
+    ExtentPositive {
+        extent: ExtentExpr,
+    },
+}
+
+/// The sealed CPU opcode enum: exhaustive over everything the CPU backend
+/// emits. Cranelift codegen matches it without a wildcard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CpuOpKind {
+    /// A typed constant (S-value).
+    Const {
+        value: ConstValue,
+        dtype: DType,
+    },
+    /// The retained runtime value of one runtime extent as an i32 S-value.
+    RuntimeExtent {
+        extent: RuntimeExtentId,
+    },
+    /// Write every input leaf into the tuple output binding.
+    TuplePack,
+    /// Read one leaf of a tuple binding.
+    TupleGet {
+        index: usize,
+    },
+    /// Write the two index leaves into the range output binding.
+    RangeMake,
+    /// Read the start leaf of a range binding.
+    RangeStart,
+    /// Read the end leaf of a range binding.
+    RangeEnd,
+    /// Scalar select over S-values of one dtype.
+    Select {
+        dtype: DType,
+    },
+    /// The retained extent of one axis (or its valid extent) as an i32
+    /// S-value; the extent expression is embedded.
+    ExtentOf {
+        extent: ExtentExpr,
+    },
+    ValidExtentOf {
+        extent: ExtentExpr,
+    },
+    /// Boolean not.
+    Not,
+    /// A comparison producing a bool S-value.
+    Compare {
+        op: BinaryOp,
+        left: DType,
+        right: DType,
+    },
+    /// Boolean and/or.
+    BoolBinary {
+        op: BinaryOp,
+    },
+    /// 32-bit wrapping integer unary op, reinterpreted at `dtype`.
+    IntUnary {
+        op: UnaryOp,
+        dtype: DType,
+    },
+    /// 32-bit wrapping / Euclidean integer binary op.
+    IntBinary {
+        op: BinaryOp,
+        dtype: DType,
+    },
+    /// Float arithmetic computed in binary64 and rounded once at `dtype`
+    /// (the registry reference model).
+    FloatUnary {
+        op: UnaryOp,
+        dtype: DType,
+    },
+    FloatBinary {
+        op: BinaryOp,
+        dtype: DType,
+    },
+    /// The versioned `seismic_math` software sequence: binary64 host std
+    /// evaluation rounded once — the same code path the reference
+    /// interpreter runs, so the bits agree by construction.
+    SeismicMath {
+        op: MathOp,
+        dtype: DType,
+        reference: SeismicMathReference,
+    },
+    /// Registry cast: integer↔integer preserves bits; everything else
+    /// converts by value with the destination rounding.
+    Cast {
+        source: DType,
+        target: DType,
+    },
+    /// A representation-layout view producer: the output binding aliases the
+    /// operand storage; no runtime computation.
+    LayoutAddress {
+        transform: LayoutTransform,
+    },
+    /// Checked typed element load at explicit indices over `shape`.
+    LoadElement {
+        dtype: DType,
+        shape: Vec<ExtentExpr>,
+    },
+    /// Checked typed element store at explicit indices over `shape`.
+    StoreElement {
+        dtype: DType,
+        shape: Vec<ExtentExpr>,
+    },
+    /// Uninitialized storage declaration: planned, never emitted.
+    StorageAllocation,
+    /// An arbitrary-rank linear loop over elements (or planes). For `Fill`
+    /// the constant is embedded as f64 bits.
+    LinearElementLoop {
+        op: LinearLoopOp,
+        dtype: DType,
+        shape: Vec<ExtentExpr>,
+        fill_bits: u64,
+    },
+    /// Packed decode: dense f32 elements decoded from representation planes
+    /// through the intrinsic registry.
+    PackedDecode {
+        repr: String,
+        shape: Vec<ExtentExpr>,
+    },
+    /// Raw readable representation-plane element.
+    PackedPlaneRead {
+        plane: PlaneField,
+        repr: String,
+        shape: Vec<ExtentExpr>,
+    },
+    /// One decoded element of a packed view, addressed through its
+    /// representation planes.
+    PackedElementRead {
+        repr: String,
+        shape: Vec<ExtentExpr>,
+    },
+    /// Serialized exact atomic update: load / combine / round / store.
+    SerializedAtomic {
+        op: seismic_lang::intrinsics::AtomicOp,
+        dtype: DType,
+        shape: Vec<ExtentExpr>,
+    },
+    /// Concurrent atomic update from the worker domain: a compare/exchange
+    /// loop on the element's 32-bit word (float `add` reassociates).
+    AtomicDevice {
+        op: seismic_lang::intrinsics::AtomicOp,
+        dtype: DType,
+        shape: Vec<ExtentExpr>,
+    },
+    /// A planned safety predicate: on failure it writes the first error into
+    /// its status field and skips the guarded opcode (the next one).
+    Check {
+        kind: CheckKind,
+        status: exec::StatusFieldId,
+    },
+    /// In-kernel serial loop (an ordered loop absorbed by fusion). The
+    /// binder is the launch operand position of the loop variable.
+    SerialFor {
+        binder: u16,
+        length: ExtentExpr,
+        body: Vec<CpuOp>,
+    },
+    /// Binds one launch operand position to an iteration axis coordinate
+    /// (an absorbed independent loop's binder).
+    AxisBinder {
+        position: u16,
+        axis: usize,
+    },
+    /// In-kernel conditional (an `if` absorbed by fusion). The condition is
+    /// the launch operand position of the predicate value.
+    Branch {
+        condition: u16,
+        then_ops: Vec<CpuOp>,
+        else_ops: Vec<CpuOp>,
+    },
+    /// The ordered universal reduction: ascending serial fold with registry
+    /// accumulator/identity/tie semantics; parallel outer coordinates are
+    /// the launch domain, one logical participant per output, one
+    /// publication. The `argmax` nonempty precondition is retained: a zero
+    /// length skips the fold and reports the first error.
+    ReduceFold {
+        op: ReduceOp,
+        input: DType,
+        accumulator: DType,
+        /// The dtype of the reduced result (registry rule).
+        result_dtype: DType,
+        axis: usize,
+        outer: Vec<ExtentExpr>,
+        length: ExtentExpr,
+        nonempty_precondition: bool,
+    },
+}
+
+/// One CPU opcode with its operand and result binding positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuOp {
+    pub kind: CpuOpKind,
+    /// Binding positions of the consumed node inputs, in node input order.
+    pub operands: Vec<u16>,
+    /// Binding positions the op writes (scalar slots, kernel values, or
+    /// output storage elements).
+    pub results: Vec<u16>,
+}
+
+impl CpuOp {
+    fn new(kind: CpuOpKind, operands: Vec<u16>, results: Vec<u16>) -> Self {
+        CpuOp {
+            kind,
+            operands,
+            results,
+        }
+    }
+
+    /// The opcode with re-anchored positions (used when a single-node
+    /// legalization is placed inside a fused launch).
+    fn with_positions(mut self, operands: Vec<u16>, results: Vec<u16>) -> Self {
+        self.operands = operands;
+        self.results = results;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layouts
+// ---------------------------------------------------------------------------
+
+/// A dense row-major plane, or the representation planes of one packed
+/// tensor. The template retains only semantic shape; byte strides are the
+/// canonical dense layout of each plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CpuLayoutTemplate {
+    Dense { dtype: DType, axes: Vec<ExtentExpr> },
+    Packed { repr: String, axes: Vec<ExtentExpr> },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CpuTemplateLayout {
-    TensorPlane {
-        dtype: DType,
-        shape: Vec<Sym>,
-        representation: Option<String>,
-        plane: Vec<String>,
-    },
-    ScalarSlot {
-        dtype: DType,
-        words: u32,
-    },
+pub struct CpuResolvedPlane {
+    pub name: String,
+    pub dtype: DType,
+    pub elements: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuResolvedLayout {
-    TensorPlane {
+    Dense {
         dtype: DType,
         shape: Vec<u64>,
-        representation: Option<String>,
-        plane: Vec<String>,
+        bytes: u64,
     },
-    ScalarSlot {
-        dtype: DType,
-        words: u32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum CpuTemplateInstruction {
-    Operand {
-        value: ScalarValueId,
-        operand: OperandId,
-        ty: Type,
-        transport: ValueTransportTemplate,
-    },
-    Coordinate {
-        value: ScalarValueId,
-        axis: u32,
-        component: u32,
-        components: Vec<Sym>,
-    },
-    Scalar {
-        scalar: ScalarInstruction,
-        value_types: BTreeMap<ScalarValueId, Type>,
-        views: BTreeMap<seismic_lang::logical::LocalViewId, seismic_lang::logical::LocalView>,
-    },
-    Output {
-        value: ScalarValueId,
-        operand: OperandId,
-        ty: Type,
-        transport: ValueTransportTemplate,
+    Packed {
+        repr: String,
+        values: u64,
+        planes: Vec<CpuResolvedPlane>,
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum CpuResolvedInstruction {
-    Operand {
-        value: ScalarValueId,
-        operand: OperandId,
-        ty: Type,
-        transport: exec::ResolvedValueTransport,
-    },
-    Coordinate {
-        value: ScalarValueId,
-        axis: u32,
-        component: u32,
-        components: Vec<u64>,
-    },
-    Scalar {
-        scalar: ResolvedScalarInstruction,
-        value_types: BTreeMap<ScalarValueId, Type>,
-        views: BTreeMap<seismic_lang::logical::LocalViewId, seismic_lang::logical::LocalView>,
-    },
-    Output {
-        value: ScalarValueId,
-        operand: OperandId,
-        ty: Type,
-        transport: exec::ResolvedValueTransport,
-    },
-}
-
-impl ExecutableDialect for CpuDialect {
-    type TemplateInstruction = CpuTemplateInstruction;
-    type ResolvedInstruction = CpuResolvedInstruction;
-    type TemplateLayout = CpuTemplateLayout;
-    type ResolvedLayout = CpuResolvedLayout;
-    type Capability = ScalarCapabilitySet;
-
-    fn consequences(
-        instruction: &Self::TemplateInstruction,
-    ) -> exec::InstructionConsequences<Self::Capability> {
-        match instruction {
-            CpuTemplateInstruction::Scalar { scalar, .. } => scalar.consequences().clone(),
-            CpuTemplateInstruction::Operand { transport, .. } => {
-                transport_consequences(transport, AccessMode::Read)
-            }
-            CpuTemplateInstruction::Output { transport, .. } => {
-                transport_consequences(transport, AccessMode::Write)
-            }
-            CpuTemplateInstruction::Coordinate { .. } => exec::InstructionConsequences {
-                accesses: vec![],
-                capability: None,
-                numerical: vec![],
-                resources: exec::InstructionResources::default(),
-            },
+impl CpuResolvedLayout {
+    pub fn dense_dtype(&self) -> Option<DType> {
+        match self {
+            CpuResolvedLayout::Dense { dtype, .. } => Some(*dtype),
+            CpuResolvedLayout::Packed { .. } => None,
         }
     }
+}
 
-    fn resolve_instruction(
-        instruction: &Self::TemplateInstruction,
-        symbols: &BTreeMap<String, i64>,
-        storage: &BTreeMap<StorageId, ResolvedStorageId>,
-    ) -> Result<Self::ResolvedInstruction, String> {
-        Ok(match instruction {
-            CpuTemplateInstruction::Operand {
-                value,
-                operand,
-                ty,
-                transport,
-            } => CpuResolvedInstruction::Operand {
-                value: *value,
-                operand: *operand,
-                ty: ty.clone(),
-                transport: resolve_transport(transport, storage)?,
+// ---------------------------------------------------------------------------
+// The dialect
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuDialect;
+
+impl seismic_realization::executable::sealed::Sealed for CpuDialect {}
+
+impl ExecutableDialect for CpuDialect {
+    type Op = CpuOp;
+    type LayoutTemplate = CpuLayoutTemplate;
+    type ResolvedLayout = CpuResolvedLayout;
+
+    fn legalize(p: &PhysicalPrimitive, t: &EffectiveTargetProfile) -> Legalized<CpuOp> {
+        let _ = t;
+        // Positional convention of the single-node mapping: bindings are the
+        // node's inputs followed by its outputs.
+        let input_len = u16::try_from(p.inputs.len()).unwrap_or(u16::MAX);
+        let operands = (0..input_len).collect::<Vec<_>>();
+        let results = (input_len..input_len + u16::try_from(p.results.len()).unwrap_or(0))
+            .collect::<Vec<_>>();
+        let scalar_of = |position: usize| p.inputs.get(position).and_then(scalar_dtype_of);
+        let kind = match &p.op {
+            logical::PrimitiveOp::Constant(literal) => {
+                let dtype = p
+                    .results
+                    .first()
+                    .and_then(scalar_dtype_of)
+                    .unwrap_or(DType::I32);
+                let value = match literal {
+                    Literal::Int(v) => ConstValue::Int(*v),
+                    Literal::Float(v) => ConstValue::FloatBits(v.to_bits()),
+                    Literal::Bool(v) => ConstValue::Bool(*v),
+                    Literal::ShapeParam(name) => {
+                        return Legalized::Inapplicable {
+                            reason: format!(
+                                "the shape parameter `{name}` survived specialization \
+                                 (compiler bug)"
+                            ),
+                        };
+                    }
+                };
+                CpuOpKind::Const { value, dtype }
+            }
+            logical::PrimitiveOp::RuntimeExtent(id) => CpuOpKind::RuntimeExtent { extent: *id },
+            logical::PrimitiveOp::Capability(intrinsic) => {
+                return Legalized::Inapplicable {
+                    reason: format!(
+                        "the CPU backend implements no backend intrinsic `{}`; the portable \
+                         reference body or the exact effective signature on another target \
+                         must supply this alternative",
+                        intrinsic.path()
+                    ),
+                };
+            }
+            logical::PrimitiveOp::Primitive(id) => match id {
+                PrimitiveId::TuplePack => CpuOpKind::TuplePack,
+                PrimitiveId::TupleGet(index) => CpuOpKind::TupleGet { index: *index },
+                PrimitiveId::RangeMake => CpuOpKind::RangeMake,
+                PrimitiveId::RangeStart => CpuOpKind::RangeStart,
+                PrimitiveId::RangeEnd => CpuOpKind::RangeEnd,
+                PrimitiveId::Select => CpuOpKind::Select {
+                    dtype: p
+                        .results
+                        .first()
+                        .and_then(scalar_dtype_of)
+                        .or_else(|| scalar_of(1))
+                        .unwrap_or(DType::F32),
+                },
+                PrimitiveId::Extent { axis } => CpuOpKind::ExtentOf {
+                    extent: tensor_axis(&p.inputs, 0, *axis),
+                },
+                PrimitiveId::ValidExtent { axis } => CpuOpKind::ValidExtentOf {
+                    extent: tensor_axis(&p.inputs, 0, *axis),
+                },
+                PrimitiveId::Unary(op) => match op {
+                    UnaryOp::Not => CpuOpKind::Not,
+                    UnaryOp::BitNot => CpuOpKind::IntUnary {
+                        op: *op,
+                        dtype: scalar_of(0).unwrap_or(DType::I32),
+                    },
+                    UnaryOp::Neg => {
+                        let dtype = scalar_of(0).unwrap_or(DType::I32);
+                        if dtype.is_float() {
+                            CpuOpKind::FloatUnary { op: *op, dtype }
+                        } else {
+                            CpuOpKind::IntUnary { op: *op, dtype }
+                        }
+                    }
+                },
+                PrimitiveId::Binary(op) => match op {
+                    BinaryOp::And | BinaryOp::Or => CpuOpKind::BoolBinary { op: *op },
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge => CpuOpKind::Compare {
+                        op: *op,
+                        left: scalar_of(0).unwrap_or(DType::I32),
+                        right: scalar_of(1).unwrap_or(DType::I32),
+                    },
+                    BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::BitAnd
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr => CpuOpKind::IntBinary {
+                        op: *op,
+                        dtype: scalar_of(0).unwrap_or(DType::I32),
+                    },
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem => {
+                        let left = scalar_of(0).unwrap_or(DType::I32);
+                        let right = scalar_of(1).unwrap_or(DType::I32);
+                        if left.is_float() || right.is_float() {
+                            CpuOpKind::FloatBinary {
+                                op: *op,
+                                dtype: p
+                                    .results
+                                    .first()
+                                    .and_then(scalar_dtype_of)
+                                    .unwrap_or(DType::promote(left, right).unwrap_or(left)),
+                            }
+                        } else {
+                            CpuOpKind::IntBinary {
+                                op: *op,
+                                dtype: left,
+                            }
+                        }
+                    }
+                },
+                PrimitiveId::Cast(target) => CpuOpKind::Cast {
+                    source: scalar_of(0).unwrap_or(DType::I32),
+                    target: *target,
+                },
+                PrimitiveId::Math(op) => CpuOpKind::SeismicMath {
+                    op: *op,
+                    dtype: p
+                        .results
+                        .first()
+                        .and_then(scalar_dtype_of)
+                        .or_else(|| scalar_of(0))
+                        .unwrap_or(DType::F32),
+                    reference: SeismicMathReference::current(),
+                },
+                PrimitiveId::TensorAlloc { .. } => CpuOpKind::StorageAllocation,
+                PrimitiveId::Fill { value, dtype } => CpuOpKind::LinearElementLoop {
+                    op: LinearLoopOp::Fill,
+                    dtype: *dtype,
+                    shape: tensor_axes(&p.inputs, 0),
+                    fill_bits: value.to_bits(),
+                },
+                PrimitiveId::Materialize => CpuOpKind::LinearElementLoop {
+                    op: LinearLoopOp::Materialize,
+                    dtype: dense_dtype(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                    fill_bits: 0,
+                },
+                PrimitiveId::Clone => CpuOpKind::LinearElementLoop {
+                    op: LinearLoopOp::Clone,
+                    dtype: dense_dtype(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                    fill_bits: 0,
+                },
+                PrimitiveId::Load => CpuOpKind::LinearElementLoop {
+                    op: LinearLoopOp::Load,
+                    dtype: dense_dtype(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                    fill_bits: 0,
+                },
+                PrimitiveId::Decode => CpuOpKind::PackedDecode {
+                    repr: packed_repr(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                },
+                PrimitiveId::PackedRead(plane) => CpuOpKind::PackedPlaneRead {
+                    plane: *plane,
+                    repr: packed_repr(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                },
+                PrimitiveId::Transpose => CpuOpKind::LayoutAddress {
+                    transform: LayoutTransform::Transpose,
+                },
+                PrimitiveId::Reshape => CpuOpKind::LayoutAddress {
+                    transform: LayoutTransform::Reshape,
+                },
+                PrimitiveId::SliceView { .. } => CpuOpKind::LayoutAddress {
+                    transform: LayoutTransform::Slice,
+                },
+                PrimitiveId::ElementRead { .. } => {
+                    if p.inputs.first().is_some_and(|ty| {
+                        matches!(
+                            ty,
+                            ValueType::Tensor(TensorType {
+                                elem: Elem::Repr(_),
+                                ..
+                            })
+                        )
+                    }) {
+                        CpuOpKind::PackedElementRead {
+                            repr: packed_repr(&p.inputs, 0),
+                            shape: tensor_axes(&p.inputs, 0),
+                        }
+                    } else {
+                        CpuOpKind::LoadElement {
+                            dtype: dense_dtype(&p.inputs, 0),
+                            shape: tensor_axes(&p.inputs, 0),
+                        }
+                    }
+                }
+                PrimitiveId::ElementWrite { .. } => CpuOpKind::StoreElement {
+                    dtype: dense_dtype(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                },
+                PrimitiveId::CopyInto => CpuOpKind::LinearElementLoop {
+                    op: LinearLoopOp::Copy,
+                    dtype: dense_dtype(&p.inputs, 0),
+                    shape: tensor_axes(&p.inputs, 0),
+                    fill_bits: 0,
+                },
+                PrimitiveId::Atomic { op, .. } => CpuOpKind::SerializedAtomic {
+                    op: *op,
+                    dtype: scalar_value_dtype(&p.inputs),
+                    shape: tensor_axes(&p.inputs, 0),
+                },
+                PrimitiveId::Reduce { op, .. } => {
+                    return Legalized::Inapplicable {
+                        reason: format!(
+                            "the `{}` reduction reached scalar legalization (compiler bug); \
+                             reductions are ReductionNodes consumed by map_reduction",
+                            op.name()
+                        ),
+                    };
+                }
             },
-            CpuTemplateInstruction::Coordinate {
-                value,
-                axis,
-                component,
-                components,
-            } => CpuResolvedInstruction::Coordinate {
-                value: *value,
-                axis: *axis,
-                component: *component,
-                components: components
-                    .iter()
-                    .map(|extent| {
-                        u64::try_from(extent.eval(&|name| symbols.get(name).copied()).ok_or_else(
-                            || format!("unresolved CPU coordinate extent `{extent}`"),
-                        )?)
-                        .map_err(|_| "CPU coordinate extent is negative".to_string())
-                    })
-                    .collect::<Result<_, _>>()?,
-            },
-            CpuTemplateInstruction::Scalar {
-                scalar,
-                value_types,
-                views,
-            } => CpuResolvedInstruction::Scalar {
-                scalar: terminal::resolve_scalar_instruction(scalar, symbols, storage)?,
-                value_types: value_types.clone(),
-                views: views.clone(),
-            },
-            CpuTemplateInstruction::Output {
-                value,
-                operand,
-                ty,
-                transport,
-            } => CpuResolvedInstruction::Output {
-                value: *value,
-                operand: *operand,
-                ty: ty.clone(),
-                transport: resolve_transport(transport, storage)?,
-            },
-        })
+        };
+        Legalized::Ops(
+            NonEmpty::new(vec![CpuOp::new(kind, operands, results)]).expect("one opcode"),
+        )
+    }
+
+    fn consequences(op: &CpuOp) -> PhysicalConsequences {
+        // Exact hard resources of the universal mapping: no private or
+        // workgroup bytes (large aggregates are planned arena/worker storage,
+        // never implicit stack arrays), bounded code shape, no capability,
+        // exact `direct_bindings`. The native contract is honest about
+        // Cranelift: register allocation is opaque, so the admissible domain
+        // admits any reflected maximum resident participant count of at
+        // least one, and the resolved geometry `min(preferred, native_max)`
+        // always keeps a resident participant.
+        let mut consequences = universal_consequences(1, 0);
+        // Uncalibrated CPU cost: ranking only, never legality.
+        consequences.cost = exec::CostEstimate(match &op.kind {
+            CpuOpKind::SeismicMath { .. } => 8,
+            CpuOpKind::StorageAllocation | CpuOpKind::LayoutAddress { .. } => 0,
+            // A compare/exchange round trip; contention is not modelled.
+            CpuOpKind::AtomicDevice { .. } => 4,
+            _ => 1,
+        });
+        // A concurrent float `add` combines in a data-dependent order.
+        if let CpuOpKind::AtomicDevice {
+            op: seismic_lang::intrinsics::AtomicOp::Add,
+            dtype: DType::F32,
+            ..
+        } = &op.kind
+        {
+            consequences.numerical =
+                seismic_realization::numerics::NumericalTransfer::Reassociate {
+                    op: ReduceOp::Sum,
+                    topology: seismic_realization::numerics::ReductionTopology::SerialAxis {
+                        axis: 0,
+                        length: ExtentExpr::Static(0),
+                    },
+                };
+        }
+        if let CpuOpKind::SeismicMath { reference, .. } = &op.kind {
+            debug_assert_eq!(
+                (reference.identity, reference.version),
+                (
+                    terminal::SEISMIC_MATH.identity,
+                    terminal::SEISMIC_MATH.version
+                ),
+                "a math opcode must reference the current seismic_math version"
+            );
+        }
+        consequences
+    }
+
+    fn public_layout(tensor: &TensorType) -> CpuLayoutTemplate {
+        layout_of(tensor)
+    }
+
+    fn internal_layout(tensor: &TensorType) -> CpuLayoutTemplate {
+        layout_of(tensor)
+    }
+
+    /// Layout template for a staged raw-byte workgroup/participant
+    /// allocation: a word-aligned byte blob. The universal CPU strategy
+    /// declares none; optimized CPU strategies may stage worker scratch
+    /// through it.
+    fn staged_layout(bytes: &seismic_lang::sym::Sym, alignment: u64) -> CpuLayoutTemplate {
+        let words = bytes
+            .clone()
+            .add(&Sym::constant(
+                i64::try_from(alignment.max(1) * 4 - 1).unwrap_or(3),
+            ))
+            .quot(&Sym::constant(4));
+        CpuLayoutTemplate::Dense {
+            dtype: DType::U32,
+            axes: vec![ExtentExpr::Sym(words)],
+        }
     }
 
     fn resolve_layout(
-        layout: &Self::TemplateLayout,
-        symbols: &BTreeMap<String, i64>,
-    ) -> Result<Self::ResolvedLayout, String> {
+        layout: &CpuLayoutTemplate,
+        values: &PlanValues,
+    ) -> Result<CpuResolvedLayout, InvariantReport> {
+        let extent = |expr: &ExtentExpr| -> Result<u64, InvariantReport> {
+            match expr {
+                ExtentExpr::Static(n) => Ok(*n),
+                ExtentExpr::Sym(sym) => values.eval(sym),
+                ExtentExpr::Runtime(_) => Err(InvariantReport(
+                    "a runtime extent survived into a resolved layout".into(),
+                )),
+            }
+        };
         Ok(match layout {
-            CpuTemplateLayout::TensorPlane {
-                dtype,
-                shape,
-                representation,
-                plane,
-            } => {
-                CpuResolvedLayout::TensorPlane {
+            CpuLayoutTemplate::Dense { dtype, axes } => {
+                let mut shape = Vec::with_capacity(axes.len());
+                let mut elements = 1u64;
+                for axis in axes {
+                    let n = extent(axis)?;
+                    shape.push(n);
+                    elements = elements.checked_mul(n).ok_or_else(|| {
+                        InvariantReport("dense layout element total overflows".into())
+                    })?;
+                }
+                let bytes = elements
+                    .checked_mul(u64::from(dtype.bytes()))
+                    .ok_or_else(|| InvariantReport("dense layout bytes overflow".into()))?;
+                CpuResolvedLayout::Dense {
                     dtype: *dtype,
-                    shape: shape
-                        .iter()
-                        .map(|extent| {
-                            u64::try_from(
-                                extent.eval(&|name| symbols.get(name).copied()).ok_or_else(
-                                    || format!("unresolved CPU layout extent `{extent}`"),
-                                )?,
-                            )
-                            .map_err(|_| "CPU layout extent is negative".to_string())
-                        })
-                        .collect::<Result<_, _>>()?,
-                    representation: representation.clone(),
-                    plane: plane.clone(),
+                    shape,
+                    bytes,
                 }
             }
-            CpuTemplateLayout::ScalarSlot { dtype, words } => CpuResolvedLayout::ScalarSlot {
-                dtype: *dtype,
-                words: *words,
-            },
+            CpuLayoutTemplate::Packed { repr: name, axes } => {
+                let representation = repr::lookup(name)
+                    .ok_or_else(|| InvariantReport(format!("unknown representation `{name}`")))?;
+                let mut count = 1u64;
+                for axis in axes {
+                    count = count.checked_mul(extent(axis)?).ok_or_else(|| {
+                        InvariantReport("packed layout element total overflows".into())
+                    })?;
+                }
+                let mut planes = Vec::new();
+                for plane in representation.planes() {
+                    let elements = plane.storage_elements(count).ok_or_else(|| {
+                        InvariantReport(format!(
+                            "plane `{}` element total overflows for `{name}`",
+                            plane.name
+                        ))
+                    })?;
+                    let bytes = plane.bytes(count).ok_or_else(|| {
+                        InvariantReport(format!(
+                            "plane `{}` byte total overflows for `{name}`",
+                            plane.name
+                        ))
+                    })?;
+                    planes.push(CpuResolvedPlane {
+                        name: plane.name.to_string(),
+                        dtype: plane.dtype(),
+                        elements,
+                        bytes,
+                    });
+                }
+                CpuResolvedLayout::Packed {
+                    repr: name.clone(),
+                    values: count,
+                    planes,
+                }
+            }
         })
     }
 }
 
-fn transport_consequences(
-    transport: &ValueTransportTemplate,
-    mode: AccessMode,
-) -> exec::InstructionConsequences<ScalarCapabilitySet> {
-    let mut accesses = Vec::new();
-    fn collect(
-        value: &ValueTransportTemplate,
-        mode: AccessMode,
-        out: &mut Vec<exec::PhysicalAccess>,
-    ) {
-        match value {
-            ValueTransportTemplate::Void => {}
-            ValueTransportTemplate::Kernel(_) => {}
-            ValueTransportTemplate::Storage(values) => {
-                out.extend(values.iter().map(|storage| exec::PhysicalAccess {
-                    storage: *storage,
-                    mode,
-                }))
-            }
-            ValueTransportTemplate::Tuple(values) => {
-                for value in values.iter() {
-                    collect(value, mode, out);
-                }
-            }
-        }
-    }
-    collect(transport, mode, &mut accesses);
-    exec::InstructionConsequences {
-        accesses,
-        capability: None,
-        numerical: vec![],
-        resources: exec::InstructionResources::default(),
-    }
-}
-
-fn resolve_transport(
-    transport: &ValueTransportTemplate,
-    storage: &BTreeMap<StorageId, ResolvedStorageId>,
-) -> Result<exec::ResolvedValueTransport, String> {
-    Ok(match transport {
-        ValueTransportTemplate::Void => exec::ResolvedValueTransport::Void,
-        ValueTransportTemplate::Kernel(value) => {
-            return Err(format!(
-                "CPU instruction directly references unresolved kernel value#{}",
-                value.0
-            ));
-        }
-        ValueTransportTemplate::Storage(values) => {
-            exec::ResolvedValueTransport::Storage(map_nonempty(values, |id| {
-                storage
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| format!("CPU transport names absent storage#{}", id.0))
-            })?)
-        }
-        ValueTransportTemplate::Tuple(values) => {
-            exec::ResolvedValueTransport::Tuple(map_nonempty(values, |value| {
-                resolve_transport(value, storage).map(Box::new)
-            })?)
-        }
-    })
-}
-
-fn map_nonempty<T, U>(
-    values: &NonEmpty<T>,
-    mut map: impl FnMut(&T) -> Result<U, String>,
-) -> Result<NonEmpty<U>, String> {
-    let mut values = values.iter();
-    let mut result = NonEmpty::new(map(values.next().expect("NonEmpty invariant"))?);
-    for value in values {
-        result.push(map(value)?);
-    }
-    Ok(result)
-}
-
-pub fn capability_fingerprint(limits: &super::mapping::Limits) -> String {
-    format!(
-        "seismic-cpu-executable-v2:{}:workers={}:scratch={}",
-        std::env::consts::ARCH,
-        limits.workers,
-        limits.max_scratch_bytes
-    )
-}
-
-pub fn target_profile(
-    limits: &super::mapping::Limits,
-) -> ExecutableTargetProfile<ScalarCapabilitySet> {
-    ExecutableTargetProfile {
-        target: super::mapping::TARGET.into(),
-        capability_fingerprint: capability_fingerprint(limits),
-        toolchain_fingerprint: format!(
-            "cranelift-{}-{}",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::ARCH
-        ),
-        capabilities: BTreeSet::from([ScalarCapabilitySet::default()]),
-        limits: ExecutableTargetLimits {
-            max_allocation_bytes: u64::MAX,
-            max_device_bytes: u64::MAX,
-            max_workgroup_bytes: 0,
-            max_private_bytes_per_participant: limits.max_scratch_bytes,
-            max_bindings_per_launch: u64::MAX,
-            max_registers_per_kernel: u64::MAX,
-            max_workgroups: [u64::MAX, 1, 1],
-            max_participants_per_workgroup: 1,
+fn layout_of(tensor: &TensorType) -> CpuLayoutTemplate {
+    match &tensor.elem {
+        Elem::Dtype(dtype) => CpuLayoutTemplate::Dense {
+            dtype: *dtype,
+            axes: tensor.axes.clone(),
+        },
+        Elem::Repr(name) => CpuLayoutTemplate::Packed {
+            repr: name.clone(),
+            axes: tensor.axes.clone(),
+        },
+        // An unresolved element parameter reads as f32 (the registry's
+        // portable-scope rule); specialization resolves it before layouts.
+        Elem::Param(_) => CpuLayoutTemplate::Dense {
+            dtype: DType::F32,
+            axes: tensor.axes.clone(),
         },
     }
 }
 
-struct GraphStorage<'a> {
-    program: &'a LogicalProgram,
-    graph: &'a LogicalTaskGraph,
-    next_storage: u32,
-    next_kernel_value: u32,
-    templates: Vec<(Option<OperandId>, StorageTemplate<CpuDialect>)>,
-    storage: BTreeMap<StorageRef, ValueTransportTemplate>,
-    operands: BTreeMap<OperandId, ValueTransportTemplate>,
-}
-
-impl<'a> GraphStorage<'a> {
-    fn new(program: &'a LogicalProgram, graph: &'a LogicalTaskGraph) -> Self {
-        Self {
-            program,
-            graph,
-            next_storage: 0,
-            next_kernel_value: 0,
-            templates: vec![],
-            storage: BTreeMap::new(),
-            operands: BTreeMap::new(),
-        }
-    }
-
-    fn build(mut self) -> Result<Self, String> {
-        for (port, input) in self.graph.inputs.iter().enumerate() {
-            if let Type::Tensor(tensor) = &input.ty {
-                let storage = StorageRef::Input {
-                    port: port as u32,
-                    path: Vec::new(),
-                };
-                let transport = self.allocate_tensor(tensor, Some(storage.clone()), None)?;
-                self.storage.insert(storage, transport);
-            }
-        }
-        for (port, result) in self.graph.results.iter().enumerate() {
-            if let Type::Tensor(tensor) = &result.ty {
-                let storage = StorageRef::Result {
-                    port: port as u32,
-                    path: Vec::new(),
-                };
-                let transport = self.allocate_tensor(tensor, Some(storage.clone()), None)?;
-                self.storage.insert(storage, transport);
-            }
-        }
-        let aggregate_results = self
-            .graph
-            .calls
-            .iter()
-            .filter(|call| !call.outputs.contains(&call.result))
-            .map(|call| call.result)
-            .collect::<BTreeSet<_>>();
-        for operand in &self.graph.operands {
-            if aggregate_results.contains(&operand.id) {
-                continue;
-            }
-            let inferred_storage =
-                operand
-                    .storage
-                    .clone()
-                    .or_else(|| match (&operand.value, &operand.ty) {
-                        (ValueRef::Input(port), Type::Tensor(_)) => self
-                            .graph
-                            .inputs
-                            .get(*port as usize)
-                            .map(|_| StorageRef::Input {
-                                port: *port,
-                                path: Vec::new(),
-                            }),
-                        (ValueRef::Result(port), Type::Tensor(_)) => self
-                            .graph
-                            .results
-                            .get(*port as usize)
-                            .map(|_| StorageRef::Result {
-                                port: *port,
-                                path: Vec::new(),
-                            }),
-                        _ => None,
-                    });
-            let transport = if let Some(storage) = &inferred_storage {
-                if let Some(existing) = self.storage.get(storage) {
-                    let existing = existing.clone();
-                    existing
-                } else {
-                    let transport = self.allocate_type(
-                        &operand.ty,
-                        Some(storage.clone()),
-                        Some(operand.id),
-                        &[],
-                    )?;
-                    self.storage.insert(storage.clone(), transport.clone());
-                    transport
-                }
-            } else {
-                self.allocate_type(&operand.ty, None, Some(operand.id), &[])?
-            };
-            self.operands.insert(operand.id, transport);
-        }
-        for call in &self.graph.calls {
-            if !aggregate_results.contains(&call.result) {
-                continue;
-            }
-            let ty = &self
-                .graph
-                .operand(call.result)
-                .ok_or("call aggregate operand is absent")?
-                .ty;
-            let mut leaves = call.outputs.iter();
-            let transport = aggregate_transport(ty, &mut leaves, &self.operands)?;
-            if leaves.next().is_some() {
-                return Err("call result has more physical leaves than its aggregate type".into());
-            }
-            self.operands.insert(call.result, transport);
-        }
-        for (ordinal, local) in self.graph.storage.iter().enumerate() {
-            let storage = StorageRef::Local(seismic_lang::logical::LocalStorageId(ordinal as u32));
-            if !self.storage.contains_key(&storage) {
-                let transport = self.allocate_tensor(&local.ty, Some(storage.clone()), None)?;
-                self.storage.insert(storage, transport);
-            }
-        }
-        Ok(self)
-    }
-
-    fn allocate_type(
-        &mut self,
-        ty: &Type,
-        logical: Option<StorageRef>,
-        operand: Option<OperandId>,
-        path: &[u32],
-    ) -> Result<ValueTransportTemplate, String> {
-        match ty {
-            Type::Tuple(fields) => {
-                let mut values = fields
-                    .iter()
-                    .enumerate()
-                    .map(|(index, field)| {
-                        let mut child = path.to_vec();
-                        child.push(index as u32);
-                        self.allocate_type(field, None, operand, &child)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(ValueTransportTemplate::Tuple(nonempty(
-                    values.drain(..).map(Box::new),
-                )?))
-            }
-            Type::Tensor(tensor) => self.allocate_tensor(tensor, logical, operand),
-            Type::Scalar(dtype) => self.allocate_scalar(*dtype, 1, operand, path),
-            Type::Index { .. } => self.allocate_scalar(DType::I32, 1, operand, path),
-            Type::Range { .. } => self.allocate_scalar(DType::I32, 2, operand, path),
-            Type::CapabilityValue { .. } => {
-                let value = KernelValueId(self.next_kernel_value);
-                self.next_kernel_value += 1;
-                Ok(ValueTransportTemplate::Kernel(value))
-            }
-            Type::Void => Ok(ValueTransportTemplate::Void),
-        }
-    }
-
-    fn allocate_scalar(
-        &mut self,
-        dtype: DType,
-        words: u32,
-        operand: Option<OperandId>,
-        path: &[u32],
-    ) -> Result<ValueTransportTemplate, String> {
-        let id = self.fresh_storage();
-        let bytes = u64::from(words) * 8;
-        let abi = operand.and_then(|operand| {
-            self.graph
-                .operand(operand)
-                .and_then(|operand| match operand.value {
-                    ValueRef::Input(ordinal) => Some(AbiRole::Parameter {
-                        ordinal,
-                        path: path.to_vec(),
-                        representation_plane: None,
-                    }),
-                    ValueRef::Result(ordinal) => Some(AbiRole::Result {
-                        ordinal,
-                        path: path.to_vec(),
-                        representation_plane: None,
-                    }),
-                    ValueRef::Local(_) => None,
-                })
-        });
-        let scope = if abi.is_some() {
-            StorageScope::External
-        } else {
-            StorageScope::Device
-        };
-        self.templates.push((
-            operand,
-            StorageTemplate {
-                id,
-                scope,
-                replication: Replication::Once,
-                bytes: Sym::constant(i64::try_from(bytes).unwrap()),
-                alignment: 8,
-                layout: CpuTemplateLayout::ScalarSlot { dtype, words },
-                provenance: PhysicalStorageProvenance {
-                    logical_storage: None,
-                    operand,
-                    view: None,
-                    subrange: PhysicalSubrangeTemplate {
-                        byte_offset: Sym::constant(0),
-                        bytes: Sym::constant(i64::try_from(bytes).unwrap()),
-                    },
-                    address: PhysicalAddressTemplate::DenseAffine {
-                        byte_offset: Sym::constant(0),
-                        byte_strides: vec![],
-                    },
-                    abi,
-                },
-            },
-        ));
-        Ok(ValueTransportTemplate::Storage(NonEmpty::new(id)))
-    }
-
-    fn allocate_tensor(
-        &mut self,
-        tensor: &TensorType,
-        logical: Option<StorageRef>,
-        operand: Option<OperandId>,
-    ) -> Result<ValueTransportTemplate, String> {
-        let shape = tensor
-            .shape
-            .iter()
-            .map(|extent| capacity(self.program, extent))
-            .collect::<Vec<_>>();
-        let elements = shape
-            .iter()
-            .fold(Sym::constant(1), |total, extent| total.mul(extent));
-        let mut planes = Vec::new();
-        match &tensor.elem {
-            Elem::Dtype(dtype) => planes.push((Vec::new(), *dtype, elements.clone(), None)),
-            Elem::Repr(name) => {
-                let representation =
-                    repr::lookup(name).ok_or_else(|| format!("unknown representation `{name}`"))?;
-                for plane in representation.planes() {
-                    planes.push((
-                        vec![plane.name.to_string()],
-                        plane.dtype(),
-                        plane.extent(&elements),
-                        Some(name.clone()),
-                    ));
-                }
-            }
-            Elem::Param(name) => return Err(format!("unresolved CPU element parameter `{name}`")),
-        }
-        let mut ids = Vec::new();
-        for (plane, dtype, plane_elements, representation) in planes {
-            let id = self.fresh_storage();
-            let bytes = plane_elements.scale(i64::from(dtype.bytes()));
-            let (scope, abi) = match &logical {
-                Some(StorageRef::Input { port, .. }) => (
-                    StorageScope::External,
-                    Some(AbiRole::Parameter {
-                        ordinal: *port,
-                        path: self
-                            .graph
-                            .inputs
-                            .get(*port as usize)
-                            .map(|input| input.path.clone())
-                            .ok_or("CPU input ABI port is absent")?,
-                        representation_plane: plane.first().cloned(),
-                    }),
-                ),
-                Some(StorageRef::Result { port, .. }) => (
-                    StorageScope::External,
-                    Some(AbiRole::Result {
-                        ordinal: *port,
-                        path: self
-                            .graph
-                            .results
-                            .get(*port as usize)
-                            .map(|result| result.path.clone())
-                            .ok_or("CPU result ABI port is absent")?,
-                        representation_plane: plane.first().cloned(),
-                    }),
-                ),
-                Some(StorageRef::Local(_)) | None => (StorageScope::Device, None),
-            };
-            let strides = dense_byte_strides(&shape, dtype)?;
-            self.templates.push((
-                operand,
-                StorageTemplate {
-                    id,
-                    scope,
-                    replication: Replication::Once,
-                    bytes: bytes.clone(),
-                    alignment: u64::from(dtype.bytes()),
-                    layout: CpuTemplateLayout::TensorPlane {
-                        dtype,
-                        shape: shape.clone(),
-                        representation: representation.clone(),
-                        plane: plane.clone(),
-                    },
-                    provenance: PhysicalStorageProvenance {
-                        logical_storage: logical.clone(),
-                        operand,
-                        view: None,
-                        subrange: PhysicalSubrangeTemplate {
-                            byte_offset: Sym::constant(0),
-                            bytes,
-                        },
-                        address: if let Some(representation) = representation {
-                            PhysicalAddressTemplate::Representation {
-                                representation,
-                                plane: plane.join("."),
-                                logical_strides: dense_logical_strides(&shape),
-                            }
-                        } else {
-                            PhysicalAddressTemplate::DenseAffine {
-                                byte_offset: Sym::constant(0),
-                                byte_strides: strides,
-                            }
-                        },
-                        abi,
-                    },
-                },
-            ));
-            ids.push(id);
-        }
-        Ok(ValueTransportTemplate::Storage(nonempty(ids.into_iter())?))
-    }
-
-    fn fresh_storage(&mut self) -> StorageId {
-        let id = StorageId(self.next_storage);
-        self.next_storage += 1;
-        id
-    }
-}
-
-fn aggregate_transport<'a>(
-    ty: &Type,
-    leaves: &mut impl Iterator<Item = &'a OperandId>,
-    operands: &BTreeMap<OperandId, ValueTransportTemplate>,
-) -> Result<ValueTransportTemplate, String> {
+fn scalar_dtype_of(ty: &ValueType) -> Option<DType> {
     match ty {
-        Type::Void => Ok(ValueTransportTemplate::Void),
-        Type::Tuple(fields) => Ok(ValueTransportTemplate::Tuple(nonempty(
-            fields
-                .iter()
-                .map(|field| aggregate_transport(field, leaves, operands).map(Box::new))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter(),
-        )?)),
-        _ => {
-            let operand = leaves.next().ok_or_else(|| {
-                format!("call result has fewer physical leaves than aggregate field `{ty:?}`")
-            })?;
-            operands
-                .get(operand)
-                .cloned()
-                .ok_or_else(|| format!("call result leaf operand#{} is absent", operand.0))
+        ValueType::Scalar(d) => Some(*d),
+        ValueType::Index { .. } => Some(DType::I32),
+        _ => None,
+    }
+}
+
+fn tensor_of(inputs: &[ValueType], position: usize) -> Option<&TensorType> {
+    inputs.get(position).and_then(|ty| match ty {
+        ValueType::Tensor(tensor) => Some(tensor),
+        _ => None,
+    })
+}
+
+fn tensor_axes(inputs: &[ValueType], position: usize) -> Vec<ExtentExpr> {
+    tensor_of(inputs, position)
+        .map(|t| t.axes.clone())
+        .unwrap_or_default()
+}
+
+fn tensor_axis(inputs: &[ValueType], position: usize, axis: usize) -> ExtentExpr {
+    tensor_of(inputs, position)
+        .and_then(|t| t.axes.get(axis).cloned())
+        .unwrap_or(ExtentExpr::Static(0))
+}
+
+fn dense_dtype(inputs: &[ValueType], position: usize) -> DType {
+    tensor_of(inputs, position)
+        .map(|t| match &t.elem {
+            Elem::Dtype(d) => *d,
+            _ => DType::F32,
+        })
+        .unwrap_or(DType::F32)
+}
+
+fn packed_repr(inputs: &[ValueType], position: usize) -> String {
+    tensor_of(inputs, position)
+        .and_then(|t| match &t.elem {
+            Elem::Repr(name) => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The dtype of the added value of an atomic: the scalar (non-index) input.
+fn scalar_value_dtype(inputs: &[ValueType]) -> DType {
+    inputs
+        .iter()
+        .find_map(|ty| match ty {
+            ValueType::Scalar(d) => Some(*d),
+            _ => None,
+        })
+        .unwrap_or(DType::F32)
+}
+
+// ---------------------------------------------------------------------------
+// Universal CPU strategies over the common builder
+// ---------------------------------------------------------------------------
+
+/// How one component entry contributes to the fused launch.
+enum EntryKind {
+    /// A formed primitive node.
+    Primitive,
+    /// An absorbed independent loop: its axis joins the launch domain, its
+    /// node is consumed by the fusion, and it contributes no opcode.
+    Axis { binder: GraphValueId },
+    /// An absorbed ordered loop: an in-kernel serial frame around its body.
+    SerialLoop {
+        binder: GraphValueId,
+        length: ExtentExpr,
+        body: Vec<ComponentEntry>,
+    },
+    /// An absorbed conditional: an in-kernel branch around its arm bodies.
+    Branch {
+        condition: GraphValueId,
+        then_body: Vec<ComponentEntry>,
+        else_body: Vec<ComponentEntry>,
+    },
+}
+
+struct ComponentEntry {
+    node: NodeRef,
+    logical: LogicalNode,
+    formed: Option<terminal::FormedPrimitive>,
+    kind: EntryKind,
+}
+
+/// How a launch containing `atomic` updates is realized on the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicMapping {
+    /// The universal form: one worker traverses the launch domain and every
+    /// update is the exact load/combine/round/store in visit order.
+    Serialized,
+    /// The concurrent form: the worker pool traverses the domain and every
+    /// update is a compare/exchange loop on the element's 32-bit word.
+    /// Float `add` reassociates.
+    Device,
+}
+
+struct Strategy {
+    facts: GraphFacts,
+    runtime_extents: BTreeMap<RuntimeExtentId, RuntimeExtent>,
+    participants: Sym,
+    atomics: AtomicMapping,
+}
+
+/// Whether the graph updates storage atomically anywhere, every such update
+/// on a 32-bit element (the device-atomic alternative is then constructed).
+fn atomics_admitted(graph: &TaskGraph, facts: &GraphFacts) -> bool {
+    fn walk(region: &GraphRegion, facts: &GraphFacts, found: &mut bool, admitted: &mut bool) {
+        for node in region.nodes.iter() {
+            match &node.kind {
+                LogicalNodeKind::Primitive(application) => {
+                    if let PrimitiveOp::Primitive(PrimitiveId::Atomic { .. }) = &application.op {
+                        *found = true;
+                        let dtype = node
+                            .inputs
+                            .last()
+                            .and_then(|value| facts.types.get(value))
+                            .and_then(|ty| ty.scalar_dtype());
+                        if !matches!(dtype, Some(DType::F32 | DType::I32 | DType::U32)) {
+                            *admitted = false;
+                        }
+                    }
+                }
+                LogicalNodeKind::Loop(inner) => walk(&inner.body, facts, found, admitted),
+                LogicalNodeKind::If(inner) => {
+                    walk(&inner.then_region, facts, found, admitted);
+                    walk(&inner.else_region, facts, found, admitted);
+                }
+                _ => {}
+            }
         }
     }
+    let mut found = false;
+    let mut admitted = true;
+    walk(&graph.root, facts, &mut found, &mut admitted);
+    found && admitted
 }
 
-fn nonempty<T>(mut values: impl Iterator<Item = T>) -> Result<NonEmpty<T>, String> {
-    let head = values.next().ok_or("physical bundle is empty")?;
-    let mut result = NonEmpty::new(head);
-    for value in values {
-        result.push(value);
-    }
-    Ok(result)
+/// Whether any entry of a fused launch (at any nesting) is an atomic update.
+fn entries_update_atomically(entries: &[ComponentEntry]) -> bool {
+    entries.iter().any(|entry| match &entry.kind {
+        EntryKind::Primitive => matches!(
+            &entry.logical.kind,
+            LogicalNodeKind::Primitive(application)
+                if matches!(application.op, PrimitiveOp::Primitive(PrimitiveId::Atomic { .. }))
+        ),
+        EntryKind::Axis { .. } => false,
+        EntryKind::SerialLoop { body, .. } => entries_update_atomically(body),
+        EntryKind::Branch {
+            then_body,
+            else_body,
+            ..
+        } => entries_update_atomically(then_body) || entries_update_atomically(else_body),
+    })
 }
 
-fn capacity(program: &LogicalProgram, value: &Sym) -> Sym {
-    value
-        .as_constant()
-        .or_else(|| program.extent_capacity(value))
-        .map(Sym::constant)
-        .unwrap_or_else(|| value.clone())
-}
-
-fn dense_logical_strides(shape: &[Sym]) -> Vec<Sym> {
-    let mut stride = Sym::constant(1);
-    let mut result = vec![Sym::constant(1); shape.len()];
-    for (axis, extent) in shape.iter().enumerate().rev() {
-        result[axis] = stride.clone();
-        stride = stride.mul(extent);
-    }
-    result
-}
-
-fn dense_byte_strides(shape: &[Sym], dtype: DType) -> Result<Vec<Sym>, String> {
-    Ok(dense_logical_strides(shape)
-        .into_iter()
-        .map(|stride| stride.scale(i64::from(dtype.bytes())))
-        .collect())
-}
-
-fn task_order(graph: &LogicalTaskGraph) -> Result<Vec<LogicalEndpoint>, String> {
-    let mut nodes = graph
-        .tasks
-        .iter()
-        .map(|task| LogicalEndpoint::Task(task.id))
-        .chain(
-            graph
-                .calls
-                .iter()
-                .map(|call| LogicalEndpoint::Call(call.id)),
-        )
-        .collect::<BTreeSet<_>>();
-    let mut order = Vec::new();
-    while !nodes.is_empty() {
-        let next = nodes
-            .iter()
-            .find(|candidate| {
-                graph.dependencies.iter().all(|dependency| {
-                    dependency.to != **candidate || !nodes.contains(&dependency.from)
-                })
-            })
-            .copied()
-            .ok_or("logical task graph contains a cycle")?;
-        nodes.remove(&next);
-        order.push(next);
-    }
-    Ok(order)
-}
-
-fn elaborate_graph(
-    program: &LogicalProgram,
-    graph: &LogicalTaskGraph,
-    limits: &super::mapping::Limits,
-) -> Result<exec::PlanAlternative<CpuDialect>, String> {
-    let storage = GraphStorage::new(program, graph).build()?;
-    let mut builder = ScheduleBuilder::new(graph)?;
-    for (operand, template) in &storage.templates {
-        if let Some(operand) = operand {
-            builder.add_operand_storage(*operand, template.clone())?;
-        } else if let Some(StorageRef::Input { port, .. }) = &template.provenance.logical_storage {
-            builder.add_input_storage(*port, template.clone())?;
-        } else if let Some(StorageRef::Result { port, .. }) = &template.provenance.logical_storage {
-            builder.add_result_storage(*port, template.clone())?;
-        } else if let Some(logical) = &template.provenance.logical_storage {
-            builder.add_effect_storage(logical.clone(), template.clone())?;
-        } else {
-            builder.add_invocation_storage(template.clone())?;
-        }
-    }
-    for (port, input) in graph.inputs.iter().enumerate() {
-        let port = port as u32;
-        let transport = if let Some(operand) = graph
-            .operands
-            .iter()
-            .find(|operand| matches!(operand.value, ValueRef::Input(value) if value == port))
-        {
-            storage.operands[&operand.id].clone()
-        } else if matches!(input.ty, Type::Void) {
-            ValueTransportTemplate::Void
-        } else {
-            storage
-                .storage
-                .get(&StorageRef::Input {
-                    port,
-                    path: Vec::new(),
-                })
-                .cloned()
-                .ok_or_else(|| format!("CPU input port#{port} has no physical transport"))?
-        };
-        let obligation = builder.input(port)?;
-        builder.bind_input(obligation, transport)?;
-    }
-
-    let mut scalar_values = BTreeMap::<ValueBindingKey, ScalarValueId>::new();
-    let mut operand_values = BTreeMap::<OperandId, ScalarValueId>::new();
-    let mut next_value = 0u32;
-    for port in 0..graph.inputs.len() as u32 {
-        scalar_values.insert(ValueBindingKey::Input(port), ScalarValueId(next_value));
-        next_value += 1;
-    }
-    for port in 0..graph.results.len() as u32 {
-        scalar_values.insert(ValueBindingKey::Result(port), ScalarValueId(next_value));
-        next_value += 1;
-    }
-    for operand in &graph.operands {
-        let value = scalar_values
-            .entry(ValueBindingKey::from(&operand.value))
-            .or_insert_with(|| {
-                let value = ScalarValueId(next_value);
-                next_value += 1;
-                value
-            });
-        operand_values.insert(operand.id, *value);
-    }
-    for (ordinal, _) in graph.values.iter().enumerate() {
-        scalar_values
-            .entry(ValueBindingKey::Local(seismic_lang::logical::LocalValueId(
-                ordinal as u32,
-            )))
-            .or_insert_with(|| {
-                let value = ScalarValueId(next_value);
-                next_value += 1;
-                value
-            });
-    }
-    let scalar_storage = storage
-        .storage
-        .iter()
-        .map(|(logical, transport)| {
-            Ok((
-                logical.clone(),
-                scalar_storage_bindings(transport, &storage.templates)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let views: BTreeMap<_, _> = graph
-        .views
-        .iter()
-        .enumerate()
-        .map(|(ordinal, view)| {
-            Ok((
-                seismic_lang::logical::LocalViewId(ordinal as u32),
-                scalar_storage
-                    .get(&view.storage)
-                    .cloned()
-                    .ok_or("CPU view base has no physical storage")?,
-            ))
-        })
-        .collect::<Result<_, String>>()?;
-    let order = task_order(graph)?;
-    let mut phase = 0u32;
-    let mut launch = 0u32;
-    let mut previous_phase = None;
-    let mut task_launch = BTreeMap::new();
-    for endpoint in &order {
-        match endpoint {
-            LogicalEndpoint::Task(task_id) => {
-                let task = graph.task(*task_id).ok_or("scheduled CPU task is absent")?;
-                let bindings = ScalarBindings {
-                    values: scalar_values.clone(),
-                    operands: operand_values.clone(),
-                    storage: scalar_storage.clone(),
-                    views: views.clone(),
-                };
-                let lowered = terminal::lower_task(graph, task, &bindings).map_err(|error| {
-                    format!(
-                        "{error}; CPU physical storage mappings are {:?}; input remap {:?}; inputs {:?}",
-                        scalar_storage.keys().collect::<Vec<_>>(),
-                        graph.input_remap,
-                        graph.inputs,
-                    )
-                })?;
-                for operand in &task.outputs {
-                    if let Some(value) = lowered.operand_value(*operand) {
-                        operand_values.insert(*operand, value);
-                    }
-                }
-                let mut instructions = Vec::new();
-                for (axis, logical_axis) in task.domain.axes.iter().enumerate() {
-                    let components = axis_components(logical_axis)?;
-                    for (component, binder) in logical_axis.binders.iter().enumerate() {
-                        let value = scalar_values[&ValueBindingKey::Local(*binder)];
-                        instructions.push(CpuTemplateInstruction::Coordinate {
-                            value,
-                            axis: axis as u32,
-                            component: component as u32,
-                            components: components.clone(),
-                        });
-                    }
-                }
-                for operand in &task.inputs {
-                    instructions.push(CpuTemplateInstruction::Operand {
-                        value: operand_values[operand],
-                        operand: *operand,
-                        ty: graph.operand(*operand).unwrap().ty.clone(),
-                        transport: storage.operands[operand].clone(),
-                    });
-                }
-                let logical_views = graph
-                    .views
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(index, view)| (seismic_lang::logical::LocalViewId(index as u32), view))
-                    .collect::<BTreeMap<_, _>>();
-                instructions.extend(lowered.instructions().iter().cloned().map(|scalar| {
-                    let value_types = scalar_values
-                        .values()
-                        .copied()
-                        .chain(operand_values.values().copied())
-                        .chain(scalar.result)
-                        .filter_map(|value| {
-                            lowered.value_type(value).cloned().map(|ty| (value, ty))
-                        })
-                        .collect();
-                    CpuTemplateInstruction::Scalar {
-                        scalar,
-                        value_types,
-                        views: logical_views.clone(),
-                    }
-                }));
-                for operand in &task.outputs {
-                    instructions.push(CpuTemplateInstruction::Output {
-                        value: operand_values[operand],
-                        operand: *operand,
-                        ty: graph.operand(*operand).unwrap().ty.clone(),
-                        transport: storage.operands[operand].clone(),
-                    });
-                }
-                let task_bindings = task
-                    .inputs
-                    .iter()
-                    .chain(&task.outputs)
-                    .map(|operand| OperandTransportTemplate {
-                        operand: *operand,
-                        transport: storage.operands[operand].clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let mapping = serial_participant_map(task, program)?;
-                let step = builder.mapped_task_step(
-                    builder.task(*task_id)?,
-                    mapping,
-                    task_bindings,
-                    nonempty(instructions.into_iter()).map_err(|_| {
-                        format!("CPU task#{} has no physical instruction", task_id.0)
-                    })?,
+/// Construct the complete CPU plan family: every applicable logical
+/// alternative of every choice receives one universal physical alternative.
+pub fn elaborate(
+    logical: &LogicalProgram,
+    limits: &Limits,
+) -> Result<PlanFamily<CpuDialect>, String> {
+    let mut family = PlanFamilyBuilder::<CpuDialect>::from_logical(logical)?;
+    family.tuning_parameter(
+        PARTICIPANTS_PARAMETER,
+        1,
+        i64::try_from(limits.workers).map_err(|_| "CPU worker count exceeds i64")?,
+    )?;
+    let participants = Sym::param(PARTICIPANTS_PARAMETER);
+    for choice_id in logical.choices.ids() {
+        let alternatives = logical.choice(choice_id).alternatives.len() as u32;
+        for ordinal in 0..alternatives {
+            let mut builder = family.alternative(choice_id, ordinal)?;
+            build_alternative(
+                &mut builder,
+                logical,
+                participants.clone(),
+                AtomicMapping::Serialized,
+            )?;
+            let alternative = builder
+                .finish_alternative()
+                .map_err(|error| format!("CPU universal alternative: {error}"))?;
+            family
+                .add_alternative(choice_id, alternative)
+                .map_err(|error| format!("CPU family assembly: {error}"))?;
+            // Device-atomic alternative: launches with `atomic` updates keep
+            // the worker domain and combine through compare/exchange.
+            let graph = logical
+                .graph(logical.choice(choice_id).alternatives.as_slice()[ordinal as usize].graph);
+            let facts = GraphFacts::collect(graph, &logical.runtime_extents);
+            if atomics_admitted(graph, &facts) {
+                let mut builder = family.alternative(choice_id, ordinal)?;
+                build_alternative(
+                    &mut builder,
+                    logical,
+                    participants.clone(),
+                    AtomicMapping::Device,
                 )?;
-                let used = instruction_storage(&step);
-                let groups = binding_groups(&used);
-                let launch_id = LaunchId(launch);
-                let phase_id = PhaseId(phase);
-                builder.add_phase(PhaseTemplate {
-                    id: phase_id,
-                    predecessors: previous_phase.into_iter().collect(),
-                    launches: NonEmpty::new(LaunchTemplate {
-                        id: launch_id,
-                        geometry: DispatchTemplate {
-                            workgroups: [Sym::constant(1), Sym::constant(1), Sym::constant(1)],
-                            participants_per_workgroup: [
-                                Sym::constant(1),
-                                Sym::constant(1),
-                                Sym::constant(1),
-                            ],
-                        },
-                        binding_groups: groups,
-                        kernel: KernelTemplate {
-                            participant_storage: vec![],
-                            workgroup_storage: vec![],
-                            steps: NonEmpty::new(step),
-                        },
-                    }),
-                })?;
-                task_launch.insert(*task_id, launch_id);
-                previous_phase = Some(phase_id);
-                phase += 1;
-                launch += 1;
+                let alternative = builder
+                    .finish_alternative()
+                    .map_err(|error| format!("CPU device-atomic alternative: {error}"))?;
+                family
+                    .add_alternative(choice_id, alternative)
+                    .map_err(|error| format!("CPU family assembly: {error}"))?;
             }
-            LogicalEndpoint::Call(call_id) => {
-                let call = graph.call(*call_id).ok_or("scheduled CPU call is absent")?;
-                let inputs = call
-                    .inputs
-                    .iter()
-                    .map(|operand| OperandTransportTemplate {
-                        operand: *operand,
-                        transport: storage.operands[operand].clone(),
-                    })
-                    .collect();
-                let mut result_operands = call.outputs.clone();
-                if !result_operands.contains(&call.result) {
-                    result_operands.push(call.result);
-                }
-                let results = result_operands
-                    .iter()
-                    .map(|operand| OperandTransportTemplate {
-                        operand: *operand,
-                        transport: storage.operands[operand].clone(),
-                    })
-                    .collect();
-                builder.add_subplan(builder.call(*call_id)?, inputs, results)?;
-            }
-            LogicalEndpoint::Input(_) | LogicalEndpoint::Output(_) => unreachable!(),
         }
     }
-    for dependency in &graph.dependencies {
-        let transport = match &dependency.kind {
-            LogicalDependencyKind::Control => DependencyTransport::Control,
-            LogicalDependencyKind::Value(operand) => DependencyTransport::Value {
-                operand: *operand,
-                transport: storage.operands[operand].clone(),
-            },
-            LogicalDependencyKind::Effect(logical) => DependencyTransport::Effect {
-                logical_storage: logical.clone(),
-                storage: storage_ids(&storage.storage[logical])?,
-            },
-            LogicalDependencyKind::Ownership(logical) => DependencyTransport::Ownership {
-                logical_storage: logical.clone(),
-                storage: storage_ids(&storage.storage[logical])?,
-            },
-        };
-        builder.place_launch_boundary(builder.dependency(dependency.id)?, transport)?;
-    }
-    for output in 0..graph.results.len() as u32 {
-        let operand = graph
-            .operands
-            .iter()
-            .find(|operand| matches!(operand.value, ValueRef::Result(port) if port == output))
-            .ok_or_else(|| format!("CPU result port#{output} has no operand"))?;
-        builder.publish_output(
-            builder.output(output)?,
-            operand.id,
-            storage.operands[&operand.id].clone(),
-        )?;
-    }
-    let _ = limits;
-    builder.finish(Sym::constant(i64::from(phase.max(1))))
+    family
+        .finish()
+        .map_err(|error| format!("CPU family finish: {error}"))
 }
 
-fn storage_ids(transport: &ValueTransportTemplate) -> Result<NonEmpty<StorageId>, String> {
-    let mut ids = Vec::new();
-    fn collect(value: &ValueTransportTemplate, ids: &mut Vec<StorageId>) -> Result<(), String> {
-        match value {
-            ValueTransportTemplate::Void => {}
-            ValueTransportTemplate::Kernel(_) => {
-                return Err("retained CPU value has a kernel-only transport".into());
+fn build_alternative(
+    builder: &mut AlternativeBuilder<CpuDialect>,
+    logical: &LogicalProgram,
+    participants: Sym,
+    atomics: AtomicMapping,
+) -> Result<(), BuilderError> {
+    let graph = builder.graph().clone();
+    let facts = GraphFacts::collect(&graph, &logical.runtime_extents);
+    let runtime_extents = logical
+        .runtime_extents
+        .ids()
+        .zip(logical.runtime_extents.iter())
+        .map(|(id, extent)| (id, extent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let strategy = Strategy {
+        facts,
+        runtime_extents,
+        participants,
+        atomics,
+    };
+    strategy.region(builder, &graph, &Vec::new())?;
+    // Complete the graph boundary results in canonical order.
+    for (ordinal, result) in graph.results.iter().enumerate() {
+        match result {
+            RegionResult::Value { id, .. } => {
+                let transport = builder.transport_of(*id)?;
+                builder.complete_result(ordinal as u32, transport)?;
             }
-            ValueTransportTemplate::Storage(values) => ids.extend(values.iter().copied()),
-            ValueTransportTemplate::Tuple(values) => {
-                for value in values.iter() {
-                    collect(value, ids)?;
+            RegionResult::State { storage, .. } => {
+                let transport = builder.transport_of_storage(*storage, Access::Shared)?;
+                builder.complete_result(ordinal as u32, transport)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The canonical boundary leaf of one storage (its parameter/result origin).
+fn boundary_leaf(graph: &TaskGraph, storage: LogicalStorageId) -> BoundaryLeaf {
+    graph
+        .storages
+        .get(storage)
+        .map(|s| match &s.origin {
+            logical::StorageOrigin::Parameter { ordinal, path, .. } => BoundaryLeaf::Input {
+                param: *ordinal,
+                leaf: path.clone(),
+            },
+            logical::StorageOrigin::Result { path, .. } => {
+                BoundaryLeaf::Result { leaf: path.clone() }
+            }
+            logical::StorageOrigin::Owned => BoundaryLeaf::default(),
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a loop body holds only primitives and nested control (no call
+/// or reduction): such a body can fuse into one kernel-local launch.
+fn absorbable(region: &GraphRegion) -> bool {
+    fn walk(region: &GraphRegion) -> bool {
+        for node in region.nodes.iter() {
+            match &node.kind {
+                LogicalNodeKind::Primitive(_) => {}
+                LogicalNodeKind::Loop(inner) => {
+                    if !walk(&inner.body) {
+                        return false;
+                    }
                 }
+                LogicalNodeKind::If(inner) => {
+                    if !walk(&inner.then_region) || !walk(&inner.else_region) {
+                        return false;
+                    }
+                }
+                LogicalNodeKind::Reduction(_) | LogicalNodeKind::Call(_) => {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    walk(region)
+}
+
+/// Navigate to one region of a task graph by region path.
+fn region_at<'g>(
+    graph: &'g TaskGraph,
+    path: &RegionPath,
+) -> Result<&'g logical::GraphRegion, String> {
+    let mut region = &graph.root;
+    for step in path {
+        let node = region
+            .nodes
+            .get(step.node())
+            .ok_or_else(|| format!("region path names absent node#{}", step.node().0))?;
+        match (&node.kind, step) {
+            (LogicalNodeKind::If(if_node), RegionStep::IfThen(_)) => region = &if_node.then_region,
+            (LogicalNodeKind::If(if_node), RegionStep::IfElse(_)) => region = &if_node.else_region,
+            (LogicalNodeKind::Loop(loop_node), RegionStep::LoopBody(_)) => region = &loop_node.body,
+            _ => return Err("region path disagrees with graph structure".into()),
+        }
+    }
+    Ok(region)
+}
+
+/// One collected region segment: a fused component, or a structural node
+/// that requires the executor transitions.
+enum Segment {
+    /// One fused launch over the collected entries; `axes` are the joined
+    /// independent-loop extents of the absorbed region (empty for a plain
+    /// domain-keyed component).
+    Component {
+        axes: Vec<ExtentExpr>,
+        entries: Vec<ComponentEntry>,
+    },
+    Executor(NodeId, LogicalNode),
+}
+
+/// Emit each collected group as one component segment, in group order.
+fn flush_groups(
+    groups: BTreeMap<Option<String>, Vec<ComponentEntry>>,
+    axes: Vec<ExtentExpr>,
+) -> Vec<Segment> {
+    groups
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .map(|(_, entries)| Segment::Component {
+            axes: axes.clone(),
+            entries,
+        })
+        .collect()
+}
+
+impl Strategy {
+    /// Consume every node of one region: collect its segments (absorbing
+    /// loops and conditionals whose bodies hold only primitives), then
+    /// commit each in order.
+    fn region(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        graph: &TaskGraph,
+        path: &RegionPath,
+    ) -> Result<(), BuilderError> {
+        let segments = self.collect(graph, path, &mut Vec::new(), false)?;
+        self.commit(builder, graph, path, segments)
+    }
+
+    /// Collect the component groups of one region. Independent loops with
+    /// primitive-only bodies are absorbed: their axis joins the launch
+    /// domain and the loop node is consumed by the fusion. Ordered loops
+    /// and conditionals inside an absorbed region become in-kernel serial
+    /// frames and branches; anything retaining a call or reduction uses the
+    /// structured executor transitions.
+    fn collect(
+        &self,
+        graph: &TaskGraph,
+        path: &RegionPath,
+        axes: &mut Vec<ExtentExpr>,
+        absorbing: bool,
+    ) -> Result<Vec<Segment>, BuilderError> {
+        let region = region_at(graph, path).map_err(BuilderError::from)?;
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut groups: BTreeMap<Option<String>, Vec<ComponentEntry>> = BTreeMap::new();
+        let absorbing_key = absorbing.then(|| "absorbed-region".to_string());
+        for (node_id, node) in region.nodes.ids().zip(region.nodes.iter()) {
+            let node_ref = NodeRef {
+                region: path.clone(),
+                node: node_id,
+            };
+            match &node.kind {
+                LogicalNodeKind::Primitive(_) => {
+                    let formed = form_primitive(node_id, node, &self.facts)
+                        .map_err(|error| format!("CPU formation: {error}"))?;
+                    let key = if absorbing {
+                        // One component per absorbed region: the launch
+                        // domain is the joined axes, not per-node domains.
+                        absorbing_key.clone()
+                    } else {
+                        formed
+                            .iteration
+                            .as_ref()
+                            .map(|map| format!("{:?}", map.extents))
+                    };
+                    groups.entry(key).or_default().push(ComponentEntry {
+                        node: node_ref,
+                        logical: node.clone(),
+                        formed: Some(formed),
+                        kind: EntryKind::Primitive,
+                    });
+                }
+                LogicalNodeKind::Loop(loop_node) => {
+                    let absorbable = absorbable(&loop_node.body);
+                    match (loop_node.kind, absorbable, absorbing) {
+                        (LoopKind::Independent, true, _) => {
+                            // The axis joins the launch domain; the body's
+                            // nodes join the same absorbed component.
+                            axes.push(loop_node.range.bound.clone());
+                            groups
+                                .entry(absorbing_key.clone())
+                                .or_default()
+                                .push(ComponentEntry {
+                                    node: node_ref,
+                                    logical: node.clone(),
+                                    formed: None,
+                                    kind: EntryKind::Axis {
+                                        binder: loop_node.binder,
+                                    },
+                                });
+                            let body_path = {
+                                let mut p = path.clone();
+                                p.push(RegionStep::LoopBody(node_id));
+                                p
+                            };
+                            let body_segments = self.collect(graph, &body_path, axes, true)?;
+                            for segment in body_segments {
+                                match segment {
+                                    Segment::Component { entries, .. } => {
+                                        groups
+                                            .entry(absorbing_key.clone())
+                                            .or_default()
+                                            .extend(entries);
+                                    }
+                                    Segment::Executor(..) => {
+                                        return Err(BuilderError::from(
+                                            "an absorbable body retained an executor node"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            // Commit while the absorbed axis is still in scope;
+                            // after the pop it is no longer part of the parent
+                            // region's launch domain.
+                            segments
+                                .extend(flush_groups(std::mem::take(&mut groups), axes.clone()));
+                            axes.pop();
+                        }
+                        (LoopKind::Ordered, true, true) => {
+                            // An in-kernel serial frame around the body.
+                            let body_path = {
+                                let mut p = path.clone();
+                                p.push(RegionStep::LoopBody(node_id));
+                                p
+                            };
+                            let body_segments = self.collect(graph, &body_path, axes, true)?;
+                            let mut body = Vec::new();
+                            for segment in body_segments {
+                                match segment {
+                                    Segment::Component { entries, .. } => body.extend(entries),
+                                    Segment::Executor(..) => {
+                                        return Err(BuilderError::from(
+                                            "an absorbable body retained an executor node"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            groups
+                                .entry(absorbing_key.clone())
+                                .or_default()
+                                .push(ComponentEntry {
+                                    node: node_ref,
+                                    logical: node.clone(),
+                                    formed: None,
+                                    kind: EntryKind::SerialLoop {
+                                        binder: loop_node.binder,
+                                        length: loop_node.range.bound.clone(),
+                                        body,
+                                    },
+                                });
+                        }
+                        _ => {
+                            // Executor `Repeat` with the retained range; the
+                            // body is walked as its own region.
+                            segments
+                                .extend(flush_groups(std::mem::take(&mut groups), axes.clone()));
+                            segments.push(Segment::Executor(node_id, node.clone()));
+                        }
+                    }
+                }
+                LogicalNodeKind::If(if_node) if absorbing => {
+                    // An in-kernel branch around the arm bodies.
+                    let then_path = {
+                        let mut p = path.clone();
+                        p.push(RegionStep::IfThen(node_id));
+                        p
+                    };
+                    let else_path = {
+                        let mut p = path.clone();
+                        p.push(RegionStep::IfElse(node_id));
+                        p
+                    };
+                    let flatten = |segments: Vec<Segment>| {
+                        let mut flat = Vec::new();
+                        for segment in segments {
+                            match segment {
+                                Segment::Component { entries, .. } => flat.extend(entries),
+                                Segment::Executor(..) => {
+                                    return Err(BuilderError::from(
+                                        "an absorbable body retained an executor node".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(flat)
+                    };
+                    let then_body = flatten(self.collect(graph, &then_path, axes, true)?)?;
+                    let else_body = flatten(self.collect(graph, &else_path, axes, true)?)?;
+                    groups
+                        .entry(absorbing_key.clone())
+                        .or_default()
+                        .push(ComponentEntry {
+                            node: node_ref,
+                            logical: node.clone(),
+                            formed: None,
+                            kind: EntryKind::Branch {
+                                condition: if_node.condition,
+                                then_body,
+                                else_body,
+                            },
+                        });
+                }
+                LogicalNodeKind::If(_)
+                | LogicalNodeKind::Reduction(_)
+                | LogicalNodeKind::Call(_) => {
+                    segments.extend(flush_groups(std::mem::take(&mut groups), axes.clone()));
+                    segments.push(Segment::Executor(node_id, node.clone()));
+                }
+            }
+        }
+        segments.extend(flush_groups(groups, axes.clone()));
+        Ok(segments)
+    }
+
+    /// Commit each collected segment in order.
+    fn commit(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        graph: &TaskGraph,
+        path: &RegionPath,
+        segments: Vec<Segment>,
+    ) -> Result<(), BuilderError> {
+        for segment in segments {
+            match segment {
+                Segment::Component { axes, entries } => {
+                    if !entries.is_empty() {
+                        self.component(builder, axes, entries)?;
+                    }
+                }
+                Segment::Executor(node_id, node) => match &node.kind {
+                    LogicalNodeKind::Reduction(reduction) => {
+                        self.reduction(builder, path, node_id, &node, reduction)?;
+                    }
+                    LogicalNodeKind::Loop(_) => {
+                        self.loop_node(builder, graph, path, node_id, &node)?;
+                    }
+                    LogicalNodeKind::If(_) => {
+                        self.if_node(builder, graph, path, node_id, &node)?;
+                    }
+                    LogicalNodeKind::Call(_) => {
+                        self.call(builder, graph, path, node_id, &node)?;
+                    }
+                    LogicalNodeKind::Primitive(_) => {
+                        unreachable!("a primitive node is never an executor segment")
+                    }
+                },
             }
         }
         Ok(())
     }
-    collect(transport, &mut ids)?;
-    nonempty(ids.into_iter())
-}
 
-fn scalar_storage_bindings(
-    transport: &ValueTransportTemplate,
-    templates: &[(Option<OperandId>, StorageTemplate<CpuDialect>)],
-) -> Result<Vec<ScalarStorageBinding>, String> {
-    let ids = storage_ids(transport)?;
-    ids.iter()
-        .map(|id| {
-            let template = templates
+    /// One fused universal launch over one component. Absorbed regions
+    /// launch over their joined independent axes; plain components over
+    /// their shared elementwise domain (or a single-visit serial map).
+    fn component(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        axes: Vec<ExtentExpr>,
+        entries: Vec<ComponentEntry>,
+    ) -> Result<(), BuilderError> {
+        // Predicted binding layout (the builder's contract): every node's
+        // inputs in order, then every node's outputs in order, over the
+        // whole entry tree.
+        let mut input_values: Vec<GraphValueId> = Vec::new();
+        let mut output_values: Vec<GraphValueId> = Vec::new();
+        fn walk_values(
+            entries: &[ComponentEntry],
+            inputs: &mut Vec<GraphValueId>,
+            outputs: &mut Vec<GraphValueId>,
+        ) {
+            for entry in entries {
+                inputs.extend(entry.logical.inputs.iter().copied());
+                outputs.extend(entry.logical.outputs.iter().map(|output| output.id));
+                match &entry.kind {
+                    EntryKind::Primitive | EntryKind::Axis { .. } => {}
+                    EntryKind::SerialLoop { body, .. } => walk_values(body, inputs, outputs),
+                    EntryKind::Branch {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        walk_values(then_body, inputs, outputs);
+                        walk_values(else_body, inputs, outputs);
+                    }
+                }
+            }
+        }
+        walk_values(&entries, &mut input_values, &mut output_values);
+        let input_count = input_values.len() as u16;
+        let position_of = |value: GraphValueId| -> Option<u16> {
+            input_values
                 .iter()
-                .find(|(_, template)| template.id == *id)
-                .ok_or("CPU scalar storage template is absent")?;
-            let plane = match &template.1.layout {
-                CpuTemplateLayout::TensorPlane { plane, .. } => plane.clone(),
-                CpuTemplateLayout::ScalarSlot { .. } => vec![],
-            };
-            Ok(ScalarStorageBinding {
-                storage: *id,
-                plane,
-            })
-        })
-        .collect()
-}
-
-fn serial_participant_map(
-    task: &seismic_lang::logical::LogicalTask,
-    program: &LogicalProgram,
-) -> Result<ParticipantMap, String> {
-    let mut extents = Vec::new();
-    let mut axes = Vec::new();
-    for (axis, logical) in task.domain.axes.iter().enumerate() {
-        let extent = match &logical.source {
-            seismic_lang::logical::LogicalAxisSource::Range { lo, hi, .. } => {
-                logical_extent(program, lo, hi)?
-            }
-            seismic_lang::logical::LogicalAxisSource::Coordinates { value, axes } => {
-                let Type::Tensor(tensor) = &value.ty else {
-                    return Err("coordinate domain source is not a tensor".into());
-                };
-                let source_axis = *axes.first().ok_or("coordinate domain has no axis")?;
-                capacity(program, &tensor.shape[source_axis])
-            }
-            seismic_lang::logical::LogicalAxisSource::Members { .. } => Sym::constant(1),
-        };
-        extents.push(extent);
-        axes.push(AxisMap::Serial {
-            logical_axis: axis as u32,
-        });
-    }
-    Ok(ParticipantMap {
-        task: task.id,
-        axes,
-        logical_extents: extents,
-        masks_inactive_participants: false,
-    })
-}
-
-fn axis_components(axis: &seismic_lang::logical::LogicalAxis) -> Result<Vec<Sym>, String> {
-    match &axis.source {
-        seismic_lang::logical::LogicalAxisSource::Coordinates { value, axes } => {
-            let Type::Tensor(tensor) = &value.ty else {
-                return Err("coordinate domain source is not a tensor".into());
-            };
-            axes.iter()
-                .map(|axis| {
-                    tensor
-                        .shape
-                        .get(*axis)
-                        .cloned()
-                        .ok_or_else(|| "coordinate component axis is out of bounds".into())
+                .position(|candidate| *candidate == value)
+                .map(|index| index as u16)
+                .or_else(|| {
+                    output_values
+                        .iter()
+                        .position(|candidate| *candidate == value)
+                        .map(|index| input_count + index as u16)
                 })
-                .collect()
-        }
-        seismic_lang::logical::LogicalAxisSource::Range { lo, hi, .. } => {
-            Ok(vec![logical_extent_raw(lo, hi)?])
-        }
-        seismic_lang::logical::LogicalAxisSource::Members { .. } => Ok(vec![Sym::constant(1)]),
-    }
-}
-
-fn logical_extent_raw(
-    lo: &seismic_lang::logical::LogicalExpr,
-    hi: &seismic_lang::logical::LogicalExpr,
-) -> Result<Sym, String> {
-    fn value(expr: &seismic_lang::logical::LogicalExpr) -> Option<Sym> {
-        match &expr.kind {
-            seismic_lang::logical::LogicalExprKind::Int(value) => Some(Sym::constant(*value)),
-            seismic_lang::logical::LogicalExprKind::Shape(value) => Some(value.clone()),
-            _ => None,
-        }
-    }
-    let lo = value(lo).ok_or("CPU range lower bound is not structural")?;
-    let hi = value(hi).ok_or("CPU range upper bound is not structural")?;
-    Ok(hi.add(&lo.scale(-1)))
-}
-
-fn logical_extent(
-    program: &LogicalProgram,
-    lo: &seismic_lang::logical::LogicalExpr,
-    hi: &seismic_lang::logical::LogicalExpr,
-) -> Result<Sym, String> {
-    Ok(capacity(program, &logical_extent_raw(lo, hi)?))
-}
-
-fn instruction_storage(step: &KernelStep<CpuDialect>) -> BTreeMap<StorageId, AccessMode> {
-    let mut used = BTreeMap::new();
-    if let exec::KernelStepView::MappedTask { instructions, .. } = step.view() {
-        for instruction in instructions.iter() {
-            for access in CpuDialect::consequences(instruction).accesses {
-                used.entry(access.storage)
-                    .and_modify(|mode| *mode = merge_access(*mode, access.mode))
-                    .or_insert(access.mode);
+        };
+        let iteration = if !axes.is_empty() {
+            LinearIterationMap::linear(&axes, &self.runtime_extents)
+                .map_err(|error| format!("CPU geometry: {error}"))?
+                .with_participants(self.participants.clone())
+        } else {
+            let domain = entries.iter().find_map(|entry| {
+                entry
+                    .formed
+                    .as_ref()
+                    .and_then(|formed| formed.iteration.as_ref().map(|map| map.extents.clone()))
+            });
+            match domain {
+                Some(extents) => LinearIterationMap::linear(&extents, &self.runtime_extents)
+                    .map_err(|error| format!("CPU geometry: {error}"))?
+                    .with_participants(self.participants.clone()),
+                None => LinearIterationMap::serial(),
+            }
+        };
+        // A launch that updates storage atomically runs on one worker under
+        // the serialized mapping; the device-atomic mapping keeps the domain.
+        let iteration =
+            if self.atomics == AtomicMapping::Serialized && entries_update_atomically(&entries) {
+                LinearIterationMap::serialized(&iteration)
+            } else {
+                iteration
+            };
+        let mut node_refs = Vec::new();
+        fn collect_refs(entries: &[ComponentEntry], refs: &mut Vec<NodeRef>) {
+            for entry in entries {
+                refs.push(entry.node.clone());
+                match &entry.kind {
+                    EntryKind::Primitive | EntryKind::Axis { .. } => {}
+                    EntryKind::SerialLoop { body, .. } => collect_refs(body, refs),
+                    EntryKind::Branch {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        collect_refs(then_body, refs);
+                        collect_refs(else_body, refs);
+                    }
+                }
             }
         }
+        collect_refs(&entries, &mut node_refs);
+        let ops = self.entries_ops(builder, &entries, &position_of)?;
+        let ops = NonEmpty::new(ops).ok_or_else(|| "a CPU launch has no opcode".to_string())?;
+        builder.fuse(
+            node_refs,
+            FusedStrategyTemplate {
+                iteration,
+                ops: Legalized::Ops(ops),
+            },
+        )
     }
-    used
-}
 
-fn merge_access(left: AccessMode, right: AccessMode) -> AccessMode {
-    if left == right {
-        left
-    } else if left == AccessMode::Atomic || right == AccessMode::Atomic {
-        AccessMode::Atomic
-    } else {
-        AccessMode::ReadWrite
+    /// The op stream of one entry tree: planned checks and the opcode for
+    /// each primitive, serial frames and branches around nested bodies.
+    fn entries_ops(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        entries: &[ComponentEntry],
+        position_of: &impl Fn(GraphValueId) -> Option<u16>,
+    ) -> Result<Vec<CpuOp>, BuilderError> {
+        let mut next_axis = 0usize;
+        self.entries_ops_with_axes(builder, entries, position_of, &mut next_axis)
     }
-}
 
-fn binding_groups(used: &BTreeMap<StorageId, AccessMode>) -> Vec<BindingGroupTemplate> {
-    used.iter()
-        .enumerate()
-        .map(|(slot, (storage, access))| BindingGroupTemplate {
-            id: exec::BindingGroupId(slot as u32),
-            kind: BindingGroupKind::Direct,
-            slot: slot as u32,
-            members: NonEmpty::new(BindingTemplate {
-                id: BindingId(slot as u32),
-                storage: *storage,
-                access: *access,
-                operand: None,
-            }),
+    fn entries_ops_with_axes(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        entries: &[ComponentEntry],
+        position_of: &impl Fn(GraphValueId) -> Option<u16>,
+        next_axis: &mut usize,
+    ) -> Result<Vec<CpuOp>, BuilderError> {
+        let mut ops = Vec::new();
+        for entry in entries {
+            // The node's own safety obligations, discharged in order.
+            for (index, obligation) in entry.logical.safety.iter().enumerate() {
+                let classified = classify_obligation(obligation, &self.facts, entry.logical.span);
+                let receipt = terminal::discharge_with_builder(
+                    builder,
+                    ObligationRef {
+                        node: entry.node.clone(),
+                        index,
+                    },
+                    &classified,
+                    |_| Legalized::Inapplicable {
+                        reason: "the predicate is planned into the owning launch".into(),
+                    },
+                )?;
+                if let (ObligationDischarge::RuntimeChecked(check), Some(status)) =
+                    (classified, receipt)
+                {
+                    let kind = self.check_kind(&check.predicate, position_of)?;
+                    ops.push(CpuOp::new(
+                        CpuOpKind::Check { kind, status },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+            match &entry.kind {
+                EntryKind::Primitive => {
+                    let op = self.primitive_op(entry, position_of)?;
+                    ops.push(op);
+                }
+                EntryKind::Axis { binder } => {
+                    let position = position_of(*binder).ok_or_else(|| {
+                        format!("axis binder value#{} has no binding position", binder.0)
+                    })?;
+                    ops.push(CpuOp::new(
+                        CpuOpKind::AxisBinder {
+                            position,
+                            axis: *next_axis,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                    *next_axis += 1;
+                }
+                EntryKind::SerialLoop {
+                    binder,
+                    length,
+                    body,
+                } => {
+                    let binder_position = position_of(*binder).ok_or_else(|| {
+                        format!("serial binder value#{} has no binding position", binder.0)
+                    })?;
+                    let body_ops =
+                        self.entries_ops_with_axes(builder, body, position_of, next_axis)?;
+                    ops.push(CpuOp::new(
+                        CpuOpKind::SerialFor {
+                            binder: binder_position,
+                            length: length.clone(),
+                            body: body_ops,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+                EntryKind::Branch {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    let condition_position = position_of(*condition).ok_or_else(|| {
+                        format!(
+                            "branch condition value#{} has no binding position",
+                            condition.0
+                        )
+                    })?;
+                    let then_ops =
+                        self.entries_ops_with_axes(builder, then_body, position_of, next_axis)?;
+                    let else_ops =
+                        self.entries_ops_with_axes(builder, else_body, position_of, next_axis)?;
+                    ops.push(CpuOp::new(
+                        CpuOpKind::Branch {
+                            condition: condition_position,
+                            then_ops,
+                            else_ops,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
+        Ok(ops)
+    }
+
+    /// The opcode of one formed primitive, re-anchored onto the fused layout.
+    fn primitive_op(
+        &self,
+        entry: &ComponentEntry,
+        position_of: &impl Fn(GraphValueId) -> Option<u16>,
+    ) -> Result<CpuOp, BuilderError> {
+        let formed = entry.formed.as_ref().ok_or_else(|| {
+            format!(
+                "CPU node#{} reached primitive mapping without formation",
+                entry.node.node.0
+            )
+        })?;
+        let physical = formed.physical_primitive();
+        let profile = mapping::target_profile(&Limits {
+            workers: 1,
+            max_scratch_bytes: mapping::SCRATCH_BYTES,
+        });
+        let op = CpuDialect::legalize(&physical, &profile)
+            .ops()
+            .and_then(|ops| ops.iter().next().cloned())
+            .ok_or_else(|| {
+                format!(
+                    "a universal CPU primitive mapping is inapplicable (compiler bug): {:?}",
+                    formed.op
+                )
+            })?;
+        let operands = entry
+            .logical
+            .inputs
+            .iter()
+            .map(|value| {
+                position_of(*value)
+                    .ok_or_else(|| format!("CPU operand value#{} has no binding position", value.0))
+            })
+            .collect::<Result<Vec<_>, BuilderError>>()?;
+        let results = entry
+            .logical
+            .outputs
+            .iter()
+            .map(|output| {
+                position_of(output.id).ok_or_else(|| {
+                    format!("CPU result value#{} has no binding position", output.id.0)
+                })
+            })
+            .collect::<Result<Vec<_>, BuilderError>>()?;
+        let CpuOp {
+            kind,
+            operands: _,
+            results: _,
+        } = op;
+        let kind = match (self.atomics, kind) {
+            // The device-atomic mapping keeps the worker domain, so every
+            // update is a compare/exchange on the element's word.
+            (AtomicMapping::Device, CpuOpKind::SerializedAtomic { op, dtype, shape }) => {
+                CpuOpKind::AtomicDevice { op, dtype, shape }
+            }
+            (_, kind) => kind,
+        };
+        Ok(CpuOp::new(kind, Vec::new(), Vec::new()).with_positions(operands, results))
+    }
+
+    /// One planned runtime-check predicate with positional operands.
+    fn check_kind(
+        &self,
+        predicate: &CheckPredicate,
+        position_of: &impl Fn(GraphValueId) -> Option<u16>,
+    ) -> Result<CheckKind, BuilderError> {
+        let position = |value: GraphValueId| -> Result<u16, BuilderError> {
+            position_of(value)
+                .ok_or_else(|| format!("check operand value#{} has no binding position", value.0))
+        };
+        Ok(match predicate {
+            CheckPredicate::IndexInBounds { index, extent } => CheckKind::IndexInBounds {
+                index: position(*index)?,
+                extent: extent.clone(),
+            },
+            CheckPredicate::RangeInBounds { start, end, extent } => CheckKind::RangeInBounds {
+                start: position(*start)?,
+                end: position(*end)?,
+                extent: extent.clone(),
+            },
+            CheckPredicate::DivisorNonZero { value } => CheckKind::DivisorNonZero {
+                value: position(*value)?,
+            },
+            CheckPredicate::DivisionSafe { lhs, rhs } => CheckKind::DivisionSafe {
+                lhs: position(*lhs)?,
+                rhs: position(*rhs)?,
+            },
+            CheckPredicate::ShiftInRange { value } => CheckKind::ShiftInRange {
+                value: position(*value)?,
+            },
+            CheckPredicate::ProductFits { factors, bits } => CheckKind::ProductFits {
+                factors: factors.clone(),
+                bits: *bits,
+            },
+            CheckPredicate::ExtentPositive { extent } => CheckKind::ExtentPositive {
+                extent: extent.clone(),
+            },
         })
-        .collect()
-}
-
-pub fn elaborate(
-    program: &LogicalProgram,
-    limits: &super::mapping::Limits,
-) -> Result<PlanFamily<CpuDialect>, String> {
-    let mut family = PlanFamilyBuilder::from_logical(program)?;
-    for graph in &program.task_graphs {
-        family.add_alternative(elaborate_graph(program, graph, limits)?)?;
     }
-    family.finish()
+
+    // -- structured nodes ---------------------------------------------------
+
+    fn reduction(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        path: &RegionPath,
+        node_id: NodeId,
+        node: &LogicalNode,
+        reduction: &ReductionNode,
+    ) -> Result<(), BuilderError> {
+        let node_ref = NodeRef {
+            region: path.clone(),
+            node: node_id,
+        };
+        let formed = universal_node(node_id, node, &self.facts)
+            .map_err(|error| format!("CPU reduction formation: {error}"))?;
+        let UniversalNode::Reduction(universal) = &formed else {
+            return Err("CPU reduction formation returned a non-reduction".into());
+        };
+        let strategy: ReductionStrategy = universal.strategy.clone();
+        // The reduction preconditions (`argmax` nonempty) are retained by
+        // the fold opcode itself: a zero length reports the first error.
+        let _ = &universal.preconditions;
+        let operand_type = self
+            .facts
+            .types
+            .get(&reduction.operand)
+            .cloned()
+            .ok_or("the reduction operand has no type")?;
+        let tensor = operand_type
+            .shaped()
+            .cloned()
+            .ok_or("the reduction operand is not a tensor")?;
+        let input_dtype = match &tensor.elem {
+            Elem::Dtype(d) => *d,
+            _ => DType::F32,
+        };
+        let mut outer = tensor.axes.clone();
+        let length = outer.remove(reduction.axis);
+        let result_dtype = match &reduction.result {
+            ValueType::Scalar(d) => *d,
+            _ => input_dtype,
+        };
+        let nonempty_precondition =
+            reduction_identity(reduction.op) == ReductionIdentity::FirstElementNonEmpty;
+        let iteration = LinearIterationMap::linear(&outer, &self.runtime_extents)
+            .map_err(|error| format!("CPU reduction geometry: {error}"))?
+            .with_participants(self.participants.clone());
+        let result_value = node
+            .outputs
+            .first()
+            .map(|output| output.id)
+            .ok_or("a reduction has no result value")?;
+        let result_transport = builder.transport_of(result_value)?;
+        // Predicted layout: [operand, result].
+        let op = CpuOp::new(
+            CpuOpKind::ReduceFold {
+                op: reduction.op,
+                input: input_dtype,
+                accumulator: strategy.accumulator,
+                result_dtype,
+                axis: reduction.axis,
+                outer,
+                length,
+                nonempty_precondition,
+            },
+            vec![0],
+            vec![1],
+        );
+        builder.map_reduction(
+            node_ref,
+            ReductionStrategyTemplate {
+                topology: strategy.topology.clone(),
+                iteration,
+                ops: Legalized::Ops(NonEmpty::new(vec![op]).expect("one opcode")),
+                result: result_transport,
+            },
+        )
+    }
+
+    fn loop_node(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        graph: &TaskGraph,
+        path: &RegionPath,
+        node_id: NodeId,
+        node: &LogicalNode,
+    ) -> Result<(), BuilderError> {
+        let node_ref = NodeRef {
+            region: path.clone(),
+            node: node_id,
+        };
+        let formed = universal_node(node_id, node, &self.facts)
+            .map_err(|error| format!("CPU loop formation: {error}"))?;
+        let UniversalNode::Loop(universal) = &formed else {
+            return Err("CPU loop formation returned a non-loop".into());
+        };
+        // The loop node's own safety obligations (range bounds) are
+        // classified and discharged; the runtime evaluates the retained
+        // range predicate when it interprets the `Repeat` step.
+        for (index, obligation) in node.safety.iter().enumerate() {
+            let classified = classify_obligation(obligation, &self.facts, node.span);
+            terminal::discharge_with_builder(
+                builder,
+                ObligationRef {
+                    node: node_ref.clone(),
+                    index,
+                },
+                &classified,
+                |_| Legalized::Inapplicable {
+                    reason: "the range predicate is evaluated by the executor".into(),
+                },
+            )?;
+        }
+        let carried = universal
+            .carries
+            .iter()
+            .map(|slot| match slot.initial {
+                RegionInput::Value(value) => Ok(PhysicalCarryTemplate {
+                    transport: builder.transport_of(value)?,
+                }),
+                RegionInput::State(token) => {
+                    let storage = builder
+                        .logical_storage_of_token(token)
+                        .ok_or("a carried state token has no storage")?;
+                    Ok(PhysicalCarryTemplate {
+                        transport: match builder.storage_of(storage) {
+                            Some(template) => TransportTemplate::Storage(
+                                NonEmpty::new(vec![StorageViewTemplate {
+                                    storage: template,
+                                    access: Access::Exclusive,
+                                    transform: seismic_lang::logical::ViewTransform::Identity,
+                                }])
+                                .expect("one plane"),
+                            ),
+                            None => TransportTemplate::Boundary(boundary_leaf(graph, storage)),
+                        },
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, BuilderError>>()?;
+        let range = ExecutorRangeTemplate {
+            start: builder.transport_of(universal.range.start)?,
+            end: builder.transport_of(universal.range.end)?,
+            bound: universal.range.bound.clone(),
+        };
+        let body_path = {
+            let mut p = path.clone();
+            p.push(RegionStep::LoopBody(node_id));
+            p
+        };
+        builder.schedule_loop(node_ref, range, carried, |builder| {
+            self.region(builder, graph, &body_path)
+        })
+    }
+
+    fn if_node(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        graph: &TaskGraph,
+        path: &RegionPath,
+        node_id: NodeId,
+        node: &LogicalNode,
+    ) -> Result<(), BuilderError> {
+        let _ = graph;
+        let node_ref = NodeRef {
+            region: path.clone(),
+            node: node_id,
+        };
+        let formed = universal_node(node_id, node, &self.facts)
+            .map_err(|error| format!("CPU conditional formation: {error}"))?;
+        let UniversalNode::If(universal) = &formed else {
+            return Err("CPU conditional formation returned a non-conditional".into());
+        };
+        let predicate = ExecutorPredicateTemplate {
+            value: builder.transport_of(universal.condition)?,
+        };
+        // Aggregate joins are leaf-lowered: each value join copies the taken
+        // branch's transport into the joined transport (leaf slots/storage
+        // views already agree); state joins name the joined storage.
+        let joins = universal
+            .joins
+            .iter()
+            .map(|slot| match slot {
+                JoinSlot::Value { joined, .. } => {
+                    let transport = builder.transport_of(*joined)?;
+                    Ok(PhysicalJoinTemplate::Value {
+                        then: transport.clone(),
+                        else_branch: transport.clone(),
+                        joined: transport,
+                    })
+                }
+                JoinSlot::State { storage, .. } => {
+                    let template = builder
+                        .storage_of(*storage)
+                        .ok_or("a joined state storage has no template")?;
+                    Ok(PhysicalJoinTemplate::State { storage: template })
+                }
+            })
+            .collect::<Result<Vec<_>, BuilderError>>()?;
+        let then_path = {
+            let mut p = path.clone();
+            p.push(RegionStep::IfThen(node_id));
+            p
+        };
+        let else_path = {
+            let mut p = path.clone();
+            p.push(RegionStep::IfElse(node_id));
+            p
+        };
+        builder.schedule_if(
+            node_ref,
+            predicate,
+            |builder| self.region(builder, graph, &then_path),
+            |builder| self.region(builder, graph, &else_path),
+            joins,
+        )
+    }
+
+    fn call(
+        &self,
+        builder: &mut AlternativeBuilder<CpuDialect>,
+        _graph: &TaskGraph,
+        path: &RegionPath,
+        node_id: NodeId,
+        node: &LogicalNode,
+    ) -> Result<(), BuilderError> {
+        let node_ref = NodeRef {
+            region: path.clone(),
+            node: node_id,
+        };
+        let formed = universal_node(node_id, node, &self.facts)
+            .map_err(|error| format!("CPU call formation: {error}"))?;
+        let UniversalNode::Call(universal) = &formed else {
+            return Err("CPU call formation returned a non-call".into());
+        };
+        let _ = universal;
+        builder.invoke_canonical(node_ref)
+    }
 }
 
+// ---------------------------------------------------------------------------
+// The pipeline backend
+// ---------------------------------------------------------------------------
+
+/// Mechanically retained resolved launch (encoding decisions happen at
+/// assembly, where the whole resolved plan is available).
 pub struct EncodedLaunch {
-    pub launch: exec::ResolvedLaunch<CpuDialect>,
-    pub native: crate::NativePhase,
+    pub launch: ResolvedLaunch<CpuDialect>,
 }
 
+/// The CPU native artifact: executable memory plus the runtime glue's
+/// launch table.
 pub struct NativeArtifact {
-    pub kernel: crate::Kernel,
+    pub kernel: crate::native::Kernel,
 }
 
-impl Backend for super::mapping::Cpu {
+impl Backend for mapping::Cpu {
     type Dialect = CpuDialect;
     type EncodedLaunch = EncodedLaunch;
     type NativeArtifact = NativeArtifact;
 
     fn target(&self) -> &'static str {
-        super::mapping::TARGET
+        mapping::TARGET
     }
 
     fn capability_fingerprint(&self) -> String {
-        self.executable_target.capability_fingerprint.clone()
+        mapping::capability_fingerprint(self.limits())
     }
 
     fn supports_intrinsic(
@@ -1259,26 +1938,25 @@ impl Backend for super::mapping::Cpu {
         intrinsic: &seismic_lang::sir::IntrinsicUse,
     ) -> Result<(), String> {
         Err(format!(
-            "the CPU scalar backend does not implement backend intrinsic `{}`",
+            "the CPU backend implements no backend intrinsic `{}`",
             intrinsic.id.path()
         ))
     }
 
-    fn target_profile(&self) -> &ExecutableTargetProfile<ScalarCapabilitySet> {
-        &self.executable_target
+    fn target_profile(&self) -> &EffectiveTargetProfile {
+        self.profile()
     }
 
     fn elaborate(&self, logical: &LogicalProgram) -> Result<PlanFamily<CpuDialect>, String> {
-        elaborate(logical, &self.limits)
+        elaborate(logical, self.limits())
     }
 
     fn encode_launch(
         &self,
-        launch: &exec::ResolvedLaunch<CpuDialect>,
+        launch: &ResolvedLaunch<CpuDialect>,
     ) -> Result<Self::EncodedLaunch, String> {
         Ok(EncodedLaunch {
             launch: launch.clone(),
-            native: crate::native::encode_launch(launch)?,
         })
     }
 
@@ -1286,9 +1964,7 @@ impl Backend for super::mapping::Cpu {
         &self,
         encoded: EncodedPlan<CpuDialect, EncodedLaunch>,
     ) -> Result<Self::NativeArtifact, String> {
-        let execution = crate::native::assemble(encoded)?;
-        Ok(NativeArtifact {
-            kernel: crate::compile_native(execution)?,
-        })
+        let kernel = crate::native::assemble(encoded)?;
+        Ok(NativeArtifact { kernel })
     }
 }

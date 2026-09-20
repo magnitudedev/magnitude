@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// The compiled entry of a parallel phase: buffer table, scalar words, scratch, work item.
-pub(crate) type PhaseEntry = unsafe extern "C" fn(*const *mut u8, *const u64, *mut u8, u64) -> i32;
+pub type PhaseEntry = unsafe extern "C" fn(*const *mut u8, *mut u64, *mut u8, u64) -> i32;
 
 #[derive(Clone)]
 struct Job {
@@ -17,7 +17,6 @@ struct Job {
     next: Arc<AtomicU64>,
     status: Arc<AtomicI32>,
 }
-
 #[derive(Default)]
 struct State {
     generation: u64,
@@ -100,7 +99,7 @@ fn work(shared: &Shared) {
                     let status = unsafe {
                         (job.entry)(
                             job.buffers as *const *mut u8,
-                            job.scalars as *const u64,
+                            job.scalars as *mut u64,
                             scratch.as_mut_ptr().cast(),
                             item,
                         )
@@ -161,11 +160,11 @@ impl Workers {
 
     /// Execute `items` work items of one phase and return after all of them completed.
     /// A nonzero status is the first one a work item reported; remaining items still ran.
-    pub(crate) fn run(
+    pub fn run(
         &mut self,
         entry: PhaseEntry,
         buffers: &[*mut u8],
-        scalars: &[u64],
+        scalars: &mut [u64],
         items: u64,
         scratch_bytes: usize,
     ) -> Result<i32, String> {
@@ -182,7 +181,7 @@ impl Workers {
             return Ok(unsafe {
                 entry(
                     buffers.as_ptr(),
-                    scalars.as_ptr(),
+                    scalars.as_mut_ptr(),
                     self.scratch.as_mut_ptr().cast(),
                     0,
                 )
@@ -192,7 +191,7 @@ impl Workers {
         let job = Job {
             entry,
             buffers: buffers.as_ptr() as usize,
-            scalars: scalars.as_ptr() as usize,
+            scalars: scalars.as_mut_ptr() as usize,
             items,
             scratch_bytes,
             next: Arc::new(AtomicU64::new(0)),

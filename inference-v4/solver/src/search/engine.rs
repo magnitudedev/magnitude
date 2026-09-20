@@ -1,12 +1,12 @@
 use super::{
     knowledge::{self, Knowledge, SharedKnowledge},
-    Limits, Options, Policy, Stats,
+    Budget, Limits, Options, Policy, Stats,
 };
 use crate::{
     decomposition,
     model::{Factor, FactorKind, Model, Obligation, VarId},
     propagation,
-    result::{FeasibleSolution, Progress, StopReason},
+    result::{Budgeted, FeasibleSolution, Progress, Solution, StopReason},
     Domain, Error, Result,
 };
 use std::{
@@ -21,6 +21,17 @@ pub(super) enum Outcome {
     Optimal(FeasibleSolution),
     Infeasible,
     Incomplete(Progress),
+}
+
+/// One advance policy over the same traversal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Run until a terminal claim or a limit suspends the search.
+    Normal,
+    /// Additionally yield as soon as a new witness is reported.
+    Witness,
+    /// Ignore work and time limits until feasibility is decided, then yield.
+    Feasibility,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -950,23 +961,111 @@ impl Search {
         self.stats.retained_bytes < before
     }
     pub fn advance(&mut self, limits: Limits) -> Result<Outcome> {
-        self.advance_mode(limits, false)
+        self.advance_mode(limits, Mode::Normal)
     }
     pub(super) fn advance_to_witness(&mut self, limits: Limits) -> Result<Outcome> {
-        self.advance_mode(limits, true)
+        self.advance_mode(limits, Mode::Witness)
     }
-    fn advance_mode(&mut self, limits: Limits, yield_witness: bool) -> Result<Outcome> {
+    /// Ignores work and time limits until feasibility is decided, then yields
+    /// with the first incumbent. Memory and coverage still suspend the search.
+    pub(super) fn advance_feasibility(&mut self, limits: Limits) -> Result<Outcome> {
+        self.advance_mode(limits, Mode::Feasibility)
+    }
+    /// Installs a validated feasible solution of this exact model as the
+    /// incumbent without restarting search. Returns whether it became the new
+    /// incumbent; a weaker assignment is retained but not installed.
+    pub(super) fn install_incumbent(&mut self, incumbent: FeasibleSolution) -> Result<bool> {
+        if !Arc::ptr_eq(&self.model, &incumbent.model) {
+            return Err(Error::InvalidModel(
+                "incumbent belongs to another model".into(),
+            ));
+        }
+        if self
+            .incumbent
+            .as_ref()
+            .is_none_or(|old| incumbent.cost() < old.cost())
+        {
+            self.stats
+                .first_feasible_seconds
+                .get_or_insert(self.stats.solve_seconds);
+            self.stats.winner_found_seconds = Some(self.stats.solve_seconds);
+            self.incumbent = Some(incumbent);
+            self.update_memory();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    /// Guides branching with a preferred complete assignment of the model's
+    /// original domains. It is a search preference, never a feasibility claim.
+    pub(super) fn prefer(&mut self, values: &[i64]) -> Result<()> {
+        if values.len() != self.model.variables().len() {
+            return Err(Error::InvalidAssignment(format!(
+                "expected {} values, received {}",
+                self.model.variables().len(),
+                values.len()
+            )));
+        }
+        for (var, value) in self.model.variables().iter().zip(values) {
+            if !var.domain.contains(*value) {
+                return Err(Error::InvalidAssignment(format!(
+                    "{} does not contain {value}",
+                    var.name
+                )));
+            }
+        }
+        self.preferred = Some(values.to_vec());
+        Ok(())
+    }
+    /// One budgeted solve advance. The budget limits optimization only:
+    /// feasibility is decided first regardless of work and time, then the
+    /// remaining budget is spent improving the incumbent.
+    pub(super) fn advance_budgeted(&mut self, budget: Budget) -> Result<Budgeted> {
+        if self.incumbent.is_none() {
+            let feasibility = Limits {
+                work: u64::MAX,
+                time: None,
+                memory_bytes: budget.optimization.memory_bytes,
+            };
+            match self.advance_feasibility(feasibility)? {
+                Outcome::Optimal(feasible) => {
+                    return Ok(Budgeted::Optimal(Solution { feasible }));
+                }
+                Outcome::Infeasible => return Ok(Budgeted::Infeasible),
+                // Feasibility mode yields here only with a first incumbent;
+                // otherwise memory or coverage suspended the search.
+                Outcome::Incomplete(progress) => {
+                    if progress.incumbent.is_none() {
+                        return Ok(Budgeted::Suspended(progress));
+                    }
+                }
+            }
+        }
+        match self.advance(budget.optimization)? {
+            Outcome::Optimal(feasible) => Ok(Budgeted::Optimal(Solution { feasible })),
+            Outcome::Infeasible => Err(Error::Invariant(
+                "infeasible outcome contradicts an existing incumbent".into(),
+            )),
+            Outcome::Incomplete(progress) => Ok(match progress.incumbent {
+                Some(solution) => Budgeted::Incumbent {
+                    solution,
+                    lower_bound: progress.lower_bound,
+                },
+                None => Budgeted::Suspended(progress),
+            }),
+        }
+    }
+    fn advance_mode(&mut self, limits: Limits, mode: Mode) -> Result<Outcome> {
         self.advance_peak_retained_bytes = self.stats.retained_bytes;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        let result = self.advance_inner(limits, yield_witness);
+        let result = self.advance_inner(limits, mode);
         if let Err(error) = &result {
             self.failure = Some(error.clone());
         }
         result
     }
-    fn advance_inner(&mut self, limits: Limits, yield_witness: bool) -> Result<Outcome> {
+    fn advance_inner(&mut self, limits: Limits, mode: Mode) -> Result<Outcome> {
         let started = Instant::now();
         let work_start = self.stats.work;
         let reason = loop {
@@ -991,7 +1090,11 @@ impl Search {
                     return Ok(Outcome::Optimal(witness.clone()));
                 }
             }
-            if yield_witness {
+            // Feasibility is decided: leave the remaining budget to optimization.
+            if mode == Mode::Feasibility && self.incumbent.is_some() {
+                break StopReason::Work;
+            }
+            if mode == Mode::Witness {
                 if let Some(w) = &self.incumbent {
                     if self.reported_cost.is_none_or(|cost| w.cost() < cost) {
                         self.reported_cost = Some(w.cost());
@@ -999,11 +1102,13 @@ impl Search {
                     }
                 }
             }
-            if self.stats.work - work_start >= limits.work {
-                break StopReason::Work;
-            }
-            if limits.time.is_some_and(|d| started.elapsed() >= d) {
-                break StopReason::Time;
+            if mode != Mode::Feasibility {
+                if self.stats.work - work_start >= limits.work {
+                    break StopReason::Work;
+                }
+                if limits.time.is_some_and(|d| started.elapsed() >= d) {
+                    break StopReason::Time;
+                }
             }
             if (self.stats.work - work_start).is_multiple_of(64) {
                 self.update_memory();

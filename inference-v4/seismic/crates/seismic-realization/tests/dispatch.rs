@@ -1,168 +1,142 @@
-use seismic_lang::types::DType;
-use seismic_realization::dispatch::{GroupDispatch, TileDeclaration, TilePlacement};
+//! The one common linear/runtime iteration geometry: the hosted
+//! `LinearIterationMap` is the single definition.
+
+use seismic_lang::{
+    logical::{RuntimeExtent, RuntimeScalarExpr},
+    sym::Sym,
+    types::{ExtentExpr, RuntimeExtentId},
+};
+use seismic_realization::dispatch::{
+    LaunchCondition, LinearIterationMap, LinearMapError, LinearTotal, Traversal,
+};
+use std::collections::BTreeMap;
 
 #[test]
-fn work_mapping_covers_each_logical_coordinate_once() {
-    use seismic_realization::dispatch::WorkMapping;
-    for outer in [1, 2, 3] {
-        for middle in [1, 3] {
-            for inner in [1, 2, 3, 4, 5, 6] {
-                for step in [1, 2, 3] {
-                    let mapping = WorkMapping::new(&[outer, middle, inner], &[1, 1, step]).unwrap();
-                    let mut visited = std::collections::BTreeSet::new();
-                    for item in 0..mapping.work_items() {
-                        let base = mapping.coordinates(item).unwrap();
-                        assert!(base[0] < outer && base[1] < middle);
-                        for offset in 0..mapping.extents(item).unwrap()[2] {
-                            assert!(base[2] + offset < inner);
-                            assert!(visited.insert((base[0], base[1], base[2] + offset)));
-                        }
-                    }
-                    let expected: std::collections::BTreeSet<_> = (0..outer)
-                        .flat_map(|x| {
-                            (0..middle).flat_map(move |y| (0..inner).map(move |z| (x, y, z)))
-                        })
-                        .collect();
-                    assert_eq!(visited, expected);
-                    assert!(mapping.coordinates(mapping.work_items()).is_err());
-                }
-            }
+fn one_pass_and_grid_stride_cover_the_same_domain() {
+    let extents = vec![ExtentExpr::Static(7), ExtentExpr::Static(3)];
+    let grid_stride = LinearIterationMap::linear(&extents, &BTreeMap::new())
+        .expect("the map builds")
+        .with_participants(Sym::constant(8));
+    assert_eq!(grid_stride.traversal, Traversal::GridStride);
+    // Grid-stride: participant `i` visits `i, i + p, i + 2p, …`, tail masked.
+    let mut strided = Vec::new();
+    for participant in 0..8u64 {
+        let mut linear = participant;
+        while linear < 21 {
+            strided.push(grid_stride.delinearize(linear).unwrap());
+            linear += 8;
         }
     }
-    let mapping = WorkMapping::new(&[2, 6], &[1, 3]).unwrap();
-    assert_eq!(
-        (0..4)
-            .map(|i| mapping.coordinates(i).unwrap())
-            .collect::<Vec<_>>(),
-        [vec![0, 0], vec![0, 3], vec![1, 0], vec![1, 3]]
-    );
+    // One pass: each participant owns exactly one coordinate, no tail.
+    let one_pass = LinearIterationMap::serialized(&grid_stride);
+    assert_eq!(one_pass.traversal, Traversal::OnePass);
+    assert!(!one_pass.tail_mask);
+    let mut ascending = (0..21)
+        .map(|linear| one_pass.delinearize(linear).unwrap())
+        .collect::<Vec<_>>();
+    ascending.sort();
+    let mut sorted = strided;
+    sorted.sort();
+    assert_eq!(sorted, ascending);
 }
 
 #[test]
-fn work_mapping_distinguishes_serial_empty_and_invalid_domains() {
-    use seismic_realization::dispatch::WorkMapping;
-    let serial = WorkMapping::new(&[], &[]).unwrap();
-    assert_eq!(serial.work_items(), 1);
-    assert_eq!(serial.coordinates(0).unwrap(), Vec::<u64>::new());
-    for extents in [vec![0], vec![2, 0, 3], vec![u64::MAX, 0, u64::MAX]] {
-        let mapping = WorkMapping::new(&extents, &vec![1; extents.len()]).unwrap();
-        assert_eq!(mapping.work_items(), 0);
-        assert!(mapping.coordinates(0).is_err());
-    }
-    assert!(WorkMapping::new(&[2], &[]).is_err());
-    assert!(WorkMapping::new(&[2], &[0]).is_err());
-    let tail = WorkMapping::new(&[3], &[2]).unwrap();
-    assert_eq!(tail.work_items(), 2);
-    assert_eq!(tail.coordinates(1).unwrap(), vec![2]);
-    assert_eq!(tail.extents(0).unwrap()[0], 2);
-    assert_eq!(tail.extents(1).unwrap()[0], 1);
-    assert!(WorkMapping::new(&[u64::MAX, 2], &[1, 1]).is_err());
+fn zero_work_is_a_retained_launch_condition() {
+    let empty = LinearIterationMap::linear(&[ExtentExpr::Static(0)], &BTreeMap::new())
+        .expect("the map builds");
+    assert_eq!(empty.launch_condition(), LaunchCondition::AlwaysSkip);
+    assert_eq!(empty.delinearize(0), None);
+    let nonempty = LinearIterationMap::linear(&[ExtentExpr::Static(4)], &BTreeMap::new())
+        .expect("the map builds");
+    assert_eq!(nonempty.launch_condition(), LaunchCondition::Execute);
 }
+
 #[test]
-fn declaration_units_and_padding_are_explicit() {
-    let dispatch = GroupDispatch::new(7, 32, 4).unwrap();
-    assert_eq!(dispatch.dispatched_lanes(), 256);
-    assert_eq!(dispatch.participating_lanes(), 224);
-    assert_eq!(dispatch.padding_lanes(), 32);
-    let tile = |placement| TileDeclaration {
-        symbol: "tile".into(),
-        dtype: DType::BF16,
-        capacity: 65,
-        placement,
+fn runtime_extents_are_retained_not_replaced_by_capacities() {
+    let id = RuntimeExtentId(0);
+    let runtime = RuntimeExtent {
+        id,
+        value: RuntimeScalarExpr::Extent(id),
+        capacity: 4096,
+        expected: None,
     };
-    assert_eq!(
-        tile(TilePlacement::Replicated).bytes(&dispatch).unwrap(),
-        (130, 0)
-    );
-    assert_eq!(
-        tile(TilePlacement::Distributed).bytes(&dispatch).unwrap(),
-        (6, 0)
-    );
-    assert_eq!(
-        tile(TilePlacement::GroupShared).bytes(&dispatch).unwrap(),
-        (0, 520)
-    );
-    assert!(GroupDispatch::new(u64::MAX, 32, 4).is_err());
-    assert!(GroupDispatch::new(1, 0, 4).is_err());
-}
-
-#[test]
-fn physical_arrays_cover_logical_tiles_including_empty_and_partial_lanes() {
-    for capacity in [0, 1, 31, 32, 33, 65] {
-        for dtype in [DType::F16, DType::F32] {
-            let dispatch = GroupDispatch::new(7, 32, 4).unwrap();
-            for placement in [
-                TilePlacement::Replicated,
-                TilePlacement::Distributed,
-                TilePlacement::GroupShared,
-                TilePlacement::GroupWide,
-            ] {
-                let tile = TileDeclaration {
-                    symbol: "t".into(),
-                    dtype,
-                    capacity,
-                    placement: placement.clone(),
-                };
-                let layout = tile.layout(&dispatch).unwrap();
-                let width = u64::from(dtype.bytes());
-                match placement {
-                    TilePlacement::Replicated => {
-                        assert_eq!(layout.private_elements_per_lane, capacity.max(1));
-                        assert_eq!(layout.shared_elements_per_item, 0);
-                    }
-                    TilePlacement::Distributed => {
-                        let slots = layout.private_elements_per_lane;
-                        assert!(slots > 0);
-                        assert!(slots * 32 >= capacity);
-                        assert!(slots == 1 || (slots - 1) * 32 < capacity);
-                        assert_eq!(layout.shared_elements_per_item, 0);
-                    }
-                    TilePlacement::GroupShared | TilePlacement::GroupWide => {
-                        assert_eq!(layout.private_elements_per_lane, 0);
-                        assert_eq!(layout.shared_elements_per_item, capacity.max(1));
-                    }
-                }
-                assert_eq!(
-                    layout.private_bytes_per_lane,
-                    layout.private_elements_per_lane * width
-                );
-                // A group-wide array exists once per group; an item-owned one once per item.
-                let items = if placement == TilePlacement::GroupWide {
-                    1
-                } else {
-                    4
-                };
-                assert_eq!(
-                    layout.shared_bytes_per_group,
-                    layout.shared_elements_per_item * width * items
-                );
-                assert_eq!(
-                    tile.bytes(&dispatch).unwrap(),
-                    (layout.private_bytes_per_lane, layout.shared_bytes_per_group)
-                );
-            }
+    let map =
+        LinearIterationMap::linear(&[ExtentExpr::Runtime(id)], &BTreeMap::from([(id, runtime)]))
+            .expect("the map builds");
+    // Planning/resource accounting uses the checked capacity bound…
+    assert_eq!(map.total_symbol().as_constant(), Some(4096));
+    // …while the retained total is the exact runtime product.
+    match &map.total {
+        LinearTotal::Runtime {
+            product, capacity, ..
+        } => {
+            assert_eq!(*capacity, 4096);
+            assert_eq!(*product, RuntimeScalarExpr::Extent(id));
         }
+        other => panic!("the total must be runtime, got {other:?}"),
     }
 }
 
 #[test]
-fn storage_rejects_invalid_widths_and_byte_overflow() {
-    let mut dispatch = GroupDispatch::new(1, 32, 4).unwrap();
-    let mut tile = TileDeclaration {
-        symbol: "t".into(),
-        dtype: DType::F32,
+fn expected_extents_price_cost_but_never_geometry() {
+    let id = RuntimeExtentId(0);
+    let runtime = RuntimeExtent {
+        id,
+        value: RuntimeScalarExpr::Extent(id),
+        capacity: 4096,
+        expected: Some(128),
+    };
+    let map = LinearIterationMap::linear(
+        &[ExtentExpr::Runtime(id), ExtentExpr::Static(3)],
+        &BTreeMap::from([(id, runtime)]),
+    )
+    .expect("the map builds");
+    // Geometry and resources keep the capacity bound…
+    assert_eq!(map.total_symbol().as_constant(), Some(4096 * 3));
+    assert_eq!(map.total.bound(), 4096 * 3);
+    // …while cost prices the workload's expectation.
+    assert_eq!(map.total.expected(), 128 * 3);
+    assert_eq!(map.cost_symbol().as_constant(), Some(128 * 3));
+    // An unstated axis leaves the domain priced at capacity.
+    let unstated = RuntimeExtent {
+        id,
+        value: RuntimeScalarExpr::Extent(id),
+        capacity: 4096,
+        expected: None,
+    };
+    let map = LinearIterationMap::linear(
+        &[ExtentExpr::Runtime(id)],
+        &BTreeMap::from([(id, unstated)]),
+    )
+    .expect("the map builds");
+    assert_eq!(map.cost_symbol(), map.total_symbol());
+}
+
+#[test]
+fn checked_totals_never_wrap() {
+    let huge = LinearIterationMap::linear(
+        &[ExtentExpr::Static(u64::MAX), ExtentExpr::Static(2)],
+        &BTreeMap::new(),
+    );
+    assert_eq!(huge.unwrap_err(), LinearMapError::StaticOverflow);
+    let id = RuntimeExtentId(0);
+    let runtime = RuntimeExtent {
+        id,
+        value: RuntimeScalarExpr::Extent(id),
         capacity: u64::MAX,
-        placement: TilePlacement::Replicated,
+        expected: None,
     };
-    assert!(tile.layout(&dispatch).is_err());
-    tile.placement = TilePlacement::GroupShared;
-    // Per-item bytes fit, but per-group bytes do not.
-    tile.capacity = u64::MAX / 4;
-    assert!(tile.layout(&dispatch).is_err());
-    tile.capacity = 1;
-    dispatch.lanes_per_item = 0;
-    assert!(tile.layout(&dispatch).is_err());
-    dispatch.lanes_per_item = 32;
-    dispatch.items_per_group = 0;
-    assert!(tile.layout(&dispatch).is_err());
+    let runtime_overflow = LinearIterationMap::linear(
+        &[ExtentExpr::Runtime(id), ExtentExpr::Runtime(id)],
+        &BTreeMap::from([(id, runtime)]),
+    );
+    assert_eq!(
+        runtime_overflow.unwrap_err(),
+        LinearMapError::CapacityOverflow
+    );
+    let unresolved = LinearIterationMap::linear(
+        &[ExtentExpr::Sym(Sym::param("unresolved"))],
+        &BTreeMap::new(),
+    );
+    assert_eq!(unresolved.unwrap_err(), LinearMapError::UnresolvedSymbol);
 }

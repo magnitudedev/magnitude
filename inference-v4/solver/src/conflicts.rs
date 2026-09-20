@@ -54,10 +54,12 @@ impl ConflictStore {
         }
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> &ConflictStats {
         &self.stats
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.facts.len()
     }
@@ -82,6 +84,7 @@ impl ConflictStore {
     /// independently confirms it. Other factors used to narrow the workspace do
     /// not become hidden premises: every resulting scoped domain is retained.
     /// This permits reuse across regions with unrelated extra constraints.
+    #[cfg(test)]
     pub fn record_factor_infeasible(
         &mut self,
         factor: &Factor,

@@ -1,5 +1,5 @@
-//! `metal-estimate-probe-calibrated-m4max-20260919-v3`: an additive execution-time estimate in nanoseconds
-//! (spec 12.4-12.5, plan 4.2). No result of this model is an execution upper bound.
+//! `metal-estimate-probe-calibrated-m4max-20260919-v3`: an additive execution-time estimate in nanoseconds.
+//! No result of this model is an execution upper bound.
 //!
 //! Coefficient provenance. "Probe" means a small standalone Metal kernel timed on an Apple
 //! M4 Max (macOS 15) on 2026-09-19, fifty dispatches per command buffer, best of several

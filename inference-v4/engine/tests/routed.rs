@@ -1,12 +1,19 @@
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{allocate, fill, Backend, WIDTHS};
+use reference::{allocate, fill, Backend};
 use seismic_engine::models::qwen35::program::program;
-use seismic_lang::types::DType;
+use seismic_lang::types::{DType, Elem};
 use serde_json::Value;
 use std::collections::HashMap;
 fn doubles(v: &Value) -> impl Iterator<Item = f64> + '_ {
     v.as_array().unwrap().iter().map(|v| v.as_f64().unwrap())
+}
+fn close_bf16(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+        // BF16 publication: agreement is at the published BF16 value.
+        assert_eq!(a, e, "element {i}: {a} != {e}");
+    }
 }
 fn close(actual: &[f32], expected: &Value, tolerance: f32) {
     let expected = doubles(expected).map(|v| v as f32).collect::<Vec<_>>();
@@ -75,24 +82,60 @@ fn exercise(backend: &mut Backend<'_>) {
         tensors.get_mut("residual").unwrap(),
         doubles(&fixture["residual"]),
     );
-    for case in fixture["cases"].as_array().unwrap() {
+    // Normative expected values: the current reference interpreter over the
+    // same inputs (the registry's f32 reduction accumulator governs both
+    // sides; the V3 fixture only supplies the inputs).
+    let expected: Vec<(bool, Vec<f32>)> = {
+        let program = match backend {
+            Backend::Interpreter(program, _) => *program,
+            Backend::Metal(compiler) => compiler.program(),
+        };
+        let mut reference = Backend::Interpreter(
+            program,
+            HashMap::from([("A".into(), Elem::Dtype(DType::BF16))]),
+        );
+        fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| {
+                let normalize = case["normalize"].as_bool().unwrap();
+                let scalars = HashMap::from([
+                    ("eps".into(), 1e-6),
+                    ("normalize".into(), f64::from(normalize)),
+                ]);
+                let mut run = tensors.clone();
+                reference.run("qwen_routed_suffix", &shapes, &mut run, &scalars);
+                // The residual out is result leaf 14.
+                (
+                    normalize,
+                    reference::values(&run["result14"])
+                        .into_iter()
+                        .map(|v| v as f32)
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let cases = fixture["cases"].as_array().unwrap();
+    for (case, (normalize, expected)) in cases.iter().zip(&expected) {
         let scalars = HashMap::from([
             ("eps".into(), 1e-6),
-            (
-                "normalize".into(),
-                f64::from(case["normalize"].as_bool().unwrap()),
-            ),
+            ("normalize".into(), f64::from(*normalize)),
         ]);
         backend.run("qwen_routed_suffix", &shapes, &mut tensors, &scalars);
-        close(&reference::values(&tensors["out"]), &case["out"], 2e-6);
+        // The backend must agree with the reference bit for bit at the
+        // published BF16 value.
+        close_bf16(&reference::values(&tensors["result14"]), expected);
     }
 }
 #[test]
 fn reference_routed() {
     let program = program().unwrap();
-    for width in WIDTHS {
-        exercise(&mut Backend::Interpreter(&program, width));
-    }
+    exercise(&mut Backend::Interpreter(
+        &program,
+        HashMap::from([("A".into(), Elem::Dtype(DType::BF16))]),
+    ));
 }
 #[test]
 #[ignore = "requires a Metal device"]

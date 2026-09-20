@@ -1,18 +1,16 @@
 //! Long-context session measurement with ordinary automatic selection: the session-bench
-//! prose fixture prefilled in fixed chunks, then greedy decode. Only the search budget's
-//! strategy and precision policy are supplied; no implementation flags exist.
+//! prose fixture prefilled in fixed chunks, then greedy decode. Only the search budget and
+//! precision policy are supplied; no implementation flags exist.
 
 use seismic_lang::precision::{EvidenceRequirement, Limit, PrecisionPolicy, Tolerance};
-use seismic_runtime::Strategy;
 
-const USAGE: &str = "usage: qwen_prose_session ARTIFACT OUTPUT_JSON [--device metal|cpu|cuda] [--strategy exact|greedy] --precision exact|bounded|unconstrained [--atol V --rtol V --relative-floor V --ulps N|- --evidence proven|qualified] [--context-tokens 16384] [--prefill-chunk 512] [--decode 256] [--fixture PATH]\n\
+const USAGE: &str = "usage: qwen_prose_session ARTIFACT OUTPUT_JSON [--device metal|cpu|cuda] --precision exact|bounded|unconstrained [--atol V --rtol V --relative-floor V --ulps N|- --evidence proven|qualified] [--context-tokens 16384] [--prefill-chunk 512] [--decode 256] [--fixture PATH]\n\
 bounded precision requires all five bounded-policy options; `--ulps -` makes the numerical envelope authoritative";
 
 struct Options {
     artifact: String,
     output: String,
     target: String,
-    strategy: Strategy,
     precision: PrecisionPolicy,
     context: usize,
     chunk: usize,
@@ -33,7 +31,6 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
     let mut args = args.into_iter();
     let mut positional = Vec::new();
     let mut target = None;
-    let mut strategy = None;
     let mut precision = None;
     let mut bounded = BoundedOptions::default();
     let mut context = None;
@@ -74,18 +71,6 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     ));
                 }
                 set(&mut target, parsed, &arg)?;
-            }
-            "--strategy" => {
-                let parsed = match value(&mut args, &arg)?.as_str() {
-                    "exact" => Strategy::Exact,
-                    "greedy" => Strategy::Greedy,
-                    other => {
-                        return Err(format!(
-                            "bad --strategy `{other}`; expected exact or greedy"
-                        ))
-                    }
-                };
-                set(&mut strategy, parsed, &arg)?;
             }
             "--precision" => set(&mut precision, value(&mut args, &arg)?, &arg)?,
             "--atol" => {
@@ -214,7 +199,6 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         artifact: artifact.clone(),
         output: output.clone(),
         target: target.unwrap_or_else(|| "metal".into()),
-        strategy: strategy.unwrap_or(Strategy::Exact),
         precision,
         context: context.unwrap_or(16384),
         chunk: chunk.unwrap_or(512),
@@ -281,7 +265,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let settings = Settings {
         precision: options.precision.clone(),
-        strategy: options.strategy,
         ..Settings::default()
     };
     let result = (|| {
@@ -301,16 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(report) => serde_json::json!({"status":"measured", "report": report}),
         Err(error) => serde_json::json!({"status":"not_measured", "error": error}),
     };
-    let strategy = match options.strategy {
-        Strategy::Exact => "exact",
-        Strategy::Greedy => "greedy",
-    };
     let record = serde_json::json!({
         "result": record,
         "device": device_name,
         "backend": options.target,
         "precision": precision_json(&options.precision),
-        "strategy": strategy,
         "fixture": options.fixture,
         "session": {
             "context_tokens": options.context,

@@ -1,44 +1,36 @@
-//! Frames, definition selection, calls, statements, regions, stages and merges.
-use super::value::{Backing, Flow, Piece, ResultVal, Shaped, Value};
-use super::{round_to, Arg, Interpreter};
-use crate::family::Workload;
-use crate::sir::Mode;
+//! Frames, reference-body selection, calls, and statement execution over the
+//! checked representation. A function family is evaluated through its
+//! reference body; lowerings are non-reference alternatives and are never
+//! interpreted.
+use super::value::{Backing, Flow, Shaped, Value};
+use super::{Arg, Bindings, Interpreter};
 use crate::sir::{
-    Block, Body, CallId, ContractFamily, DefId, DefKind, Definition, Expr, ExprKind, Merge,
-    Pattern, Predicate, Region, RegionSource, SliceParent, Stage, Stmt, StmtKind, VarKind,
+    BlockTerminator, CheckedBlock, CheckedCall, CheckedExpr, CheckedExprKind, CheckedPlace,
+    CheckedStmt, ContractFamily, DefId, DefKind, Definition, Mode, Pattern, Predicate,
 };
 use crate::span::{line_col, Span};
 use crate::sym::Sym;
 use crate::syntax::ast::AssignOp;
-use crate::types::{DType, Elem};
-use crate::types::{Extent, SliceId, Ty};
+use crate::types::{DType, Elem, ExtentExpr, ValueType};
 use std::collections::HashMap;
-use std::rc::Rc;
 
 pub(super) struct Frame<'a> {
     pub def: &'a Definition,
-    pub body: &'a Body,
-    pub vars: Vec<Option<Value>>,
-    /// Current piece of every slice binder in scope, by `SliceId`.
-    pub slices: Vec<Option<Piece>>,
-    /// Shape parameters; one bound to a structural extent holds the current valid extent.
+    pub body: &'a crate::sir::CheckedBody,
+    pub locals: Vec<Option<Value>>,
+    /// Shape parameters.
     pub shapes: HashMap<String, i64>,
-    /// Shape parameters bound to a structural extent: the caller's piece (capacity, domain).
-    pub caps: HashMap<String, Piece>,
     pub elems: HashMap<String, Elem>,
-    /// Realized lengths of runtime-bounded range views, by the checker's `@dyn#n` atom.
-    pub dynamic: HashMap<String, i64>,
 }
 
 impl<'a> Frame<'a> {
-    /// Symbols name shape parameters, or the runtime value of an integer body variable as
-    /// `name#VarId` (the checker's variable atoms); a bare name denotes the innermost live
-    /// integer variable of that name.
+    /// Symbols name shape parameters, or the runtime value of an integer body
+    /// local as `name#LocalId` (the checker's variable atoms).
     fn lookup(&self, name: &str) -> Option<i64> {
-        if let Some(v) = self.shapes.get(name).or_else(|| self.dynamic.get(name)) {
+        if let Some(v) = self.shapes.get(name) {
             return Some(*v);
         }
-        let integer = |i: usize| match self.vars.get(i) {
+        let integer = |i: usize| match self.locals.get(i) {
             Some(Some(Value::Scalar(d, x))) if d.is_int() => Some(*x as i64),
             _ => None,
         };
@@ -46,17 +38,17 @@ impl<'a> Frame<'a> {
             if let Some(id) = id
                 .parse::<usize>()
                 .ok()
-                .filter(|id| self.body.vars.get(*id).is_some_and(|v| v.name == base))
+                .filter(|id| self.body.locals.get(*id).is_some_and(|v| v.name == base))
             {
                 return integer(id);
             }
         }
         self.body
-            .vars
+            .locals
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, var)| var.name == name)
+            .filter(|(_, local)| local.name == name)
             .find_map(|(i, _)| integer(i))
     }
 
@@ -72,33 +64,23 @@ impl<'a> Frame<'a> {
         }
     }
 
-    /// A predicate on a structurally bound parameter constrains the capacity (R1).
+    /// A `where` predicate over the bound shapes.
     fn holds(&self, p: &Predicate) -> Result<bool, String> {
-        let env = |n: &str| {
-            self.caps
-                .get(n)
-                .map(|piece| piece.width)
-                .or_else(|| self.lookup(n))
-        };
         let eval = |s: &Sym| {
-            s.eval(&env)
+            s.eval(&|n| self.shapes.get(n).copied())
                 .ok_or_else(|| format!("cannot evaluate predicate operand `{s}`"))
         };
         Ok(match p {
             Predicate::NonNegative(s) => eval(s)? >= 0,
             Predicate::Zero(s) => eval(s)? == 0,
             Predicate::NonZero(s) => eval(s)? != 0,
-            Predicate::Full(name) => self
-                .caps
-                .get(name)
-                .is_none_or(|piece| piece.width > 0 && piece.domain % piece.width == 0),
         })
     }
 }
 
 fn same_backing(a: &Shaped, b: &Shaped) -> bool {
     match (&a.backing, &b.backing) {
-        (Backing::Owned(x), Backing::Owned(y)) => Rc::ptr_eq(x, y),
+        (Backing::Owned(x), Backing::Owned(y)) => std::rc::Rc::ptr_eq(x, y),
         (Backing::Tensor(x), Backing::Tensor(y)) => x == y,
         _ => false,
     }
@@ -111,32 +93,35 @@ impl<'a> Interpreter<'a> {
         &mut self,
         name: &str,
         args: &[Arg],
-        workload: &Workload,
-    ) -> Result<(), String> {
+        bindings: &Bindings,
+    ) -> Result<Value, String> {
         let program = self.program;
         let family = program.resolve_family(name)?;
         let families = [family];
-        let shapes: HashMap<String, i64> = workload
+        let shapes: HashMap<String, i64> = bindings
             .shapes
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        let elems: HashMap<String, Elem> = workload
+        let elems: HashMap<String, Elem> = bindings
             .elems
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let this: &Interpreter<'a> = self;
         let make = |d: &'a Definition| -> Result<Frame<'a>, String> {
             if let Some(missing) = d.shape_params.iter().find(|p| !shapes.contains_key(*p)) {
-                return Err(format!("workload does not bind shape parameter {missing}"));
+                return Err(format!("bindings do not bind shape parameter {missing}"));
             }
-            let values = self.entry_values(d, args, &shapes)?;
-            self.instantiate(d, shapes.clone(), HashMap::new(), elems.clone(), values)
+            let values = this.entry_values(d, args, &shapes)?;
+            this.instantiate(d, shapes.clone(), elems.clone(), values)
         };
-        let mut frame = self.select(name, &families, &make)?;
+        let mut frame = self.select_body(&family.name, &families, &make)?;
         let body = frame.body;
-        self.block(&body.block, &mut frame)?;
-        Ok(())
+        match self.block(&body.root, &mut frame)? {
+            Flow::Return(v) => Ok(v),
+            Flow::Next => Ok(Value::Void),
+        }
     }
 
     fn entry_values(
@@ -162,30 +147,32 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Scalar(
                     dtype,
                     if dtype.is_float() {
-                        round_to(dtype, v)
+                        super::round_to(dtype, v)
                     } else {
                         v
                     },
                 ))
             };
             values.push(match (arg, &param.ty) {
-                (Arg::Tensor(id), Ty::Tensor(_) | Ty::View(_)) => {
+                (Arg::Tensor(id), ValueType::Tensor(_)) => {
                     let t = self.tensors.get(*id).ok_or_else(|| {
                         format!("argument {i} names tensor {id}, which does not exist")
                     })?;
-                    Value::View(Shaped::tensor(*id, t.shape()))
+                    Value::Tensor(Shaped::tensor(*id, t.shape()))
                 }
-                (Arg::Scalar(v), Ty::Scalar(dtype)) => scalar(*dtype, None, *v)?,
-                (Arg::Scalar(v), Ty::Index(bound)) => {
+                (Arg::Scalar(v), ValueType::Scalar(dtype)) => scalar(*dtype, None, *v)?,
+                (Arg::Scalar(v), ValueType::Index { bound }) => {
                     let bound = bound
-                        .eval(&|n| shapes.get(n).copied())
+                        .sym()
+                        .and_then(|s| s.eval(&|n| shapes.get(n).copied()))
                         .and_then(|n| u64::try_from(n).ok())
                         .ok_or_else(|| format!("unresolved index bound for `{}`", param.name))?;
                     scalar(DType::I32, Some(bound), *v)?
                 }
-                (Arg::Range(start, end), Ty::Range(bound)) => {
+                (Arg::Range(start, end), ValueType::Range { bound }) => {
                     let bound = bound
-                        .eval(&|n| shapes.get(n).copied())
+                        .sym()
+                        .and_then(|s| s.eval(&|n| shapes.get(n).copied()))
                         .and_then(|n| u64::try_from(n).ok())
                         .ok_or_else(|| format!("unresolved range bound for `{}`", param.name))?;
                     let mut first = crate::abi::ScalarParameter::plain(
@@ -221,13 +208,12 @@ impl<'a> Interpreter<'a> {
         Ok(values)
     }
 
-    /// Bind one definition to evaluated arguments (in parameter order). `Err` is the reason
-    /// the definition is not applicable.
+    /// Bind one definition to evaluated arguments (in parameter order). `Err`
+    /// is the reason the definition is not applicable.
     fn instantiate(
         &self,
         def: &'a Definition,
         mut shapes: HashMap<String, i64>,
-        caps: HashMap<String, Piece>,
         mut elems: HashMap<String, Elem>,
         values: Vec<Value>,
     ) -> Result<Frame<'a>, String> {
@@ -242,10 +228,9 @@ impl<'a> Interpreter<'a> {
         for (name, elem) in &def.elem_bindings {
             elems.entry(name.clone()).or_insert_with(|| elem.clone());
         }
-        let mut slices = vec![None; body.slices.len()];
         for (param, value) in def.params.iter().zip(&values) {
             match (&param.ty, value) {
-                (Ty::Tensor(t) | Ty::View(t) | Ty::Tile(t), Value::Tile(s) | Value::View(s)) => {
+                (ValueType::Tensor(t), Value::Tensor(s)) => {
                     if t.axes.len() != s.shape.len() {
                         return Err(format!(
                             "`{}` has rank {}, argument has rank {}",
@@ -273,7 +258,7 @@ impl<'a> Interpreter<'a> {
                         _ => {}
                     }
                     for (axis, n) in t.axes.iter().zip(&s.shape) {
-                        if let Extent::Semantic(sym) = axis {
+                        if let ExtentExpr::Sym(sym) = axis {
                             if let Some(p) = def
                                 .shape_params
                                 .iter()
@@ -284,16 +269,9 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                (Ty::Scalar(_) | Ty::Index(_), Value::Scalar(..))
-                | (Ty::Range(_), Value::Range(..))
-                | (Ty::Tuple(_), Value::Tuple(_))
-                | (Ty::Result(_), Value::Result(_))
-                | (Ty::Native(_), Value::Native(_)) => {}
-                (Ty::Slice(id), Value::Slice(piece)) => match slices.get_mut(id.0 as usize) {
-                    Some(slot) => *slot = Some(*piece),
-                    None => return Err(format!("`{}` names an unknown slice", param.name)),
-                },
-                (_, Value::Void) if param.mode == Mode::Out => {}
+                (ValueType::Scalar(_) | ValueType::Index { .. }, Value::Scalar(..))
+                | (ValueType::Range { .. }, Value::Range(..))
+                | (ValueType::Tuple(_), Value::Tuple(_)) => {}
                 (ty, v) => {
                     return Err(format!(
                         "`{}`: {} where {ty} is required",
@@ -303,32 +281,27 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        let mut vars = vec![None; body.vars.len()];
+        let mut locals = vec![None; body.locals.len()];
         for (param, value) in def.params.iter().zip(values) {
-            if !matches!(value, Value::Void) {
-                *vars
-                    .get_mut(param.var)
-                    .ok_or("parameter variable outside the body")? = Some(value);
-            }
+            *locals
+                .get_mut(param.local)
+                .ok_or("parameter local outside the body")? = Some(value);
         }
         let frame = Frame {
             def,
             body,
-            vars,
-            slices,
+            locals,
             shapes,
-            caps,
             elems,
-            dynamic: HashMap::new(),
         };
         for param in &def.params {
-            let Some(value) = &frame.vars[param.var] else {
+            let Some(value) = &frame.locals[param.local] else {
                 continue;
             };
             match (&param.ty, value) {
-                (Ty::Tensor(t) | Ty::View(t) | Ty::Tile(t), Value::Tile(s) | Value::View(s)) => {
+                (ValueType::Tensor(t), Value::Tensor(s)) => {
                     for (k, (axis, n)) in t.axes.iter().zip(&s.shape).enumerate() {
-                        if let Extent::Semantic(sym) = axis {
+                        if let ExtentExpr::Sym(sym) = axis {
                             let expected = frame.sym(sym)?;
                             if expected != *n as i64 {
                                 return Err(format!(
@@ -339,10 +312,16 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                (Ty::Index(bound), Value::Scalar(_, x)) => {
-                    let bound = frame.sym(bound)?;
+                (ValueType::Index { bound }, Value::Scalar(_, x)) => {
+                    let bound = bound
+                        .sym()
+                        .and_then(|s| frame.sym(s).ok())
+                        .unwrap_or(i64::MAX);
                     if *x < 0.0 || *x as i64 >= bound {
-                        return Err(format!("`{}` = {x} is outside index[{bound}]", param.name));
+                        return Err(format!(
+                            "`{}` = {x} is outside its declared index bound {bound}",
+                            param.name
+                        ));
                     }
                 }
                 _ => {}
@@ -356,9 +335,10 @@ impl<'a> Interpreter<'a> {
         Ok(frame)
     }
 
-    /// Deterministic definition choice from the union of portable functions and matching
-    /// target-specific functions and lowerings. `choice` may force any applicable body.
-    fn select(
+    /// Deterministic reference-body choice: portable bodies first, then
+    /// backend-specific bodies matching the interpreter target. Lowerings are
+    /// non-reference alternatives and are never selected.
+    fn select_body(
         &self,
         name: &str,
         families: &[&'a ContractFamily],
@@ -368,11 +348,18 @@ impl<'a> Interpreter<'a> {
         let target = self.target.as_deref();
         let mut ids: Vec<DefId> = families
             .iter()
-            .flat_map(|f| f.bodies.iter().chain(&f.lowerings))
+            .flat_map(|f| f.bodies.iter())
             .copied()
             .collect();
         ids.sort();
         ids.dedup();
+        // Prefer a portable reference body; fall back to the target's helper.
+        ids.sort_by_key(|id| {
+            matches!(
+                program.definition(*id).kind,
+                DefKind::Body { target: Some(_) }
+            ) as u8
+        });
         let mut applicable: Vec<(DefId, Frame<'a>)> = Vec::new();
         let mut reasons = Vec::new();
         for id in ids {
@@ -381,8 +368,8 @@ impl<'a> Interpreter<'a> {
                 DefKind::Body { target: None } => true,
                 DefKind::Body {
                     target: Some(required),
-                }
-                | DefKind::Lower { target: required } => Some(required.as_str()) == target,
+                } => Some(required.as_str()) == target,
+                DefKind::Lower { .. } => false,
             };
             if !available {
                 continue;
@@ -392,96 +379,49 @@ impl<'a> Interpreter<'a> {
                 Err(reason) => reasons.push(format!("definition {}: {reason}", id.0)),
             }
         }
-        let forced = match &self.choice {
-            Some(choose) => choose(
-                name,
-                &applicable.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            ),
-            None => None,
-        };
-        let position = match forced {
-            Some(id) => applicable
-                .iter()
-                .position(|(candidate, _)| *candidate == id)
-                .ok_or_else(|| {
-                    format!("forced definition {} of `{name}` is not applicable", id.0)
-                })?,
-            None => (!applicable.is_empty()).then_some(0).ok_or_else(|| {
+        applicable
+            .into_iter()
+            .map(|(_, frame)| frame)
+            .next()
+            .ok_or_else(|| {
                 format!(
-                    "no applicable definition of `{name}`{}{}",
+                    "no reference body of `{name}` is applicable{}{}",
                     if reasons.is_empty() { "" } else { ": " },
                     reasons.join("; ")
                 )
-            })?,
-        };
-        Ok(applicable.swap_remove(position).1)
+            })
     }
 
     pub(super) fn call(
         &mut self,
-        call: CallId,
-        args: &'a [Expr],
+        call: &CheckedCall,
+        args: &[CheckedExpr],
         f: &mut Frame<'a>,
     ) -> Result<Value, String> {
         let program = self.program;
-        let body = f.body;
-        let site = body.calls.get(call.0 as usize).ok_or("unknown call site")?;
         let family = program
             .families
-            .get(site.family)
+            .get(call.family)
             .ok_or("call names an unknown family")?;
-        let mut outs = vec![false; args.len()];
-        if let Some(b) = site.bindings.first() {
-            for (param, ordinal) in program
-                .definition(b.definition)
-                .params
-                .iter()
-                .zip(&b.arg_order)
-            {
-                if let Some(slot) = outs.get_mut(*ordinal) {
-                    *slot = param.mode == Mode::Out;
-                }
-            }
-        }
         let mut values = Vec::with_capacity(args.len());
-        for (a, out) in args.iter().zip(&outs) {
-            let unset = matches!(&a.kind, ExprKind::Var(id) if f.vars.get(*id).is_some_and(|v| v.is_none()));
-            values.push(if *out && unset {
-                Value::Void
-            } else {
-                self.expr(a, f)?
-            });
+        for a in args {
+            values.push(self.expr(a, f)?);
         }
         let mut inner = {
             let caller: &Frame<'a> = f;
             let this: &Interpreter<'a> = self;
             let make = |d: &'a Definition| -> Result<Frame<'a>, String> {
-                let b = site
+                let b = call
                     .bindings
                     .iter()
                     .find(|b| b.definition == d.id)
                     .ok_or("the arguments do not bind its parameters")?;
                 let mut shapes = HashMap::new();
-                let mut caps = HashMap::new();
-                for (name, extent) in &b.shape_args {
-                    match extent {
-                        Extent::Semantic(sym) => {
-                            // An extent the caller cannot evaluate is solved from the runtime
-                            // shapes of the arguments and checked for consistency there.
-                            if let Ok(n) = caller.sym(sym) {
-                                shapes.insert(name.clone(), n);
-                            }
-                            if let Some((_, piece)) =
-                                caller.caps.iter().find(|(p, _)| sym == &Sym::param(p))
-                            {
-                                caps.insert(name.clone(), *piece);
-                            }
-                        }
-                        Extent::Structural(slice) => {
-                            let piece = this.piece(caller, *slice)?;
-                            shapes.insert(name.clone(), piece.extent());
-                            caps.insert(name.clone(), piece);
-                        }
+                for (name, sym) in &b.shape_args {
+                    // An extent the caller cannot evaluate is solved from the
+                    // runtime shapes of the arguments and checked there.
+                    if let Ok(n) = caller.sym(sym) {
+                        shapes.insert(name.clone(), n);
                     }
                 }
                 let mut elems = HashMap::new();
@@ -501,20 +441,22 @@ impl<'a> Interpreter<'a> {
                             .ok_or("argument order names a missing argument")
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                this.instantiate(d, shapes, caps, elems, ordered)
+                this.instantiate(d, shapes, elems, ordered)
             };
-            this.select(&family.name, &[family], &make)?
+            this.select_body(&family.name, &[family], &make)?
         };
         let callee = inner.body;
-        let result = match self.block(&callee.block, &mut inner)? {
-            Flow::Return(v) | Flow::Yield(v) => v,
-            Flow::Next => Value::Void,
-        };
-        let binding = site
+        let binding = call
             .bindings
             .iter()
             .find(|b| b.definition == inner.def.id)
             .ok_or("selected definition lost its binding")?;
+        let result = match self.block(&callee.root, &mut inner)? {
+            Flow::Return(v) => v,
+            Flow::Next => Value::Void,
+        };
+        // `inout` effects: scalar and tuple state is installed back; tensor
+        // storage was shared through the same backing during the call.
         for (param, ordinal) in inner.def.params.iter().zip(&binding.arg_order) {
             if param.mode == Mode::In {
                 continue;
@@ -522,15 +464,18 @@ impl<'a> Interpreter<'a> {
             let arg = args
                 .get(*ordinal)
                 .ok_or("argument order names a missing argument")?;
-            match inner.vars[param.var].take() {
+            match inner.locals[param.local].take() {
                 Some(v @ (Value::Scalar(..) | Value::Tuple(_))) => {
-                    self.assign(arg, AssignOp::Assign, v, f)?
+                    self.assign_expr(arg, AssignOp::Assign, v, f)?
                 }
-                Some(Value::Tile(s)) => {
-                    if let ExprKind::Var(id) = &arg.kind {
-                        let shared = matches!(&f.vars[*id], Some(Value::Tile(c) | Value::View(c)) if same_backing(c, &s));
+                Some(Value::Tensor(s)) => {
+                    if let CheckedExprKind::Local(id) = &arg.kind {
+                        let shared = matches!(
+                            &f.locals[*id],
+                            Some(Value::Tensor(c)) if same_backing(c, &s)
+                        );
                         if !shared {
-                            f.vars[*id] = Some(Value::Tile(s));
+                            f.locals[*id] = Some(Value::Tensor(s));
                         }
                     }
                 }
@@ -555,22 +500,35 @@ impl<'a> Interpreter<'a> {
         format!("in `{}` line {line}: {message}", def.name)
     }
 
-    pub(super) fn block(&mut self, block: &'a Block, f: &mut Frame<'a>) -> Result<Flow, String> {
-        for s in block {
-            match self.stmt(s, f).map_err(|m| self.locate(f.def, s.span, m))? {
+    pub(super) fn block(
+        &mut self,
+        block: &'a CheckedBlock,
+        f: &mut Frame<'a>,
+    ) -> Result<Flow, String> {
+        for s in &block.statements {
+            match self
+                .stmt(s, f)
+                .map_err(|m| self.locate(f.def, s.span(), m))?
+            {
                 Flow::Next => {}
                 flow => return Ok(flow),
             }
         }
-        Ok(Flow::Next)
+        match &block.terminator {
+            BlockTerminator::Continue => Ok(Flow::Next),
+            BlockTerminator::Return(values) => {
+                let value = self.values(values, f)?;
+                Ok(Flow::Return(value))
+            }
+        }
     }
 
     fn bind(&mut self, pattern: &Pattern, value: Value, f: &mut Frame<'a>) -> Result<(), String> {
         match (pattern, value) {
-            (Pattern::Var(id), value) => {
-                *f.vars
+            (Pattern::Local(id), value) => {
+                *f.locals
                     .get_mut(*id)
-                    .ok_or("binding outside the body's variables")? = Some(value);
+                    .ok_or("binding outside the body's locals")? = Some(value);
                 Ok(())
             }
             (Pattern::Tuple(patterns), Value::Tuple(items)) if patterns.len() == items.len() => {
@@ -587,7 +545,7 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn values(&mut self, items: &'a [Expr], f: &mut Frame<'a>) -> Result<Value, String> {
+    fn values(&mut self, items: &[CheckedExpr], f: &mut Frame<'a>) -> Result<Value, String> {
         let value = match items {
             [] => Value::Void,
             [one] => self.expr(one, f)?,
@@ -600,68 +558,58 @@ impl<'a> Interpreter<'a> {
         self.snapshot(value)
     }
 
-    pub(super) fn assign(
+    /// Assign through a checked place.
+    fn assign_place(
         &mut self,
-        target: &'a Expr,
+        place: &'a CheckedPlace,
         op: AssignOp,
         value: Value,
         f: &mut Frame<'a>,
     ) -> Result<(), String> {
-        match &target.kind {
-            ExprKind::Tuple(targets) => match value {
-                Value::Tuple(items) if items.len() == targets.len() => {
-                    for (t, v) in targets.iter().zip(items) {
-                        self.assign(t, op, v, f)?;
-                    }
-                    Ok(())
-                }
-                other => Err(format!(
-                    "cannot assign {} to {} places",
-                    other.kind(),
-                    targets.len()
-                )),
-            },
-            ExprKind::Var(id) => {
+        match place {
+            CheckedPlace::Local { root } => {
                 let current = f
-                    .vars
-                    .get(*id)
-                    .ok_or("assignment outside the body's variables")?
+                    .locals
+                    .get(*root)
+                    .ok_or("assignment outside the body's locals")?
                     .clone();
                 match (current, value) {
                     (Some(Value::Scalar(d, x)), Value::Scalar(vd, v)) if op != AssignOp::Assign => {
-                        f.vars[*id] =
+                        f.locals[*root] =
                             Some(Value::scalar(super::scalar::assign(op, (d, x), (vd, v))?));
                         Ok(())
                     }
-                    (
-                        Some(Value::View(s)),
-                        v @ (Value::Scalar(..) | Value::Tile(_) | Value::View(_)),
-                    ) => self.write(&s, op, &v),
-                    (
-                        Some(Value::Tile(s)),
-                        v @ (Value::Scalar(..) | Value::Tile(_) | Value::View(_)),
-                    ) if matches!(s.backing, Backing::Owned(_))
-                        && (op != AssignOp::Assign
+                    (Some(Value::Tensor(s)), v @ (Value::Scalar(..) | Value::Tensor(_)))
+                        if op != AssignOp::Assign
                             || v.shaped().is_some_and(|n| {
                                 n.shape == s.shape && self.dtype_of(n) == self.dtype_of(&s)
-                            })) =>
+                            }) =>
                     {
                         self.write(&s, op, &v)
                     }
                     (_, v) if op == AssignOp::Assign => {
-                        f.vars[*id] = Some(self.snapshot(v)?);
+                        f.locals[*root] = Some(self.snapshot(v)?);
                         Ok(())
                     }
                     (current, v) => Err(format!(
                         "`{}` of {} into {}",
                         op.text(),
                         v.kind(),
-                        current.map_or("an unset variable", |c| c.kind())
+                        current.map_or("an unset local", |c| c.kind())
                     )),
                 }
             }
-            ExprKind::Index { .. } | ExprKind::Transpose(_) => {
-                let dst = self.place(target, f)?;
+            CheckedPlace::Element { root, indices } => {
+                let current = f
+                    .locals
+                    .get(*root)
+                    .ok_or("assignment outside the body's locals")?
+                    .clone()
+                    .ok_or_else(|| "`assignment target has no value".to_string())?;
+                let Value::Tensor(base) = current else {
+                    return Err("element assignment on a value that is not tensor storage".into());
+                };
+                let dst = self.select(base, indices, f)?;
                 if matches!(value, Value::Scalar(..))
                     && !dst.shape.is_empty()
                     && op == AssignOp::Assign
@@ -670,379 +618,139 @@ impl<'a> Interpreter<'a> {
                 }
                 self.write(&dst, op, &value)
             }
+            CheckedPlace::Tuple(places) => match value {
+                Value::Tuple(items) if items.len() == places.len() => {
+                    for (p, v) in places.iter().zip(items) {
+                        self.assign_place(p, op, v, f)?;
+                    }
+                    Ok(())
+                }
+                other => Err(format!(
+                    "cannot assign {} to {} places",
+                    other.kind(),
+                    places.len()
+                )),
+            },
+        }
+    }
+
+    /// Assign back through a call-argument expression (a local or a selection).
+    fn assign_expr(
+        &mut self,
+        target: &CheckedExpr,
+        op: AssignOp,
+        value: Value,
+        f: &mut Frame<'a>,
+    ) -> Result<(), String> {
+        match &target.kind {
+            CheckedExprKind::Local(id) => {
+                let current = f.locals.get(*id).cloned().flatten();
+                match (current, value) {
+                    (Some(Value::Scalar(d, x)), Value::Scalar(vd, v)) if op != AssignOp::Assign => {
+                        f.locals[*id] =
+                            Some(Value::scalar(super::scalar::assign(op, (d, x), (vd, v))?));
+                        Ok(())
+                    }
+                    (Some(Value::Tensor(s)), v @ (Value::Scalar(..) | Value::Tensor(_)))
+                        if matches!(s.backing, Backing::Owned(_))
+                            && (op != AssignOp::Assign
+                                || v.shaped().is_some_and(|n| {
+                                    n.shape == s.shape && self.dtype_of(n) == self.dtype_of(&s)
+                                })) =>
+                    {
+                        self.write(&s, op, &v)
+                    }
+                    (_, v) if op == AssignOp::Assign => {
+                        f.locals[*id] = Some(self.snapshot(v)?);
+                        Ok(())
+                    }
+                    (current, v) => Err(format!(
+                        "`{}` of {} into {}",
+                        op.text(),
+                        v.kind(),
+                        current.map_or("an unset local", |c| c.kind())
+                    )),
+                }
+            }
+            CheckedExprKind::Primitive {
+                id: crate::intrinsics::PrimitiveId::SliceView { .. },
+                ..
+            } => {
+                let dst = self.place(target, f)?;
+                self.write(&dst, op, &value)
+            }
             _ => Err("unsupported assignment target".into()),
         }
     }
 
-    fn counted(
-        &mut self,
-        vars: &[usize],
-        bounds: &[(i64, i64)],
-        body: &'a Block,
-        f: &mut Frame<'a>,
-    ) -> Result<Flow, String> {
-        let mut flow = Flow::Next;
-        if bounds.iter().all(|(lo, hi)| lo < hi) {
-            let mut at: Vec<i64> = bounds.iter().map(|b| b.0).collect();
-            'visits: loop {
-                for (v, x) in vars.iter().zip(&at) {
-                    f.vars[*v] = Some(Value::int(*x));
-                }
-                match self.block(body, f)? {
-                    Flow::Next => {}
-                    other => {
-                        flow = other;
-                        break;
-                    }
-                }
-                let mut k = at.len();
-                loop {
-                    if k == 0 {
-                        break 'visits;
-                    }
-                    k -= 1;
-                    at[k] += 1;
-                    if at[k] < bounds[k].1 {
-                        break;
-                    }
-                    at[k] = bounds[k].0;
-                }
-            }
-        }
-        for v in vars {
-            f.vars[*v] = None;
-        }
-        Ok(flow)
-    }
-
-    fn stmt(&mut self, s: &'a Stmt, f: &mut Frame<'a>) -> Result<Flow, String> {
-        match &s.kind {
-            StmtKind::Bind { pattern, value } => {
+    fn stmt(&mut self, s: &'a CheckedStmt, f: &mut Frame<'a>) -> Result<Flow, String> {
+        match s {
+            CheckedStmt::Let { pattern, value, .. } => {
                 let v = self.expr(value, f)?;
                 let v = self.snapshot(v)?;
                 self.bind(pattern, v, f)?;
                 Ok(Flow::Next)
             }
-            StmtKind::Assign { target, op, value } => {
+            CheckedStmt::Assign { place, op, value } => {
                 // The whole right-hand side reads old versions before anything is installed.
                 let v = self.expr(value, f)?;
                 let v = self.snapshot(v)?;
-                self.assign(target, *op, v, f)?;
+                self.assign_place(place, *op, v, f)?;
                 Ok(Flow::Next)
             }
-            StmtKind::Region(region) => {
-                self.region(region, f)?;
-                Ok(Flow::Next)
-            }
-            StmtKind::Stages(stages) => self.stages(stages, f),
-            StmtKind::Range {
-                var,
-                lo,
-                hi,
-                value,
+            CheckedStmt::Loop {
+                binder,
+                range,
                 body,
                 ..
             } => {
-                let bounds = if let Some(value) = value {
-                    let Value::Range(lo, hi) = self.expr(value, f)? else {
-                        return Err("range loop source is not a range".into());
-                    };
-                    [(lo, hi)]
-                } else {
-                    [(self.int(lo, f)?, self.int(hi, f)?)]
-                };
-                self.counted(&[*var], &bounds, body, f)
-            }
-            StmtKind::Coordinates {
-                vars,
-                of,
-                axes,
-                body,
-            } => {
-                let shaped = self.place(of, f)?;
-                if vars.len() != axes.len() {
-                    return Err(
-                        "coordinate loop binds a different number of names than axes".into(),
-                    );
+                let lo = self.int(&range.start, f)?;
+                let hi = self.int(&range.end, f)?;
+                // Ascending coordinate order: the deterministic reference order
+                // for ordered and independent loops alike.
+                for i in lo..hi {
+                    *f.locals
+                        .get_mut(*binder)
+                        .ok_or("loop binder outside the body's locals")? = Some(Value::int(i));
+                    match self.block(body, f)? {
+                        Flow::Next => {}
+                        Flow::Return(_) => {
+                            return Err("`return` inside a loop is rejected while checking".into())
+                        }
+                    }
                 }
-                let mut bounds = Vec::with_capacity(axes.len());
-                for axis in axes {
-                    let n = *shaped.shape.get(*axis).ok_or_else(|| {
-                        format!("axis {axis} of a rank-{} value", shaped.shape.len())
-                    })? as i64;
-                    let base = match of.ty.shaped().and_then(|t| t.axes.get(*axis)) {
-                        Some(Extent::Structural(slice)) => self.piece(f, *slice)?.lo,
-                        _ => 0,
-                    };
-                    bounds.push((base, base + n));
-                }
-                self.counted(vars, &bounds, body, f)
+                f.locals[*binder] = None;
+                Ok(Flow::Next)
             }
-            StmtKind::Members { var, slice, body } => {
-                let piece = self.piece(f, *slice)?;
-                self.counted(&[*var], &[(piece.lo, piece.hi)], body, f)
-            }
-            StmtKind::If { cond, then, els } => match self.scalar(cond, f)? {
-                (DType::Bool, x) => self.block(if x != 0.0 { then } else { els }, f),
+            CheckedStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => match self.scalar(condition, f)? {
+                (DType::Bool, x) => self.block(if x != 0.0 { then_body } else { else_body }, f),
                 (d, _) => Err(format!("condition is {}, not bool", d.name())),
             },
-            StmtKind::Publish { value, destination } => {
-                let v = self.expr(value, f)?;
-                let dst = self.place(destination, f)?;
-                match &v {
-                    Value::Scalar(..) if !dst.shape.is_empty() => {
-                        return Err(format!(
-                            "publish of a scalar to a destination of shape {:?}",
-                            dst.shape
-                        ))
-                    }
-                    Value::Scalar(..) | Value::Tile(_) | Value::View(_) => {}
-                    other => return Err(format!("publish of {}", other.kind())),
-                }
-                self.write(&dst, AssignOp::Assign, &v)?;
-                Ok(Flow::Next)
-            }
-            StmtKind::Yield(items) => Ok(Flow::Yield(self.values(items, f)?)),
-            StmtKind::Return(items) => Ok(Flow::Return(self.values(items, f)?)),
-            StmtKind::Expr(e) => {
-                self.expr(e, f)?;
+            CheckedStmt::Evaluate(expr) => {
+                self.expr(expr, f)?;
                 Ok(Flow::Next)
             }
         }
     }
+}
 
-    /// A linear stage chain: each stage completes before the next; a yield binds the next
-    /// stage's ports positionally; the terminal stage's yield is the chain's yield.
-    fn stages(&mut self, stages: &'a [Stage], f: &mut Frame<'a>) -> Result<Flow, String> {
-        let mut port: Option<Value> = None;
-        for (i, stage) in stages.iter().enumerate() {
-            match (stage.ports.as_slice(), port.take()) {
-                ([], _) => {}
-                ([one], Some(v)) => f.vars[*one] = Some(v),
-                (many, Some(Value::Tuple(items))) if items.len() == many.len() => {
-                    for (var, v) in many.iter().zip(items) {
-                        f.vars[*var] = Some(v);
-                    }
-                }
-                (many, _) => {
-                    return Err(self.locate(
-                        f.def,
-                        stage.span,
-                        format!(
-                            "stage `{}` binds {} ports the previous stage did not yield",
-                            stage.name,
-                            many.len()
-                        ),
-                    ))
-                }
-            }
-            match self.block(&stage.body, f)? {
-                Flow::Next => {}
-                Flow::Yield(v) if i + 1 == stages.len() => return Ok(Flow::Yield(v)),
-                Flow::Yield(v) => port = Some(v),
-                flow @ Flow::Return(_) => return Ok(flow),
-            }
-        }
-        Ok(Flow::Next)
-    }
+/// Span of a checked statement, for diagnostics.
+trait StmtSpan {
+    fn span(&self) -> Span;
+}
 
-    // ----- regions ---------------------------------------------------------------------
-
-    /// Pieces of one binder: uniform-capacity pieces with a shorter tail, or for a merge the
-    /// canonical near-equal partition into `clamp(ceil(extent / width), 1, extent)` parts.
-    fn pieces(
-        &self,
-        f: &Frame<'a>,
-        region: &Region,
-        slice: SliceId,
-        merge: bool,
-    ) -> Result<Vec<Piece>, String> {
-        let decl = f
-            .body
-            .slices
-            .get(slice.0 as usize)
-            .ok_or("unknown slice binder")?;
-        let (lo, hi) = match &decl.parent {
-            SliceParent::Domain { lo, hi } => (f.sym(lo)?, f.sym(hi)?),
-            SliceParent::Refine(parent) | SliceParent::Rebind(parent) => {
-                let p = self.piece(f, *parent)?;
-                (p.lo, p.hi)
-            }
-        };
-        let domain = (hi - lo).max(0);
-        if domain == 0 {
-            return Ok(Vec::new());
+impl StmtSpan for CheckedStmt {
+    fn span(&self) -> Span {
+        match self {
+            CheckedStmt::Let { value, .. } => value.span,
+            CheckedStmt::Assign { value, .. } => value.span,
+            CheckedStmt::Loop { range, .. } => range.start.span,
+            CheckedStmt::If { condition, .. } => condition.span,
+            CheckedStmt::Evaluate(e) => e.span,
         }
-        let width = self
-            .partitioner
-            .width(&f.def.name, region.id, slice, domain);
-        if width < 1 || width > domain {
-            return Err(format!(
-                "partitioner chose width {width} for an extent of {domain}"
-            ));
-        }
-        let mut out = Vec::new();
-        if merge {
-            let parts = ((domain + width - 1) / width).clamp(1, domain);
-            let (base, extra) = (domain / parts, domain % parts);
-            let capacity = base + i64::from(extra > 0);
-            let mut at = lo;
-            for p in 0..parts {
-                let n = base + i64::from(p < extra);
-                out.push(Piece {
-                    lo: at,
-                    hi: at + n,
-                    width: capacity,
-                    domain,
-                });
-                at += n;
-            }
-        } else {
-            let mut at = lo;
-            while at < hi {
-                out.push(Piece {
-                    lo: at,
-                    hi: (at + width).min(hi),
-                    width,
-                    domain,
-                });
-                at += width;
-            }
-        }
-        Ok(out)
-    }
-
-    /// Execute a region. A result-producing region returns `Flow::Yield` of its value.
-    pub(super) fn region(&mut self, r: &'a Region, f: &mut Frame<'a>) -> Result<Flow, String> {
-        let body = f.body;
-        let binders = r
-            .binders
-            .iter()
-            .map(|v| match body.vars.get(*v).map(|var| &var.kind) {
-                Some(VarKind::Slice(id)) => Ok((*v, *id)),
-                _ => Err("region binder is not a slice".to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let visits: Vec<Vec<Piece>> = match &r.source {
-            RegionSource::Results(source) => match self.expr(source, f)? {
-                Value::Result(result) => result.pieces.clone(),
-                other => {
-                    return Err(format!(
-                        "region traverses {}, not a region result",
-                        other.kind()
-                    ))
-                }
-            },
-            RegionSource::Domains => {
-                let axes = binders
-                    .iter()
-                    .map(|(_, id)| self.pieces(f, r, *id, r.merge.is_some()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut visits = vec![Vec::new()];
-                for axis in &axes {
-                    visits = visits
-                        .iter()
-                        .flat_map(|prefix| {
-                            axis.iter()
-                                .map(move |p| prefix.iter().copied().chain([*p]).collect())
-                        })
-                        .collect();
-                }
-                visits
-            }
-        };
-        // A rebinding also stands for the producer's binder in member types.
-        let mut bound: Vec<(usize, SliceId)> = Vec::new();
-        for (k, (_, id)) in binders.iter().enumerate() {
-            bound.push((k, *id));
-            if let Some(SliceParent::Rebind(origin)) =
-                body.slices.get(id.0 as usize).map(|d| &d.parent)
-            {
-                if matches!(r.source, RegionSource::Results(_))
-                    && f.slices.get(origin.0 as usize).is_some_and(|s| s.is_none())
-                {
-                    bound.push((k, *origin));
-                }
-            }
-        }
-        let saved: Vec<Option<Piece>> = bound
-            .iter()
-            .map(|(_, id)| f.slices.get(id.0 as usize).copied().flatten())
-            .collect();
-        let producing = r.result.is_some() || r.merge.is_some();
-        let mut values = Vec::with_capacity(visits.len());
-        for visit in &visits {
-            if visit.len() != binders.len() {
-                return Err(format!(
-                    "region binds {} slices over a result of {} axes",
-                    binders.len(),
-                    visit.len()
-                ));
-            }
-            for (k, id) in &bound {
-                *f.slices
-                    .get_mut(id.0 as usize)
-                    .ok_or("unknown slice binder")? = Some(visit[*k]);
-            }
-            for ((var, _), piece) in binders.iter().zip(visit) {
-                f.vars[*var] = Some(Value::Slice(*piece));
-            }
-            match self.block(&r.body, f)? {
-                Flow::Yield(v) if producing => values.push(v),
-                Flow::Next if !producing => {}
-                Flow::Yield(_) => return Err("a statement region cannot yield".into()),
-                Flow::Next => {
-                    return Err("a visit of a result-producing region did not yield".into())
-                }
-                Flow::Return(_) => return Err("return inside a region".into()),
-            }
-        }
-        for ((_, id), old) in bound.iter().zip(saved) {
-            f.slices[id.0 as usize] = old;
-        }
-        for (var, _) in &binders {
-            f.vars[*var] = None;
-        }
-        match &r.merge {
-            Some(merge) => Ok(Flow::Yield(self.merge(merge, values, f)?)),
-            None if producing => Ok(Flow::Yield(Value::Result(Rc::new(ResultVal::new(
-                visits, values,
-            ))))),
-            None => Ok(Flow::Next),
-        }
-    }
-
-    /// Adjacent pairs level by level, an odd last value forwarded; empty gives the identity
-    /// and a single part its partial.
-    fn merge(
-        &mut self,
-        merge: &'a Merge,
-        mut level: Vec<Value>,
-        f: &mut Frame<'a>,
-    ) -> Result<Value, String> {
-        if level.is_empty() {
-            let identity = self.expr(&merge.identity, f)?;
-            return self.snapshot(identity);
-        }
-        while level.len() > 1 {
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            let mut items = level.into_iter();
-            while let Some(left) = items.next() {
-                let Some(right) = items.next() else {
-                    next.push(left);
-                    break;
-                };
-                self.bind(&merge.left, left, f)?;
-                self.bind(&merge.right, right, f)?;
-                match self.block(&merge.body, f)? {
-                    Flow::Yield(v) => next.push(v),
-                    _ => return Err("merge body did not yield".into()),
-                }
-            }
-            level = next;
-        }
-        level
-            .pop()
-            .ok_or_else(|| "merge lost its value".to_string())
     }
 }

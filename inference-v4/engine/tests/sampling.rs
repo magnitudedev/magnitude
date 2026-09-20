@@ -1,19 +1,17 @@
 //! Semantic selection qualification; native automatic-selection qualification is separate.
 #[path = "support/reference.rs"]
 mod reference;
-use reference::{Arg, TensorData, WIDTHS};
+use reference::{Arg, TensorData};
 use seismic_lang::types::DType;
 use std::collections::HashMap;
 
-/// Selection is integral, so both partitionings must agree exactly.
+/// Selection is integral and deterministic: one reference run.
 fn sample(rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]> {
-    let [narrow, wide] = WIDTHS.map(|width| sample_at(width, rows, masks, draws));
-    assert_eq!(narrow, wide);
-    wide
+    sample_at(rows, masks, draws)
 }
-fn sample_at(width: i64, rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]> {
+fn sample_at(rows: &[Vec<f64>], masks: &[u32], draws: &[[u32; 6]]) -> Vec<[i32; 2]> {
     let program = seismic_std::program().unwrap();
-    let mut vm = reference::interpreter(&program, width);
+    let mut vm = reference::interpreter(&program);
     let m = rows.len();
     let v = rows[0].len();
     let logits = vm.add_tensor(TensorData::dense(DType::F32, vec![m, v], rows.concat()));

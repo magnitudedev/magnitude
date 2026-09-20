@@ -1167,6 +1167,7 @@ dependencies = [
  "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
+ "seismic-realization",
  "seismic-runtime",
  "seismic-std",
  "serde",
@@ -1199,6 +1200,7 @@ dependencies = [
 name = "seismic-realization"
 version = "0.1.0"
 dependencies = [
+ "magnitude-solver",
  "seismic-lang",
 ]
 

@@ -9,3 +9,4 @@ path = "src/realization.rs"
 
 [dependencies]
 seismic-lang.workspace = true
+magnitude-solver = { path = "../../../solver" }

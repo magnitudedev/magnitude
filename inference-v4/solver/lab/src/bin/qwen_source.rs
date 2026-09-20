@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
     if size <= 0 {
         return Err("size must be positive".into());
     }
-    // These geometry values are from the pinned 4B artifact, recorded in the report.
+    // These geometry values are from the pinned 4B artifact.
     let bf = Elem::Dtype(DType::BF16);
     let weight = if args.get(4).is_some_and(|s| s == "bf16") {
         bf.clone()

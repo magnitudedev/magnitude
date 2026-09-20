@@ -1,4 +1,5 @@
-//! Unified logical -> physical -> native compilation inspection commands.
+//! Unified logical -> family -> solve -> resolve -> native compilation
+//! inspection commands.
 
 use crate::{load_program, options, Options};
 use seismic_compiler::{
@@ -8,15 +9,14 @@ use seismic_compiler::{
 use seismic_cpu::mapping::Cpu;
 use seismic_cuda::mapping::Cuda;
 use seismic_lang::sir::Program;
-use seismic_metal::mapping::{EstimateModel, Limits, Metal};
-use seismic_realization::executable::{
-    ExecutableDialect, ResolvedPlan, ResolvedScheduleItem, StorageScope,
-};
+use seismic_metal::mapping::{Limits, Metal};
+use seismic_realization::executable::{ExecutableDialect, ResolvedSchedule, ResolvedStep};
 
 const FLAGS: &[&str] = &[
     "--fn",
     "--shape",
     "--element",
+    "--extent",
     "--precision",
     "--atol",
     "--rtol",
@@ -27,7 +27,6 @@ const FLAGS: &[&str] = &[
     "--input-range",
     "--allow-special-changes",
     "--target",
-    "--strategy",
 ];
 
 const DEFAULT_MAX_THREADS_PER_THREADGROUP: u64 = 1024;
@@ -52,7 +51,7 @@ fn metal() -> Result<(Metal, String), String> {
         max_private_bytes: seismic_metal::mapping::CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
     };
     Ok((
-        Metal::new(limits, EstimateModel::default()).map_err(|error| error.to_string())?,
+        Metal::new(limits).map_err(|error| error.to_string())?,
         "documented Metal baseline (no live device facts available)".into(),
     ))
 }
@@ -105,12 +104,32 @@ fn compile<B: Backend>(
         &options.workload,
         backend,
         &[],
-        Budget {
-            strategy: options.strategy,
-            ..Budget::default()
-        },
+        Budget::default(),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Launches of the retained structured schedule, in retained order.
+fn launches<D: ExecutableDialect>(schedule: &ResolvedSchedule<D>) -> Vec<&ResolvedStep<D>> {
+    let mut out = Vec::new();
+    fn walk<'a, D: ExecutableDialect>(
+        schedule: &'a ResolvedSchedule<D>,
+        out: &mut Vec<&'a ResolvedStep<D>>,
+    ) {
+        for step in schedule.steps.iter() {
+            match step {
+                ResolvedStep::Launch(_) => out.push(step),
+                ResolvedStep::Call(call) => walk(&call.body.schedule, out),
+                ResolvedStep::If(if_step) => {
+                    walk(&if_step.then_schedule, out);
+                    walk(&if_step.else_schedule, out);
+                }
+                ResolvedStep::Repeat(repeat) => walk(&repeat.body, out),
+            }
+        }
+    }
+    walk(schedule, &mut out);
+    out
 }
 
 fn report<D: ExecutableDialect, A>(
@@ -119,84 +138,55 @@ fn report<D: ExecutableDialect, A>(
     capacities: &str,
 ) -> String {
     let physical = &compiled.physical;
-    fn counts<D: ExecutableDialect>(plan: &ResolvedPlan<D>) -> (usize, usize, usize) {
-        let mut phases = 0;
-        let mut launches = 0;
-        let mut subplans = 0;
-        for item in plan.items().iter() {
-            match item {
-                ResolvedScheduleItem::Phase(phase) => {
-                    phases += 1;
-                    launches += phase.launches.len();
-                }
-                ResolvedScheduleItem::Subplan(subplan) => {
-                    subplans += 1;
-                    let child = counts(&subplan.plan);
-                    phases += child.0;
-                    launches += child.1;
-                    subplans += child.2;
-                }
-            }
-        }
-        (phases, launches, subplans)
-    }
-    fn resources<D: ExecutableDialect>(plan: &ResolvedPlan<D>, text: &mut String) {
-        let device_bytes = plan
-            .device_storage()
-            .allocations
-            .iter()
-            .filter(|storage| storage.scope == StorageScope::Device)
-            .map(|storage| storage.bytes)
-            .sum::<u64>();
-        for item in plan.items().iter() {
-            match item {
-                ResolvedScheduleItem::Phase(phase) => {
-                    for launch in phase.launches.iter() {
-                        let threads = launch
-                            .geometry
-                            .participants_per_workgroup
-                            .iter()
-                            .product::<u64>();
-                        text.push_str(&format!(
-                            "  launch#{}: workgroups={:?}, threads/group={threads}, device={device_bytes} B, workgroup={} B, private/thread={} B, bindings={}\n",
-                            launch.id.0,
-                            launch.geometry.workgroups,
-                            launch.kernel.resources.workgroup_bytes,
-                            launch.kernel.resources.private_bytes,
-                            launch.binding_groups.len()
-                        ));
-                    }
-                }
-                ResolvedScheduleItem::Subplan(subplan) => resources(&subplan.plan, text),
-            }
-        }
-    }
-    let counts = counts(physical);
     let mut text = format!(
         "entry: {}\ntarget: {target}\ntarget facts: {capacities}\ncapability fingerprint: {}\nestimated cost: {}\noptimal: {}\nnumerical assessment: {:?}\n",
-        compiled.logical.entry, compiled.logical.capability_fingerprint,
-        physical.estimated_cost(), physical.optimal(), physical.numerical_assessment(),
+        compiled.logical.entry,
+        compiled.logical.target.capability_fingerprint,
+        physical.estimated_cost,
+        physical.optimal,
+        physical.numerical,
     );
-    text.push_str(&format!(
-        "numerical evidence: {}:{}\n",
-        physical.identity().precision.method_revision,
-        physical.identity().precision.evidence_domain
-    ));
     text.push_str("assignment:\n");
-    for (choice, selected) in physical.identity().assignment.selections() {
+    for (choice, selected) in &physical.identity.selections {
         text.push_str(&format!(
             "  choice#{} = logical#{} / physical#{}\n",
-            choice.0, selected.logical_alternative, selected.physical_alternative
+            choice.0, selected.0, selected.1
         ));
     }
-    for (symbol, value) in physical.identity().assignment.symbols() {
-        text.push_str(&format!("  {symbol} = {value}\n"));
-    }
     text.push_str("resources:\n");
-    resources(physical, &mut text);
+    let device_bytes = physical.internal_arena.bytes;
+    for step in launches(&physical.entry.schedule) {
+        if let ResolvedStep::Launch(launch) = step {
+            text.push_str(&format!(
+                "  launch#{}: device={device_bytes} B, workgroup={} B, private/participant={} B, bindings={}\n",
+                launch.id.0,
+                launch.kernel.resources.workgroup_bytes,
+                launch.kernel.resources.private_bytes_per_participant,
+                launch.bindings.len()
+            ));
+        }
+    }
+    let nested = {
+        fn calls<D: ExecutableDialect>(schedule: &ResolvedSchedule<D>) -> usize {
+            schedule
+                .steps
+                .iter()
+                .map(|step| match step {
+                    ResolvedStep::Call(call) => 1 + calls(&call.body.schedule),
+                    ResolvedStep::If(if_step) => {
+                        calls(&if_step.then_schedule) + calls(&if_step.else_schedule)
+                    }
+                    ResolvedStep::Repeat(repeat) => calls(&repeat.body),
+                    ResolvedStep::Launch(_) => 0,
+                })
+                .sum()
+        }
+        calls(&physical.entry.schedule)
+    };
     text.push_str(&format!(
-        "executable plan: {} phases, {} launches, {} nested plans\n",
-        counts.0, counts.1, counts.2
+        "executable plan: {} launches, {} nested calls\n",
+        launches(&physical.entry.schedule).len(),
+        nested
     ));
     text
 }
@@ -232,8 +222,8 @@ pub fn emit(args: &[String]) -> Result<(), String> {
             let compiled = compile(&options, &program, &backend)?;
             let mut text = report(&compiled, "cpu", &facts);
             text.push_str(&format!(
-                "\nnative CPU artifact: {} phases\n",
-                compiled.native.kernel.phase_count()
+                "\nnative CPU artifact: {} launches\n",
+                compiled.native.kernel.launch_count()
             ));
             text
         }
@@ -281,13 +271,12 @@ fn search_report<D: ExecutableDialect, A>(
     target: &str,
     capacities: &str,
 ) -> String {
-    let assignment = &compiled.physical.identity().assignment;
+    let physical = &compiled.physical;
     format!(
-        "executable search of `{}` on {target}\n  target facts       {capacities}\n  selected choices   {}\n  resolved symbols   {}\n  selected cost      {}\n  optimum proven     {}\n",
+        "executable search of `{}` on {target}\n  target facts       {capacities}\n  selected choices   {}\n  selected cost      {}\n  optimum proven     {}\n",
         compiled.logical.entry,
-        assignment.selections().len(),
-        assignment.symbols().len(),
-        compiled.physical.estimated_cost(),
-        compiled.physical.optimal(),
+        physical.identity.selections.len(),
+        physical.estimated_cost,
+        physical.optimal,
     )
 }

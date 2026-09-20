@@ -69,12 +69,13 @@ pub struct Decision {
 #[derive(Serialize)]
 pub struct LaunchResource {
     pub launch: u64,
-    pub workgroups: [u64; 3],
+    /// Grid geometry when statically determined.
+    pub workgroups: Option<[u64; 3]>,
     pub device_bytes: u64,
     pub workgroup_bytes: u64,
     pub private_bytes_per_participant: u64,
     pub bindings: u64,
-    pub threads_per_group: u64,
+    pub threads_per_group: Option<u64>,
 }
 impl From<seismic_runtime::Selection> for EntrySelection {
     fn from(s: seismic_runtime::Selection) -> Self {
@@ -84,7 +85,7 @@ impl From<seismic_runtime::Selection> for EntrySelection {
                 .selections()
                 .iter()
                 .map(|(choice, selection)| Decision {
-                    choice: choice.0,
+                    choice: *choice,
                     logical_alternative: selection.logical_alternative,
                     physical_alternative: selection.physical_alternative,
                 })

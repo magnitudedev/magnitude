@@ -12,6 +12,23 @@ applies_to:
 Seismic source describes logical computation. It does not describe physical partitioning,
 placement, launch geometry, instruction fragments, or pipeline scheduling.
 
+## One semantic registry
+
+Typing, reference execution, logical construction, backend legalization, and
+numerical analysis use one closed registry of primitive signatures. A
+signature owns its parameters, result and effect functions, safety function,
+reference semantics, and reference numerics; capability signatures add exact
+argument and result types, semantics, and numerical transfer. There are no
+independent per-phase signature tables: changing a semantic decision changes
+the registry, and with it capability, logical, plan, cache, and evidence
+identities.
+
+`If`, `Loop`, `Call`, and function boundaries are graph structure, not
+primitives. Every checked construct has exhaustive registry handling in the
+reference interpreter, logical construction, and every backend legalization;
+a construct that cannot be represented is a checking failure, never a later
+compiler defect.
+
 ## Computation and implementation choice
 
 `fn` is the sole named-computation abstraction. A portable function body is executable behavior.
@@ -38,20 +55,28 @@ Owned values move. Shared borrows may overlap. Mutable borrows are exclusive. Sl
 ownership copies are explicit. `let` is immutable and `let mut` authorizes mutation without
 manufacturing ownership or write access.
 
+Logical tensor operations accept values independently of their current storage realization.
+When an operation requires an addressable input, the compiler materializes a computed value;
+authors do not insert `load` or casts merely to satisfy physical storage. `to_owned` ensures
+ownership: it materializes borrowed or computed values and is the identity on an already-owned
+value, never a request for a redundant allocation.
+
 Functions return owned outputs or explicitly mutate `&mut` parameters. Parameter modes, alias
 declarations, publication statements, source views, and source tiles are not part of the language.
 The ABI may use hidden result buffers and legal storage reuse while preserving those semantics.
 
-At an entry boundary, an owned tensor result is represented by a compiler-owned hidden destination;
-a tuple result is flattened recursively and each tensor leaf retains its logical tuple path. These
-destinations follow the source-authored parameters in checked execution IR, but are absent from
-source invocation bindings. Their concrete plane layouts are derived from the specialized checked
-result types. The runtime allocates them independently, retains them through synchronous native
-completion, and returns the path-labelled result planes to the caller. Backends consume this complete
-physical ABI without exposing destination parameters or storage planes in Seismic source.
+At an entry boundary, an owned tensor result is represented by a root-ABI
+result binding; a tuple result is traversed recursively and each tensor leaf
+retains its logical tuple path. The root ABI is created once from the entry
+interface and the canonical leaf traversal; it is the only ABI. Nested call
+boundaries resolve directly to caller transports and never own public
+allocations. The runtime allocates result planes by path, retains them
+through synchronous native completion, and returns the path-labelled result
+planes to the caller. Backends consume this complete ABI without exposing
+destination parameters or storage planes in Seismic source.
 
 A result-bearing capability intrinsic produces one fresh owned logical value. The compiler
-preserves that operation atomically through checked and execution IR with a distinct owned
+preserves that operation atomically through checked and logical IR with a distinct owned
 destination; it does not reinterpret it as unrelated elementwise work. Backend realization
 receives the typed operands, typed result, and destination identity together. Physical allocation
 and storage reuse remain compiler/backend decisions and never enter source syntax.

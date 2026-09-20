@@ -1,22 +1,24 @@
-//! Reference interpreter over `sir`: the semantic oracle. Regions execute under a
-//! caller-supplied partitioning so partition independence can be exercised.
+//! Reference interpreter over the checked semantic program: the semantic
+//! oracle. Every function family is evaluated through its reference body and
+//! the intrinsic registry.
 //!
-//! Scalars carry their dtype and every operation rounds once at its dtype, so generic
-//! bodies evaluate at the element types actually bound. Shaped values are zero-based
-//! strided selections; the semantic coordinate of a structural axis' first position is its
-//! slice's `lo`, taken from the static axis type, so callees (whose axes are semantic) see
-//! plain zero-based extents. Parallel visits run sequentially in lexicographic order.
-use super::family::Workload;
-use super::sir::{DefId, Program};
-use super::types::{RegionId, SliceId};
+//! Scalars carry their dtype and every operation rounds once at its dtype, so
+//! generic bodies evaluate at the element types actually bound. Shaped values
+//! are zero-based strided selections. Independent (`parallel for`) visits run
+//! sequentially in ascending coordinate order — the deterministic reference
+//! order. Nothing is ever clamped: out-of-bounds selections are errors.
+use super::sir::Program;
+use super::types::Elem;
 pub use tensor::{round_to, Rng, TensorData};
+pub use value::Value;
 
 mod eval;
 mod exec;
-mod native;
 mod scalar;
 mod tensor;
-mod value;
+pub mod value;
+
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub enum Arg {
@@ -27,34 +29,19 @@ pub enum Arg {
     Range(i64, i64),
 }
 
-/// Chooses the slice width for each static binder. `extent` is the runtime extent of the
-/// partitioned domain for this visit. Must return a value in `1..=max(extent, 1)`.
-pub trait Partitioner {
-    fn width(&self, definition: &str, region: RegionId, slice: SliceId, extent: i64) -> i64;
+/// Concrete invocation bindings for shape and element parameters.
+#[derive(Clone, Debug, Default)]
+pub struct Bindings {
+    pub shapes: BTreeMap<String, i64>,
+    pub elems: BTreeMap<String, Elem>,
 }
-
-/// Every binder gets width `w` (clamped to the extent).
-pub struct Uniform(pub i64);
-
-impl Partitioner for Uniform {
-    fn width(&self, _: &str, _: RegionId, _: SliceId, extent: i64) -> i64 {
-        self.0.clamp(1, extent.max(1))
-    }
-}
-
-/// Forces the body of a call or entry: given the family name and every applicable
-/// definition with a body (ascending `DefId`), `Some(id)` selects it, `None` defers.
-pub type Choice<'a> = Box<dyn Fn(&str, &[DefId]) -> Option<DefId> + 'a>;
 
 pub struct Interpreter<'a> {
     pub program: &'a Program,
     pub tensors: Vec<TensorData>,
-    pub partitioner: Box<dyn Partitioner + 'a>,
-    /// Target whose target-specific functions and lowerings may be interpreted; `None`
+    /// Target whose backend-specific helper bodies may be interpreted; `None`
     /// considers portable functions only.
     pub target: Option<String>,
-    /// Overrides the deterministic first-applicable definition choice.
-    pub choice: Option<Choice<'a>>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -62,18 +49,8 @@ impl<'a> Interpreter<'a> {
         Interpreter {
             program,
             tensors: Vec::new(),
-            partitioner: Box::new(Uniform(1)),
             target: None,
-            choice: None,
         }
-    }
-
-    pub fn with_choice(
-        mut self,
-        choice: impl Fn(&str, &[DefId]) -> Option<DefId> + 'a,
-    ) -> Interpreter<'a> {
-        self.choice = Some(Box::new(choice));
-        self
     }
 
     pub fn add_tensor(&mut self, t: TensorData) -> usize {
@@ -81,9 +58,16 @@ impl<'a> Interpreter<'a> {
         self.tensors.len() - 1
     }
 
-    /// Run linked function `name` for `workload`.
-    pub fn run(&mut self, name: &str, args: &[Arg], workload: &Workload) -> Result<(), String> {
-        self.run_entry(name, args, workload)
+    /// Run linked function `name` for the given argument bindings. Tensor
+    /// arguments are updated in place; the returned value is the function's
+    /// result.
+    pub fn run(
+        &mut self,
+        name: &str,
+        args: &[Arg],
+        bindings: &Bindings,
+    ) -> Result<value::Value, String> {
+        self.run_entry(name, args, bindings)
     }
 }
 
@@ -117,6 +101,79 @@ mod tests {
                 .map(|i| t.get(i) as f32)
                 .collect(),
         }
+    }
+
+    #[test]
+    fn atomic_updates_combine_in_visit_order() {
+        let p = program(&["\
+fn histogram[N, E](routes: &tensor[N] i32, counts: &mut tensor[E] i32):
+    parallel for i in 0..N:
+        atomic(add, counts[routes[i]], 1)
+
+fn best[N, E](values: &tensor[N] f32, routes: &tensor[N] i32, top: &mut tensor[E] f32):
+    parallel for i in 0..N:
+        atomic(max, top[routes[i]], f32(values[i]))
+
+fn least[N, E](values: &tensor[N] f32, routes: &tensor[N] i32, low: &mut tensor[E] f32):
+    parallel for i in 0..N:
+        atomic(min, low[routes[i]], f32(values[i]))
+"]);
+        let bindings = Bindings {
+            shapes: [("N".to_string(), 6), ("E".to_string(), 3)]
+                .into_iter()
+                .collect(),
+            ..Bindings::default()
+        };
+        let routes = TensorData::dense(DType::I32, vec![6], vec![0.0, 2.0, 2.0, 1.0, 2.0, 0.0]);
+        let nan = f64::NAN;
+        let samples = TensorData::dense(DType::F32, vec![6], vec![1.0, 5.0, nan, -3.0, 7.0, 2.0]);
+
+        let mut interpreter = Interpreter::new(&p);
+        let r = interpreter.add_tensor(routes.clone());
+        let counts = interpreter.add_tensor(TensorData::dense(DType::I32, vec![3], vec![0.0; 3]));
+        interpreter
+            .run(
+                "histogram",
+                &[Arg::Tensor(r), Arg::Tensor(counts)],
+                &bindings,
+            )
+            .unwrap();
+        assert_eq!(values(&interpreter.tensors[counts]), vec![2.0, 1.0, 3.0]);
+
+        // `max`/`min` ignore a NaN operand, as the reference reductions do.
+        let mut interpreter = Interpreter::new(&p);
+        let v = interpreter.add_tensor(samples.clone());
+        let r = interpreter.add_tensor(routes.clone());
+        let top = interpreter.add_tensor(TensorData::dense(
+            DType::F32,
+            vec![3],
+            vec![f64::NEG_INFINITY; 3],
+        ));
+        interpreter
+            .run(
+                "best",
+                &[Arg::Tensor(v), Arg::Tensor(r), Arg::Tensor(top)],
+                &bindings,
+            )
+            .unwrap();
+        assert_eq!(values(&interpreter.tensors[top]), vec![2.0, -3.0, 7.0]);
+
+        let mut interpreter = Interpreter::new(&p);
+        let v = interpreter.add_tensor(samples);
+        let r = interpreter.add_tensor(routes);
+        let low = interpreter.add_tensor(TensorData::dense(
+            DType::F32,
+            vec![3],
+            vec![f64::INFINITY; 3],
+        ));
+        interpreter
+            .run(
+                "least",
+                &[Arg::Tensor(v), Arg::Tensor(r), Arg::Tensor(low)],
+                &bindings,
+            )
+            .unwrap();
+        assert_eq!(values(&interpreter.tensors[low]), vec![1.0, -3.0, 5.0]);
     }
 
     #[test]
@@ -157,8 +214,73 @@ fn product_add(a: &tensor[2, 3] f32, b: &tensor[3, 2] f32, c: &tensor[2, 2] f32,
             }
             let output = interpreter.add_tensor(matrix(vec![2, 2], vec![0.0; 4]));
             args.push(Arg::Tensor(output));
-            interpreter.run(entry, &args, &Workload::default()).unwrap();
+            interpreter.run(entry, &args, &Bindings::default()).unwrap();
             assert_eq!(values(&interpreter.tensors[output]), expected);
         }
+    }
+
+    #[test]
+    fn reference_bodies_evaluate_with_registry_semantics() {
+        let p = program(&["\
+fn add[N](x: &tensor[N] f32, y: &tensor[N] f32) -> tensor[N] f32:
+    let a = load(x)
+    let b = load(y)
+    return a + b
+
+fn sum[N](x: &tensor[N] f32) -> f32:
+    let v = load(x)
+    return reduce(v, 0, sum)
+"]);
+        let mut interpreter = Interpreter::new(&p);
+        let x = interpreter.add_tensor(TensorData::dense(
+            DType::F32,
+            vec![4],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ));
+        let y = interpreter.add_tensor(TensorData::dense(
+            DType::F32,
+            vec![4],
+            vec![10.0, 20.0, 30.0, 40.0],
+        ));
+        let bindings = Bindings {
+            shapes: [("N".to_string(), 4)].into_iter().collect(),
+            ..Bindings::default()
+        };
+        let result = interpreter
+            .run("add", &[Arg::Tensor(x), Arg::Tensor(y)], &bindings)
+            .unwrap();
+        match result {
+            value::Value::Tensor(s) => {
+                let data = interpreter.gather_for_test(&s);
+                assert_eq!(data, vec![11.0, 22.0, 33.0, 44.0]);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+        let total = interpreter
+            .run("sum", &[Arg::Tensor(x)], &bindings)
+            .unwrap();
+        assert!(matches!(total, Value::Scalar(DType::F32, v) if v == 10.0f32 as f64));
+    }
+
+    #[test]
+    fn packed_values_are_readable_but_not_writable() {
+        let p = program(&["\
+fn read[N](x: &tensor[N] q4g64) -> f32:
+    let v = decode(x)
+    return reduce(v, 0, sum)
+"]);
+        let mut interpreter = Interpreter::new(&p);
+        let packed = TensorData::random_packed(
+            &mut Rng(0x1234_5678_9abc_def0),
+            crate::repr::lookup("q4g64").unwrap(),
+            vec![128],
+        );
+        let id = interpreter.add_tensor(packed);
+        let bindings = Bindings {
+            shapes: [("N".to_string(), 128)].into_iter().collect(),
+            ..Bindings::default()
+        };
+        let result = interpreter.run("read", &[Arg::Tensor(id)], &bindings);
+        assert!(result.is_ok(), "{result:?}");
     }
 }

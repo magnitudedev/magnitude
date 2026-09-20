@@ -3,11 +3,12 @@
 
 use crate::intrinsics::{self, CapabilityId};
 use crate::repr;
-use crate::sir::{ContractFamily, DefId, DefKind, Mode, Predicate};
+use crate::sir::sym_extent;
+use crate::sir::{ContractFamily, DefId, DefKind, Mode, ParamOwnership, Predicate};
 use crate::span::{Diagnostic, Span};
 use crate::sym::{Atom, Sym};
 use crate::syntax::ast::{self, BinaryOp, ExprKind as A, ShapedHead, TypeKind};
-use crate::types::{DType, Elem, Extent, Shaped, Ty};
+use crate::types::{DType, Elem, NonEmpty, TensorType, ValueType};
 use std::collections::HashMap;
 
 /// A diagnostic attributed to a source file (index into the compiled file list).
@@ -22,20 +23,12 @@ pub(crate) struct SigParam {
     pub name: String,
     pub mode: Mode,
     pub ownership: ParamOwnership,
-    pub ty: Ty,
+    pub ty: ValueType,
     pub span: Span,
 }
 
-/// Logical call ownership, kept beside the legacy mode used by existing SIR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParamOwnership {
-    Value,
-    Owned,
-    Shared,
-    Exclusive,
-}
-
-/// A declaration's checked interface. Shapes are semantic extents over its own shape parameters.
+/// A declaration's checked interface. Shapes are symbolic extents over its own
+/// shape parameters.
 #[derive(Clone, Debug)]
 pub(crate) struct Sig {
     pub name: String,
@@ -43,7 +36,7 @@ pub(crate) struct Sig {
     pub elem_params: Vec<String>,
     pub params: Vec<SigParam>,
     pub aliases: Vec<(usize, usize)>,
-    pub result: Ty,
+    pub result: ValueType,
     pub predicates: Vec<Predicate>,
 }
 
@@ -109,10 +102,10 @@ pub(crate) struct Resolved<'a> {
     pub by_name: HashMap<String, Vec<usize>>,
 }
 
-fn native_targets(ty: &Ty, out: &mut Vec<String>) {
+fn capability_targets(ty: &ValueType, out: &mut Vec<String>) {
     match ty {
-        Ty::Native(native) => out.push(native.target.clone()),
-        Ty::Tuple(items) => items.iter().for_each(|item| native_targets(item, out)),
+        ValueType::CapabilityValue(n) => out.push(n.target.clone()),
+        ValueType::Tuple(items) => items.iter().for_each(|item| capability_targets(item, out)),
         _ => {}
     }
 }
@@ -120,9 +113,9 @@ fn native_targets(ty: &Ty, out: &mut Vec<String>) {
 fn check_signature_target(sig: &Sig, target: Option<&str>, span: Span) -> Result<(), Diagnostic> {
     let mut native = Vec::new();
     for param in &sig.params {
-        native_targets(&param.ty, &mut native);
+        capability_targets(&param.ty, &mut native);
     }
-    native_targets(&sig.result, &mut native);
+    capability_targets(&sig.result, &mut native);
     if let Some(found) = native
         .into_iter()
         .find(|found| Some(found.as_str()) != target)
@@ -214,46 +207,49 @@ fn type_from_ast(
     t: &ast::TypeExpr,
     shape_params: &[String],
     elem_params: &mut Vec<String>,
-) -> Result<Ty, Diagnostic> {
+) -> Result<ValueType, Diagnostic> {
     match &t.kind {
         TypeKind::Scalar(name) => match DType::from_name(&name.name) {
-            Some(d) => Ok(Ty::Scalar(d)),
+            Some(d) => Ok(ValueType::Scalar(d)),
             None if name.name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => Err(Diagnostic::new(name.span, format!("element parameter `{}` cannot be a scalar type: scalar values have a concrete dtype", name.name))),
             None => Err(Diagnostic::new(name.span, format!("unknown type `{}`", name.name))),
         },
-        TypeKind::Index(bound) => Ok(Ty::Index(shape_sym(bound, shape_params)?)),
-        TypeKind::Range(bound) => Ok(Ty::Range(shape_sym(bound, shape_params)?)),
+        TypeKind::Index(bound) => Ok(ValueType::Index {
+            bound: sym_extent(shape_sym(bound, shape_params)?),
+        }),
+        TypeKind::Range(bound) => Ok(ValueType::Range {
+            bound: sym_extent(shape_sym(bound, shape_params)?),
+        }),
         TypeKind::Shaped { head, shape, elem } => {
             if shape.is_empty() {
-                return Err(Diagnostic::new(t.span, "a tensor, view or tile type needs a shape"));
+                return Err(Diagnostic::new(t.span, "a tensor type needs a shape"));
             }
             let mut axes = Vec::new();
             for e in shape {
-                axes.push(Extent::Semantic(shape_sym(e, shape_params)?));
+                axes.push(sym_extent(shape_sym(e, shape_params)?));
             }
-            let shaped = Shaped::new(axes, elem_of(elem, elem_params)?);
-            Ok(match head {
-                ShapedHead::Tensor => Ty::Tensor(shaped),
-                ShapedHead::SharedTensor | ShapedHead::MutTensor => Ty::View(shaped),
-            })
+            let shaped = TensorType::new(axes, elem_of(elem, elem_params)?);
+            let _ = head; // ownership is recorded beside the type, never in it
+            Ok(ValueType::Tensor(shaped))
         }
         TypeKind::Tuple(items) => {
             let mut out = Vec::new();
             for item in items {
                 let ty = type_from_ast(item, shape_params, elem_params)?;
-                if ty == Ty::Void {
+                if ty.is_void() {
                     return Err(Diagnostic::new(item.span, "`void` is not a tuple component"));
                 }
                 out.push(ty);
             }
-            Ok(Ty::Tuple(out))
+            // An empty tuple component list canonicalizes to `Void`.
+            Ok(NonEmpty::new(out).map(ValueType::Tuple).unwrap_or(ValueType::Void))
         }
-        TypeKind::Void => Ok(Ty::Void),
+        TypeKind::Void => Ok(ValueType::Void),
     }
 }
 
-/// Conjuncts of a `where` clause: comparisons, divisibility and equalities over shape
-/// parameters and integer literals, plus `full(X)`.
+/// Conjuncts of a `where` clause: comparisons, divisibility and equalities over
+/// shape parameters and integer literals.
 fn predicates_of(
     e: &ast::Expr,
     shape_params: &[String],
@@ -275,27 +271,14 @@ fn predicates_of(
                 BinaryOp::Lt => Predicate::NonNegative(r.sub(&l).sub(&one)),
                 BinaryOp::Eq => Predicate::Zero(l.sub(&r)),
                 BinaryOp::Ne => Predicate::NonZero(l.sub(&r)),
-                _ => return Err(Diagnostic::new(e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters, or `full(X)`")),
+                _ => return Err(Diagnostic::new(e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
             });
             Ok(())
         }
-        A::Call { callee, bindings, args } if matches!(&callee.kind, A::Name(n) if n.name == "full") => {
-            let param = match (bindings.is_empty(), args.as_slice()) {
-                (true, [ast::Arg { name: None, value }]) => match &value.kind {
-                    A::Name(n) if shape_params.contains(&n.name) => Some(n.name.clone()),
-                    _ => None,
-                },
-                _ => None,
-            };
-            match param {
-                Some(p) => {
-                    out.push(Predicate::Full(p));
-                    Ok(())
-                }
-                None => Err(Diagnostic::new(e.span, "`full(X)` takes one shape parameter")),
-            }
-        }
-        _ => Err(Diagnostic::new(e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters, or `full(X)`")),
+        A::Call { callee, .. } if matches!(&callee.kind, A::Name(n) if n.name == "full") => Err(
+            Diagnostic::new(e.span, "`full(X)` was removed with structural slices; shapes are semantic extents only"),
+        ),
+        _ => Err(Diagnostic::new(e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
     }
 }
 
@@ -324,7 +307,7 @@ pub(crate) fn signature_of(
             ));
         }
         let ty = type_from_ast(&p.ty, &shape_params, &mut elem_params)?;
-        if ty == Ty::Void {
+        if ty.is_void() {
             return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
         }
         let ownership = match &p.ty.kind {
@@ -371,7 +354,7 @@ pub(crate) fn signature_of(
             ));
         }
         Some(t) => type_from_ast(t, &shape_params, &mut elem_params)?,
-        None => Ty::Void,
+        None => ValueType::Void,
     };
     let mut predicates = Vec::new();
     for e in s.predicates.iter().chain(extra_predicates) {
@@ -392,34 +375,32 @@ fn elems_overlap(a: &Elem, b: &Elem) -> bool {
     matches!((a, b), (Elem::Param(_), _) | (_, Elem::Param(_))) || a == b
 }
 
-/// Whether two types can describe the same argument: kinds, ranks, element descriptors and
-/// constant extents. Shape relationships between parameters are not compared.
-pub(crate) fn kinds_overlap(a: &Ty, b: &Ty) -> bool {
+/// Whether two types can describe the same argument: kinds, ranks, element
+/// descriptors and constant extents. Shape relationships between parameters
+/// are not compared.
+pub(crate) fn kinds_overlap(a: &ValueType, b: &ValueType) -> bool {
     match (a, b) {
-        (Ty::Scalar(_) | Ty::Index(_), Ty::Scalar(_) | Ty::Index(_)) => {
-            a.scalar_dtype() == b.scalar_dtype()
-        }
-        (Ty::Range(_), Ty::Range(_)) => true,
-        (Ty::Tensor(x), Ty::Tensor(y))
-        | (Ty::View(x), Ty::View(y))
-        | (Ty::Tile(x), Ty::Tile(y)) => {
+        (
+            ValueType::Scalar(_) | ValueType::Index { .. },
+            ValueType::Scalar(_) | ValueType::Index { .. },
+        ) => a.scalar_dtype() == b.scalar_dtype(),
+        (ValueType::Range { .. }, ValueType::Range { .. }) => true,
+        (ValueType::Tensor(x), ValueType::Tensor(y)) => {
             x.rank() == y.rank()
                 && elems_overlap(&x.elem, &y.elem)
-                && x.axes.iter().zip(&y.axes).all(|(p, q)| {
-                    match (
-                        p.semantic().and_then(Sym::as_constant),
-                        q.semantic().and_then(Sym::as_constant),
-                    ) {
+                && x.axes
+                    .iter()
+                    .zip(&y.axes)
+                    .all(|(p, q)| match (p.as_static(), q.as_static()) {
                         (Some(m), Some(n)) => m == n,
                         _ => true,
-                    }
-                })
+                    })
         }
-        (Ty::Tuple(x), Ty::Tuple(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| kinds_overlap(p, q))
+        (ValueType::Tuple(x), ValueType::Tuple(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| kinds_overlap(p, q))
         }
-        (Ty::Native(x), Ty::Native(y)) => x == y,
-        (Ty::Void, Ty::Void) => true,
+        (ValueType::CapabilityValue(x), ValueType::CapabilityValue(y)) => x == y,
+        (ValueType::Void, ValueType::Void) => true,
         _ => false,
     }
 }
@@ -429,7 +410,7 @@ pub(crate) fn structures_overlap(a: &Sig, b: &Sig) -> bool {
         && a.params
             .iter()
             .zip(&b.params)
-            .all(|(p, q)| kinds_overlap(&p.ty, &q.ty))
+            .all(|(p, q)| p.ownership == q.ownership && kinds_overlap(&p.ty, &q.ty))
 }
 
 /// Overlapping definitions agree on result, modes and shape/element relationships.
@@ -511,32 +492,48 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
     }
 
     fn equivalent_type(
-        a: &Ty,
-        b: &Ty,
+        a: &ValueType,
+        b: &ValueType,
         shape_names: &HashMap<String, String>,
         elements: &mut Elements,
     ) -> bool {
+        fn extent_equal(
+            a: &crate::types::ExtentExpr,
+            b: &crate::types::ExtentExpr,
+            shape_names: &HashMap<String, String>,
+        ) -> bool {
+            match (a, b) {
+                (crate::types::ExtentExpr::Static(x), crate::types::ExtentExpr::Static(y)) => {
+                    x == y
+                }
+                (crate::types::ExtentExpr::Sym(x), crate::types::ExtentExpr::Sym(y)) => {
+                    x == &rename_shape(y, shape_names)
+                }
+                _ => false,
+            }
+        }
         match (a, b) {
-            (Ty::Scalar(a), Ty::Scalar(b)) => a == b,
-            (Ty::Index(a), Ty::Index(b)) => a == &rename_shape(b, shape_names),
-            (Ty::Range(a), Ty::Range(b)) => a == &rename_shape(b, shape_names),
-            (Ty::Tensor(a), Ty::Tensor(b))
-            | (Ty::View(a), Ty::View(b))
-            | (Ty::Tile(a), Ty::Tile(b)) => {
+            (ValueType::Scalar(a), ValueType::Scalar(b)) => a == b,
+            (ValueType::Index { bound: a }, ValueType::Index { bound: b })
+            | (ValueType::Range { bound: a }, ValueType::Range { bound: b }) => {
+                extent_equal(a, b, shape_names)
+            }
+            (ValueType::Tensor(a), ValueType::Tensor(b)) => {
                 a.axes.len() == b.axes.len()
-                    && a.axes.iter().zip(&b.axes).all(|(a, b)| {
-                        matches!((a.semantic(), b.semantic()), (Some(a), Some(b)) if a == &rename_shape(b, shape_names))
-                    })
+                    && a.axes
+                        .iter()
+                        .zip(&b.axes)
+                        .all(|(a, b)| extent_equal(a, b, shape_names))
                     && elements.constrain(&a.elem, &b.elem)
             }
-            (Ty::Tuple(a), Ty::Tuple(b)) => {
+            (ValueType::Tuple(a), ValueType::Tuple(b)) => {
                 a.len() == b.len()
                     && a.iter()
-                        .zip(b)
+                        .zip(b.iter())
                         .all(|(a, b)| equivalent_type(a, b, shape_names, elements))
             }
-            (Ty::Native(a), Ty::Native(b)) => a == b,
-            (Ty::Void, Ty::Void) => true,
+            (ValueType::CapabilityValue(a), ValueType::CapabilityValue(b)) => a == b,
+            (ValueType::Void, ValueType::Void) => true,
             _ => false,
         }
     }

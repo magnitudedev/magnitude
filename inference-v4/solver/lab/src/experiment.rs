@@ -234,7 +234,7 @@ pub fn solve(saved: &Instance, method: &str, seed: u64, settings: &Settings) -> 
                 }
                 validation_ms += ms(validation.elapsed());
                 // A result validated after the budget is recorded as late, not
-                // credited as a one-second result by the report.
+                // credited as a one-second result.
                 cost = Some(candidate_cost);
                 values = Some(candidate);
             }

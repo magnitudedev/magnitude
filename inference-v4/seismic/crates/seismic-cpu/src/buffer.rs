@@ -82,4 +82,17 @@ impl Buffer {
         }
         Ok(())
     }
+    /// The host pointer of this view's bytes. The Rc allocation outlives the
+    /// view; no growth occurs while the kernel borrows it.
+    pub(crate) fn data_pointer(&self) -> *mut u8 {
+        let mut storage = self
+            .storage
+            .try_borrow_mut()
+            .expect("CPU storage is already in use");
+        unsafe { storage.as_mut_ptr().cast::<u8>().add(self.offset) }
+    }
+    /// A stable identity of the backing allocation (for alias validation).
+    pub(crate) fn root_id(&self) -> u64 {
+        std::rc::Rc::as_ptr(&self.storage) as u64
+    }
 }

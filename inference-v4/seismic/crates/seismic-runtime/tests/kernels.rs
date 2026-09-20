@@ -1,16 +1,14 @@
 //! Gate G3: every linked seismic-std kernel the Qwen path uses, selected and run on
 //! Metal, agrees with the reference interpreter. The same case table runs on the CPU device
 //! under exact precision, where every output must be bit-identical to the interpreter.
-use seismic_lang::family::Workload;
-use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData, Uniform};
+use seismic_lang::interp::{Arg, Bindings as InterpBindings, Interpreter, Rng, TensorData};
 use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 use seismic_lang::repr;
 use seismic_lang::sir::Mode;
 use seismic_lang::sir::{Definition, Program};
-use seismic_lang::types::{DType, Elem};
-use seismic_lang::types::{Extent, Ty};
+use seismic_lang::types::{DType, Elem, ExtentExpr, ValueType};
 use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
-use seismic_runtime::{Buffer, Device};
+use seismic_runtime::{Buffer, Device, Workload};
 use seismic_std::sweep::{cases, packed_cases, Case};
 use std::collections::HashMap;
 
@@ -67,6 +65,7 @@ fn run(
             .map(|(n, e)| Ok((n.to_string(), element(e)?)))
             .collect::<Result<_, String>>()?,
         precision: precision.clone(),
+        extents: Default::default(),
     };
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
     let mut tensors: Vec<(String, bool, TensorData)> = Vec::new();
@@ -74,17 +73,19 @@ fn run(
     let mut scalars = HashMap::new();
     for param in &definition.params {
         match &param.ty {
-            Ty::Tensor(shaped) | Ty::View(shaped) => {
+            ValueType::Tensor(shaped) => {
                 let shape = shaped
                     .axes
                     .iter()
                     .map(|axis| match axis {
-                        Extent::Semantic(sym) => sym
+                        ExtentExpr::Sym(sym) => sym
                             .eval(&|n| workload.shapes.get(n).copied())
                             .and_then(|v| usize::try_from(v).ok())
                             .ok_or_else(|| format!("{}: unresolved extent {sym}", param.name)),
-                        Extent::Structural(_) => {
-                            Err(format!("{}: structural entry extent", param.name))
+                        ExtentExpr::Static(value) => usize::try_from(*value)
+                            .map_err(|_| format!("{}: extent exceeds address range", param.name)),
+                        ExtentExpr::Runtime(_) => {
+                            Err(format!("{}: runtime-dependent entry extent", param.name))
                         }
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -106,13 +107,13 @@ fn run(
                 };
                 if let Some((_, values)) = case.contents.iter().find(|(n, _)| *n == param.name) {
                     for (flat, value) in values.iter().enumerate() {
-                        tensor.set(flat, *value);
+                        tensor.set(flat, *value).map_err(|e| e.to_string())?;
                     }
                 }
                 args.push(Arg::Tensor(tensors.len()));
                 tensors.push((param.name.clone(), param.mode != Mode::In, tensor));
             }
-            Ty::Scalar(_) | Ty::Index(_) => {
+            ValueType::Scalar(_) | ValueType::Index { .. } => {
                 let (_, value) = case
                     .scalars
                     .iter()
@@ -138,7 +139,10 @@ fn run(
         let count = tensors[words].2.shape().iter().product::<usize>();
         let raw: Vec<u32> = (0..count).map(|_| rng.next() as u32).collect();
         for (flat, word) in raw.iter().enumerate() {
-            tensors[words].2.set(flat, f64::from(*word));
+            tensors[words]
+                .2
+                .set(flat, f64::from(*word))
+                .map_err(|e| e.to_string())?;
         }
         let bytes: Vec<u8> = raw.iter().flat_map(|w| w.to_le_bytes()).collect();
         let halves = tensors
@@ -149,15 +153,19 @@ fn run(
             let half = u16::from_le_bytes([bytes[2 * flat], bytes[2 * flat + 1]]);
             tensors[halves]
                 .2
-                .set(flat, f64::from(seismic_lang::numeric::f16_to_f32(half)));
+                .set(flat, f64::from(seismic_lang::numeric::f16_to_f32(half)))
+                .map_err(|e| e.to_string())?;
         }
     }
 
     let mut interpreter = Interpreter::new(program);
-    interpreter.partitioner = Box::new(Uniform(3));
     interpreter.tensors = tensors.iter().map(|(_, _, t)| t.clone()).collect();
+    let interpreter_bindings = InterpBindings {
+        shapes: workload.shapes.clone(),
+        elems: workload.elems.clone(),
+    };
     interpreter
-        .run(case.entry, &args, &workload)
+        .run(case.entry, &args, &interpreter_bindings)
         .map_err(|e| format!("interpreter: {e}"))?;
 
     let shapes: HashMap<String, i64> = workload.shapes.clone().into_iter().collect();

@@ -1,28 +1,31 @@
-//! Expression evaluation and shaped storage access.
+//! Expression evaluation and shaped storage access over the checked model.
+//! Every registry primitive has exactly one reference evaluation.
 use super::exec::Frame;
 use super::scalar;
-use super::value::{Backing, Flow, Piece, Shaped, Value, S};
+use super::value::{Backing, Shaped, Value, S};
 use super::{round_to, Interpreter, TensorData};
-use crate::sir::{Expr, ExprKind, Index, Math, ReduceOp};
+use crate::intrinsics::{accumulator_dtype, MathOp, PrimitiveId, ReduceOp};
+use crate::repr::{self, Coefficient, PlaneEncoding};
+use crate::sir::{CheckedExpr, CheckedExprKind, CheckedIndex, Literal};
 use crate::syntax::ast::{AssignOp, BinaryOp};
-use crate::types::{DType, Elem};
-use crate::types::{Extent, Ty};
+use crate::types::{DType, Elem, ExtentExpr};
 
-/// An elementwise operand: a broadcast scalar or row-major tile data.
+/// An elementwise operand: a broadcast scalar or row-major tensor data.
 pub(super) enum Operand {
     Scalar(S),
-    Tile {
+    Tensor {
         dtype: DType,
         shape: Vec<usize>,
         data: Vec<f64>,
     },
 }
 
-pub(super) fn hint(ty: &Ty) -> Option<DType> {
+pub(super) fn hint(ty: &crate::types::ValueType) -> Option<DType> {
+    use crate::types::ValueType;
     match ty {
-        Ty::Scalar(d) => Some(*d),
-        Ty::Index(_) => Some(DType::I32),
-        Ty::Tensor(s) | Ty::View(s) | Ty::Tile(s) => match s.elem {
+        ValueType::Scalar(d) => Some(*d),
+        ValueType::Index { .. } => Some(DType::I32),
+        ValueType::Tensor(s) => match s.elem {
             Elem::Dtype(d) => Some(d),
             _ => None,
         },
@@ -66,8 +69,8 @@ impl<'a> Interpreter<'a> {
                 let dense = rc.borrow();
                 match dense.init.get(flat) {
                     Some(true) => Ok(dense.data[flat]),
-                    Some(false) => Err("read of an uninitialized tile element".into()),
-                    None => Err("read outside tile bounds".into()),
+                    Some(false) => Err("read of an uninitialized tensor element".into()),
+                    None => Err("read outside tensor bounds".into()),
                 }
             }
         }
@@ -76,7 +79,9 @@ impl<'a> Interpreter<'a> {
     pub(super) fn write_flat(&mut self, s: &Shaped, flat: usize, value: S) -> Result<(), String> {
         match &s.backing {
             Backing::Tensor(id) => match &mut self.tensors[*id] {
-                TensorData::Packed { .. } => Err("cannot store into a packed tensor".into()),
+                TensorData::Packed { .. } => {
+                    Err("packed representations are readable and decodable but not writable".into())
+                }
                 TensorData::Dense { dtype, data, .. } => {
                     let slot = data.get_mut(flat).ok_or("write outside tensor bounds")?;
                     *slot = scalar::cast(*dtype, value).1;
@@ -86,7 +91,7 @@ impl<'a> Interpreter<'a> {
             Backing::Owned(rc) => {
                 let mut dense = rc.borrow_mut();
                 if flat >= dense.data.len() {
-                    return Err("write outside tile bounds".into());
+                    return Err("write outside tensor bounds".into());
                 }
                 dense.data[flat] = scalar::cast(dense.dtype, value).1;
                 dense.init[flat] = true;
@@ -106,7 +111,7 @@ impl<'a> Interpreter<'a> {
     pub(super) fn operand(&self, v: &Value) -> Result<Operand, String> {
         match v {
             Value::Scalar(d, x) => Ok(Operand::Scalar((*d, *x))),
-            Value::Tile(s) | Value::View(s) => Ok(Operand::Tile {
+            Value::Tensor(s) => Ok(Operand::Tensor {
                 dtype: self.dtype_of(s),
                 shape: s.shape.clone(),
                 data: self.gather(s)?,
@@ -123,7 +128,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, String> {
         let mut shape: Option<&Vec<usize>> = None;
         for o in operands {
-            if let Operand::Tile { shape: s, .. } = o {
+            if let Operand::Tensor { shape: s, .. } = o {
                 if shape.is_some_and(|p| p != s) {
                     return Err(format!(
                         "elementwise shape mismatch: {:?} vs {s:?}",
@@ -138,7 +143,7 @@ impl<'a> Interpreter<'a> {
                 .iter()
                 .map(|o| match o {
                     Operand::Scalar(s) => *s,
-                    Operand::Tile { dtype, data, .. } => (*dtype, data[i]),
+                    Operand::Tensor { dtype, data, .. } => (*dtype, data[i]),
                 })
                 .collect()
         };
@@ -153,7 +158,7 @@ impl<'a> Interpreter<'a> {
             dtype = d;
             data.push(x);
         }
-        Ok(Value::Tile(Shaped::owned(dtype, shape.clone(), data)))
+        Ok(Value::Tensor(Shaped::owned(dtype, shape.clone(), data)))
     }
 
     /// Write `value` through `dst` (`dst op= value`), rounding to the destination dtype.
@@ -165,7 +170,7 @@ impl<'a> Interpreter<'a> {
         value: &Value,
     ) -> Result<(), String> {
         let source = self.operand(value)?;
-        if let Operand::Tile { shape, .. } = &source {
+        if let Operand::Tensor { shape, .. } = &source {
             if shape != &dst.shape {
                 return Err(format!(
                     "shape mismatch: value {shape:?} vs destination {:?}",
@@ -183,7 +188,7 @@ impl<'a> Interpreter<'a> {
         for (i, flat) in flats.into_iter().enumerate() {
             let v = match &source {
                 Operand::Scalar(s) => *s,
-                Operand::Tile { dtype, data, .. } => (*dtype, data[i]),
+                Operand::Tensor { dtype, data, .. } => (*dtype, data[i]),
             };
             let v = if op == AssignOp::Assign {
                 v
@@ -195,12 +200,13 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    /// Value semantics at a binding, yield, port or return: an owned tile that anything else
-    /// can still reach is copied. Views stay borrows; packed snapshots are immutable.
+    /// Value semantics at a binding or return: an owned tensor that anything
+    /// else can still reach is copied. Views stay borrows; packed snapshots are
+    /// immutable descriptors.
     pub(super) fn snapshot(&self, v: Value) -> Result<Value, String> {
         Ok(match v {
-            Value::Tile(s) if matches!(s.backing, Backing::Owned(_)) && !s.exclusive() => {
-                Value::Tile(Shaped::owned(
+            Value::Tensor(s) if matches!(s.backing, Backing::Owned(_)) && !s.exclusive() => {
+                Value::Tensor(Shaped::owned(
                     self.dtype_of(&s),
                     s.shape.clone(),
                     self.gather(&s)?,
@@ -218,88 +224,23 @@ impl<'a> Interpreter<'a> {
 
     // ----- symbols and geometry --------------------------------------------------------
 
-    pub(super) fn piece(
-        &self,
-        f: &Frame<'a>,
-        slice: crate::types::SliceId,
-    ) -> Result<Piece, String> {
-        f.slices
-            .get(slice.0 as usize)
-            .copied()
-            .flatten()
-            .ok_or_else(|| format!("slice#{} is not bound here", slice.0))
-    }
-
-    pub(super) fn extent(&self, e: &Extent, f: &Frame<'a>) -> Result<usize, String> {
+    pub(super) fn extent(&self, e: &ExtentExpr, f: &Frame<'a>) -> Result<usize, String> {
         let n = match e {
-            Extent::Semantic(s) => f.sym(s)?,
-            Extent::Structural(s) => self.piece(f, *s)?.extent(),
+            ExtentExpr::Static(n) => *n as i64,
+            ExtentExpr::Sym(s) => f.sym(s)?,
+            ExtentExpr::Runtime(id) => {
+                return Err(format!("runtime extent #{} is not bound here", id.0))
+            }
         };
         usize::try_from(n).map_err(|_| format!("negative extent {n}"))
     }
 
-    /// Semantic coordinate of position zero of `axis` of a value of static type `ty`.
-    fn axis_base(&self, ty: &Ty, axis: usize, f: &Frame<'a>) -> Result<i64, String> {
-        match ty.shaped().and_then(|s| s.axes.get(axis)) {
-            Some(Extent::Structural(s)) => Ok(self.piece(f, *s)?.lo),
-            _ => Ok(0),
-        }
-    }
-
-    // ----- expressions -----------------------------------------------------------------
-
-    pub(super) fn scalar(&mut self, e: &'a Expr, f: &mut Frame<'a>) -> Result<S, String> {
-        match self.expr(e, f)? {
-            Value::Scalar(d, x) => Ok((d, x)),
-            other => Err(format!("expected a scalar, found {}", other.kind())),
-        }
-    }
-
-    pub(super) fn int(&mut self, e: &'a Expr, f: &mut Frame<'a>) -> Result<i64, String> {
-        match self.scalar(e, f)? {
-            (d, x) if d.is_int() => Ok(x as i64),
-            (d, _) => Err(format!("expected an integer, found {}", d.name())),
-        }
-    }
-
-    /// The storage an expression designates, without reading it.
-    pub(super) fn place(&mut self, e: &'a Expr, f: &mut Frame<'a>) -> Result<Shaped, String> {
-        match &e.kind {
-            ExprKind::Range { .. } => return Err("a range value is only consumed by a loop".into()),
-            ExprKind::Index { base, indices } => {
-                let b = self.place(base, f)?;
-                self.index(b, &base.ty, &e.ty, indices, f)
-            }
-            ExprKind::Transpose(inner) => self.place(inner, f)?.transposed(),
-            _ => match self.expr(e, f)? {
-                Value::Tile(s) | Value::View(s) => Ok(s),
-                other => Err(format!("{} is not storage", other.kind())),
-            },
-        }
-    }
-
-    /// The checker's atom for the extent of a runtime-bounded range (`@dyn#n`), if `axis` of
-    /// `ty` is exactly one.
-    fn dynamic_atom(ty: &Ty, axis: usize) -> Option<String> {
-        let Extent::Semantic(sym) = ty.shaped()?.axes.get(axis)? else {
-            return None;
-        };
-        sym.atoms().into_iter().find_map(|a| match a {
-            crate::sym::Atom::Param(p)
-                if p.starts_with('@') && sym == &crate::sym::Sym::param(&p) =>
-            {
-                Some(p)
-            }
-            _ => None,
-        })
-    }
-
-    fn index(
+    /// Apply checked indices to a selection. Nothing is clamped: selections
+    /// outside the axis are errors.
+    pub(super) fn select(
         &mut self,
         b: Shaped,
-        bt: &Ty,
-        rt: &Ty,
-        indices: &'a [Index],
+        indices: &[CheckedIndex],
         f: &mut Frame<'a>,
     ) -> Result<Shaped, String> {
         if indices.len() > b.shape.len() {
@@ -322,58 +263,34 @@ impl<'a> Interpreter<'a> {
                 out.strides.push(stride);
                 continue;
             };
-            let base = self.axis_base(bt, axis, f)?;
             let point = |v: i64| -> Result<usize, String> {
-                usize::try_from(v - base).ok().filter(|p| *p < extent).ok_or_else(|| format!("index {v} outside axis {axis} of extent {extent} (first coordinate {base})"))
+                usize::try_from(v)
+                    .ok()
+                    .filter(|p| *p < extent)
+                    .ok_or_else(|| format!("index {v} outside axis {axis} of extent {extent}"))
             };
             let (lo, hi) = match index {
-                Index::Point(p) => {
+                CheckedIndex::Point(p) => {
                     out.offset += point(self.int(p, f)?)? * stride;
                     continue;
                 }
-                Index::Coord(var) => {
-                    let v = match f.vars.get(*var).and_then(|v| v.as_ref()) {
-                        Some(Value::Scalar(_, x)) => *x as i64,
-                        _ => return Err("tile coordinate is not bound".into()),
-                    };
-                    out.offset += point(v)? * stride;
-                    continue;
-                }
-                Index::Slice(s) => {
-                    let p = self.piece(f, *s)?;
-                    (p.lo - base, p.hi - base)
-                }
-                Index::Range { start, end } => {
+                CheckedIndex::Range { start, end } => {
                     let lo = match start {
-                        Some(x) => self.int(x, f)? - base,
+                        Some(x) => self.int(x, f)?,
                         None => 0,
                     };
                     let hi = match end {
-                        Some(x) => self.int(x, f)? - base,
+                        Some(x) => self.int(x, f)?,
                         None => extent as i64,
                     };
                     (lo, hi)
                 }
             };
-            // A runtime-bounded range is clamped to its axis; its realized length is the value
-            // of the checker's extent atom from here on.
-            let dynamic = if matches!(index, Index::Range { .. }) {
-                Self::dynamic_atom(rt, out.shape.len())
-            } else {
-                None
-            };
-            let (lo, hi) = match &dynamic {
-                Some(_) => {
-                    let hi = hi.clamp(0, extent as i64);
-                    (lo.clamp(0, hi), hi)
-                }
-                None => (lo, hi),
-            };
-            if let Some(atom) = dynamic {
-                f.dynamic.insert(atom, hi - lo);
-            }
             if lo < 0 || hi < lo || hi > extent as i64 {
-                return Err(format!("selection {}..{} outside axis {axis} of extent {extent} (first coordinate {base})", lo + base, hi + base));
+                return Err(format!(
+                    "selection {}..{} outside axis {axis} of extent {extent}",
+                    lo, hi
+                ));
             }
             out.offset += lo as usize * stride;
             out.shape.push((hi - lo) as usize);
@@ -382,115 +299,30 @@ impl<'a> Interpreter<'a> {
         Ok(out)
     }
 
-    pub(super) fn expr(&mut self, e: &'a Expr, f: &mut Frame<'a>) -> Result<Value, String> {
+    /// The storage an expression designates, without reading it.
+    pub(super) fn place(&mut self, e: &CheckedExpr, f: &mut Frame<'a>) -> Result<Shaped, String> {
         match &e.kind {
-            ExprKind::Int(v) => {
-                let d = hint(&e.ty).unwrap_or(DType::I32);
-                Ok(Value::Scalar(
-                    d,
-                    if d.is_float() {
-                        round_to(d, *v as f64)
-                    } else {
-                        *v as f64
-                    },
-                ))
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::SliceView { .. },
+                operands,
+            } => {
+                let b = self.place(&operands[0], f)?;
+                let indices = slots_of(e);
+                self.select(b, &indices, f)
             }
-            ExprKind::Float(v) => {
-                let d = hint(&e.ty).filter(|d| d.is_float()).unwrap_or(DType::F32);
-                Ok(Value::Scalar(d, round_to(d, *v)))
-            }
-            ExprKind::Bool(b) => Ok(Value::Scalar(DType::Bool, u8::from(*b) as f64)),
-            ExprKind::Var(id) => f.vars.get(*id).and_then(|v| v.clone()).ok_or_else(|| {
-                format!("`{}` is read before it has a value", f.body.vars[*id].name)
-            }),
-            ExprKind::ShapeParam(name) => f
-                .shapes
-                .get(name)
-                .map(|v| Value::int(*v))
-                .ok_or_else(|| format!("shape parameter {name} is unbound")),
-            ExprKind::Tuple(items) => Ok(Value::Tuple(
-                items
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Transpose,
+                operands,
+            } => self.place(&operands[0], f)?.transposed(),
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Reshape,
+                operands,
+            } => {
+                let base = self.place(&operands[0], f)?;
+                let target: Vec<i64> = operands[1..]
                     .iter()
-                    .map(|i| self.expr(i, f))
-                    .collect::<Result<_, _>>()?,
-            )),
-            ExprKind::Range { .. } => Err("a range value is only consumed by a loop".into()),
-            ExprKind::Field { base, index } => match self.expr(base, f)? {
-                Value::Tuple(mut items) if *index < items.len() => Ok(items.swap_remove(*index)),
-                other => Err(format!("component {index} of {}", other.kind())),
-            },
-            ExprKind::TileAlloc => {
-                let (Ty::Tile(s) | Ty::Tensor(s)) = &e.ty else {
-                    return Err("owned allocation without a shaped owned type".into());
-                };
-                let shape = s
-                    .axes
-                    .iter()
-                    .map(|a| self.extent(a, f))
-                    .collect::<Result<Vec<_>, _>>()?;
-                match f.elem(&s.elem) {
-                    Elem::Dtype(d) => Ok(Value::Tile(Shaped::uninit(d, shape))),
-                    other => Err(format!(
-                        "local tile allocation requires a dense dtype, found {other}"
-                    )),
-                }
-            }
-            ExprKind::Filled { like, value } => {
-                let like = self.place(like, f)?;
-                let dtype = match e.ty.shaped().map(|s| f.elem(&s.elem)) {
-                    Some(Elem::Dtype(d)) => d,
-                    _ => self.dtype_of(&like),
-                };
-                let n = like.count();
-                Ok(Value::Tile(Shaped::owned(
-                    dtype,
-                    like.shape,
-                    vec![round_to(dtype, *value); n],
-                )))
-            }
-            ExprKind::Index { base, indices } => {
-                let b = self.place(base, f)?;
-                let element = indices.len() == b.shape.len()
-                    && indices
-                        .iter()
-                        .all(|i| matches!(i, Index::Point(_) | Index::Coord(_)));
-                let s = self.index(b, &base.ty, &e.ty, indices, f)?;
-                if element {
-                    Ok(Value::Scalar(
-                        self.dtype_of(&s),
-                        self.read_flat(&s, s.offset)?,
-                    ))
-                } else {
-                    Ok(Value::View(s))
-                }
-            }
-            ExprKind::Member { result, slices } => {
-                let Value::Result(r) = self.expr(result, f)? else {
-                    return Err("member selection on a value that is not a region result".into());
-                };
-                let at = slices
-                    .iter()
-                    .map(|s| self.piece(f, *s))
-                    .collect::<Result<Vec<_>, _>>()?;
-                r.member(&at).cloned()
-            }
-            ExprKind::Transpose(inner) => Ok(match self.expr(inner, f)? {
-                Value::Tile(s) => Value::Tile(s.transposed()?),
-                Value::View(s) => Value::View(s.transposed()?),
-                other => return Err(format!("transpose of {}", other.kind())),
-            }),
-            ExprKind::Reshape { base, axes } => {
-                let v = self.expr(base, f)?;
-                let Some(s) = v.shaped() else {
-                    return Err(format!("reshape of {}", v.kind()));
-                };
-                if matches!(self.elem_of(s), Elem::Repr(_)) {
-                    return Err("reshape requires dense storage".into());
-                }
-                let target = axes
-                    .iter()
-                    .map(|a| self.extent(a, f).map(|n| n as i64))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|d| self.int(d, f).map(|n| n as i64))
+                    .collect::<Result<_, _>>()?;
                 let signed = |v: &[usize]| {
                     v.iter()
                         .map(|n| {
@@ -499,74 +331,155 @@ impl<'a> Interpreter<'a> {
                         .collect::<Result<Vec<_>, _>>()
                 };
                 let strides = crate::layout::reshape_strides(
-                    &signed(&s.shape)?,
-                    &signed(&s.strides)?,
+                    &signed(&base.shape)?,
+                    &signed(&base.strides)?,
                     &target,
                 )?;
-                let out = Shaped {
-                    backing: s.backing.clone(),
+                Ok(Shaped {
+                    backing: base.backing.clone(),
                     shape: target.into_iter().map(|n| n as usize).collect(),
                     strides: strides.into_iter().map(|n| n as usize).collect(),
-                    offset: s.offset,
-                };
-                Ok(if matches!(v, Value::Tile(_)) {
-                    Value::Tile(out)
-                } else {
-                    Value::View(out)
+                    offset: base.offset,
                 })
             }
-            ExprKind::Load(view) => {
-                let s = self.place(view, f)?;
-                if matches!(self.elem_of(&s), Elem::Repr(_)) {
-                    return Ok(Value::Tile(s));
+            _ => match self.expr(e, f)? {
+                Value::Tensor(s) => Ok(s),
+                other => Err(format!("{} is not storage", other.kind())),
+            },
+        }
+    }
+
+    pub(super) fn scalar(&mut self, e: &CheckedExpr, f: &mut Frame<'a>) -> Result<S, String> {
+        match self.expr(e, f)? {
+            Value::Scalar(d, x) => Ok((d, x)),
+            other => Err(format!("expected a scalar, found {}", other.kind())),
+        }
+    }
+
+    pub(super) fn int(&mut self, e: &CheckedExpr, f: &mut Frame<'a>) -> Result<i64, String> {
+        match self.scalar(e, f)? {
+            (d, x) if d.is_int() => Ok(x as i64),
+            (d, _) => Err(format!("expected an integer, found {}", d.name())),
+        }
+    }
+
+    // ----- expressions -----------------------------------------------------------------
+
+    pub(super) fn expr(&mut self, e: &CheckedExpr, f: &mut Frame<'a>) -> Result<Value, String> {
+        match &e.kind {
+            CheckedExprKind::Literal(literal) => Ok(match literal {
+                Literal::Int(v) => {
+                    let d = hint(&e.ty).unwrap_or(DType::I32);
+                    Value::Scalar(
+                        d,
+                        if d.is_float() {
+                            round_to(d, *v as f64)
+                        } else {
+                            *v as f64
+                        },
+                    )
                 }
-                Ok(Value::Tile(Shaped::owned(
-                    self.dtype_of(&s),
-                    s.shape.clone(),
-                    self.gather(&s)?,
-                )))
+                Literal::Float(v) => {
+                    let d = hint(&e.ty).filter(|d| d.is_float()).unwrap_or(DType::F32);
+                    Value::Scalar(d, round_to(d, *v))
+                }
+                Literal::Bool(b) => Value::Scalar(DType::Bool, u8::from(*b) as f64),
+                Literal::ShapeParam(name) => f
+                    .shapes
+                    .get(name)
+                    .map(|v| Value::int(*v))
+                    .ok_or_else(|| format!("shape parameter {name} is unbound"))?,
+            }),
+            CheckedExprKind::Local(id) => {
+                f.locals.get(*id).and_then(|v| v.clone()).ok_or_else(|| {
+                    format!(
+                        "`{}` is read before it has a value",
+                        f.body.locals[*id].name
+                    )
+                })
             }
-            ExprKind::Decode(view) => {
-                let s = self.place(view, f)?;
-                let data = self
-                    .gather(&s)?
-                    .into_iter()
-                    .map(|x| round_to(DType::F32, x))
-                    .collect();
-                Ok(Value::Tile(Shaped::owned(DType::F32, s.shape, data)))
+            CheckedExprKind::Primitive { id, operands } => self.primitive(id, operands, e, f),
+            CheckedExprKind::Capability { id, args } => self.capability(id, args, e, f),
+            CheckedExprKind::Call { call, args } => self.call(call, args, f),
+        }
+    }
+
+    /// One reference evaluation per registry primitive, exhaustive.
+    fn primitive(
+        &mut self,
+        id: &PrimitiveId,
+        operands: &[CheckedExpr],
+        e: &CheckedExpr,
+        f: &mut Frame<'a>,
+    ) -> Result<Value, String> {
+        match id {
+            PrimitiveId::TuplePack => Ok(Value::Tuple(
+                operands
+                    .iter()
+                    .map(|i| self.expr(i, f))
+                    .collect::<Result<_, _>>()?,
+            )),
+            PrimitiveId::TupleGet(index) => {
+                let index = *index;
+                match self.expr(&operands[0], f)? {
+                    Value::Tuple(mut items) if index < items.len() => Ok(items.swap_remove(index)),
+                    other => Err(format!("component {index} of {}", other.kind())),
+                }
             }
-            ExprKind::Cast { dtype, expr } => {
-                let v = self.expr(expr, f)?;
-                let operand = self.operand(&v)?;
-                self.elementwise(&[operand], *dtype, &mut |a| Ok(scalar::cast(*dtype, a[0])))
+            PrimitiveId::RangeMake => {
+                let lo = self.int(&operands[0], f)?;
+                let hi = self.int(&operands[1], f)?;
+                Ok(Value::Range(lo, hi))
             }
-            ExprKind::Unary { op, expr } => {
-                let v = self.expr(expr, f)?;
+            PrimitiveId::RangeStart => match self.expr(&operands[0], f)? {
+                Value::Range(lo, _) => Ok(Value::int(lo)),
+                other => Err(format!("range start of {}", other.kind())),
+            },
+            PrimitiveId::RangeEnd => match self.expr(&operands[0], f)? {
+                Value::Range(_, hi) => Ok(Value::int(hi)),
+                other => Err(format!("range end of {}", other.kind())),
+            },
+            PrimitiveId::Unary(op) => {
+                let v = self.expr(&operands[0], f)?;
                 let operand = self.operand(&v)?;
                 self.elementwise(&[operand], hint(&e.ty).unwrap_or(DType::F32), &mut |a| {
                     scalar::unary(*op, a[0])
                 })
             }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.expr(lhs, f)?;
+            PrimitiveId::Binary(op) => {
+                let l = self.expr(&operands[0], f)?;
                 // Scalar logic short-circuits, so a guard protects its right operand.
                 if let (BinaryOp::And | BinaryOp::Or, Value::Scalar(DType::Bool, x)) = (op, &l) {
                     if (*x != 0.0) == (*op == BinaryOp::Or) {
                         return Ok(l);
                     }
                 }
-                let r = self.expr(rhs, f)?;
+                let r = self.expr(&operands[1], f)?;
                 let h = hint(&e.ty);
                 let operands = [self.operand(&l)?, self.operand(&r)?];
                 self.elementwise(&operands, h.unwrap_or(DType::F32), &mut |a| {
                     scalar::binary(*op, a[0], a[1], h)
                 })
             }
-            ExprKind::Math { op, args } => self.math(*op, args, e, f),
-            ExprKind::Select { cond, then, els } => {
-                let c = self.expr(cond, f)?;
-                let t = self.expr(then, f)?;
-                let n = self.expr(els, f)?;
+            PrimitiveId::Cast(dtype) => {
+                let v = self.expr(&operands[0], f)?;
+                let operand = self.operand(&v)?;
+                self.elementwise(&[operand], *dtype, &mut |a| Ok(scalar::cast(*dtype, a[0])))
+            }
+            PrimitiveId::Math(op) => {
+                let mut collected = Vec::with_capacity(operands.len());
+                for a in operands {
+                    let v = self.expr(a, f)?;
+                    collected.push(self.operand(&v)?);
+                }
+                self.elementwise(&collected, hint(&e.ty).unwrap_or(DType::F32), &mut |a| {
+                    scalar::math(*op, a)
+                })
+            }
+            PrimitiveId::Select => {
+                let c = self.expr(&operands[0], f)?;
+                let t = self.expr(&operands[1], f)?;
+                let n = self.expr(&operands[2], f)?;
                 if let Value::Scalar(d, x) = &c {
                     if *d != DType::Bool {
                         return Err("select requires a bool condition".into());
@@ -584,18 +497,79 @@ impl<'a> Interpreter<'a> {
                     Ok(scalar::cast(d, if a[0].1 != 0.0 { a[1] } else { a[2] }))
                 })
             }
-            ExprKind::Reduce {
-                value, axis, op, ..
-            } => {
-                let s = self.place(value, f)?;
-                self.reduce(&s, *axis, *op)
+            PrimitiveId::TensorAlloc { .. } => {
+                let shape = operands
+                    .iter()
+                    .map(|d| self.extent_of_operand(d, f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dtype = match &e.ty {
+                    crate::types::ValueType::Tensor(s) => f.elem(&s.elem),
+                    _ => return Err("owned allocation without a tensor type".into()),
+                };
+                match dtype {
+                    Elem::Dtype(d) => Ok(Value::Tensor(Shaped::uninit(d, shape))),
+                    other => Err(format!(
+                        "local tensor allocation requires a dense dtype, found {other}"
+                    )),
+                }
             }
-            ExprKind::CoordOf(var) => match f.vars.get(*var).and_then(|v| v.as_ref()) {
-                Some(Value::Scalar(_, x)) => Ok(Value::int(*x as i64)),
-                _ => Err("coord() of an unbound tile coordinate".into()),
-            },
-            ExprKind::ExtentOf { base, axis } => {
-                let s = self.place(base, f)?;
+            PrimitiveId::Fill { value, dtype } => {
+                let like = self.place(&operands[0], f)?;
+                let n = like.count();
+                Ok(Value::Tensor(Shaped::owned(
+                    *dtype,
+                    like.shape,
+                    vec![round_to(*dtype, *value); n],
+                )))
+            }
+            PrimitiveId::Materialize | PrimitiveId::Clone | PrimitiveId::Load => {
+                let s = self.place(&operands[0], f)?;
+                if matches!(self.elem_of(&s), Elem::Repr(_)) {
+                    // A packed snapshot is an immutable descriptor over the same plane bytes.
+                    return Ok(Value::Tensor(s));
+                }
+                Ok(Value::Tensor(Shaped::owned(
+                    self.dtype_of(&s),
+                    s.shape.clone(),
+                    self.gather(&s)?,
+                )))
+            }
+            PrimitiveId::Decode => {
+                let s = self.place(&operands[0], f)?;
+                let data = self
+                    .gather(&s)?
+                    .into_iter()
+                    .map(|x| round_to(DType::F32, x))
+                    .collect();
+                Ok(Value::Tensor(Shaped::owned(DType::F32, s.shape, data)))
+            }
+            PrimitiveId::PackedRead(field) => {
+                let s = self.place(&operands[0], f)?;
+                self.packed_read(&s, field.name())
+            }
+            PrimitiveId::Transpose => Ok(match self.expr(&operands[0], f)? {
+                Value::Tensor(s) => Value::Tensor(s.transposed()?),
+                other => return Err(format!("transpose of {}", other.kind())),
+            }),
+            PrimitiveId::Reshape => self.place(e, f).map(Value::Tensor),
+            PrimitiveId::SliceView { .. } => self.place(e, f).map(Value::Tensor),
+            PrimitiveId::ElementRead { .. } => {
+                let s = self.place(&operands[0], f)?;
+                let indices = point_indices(operands);
+                let selected = self.select(s, &indices, f)?;
+                if !selected.shape.is_empty() {
+                    return Err("a point read selects one element".into());
+                }
+                Ok(Value::Scalar(
+                    self.dtype_of(&selected),
+                    self.read_flat(&selected, selected.offset)?,
+                ))
+            }
+            PrimitiveId::ElementWrite { .. } | PrimitiveId::CopyInto => {
+                Err("write primitives are carried by checked assignments, not expressions".into())
+            }
+            PrimitiveId::Extent { axis } | PrimitiveId::ValidExtent { axis } => {
+                let s = self.place(&operands[0], f)?;
                 s.shape
                     .get(*axis)
                     .map(|n| Value::int(*n as i64))
@@ -603,75 +577,57 @@ impl<'a> Interpreter<'a> {
                         format!("extent of axis {axis} of a rank-{} value", s.shape.len())
                     })
             }
-            ExprKind::Geometry { base, axis, valid } => {
-                let s = self.place(base, f)?;
-                let extent = *s.shape.get(*axis).ok_or_else(|| {
-                    format!("geometry of axis {axis} of a rank-{} value", s.shape.len())
-                })? as i64;
-                if *valid {
-                    return Ok(Value::int(extent));
-                }
-                let capacity = match base.ty.shaped().and_then(|t| t.axes.get(*axis)) {
-                    Some(Extent::Structural(slice)) => self.piece(f, *slice)?.width,
-                    Some(Extent::Semantic(sym)) => f
-                        .caps
-                        .iter()
-                        .find(|(p, _)| sym == &crate::sym::Sym::param(p))
-                        .map(|(_, piece)| piece.width)
-                        .unwrap_or(extent),
-                    None => extent,
+            PrimitiveId::Atomic { op, .. } => {
+                // The place is the operand prefix `[base, indices…]`, the value last.
+                let value = self.scalar(operands.last().expect("atomic has a value"), f)?;
+                let indices: Vec<CheckedIndex> = operands[1..operands.len() - 1]
+                    .iter()
+                    .map(|p| CheckedIndex::Point(p.clone()))
+                    .collect();
+                let b = self.expr(&operands[0], f)?;
+                let Value::Tensor(shaped) = b else {
+                    return Err("the `atomic` place does not name tensor storage".into());
                 };
-                Ok(Value::int(capacity.max(extent)))
-            }
-            ExprKind::Call { call, args } => self.call(*call, args, f),
-            ExprKind::Region(region) => match self.region(region, f)? {
-                Flow::Yield(v) => Ok(v),
-                _ => Err("region expression produced no value".into()),
-            },
-            ExprKind::Intrinsic { op, args } => self.intrinsic(*op, args, e, f),
-            ExprKind::Accessor { base, name } => {
-                let s = self.place(base, f)?;
-                let axis = base
-                    .ty
-                    .shaped()
-                    .and_then(|t| t.packed_axis)
-                    .unwrap_or(s.shape.len().saturating_sub(1));
-                self.accessor(&s, axis, name)
-            }
-            ExprKind::Atomic { op, place, value } => {
-                let dst = self.place(place, f)?;
+                let dst = self.select(shaped, &indices, f)?;
                 if !dst.shape.is_empty() {
                     return Err("atomic update of a place that is not one element".into());
                 }
-                let v = self.scalar(value, f)?;
                 let d = self.dtype_of(&dst);
                 let current = (d, self.read_flat(&dst, dst.offset)?);
-                let updated = scalar::binary(*op, current, v, Some(d))?;
+                let updated = match op {
+                    // Registry `RoundsOnce`: the sum rounds once at the element dtype.
+                    crate::intrinsics::AtomicOp::Add => {
+                        scalar::binary(BinaryOp::Add, current, value, Some(d))?
+                    }
+                    // Exact selection of one operand; a NaN operand is ignored,
+                    // as in the reference `max`/`min` reductions.
+                    crate::intrinsics::AtomicOp::Max => (d, current.1.max(value.1)),
+                    crate::intrinsics::AtomicOp::Min => (d, current.1.min(value.1)),
+                };
                 self.write_flat(&dst, dst.offset, updated)?;
                 Ok(Value::Void)
+            }
+            PrimitiveId::Reduce { op, axis, .. } => {
+                let s = self.place(&operands[0], f)?;
+                self.reduce(&s, *axis, *op)
             }
         }
     }
 
-    fn math(
-        &mut self,
-        op: Math,
-        args: &'a [Expr],
-        e: &'a Expr,
-        f: &mut Frame<'a>,
-    ) -> Result<Value, String> {
-        let mut operands = Vec::with_capacity(args.len());
-        for a in args {
-            let v = self.expr(a, f)?;
-            operands.push(self.operand(&v)?);
+    fn extent_of_operand(&mut self, d: &CheckedExpr, f: &mut Frame<'a>) -> Result<usize, String> {
+        match &d.ty {
+            crate::types::ValueType::Index { bound } => self.extent(bound, f),
+            _ => {
+                let n = self.int(d, f)?;
+                usize::try_from(n).map_err(|_| format!("negative extent {n}"))
+            }
         }
-        self.elementwise(&operands, hint(&e.ty).unwrap_or(DType::F32), &mut |a| {
-            scalar::math(op, a)
-        })
     }
 
-    /// Reduction along one axis in ascending index order. Sums round every step to the
-    /// accumulation dtype; max/min/argmax keep the smaller index on ties.
+    /// Reduction along one axis in ascending coordinate order, with the
+    /// registry's accumulator, identity and tie semantics. Integer sums wrap
+    /// at the operand dtype each step; `argmax` requires a nonempty axis and
+    /// keeps the smaller coordinate on ties.
     fn reduce(&self, s: &Shaped, axis: usize, op: ReduceOp) -> Result<Value, String> {
         if axis >= s.shape.len() {
             return Err(format!(
@@ -679,12 +635,11 @@ impl<'a> Interpreter<'a> {
                 s.shape.len()
             ));
         }
-        // Floating reductions are carried in f32 whatever the operand's element type.
-        let input = if self.dtype_of(s).is_float() {
-            DType::F32
-        } else {
-            self.dtype_of(s)
-        };
+        let input = self.dtype_of(s);
+        if matches!(self.elem_of(s), Elem::Repr(_)) {
+            return Err("reduce requires a dense tile; decode packed values first".into());
+        }
+        let accumulator = accumulator_dtype(op, input);
         let data = self.gather(s)?;
         let extent = s.shape[axis];
         if extent == 0 && op == ReduceOp::Argmax {
@@ -695,7 +650,7 @@ impl<'a> Interpreter<'a> {
         let mut out = Vec::with_capacity(outer * inner);
         for o in 0..outer {
             for i in 0..inner {
-                let mut acc = match (op, input) {
+                let mut acc = match (op, accumulator) {
                     (ReduceOp::Sum, _) => 0.0,
                     (ReduceOp::Min, DType::Bool) => 1.0,
                     (_, DType::Bool) => 0.0,
@@ -710,7 +665,7 @@ impl<'a> Interpreter<'a> {
                 for k in 0..extent {
                     let x = data[(o * extent + k) * inner + i];
                     match op {
-                        ReduceOp::Sum => acc = round_to(input, acc + x),
+                        ReduceOp::Sum => acc = round_to(accumulator, acc + x),
                         ReduceOp::Max => acc = acc.max(x),
                         ReduceOp::Min => acc = acc.min(x),
                         ReduceOp::Argmax => {
@@ -730,15 +685,332 @@ impl<'a> Interpreter<'a> {
         }
         let mut shape = s.shape.clone();
         shape.remove(axis);
-        let dtype = if op == ReduceOp::Argmax {
-            DType::I32
-        } else {
-            input
-        };
+        let dtype = accumulator_dtype(op, input);
         Ok(if shape.is_empty() {
             Value::Scalar(dtype, out[0])
         } else {
-            Value::Tile(Shaped::owned(dtype, shape, out))
+            Value::Tensor(Shaped::owned(dtype, shape, out))
         })
+    }
+
+    // ----- capability intrinsics ---------------------------------------------------------
+
+    /// Capability intrinsics under a single participant: the reference model
+    /// has one participant per group, so an exchange returns its own value and
+    /// a subgroup reduction of one value is that value. Logical matrix
+    /// intrinsics evaluate their defined reference order.
+    fn capability(
+        &mut self,
+        id: &crate::intrinsics::IntrinsicId,
+        args: &[CheckedExpr],
+        e: &CheckedExpr,
+        f: &mut Frame<'a>,
+    ) -> Result<Value, String> {
+        match id.name.as_str() {
+            "lane_index" => Ok(Value::int(0)),
+            "shuffle" => {
+                let v = self.expr(&args[0], f)?;
+                match self.int(&args[1], f)? {
+                    0 => Ok(v),
+                    other => Err(format!("participant {other} outside a group of one")),
+                }
+            }
+            "simd_sum" | "simd_max" | "simd_min" => self.expr(&args[0], f),
+            "matmul" | "matmul_add" => self.matmul(id, args, e, f),
+            other => Err(format!("`{other}` has no reference semantics")),
+        }
+    }
+
+    /// The reference order: each output accumulates an fma chain over an
+    /// ascending inner axis, rounding at the accumulation dtype.
+    fn matmul(
+        &mut self,
+        id: &crate::intrinsics::IntrinsicId,
+        args: &[CheckedExpr],
+        e: &CheckedExpr,
+        f: &mut Frame<'a>,
+    ) -> Result<Value, String> {
+        let add = id.name == "matmul_add";
+        let expected = if add { 3 } else { 2 };
+        if args.len() != expected {
+            return Err(format!("`{id}` takes {expected} operands"));
+        }
+        let left = self.place(&args[0], f)?;
+        let right = self.place(&args[1], f)?;
+        if left.shape.len() != 2 || right.shape.len() != 2 {
+            return Err(format!("`{id}` operands must be rank two"));
+        }
+        let (rows, inner, columns) = (left.shape[0], left.shape[1], right.shape[1]);
+        if right.shape[0] != inner {
+            return Err(format!(
+                "`{id}` inner extents differ: {inner} and {}",
+                right.shape[0]
+            ));
+        }
+        let crate::types::ValueType::Tensor(result) = &e.ty else {
+            return Err(format!("`{id}` result is not an owned tensor value"));
+        };
+        let Elem::Dtype(dtype) = f.elem(&result.elem) else {
+            return Err(format!("`{id}` result must have a dense element type"));
+        };
+        let left_dtype = self.dtype_of(&left);
+        let right_dtype = self.dtype_of(&right);
+        let left_values = self.gather(&left)?;
+        let right_values = self.gather(&right)?;
+        let accumulator = if add {
+            let value = self.place(&args[2], f)?;
+            if value.shape != [rows, columns] {
+                return Err(format!(
+                    "`{id}` accumulator shape {:?} differs from [{rows}, {columns}]",
+                    value.shape
+                ));
+            }
+            Some((self.dtype_of(&value), self.gather(&value)?))
+        } else {
+            None
+        };
+        let mut output = Vec::with_capacity(rows.saturating_mul(columns));
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut sum = accumulator.as_ref().map_or(
+                    scalar::cast(dtype, (DType::I32, 0.0)),
+                    |(source_dtype, values)| {
+                        scalar::cast(dtype, (*source_dtype, values[row * columns + column]))
+                    },
+                );
+                for k in 0..inner {
+                    let l = (left_dtype, left_values[row * inner + k]);
+                    let r = (right_dtype, right_values[k * columns + column]);
+                    sum = if dtype.is_int() {
+                        let product = scalar::binary(
+                            BinaryOp::Mul,
+                            scalar::cast(dtype, l),
+                            scalar::cast(dtype, r),
+                            Some(dtype),
+                        )?;
+                        scalar::binary(BinaryOp::Add, sum, product, Some(dtype))?
+                    } else {
+                        scalar::cast(dtype, scalar::math(MathOp::Fma, &[l, r, sum])?)
+                    };
+                }
+                output.push(sum.1);
+            }
+        }
+        Ok(Value::Tensor(Shaped::owned(
+            dtype,
+            vec![rows, columns],
+            output,
+        )))
+    }
+
+    // ----- packed planes -----------------------------------------------------------------
+
+    /// `t.words`, `t.scale`, `t.bias` and the other physical planes of a packed
+    /// value: a dense tile whose packet axis is replaced by the plane's extent
+    /// over that axis. Planes are readable and decodable, never writable.
+    fn packed_read(&self, s: &Shaped, name: &str) -> Result<Value, String> {
+        let Backing::Tensor(id) = &s.backing else {
+            return Err(format!("`.{name}` needs a packed value"));
+        };
+        let TensorData::Packed {
+            repr: rep, planes, ..
+        } = &self.tensors[*id]
+        else {
+            return Err(format!("`.{name}` needs a packed value"));
+        };
+        let axis = s.shape.len().saturating_sub(1);
+        if axis >= s.shape.len() || s.strides[axis] != 1 {
+            return Err(format!("`.{name}` needs the packet axis in storage order"));
+        }
+        let length = s.shape[axis];
+        let logical = name == "scale" || name == "bias";
+        let plane = if logical {
+            None
+        } else {
+            Some(
+                rep.plane(name)
+                    .ok_or_else(|| format!("`{}` has no physical plane `{name}`", rep.name))?,
+            )
+        };
+        let group = plane.as_ref().map_or(rep.group, |p| p.group) as usize;
+        let (count, dtype) = match &plane {
+            None => (length.div_ceil(group), rep.coefficient_dtype()),
+            Some(p) => (
+                p.storage_elements(length as u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or("plane extent overflow")?,
+                p.dtype(),
+            ),
+        };
+        let mut rows = s.clone();
+        rows.shape[axis] = 1;
+        let mut data = Vec::with_capacity(rows.count() * count);
+        // Rows are visited in row-major order of the result, whose packet axis is `axis`.
+        let outer: usize = s.shape[..axis].iter().product();
+        let inner: usize = s.shape[axis + 1..].iter().product();
+        let starts = rows.flats();
+        for o in 0..outer {
+            for e in 0..count {
+                for i in 0..inner {
+                    let first = starts[o * inner + i];
+                    if first % group != 0 {
+                        return Err(format!(
+                            "`.{name}` of a selection that does not start on a group of {group}"
+                        ));
+                    }
+                    data.push(match &plane {
+                        None => coefficient_value(rep, planes, name == "bias", first + e * group)?,
+                        Some(p) => {
+                            let entry = first / group * p.fields as usize;
+                            match &p.encoding {
+                                PlaneEncoding::Dense(_) => {
+                                    plane_value(rep, planes, p, entry + e)?
+                                }
+                                PlaneEncoding::Packed { bits, .. } => {
+                                    let bit = entry * *bits as usize;
+                                    if bit % 32 != 0 {
+                                        return Err(format!("`.{name}` of a selection that does not start on a storage word"));
+                                    }
+                                    let bytes = rep.plane_index(p.name).and_then(|k| planes.get(k)).ok_or("missing plane storage")?;
+                                    let at = (bit / 32 + e) * 4;
+                                    let word: [u8; 4] =
+                                        std::array::from_fn(|k| bytes.get(at + k).copied().unwrap_or(0));
+                                    f64::from(u32::from_le_bytes(word))
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        let mut shape = s.shape.clone();
+        shape[axis] = count;
+        Ok(Value::Tensor(Shaped::owned(dtype, shape, data)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gather_for_test(&self, s: &Shaped) -> Vec<f64> {
+        self.gather(s).unwrap()
+    }
+}
+
+/// The checked indices of a point read: the operand exprs after the base.
+fn point_indices(operands: &[CheckedExpr]) -> Vec<CheckedIndex> {
+    operands[1..]
+        .iter()
+        .map(|p| CheckedIndex::Point(p.clone()))
+        .collect()
+}
+
+/// The index slots of a view-selection expression, reconstructed from its
+/// operand structure: `[base, start0, end0, …]` in slot order.
+fn slots_of(e: &CheckedExpr) -> Vec<CheckedIndex> {
+    let CheckedExprKind::Primitive {
+        id: PrimitiveId::SliceView { indices },
+        operands,
+    } = &e.kind
+    else {
+        return Vec::new();
+    };
+    let mut present = operands[1..].iter();
+    indices
+        .iter()
+        .map(|slot| match slot {
+            crate::intrinsics::IndexSlot::Point => CheckedIndex::Point(
+                present
+                    .next()
+                    .cloned()
+                    .expect("operand count matches slots"),
+            ),
+            crate::intrinsics::IndexSlot::Range { start, end } => CheckedIndex::Range {
+                start: if *start {
+                    present.next().cloned()
+                } else {
+                    None
+                },
+                end: if *end { present.next().cloned() } else { None },
+            },
+        })
+        .collect()
+}
+
+/// One decoded entry of a physical plane.
+fn plane_value(
+    rep: &repr::Repr,
+    planes: &[Vec<u8>],
+    plane: &repr::Plane,
+    entry: usize,
+) -> Result<f64, String> {
+    let bytes = rep
+        .plane_index(plane.name)
+        .and_then(|i| planes.get(i))
+        .ok_or_else(|| format!("`{}` has no plane `{}`", rep.name, plane.name))?;
+    let outside = || {
+        format!(
+            "plane `{}` entry {entry} is outside its storage",
+            plane.name
+        )
+    };
+    match &plane.encoding {
+        PlaneEncoding::Packed {
+            bits,
+            interpretation,
+        } => {
+            if (entry + 1) * *bits as usize > bytes.len() * 8 {
+                return Err(outside());
+            }
+            Ok(f64::from(
+                interpretation.decode(repr::read_packed(bytes, entry, *bits), *bits),
+            ))
+        }
+        PlaneEncoding::Dense(dtype) => {
+            let width = dtype.bytes() as usize;
+            let raw = bytes
+                .get(entry * width..(entry + 1) * width)
+                .ok_or_else(outside)?;
+            Ok(f64::from(match (dtype, raw) {
+                (DType::F32, [a, b, c, d]) => f32::from_le_bytes([*a, *b, *c, *d]),
+                (DType::F16, [a, b]) => crate::numeric::f16_to_f32(u16::from_le_bytes([*a, *b])),
+                (DType::BF16, [a, b]) => {
+                    f32::from_bits(u32::from(u16::from_le_bytes([*a, *b])) << 16)
+                }
+                _ => {
+                    return Err(format!(
+                        "plane `{}` is not a floating coefficient plane",
+                        plane.name
+                    ))
+                }
+            }))
+        }
+    }
+}
+
+/// The logical scale or bias applying to the value at flat position `flat`.
+fn coefficient_value(
+    rep: &repr::Repr,
+    planes: &[Vec<u8>],
+    bias: bool,
+    flat: usize,
+) -> Result<f64, String> {
+    match rep.coefficient(bias) {
+        None => Err(format!("`{}` has no bias", rep.name)),
+        Some(Coefficient::Direct { plane }) => {
+            plane_value(rep, planes, &plane, flat / plane.group as usize)
+        }
+        Some(Coefficient::Product {
+            factor,
+            coefficients,
+            field,
+            sign,
+        }) => {
+            let code = plane_value(
+                rep,
+                planes,
+                &coefficients,
+                flat / coefficients.group as usize * coefficients.fields as usize + field as usize,
+            )?;
+            let factor = plane_value(rep, planes, &factor, flat / factor.group as usize)?;
+            Ok(f64::from((factor as f32 * code as f32) * sign as f32))
+        }
     }
 }

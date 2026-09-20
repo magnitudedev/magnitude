@@ -22,7 +22,10 @@ execution is admitted only when its composed evidence satisfies the entry policy
 | `parallel for i in range` | Independent visits. Captured scalar or owned local state may not be updated. |
 
 An exclusive tensor may be written in `parallel for` only when the checker proves different visits
-write disjoint places, or through an explicitly atomic operation. Lexical position fixes production:
+write disjoint places (an index injective in every loop binder: affine with a nonzero coefficient,
+a mixed radix over several binders, or a slice `c*v + d : c*v + d + len` with `len <= c`), or through
+`atomic(add|max|min, place, value)`, which the reference applies in visit order. Lexical position
+fixes production:
 a binding outside a loop is evaluated once; a binding inside is evaluated once per visit.
 
 The compiler may block, vectorize, fuse, stage, pipeline, or distribute loops. These are physical

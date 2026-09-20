@@ -11,112 +11,172 @@ applies_to:
 
 # Seismic compilation
 
-Seismic has four authoritative compilation artifacts:
+The sole production path is:
 
-1. `SemanticProgram` is checked source meaning: types, ownership, effects, capabilities and
-   numerical semantics.
-2. `LogicalProgram` is one target/workload specialization. Each applicable implementation owns a
-   scheduling-normal `LogicalTaskGraph` whose tasks have one coherent logical domain and whose
-   dependencies make value, effect and ownership order explicit.
-3. `ResolvedPlan<D>` is one complete executable refinement. It owns nested plans, phases, launches,
-   participant mappings, instructions, storage, binding groups, synchronization, resources,
-   numerical effects and the complete selected assignment.
-4. `NativeArtifact` is the mechanical backend encoding of that resolved plan.
+```text
+CheckedProgram
+  -> specialize one entry and its implementation choices
+  -> LogicalProgram
+  -> construct one PlanFamily<BackendDialect>
+  -> solve one global planning model
+  -> ResolvedPlan<BackendDialect>
+  -> mechanically encode NativeArtifact
+  -> validate bindings and execute
+```
 
-There is no second physical graph, post-selection linker or native feasibility retry. Solver state
-is private planning state and is never executable.
+There is no baseline compiler, fallback scheduler, retry compiler, repair pass,
+alternative native compiler, or post-selection resource check. Serial, CPU-worker,
+grid, grid-stride, subgroup, matrix, fused, split, and multi-launch executions are
+peer alternatives in the one `PlanFamily`; the universally applicable serial and
+grid-stride forms are ordinary members of that family, not a side channel.
 
-## Semantic to logical
+## Artifacts and authority
 
-Specialization retains all applicable implementations for one target/workload identity.
-Normalization decomposes each implementation into tasks before backend planning:
+1. `CheckedProgram` owns types, ownership, mutation permission, control and
+   reference meaning, function families, and capabilities. It decides nothing
+   about tasks, launches, memory spaces, or limits.
+2. `LogicalProgram` is one target/workload specialization: occurrence-qualified
+   implementation choices plus hierarchical SSA task graphs. It owns
+   specialization, logical storage and views, structured control, calls,
+   reductions, dependencies, safety obligations, and runtime extents. It names
+   no participants, geometry, allocation, barriers, or opcodes.
+3. `PlanFamily<D>` is solver input, not serialized IR. It owns legal
+   algorithms and mappings, fusion and splitting, physical storage and
+   transport, synchronization, exact hard resources, bounded native-resource
+   contracts, capabilities, numerics, and cost.
+4. The planning model owns the one global implementation, strategy, tuning,
+   activation, dispatch, storage-placement, capability, safety, and
+   numerical-policy assignment.
+5. `ResolvedPlan<D>` owns the selected nested schedule, opcodes, runtime
+   geometry expressions, offsets, resources, and the numerical assessment.
+   The root plan alone owns the public ABI, the global storage table, and the
+   internal arena; nested call bodies reference transports in that same
+   table and never own a second ABI or arena.
+6. `NativeArtifact` is the mechanical encoding of the resolved plan. It
+   mirrors the resolved execution tree, collapsing only statically empty or
+   singleton structural wrappers; dynamic `If`/`Repeat` control is never
+   flattened away.
+7. The runtime validates bindings, binds retained IDs, evaluates retained
+   execution expressions, submits in retained order, skips zero-work
+   launches, and reports status. It makes no compilation or selection
+   decision.
 
-- independent domains become explicit logical axes;
-- ordered iteration and carried state remain ordered axes;
-- reductions are explicit task operations;
-- calls are typed choice boundaries with explicit input and result operands;
-- data, mutation and ownership order become graph dependencies; and
-- result storage identities and paths exist before physical planning.
+Solver state is private planning state and is never executable.
 
-A scalar task body cannot hide another independent scheduling domain. Task-local views contain
-only identity, reshape and transpose transforms. Dynamic slicing is an index operation whose
-endpoints are task-local scalar expressions, so terminal instructions never retain unresolved
-program-wide value identities.
+## One schedule authority
 
-Logical structure names no threads, workgroups, tiles, memory spaces or backend limits.
+Order is expressed once, as a structured execution tree of
+`Launch`/`Call`/`If`/`Repeat` steps. Sibling steps complete in order; `If`
+evaluates one retained predicate and one branch; `Repeat` evaluates a
+retained half-open range and rebinds its scalar binder and carries each
+visit. Loops or conditionals consumed wholly by one launch become kernel-local
+control; those containing retained calls or multiple launches become the
+corresponding structured schedule steps. There are no phase lists and no
+predecessor edges parallel to item order.
 
-## Logical to executable
+Calls remain nested: `ResolvedCall` retains the child plan body and its
+boundary environment, whose transports resolve directly to caller storage
+IDs. Only the root boundary has ABI allocations.
 
-Each backend elaborates a `PlanFamily<D>` of complete schedule alternatives. A private
-`ScheduleBuilder` owns the obligations for every task, call, dependency and output. Mapping,
-subplan composition, synchronization and publication consume those obligations exactly once;
-`finish` is the only way to construct an alternative.
+## Family, model, and solve
 
-A complete alternative contains:
+Each backend elaborates a complete `PlanFamily<D>`: every applicable portable
+alternative receives a universal physical alternative, or that is a compiler
+defect. Alternatives are built through the consuming family builder; mapping,
+fusion, splitting, scheduling, calls, and obligation discharge consume exact
+logical IDs, and an alternative is finishable only when its logical and
+physical pending sets are empty.
 
-- explicit maps from logical axes to workgroup, participant, subgroup or serial execution;
-- non-empty phases and launches with launch-local admitted instructions;
-- exact value transports, including representation planes, tuple structure and zero-channel
-  `Void`;
-- storage with size, alignment, replication and provenance;
-- binding groups and access modes;
-- program-order, barrier or launch-boundary placement for every dependency; and
-- symbolic cost, resource, capability and numerical facts derived from those same objects.
+The family supplies only legal choices and their exact constraints; it carries
+no selected, default, constructive, or executable assignment. The one global
+model includes implementation, physical strategy, tuning, child activation,
+dispatch and resources, storage activation, interference and offsets,
+capability, safety, and whole-plan numerical policy. Global placement owns
+every active device offset and constrains every storage end by device capacity;
+interfering lifetimes receive ordering constraints, and sequential sibling
+internals may reuse space.
 
-The common planner builds one finite solver model over this family. It selects complete logical
-and physical alternatives, structural integers and an admissible numerical assignment. Target
-limits and precision are hard constraints. Greedy and exact differ only in search; both resolve
-through the same constructor. Bounded search may return a legal incumbent with `optimal = false`,
-but never a partial plan.
+The solver is the sole selection authority. Its feasible assignment contains
+every implementation, strategy, tuning, activation, and offset decision.
+Internal arena size is the deterministic maximum active storage end, not a
+second selected value. The optimization budget limits optimization only:
+feasibility is decided first, so a budget can never cause a no-incumbent
+production failure. Production returns the best incumbent with an optimality
+flag, never a partial plan.
 
-Resolution evaluates symbols once and produces a nested `ResolvedPlan<D>`. It cannot add storage,
-change mappings or choose another implementation. Invocation alias rules are derived from the
-resolved plan and exact backend-retained public ABI storage identities.
+Resolution accepts only feasible assignments. It evaluates solved
+expressions, allocates IDs, instantiates boundaries, substitutes
+offsets/geometry/opcodes, and recurses; it performs no ordinary legality
+check and cannot substitute a family-time or backend-time decision for a
+solver assignment. The resulting `ResolvedPlan` is self-contained: physical
+storage and scalar-slot references are resolved IDs, input scalar references
+carry final ABI byte offsets, result scalar destinations carry final result
+field IDs, and storage placement is a closed typed variant. No backend retains
+or replays the open family to reconstruct those identities.
 
 ## Native emission
 
-The compiler core recursively visits the resolved schedule and calls `encode_launch` exactly once
-for every resolved launch. The backend assembles the already-encoded hierarchy. Encoders may
-assign native names and instruction spellings, but cannot introduce algorithms, storage, copies,
-barriers, mappings or numerical transformations.
+The compiler core encodes each resolved launch exactly once and the backend
+assembles the already-encoded hierarchy. Encoders may assign native names and
+instruction spellings, but cannot introduce algorithms, allocation, geometry,
+synchronization, copies, or numerical transformations, and cannot reject a
+selected opcode. Emission failures are compiler defects, toolchain failures,
+or system failures — never a reason to retry another candidate.
 
-Metal emits MSL; CUDA emits PTX with the resolved launch bound; CPU emits Cranelift functions for
-resolved phases. Native artifacts preserve exact public ABI order and storage identities. Runtime
-execution binds that ABI and executes retained phase/launch order without reconstructing compiler
-decisions.
+Native compilation is not a planning oracle. Reflected native facts
+(telemetry and the selected bounded native-resource contract) evaluate
+resolved geometry; a fact outside its declared domain is a compiler defect.
 
-Native compilation is not a planning oracle. A JIT rejection or resource contradiction after
-resolution is a backend invariant defect, not a reason to retry another candidate.
+## ABI and invocation
 
-## Capabilities and precision
+The root ABI is created once from the entry interface and the canonical leaf
+traversal: dense tensor leaves have one typed buffer, packed leaves have
+registry-ordered planes, scalar and index inputs are typed fields, and input
+ranges are adjacent start/end fields. Tensor results are runtime-allocated by
+path and plane; scalar, index, and range results decode from a
+compiler-owned result scalar block. Internal arena and nested boundaries
+never appear in the ABI; capability values are forbidden.
 
-Hardware and driver observations form a target capability profile. Kernel authors require a
-backend capability through its intrinsic family; ordinary hardware/toolchain variation remains a
-backend concern. An alternative requiring an absent capability is inadmissible.
-
-Every selected instruction carries numerical effects. Approximate native operations therefore
-participate in whole-plan precision admissibility before resolution. Evidence is keyed to the
-complete logical identity, target/toolchain profile, assignment and precision method; evidence for
-one composition cannot justify another.
+Alias rules are retained in the root ABI (shared-read ranges may overlap;
+exclusive/owned ranges are disjoint from other live parameter ranges;
+results are distinct). The runtime validates them over actual byte ranges
+before submission. Invocation values or aliasing that violate the retained
+ABI are invocation errors, rejected before submission.
 
 ## Failure boundaries
 
-- Invalid types, ownership, effects or logical control are semantic failures.
-- Missing applicable implementations are coverage failures.
-- No complete target-legal schedule is planning infeasibility.
-- No assignment satisfying requested precision is numerical infeasibility.
-- A resolved plan or native artifact contradicting retained facts is a compiler defect.
-- Invocation values or aliasing that violate retained ABI are invocation errors.
+Production failures are one closed taxonomy:
 
-No failure silently changes backend, search strategy or precision policy.
+- invalid semantic program (diagnostics);
+- no applicable implementation (an exact capability signature is absent);
+- planning infeasible (the complete planning model has no valid assignment);
+- compiler bug (a retained invariant is contradicted);
+- toolchain failure; and
+- system failure.
+
+No failure silently changes backend, search effort, or precision policy.
 
 ## Invariants
 
-- Every active logical task, call, dependency and output is consumed exactly once.
-- Parallel work is visible only as logical domains plus explicit participant maps.
-- Ordered work cannot become parallel without a different semantic implementation.
-- Calls become nested resolved plans before emission; emitters never receive logical call bodies.
-- Storage, synchronization, resources and numerical effects belong to selected executable objects.
-- Solver selection resolves once; native emission never retries planning.
-- Backend encoders accept one resolved launch and cannot see an open plan family.
-- Runtime executes resolved native order and never infers ABI identity from names.
+- Every active logical node, call, dependency, obligation, and result is
+  consumed exactly once by the alternative that maps it.
+- Parallel work is visible only as logical domains plus explicit participant
+  maps; logical rank is not native grid rank.
+- Ordered work cannot become parallel without a different semantic
+  implementation.
+- Calls remain nested through resolution and emission; emitters never
+  receive logical call bodies.
+- Storage, synchronization, resources, and numerical effects belong to
+  selected executable objects; every aggregate is scalar SSA or planned
+  storage, and no implicit native local array exists.
+- Solver selection resolves once; native emission and runtime never retry
+  planning.
+- `PlanFamily` contains no assignment, default selection, placement, or
+  executable witness; every physical decision consumed by resolution comes
+  from the solver assignment.
+- Backend encoders accept one resolved launch and cannot see an open plan
+  family.
+- Native assembly accepts only the resolved plan; template-to-resolved replay
+  maps and family retention are forbidden.
+- Runtime executes resolved native order and never infers ABI identity from
+  names.

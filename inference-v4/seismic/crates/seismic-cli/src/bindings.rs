@@ -4,7 +4,7 @@ use seismic_lang::repr;
 use seismic_lang::sir::{Definition, Program};
 use seismic_lang::sym::Sym;
 use seismic_lang::types::Elem;
-use seismic_lang::types::{Extent, Ty};
+use seismic_lang::types::{ExtentExpr, ValueType};
 
 /// Any definition in a family can name the entry ABI because family construction checks
 /// every implementation against the same contract.
@@ -84,13 +84,18 @@ pub fn bindings(args: &[String]) -> Result<(), String> {
     for param in &f.params {
         let pname = &param.name;
         match &param.ty {
-            Ty::Tensor(s) => {
+            ValueType::Tensor(s) => {
                 let axes = s
                     .axes
                     .iter()
                     .map(|axis| match axis {
-                        Extent::Semantic(sym) => Ok(sym),
-                        Extent::Structural(_) => Err(format!("parameter `{pname}` has a structural extent; entry storage is semantic")),
+                        ExtentExpr::Sym(sym) => Ok(sym),
+                        ExtentExpr::Static(_) => Err(format!(
+                            "parameter `{pname}` has a static extent; entry storage is semantic"
+                        )),
+                        ExtentExpr::Runtime(_) => Err(format!(
+                            "parameter `{pname}` has a runtime-dependent extent; entry storage is semantic"
+                        )),
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let product = |skip: Option<usize>| {
@@ -145,9 +150,9 @@ pub fn bindings(args: &[String]) -> Result<(), String> {
                     }
                 }
             }
-            ty @ (Ty::Scalar(_) | Ty::Index(_)) => {
-                let integer =
-                    matches!(ty, Ty::Index(_)) || matches!(ty, Ty::Scalar(d) if d.is_int());
+            ty @ (ValueType::Scalar(_) | ValueType::Index { .. }) => {
+                let integer = matches!(ty, ValueType::Index { .. })
+                    || matches!(ty, ValueType::Scalar(d) if d.is_int());
                 out.push_str(&format!(
                     "    pub {pname}: {},\n",
                     if integer { "i64" } else { "f64" }

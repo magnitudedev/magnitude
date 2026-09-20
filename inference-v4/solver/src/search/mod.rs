@@ -5,7 +5,8 @@ mod knowledge;
 mod neighborhood;
 mod repair;
 mod structure;
-use crate::{Model, Outcome, Result, Solution};
+use crate::result::Budgeted;
+use crate::{FeasibleSolution, Model, Outcome, Result, Solution};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -58,6 +59,34 @@ impl Search {
             ),
         };
         Ok(Self { implementation })
+    }
+    /// Installs a validated feasible solution of this search's exact model as
+    /// the incumbent without restarting search. Returns whether it became the
+    /// new incumbent; a weaker assignment is retained but not installed.
+    pub fn install_incumbent(&mut self, incumbent: FeasibleSolution) -> Result<bool> {
+        match &mut self.implementation {
+            Implementation::Exact(search) => search.install_incumbent(incumbent),
+            Implementation::Neighborhood(search) => search.install_incumbent(incumbent),
+        }
+    }
+    /// Guides search with a preferred complete assignment of the model's
+    /// original domains. It is a search preference, never a feasibility claim.
+    pub fn prefer(&mut self, values: &[i64]) -> Result<()> {
+        match &mut self.implementation {
+            Implementation::Exact(search) => search.prefer(values),
+            Implementation::Neighborhood(search) => search.prefer(values),
+        }
+    }
+    /// One budgeted solve advance. The budget limits optimization only:
+    /// feasibility is decided first regardless of work and time, then the
+    /// remaining budget is spent improving the incumbent, which is returned
+    /// with an optimality flag. Work and time never suspend the search before
+    /// feasibility is decided.
+    pub fn advance_budgeted(&mut self, budget: Budget) -> Result<Budgeted> {
+        match &mut self.implementation {
+            Implementation::Exact(search) => search.advance_budgeted(budget),
+            Implementation::Neighborhood(search) => search.advance_budgeted(budget),
+        }
     }
     pub fn advance(&mut self, limits: Limits) -> Result<Outcome> {
         match &mut self.implementation {
@@ -123,6 +152,22 @@ impl Default for Limits {
             work: 100_000,
             time: None,
             memory_bytes: None,
+        }
+    }
+}
+/// Budget for one budgeted solve advance. It limits optimization only: the
+/// search decides feasibility first regardless of work and time, so there is
+/// no budgeted outcome without an incumbent except a memory or coverage
+/// suspension. The retained-memory cap also bounds the feasibility phase.
+#[derive(Clone, Debug)]
+pub struct Budget {
+    /// Limits spent only after a feasible incumbent exists.
+    pub optimization: Limits,
+}
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            optimization: Limits::default(),
         }
     }
 }

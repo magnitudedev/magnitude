@@ -19,21 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             value
         }
     };
-    // Likewise `--strategy exact|greedy`: how selection improves the seed (default exact).
-    let strategy = match args.iter().position(|a| a == "--strategy") {
-        None => seismic_runtime::Strategy::Exact,
-        Some(at) => {
-            let strategy = match args.get(at + 1).map(String::as_str) {
-                Some("exact") => seismic_runtime::Strategy::Exact,
-                Some("greedy") => seismic_runtime::Strategy::Greedy,
-                _ => return Err("--strategy requires exact or greedy".into()),
-            };
-            args.drain(at..at + 2);
-            strategy
-        }
-    };
     if args.len() != 6 && args.len() != 7 {
-        return Err("usage: qwen_baseline ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON [exact|unconstrained] [--device cpu|cuda|metal] [--strategy exact|greedy]".into());
+        return Err("usage: qwen_baseline ARTIFACT CONTEXT PROMPT_IDS CONTINUATION_IDS OUTPUT_JSON [exact|unconstrained] [--device cpu|cuda|metal]".into());
     }
     let precision = match args.get(6).map(String::as_str) {
         None | Some("exact") => seismic_lang::precision::PrecisionPolicy::Exact,
@@ -56,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let continuation = parse(&args[4])?;
     let settings = Settings {
         precision: precision.clone(),
-        strategy,
         ..Settings::default()
     };
     let result = (|| {
@@ -79,7 +65,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "device": device_name,
         "backend": target,
         "precision": format!("{precision:?}"),
-        "strategy": format!("{strategy:?}"),
         "budget": {"work": settings.budget.work, "seconds": settings.budget.time.map(|t| t.as_secs_f64())},
     });
     std::fs::write(&args[5], serde_json::to_vec_pretty(&record)?)?;

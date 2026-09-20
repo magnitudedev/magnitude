@@ -4,12 +4,12 @@
 //! complete authored library can be specialized for production geometries and
 //! target capability profiles without a device being present.
 
+use seismic_compiler::pipeline::Workload;
 use seismic_lang::{
-    family::{TargetEnvironment, Workload},
-    logical::{self, StorageOrigin, Type, ValueKind},
+    logical::{self, EffectiveTargetIdentity, RegionParameter, RegionResult},
     program::{compile, SourceFile},
     sir::IntrinsicUse,
-    types::{DType, Elem},
+    types::{DType, Elem, ValuePath, ValueType},
 };
 use std::collections::BTreeMap;
 
@@ -51,6 +51,58 @@ fn workload(shape_values: &[(&str, i64)], elem_values: &[(&str, Elem)]) -> Workl
 
 fn accept_all(_: &IntrinsicUse) -> Result<(), String> {
     Ok(())
+}
+
+fn construct<'a>(
+    program: &'a seismic_lang::sir::Program,
+    entry: &str,
+    target: &str,
+    fingerprint: &str,
+    supports: &dyn Fn(&IntrinsicUse) -> Result<(), String>,
+    workload: &Workload,
+) -> logical::LogicalProgram {
+    let identity = EffectiveTargetIdentity {
+        backend: target.to_string(),
+        capability_fingerprint: fingerprint.to_string(),
+    };
+    logical::construct(
+        program,
+        entry,
+        &identity,
+        supports,
+        workload.shapes.clone(),
+        workload.elems.clone(),
+    )
+    .unwrap_or_else(|error| panic!("{entry} for {target}: {error:?}"))
+}
+
+/// Tensor leaf paths of one value type, in canonical traversal order.
+fn tensor_leaf_paths(ty: &ValueType) -> Vec<ValuePath> {
+    fn walk(ty: &ValueType, prefix: &mut Vec<u32>, out: &mut Vec<ValuePath>) {
+        match ty {
+            ValueType::Tensor(_) => out.push(ValuePath(prefix.clone())),
+            ValueType::Tuple(children) => {
+                for (ordinal, child) in children.iter().enumerate() {
+                    prefix.push(ordinal as u32);
+                    walk(child, prefix, out);
+                    prefix.pop();
+                }
+            }
+            _ => (),
+        }
+    }
+    let mut out = Vec::new();
+    walk(ty, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The entry occurrence's task graph.
+fn entry_graph(logical: &logical::LogicalProgram) -> &logical::TaskGraph {
+    logical
+        .graphs
+        .iter()
+        .find(|graph| graph.choice == logical.entry_choice)
+        .expect("the entry choice has a task graph")
 }
 
 #[test]
@@ -128,28 +180,31 @@ fn active_qwen_corpus_specializes_at_production_geometry_for_every_target() {
 
     for target in ["cpu", "metal", "cuda"] {
         let fingerprint = format!("logical-corpus-{target}-v1");
-        let environment = TargetEnvironment {
-            target,
-            capability_fingerprint: &fingerprint,
-            supports_intrinsic: &accept_all,
-        };
-        for (entry, workload, expected_result_slots) in &cases {
-            let logical =
-                logical::specialize_entry_contract(&program, entry, &environment, workload)
-                    .unwrap_or_else(|error| panic!("{entry} for {target}: {error}"));
+        for (entry, workload, expected_result_leaves) in &cases {
+            let logical = construct(&program, entry, target, &fingerprint, &accept_all, workload);
             logical
                 .verify()
-                .unwrap_or_else(|error| panic!("{entry} for {target}: {error}"));
-            assert_eq!(logical.target, target);
+                .unwrap_or_else(|errors| panic!("{entry} for {target}: {errors:?}"));
+            assert_eq!(logical.target.backend, target);
+            let interface = logical.choice(logical.entry_choice).interface.clone();
+            let leaves = tensor_leaf_paths(&interface.result);
+            assert_eq!(leaves.len(), *expected_result_leaves, "{entry}");
+            let graph = entry_graph(&logical);
             assert_eq!(
-                logical.result_slots.len(),
-                *expected_result_slots,
-                "{entry}"
+                graph
+                    .results
+                    .iter()
+                    .filter(|result| matches!(
+                        result,
+                        RegionResult::Value {
+                            ty: ValueType::Tensor(_),
+                            ..
+                        }
+                    ))
+                    .count(),
+                leaves.len(),
+                "{entry}: every tensor result leaf is a published region result"
             );
-            assert!(logical.result_slots.iter().all(|slot| matches!(
-                &logical.storage[slot.storage.0 as usize].origin,
-                StorageOrigin::Result { path } if path == &slot.path
-            )));
         }
     }
 }
@@ -171,38 +226,52 @@ fn logical_abi_covers_scalar_range_and_nested_tuple_results() {
                 .join("\n")
         )
     });
-    let environment = TargetEnvironment {
-        target: "cpu",
-        capability_fingerprint: "logical-corpus-boundaries-v1",
-        supports_intrinsic: &accept_all,
-    };
     let workload = workload(&[("N", 8)], &[]);
 
-    let scalar =
-        logical::specialize_entry_contract(&program, "scalar_result", &environment, &workload)
-            .expect("scalar result specialization");
-    assert!(scalar.result_slots.is_empty());
-    assert_eq!(
-        scalar.choices[0].interface.results,
-        [Type::Scalar(DType::F32)]
+    let scalar = construct(
+        &program,
+        "scalar_result",
+        "cpu",
+        "logical-corpus-boundaries-v1",
+        &accept_all,
+        &workload,
     );
+    let interface = scalar.choice(scalar.entry_choice).interface.clone();
+    assert_eq!(interface.result, ValueType::Scalar(DType::F32));
+    assert!(tensor_leaf_paths(&interface.result).is_empty());
 
-    let range =
-        logical::specialize_entry_contract(&program, "range_input", &environment, &workload)
-            .expect("range input specialization");
-    assert!(range
-        .values
+    let range = construct(
+        &program,
+        "range_input",
+        "cpu",
+        "logical-corpus-boundaries-v1",
+        &accept_all,
+        &workload,
+    );
+    assert!(entry_graph(&range)
+        .parameters
         .iter()
-        .any(|value| matches!(value.kind, ValueKind::RangeParameter { ordinal: 0, .. })));
+        .any(|parameter| matches!(
+            parameter,
+            RegionParameter::Value {
+                ty: ValueType::Range { .. },
+                ..
+            }
+        )));
 
-    let nested =
-        logical::specialize_entry_contract(&program, "nested_results", &environment, &workload)
-            .expect("nested tuple specialization");
+    let nested = construct(
+        &program,
+        "nested_results",
+        "cpu",
+        "logical-corpus-boundaries-v1",
+        &accept_all,
+        &workload,
+    );
+    let interface = nested.choice(nested.entry_choice).interface.clone();
     assert_eq!(
-        nested
-            .result_slots
+        tensor_leaf_paths(&interface.result)
             .iter()
-            .map(|slot| slot.path.clone())
+            .map(|path| path.0.clone())
             .collect::<Vec<_>>(),
         [vec![0], vec![1, 0], vec![1, 1]]
     );
@@ -219,18 +288,22 @@ fn unavailable_capability_removes_only_the_dependent_implementation() {
         ],
     );
 
-    let supported_environment = TargetEnvironment {
-        target: "metal",
-        capability_fingerprint: "metal-matrix-supported-v1",
-        supports_intrinsic: &accept_all,
-    };
-    let supported =
-        logical::specialize_entry_contract(&program, "matmul", &supported_environment, &workload)
-            .expect("matmul with matrix capability");
-    assert!(supported.choices[0]
+    let supported = construct(
+        &program,
+        "matmul",
+        "metal",
+        "metal-matrix-supported-v1",
+        &accept_all,
+        &workload,
+    );
+    assert!(supported
+        .choice(supported.entry_choice)
         .alternatives
         .iter()
-        .any(|alternative| { alternative.capabilities.contains("metal.matrix") }));
+        .any(|alternative| alternative
+            .required_capabilities
+            .iter()
+            .any(|capability| capability.path() == "metal.matrix")));
 
     let reject_matrix = |used: &IntrinsicUse| {
         if used.id.capability.path() == "metal.matrix" {
@@ -239,18 +312,25 @@ fn unavailable_capability_removes_only_the_dependent_implementation() {
             Ok(())
         }
     };
-    let unsupported_environment = TargetEnvironment {
-        target: "metal",
-        capability_fingerprint: "metal-matrix-unavailable-v1",
-        supports_intrinsic: &reject_matrix,
-    };
-    let unsupported =
-        logical::specialize_entry_contract(&program, "matmul", &unsupported_environment, &workload)
-            .expect("portable matmul remains applicable");
+    let unsupported = construct(
+        &program,
+        "matmul",
+        "metal",
+        "metal-matrix-unavailable-v1",
+        &reject_matrix,
+        &workload,
+    );
 
-    assert!(unsupported.choices[0]
+    assert!(unsupported
+        .choice(unsupported.entry_choice)
         .alternatives
         .iter()
-        .all(|alternative| alternative.capabilities.is_empty()));
-    assert!(unsupported.choices[0].alternatives.len() < supported.choices[0].alternatives.len());
+        .all(|alternative| alternative.required_capabilities.is_empty()));
+    assert!(
+        unsupported
+            .choice(unsupported.entry_choice)
+            .alternatives
+            .len()
+            < supported.choice(supported.entry_choice).alternatives.len()
+    );
 }

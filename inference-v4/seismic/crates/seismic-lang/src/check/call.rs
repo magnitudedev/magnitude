@@ -1,33 +1,35 @@
-//! Calls: casts, toolchain operations, target intrinsics, and calls of contract families
-//! with one candidate binding per definition that unifies with the arguments.
+//! Calls: casts, toolchain operations, capability intrinsics, and calls of
+//! contract families with one candidate binding per definition that unifies
+//! with the arguments.
 
-use super::resolve::{ParamOwnership, Sig};
-use super::Checker;
-use crate::intrinsics::{self, Intrinsic, IntrinsicParam, IntrinsicResult, Operation, Semantics};
-use crate::sir::Mode;
+use super::resolve::Sig;
+use super::{Checker, LocalKind, ValueClass};
+use crate::intrinsics::{
+    self, primitive, reduction_result, CapabilitySignature, MathOp, PrimitiveId,
+};
+use crate::sir::ParamOwnership;
 use crate::sir::{
-    self, CallId, CallSite, CandidateBinding, DefId, DefKind, Expr, ExprKind, Math, ReduceOp,
-    VarId, VarKind,
+    CandidateBinding, CheckedCall, CheckedExpr, CheckedExprKind, DefId, DefKind, LocalId,
 };
 use crate::span::Span;
 use crate::sym::{Atom, Sym};
-use crate::syntax::ast::{self, BinaryOp, ExprKind as A};
-use crate::types::{DType, Elem, Extent, NativeTy, Shaped, Ty};
+use crate::syntax::ast::{self, ExprKind as A};
+use crate::types::{DType, Elem, ExtentExpr, TensorType, ValueType};
 use std::collections::HashMap;
 
-fn math_of(name: &str) -> Option<(Math, usize)> {
+fn math_of(name: &str) -> Option<(MathOp, usize)> {
     Some(match name {
-        "fma" => (Math::Fma, 3),
-        "exp" => (Math::Exp, 1),
-        "exp_fast" => (Math::ExpFast, 1),
-        "rsqrt" => (Math::Rsqrt, 1),
-        "sqrt" => (Math::Sqrt, 1),
-        "log" => (Math::Log, 1),
-        "sin" => (Math::Sin, 1),
-        "cos" => (Math::Cos, 1),
-        "abs" => (Math::Abs, 1),
-        "max" => (Math::Max, 2),
-        "min" => (Math::Min, 2),
+        "fma" => (MathOp::Fma, 3),
+        "exp" => (MathOp::Exp, 1),
+        "exp_fast" => (MathOp::ExpFast, 1),
+        "rsqrt" => (MathOp::Rsqrt, 1),
+        "sqrt" => (MathOp::Sqrt, 1),
+        "log" => (MathOp::Log, 1),
+        "sin" => (MathOp::Sin, 1),
+        "cos" => (MathOp::Cos, 1),
+        "abs" => (MathOp::Abs, 1),
+        "max" => (MathOp::Max, 2),
+        "min" => (MathOp::Min, 2),
         _ => return None,
     })
 }
@@ -63,7 +65,7 @@ fn substitute_all(s: &Sym, env: &dyn Fn(&str) -> Option<Sym>) -> Sym {
 /// Shape and element arguments of one candidate under construction.
 #[derive(Default)]
 struct Binding {
-    shapes: HashMap<String, Extent>,
+    shapes: HashMap<String, Sym>,
     elems: HashMap<String, Elem>,
     /// Caller element parameters this candidate requires to be a concrete element.
     requires: Vec<(String, Elem)>,
@@ -75,9 +77,9 @@ impl<'a> Checker<'a> {
         callee: &ast::Expr,
         bindings: &[(ast::Ident, ast::Expr)],
         args: &[ast::Arg],
-        expected: Option<&Ty>,
+        expected: Option<&ValueType>,
         span: Span,
-    ) -> Option<Expr> {
+    ) -> Option<CheckedExpr> {
         let name = match &callee.kind {
             A::Name(name) => name,
             A::Attr { base, name } => {
@@ -169,63 +171,106 @@ impl<'a> Checker<'a> {
             ok
         };
         match name.name.as_str() {
-            "to_owned" | "clone" => {
+            "to_owned" => {
                 if !positional(self, 1) {
                     return None;
                 }
                 let value = self.expr(&args[0].value, None)?;
-                let shape = match (&value.ty, name.name.as_str()) {
-                    (Ty::View(shape), "to_owned") => shape.clone(),
-                    (Ty::Tile(shape), "to_owned") => shape.clone(),
-                    (Ty::Tensor(shape), "clone") => shape.clone(),
-                    (found, "to_owned") => {
-                        self.error(
-                            value.span,
-                            format!("`to_owned` materializes a borrowed or computed tensor value, found {found}"),
-                        );
-                        return None;
-                    }
-                    (found, _) => {
-                        self.error(
-                            value.span,
-                            format!("`clone` duplicates an owned tensor, found {found}"),
-                        );
-                        return None;
-                    }
-                };
-                // Temporary bridge: `Load` already denotes a deep snapshot, while
-                // the logical result is recorded as owned tensor storage.
-                Some(Expr {
-                    partial: value.partial,
-                    kind: ExprKind::Load(Box::new(value)),
-                    ty: Ty::Tensor(shape),
-                    sym: None,
+                // Ownership conversion is idempotent. An already-owned value
+                // needs neither a diagnostic nor a second allocation.
+                if matches!(self.class_of(&value), ValueClass::Owned) {
+                    return Some(value);
+                }
+                if !matches!(
+                    self.class_of(&value),
+                    ValueClass::Borrowed | ValueClass::Computed
+                ) {
+                    self.error(
+                        value.span,
+                        format!(
+                            "`to_owned` materializes a borrowed or computed tensor value, found {}",
+                            value.ty
+                        ),
+                    );
+                    return None;
+                }
+                if !primitive(PrimitiveId::Materialize).accepts(&[value.ty.clone()]) {
+                    self.error(
+                        value.span,
+                        format!("`to_owned` is not defined on {}", value.ty),
+                    );
+                    return None;
+                }
+                let ty = value.ty.clone();
+                Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: PrimitiveId::Materialize,
+                        operands: vec![value],
+                    },
+                    ty,
+                    None,
                     span,
-                })
+                ))
+            }
+            "clone" => {
+                if !positional(self, 1) {
+                    return None;
+                }
+                let value = self.expr(&args[0].value, None)?;
+                if !matches!(self.class_of(&value), ValueClass::Owned) {
+                    self.error(
+                        value.span,
+                        format!("`clone` duplicates an owned tensor, found {}", value.ty),
+                    );
+                    return None;
+                }
+                if !primitive(PrimitiveId::Clone).accepts(&[value.ty.clone()]) {
+                    self.error(
+                        value.span,
+                        format!("`clone` is not defined on {}", value.ty),
+                    );
+                    return None;
+                }
+                let ty = value.ty.clone();
+                Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: PrimitiveId::Clone,
+                        operands: vec![value],
+                    },
+                    ty,
+                    None,
+                    span,
+                ))
             }
             "load" => {
                 if !positional(self, 1) {
                     return None;
                 }
                 let v = self.expr(&args[0].value, None)?;
-                let (Ty::Tensor(s) | Ty::View(s)) = &v.ty else {
+                if !matches!(self.class_of(&v), ValueClass::Borrowed | ValueClass::Owned) {
                     self.error(
                         v.span,
                         format!(
-                            "`load` snapshots a view in its own representation, found {}",
+                            "`load` snapshots borrowed or owned storage in its own representation, found {}",
                             v.ty
                         ),
                     );
                     return None;
-                };
-                let ty = Ty::Tile(s.clone());
-                Some(Expr {
-                    partial: v.partial,
-                    kind: ExprKind::Load(Box::new(v)),
+                }
+                if !primitive(PrimitiveId::Load).accepts(&[v.ty.clone()]) {
+                    self.error(v.span, format!("`load` is not defined on {}", v.ty));
+                    return None;
+                }
+                let ty = v.ty.clone();
+                Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: PrimitiveId::Load,
+                        operands: vec![v],
+                    },
                     ty,
-                    sym: None,
+                    None,
                     span,
-                })
+                ))
             }
             "decode" => {
                 if !positional(self, 1) {
@@ -233,17 +278,20 @@ impl<'a> Checker<'a> {
                 }
                 let v = self.expr(&args[0].value, None)?;
                 let Some(s) = v.ty.shaped().filter(|s| !matches!(s.elem, Elem::Dtype(_))) else {
-                    self.error(v.span, format!("`decode` produces the dense `f32` tile of a packed view, found {}; convert dense values with a cast", v.ty));
+                    self.error(v.span, format!("`decode` produces the dense `f32` value of a packed view, found {}; convert dense values with a cast", v.ty));
                     return None;
                 };
-                let ty = Ty::Tile(Shaped::new(s.axes.clone(), Elem::Dtype(DType::F32)));
-                Some(Expr {
-                    partial: v.partial,
-                    kind: ExprKind::Decode(Box::new(v)),
+                let ty =
+                    ValueType::Tensor(TensorType::new(s.axes.clone(), Elem::Dtype(DType::F32)));
+                Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: PrimitiveId::Decode,
+                        operands: vec![v],
+                    },
                     ty,
-                    sym: None,
+                    None,
                     span,
-                })
+                ))
             }
             "zeros_like" | "ones_like" => {
                 let (Some(like), dtype) = (args.first().filter(|a| a.name.is_none()), args.get(1))
@@ -294,18 +342,18 @@ impl<'a> Checker<'a> {
                     self.error(span, "the second argument is `dtype=<dtype name>`");
                     return None;
                 };
-                let ty = Ty::Tile(Shaped::new(s.axes, Elem::Dtype(dtype)));
+                let ty = ValueType::Tensor(TensorType::new(s.axes, Elem::Dtype(dtype)));
                 let value = if name.name == "zeros_like" { 0.0 } else { 1.0 };
-                Some(Expr {
-                    kind: ExprKind::Filled {
-                        like: Box::new(like),
-                        value,
+                let id = PrimitiveId::Fill { value, dtype };
+                Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id,
+                        operands: vec![like],
                     },
                     ty,
-                    sym: None,
-                    partial: false,
+                    None,
                     span,
-                })
+                ))
             }
             "select" => {
                 if !positional(self, 3) {
@@ -314,7 +362,7 @@ impl<'a> Checker<'a> {
                 let cond = self.expr(&args[0].value, None)?;
                 let then = self.expr(&args[1].value, expected)?;
                 let els = self.expr(&args[2].value, Some(&then.ty))?;
-                let (shape, dtypes) = self.broadcast(&[&cond, &then, &els], "`select`", span)?;
+                let (axes, dtypes) = self.broadcast(&[&cond, &then, &els], "`select`", span)?;
                 if dtypes[0] != DType::Bool {
                     self.error(
                         cond.span,
@@ -325,7 +373,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                let Some(dtype) = DType::promote(dtypes[1], dtypes[2]) else {
+                if DType::promote(dtypes[1], dtypes[2]).is_none() {
                     self.error(
                         span,
                         format!(
@@ -335,19 +383,8 @@ impl<'a> Checker<'a> {
                         ),
                     );
                     return None;
-                };
-                let ty = self.elementwise(shape, dtype);
-                Some(Expr {
-                    kind: ExprKind::Select {
-                        cond: Box::new(cond),
-                        then: Box::new(then),
-                        els: Box::new(els),
-                    },
-                    ty,
-                    sym: None,
-                    partial: false,
-                    span,
-                })
+                }
+                self.elementwise_primitive(PrimitiveId::Select, vec![cond, then, els], axes, span)
             }
             "reduce" => {
                 let unordered = match args.get(3) {
@@ -376,12 +413,11 @@ impl<'a> Checker<'a> {
                 }
                 self.reshape(args, span)
             }
-            "extent" | "capacity" | "valid" => {
+            "extent" | "valid" => {
                 if !positional(self, 2) {
                     return None;
                 }
-                let geometry = name.name != "extent";
-                if geometry && !self.target_form(span, &format!("`{}`", name.name), None) {
+                if name.name == "valid" && !self.target_form(span, "`valid`", None) {
                     return None;
                 }
                 let base = self.expr_inner(&args[0].value, None, true)?;
@@ -396,135 +432,41 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let axis = self.constant_axis(&args[1].value, s.rank())?;
-                let sym = match (&s.axes[axis], geometry) {
-                    (Extent::Semantic(sym), false) => {
-                        self.numeric_use(sym);
-                        sym.clone()
-                    }
-                    (Extent::Semantic(sym), true) => sym.clone(),
-                    (Extent::Structural(slice), false) => {
-                        let binder = self.slice_name(*slice);
-                        self.error(span, format!("axis {axis} is structural (the width of slice `{binder}`): a structural extent is never a number in portable code, directly or through a generic helper"));
-                        return None;
-                    }
-                    (Extent::Structural(slice), true) => {
-                        let capacity = Atom::Param(format!("@capacity#{}", slice.0));
-                        self.facts
-                            .set_range_lower(capacity.clone(), Sym::constant(1));
-                        if name.name == "capacity" {
-                            Sym::atom(capacity)
-                        } else {
-                            let valid = Atom::Param(format!("@valid#{}", slice.0));
-                            self.facts.set_range(
-                                valid.clone(),
-                                Sym::constant(1),
-                                Sym::atom(capacity),
-                            );
-                            Sym::atom(valid)
-                        }
-                    }
+                let Some(sym) = s.axes[axis].sym().cloned() else {
+                    self.error(span, "axis extents are symbolic at checked scope");
+                    return None;
                 };
-                let kind = if geometry {
-                    ExprKind::Geometry {
-                        base: Box::new(base),
-                        axis,
-                        valid: name.name == "valid",
-                    }
+                self.numeric_use(&sym);
+                let id = if name.name == "extent" {
+                    PrimitiveId::Extent { axis }
                 } else {
-                    ExprKind::ExtentOf {
-                        base: Box::new(base),
-                        axis,
-                    }
+                    PrimitiveId::ValidExtent { axis }
                 };
-                Some(self.scalar(kind, DType::I32, Some(sym), span))
+                Some(self.scalar_expr(
+                    CheckedExprKind::Primitive {
+                        id,
+                        operands: vec![base],
+                    },
+                    DType::I32,
+                    Some(sym),
+                    span,
+                ))
+            }
+            "capacity" => {
+                self.error(
+                    span,
+                    "`capacity` was removed: capacity is a planning resource bound, never a source value",
+                );
+                None
             }
             "coord" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let var = match &args[0].value.kind {
-                    A::Name(n) => self
-                        .lookup(&n.name)
-                        .filter(|id| self.vars[*id].kind == VarKind::Coordinate),
-                    _ => None,
-                };
-                let Some(var) = var else {
-                    self.error(
-                        span,
-                        "`coord(i)` takes a tile coordinate bound by `owned` or `axis`",
-                    );
-                    return None;
-                };
-                // Over an axis that a caller may bind structurally the coordinate is a member of
-                // the caller's domain, not of `0..P`: it carries no bounds facts.
-                let generic = matches!(&self.vars[var].ty, Ty::Index(bound) if single_param(bound).is_some_and(|p| self.sig.shape_params.contains(&p)));
-                let sym = if generic {
-                    None
-                } else {
-                    self.atoms.get(&var).map(|a| Sym::atom(a.clone()))
-                };
-                Some(self.scalar(ExprKind::CoordOf(var), DType::I32, sym, span))
-            }
-            "atomic" => {
-                if !positional(self, 3) || !self.target_form(span, "`atomic`", None) {
-                    return None;
-                }
-                let op = match &args[0].value.kind {
-                    A::Name(n) if n.name == "add" => BinaryOp::Add,
-                    A::Name(n) if matches!(n.name.as_str(), "max" | "min") => {
-                        self.error(n.span, format!("`atomic({}, …)` has no structured IR form; only `atomic(add, place, value)` is representable", n.name));
-                        return None;
-                    }
-                    _ => {
-                        self.error(args[0].value.span, "`atomic` needs an operation name: add");
-                        return None;
-                    }
-                };
-                let place = self.place(&args[1].value)?;
-                let Ty::Scalar(dtype) = place.ty else {
-                    self.error(
-                        place.span,
-                        format!("the `atomic` place selects one element, found {}", place.ty),
-                    );
-                    return None;
-                };
-                let value = self.expr(&args[2].value, Some(&Ty::Scalar(dtype)))?;
-                if value.ty.scalar_dtype() != Some(dtype) {
-                    self.error(
-                        value.span,
-                        format!(
-                            "the `atomic` value must be {}, found {}",
-                            dtype.name(),
-                            value.ty
-                        ),
-                    );
-                    return None;
-                }
-                self.forbid_partial(&value, "an atomic update");
-                let root = self.root_var(&place)?;
-                if !matches!(self.vars[root].kind, VarKind::Param(i) if self.sig.params[i].mode != Mode::In)
-                    && self.vars[root].kind != VarKind::State
-                {
-                    self.error(
-                        place.span,
-                        "an `atomic` place is an `out`/`inout` parameter or local state",
-                    );
-                    return None;
-                }
-                self.published.insert(root);
-                self.mutated.push(root);
-                Some(Expr {
-                    kind: ExprKind::Atomic {
-                        op,
-                        place: Box::new(place),
-                        value: Box::new(value),
-                    },
-                    ty: Ty::Void,
-                    sym: None,
-                    partial: false,
+                self.error(
                     span,
-                })
+                    "`coord(i)` was removed with tile coordinates; iterate a bounded range",
+                );
+                None
             }
+            "atomic" => self.atomic(args, span),
             "owned" | "axis" | "lanes" => {
                 self.error(
                     span,
@@ -533,7 +475,7 @@ impl<'a> Checker<'a> {
                 None
             }
             "full" => {
-                self.error(span, "`full(X)` is a `where` predicate");
+                self.error(span, "`full(X)` was removed with structural slices");
                 None
             }
             _ => self.user_call(name, bindings, args, span),
@@ -553,13 +495,13 @@ impl<'a> Checker<'a> {
 
     fn math(
         &mut self,
-        op: Math,
+        op: MathOp,
         arity: usize,
         name: &str,
         args: &[ast::Arg],
-        expected: Option<&Ty>,
+        expected: Option<&ValueType>,
         span: Span,
-    ) -> Option<Expr> {
+    ) -> Option<CheckedExpr> {
         if args.len() != arity || args.iter().any(|a| a.name.is_some()) {
             self.error(
                 span,
@@ -567,12 +509,12 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let float_only = !matches!(op, Math::Max | Math::Min | Math::Abs);
-        let default = Ty::Scalar(DType::F32);
-        let mut hint: Option<Ty> = expected
+        let float_only = !op.numeric_operands();
+        let default = ValueType::Scalar(DType::F32);
+        let mut hint: Option<ValueType> = expected
             .cloned()
             .or_else(|| float_only.then(|| default.clone()));
-        let mut out: Vec<Expr> = Vec::new();
+        let mut out: Vec<CheckedExpr> = Vec::new();
         for arg in args {
             let e = self.expr(&arg.value, hint.as_ref())?;
             if out.is_empty() || matches!(args[0].value.kind, A::Int(_) | A::Float(_)) {
@@ -584,8 +526,8 @@ impl<'a> Checker<'a> {
         if out.len() > 1 && matches!(args[0].value.kind, A::Int(_) | A::Float(_)) {
             out[0] = self.expr(&args[0].value, Some(&out[1].ty.clone()))?;
         }
-        let operands: Vec<&Expr> = out.iter().collect();
-        let (shape, dtypes) = self.broadcast(&operands, &format!("`{name}`"), span)?;
+        let operands: Vec<&CheckedExpr> = out.iter().collect();
+        let (axes, dtypes) = self.broadcast(&operands, &format!("`{name}`"), span)?;
         let mut dtype = dtypes[0];
         for d in &dtypes[1..] {
             match DType::promote(dtype, *d) {
@@ -618,55 +560,23 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let ty = self.elementwise(shape, dtype);
-        Some(Expr {
-            kind: ExprKind::Math { op, args: out },
-            ty,
-            sym: None,
-            partial: false,
-            span,
-        })
+        self.elementwise_primitive(PrimitiveId::Math(op), out, axes, span)
     }
 
-    /// Build `max`/`min` from checked operands (state accumulation).
-    pub fn math_exprs(&mut self, op: Math, l: Expr, r: Expr, span: Span) -> Option<Expr> {
-        let (shape, dtypes) = self.broadcast(&[&l, &r], "`max`/`min`", span)?;
-        let Some(dtype) = DType::promote(dtypes[0], dtypes[1]).filter(|d| d.is_numeric()) else {
-            self.error(
-                span,
-                format!(
-                    "`max`/`min` between {} and {} needs an explicit cast",
-                    dtypes[0].name(),
-                    dtypes[1].name()
-                ),
-            );
-            return None;
-        };
-        let ty = self.elementwise(shape, dtype);
-        Some(Expr {
-            kind: ExprKind::Math {
-                op,
-                args: vec![l, r],
-            },
-            ty,
-            sym: None,
-            partial: false,
-            span,
-        })
-    }
-
-    fn reduce(&mut self, args: &[ast::Arg], unordered: bool, span: Span) -> Option<Expr> {
+    fn reduce(&mut self, args: &[ast::Arg], unordered: bool, span: Span) -> Option<CheckedExpr> {
         let t = self.expr(&args[0].value, None)?;
-        let Ty::Tile(s) = &t.ty else {
+        let Some(s) = t.ty.shaped() else {
             self.error(
                 t.span,
                 format!(
-                    "`reduce` reduces a dense tile, found {}; read views with `load` or a cast",
+                    "`reduce` reduces a dense tile value, found {}; read storage with `load` or a cast",
                     t.ty
                 ),
             );
             return None;
         };
+        // Storage realization is not part of reduction syntax. Logical
+        // normalization materializes a computed value when it has no view.
         let Some(dtype) = (match &s.elem {
             Elem::Dtype(d) => Some(*d),
             Elem::Param(_) => Some(DType::F32),
@@ -681,10 +591,10 @@ impl<'a> Checker<'a> {
         let axis = self.constant_axis(&args[1].value, s.rank())?;
         let op = match &args[2].value.kind {
             A::Name(n) => match n.name.as_str() {
-                "sum" => Some(ReduceOp::Sum),
-                "max" => Some(ReduceOp::Max),
-                "min" => Some(ReduceOp::Min),
-                "argmax" => Some(ReduceOp::Argmax),
+                "sum" => Some(intrinsics::ReduceOp::Sum),
+                "max" => Some(intrinsics::ReduceOp::Max),
+                "min" => Some(intrinsics::ReduceOp::Min),
+                "argmax" => Some(intrinsics::ReduceOp::Argmax),
                 _ => None,
             },
             _ => None,
@@ -696,49 +606,41 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        if unordered && op == ReduceOp::Argmax {
+        if unordered && op == intrinsics::ReduceOp::Argmax {
             self.error(span, "`argmax` has one defined winner (ties go to the smaller index) and never accepts `unordered`");
             return None;
         }
-        self.forbid_partial(&t, "a reduction operand");
-        // Over a structural axis the value is one aggregate per tuned piece.
-        let partial = match &s.axes[axis] {
-            Extent::Structural(_) => true,
-            Extent::Semantic(extent) => {
-                if let Some(p) = single_param(extent).filter(|p| self.sig.shape_params.contains(p))
-                {
-                    self.summary.reduces.insert(p);
-                }
-                false
+        if let Some(ExtentExpr::Sym(extent)) = s.axes.get(axis) {
+            if let Some(p) = single_param(extent).filter(|p| self.sig.shape_params.contains(p)) {
+                self.summary.reduces.insert(p);
             }
+        }
+        let _ = dtype;
+        let id = PrimitiveId::Reduce {
+            op,
+            axis,
+            unordered,
         };
-        let elem = if op == ReduceOp::Argmax {
-            DType::I32
-        } else {
-            dtype
-        };
-        let mut axes = s.axes.clone();
-        axes.remove(axis);
-        let ty = if axes.is_empty() {
-            Ty::Scalar(elem)
-        } else {
-            Ty::Tile(Shaped::new(axes, Elem::Dtype(elem)))
-        };
-        Some(Expr {
-            kind: ExprKind::Reduce {
-                value: Box::new(t),
-                axis,
-                op,
-                unordered,
+        let ty = reduction_result(&t.ty, op, axis)
+            .ok_or_else(|| {
+                self.error(
+                    t.span,
+                    "`reduce` reduces a dense tile; decode packed values first",
+                );
+            })
+            .ok()?;
+        Some(CheckedExpr::new(
+            CheckedExprKind::Primitive {
+                id,
+                operands: vec![t],
             },
             ty,
-            sym: None,
-            partial,
+            None,
             span,
-        })
+        ))
     }
 
-    fn reshape(&mut self, args: &[ast::Arg], span: Span) -> Option<Expr> {
+    fn reshape(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
         let base = self.expr_inner(&args[0].value, None, true)?;
         let Some(s) = base.ty.shaped().cloned() else {
             self.error(
@@ -760,47 +662,211 @@ impl<'a> Checker<'a> {
         };
         let mut source = Sym::constant(1);
         for axis in &s.axes {
-            let Extent::Semantic(extent) = axis else {
-                self.error(span, "`reshape` cannot expose a product of structural extents or erase a partition identity; every source axis must be semantic");
-                return None;
+            // A static extent is the degenerate symbolic product: a constant.
+            let extent = match axis {
+                ExtentExpr::Static(value) => Sym::constant(*value as i64),
+                ExtentExpr::Sym(extent) => extent.clone(),
+                ExtentExpr::Runtime(_) => {
+                    self.error(span, "`reshape` needs symbolic source extents");
+                    return None;
+                }
             };
-            source = source.mul(extent);
+            source = source.mul(&extent);
         }
         let mut axes = Vec::new();
+        let mut operands = vec![base];
         let mut target = Sym::constant(1);
         for dimension in dimensions {
-            let d = self.expr(dimension, Some(&Ty::Scalar(DType::I32)))?;
+            let d = self.expr(dimension, Some(&ValueType::Scalar(DType::I32)))?;
             let Some(extent) = d.sym.clone() else {
                 self.error(d.span, "`reshape` extents are symbolic integer expressions");
                 return None;
             };
             self.require_nonneg(&extent, d.span, "reshape extent may be negative");
+            self.numeric_use(&extent);
             target = target.mul(&extent);
-            axes.push(Extent::Semantic(extent));
+            axes.push(crate::sir::sym_extent(extent));
+            operands.push(d);
         }
         if axes.is_empty() || !self.prover().zero(&target.sub(&source)) {
             self.error(span, format!("`reshape` must provably preserve element correspondence: `{source}` elements into `{target}`"));
             return None;
         }
-        let shaped = Shaped::new(axes.clone(), s.elem);
-        let ty = if matches!(base.ty, Ty::Tensor(_)) {
-            Ty::Tensor(shaped)
-        } else {
-            Ty::View(shaped)
-        };
-        Some(Expr {
-            partial: base.partial,
-            kind: ExprKind::Reshape {
-                base: Box::new(base),
-                axes,
+        let shaped = TensorType::new(axes, s.elem);
+        let ty = ValueType::Tensor(shaped);
+        Some(CheckedExpr::new(
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Reshape,
+                operands,
             },
             ty,
-            sym: None,
+            None,
             span,
-        })
+        ))
     }
 
-    // ---- target intrinsics ----
+    /// `atomic(add|max|min, place, value)`: one registry primitive with an
+    /// atomic effect, portable in every body. Defined for f32/f16/bf16/i32/u32
+    /// elements; bool is rejected because bool arithmetic is undefined, and
+    /// packed planes are not writable.
+    fn atomic(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        if !positional_3(args) {
+            self.error(
+                span,
+                "`atomic(op, place, value)` takes three positional arguments",
+            );
+            return None;
+        }
+        let op = match &args[0].value.kind {
+            A::Name(n) => match intrinsics::AtomicOp::parse(&n.name) {
+                Some(op) => op,
+                None => {
+                    self.error(
+                        n.span,
+                        format!("`atomic({}, …)`: the operation is add, max or min", n.name),
+                    );
+                    return None;
+                }
+            },
+            _ => {
+                self.error(
+                    args[0].value.span,
+                    "`atomic` needs an operation name: add, max or min",
+                );
+                return None;
+            }
+        };
+        let (root, indices, selected) = match &args[1].value.kind {
+            A::Name(name) => {
+                let Some(id) = self.lookup(&name.name) else {
+                    self.error(name.span, format!("`{}` is not declared", name.name));
+                    return None;
+                };
+                (id, Vec::new(), self.locals[id].ty.clone())
+            }
+            A::Index { .. } => self.place(&args[1].value)?,
+            _ => {
+                self.error(
+                    args[1].value.span,
+                    "the `atomic` place is a tensor element: `atomic(add, t[i], v)`",
+                );
+                return None;
+            }
+        };
+        let ValueType::Scalar(dtype) = selected else {
+            self.error(
+                args[1].value.span,
+                format!("the `atomic` place selects one element, found {}", selected),
+            );
+            return None;
+        };
+        if !intrinsics::atomic_dtype(dtype) {
+            self.error(
+                span,
+                format!(
+                    "`atomic(add, …)` is defined for f32, f16, bf16, i32 and u32 elements, not {}",
+                    dtype.name()
+                ),
+            );
+            return None;
+        }
+        // Packed planes are readable but not writable.
+        if let Some(shaped) = self.locals[root].ty.shaped() {
+            if matches!(shaped.elem, Elem::Repr(_)) {
+                self.error(
+                    span,
+                    "packed representations are readable and decodable but not writable",
+                );
+                return None;
+            }
+        }
+        let value = self.expr(&args[2].value, Some(&ValueType::Scalar(dtype)))?;
+        if value.ty.scalar_dtype() != Some(dtype) {
+            self.error(
+                value.span,
+                format!(
+                    "the `atomic` value must be {}, found {}",
+                    dtype.name(),
+                    value.ty
+                ),
+            );
+            return None;
+        }
+        let binding = match &args[1].value.kind {
+            A::Name(name) => self.lookup(&name.name),
+            A::Index { base, .. } => match &base.kind {
+                A::Name(name) => self.lookup(&name.name),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(binding) = binding else {
+            self.error(span, "the `atomic` place does not name a binding");
+            return None;
+        };
+        if !self.writable_root(self.root_var_local(binding)) && !self.writable_root(root) {
+            self.error(
+                span,
+                "an `atomic` place is a `&mut tensor` parameter or local `let mut` state",
+            );
+            return None;
+        }
+        if self
+            .borrows
+            .iter()
+            .any(|(borrow, (borrowed, _))| *borrowed == root && *borrow != binding)
+        {
+            self.error(
+                span,
+                format!(
+                    "cannot update `{}` atomically while a tensor borrow is live",
+                    self.locals[root].name
+                ),
+            );
+            return None;
+        }
+        // Atomics are the one admitted cross-visit update of an independent
+        // loop; record them for the mutation summary.
+        let storage_root = self.root_var_local(binding);
+        for ctx in self.loops.iter_mut() {
+            if storage_root < ctx.floor {
+                ctx.atomics.push(storage_root);
+            }
+        }
+        self.mutated.push(storage_root);
+        let arity = indices.len();
+        let mut operands = vec![CheckedExpr::new(
+            CheckedExprKind::Local(binding),
+            self.locals[binding].ty.clone(),
+            None,
+            span,
+        )];
+        for index in &indices {
+            match index {
+                crate::sir::CheckedIndex::Point(p) => operands.push(p.clone()),
+                crate::sir::CheckedIndex::Range { start, end } => {
+                    operands.extend(start.iter().chain(end).cloned());
+                }
+            }
+        }
+        operands.push(value);
+        Some(CheckedExpr::new(
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Atomic { op, arity },
+                operands,
+            },
+            ValueType::Void,
+            None,
+            span,
+        ))
+    }
+
+    /// The storage root of a binding local, before following view aliases.
+    pub(crate) fn root_var_local(&self, id: LocalId) -> LocalId {
+        self.view_roots.get(&id).copied().unwrap_or(id)
+    }
+
+    // ---- capability intrinsics ----
 
     fn intrinsic(
         &mut self,
@@ -809,7 +875,7 @@ impl<'a> Checker<'a> {
         name: &ast::Ident,
         args: &[ast::Arg],
         span: Span,
-    ) -> Option<Expr> {
+    ) -> Option<CheckedExpr> {
         if !intrinsics::known_backend(&backend.name) {
             self.error(
                 backend.span,
@@ -834,8 +900,8 @@ impl<'a> Checker<'a> {
         ) {
             return None;
         }
-        let Some(intrinsic) = intrinsics::lookup(&backend.name, &capability.name, &name.name)
-        else {
+        let signatures = intrinsics::lookup(&backend.name, &capability.name, &name.name);
+        if signatures.is_empty() {
             self.error(
                 name.span,
                 format!(
@@ -845,232 +911,117 @@ impl<'a> Checker<'a> {
                 ),
             );
             return None;
-        };
+        }
         self.use_capability(
             &capability_id,
             span,
-            &format!("intrinsic `{}`", intrinsic.id.path()),
+            &format!(
+                "intrinsic `{}.{}.{}`",
+                backend.name, capability.name, name.name
+            ),
         );
-        self.intrinsic_call(&intrinsic, args, span)
+        self.intrinsic_call(&signatures, args, span)
     }
 
     fn intrinsic_call(
         &mut self,
-        intrinsic: &Intrinsic,
+        signatures: &[CapabilitySignature],
         args: &[ast::Arg],
         span: Span,
-    ) -> Option<Expr> {
-        let target = intrinsic.id.capability.backend.as_str();
-        let operation = intrinsic.operation;
+    ) -> Option<CheckedExpr> {
+        // Logical matrix intrinsics carry an `accumulation=` named argument.
         if matches!(
-            operation,
-            Operation::MatrixMatmul | Operation::MatrixMatmulAdd
+            signatures.first().map(|s| &s.semantics),
+            Some(
+                intrinsics::CapabilitySemantics::MatrixMatmul
+                    | intrinsics::CapabilitySemantics::MatrixMatmulAdd
+            )
         ) {
-            return self.matrix_intrinsic(intrinsic, args, span);
+            return self.matrix_intrinsic(signatures, args, span);
         }
-        if args.len() != intrinsic.params.len() || args.iter().any(|a| a.name.is_some()) {
+        let mut checked = Vec::new();
+        for arg in args {
+            if arg.name.is_some() {
+                self.error(
+                    arg.value.span,
+                    format!(
+                        "`{}` takes positional arguments only",
+                        signatures[0].id.path()
+                    ),
+                );
+                return None;
+            }
+            let e = self.expr(&arg.value, None)?;
+            checked.push(e);
+        }
+        let matching: Vec<&CapabilitySignature> = signatures
+            .iter()
+            .filter(|s| {
+                s.arguments.len() == checked.len()
+                    && s.arguments
+                        .iter()
+                        .zip(&checked)
+                        .all(|(p, a)| capability_argument_matches(p, &a.ty))
+            })
+            .collect();
+        let [signature] = matching.as_slice() else {
             self.error(
                 span,
                 format!(
-                    "`{}` takes {} positional argument(s)",
-                    intrinsic.id.path(),
-                    intrinsic.params.len()
+                    "`{}` takes {} argument(s) of its declared types; {} given",
+                    signatures[0].id.path(),
+                    signatures.first().map(|s| s.arguments.len()).unwrap_or(0),
+                    checked.len()
                 ),
             );
             return None;
-        }
-        let fragment = |ty: &Ty| matches!(ty, Ty::Native(NativeTy { target: t, name, .. }) if t == target && name == Operation::Matrix.name());
-        let mut out = Vec::new();
-        let mut float_dtype: Option<DType> = None;
-        let mut named_dtype: Option<DType> = None;
-        for (arg, param) in args.iter().zip(&intrinsic.params) {
-            match param {
-                IntrinsicParam::DTypeName => {
-                    let dtype = match &arg.value.kind {
-                        A::Name(n) => DType::from_name(&n.name),
-                        _ => None,
-                    };
-                    let Some(d) = dtype else {
-                        self.error(arg.value.span, "expected a dtype name");
-                        return None;
-                    };
-                    named_dtype = Some(d);
-                    out.push(self.scalar(ExprKind::Int(0), d, None, arg.value.span));
-                }
-                IntrinsicParam::FloatScalar => {
-                    let e = self.expr(&arg.value, float_dtype.map(Ty::Scalar).as_ref())?;
-                    let Some(d) = e.ty.scalar_dtype().filter(|d| d.is_float()) else {
-                        self.error(
-                            e.span,
-                            format!(
-                                "`{target}.{operation}` needs a float scalar, found {}",
-                                e.ty
-                            ),
-                        );
-                        return None;
-                    };
-                    float_dtype = Some(d);
-                    out.push(e);
-                }
-                IntrinsicParam::Frag8x8 => {
-                    let e = self.expr(&arg.value, None)?;
-                    if !fragment(&e.ty) {
-                        self.error(e.span, format!("`{target}.{operation}` needs a `{target}.{}` value, found {}; native types of different targets are not interchangeable", Operation::Matrix.name(), e.ty));
-                        return None;
-                    }
-                    out.push(e);
-                }
-                IntrinsicParam::Tile2 => {
-                    // A block store overwrites its window; it does not read the tile.
-                    let e =
-                        self.expr_inner(&arg.value, None, operation == Operation::MatrixStore)?;
-                    if !matches!(&e.ty, Ty::Tile(s) | Ty::View(s) if s.rank() == 2) {
-                        self.error(
-                            e.span,
-                            format!(
-                                "`{target}.{operation}` needs a rank-2 tile or view, found {}",
-                                e.ty
-                            ),
-                        );
-                        return None;
-                    }
-                    out.push(e);
-                }
-                IntrinsicParam::Integer => {
-                    let e = self.expr(&arg.value, Some(&Ty::Scalar(DType::I32)))?;
-                    if !e.ty.scalar_dtype().is_some_and(DType::is_int) {
-                        self.error(e.span, "a participant index is a 32-bit integer");
-                        return None;
-                    }
-                    out.push(e);
-                }
-                IntrinsicParam::Int => {
-                    let e = self.expr(&arg.value, Some(&Ty::Scalar(DType::I32)))?;
-                    if e.sym.is_none() {
-                        self.error(
-                            e.span,
-                            format!("`{target}.{operation}` needs a symbolic integer offset"),
-                        );
-                        return None;
-                    }
-                    out.push(e);
-                }
-                IntrinsicParam::MatrixOperand => {
-                    unreachable!("logical matrix intrinsics are checked separately")
-                }
-            }
-        }
-        for e in &out {
-            self.forbid_partial(e, "an intrinsic operand");
-        }
-        // Block loads and stores touch a fixed window at (row, column): prove it fits the
-        // semantic axes; structural axes are the target's own geometry.
-        if let Semantics::Load { rows, columns, .. } | Semantics::Store { rows, columns } =
-            operation.semantics()
-        {
-            let axes = out[1]
-                .ty
-                .shaped()
-                .map(|s| s.axes.clone())
-                .unwrap_or_default();
-            for (k, (axis, window)) in axes.iter().zip([rows, columns]).enumerate() {
-                let (Extent::Semantic(dim), Some(offset)) = (axis, out[2 + k].sym.clone()) else {
-                    continue;
-                };
-                let interval = self.prover().interval(&offset);
-                let offset_span = out[2 + k].span;
-                self.require_nonneg(&interval.lo, offset_span, "block offset may be negative");
-                self.require_nonneg(
-                    &dim.sub(&interval.hi).sub(&Sym::constant(window as i64)),
-                    offset_span,
-                    &format!("{window}-wide block may exceed extent `{dim}`"),
-                );
-            }
-        }
-        for written in operation.writes_arguments() {
-            let place = out[*written].clone();
-            let root = self.write(&place, place.span, false)?;
-            // Definite assignment tracks whole tiles: only a store covering the tile initializes it.
-            if operation == Operation::MatrixStore {
-                let covers = place.ty.shaped().is_some_and(|s| {
-                    s.axes
-                        .iter()
-                        .all(|a| a.semantic().and_then(Sym::as_constant) == Some(8))
-                }) && out[2..4]
-                    .iter()
-                    .all(|e| e.sym.as_ref().and_then(Sym::as_constant) == Some(0));
-                if covers && matches!(place.kind, ExprKind::Var(_)) {
-                    self.unassigned.remove(&root);
-                }
-            }
-        }
-        let ty = match intrinsic.result {
-            IntrinsicResult::Void => Ty::Void,
-            IntrinsicResult::Integer => Ty::Scalar(DType::I32),
-            IntrinsicResult::FloatScalar => Ty::Scalar(float_dtype.unwrap_or(DType::F32)),
-            IntrinsicResult::Frag8x8OfNamedDtype => {
-                let Semantics::Fragment { rows, columns } = operation.semantics() else {
-                    self.error(
-                        span,
-                        format!("`{target}.{operation}` does not declare a native fragment"),
-                    );
-                    return None;
-                };
-                out.clear();
-                Ty::Native(NativeTy {
-                    target: target.to_string(),
-                    name: operation.name().to_string(),
-                    shape: vec![Sym::constant(rows as i64), Sym::constant(columns as i64)],
-                    elem: Some(Elem::Dtype(named_dtype.unwrap_or(DType::F32))),
-                })
-            }
-            IntrinsicResult::LogicalMatrix => {
-                unreachable!("logical matrix intrinsics are checked separately")
-            }
         };
-        let expression = Expr {
-            kind: ExprKind::Intrinsic {
-                op: operation,
-                args: out,
-            },
-            ty,
-            sym: None,
-            partial: false,
-            span,
-        };
-        self.record_intrinsic(intrinsic, &expression);
-        Some(expression)
-    }
-
-    fn record_intrinsic(&mut self, intrinsic: &Intrinsic, expression: &Expr) {
-        let ExprKind::Intrinsic { args, .. } = &expression.kind else {
-            return;
-        };
-        let used = sir::IntrinsicUse {
-            id: intrinsic.id.clone(),
-            operation: intrinsic.operation,
-            arguments: args.iter().map(|argument| argument.ty.clone()).collect(),
-            result: expression.ty.clone(),
+        let id = signature.id.clone();
+        let result = signature.result.clone();
+        let used = crate::sir::IntrinsicUse {
+            id: id.clone(),
+            arguments: checked.iter().map(|a| a.ty.clone()).collect(),
+            result: result.clone(),
         };
         if !self.intrinsic_uses.contains(&used) {
             self.intrinsic_uses.push(used);
         }
+        Some(CheckedExpr::new(
+            CheckedExprKind::Capability { id, args: checked },
+            result,
+            None,
+            span,
+        ))
     }
 
     fn matrix_intrinsic(
         &mut self,
-        intrinsic: &Intrinsic,
+        signatures: &[CapabilitySignature],
         args: &[ast::Arg],
         span: Span,
-    ) -> Option<Expr> {
-        let operation = intrinsic.operation;
+    ) -> Option<CheckedExpr> {
+        let matmul = matches!(
+            signatures[0].semantics,
+            intrinsics::CapabilitySemantics::MatrixMatmul
+        );
         let mut positional = Vec::new();
-        let mut accumulation = None;
+        let mut accumulation: Option<DType> = None;
         for argument in args {
             match argument.name.as_ref().map(|name| name.name.as_str()) {
                 None => positional.push(&argument.value),
-                Some("accumulation") if operation == Operation::MatrixMatmul => {
-                    if accumulation.replace(&argument.value).is_some() {
+                Some("accumulation") if matmul => {
+                    let dtype = match &argument.value.kind {
+                        A::Name(name) => DType::from_name(&name.name),
+                        _ => None,
+                    };
+                    let Some(dtype) = dtype.filter(|dtype| dtype.is_numeric()) else {
+                        self.error(
+                            argument.value.span,
+                            "matrix accumulation must name a numeric dtype",
+                        );
+                        return None;
+                    };
+                    if accumulation.replace(dtype).is_some() {
                         self.error(
                             argument.value.span,
                             "`accumulation` is supplied more than once",
@@ -1081,43 +1032,47 @@ impl<'a> Checker<'a> {
                 Some(name) => {
                     self.error(
                         argument.value.span,
-                        format!("`{}` has no named argument `{name}`", intrinsic.id.path()),
+                        format!(
+                            "`{}` has no named argument `{name}`",
+                            signatures[0].id.path()
+                        ),
                     );
                     return None;
                 }
             }
         }
-        let expected = if operation == Operation::MatrixMatmul {
-            2
-        } else {
-            3
-        };
+        let expected = if matmul { 2 } else { 3 };
         if positional.len() != expected {
             self.error(
                 span,
                 format!(
                     "`{}` takes {expected} positional argument(s)",
-                    intrinsic.id.path()
+                    signatures[0].id.path()
                 ),
+            );
+            return None;
+        }
+        if matmul && accumulation.is_none() {
+            self.error(
+                span,
+                "`matrix.matmul` requires the named argument `accumulation=<dtype>`",
             );
             return None;
         }
         let mut checked = Vec::new();
         for operand in positional {
             let expression = self.expr(operand, None)?;
-            if !matches!(&expression.ty, Ty::Tensor(shape) | Ty::View(shape) | Ty::Tile(shape) if shape.rank() == 2)
-            {
+            if !matches!(&expression.ty, ValueType::Tensor(shape) if shape.rank() == 2) {
                 self.error(
                     expression.span,
                     format!(
                         "`{}` needs rank-two logical tensor operands, found {}",
-                        intrinsic.id.path(),
+                        signatures[0].id.path(),
                         expression.ty
                     ),
                 );
                 return None;
             }
-            self.forbid_partial(&expression, "a logical matrix intrinsic operand");
             checked.push(expression);
         }
         let left = checked[0].ty.shaped().expect("checked rank-two operand");
@@ -1127,34 +1082,16 @@ impl<'a> Checker<'a> {
                 span,
                 format!(
                     "`{}` inner axes differ: {} versus {}",
-                    intrinsic.id.path(),
+                    signatures[0].id.path(),
                     left.axes[1],
                     right.axes[0]
                 ),
             );
             return None;
         }
-        let (element, result_axes) = if operation == Operation::MatrixMatmul {
-            let Some(accumulation) = accumulation else {
-                self.error(
-                    span,
-                    "`matrix.matmul` requires the named argument `accumulation=<dtype>`",
-                );
-                return None;
-            };
-            let dtype = match &accumulation.kind {
-                A::Name(name) => DType::from_name(&name.name),
-                _ => None,
-            };
-            let Some(dtype) = dtype.filter(|dtype| dtype.is_numeric()) else {
-                self.error(
-                    accumulation.span,
-                    "matrix accumulation must name a numeric dtype",
-                );
-                return None;
-            };
+        let (element, result_axes) = if matmul {
             (
-                Elem::Dtype(dtype),
+                Elem::Dtype(accumulation.expect("checked above")),
                 vec![left.axes[0].clone(), right.axes[1].clone()],
             )
         } else {
@@ -1173,31 +1110,35 @@ impl<'a> Checker<'a> {
                     checked[2].span,
                     format!(
                         "`{}` accumulator shape does not match the matrix product",
-                        intrinsic.id.path()
+                        signatures[0].id.path()
                     ),
                 );
                 return None;
             }
             (accumulator.elem.clone(), accumulator.axes.clone())
         };
-        let expression = Expr {
-            kind: ExprKind::Intrinsic {
-                op: operation,
-                args: checked,
-            },
-            ty: Ty::Tensor(Shaped::new(result_axes, element)),
-            sym: None,
-            partial: false,
-            span,
+        let id = signatures[0].id.clone();
+        let result = ValueType::Tensor(TensorType::new(result_axes, element));
+        let used = crate::sir::IntrinsicUse {
+            id: id.clone(),
+            arguments: checked.iter().map(|a| a.ty.clone()).collect(),
+            result: result.clone(),
         };
-        self.record_intrinsic(intrinsic, &expression);
-        Some(expression)
+        if !self.intrinsic_uses.contains(&used) {
+            self.intrinsic_uses.push(used);
+        }
+        Some(CheckedExpr::new(
+            CheckedExprKind::Capability { id, args: checked },
+            result,
+            None,
+            span,
+        ))
     }
 
     // ---- contract families ----
 
-    /// Parameter ordinal -> argument ordinal. `into=` binds the one remaining `out`/`inout`
-    /// parameter when no parameter is named `into`.
+    /// Parameter ordinal -> argument ordinal. `into=` binds the one remaining
+    /// `inout` parameter when no parameter is named `into`.
     fn arg_order(sig: &Sig, args: &[ast::Arg]) -> Result<Vec<usize>, String> {
         if args.len() != sig.params.len() {
             return Err(format!(
@@ -1231,10 +1172,10 @@ impl<'a> Checker<'a> {
         }
         if let Some(ordinal) = into {
             let open: Vec<usize> = (0..order.len())
-                .filter(|i| order[*i].is_none() && sig.params[*i].mode != Mode::In)
+                .filter(|i| order[*i].is_none() && sig.params[*i].mode != crate::sir::Mode::In)
                 .collect();
             let [slot] = open.as_slice() else {
-                return Err("`into=` binds the one unbound `out`/`inout` parameter".to_string());
+                return Err("`into=` binds the one unbound `inout` parameter".to_string());
             };
             order[*slot] = Some(ordinal);
         }
@@ -1244,38 +1185,27 @@ impl<'a> Checker<'a> {
             .ok_or_else(|| "leaves a parameter unbound".to_string())
     }
 
-    /// Substitute a candidate's bound shape parameters into one of its symbolic extents.
+    /// Substitute a candidate's bound shape parameters into one symbolic extent.
     fn substitute(s: &Sym, binding: &Binding) -> Result<Sym, String> {
         for p in s.params() {
-            match binding.shapes.get(&p) {
-                Some(Extent::Semantic(_)) => {}
-                Some(Extent::Structural(_)) => {
-                    return Err(format!(
-                        "`{s}` computes with `{p}`, which is bound to a structural extent"
-                    ))
-                }
-                None => {
-                    return Err(format!(
-                        "shape parameter `{p}` is not determined by the arguments"
-                    ))
-                }
+            if !binding.shapes.contains_key(&p) {
+                return Err(format!(
+                    "shape parameter `{p}` is not determined by the arguments"
+                ));
             }
         }
-        Ok(substitute_all(s, &|p| match binding.shapes.get(p) {
-            Some(Extent::Semantic(v)) => Some(v.clone()),
-            _ => None,
-        }))
+        Ok(substitute_all(s, &|p| binding.shapes.get(p).cloned()))
     }
 
-    fn substitute_ty(ty: &Ty, binding: &Binding) -> Result<Ty, String> {
-        let shaped = |s: &Shaped| -> Result<Shaped, String> {
+    fn substitute_ty(ty: &ValueType, binding: &Binding) -> Result<ValueType, String> {
+        let shaped = |s: &TensorType| -> Result<TensorType, String> {
             let mut axes = Vec::new();
             for axis in &s.axes {
                 axes.push(match axis {
-                    Extent::Semantic(sym) => {
+                    ExtentExpr::Sym(sym) => {
                         match single_param(sym).and_then(|p| binding.shapes.get(&p)) {
-                            Some(extent) => extent.clone(),
-                            None => Extent::Semantic(Self::substitute(sym, binding)?),
+                            Some(extent) => crate::sir::sym_extent(extent.clone()),
+                            None => crate::sir::sym_extent(Self::substitute(sym, binding)?),
                         }
                     }
                     other => other.clone(),
@@ -1287,19 +1217,30 @@ impl<'a> Checker<'a> {
                 })?,
                 other => other.clone(),
             };
-            Ok(Shaped::new(axes, elem))
+            Ok(TensorType::new(axes, elem))
         };
         Ok(match ty {
-            Ty::Tensor(s) => Ty::Tensor(shaped(s)?),
-            Ty::View(s) => Ty::View(shaped(s)?),
-            Ty::Tile(s) => Ty::Tile(shaped(s)?),
-            Ty::Index(n) => Ty::Index(Self::substitute(n, binding)?),
-            Ty::Range(n) => Ty::Range(Self::substitute(n, binding)?),
-            Ty::Tuple(items) => Ty::Tuple(
-                items
-                    .iter()
-                    .map(|t| Self::substitute_ty(t, binding))
-                    .collect::<Result<_, _>>()?,
+            ValueType::Tensor(s) => ValueType::Tensor(shaped(s)?),
+            ValueType::Index { bound } => ValueType::Index {
+                bound: crate::sir::sym_extent(Self::substitute(
+                    bound.sym().ok_or("index bound is not symbolic")?,
+                    binding,
+                )?),
+            },
+            ValueType::Range { bound } => ValueType::Range {
+                bound: crate::sir::sym_extent(Self::substitute(
+                    bound.sym().ok_or("range bound is not symbolic")?,
+                    binding,
+                )?),
+            },
+            ValueType::Tuple(items) => ValueType::Tuple(
+                crate::types::NonEmpty::new(
+                    items
+                        .iter()
+                        .map(|t| Self::substitute_ty(t, binding))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .ok_or("empty tuple")?,
             ),
             other => other.clone(),
         })
@@ -1307,45 +1248,59 @@ impl<'a> Checker<'a> {
 
     fn unify(
         &self,
-        param: &Ty,
-        arg: &Ty,
+        param: &ValueType,
+        arg: &ValueType,
+        arg_class: ValueClass,
         binding: &mut Binding,
-        compound: &mut Vec<(Sym, Extent)>,
+        compound: &mut Vec<(Sym, Sym)>,
     ) -> Result<(), String> {
         let mismatch = || Err(format!("expects {param} but was given {arg}"));
         match (param, arg) {
-            (Ty::Scalar(a), _) => match arg.scalar_dtype() {
+            (ValueType::Scalar(a), _) => match arg.scalar_dtype() {
                 Some(b) if *a == b || (a.is_float() && b.is_float()) => Ok(()),
                 _ => mismatch(),
             },
-            (Ty::Index(_), _) if arg.scalar_dtype() == Some(DType::I32) => Ok(()),
-            (Ty::Range(p), Ty::Range(a)) => match single_param(p) {
-                Some(name) => match binding.shapes.get(&name) {
-                    Some(bound) if !self.prover().zero(&bound.semantic().unwrap().sub(a)) => {
-                        mismatch()
-                    }
-                    Some(_) => Ok(()),
-                    None => {
-                        binding.shapes.insert(name, Extent::Semantic(a.clone()));
-                        Ok(())
-                    }
-                },
-                None if self.prover().zero(&p.sub(a)) => Ok(()),
-                None => mismatch(),
-            },
-            (Ty::Tensor(p), Ty::Tensor(a) | Ty::View(a))
-            | (Ty::View(p), Ty::Tensor(a) | Ty::View(a) | Ty::Tile(a))
-            | (Ty::Tile(p), Ty::Tile(a)) => {
+            (ValueType::Index { .. }, _) if arg.scalar_dtype() == Some(DType::I32) => Ok(()),
+            (ValueType::Range { bound: p }, ValueType::Range { bound: a }) => {
+                let p = p.sym().ok_or("range bound is not symbolic")?;
+                let a = a.sym().ok_or("range bound is not symbolic")?;
+                match single_param(p) {
+                    Some(name) => match binding.shapes.get(&name) {
+                        Some(bound) if !self.prover().zero(&bound.sub(a)) => mismatch(),
+                        Some(_) => Ok(()),
+                        None => {
+                            binding.shapes.insert(name, a.clone());
+                            Ok(())
+                        }
+                    },
+                    None if self.prover().zero(&p.sub(a)) => Ok(()),
+                    None => mismatch(),
+                }
+            }
+            (ValueType::Tensor(p), ValueType::Tensor(a)) => {
+                // Ownership determines which argument classes a tensor parameter
+                // accepts; the type itself is canonical.
                 if p.rank() != a.rank() {
                     return mismatch();
                 }
                 for (pd, ad) in p.axes.iter().zip(&a.axes) {
-                    let Extent::Semantic(pd) = pd else {
+                    let to_sym = |e: &ExtentExpr| -> Option<Sym> {
+                        match e {
+                            ExtentExpr::Sym(s) => Some(s.clone()),
+                            ExtentExpr::Static(n) => Some(Sym::constant(*n as i64)),
+                            ExtentExpr::Runtime(_) => None,
+                        }
+                    };
+                    let (Some(pd), Some(ad)) = (to_sym(pd), to_sym(ad)) else {
                         return mismatch();
                     };
-                    match single_param(pd) {
+                    match single_param(&pd) {
                         Some(name) => match binding.shapes.get(&name) {
-                            Some(bound) if !self.same_extent(bound, ad) => return Err(format!("binds shape parameter `{name}` to both {bound} and {ad}; equal widths of unrelated slices establish nothing")),
+                            Some(bound) if !self.prover().zero(&bound.sub(&ad)) => {
+                                return Err(format!(
+                                    "binds shape parameter `{name}` to both {bound} and {ad}"
+                                ));
+                            }
                             Some(_) => {}
                             None => {
                                 binding.shapes.insert(name, ad.clone());
@@ -1386,11 +1341,11 @@ impl<'a> Checker<'a> {
                     mismatch()
                 }
             }
-            (Ty::Tuple(p), Ty::Tuple(a)) if p.len() == a.len() => p
+            (ValueType::Tuple(p), ValueType::Tuple(a)) if p.len() == a.len() => p
                 .iter()
-                .zip(a)
-                .try_for_each(|(p, a)| self.unify(p, a, binding, compound)),
-            (Ty::Native(p), Ty::Native(a)) if p == a => Ok(()),
+                .zip(a.iter())
+                .try_for_each(|(p, a)| self.unify(p, a, arg_class, binding, compound)),
+            (ValueType::CapabilityValue(p), ValueType::CapabilityValue(a)) if p == a => Ok(()),
             _ => mismatch(),
         }
     }
@@ -1399,9 +1354,9 @@ impl<'a> Checker<'a> {
     fn bind_candidate(
         &self,
         sig: &Sig,
-        explicit: &[(String, Extent)],
+        explicit: &[(String, Sym)],
         ast_args: &[ast::Arg],
-        args: &[Expr],
+        args: &[CheckedExpr],
     ) -> Result<(Vec<usize>, Binding), String> {
         let order = Self::arg_order(sig, ast_args)?;
         let mut binding = Binding::default();
@@ -1413,25 +1368,32 @@ impl<'a> Checker<'a> {
         }
         let mut compound = Vec::new();
         for (param, ordinal) in sig.params.iter().zip(&order) {
-            // An `out`/`inout` tile parameter binds a view of local tile state as that sub-tile:
-            // the callee updates it in place (disjointness of parallel writers is checked at
-            // the write, like any other non-whole place).
             let argument = &args[*ordinal];
-            let sub_tile = match (&param.ty, &argument.ty) {
-                (Ty::Tile(_), Ty::View(shaped))
-                    if param.mode != Mode::In
-                        && self.root_var(argument).is_some_and(|root| {
-                            matches!(self.vars[root].kind, VarKind::State)
-                                && matches!(self.vars[root].ty, Ty::Tile(_))
-                        }) =>
+            let arg_class = self.class_of(argument);
+            // Ownership admission before type unification.
+            match param.ownership {
+                ParamOwnership::Owned
+                    if !matches!(arg_class, ValueClass::Owned | ValueClass::Borrowed) =>
                 {
-                    Some(Ty::Tile(shaped.clone()))
+                    return Err(format!(
+                        "parameter `{}` takes an owned tensor or a tensor place, found a computed value",
+                        param.name
+                    ));
                 }
-                _ => None,
-            };
+                ParamOwnership::Exclusive
+                    if !matches!(arg_class, ValueClass::Owned | ValueClass::Borrowed) =>
+                {
+                    return Err(format!(
+                        "parameter `{}` requires a tensor place for exclusive access",
+                        param.name
+                    ));
+                }
+                _ => {}
+            }
             self.unify(
                 &param.ty,
-                sub_tile.as_ref().unwrap_or(&argument.ty),
+                &argument.ty,
+                arg_class,
                 &mut binding,
                 &mut compound,
             )
@@ -1441,7 +1403,6 @@ impl<'a> Checker<'a> {
         loop {
             let mut changed = false;
             for (pd, ad) in &compound {
-                let Extent::Semantic(ad) = ad else { continue };
                 let unknown: Vec<String> = pd
                     .params()
                     .into_iter()
@@ -1453,9 +1414,7 @@ impl<'a> Checker<'a> {
                     shapes: binding.shapes.clone(),
                     ..Binding::default()
                 };
-                trial
-                    .shapes
-                    .insert(u.clone(), Extent::Semantic(Sym::atom(hole.clone())));
+                trial.shapes.insert(u.clone(), Sym::atom(hole.clone()));
                 let Ok(e) = Self::substitute(pd, &trial) else {
                     continue;
                 };
@@ -1472,7 +1431,7 @@ impl<'a> Checker<'a> {
                     c => difference.div_exact(c),
                 };
                 if let Some(value) = value {
-                    binding.shapes.insert(u.clone(), Extent::Semantic(value));
+                    binding.shapes.insert(u.clone(), value);
                     changed = true;
                 }
             }
@@ -1485,11 +1444,14 @@ impl<'a> Checker<'a> {
             .iter()
             .find(|p| !binding.shapes.contains_key(*p))
         {
-            return Err(format!("shape parameter `{p}` is not determined by the arguments; bind it with `{}[{p} = …](…)`", sig.name));
+            return Err(format!(
+                "shape parameter `{p}` is not determined by the arguments; bind it with `{}[{p} = …](…)`",
+                sig.name
+            ));
         }
         for (pd, ad) in &compound {
             let expected = Self::substitute(pd, &binding)?;
-            if !self.same_extent(&Extent::Semantic(expected.clone()), ad) {
+            if !self.prover().zero(&expected.sub(ad)) {
                 return Err(format!(
                     "extent `{pd}` is `{expected}` under this binding but the argument has `{ad}`"
                 ));
@@ -1498,10 +1460,11 @@ impl<'a> Checker<'a> {
         // Index parameters: symbolic arguments are proved inside the bound; data-dependent
         // arguments keep a runtime obligation.
         for (param, ordinal) in sig.params.iter().zip(&order) {
-            let (Ty::Index(bound), Some(value)) = (&param.ty, &args[*ordinal].sym) else {
+            let (ValueType::Index { bound }, Some(value)) = (&param.ty, &args[*ordinal].sym) else {
                 continue;
             };
-            let bound = Self::substitute(bound, &binding)?;
+            let bound =
+                Self::substitute(bound.sym().ok_or("index bound is not symbolic")?, &binding)?;
             let data_dependent = value.params().iter().any(|p| {
                 !self.sig.shape_params.contains(p)
                     && self.facts.upper_of(&Atom::Param(p.clone())).is_none()
@@ -1523,7 +1486,7 @@ impl<'a> Checker<'a> {
         bindings: &[(ast::Ident, ast::Expr)],
         ast_args: &[ast::Arg],
         span: Span,
-    ) -> Option<Expr> {
+    ) -> Option<CheckedExpr> {
         let resolved = self.env.resolved;
         let Some(families) = resolved.by_name.get(&name.name) else {
             self.error(name.span, format!("`{}` is not declared", name.name));
@@ -1578,39 +1541,38 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        // Explicit shape bindings: a slice or an own shape parameter is passed along as an
-        // identity; anything else is a symbolic integer.
-        let mut explicit: Vec<(String, Extent)> = Vec::new();
+        // Explicit shape bindings: a shape parameter of this definition passed
+        // along as an identity, or a symbolic integer expression.
+        let mut explicit: Vec<(String, Sym)> = Vec::new();
         for (param, value) in bindings {
-            let identity = match &value.kind {
-                A::Name(n) => match self.lookup(&n.name).map(|id| self.vars[id].ty.clone()) {
-                    Some(Ty::Slice(slice)) => Some(Extent::Structural(slice)),
-                    None if self.sig.shape_params.contains(&n.name) => {
-                        Some(Extent::Semantic(Sym::param(&n.name)))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            let extent = match identity {
-                Some(extent) => extent,
-                None => {
-                    let value = self.expr(value, Some(&Ty::Scalar(DType::I32)))?;
+            let extent = match &value.kind {
+                A::Name(n)
+                    if n.name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_uppercase())
+                        && self.sig.shape_params.contains(&n.name) =>
+                {
+                    Sym::param(&n.name)
+                }
+                _ => {
+                    let value = self.expr(value, Some(&ValueType::Scalar(DType::I32)))?;
                     let Some(sym) = value.sym.clone() else {
                         self.error(
                             value.span,
-                            "a shape binding is a slice or a symbolic integer expression",
+                            "a shape binding is a symbolic integer expression",
                         );
                         return None;
                     };
-                    Extent::Semantic(sym)
+                    sym
                 }
             };
+            self.numeric_use(&extent);
             explicit.push((param.name.clone(), extent));
         }
 
-        // Arguments are checked once, with scalar hints and `out` positions from the first
-        // definition whose parameter list the call can bind.
+        // Arguments are checked once, with scalar hints and write positions from
+        // the first definition whose parameter list the call can bind.
         let guide = definitions
             .iter()
             .map(|d| &resolved.declared[*d].sig)
@@ -1627,9 +1589,11 @@ impl<'a> Checker<'a> {
                     .position(|o| *o == ordinal)
                     .map(|slot| &sig.params[slot])
             });
-            let hint = param.and_then(|p| p.ty.scalar_dtype()).map(Ty::Scalar);
-            let write_only_candidate = param
-                .is_some_and(|p| p.mode == Mode::Out || p.ownership == ParamOwnership::Exclusive);
+            let hint = param
+                .and_then(|p| p.ty.scalar_dtype())
+                .map(ValueType::Scalar);
+            let write_only_candidate =
+                param.is_some_and(|p| p.ownership == ParamOwnership::Exclusive);
             args.push(self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?);
         }
 
@@ -1662,7 +1626,7 @@ impl<'a> Checker<'a> {
             let Some(root) = self.root_var(argument) else {
                 continue;
             };
-            let VarKind::Param(own_parameter) = self.vars[root].kind else {
+            let LocalKind::Param(own_parameter) = self.kinds[root] else {
                 continue;
             };
             if self.sig.params[own_parameter].ownership != ParamOwnership::Exclusive {
@@ -1707,37 +1671,10 @@ impl<'a> Checker<'a> {
                         })
                 });
             if !full {
-                self.error(argument.span, format!("`{}` is uninitialized and `{}` does not initialize that exclusive tensor on every path", self.vars[root].name, name.name));
+                self.error(argument.span, format!("`{}` is uninitialized and `{}` does not initialize that exclusive tensor on every path", self.locals[root].name, name.name));
                 return None;
             }
             self.unassigned.remove(&root);
-        }
-
-        // A structural extent is never a number, also through a generic helper.
-        if self.env.enforce {
-            let mut rejected: Vec<String> = Vec::new();
-            candidates.retain(|(d, _, binding)| {
-                let numeric = &self.env.summaries[*d].numeric;
-                let offending: Vec<&String> = binding
-                    .shapes
-                    .iter()
-                    .filter(|(p, extent)| {
-                        matches!(extent, Extent::Structural(_)) && numeric.contains(*p)
-                    })
-                    .map(|(p, _)| p)
-                    .collect();
-                for p in &offending {
-                    rejected.push(format!("`{p}`"));
-                }
-                offending.is_empty()
-            });
-            let implemented = !candidates.is_empty();
-            if !rejected.is_empty() && !implemented {
-                rejected.sort();
-                rejected.dedup();
-                self.error(span, format!("`{}` uses shape parameter {} as a number (arithmetic, `extent`, a range bound or a coordinate), but this call binds it to a structural extent: the width of a slice is never a number, directly or through a generic helper", name.name, rejected.join(", ")));
-                return None;
-            }
         }
         let Some((first, first_order, first_binding)) = candidates.first() else {
             self.error(
@@ -1765,9 +1702,9 @@ impl<'a> Checker<'a> {
         };
 
         // Logical ownership is checked at the static call boundary. Borrows end
-        // with the call in this foundation; `let`-bound slice borrows are tracked
+        // with the call in this foundation; `let`-bound view borrows are tracked
         // separately by the body checker.
-        let mut accesses: HashMap<VarId, ParamOwnership> = HashMap::new();
+        let mut accesses: HashMap<LocalId, ParamOwnership> = HashMap::new();
         let mut moved_roots = Vec::new();
         for (parameter, ordinal) in first_sig.params.iter().zip(first_order) {
             let ownership = parameter.ownership;
@@ -1777,11 +1714,17 @@ impl<'a> Checker<'a> {
             let argument = &args[*ordinal];
             let Some(root) = self.root_var(argument) else {
                 if matches!(ownership, ParamOwnership::Shared | ParamOwnership::Owned)
-                    && matches!(argument.ty, Ty::Tensor(_) | Ty::View(_))
+                    && matches!(argument.ty, ValueType::Tensor(_))
+                    && matches!(
+                        self.class_of(argument),
+                        ValueClass::Computed | ValueClass::Owned
+                    )
                 {
-                    // A fresh logical value may be borrowed or moved into this
-                    // call. It has no caller-visible storage root to invalidate or
-                    // with which it could alias.
+                    // A fresh logical value (computed, or a rootless owned
+                    // materialization/clone/allocation/call result) may be
+                    // borrowed or moved into this call. It has no
+                    // caller-visible storage root to invalidate or with which
+                    // it could alias.
                     continue;
                 }
                 self.error(
@@ -1843,8 +1786,8 @@ impl<'a> Checker<'a> {
             );
         }
 
-        // Effects of `out`/`inout` parameters.
-        let modes: Vec<(Mode, usize)> = first_sig
+        // Effects of `inout` parameters.
+        let modes: Vec<(crate::sir::Mode, usize)> = first_sig
             .params
             .iter()
             .zip(first_order)
@@ -1852,18 +1795,37 @@ impl<'a> Checker<'a> {
             .collect();
         for (mode, ordinal) in modes {
             let arg = args[ordinal].clone();
-            self.forbid_partial(&arg, &format!("an argument of `{}`", name.name));
-            if mode == Mode::In {
+            if mode == crate::sir::Mode::In {
                 continue;
             }
-            let whole = matches!(arg.kind, ExprKind::Var(_));
-            let root = self.write(&arg, arg.span, whole)?;
+            let whole = matches!(arg.kind, CheckedExprKind::Local(_));
+            let base_local = |operands: &[CheckedExpr]| match operands.first().map(|o| &o.kind) {
+                Some(CheckedExprKind::Local(v)) => Some(*v),
+                _ => None,
+            };
+            let binding_local = match &arg.kind {
+                CheckedExprKind::Local(v) => Some(*v),
+                CheckedExprKind::Primitive {
+                    id:
+                        PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
+                    operands,
+                } => base_local(operands),
+                _ => None,
+            };
+            let Some(binding_local) = binding_local else {
+                self.error(
+                    arg.span,
+                    "an `inout` argument must name a tensor binding or a selection of one",
+                );
+                return None;
+            };
+            let storage_root = self.root_var_local(binding_local);
+            self.write(storage_root, binding_local, &[], whole, arg.span)?;
             if whole {
-                self.unassigned.remove(&root);
+                self.unassigned.remove(&storage_root);
             }
         }
 
-        let mut partial = false;
         let mut site = Vec::new();
         for (d, order, binding) in &candidates {
             let sig = &resolved.declared[*d].sig;
@@ -1873,15 +1835,10 @@ impl<'a> Checker<'a> {
                 let Some(extent) = binding.shapes.get(p) else {
                     continue;
                 };
-                match extent {
-                    Extent::Structural(_) => partial |= summary.reduces.contains(p),
-                    Extent::Semantic(sym) => {
-                        if let Some(own) =
-                            single_param(sym).filter(|q| self.sig.shape_params.contains(q))
-                        {
-                            self.summary.passes.push((*d, p.clone(), own));
-                        }
-                    }
+                if let Some(own) =
+                    single_param(extent).filter(|q| self.sig.shape_params.contains(q))
+                {
+                    self.summary.passes.push((*d, p.clone(), own));
                 }
                 shape_args.push((p.clone(), extent.clone()));
             }
@@ -1897,20 +1854,37 @@ impl<'a> Checker<'a> {
                 arg_order: order.clone(),
                 requires_elems: binding.requires.clone(),
             });
+            let _ = summary;
         }
-        let call = CallId(self.calls.len() as u32);
-        self.calls.push(CallSite {
+        let call = CheckedCall {
             family,
             bindings: site,
-            result: result.clone(),
             span,
-        });
-        Some(sir::Expr {
-            kind: ExprKind::Call { call, args },
-            ty: result,
-            sym: None,
-            partial,
+        };
+        Some(CheckedExpr::new(
+            CheckedExprKind::Call {
+                call: Box::new(call),
+                args,
+            },
+            result,
+            None,
             span,
-        })
+        ))
+    }
+}
+
+fn positional_3(args: &[ast::Arg]) -> bool {
+    args.len() == 3 && args.iter().all(|a| a.name.is_none())
+}
+
+/// Whether an argument type satisfies one declared capability argument.
+/// A rank-two tensor argument matches a rank-two symbolic-axes declaration;
+/// scalars match exactly up to the shared float widening of one call.
+fn capability_argument_matches(param: &ValueType, arg: &ValueType) -> bool {
+    match (param, arg) {
+        (ValueType::Scalar(a), ValueType::Scalar(b)) => a == b,
+        (ValueType::Tensor(p), ValueType::Tensor(a)) => p.rank() == a.rank(),
+        (ValueType::Index { .. }, _) => arg.scalar_dtype() == Some(DType::I32),
+        _ => param == arg,
     }
 }

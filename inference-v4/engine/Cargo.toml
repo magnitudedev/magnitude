@@ -24,3 +24,4 @@ seismic-metal.workspace = true
 seismic-cpu.workspace = true
 seismic-compiler.workspace = true
 seismic-cuda.workspace = true
+seismic-realization.workspace = true

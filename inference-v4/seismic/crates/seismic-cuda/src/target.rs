@@ -8,9 +8,8 @@
 
 use std::fmt;
 
-use seismic_lang::intrinsics::Operation;
 use seismic_lang::sir::IntrinsicUse;
-use seismic_lang::types::{DType, Ty};
+use seismic_lang::types::{DType, ValueType};
 
 /// Revision of the CUDA realization contract, independent of the source intrinsic registry.
 pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-cuda-realization-v2";
@@ -46,24 +45,23 @@ impl SupportedIntrinsic {
     }
 
     fn matches(self, use_: &IntrinsicUse) -> bool {
-        let f32 = Ty::Scalar(DType::F32);
-        let i32 = Ty::Scalar(DType::I32);
+        let f32 = ValueType::Scalar(DType::F32);
+        let i32 = ValueType::Scalar(DType::I32);
+        // Exact-signature matching against the current registry: the
+        // intrinsic identity plus concrete argument and result types.
         match self {
             Self::LaneIndexI32 => {
-                use_.operation == Operation::LaneIndex
-                    && use_.id.path() == "cuda.subgroup.lane_index"
+                use_.id.path() == "cuda.subgroup.lane_index"
                     && use_.arguments.is_empty()
                     && use_.result == i32
             }
             Self::ShuffleF32I32ToF32 => {
-                use_.operation == Operation::ShuffleIndex
-                    && use_.id.path() == "cuda.subgroup.shuffle"
+                use_.id.path() == "cuda.subgroup.shuffle"
                     && use_.arguments == [f32.clone(), i32]
                     && use_.result == f32
             }
             Self::SimdSumF32 => {
-                use_.operation == Operation::SimdSum
-                    && use_.id.path() == "cuda.subgroup.simd_sum"
+                use_.id.path() == "cuda.subgroup.simd_sum"
                     && use_.arguments == [f32.clone()]
                     && use_.result == f32
             }
@@ -370,10 +368,9 @@ impl TargetProfile {
                 intrinsic.id.capability.backend
             ));
         }
-        if matches!(
-            intrinsic.operation,
-            Operation::MatrixMatmul | Operation::MatrixMatmulAdd
-        ) {
+        // cuda.matrix stays absent until its typing, reference,
+        // legalization, resources, numerics and emission are complete.
+        if intrinsic.id.capability.name == "matrix" {
             return Err(format!(
                 "BackendNotImplemented: logical CUDA matrix intrinsic `{}` has a preserved owned result ABI, but no CUDA realization and numerical contract",
                 intrinsic.id.path()

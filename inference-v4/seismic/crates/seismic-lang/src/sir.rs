@@ -1,42 +1,55 @@
-//! Structured IR: the checked, typed program. Authored structure is authoritative:
-//! regions, stages, producers, state and publications appear exactly as written.
-//! Nothing here chooses an implementation, a grouping or a number.
+//! The checked semantic program.
 //!
-//! One `Definition` is a template. Calls name a contract (function name + argument
-//! binding); which definition implements an occurrence is a selection decision made
-//! over `family`, never here.
+//! The checked representation mirrors only current source: `let`/`let mut`,
+//! assignment, ordered/independent loops, `if`, `return`, expressions built
+//! from registry primitives and static function-family calls.
+//!
+//! One `Definition` is a template. A call names a contract (family + argument
+//! binding); which definition implements an occurrence is a selection decision
+//! made over `family`, never here. The checked static call graph is acyclic;
+//! recursion is rejected before specialization.
 
-use super::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
-use super::types::{DType, Elem, Extent, RegionId, SliceId, Ty};
-use crate::intrinsics::{CapabilityId, IntrinsicId, Operation};
+use crate::intrinsics::{IntrinsicId, PrimitiveId};
 use crate::span::Span;
 use crate::sym::Sym;
+use crate::syntax::ast::AssignOp;
+use crate::types::{Elem, ExtentExpr, ValueType};
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefId(pub u32);
 
-/// Index into `Body::vars`.
-pub type VarId = usize;
+/// Index into `CheckedBody::locals`.
+pub type LocalId = usize;
 
-/// Compiler-only parameter passing mode used by the existing execution IR.
+/// Index of one call occurrence inside a definition body, stable for
+/// diagnostics; call data itself lives in the `CheckedExprKind::Call` node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallId(pub u32);
+
+/// Compiler-only parameter passing mode (signatures only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     In,
-    Out,
     Inout,
 }
 
-/// Compiler-only execution-region classification retained below the source AST.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RegionMode {
-    Parallel,
-    Ordered,
-    Pipeline,
+/// Logical call ownership of a parameter, kept beside the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamOwnership {
+    /// A plain value (scalar, index, range, tuple, capability value).
+    Value,
+    /// An owned tensor that moves into the callee.
+    Owned,
+    /// A shared borrow (`&tensor`).
+    Shared,
+    /// An exclusive mutable borrow (`&mut tensor`).
+    Exclusive,
 }
 
-/// Index into `Body::calls`: one static call occurrence within a definition body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CallId(pub u32);
+// ---------------------------------------------------------------------------
+// Program and definitions
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -68,9 +81,10 @@ impl Program {
         &self.families[self.definition(id).family]
     }
 
-    /// Resolve a name-only root request. Calls already carry an exact family index, but an
-    /// embedding request has no argument-type selector and therefore must fail closed when
-    /// several disjoint overload families share the name.
+    /// Resolve a name-only root request. Calls already carry an exact family
+    /// index, but an embedding request has no argument-type selector and
+    /// therefore must fail closed when several disjoint overload families
+    /// share the name.
     pub fn family_index(&self, name: &str) -> Result<usize, String> {
         let mut matches = self
             .families
@@ -98,14 +112,13 @@ impl Program {
     }
 }
 
-/// A connected component of same-name implementations with overlapping applicability and a
-/// compatible contract.
+/// A connected component of same-name implementations with overlapping
+/// applicability and a compatible contract.
 #[derive(Clone, Debug)]
 pub struct ContractFamily {
     pub name: String,
     /// Canonical source contract for stable parameter names, ordering and
-    /// generic bindings. Implementations may restate equivalent signatures,
-    /// but target capability filtering must not redefine the public contract.
+    /// generic bindings.
     pub contract: DefId,
     /// Portable and backend-specific `fn` bodies.
     pub bodies: Vec<DefId>,
@@ -136,8 +149,8 @@ pub struct Definition {
     pub name: String,
     pub kind: DefKind,
     /// Capability namespaces explicitly declared by this source body.
-    pub requires: Vec<CapabilityId>,
-    /// Exact typed intrinsic signatures used directly by this body.
+    pub requires: Vec<crate::intrinsics::CapabilityId>,
+    /// Exact typed capability signatures used directly by this body.
     pub intrinsic_uses: Vec<IntrinsicUse>,
     /// Index into `Program::families`.
     pub family: usize,
@@ -148,29 +161,30 @@ pub struct Definition {
     pub params: Vec<Param>,
     /// Parameter ordinal pairs permitted to alias.
     pub aliases: Vec<(usize, usize)>,
-    pub result: Ty,
+    pub result: ValueType,
     /// Applicability: every predicate must hold.
     pub predicates: Vec<Predicate>,
-    pub body: Body,
+    pub body: CheckedBody,
     /// Index into `Program::files`.
     pub file: usize,
     pub span: Span,
 }
 
+/// One exact typed capability use recorded for fingerprinting and planning.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntrinsicUse {
     pub id: IntrinsicId,
-    pub operation: Operation,
-    pub arguments: Vec<Ty>,
-    pub result: Ty,
+    pub arguments: Vec<ValueType>,
+    pub result: ValueType,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
     pub name: String,
     pub mode: Mode,
-    pub ty: Ty,
-    pub var: VarId,
+    pub ownership: ParamOwnership,
+    pub ty: ValueType,
+    pub local: LocalId,
 }
 
 /// A decidable applicability predicate over shape parameters.
@@ -182,386 +196,285 @@ pub enum Predicate {
     Zero(Sym),
     /// `expr != 0`
     NonZero(Sym),
-    /// `full(P)`: when `P` is bound to a structural extent, its capacity divides the
-    /// semantic extent of the slice's parent domain. Vacuous for semantic bindings.
-    Full(String),
 }
 
-#[derive(Clone, Debug)]
-pub struct Body {
-    pub vars: Vec<Var>,
-    pub slices: Vec<SliceDecl>,
-    pub regions: Vec<RegionDecl>,
-    pub calls: Vec<CallSite>,
-    pub block: Block,
-}
+// ---------------------------------------------------------------------------
+// Checked bodies
+// ---------------------------------------------------------------------------
 
+/// A typed local of a checked body. Parameters occupy `0..params.len()` in
+/// parameter order.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Var {
+pub struct CheckedLocal {
     pub name: String,
-    pub ty: Ty,
-    pub kind: VarKind,
-    /// Carries a partial-domain obligation (language.md section 8).
-    pub partial: bool,
+    pub ty: ValueType,
+    pub mutable: bool,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum VarKind {
-    Param(usize),
-    /// `let`
-    Value,
-    /// `let mut`
-    State,
-    /// Region binder.
-    Slice(SliceId),
-    /// Stage input port.
-    Port,
-    /// Binder of `for i in lo..hi` (type `Index`/`i32`).
-    RangeIndex,
-    /// Binder of `owned`/`axis` (type `Index` over a semantic axis, `Coord` over a structural one).
-    Coordinate,
-    /// Binder of `for h in slice`: the semantic coordinate, a proven member of the slice.
-    SliceMember(SliceId),
-    /// Merge operand.
-    MergeOperand,
+pub struct CheckedBody {
+    pub locals: Vec<CheckedLocal>,
+    pub root: CheckedBlock,
+}
+
+impl CheckedBody {
+    /// Every call occurrence in this body, in evaluation order.
+    pub fn calls(&self) -> Vec<&CheckedCall> {
+        let mut out = Vec::new();
+        walk_block(&self.root, &mut |expr: &CheckedExpr| {
+            if let CheckedExprKind::Call { call, .. } = &expr.kind {
+                out.push(call.as_ref());
+            }
+        });
+        out
+    }
+
+    /// Every static callee definition reachable from this body.
+    pub fn callees(&self) -> Vec<crate::sir::DefId> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for call in self.calls() {
+            for binding in &call.bindings {
+                if seen.insert(binding.definition) {
+                    out.push(binding.definition);
+                }
+            }
+        }
+        out
+    }
+}
+
+fn walk_block<'a>(block: &'a CheckedBlock, visit: &mut dyn FnMut(&'a CheckedExpr)) {
+    for statement in &block.statements {
+        walk_stmt(statement, visit);
+    }
+    if let BlockTerminator::Return(values) = &block.terminator {
+        values.iter().for_each(|v| walk_expr(v, visit));
+    }
+}
+
+fn walk_stmt<'a>(statement: &'a CheckedStmt, visit: &mut dyn FnMut(&'a CheckedExpr)) {
+    match statement {
+        CheckedStmt::Let { value, .. } => walk_expr(value, visit),
+        CheckedStmt::Assign { value, .. } => walk_expr(value, visit),
+        CheckedStmt::Loop { range, body, .. } => {
+            walk_expr(&range.start, visit);
+            walk_expr(&range.end, visit);
+            walk_block(body, visit);
+        }
+        CheckedStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            walk_expr(condition, visit);
+            walk_block(then_body, visit);
+            walk_block(else_body, visit);
+        }
+        CheckedStmt::Evaluate(expr) => walk_expr(expr, visit),
+    }
+}
+
+fn walk_expr<'a>(expr: &'a CheckedExpr, visit: &mut dyn FnMut(&'a CheckedExpr)) {
+    visit(expr);
+    match &expr.kind {
+        CheckedExprKind::Primitive { operands, .. } => {
+            operands.iter().for_each(|o| walk_expr(o, visit))
+        }
+        CheckedExprKind::Capability { args, .. } => args.iter().for_each(|a| walk_expr(a, visit)),
+        CheckedExprKind::Call { args, .. } => args.iter().for_each(|a| walk_expr(a, visit)),
+        CheckedExprKind::Literal(_) | CheckedExprKind::Local(_) => {}
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SliceDecl {
-    pub var: VarId,
-    pub region: RegionId,
-    pub parent: SliceParent,
+pub struct CheckedBlock {
+    pub statements: Vec<CheckedStmt>,
+    pub terminator: BlockTerminator,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SliceParent {
-    /// A new partition of `lo..hi`. This binder is a numerical site.
-    Domain { lo: Sym, hi: Sym },
-    /// An explicit refinement of an enclosing slice. This binder is a numerical site.
-    Refine(SliceId),
-    /// Rebinding of a result member's slice. Not a site: geometry is inherited.
-    Rebind(SliceId),
+pub enum BlockTerminator {
+    /// Control continues with the enclosing construct.
+    Continue,
+    /// The function boundary's result values.
+    Return(Vec<CheckedExpr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RegionDecl {
-    pub mode: RegionMode,
-    pub binders: Vec<SliceId>,
-    /// Enclosing region, if any.
-    pub parent: Option<RegionId>,
-    pub span: Span,
-}
-
-/// One static call occurrence. `family` and the argument binding identify the contract;
-/// applicable definitions are resolved per target and workload by `family` construction.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CallSite {
-    /// Index into `Program::families`.
-    pub family: usize,
-    /// Callee shape parameter name -> bound extent, for the *contract* parameter names of
-    /// each candidate separately (candidates may name parameters differently).
-    pub bindings: Vec<CandidateBinding>,
-    pub result: Ty,
-    pub span: Span,
-}
-
-/// How one candidate definition's parameters bind at a call occurrence. Candidates whose
-/// unification failed are absent. Predicates are *not* evaluated here.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CandidateBinding {
-    pub definition: DefId,
-    pub shape_args: Vec<(String, Extent)>,
-    pub elem_args: Vec<(String, Elem)>,
-    /// Argument expression ordinal for each callee parameter (named arguments resolved).
-    pub arg_order: Vec<usize>,
-    /// Element parameters of the CALLER that must equal these concrete element types for
-    /// this candidate to apply: the callee fixes a concrete element (`bf16`, `q4g64`) where
-    /// the caller's argument element is still a parameter. Decided at family construction
-    /// against the caller template's element bindings.
-    pub requires_elems: Vec<(String, Elem)>,
-}
-
-pub type Block = Vec<Stmt>;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Stmt {
-    pub kind: StmtKind,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Pattern {
-    Var(VarId),
-    Tuple(Vec<Pattern>),
+pub enum CheckedStmt {
+    Let {
+        pattern: Pattern,
+        mutable: bool,
+        value: CheckedExpr,
+    },
+    Assign {
+        place: CheckedPlace,
+        op: AssignOp,
+        value: CheckedExpr,
+    },
+    Loop {
+        kind: LoopKind,
+        binder: LocalId,
+        range: CheckedRange,
+        body: CheckedBlock,
+        mutation: LoopMutationSummary,
+    },
+    If {
+        condition: CheckedExpr,
+        then_body: CheckedBlock,
+        else_body: CheckedBlock,
+    },
+    Evaluate(CheckedExpr),
 }
 
 /// Source-level loop semantics, independent of any physical execution width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LoopKind {
+    /// Ascending `for`; captured mutable values are carried across visits.
     Ordered,
-    Parallel,
+    /// Independent `parallel for`; no scalar/owned carry, only proved-disjoint
+    /// or atomic writes.
+    Independent,
+}
+
+/// Half-open iteration range of a loop, in ascending coordinate order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckedRange {
+    pub start: CheckedExpr,
+    pub end: CheckedExpr,
+}
+
+/// What a loop body mutates, summarized once by the checker for logical
+/// construction: ordered loops carry every changed captured value; independent
+/// loops admit only proved-disjoint element writes and atomics.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoopMutationSummary {
+    /// Mutable locals captured from enclosing scopes and written by the body
+    /// (ordered-loop carry inputs).
+    pub carried: Vec<LocalId>,
+    /// Every captured write went through an index that depends on the loop
+    /// binder (proved disjoint across independent visits).
+    pub disjoint_writes: bool,
+    /// Storage roots updated atomically inside the loop.
+    pub atomics: Vec<LocalId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum StmtKind {
-    /// `let`/`let mut`: one producer occurrence in this lexical scope.
-    Bind {
-        pattern: Pattern,
-        value: Expr,
+pub enum Pattern {
+    Local(LocalId),
+    Tuple(Vec<Pattern>),
+}
+
+/// A mutable place: a local's storage, an element/selection of it, or a tuple
+/// of places (tuple assignment).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CheckedPlace {
+    Local {
+        root: LocalId,
     },
-    /// State update. For tuple targets all right-hand sides read old versions first.
-    Assign {
-        target: Expr,
-        op: AssignOp,
-        value: Expr,
+    Element {
+        root: LocalId,
+        indices: Vec<CheckedIndex>,
     },
-    /// A region in statement position.
-    Region(Region),
-    /// A maximal run of consecutive `stage` statements.
-    Stages(Vec<Stage>),
-    /// `for i in lo..hi`
+    Tuple(Vec<CheckedPlace>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CheckedIndex {
+    Point(CheckedExpr),
+    /// `lo:hi`; `None` bounds are the axis ends.
     Range {
-        kind: LoopKind,
-        var: VarId,
-        /// Static/conservative bounds used by selection and analysis.
-        lo: Expr,
-        hi: Expr,
-        /// A runtime range value when the source is a binding rather than a literal.
-        value: Option<Expr>,
-        body: Block,
+        start: Option<CheckedExpr>,
+        end: Option<CheckedExpr>,
     },
-    /// `for i, j in owned(t)` (all axes) / `for k in axis(t, n)` (`axes == [n]`)
-    Coordinates {
-        vars: Vec<VarId>,
-        of: Expr,
-        axes: Vec<usize>,
-        body: Block,
-    },
-    /// `for h in slice`
-    Members {
-        var: VarId,
-        slice: SliceId,
-        body: Block,
-    },
-    If {
-        cond: Expr,
-        then: Block,
-        els: Block,
-    },
-    Publish {
-        value: Expr,
-        destination: Expr,
-    },
-    Yield(Vec<Expr>),
-    Return(Vec<Expr>),
-    /// A call evaluated for its `out`/`inout` effects.
-    Expr(Expr),
 }
+
+// ---------------------------------------------------------------------------
+// Checked expressions
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Region {
-    pub id: RegionId,
-    pub mode: RegionMode,
-    pub binders: Vec<VarId>,
-    pub source: RegionSource,
-    pub body: Block,
-    pub merge: Option<Merge>,
-    /// `Some` when used as an expression without `merge`: the result type. With `merge`
-    /// the expression's type is the merged member type.
-    pub result: Option<Ty>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RegionSource {
-    /// New partitions / refinements, one per binder; see each binder's `SliceDecl::parent`.
-    Domains,
-    /// Traversal of an earlier region result with its original slices.
-    Results(Box<Expr>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Merge {
-    pub left: Pattern,
-    pub right: Pattern,
-    pub identity: Expr,
-    pub body: Block,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Stage {
-    pub name: String,
-    pub ports: Vec<VarId>,
-    pub body: Block,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug)]
-pub struct Expr {
-    pub kind: ExprKind,
-    pub ty: Ty,
-    /// Symbolic value of integer expressions over shape parameters and indices.
+pub struct CheckedExpr {
+    pub kind: CheckedExprKind,
+    pub ty: ValueType,
+    /// Symbolic value of integer expressions over shape parameters and
+    /// indices, when the checker proved one.
     pub sym: Option<Sym>,
-    pub partial: bool,
     pub span: Span,
 }
 
-impl PartialEq for Expr {
-    fn eq(&self, other: &Self) -> bool {
-        let same_kind = match (&self.kind, &other.kind) {
-            (ExprKind::Float(a), ExprKind::Float(b)) => a.to_bits() == b.to_bits(),
-            (a, b) => a == b,
-        };
-        same_kind && self.ty == other.ty && self.sym == other.sym && self.span == other.span
+impl CheckedExpr {
+    pub fn new(kind: CheckedExprKind, ty: ValueType, sym: Option<Sym>, span: Span) -> CheckedExpr {
+        CheckedExpr {
+            kind,
+            ty,
+            sym,
+            span,
+        }
     }
 }
 
+/// A checked expression contains only registry primitives and static
+/// function-family calls — never physical tiles, participants, launches,
+/// structural slices, native fragments, or memory spaces.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Index {
-    /// Scalar point (semantic coordinate; membership proved for structural axes).
-    Point(Expr),
-    /// Tile coordinate over a structural axis.
-    Coord(VarId),
-    /// Slice binder.
-    Slice(SliceId),
-    /// `lo:hi` semantic range; `None` is the axis bound.
-    Range {
-        start: Option<Expr>,
-        end: Option<Expr>,
+pub enum CheckedExprKind {
+    Literal(Literal),
+    Local(LocalId),
+    Primitive {
+        id: PrimitiveId,
+        operands: Vec<CheckedExpr>,
+    },
+    Capability {
+        id: IntrinsicId,
+        args: Vec<CheckedExpr>,
+    },
+    Call {
+        call: Box<CheckedCall>,
+        args: Vec<CheckedExpr>,
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Math {
-    Fma,
-    Exp,
-    ExpFast,
-    Rsqrt,
-    Sqrt,
-    Log,
-    Sin,
-    Cos,
-    Abs,
-    Max,
-    Min,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReduceOp {
-    Sum,
-    Max,
-    Min,
-    Argmax,
-}
-
 #[derive(Clone, Debug, PartialEq)]
-pub enum ExprKind {
+pub enum Literal {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Var(VarId),
     /// A shape parameter used as a value.
     ShapeParam(String),
-    Tuple(Vec<Expr>),
-    /// A bounded logical half-open range value.
-    Range {
-        lo: Box<Expr>,
-        hi: Box<Expr>,
-    },
-    Field {
-        base: Box<Expr>,
-        index: usize,
-    },
-    /// `tile[shape] elem`: uninitialized owned tile.
-    TileAlloc,
-    /// `zeros_like` / `ones_like`: shape of the operand, given dtype, constant fill.
-    Filled {
-        like: Box<Expr>,
-        value: f64,
-    },
-    /// Element read (all points) or view (otherwise) of a tensor, view, tile.
-    Index {
-        base: Box<Expr>,
-        indices: Vec<Index>,
-    },
-    /// `results[p]` / `results[rows, cols]`
-    Member {
-        result: Box<Expr>,
-        slices: Vec<SliceId>,
-    },
-    Transpose(Box<Expr>),
-    Reshape {
-        base: Box<Expr>,
-        axes: Vec<Extent>,
-    },
-    /// Snapshot in the view's own representation.
-    Load(Box<Expr>),
-    /// Dense f32 tile of a packed view.
-    Decode(Box<Expr>),
-    /// Scalar cast, or elementwise read-and-convert of a tile/view (yields a tile).
-    Cast {
-        dtype: DType,
-        expr: Box<Expr>,
-    },
-    /// Scalar or elementwise (tile operands, scalar broadcast).
-    Unary {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
-    Binary {
-        op: BinaryOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    Math {
-        op: Math,
-        args: Vec<Expr>,
-    },
-    Select {
-        cond: Box<Expr>,
-        then: Box<Expr>,
-        els: Box<Expr>,
-    },
-    /// `unordered` (`reduce(t, axis, sum, unordered=true)`) permits reassociation: a backend may combine lane partials. The reference
-    /// interpreter always accumulates in ascending index order.
-    Reduce {
-        value: Box<Expr>,
-        axis: usize,
-        op: ReduceOp,
-        unordered: bool,
-    },
-    /// Semantic coordinate of a tile coordinate.
-    CoordOf(VarId),
-    /// `extent(v, axis)` on a semantic axis.
-    ExtentOf {
-        base: Box<Expr>,
-        axis: usize,
-    },
-    Call {
-        call: CallId,
-        args: Vec<Expr>,
-    },
-    /// A result-producing region (with or without merge).
-    Region(Box<Region>),
-    // Target-dependent forms.
-    Intrinsic {
-        op: Operation,
-        args: Vec<Expr>,
-    },
-    /// Packed plane accessor: `words`, `scale`, `bias`.
-    Accessor {
-        base: Box<Expr>,
-        name: String,
-    },
-    /// `capacity(t, axis)` / `valid(t, axis)` under geometry authority.
-    Geometry {
-        base: Box<Expr>,
-        axis: usize,
-        valid: bool,
-    },
-    Atomic {
-        op: BinaryOp,
-        place: Box<Expr>,
-        value: Box<Expr>,
-    },
+}
+
+/// One static call occurrence: the family it names and, per candidate
+/// definition that unifies with the arguments, how its parameters bind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckedCall {
+    /// Index into `Program::families`.
+    pub family: usize,
+    /// Candidates whose unification succeeded, in definition order.
+    /// Predicates are *not* evaluated here.
+    pub bindings: Vec<CandidateBinding>,
+    pub span: Span,
+}
+
+/// How one candidate definition's parameters bind at a call occurrence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateBinding {
+    pub definition: DefId,
+    /// Callee shape parameter name -> bound symbolic extent.
+    pub shape_args: Vec<(String, Sym)>,
+    pub elem_args: Vec<(String, Elem)>,
+    /// Argument expression ordinal for each callee parameter (named arguments resolved).
+    pub arg_order: Vec<usize>,
+    /// Element parameters of the CALLER that must equal these concrete element
+    /// types for this candidate to apply.
+    pub requires_elems: Vec<(String, Elem)>,
+}
+
+pub fn sym_extent(sym: Sym) -> ExtentExpr {
+    match sym.as_constant() {
+        Some(c) if c >= 0 => ExtentExpr::Static(c as u64),
+        _ => ExtentExpr::Sym(sym),
+    }
 }

@@ -8,7 +8,7 @@ fn norm_rotary[P, S, SH, SW](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32
     let ss = sum_any_order(to_owned(xf * xf))
     let inv = rsqrt(ss / f32(2 * P + S) + epsilon)
     let normalized = xf * inv * f32(wt)
-    let mut rotated = to_owned(zeros_like(x, dtype=f32))
+    let mut rotated = zeros_like(x, dtype=f32)
     for i in 0..2 * P + S:
         if i < 2 * P:
             let pair = i % P

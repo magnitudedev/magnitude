@@ -1,12 +1,16 @@
-//! Statements: bindings, state updates, logical loops, and return path rules.
+//! Statements: bindings, state updates, loops, branches, and return paths —
+//! emitted as the section-5 checked statement set.
 
-use super::resolve::ParamOwnership;
-use super::{elem_rounds, var_atom, Checker};
-use crate::sir::{self, Expr, ExprKind, Stmt, StmtKind, VarId, VarKind};
+use super::{elem_rounds, var_atom, Checker, LocalKind, ValueClass};
+use crate::sir::ParamOwnership;
+use crate::sir::{
+    BlockTerminator, CheckedBlock, CheckedExpr, CheckedExprKind, CheckedIndex, CheckedPlace,
+    CheckedRange, CheckedStmt, LoopKind, LoopMutationSummary, Pattern,
+};
 use crate::span::Span;
 use crate::sym::Sym;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, ExprKind as A};
-use crate::types::{DType, Extent, RegionId, Ty};
+use crate::types::{DType, Elem, ExtentExpr, ValueType};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,101 +33,99 @@ impl<'a> Checker<'a> {
         }
     }
 
-    pub fn block(&mut self, b: &ast::Block) -> Vec<Stmt> {
-        let mut out = Vec::new();
+    /// Check one source block into a checked block with its terminator.
+    pub fn block(&mut self, b: &ast::Block) -> CheckedBlock {
+        let mut statements = Vec::new();
+        let mut terminator = BlockTerminator::Continue;
+        let mut terminal = false;
         for s in &b.stmts {
-            if self.yields.last().is_some_and(|y| y.done) {
+            if terminal {
                 self.error(
                     s.span,
-                    "unreachable statement: `yield`/`return` is terminal for its result boundary",
+                    "unreachable statement: `return` is terminal for the function boundary",
                 );
+                continue;
             }
-            if let Some(kind) = self.stmt(s) {
-                out.push(Stmt { kind, span: s.span });
+            match self.stmt(s) {
+                Some(PartialStmt::Terminal(values)) => {
+                    terminator = BlockTerminator::Return(values);
+                    terminal = true;
+                }
+                Some(PartialStmt::Statement(CheckedStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                })) => {
+                    // An `if` whose arms both return ends this path; the arms
+                    // carry their own result values.
+                    let both = matches!(then_body.terminator, BlockTerminator::Return(_))
+                        && matches!(else_body.terminator, BlockTerminator::Return(_));
+                    statements.push(CheckedStmt::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    });
+                    if both {
+                        terminal = true;
+                    }
+                }
+                Some(PartialStmt::Statement(other)) => statements.push(other),
+                None => {}
             }
         }
-        out
+        if terminal && matches!(terminator, BlockTerminator::Continue) {
+            terminator = BlockTerminator::Return(Vec::new());
+        }
+        CheckedBlock {
+            statements,
+            terminator,
+        }
     }
 
-    fn scoped_block(&mut self, b: &ast::Block) -> Vec<Stmt> {
+    fn scoped_block(&mut self, b: &ast::Block) -> CheckedBlock {
         self.push_scope();
         let out = self.block(b);
         self.pop_scope();
         out
     }
 
-    fn stmt(&mut self, s: &ast::Stmt) -> Option<StmtKind> {
+    fn stmt(&mut self, s: &ast::Stmt) -> Option<PartialStmt> {
         match &s.kind {
             ast::StmtKind::Let {
                 mutable,
                 pattern,
                 value,
-            } => self.bind(pattern, value, *mutable),
-            ast::StmtKind::Assign { target, op, value } => self.assign(target, *op, value),
+            } => self
+                .bind(pattern, value, *mutable)
+                .map(PartialStmt::Statement),
+            ast::StmtKind::Assign { target, op, value } => {
+                self.assign(target, *op, value).map(PartialStmt::Statement)
+            }
             ast::StmtKind::For {
                 parallel,
                 targets,
                 iter,
                 body,
             } => {
-                // State carried through a loop is not its pre-loop definition on every visit.
-                self.dyn_slices.clear();
-                if let Some(y) = self.yields.last_mut() {
-                    y.loops += 1;
-                }
+                self.dyn_views.clear();
                 let kind = self.for_stmt(*parallel, targets, iter, body);
-                if let Some(y) = self.yields.last_mut() {
-                    y.loops -= 1;
-                }
-                kind
+                kind.map(PartialStmt::Statement)
             }
-            ast::StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els.as_ref()),
+            ast::StmtKind::If { cond, then, els } => self
+                .if_stmt(cond, then, els.as_ref())
+                .map(PartialStmt::Statement),
             ast::StmtKind::Return(values) => self.return_stmt(values, s.span),
             ast::StmtKind::Expr(e) => {
                 let e = self.expr(e, None)?;
-                if e.ty != Ty::Void {
-                    self.error(e.span, format!("an expression statement is a call evaluated for its `out`/`inout` effects; this value of type {} is unused", e.ty));
+                if !e.ty.is_void() {
+                    self.error(e.span, format!("an expression statement is a call evaluated for its `inout` effects; this value of type {} is unused", e.ty));
                 }
-                Some(StmtKind::Expr(e))
+                Some(PartialStmt::Statement(CheckedStmt::Evaluate(e)))
             }
         }
     }
 
     // ---- bindings ----
-
-    /// A source value expression.
-    fn value(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> Option<Expr> {
-        self.expr(e, expected)
-    }
-
-    /// Partial flags of the components of a tuple-typed value.
-    fn component_partials(&self, e: &Expr, n: usize) -> Vec<bool> {
-        match &e.kind {
-            ExprKind::Tuple(items) if items.len() == n => items.iter().map(|i| i.partial).collect(),
-            ExprKind::Member { result, .. } => match &result.ty {
-                Ty::Result(r) => self
-                    .result_partials
-                    .get(&r.producer)
-                    .filter(|p| p.len() == n)
-                    .cloned()
-                    .unwrap_or_else(|| vec![e.partial; n]),
-                _ => vec![e.partial; n],
-            },
-            _ => vec![e.partial; n],
-        }
-    }
-
-    fn partial_origin_of(&self, e: &Expr) -> Option<RegionId> {
-        match &e.kind {
-            ExprKind::Member { result, .. } => match &result.ty {
-                Ty::Result(r) => Some(r.origin),
-                _ => None,
-            },
-            ExprKind::Var(v) => self.partial_origin.get(v).copied(),
-            ExprKind::Cast { expr, .. } => self.partial_origin_of(expr),
-            _ => None,
-        }
-    }
 
     fn poison(&mut self, pattern: &ast::Pattern) {
         match pattern {
@@ -134,69 +136,66 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind(&mut self, pattern: &ast::Pattern, value: &ast::Expr, state: bool) -> Option<StmtKind> {
-        let Some(value) = self.value(value, None) else {
+    fn bind(
+        &mut self,
+        pattern: &ast::Pattern,
+        value: &ast::Expr,
+        state: bool,
+    ) -> Option<CheckedStmt> {
+        let value = self.expr(value, None)?;
+        if value.ty.is_void() {
+            self.error(value.span, "cannot bind a call that returns nothing");
             self.poison(pattern);
             return None;
-        };
-        if value.ty == Ty::Void {
-            self.error(value.span, "cannot bind a call that returns nothing");
-            return None;
         }
-        let origin = self.partial_origin_of(&value);
-        let moved = matches!(value.ty, Ty::Tensor(_))
-            .then(|| self.root_var(&value))
-            .flatten();
-        let pattern = self.destructure(pattern, &value.ty.clone(), &value, state, origin)?;
+        let moved = (matches!(value.ty, ValueType::Tensor(_))
+            && matches!(self.class_of(&value), ValueClass::Owned))
+        .then(|| self.root_var(&value))
+        .flatten();
+        let pattern = self.destructure(pattern, &value.ty.clone(), &value, state)?;
         if let Some(root) = moved {
             self.moved.insert(root);
         }
-        Some(StmtKind::Bind { pattern, value })
+        Some(CheckedStmt::Let {
+            pattern,
+            mutable: state,
+            value,
+        })
     }
 
     fn destructure(
         &mut self,
         pattern: &ast::Pattern,
-        ty: &Ty,
-        value: &Expr,
+        ty: &ValueType,
+        value: &CheckedExpr,
         state: bool,
-        origin: Option<RegionId>,
-    ) -> Option<sir::Pattern> {
+    ) -> Option<Pattern> {
         match pattern {
             ast::Pattern::Name(name) => {
-                if state && matches!(ty, Ty::Slice(_) | Ty::Coord(_) | Ty::Range(_)) {
-                    self.error(name.span, format!("`let mut` declares mutable state or a mutable storage capability; a {ty} is a structural handle and is bound with `let`"));
-                    return None;
-                }
-                if matches!(ty, Ty::Coord(_)) {
-                    self.error(name.span, "a tile coordinate cannot be rebound; it indexes tiles sharing its axis or is converted with `coord(i)`");
-                    return None;
-                }
                 let id = self.declare(
                     &name.name,
                     ty.clone(),
                     name.span,
                     if state {
-                        VarKind::State
+                        LocalKind::State
                     } else {
-                        VarKind::Value
+                        LocalKind::Value
                     },
+                    state,
                 );
-                self.vars[id].partial = value.partial;
-                if value.partial {
-                    if let Some(origin) = origin {
-                        self.partial_origin.insert(id, origin);
+                if matches!(
+                    value.kind,
+                    CheckedExprKind::Primitive {
+                        id: crate::intrinsics::PrimitiveId::TensorAlloc { .. },
+                        ..
                     }
-                }
-                if matches!(value.kind, ExprKind::TileAlloc) {
+                ) {
                     self.unassigned.insert(id);
                 }
-                if matches!(ty, Ty::View(_)) {
+                // A view binding borrows the storage it selects.
+                if matches!(self.class_of(value), ValueClass::Borrowed) {
                     if let Some(root) = self.root_var(value) {
-                        let writable = matches!(
-                            self.vars[root].kind,
-                            VarKind::Param(i) if self.sig.params[i].mode != sir::Mode::In
-                        ) || matches!(self.vars[root].kind, VarKind::State);
+                        let writable = self.writable_root(root);
                         let exclusive = state && writable;
                         if self.borrows.values().any(|(borrowed, prior_exclusive)| {
                             *borrowed == root && (exclusive || *prior_exclusive)
@@ -205,7 +204,7 @@ impl<'a> Checker<'a> {
                                 name.span,
                                 format!(
                                     "tensor borrow of `{}` overlaps a live {} borrow",
-                                    self.vars[root].name,
+                                    self.locals[root].name,
                                     if exclusive {
                                         "mutable"
                                     } else {
@@ -221,39 +220,43 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if !state && ty.scalar_dtype() == Some(DType::I32) {
-                    match (&value.sym, &value.kind) {
-                        (Some(sym), _) => {
+                    match &value.sym {
+                        Some(sym) => {
                             self.scalar_symbols.insert(id, sym.clone());
                         }
-                        // A scalar argmax over a semantic axis is an index into that axis.
-                        (
-                            None,
-                            ExprKind::Reduce {
-                                value: reduced,
-                                axis,
-                                op: sir::ReduceOp::Argmax,
-                                ..
-                            },
-                        ) => {
-                            if let Some(Extent::Semantic(extent)) =
-                                reduced.ty.shaped().and_then(|s| s.axes.get(*axis)).cloned()
+                        None => {
+                            // A scalar argmax over an axis is an index into that axis.
+                            if let CheckedExprKind::Primitive {
+                                id:
+                                    crate::intrinsics::PrimitiveId::Reduce {
+                                        op: crate::intrinsics::ReduceOp::Argmax,
+                                        axis,
+                                        ..
+                                    },
+                                operands,
+                            } = &value.kind
                             {
-                                let atom = var_atom(&name.name, id);
-                                self.facts.set_range(
-                                    atom.clone(),
-                                    Sym::constant(0),
-                                    extent.sub(&Sym::constant(1)),
-                                );
-                                self.atoms.insert(id, atom);
+                                if let Some(ExtentExpr::Sym(extent)) = operands
+                                    .first()
+                                    .and_then(|o| o.ty.shaped())
+                                    .and_then(|s| s.axes.get(*axis))
+                                {
+                                    let atom = var_atom(&name.name, id);
+                                    self.facts.set_range(
+                                        atom.clone(),
+                                        Sym::constant(0),
+                                        extent.sub(&Sym::constant(1)),
+                                    );
+                                    self.atoms.insert(id, atom);
+                                }
                             }
                         }
-                        _ => {}
                     }
                 }
-                Some(sir::Pattern::Var(id))
+                Some(Pattern::Local(id))
             }
             ast::Pattern::Tuple(items) => {
-                let Ty::Tuple(tys) = ty else {
+                let ValueType::Tuple(tys) = ty else {
                     self.error(
                         value.span,
                         format!("a tuple pattern destructures a tuple; this value is a {ty}"),
@@ -271,36 +274,43 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                let partials = self.component_partials(value, tys.len());
-                let parts: Vec<Option<&Expr>> = match &value.kind {
-                    ExprKind::Tuple(parts) if parts.len() == tys.len() => {
-                        parts.iter().map(Some).collect()
+                let parts: Vec<Option<CheckedExpr>> = match &value.kind {
+                    CheckedExprKind::Primitive {
+                        id: crate::intrinsics::PrimitiveId::TuplePack,
+                        operands,
+                    } if operands.len() == tys.len() => {
+                        operands.iter().cloned().map(Some).collect()
                     }
                     _ => vec![None; tys.len()],
                 };
                 let mut out = Vec::new();
-                for (((item, ty), partial), part) in items.iter().zip(tys).zip(partials).zip(parts)
-                {
-                    let component = match part {
-                        Some(part) => part.clone(),
-                        None => Expr {
-                            kind: ExprKind::Tuple(Vec::new()),
-                            ty: ty.clone(),
-                            sym: None,
-                            partial,
-                            span: value.span,
-                        },
-                    };
-                    out.push(self.destructure(item, ty, &component, state, origin)?);
+                for (i, ((item, ty), part)) in items.iter().zip(tys.iter()).zip(parts).enumerate() {
+                    let component = part.unwrap_or_else(|| {
+                        CheckedExpr::new(
+                            CheckedExprKind::Primitive {
+                                id: crate::intrinsics::PrimitiveId::TupleGet(i),
+                                operands: vec![value.clone()],
+                            },
+                            ty.clone(),
+                            None,
+                            value.span,
+                        )
+                    });
+                    out.push(self.destructure(item, ty, &component, state)?);
                 }
-                Some(sir::Pattern::Tuple(out))
+                Some(Pattern::Tuple(out))
             }
         }
     }
 
     // ---- state updates ----
 
-    fn assign(&mut self, target: &ast::Expr, op: AssignOp, value: &ast::Expr) -> Option<StmtKind> {
+    fn assign(
+        &mut self,
+        target: &ast::Expr,
+        op: AssignOp,
+        value: &ast::Expr,
+    ) -> Option<CheckedStmt> {
         match &target.kind {
             A::Tuple(places) => {
                 if op != AssignOp::Assign {
@@ -316,41 +326,35 @@ impl<'a> Checker<'a> {
                         );
                         return None;
                     };
-                    targets.push(self.state_place(name)?);
+                    targets.push((
+                        self.state_place(name)?,
+                        self.locals[self.lookup(&name.name)?].ty.clone(),
+                    ));
                 }
-                let expected = Ty::Tuple(targets.iter().map(|t| t.ty.clone()).collect());
-                // All right-hand sides read the old versions. Accumulating a partial into
-                // state is recognized per component of a tuple literal.
+                let expected = ValueType::Tuple(
+                    crate::types::NonEmpty::new(targets.iter().map(|(_, t)| t.clone()).collect())
+                        .expect("tuple assignment has components"),
+                );
+                // All right-hand sides read the old versions.
                 let value = match &value.kind {
                     A::Tuple(parts) if parts.len() == targets.len() => {
                         let mut out = Vec::new();
-                        for (part, place) in parts.iter().zip(&targets) {
-                            let component = match self.accumulation(part, place) {
-                                Some(built) => built?,
-                                None => self.expr(part, Some(&place.ty))?,
-                            };
-                            if !place.partial {
-                                self.forbid_partial(&component, "a state update");
-                            }
+                        for (part, (_, ty)) in parts.iter().zip(&targets) {
+                            let component = self.expr(part, Some(ty))?;
                             out.push(component);
                         }
-                        let ty = Ty::Tuple(out.iter().map(|e| e.ty.clone()).collect());
-                        let partial = out.iter().any(|e| e.partial);
-                        Expr {
-                            kind: ExprKind::Tuple(out),
-                            ty,
-                            sym: None,
-                            partial,
-                            span: value.span,
-                        }
+                        let tys: Vec<ValueType> = out.iter().map(|e| e.ty.clone()).collect();
+                        CheckedExpr::new(
+                            CheckedExprKind::Primitive {
+                                id: crate::intrinsics::PrimitiveId::TuplePack,
+                                operands: out.clone(),
+                            },
+                            ValueType::Tuple(crate::types::NonEmpty::new(tys).expect("components")),
+                            None,
+                            value.span,
+                        )
                     }
-                    _ => {
-                        let value = self.expr(value, Some(&expected))?;
-                        if !targets.iter().all(|t| t.partial) {
-                            self.forbid_partial(&value, "a state update");
-                        }
-                        value
-                    }
+                    _ => self.expr(value, Some(&expected))?,
                 };
                 if !self.assignable(&expected, &value.ty) {
                     self.error(
@@ -362,25 +366,23 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                for place in &targets {
-                    self.write(place, place.span, true)?;
+                for (place, _) in &targets {
+                    self.write_place(place, true, target.span)?;
                 }
-                let target = Expr {
-                    kind: ExprKind::Tuple(targets),
-                    ty: expected,
-                    sym: None,
-                    partial: false,
-                    span: target.span,
-                };
-                Some(StmtKind::Assign { target, op, value })
+                let places = targets.into_iter().map(|(p, _)| p).collect();
+                Some(CheckedStmt::Assign {
+                    place: CheckedPlace::Tuple(places),
+                    op,
+                    value,
+                })
             }
             A::Name(name) => {
                 let place = self.state_place(name)?;
-                let ty = place.ty.clone();
-                let value = match (op, self.accumulation_if(op, value, &place)) {
-                    (_, Some(built)) => built?,
-                    (_, None) => self.expr(value, Some(&ty))?,
+                let ty = match &place {
+                    CheckedPlace::Local { root } => self.locals[*root].ty.clone(),
+                    _ => unreachable!(),
                 };
+                let value = self.expr(value, Some(&ty))?;
                 if op == AssignOp::Assign {
                     if !self.assignable(&ty, &value.ty) {
                         self.error(
@@ -395,169 +397,204 @@ impl<'a> Checker<'a> {
                 } else {
                     self.arith_assign(&ty, &value, op)?;
                 }
-                if !place.partial && !(op == AssignOp::Add && self.accumulates_into(&value)) {
-                    self.forbid_partial(&value, "a state update");
-                }
-                let moved = (op == AssignOp::Assign && matches!(value.ty, Ty::Tensor(_)))
-                    .then(|| self.root_var(&value))
-                    .flatten();
-                let root = self.write(&place, target.span, true)?;
-                if op == AssignOp::Assign && matches!(ty, Ty::Tensor(_)) {
-                    // Assignment reinitializes owned state, including state that was moved
-                    // earlier on this path. The source is consumed separately below.
+                let moved = (op == AssignOp::Assign
+                    && matches!(value.ty, ValueType::Tensor(_))
+                    && matches!(self.class_of(&value), ValueClass::Owned))
+                .then(|| self.root_var(&value))
+                .flatten();
+                let root = self.write_place(&place, true, target.span)?;
+                if op == AssignOp::Assign && matches!(ty, ValueType::Tensor(_)) {
+                    // Assignment reinitializes owned state, including state that
+                    // was moved earlier on this path.
                     self.moved.remove(&root);
                 }
                 if let Some(source) = moved.filter(|source| *source != root) {
                     self.moved.insert(source);
                 }
                 self.unassigned.remove(&root);
-                Some(StmtKind::Assign {
-                    target: place,
-                    op,
-                    value,
-                })
+                Some(CheckedStmt::Assign { place, op, value })
             }
-            A::Index { base, .. } => {
-                let A::Name(base_name) = &base.kind else {
+            A::Index { .. } => {
+                let (root, indices, selected) = self.place(target)?;
+                let binding = match &target.kind {
+                    A::Index { base, .. } => match &base.kind {
+                        A::Name(name) => self.lookup(&name.name),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(binding) = binding else {
                     self.error(
-                        base.span,
-                        "element assignment indexes a tile variable directly",
+                        target.span,
+                        "element assignment indexes a tensor variable directly",
                     );
                     return None;
                 };
-                let Some(id) = self.lookup(&base_name.name) else {
-                    self.error(
-                        base_name.span,
-                        format!("`{}` is not declared", base_name.name),
-                    );
+                if !self.writable_root(self.root_var_local(binding)) {
+                    self.error(target.span, format!("`{}` is not writable storage; writing requires `let mut` state or a `&mut tensor` parameter", self.locals[binding].name));
                     return None;
-                };
-                let logical_mut = matches!(
-                    self.vars[id].kind,
-                    VarKind::Param(parameter)
-                        if self.sig.params[parameter].ownership == ParamOwnership::Exclusive
-                ) || matches!(
-                    (&self.vars[id].kind, &self.vars[id].ty),
-                    (VarKind::State, Ty::Tensor(_))
-                ) || self
-                    .borrows
-                    .get(&id)
-                    .is_some_and(|(_, exclusive)| *exclusive);
-                if !matches!(self.vars[id].ty, Ty::Tile(_)) && !logical_mut {
-                    self.error(target.span, format!("only tile elements are assigned; `{}` is a {}. `publish` is the only write to tensor storage", base_name.name, self.vars[id].ty));
-                    return None;
+                }
+                // Packed representations are readable and decodable but never
+                // writable; no reachable interpreter or emitter panic remains.
+                if let Some(shaped) = self.locals[binding].ty.shaped() {
+                    if matches!(shaped.elem, Elem::Repr(_)) {
+                        self.error(
+                            target.span,
+                            "packed representations are readable and decodable but not writable",
+                        );
+                        return None;
+                    }
                 }
                 let pending = self
                     .pending_full_assign
                     .iter()
-                    .find(|(v, _)| *v == id)
+                    .find(|(v, _)| *v == root)
                     .map(|(_, axes)| axes.clone());
-                if self.unassigned.contains(&id) && pending.is_none() && self.init_loop_depth == 0 {
-                    self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through `for … in owned(…)`", base_name.name));
+                if self.unassigned.contains(&root) && pending.is_none() && self.init_loop_depth == 0
+                {
+                    self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through a complete `for … in 0..extent` traversal", self.locals[root].name));
                     return None;
                 }
-                let place = self.place(target)?;
                 let covers = op == AssignOp::Assign
                     && pending.as_ref().is_some_and(|axes| {
-                        let ExprKind::Index { indices, .. } = &place.kind else {
-                            return false;
-                        };
                         indices.len() == axes.len()
                             && indices.iter().zip(axes).all(|(index, axis)| match index {
-                                sir::Index::Coord(v) => v == axis,
-                                sir::Index::Point(e) => {
-                                    matches!(e.kind, ExprKind::Var(v) if v == *axis)
+                                CheckedIndex::Point(p) => {
+                                    matches!(&p.kind, CheckedExprKind::Local(v) if v == axis)
                                 }
                                 _ => false,
                             })
                     });
-                let Ty::Scalar(dtype) = place.ty.clone() else {
-                    if op != AssignOp::Assign {
+                match &selected {
+                    ValueType::Scalar(dtype) => {
+                        let dtype = *dtype;
+                        let value = self.expr(value, Some(&ValueType::Scalar(dtype)))?;
+                        let Some(vd) = value.ty.scalar_dtype() else {
+                            self.error(
+                                value.span,
+                                format!(
+                                    "cannot assign {} to an element of dtype {}",
+                                    value.ty,
+                                    dtype.name()
+                                ),
+                            );
+                            return None;
+                        };
+                        if op == AssignOp::Assign {
+                            if !(vd == dtype || (vd.is_float() && dtype.is_float())) {
+                                self.error(
+                                    value.span,
+                                    format!(
+                                        "cannot assign {} to an element of dtype {}; cast explicitly",
+                                        vd.name(),
+                                        dtype.name()
+                                    ),
+                                );
+                            }
+                        } else {
+                            self.arith_assign(&ValueType::Scalar(dtype), &value, op)?;
+                        }
+                        self.write(root, binding, &indices, false, target.span)?;
+                        if covers {
+                            self.unassigned.remove(&root);
+                            self.pending_full_assign
+                                .retain(|(variable, _)| *variable != root);
+                        }
+                        Some(CheckedStmt::Assign {
+                            place: CheckedPlace::Element { root, indices },
+                            op,
+                            value,
+                        })
+                    }
+                    ValueType::Tensor(_) => {
+                        if op != AssignOp::Assign {
+                            self.error(
+                                target.span,
+                                "compound assignment requires a scalar element place",
+                            );
+                            return None;
+                        }
+                        let value = self.expr(value, None)?;
+                        let compatible = match (&value.ty, &selected) {
+                            (ValueType::Tensor(v), ValueType::Tensor(d)) => {
+                                self.same_axes(v, d) && elem_rounds(&v.elem, &d.elem)
+                            }
+                            _ => false,
+                        };
+                        if !compatible {
+                            self.error(
+                                value.span,
+                                format!(
+                                    "cannot assign {} to {}; convert explicitly",
+                                    value.ty, selected
+                                ),
+                            );
+                            return None;
+                        }
+                        self.write(root, binding, &indices, false, target.span)?;
+                        if covers
+                            || indices.iter().all(|i| {
+                                matches!(
+                                    i,
+                                    CheckedIndex::Range {
+                                        start: None,
+                                        end: None
+                                    }
+                                )
+                            })
+                        {
+                            self.unassigned.remove(&root);
+                            self.pending_full_assign
+                                .retain(|(variable, _)| *variable != root);
+                        }
+                        Some(CheckedStmt::Assign {
+                            place: CheckedPlace::Element { root, indices },
+                            op,
+                            value,
+                        })
+                    }
+                    other => {
                         self.error(
                             target.span,
-                            "compound assignment requires a scalar element place",
+                            format!("cannot assign into a place of type {other}"),
                         );
-                        return None;
+                        None
                     }
-                    let value = self.expr(value, None)?;
-                    let compatible = match (&value.ty, &place.ty) {
-                        (
-                            Ty::Tile(v) | Ty::View(v) | Ty::Tensor(v),
-                            Ty::Tensor(d) | Ty::View(d) | Ty::Tile(d),
-                        ) => self.same_axes(v, d) && elem_rounds(&v.elem, &d.elem),
-                        _ => false,
-                    };
-                    if !compatible {
-                        self.error(
-                            value.span,
-                            format!(
-                                "cannot assign {} to {}; convert explicitly",
-                                value.ty, place.ty
-                            ),
-                        );
-                        return None;
-                    }
-                    self.forbid_partial(&value, "a tensor slice assignment");
-                    let root = self.write(&place, target.span, false)?;
-                    if covers || self.covers_whole(&place) {
-                        self.unassigned.remove(&root);
-                        self.pending_full_assign
-                            .retain(|(variable, _)| *variable != id);
-                    }
-                    return Some(StmtKind::Publish {
-                        value,
-                        destination: place,
-                    });
-                };
-                let value = self.expr(value, Some(&Ty::Scalar(dtype)))?;
-                let Some(vd) = value.ty.scalar_dtype() else {
-                    self.error(
-                        value.span,
-                        format!(
-                            "cannot assign {} to an element of dtype {}",
-                            value.ty,
-                            dtype.name()
-                        ),
-                    );
-                    return None;
-                };
-                if op == AssignOp::Assign {
-                    if !(vd == dtype || (vd.is_float() && dtype.is_float())) {
-                        self.error(
-                            value.span,
-                            format!(
-                                "cannot assign {} to an element of dtype {}; cast explicitly",
-                                vd.name(),
-                                dtype.name()
-                            ),
-                        );
-                    }
-                } else {
-                    self.arith_assign(&Ty::Scalar(dtype), &value, op)?;
                 }
-                self.forbid_partial(&value, "an element assignment");
-                self.write(&place, target.span, false)?;
-                if covers {
-                    self.unassigned.remove(&id);
-                    self.pending_full_assign.retain(|(v, _)| *v != id);
-                }
-                Some(StmtKind::Assign {
-                    target: place,
-                    op,
-                    value,
-                })
             }
             _ => {
                 self.error(
                     target.span,
-                    "an assignment target is `let mut` state, a tile element, or a tuple of state",
+                    "an assignment target is `let mut` state, a tensor element, or a tuple of state",
                 );
                 None
             }
         }
     }
 
-    fn state_place(&mut self, name: &ast::Ident) -> Option<Expr> {
+    /// Record a whole-variable write through a place.
+    fn write_place(
+        &mut self,
+        place: &CheckedPlace,
+        whole: bool,
+        span: Span,
+    ) -> Option<crate::sir::LocalId> {
+        match place {
+            CheckedPlace::Local { root } => self.write(*root, *root, &[], whole, span),
+            CheckedPlace::Element { root, indices } => {
+                self.write(*root, *root, indices, whole, span)
+            }
+            CheckedPlace::Tuple(places) => {
+                let mut last = None;
+                for p in places {
+                    last = self.write_place(p, whole, span);
+                }
+                last
+            }
+        }
+    }
+
+    fn state_place(&mut self, name: &ast::Ident) -> Option<CheckedPlace> {
         let Some(id) = self.lookup(&name.name) else {
             self.error(
                 name.span,
@@ -568,139 +605,36 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        let ty = self.vars[id].ty.clone();
-        match self.vars[id].kind {
-            VarKind::State => {}
-            VarKind::Param(i)
-                if self.sig.params[i].mode != sir::Mode::In && matches!(ty, Ty::Tile(_)) => {}
-            VarKind::Slice(_) => {
-                self.error(
-                    name.span,
-                    format!(
-                        "slice `{}` is immutable geometry and cannot be reassigned",
-                        name.name
-                    ),
-                );
-                return None;
-            }
+        match self.kinds[id] {
+            LocalKind::State => {}
+            LocalKind::Param(i) if self.sig.params[i].ownership == ParamOwnership::Exclusive => {}
             _ => {
-                self.error(name.span, format!("`{}` is not mutable state; only `let mut` bindings and `out`/`inout` tiles are assigned", name.name));
+                self.error(name.span, format!("`{}` is not mutable state; only `let mut` bindings and `&mut tensor` parameters are assigned", name.name));
                 return None;
             }
         }
-        if matches!(ty, Ty::Result(_) | Ty::Native(_)) {
+        if matches!(self.locals[id].ty, ValueType::CapabilityValue(_)) {
             self.error(
                 name.span,
-                format!("a {ty} is immutable once produced and cannot be reassigned"),
+                "a capability value is immutable once produced and cannot be reassigned",
             );
             return None;
         }
-        Some(Expr {
-            kind: ExprKind::Var(id),
-            ty,
-            sym: None,
-            partial: self.vars[id].partial,
-            span: name.span,
-        })
+        Some(CheckedPlace::Local { root: id })
     }
 
-    fn accumulation_if(
+    fn arith_assign(
         &mut self,
+        target: &ValueType,
+        value: &CheckedExpr,
         op: AssignOp,
-        value: &ast::Expr,
-        place: &Expr,
-    ) -> Option<Option<Expr>> {
-        if op == AssignOp::Assign {
-            self.accumulation(value, place)
-        } else {
-            None
-        }
-    }
-
-    /// `s = s + p`, `s = max(s, p)`, `s = min(s, p)`: with `p` a forwarded partial of the
-    /// result being traversed this is the one admitted accumulation of partials into state
-    /// outside a structural merge. `None` when `value` does not have this form.
-    fn accumulation(&mut self, value: &ast::Expr, place: &Expr) -> Option<Option<Expr>> {
-        let ExprKind::Var(state) = place.kind else {
-            return None;
-        };
-        let is_state = |e: &ast::Expr, c: &Checker| matches!(&e.kind, A::Name(n) if c.lookup(&n.name) == Some(state));
-        let (math, operands): (Option<sir::Math>, [&ast::Expr; 2]) = match &value.kind {
-            A::Binary {
-                op: BinaryOp::Add,
-                lhs,
-                rhs,
-            } => (None, [lhs, rhs]),
-            A::Call {
-                callee,
-                bindings,
-                args,
-            } if bindings.is_empty()
-                && args.len() == 2
-                && args.iter().all(|a| a.name.is_none()) =>
-            {
-                match &callee.kind {
-                    A::Name(n) if n.name == "max" => {
-                        (Some(sir::Math::Max), [&args[0].value, &args[1].value])
-                    }
-                    A::Name(n) if n.name == "min" => {
-                        (Some(sir::Math::Min), [&args[0].value, &args[1].value])
-                    }
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        };
-        let state_first = is_state(operands[0], self);
-        if !state_first && !is_state(operands[1], self) {
-            return None;
-        }
-        Some(self.accumulate(math, operands, state_first, place, value.span))
-    }
-
-    fn accumulate(
-        &mut self,
-        math: Option<sir::Math>,
-        operands: [&ast::Expr; 2],
-        state_first: bool,
-        place: &Expr,
-        span: Span,
-    ) -> Option<Expr> {
-        let mut other = self.expr(operands[usize::from(state_first)], Some(&place.ty))?;
-        let state = self.expr(operands[usize::from(!state_first)], None)?;
-        let admitted = other.partial && !self.partial_free();
-        if admitted {
-            if !self.accumulates_into(&other) {
-                self.error(other.span, "a partial value accumulates into `let mut` state only inside a traversal of the result it belongs to (`ordered [p] in results:`)");
-                return None;
-            }
-            // The accumulated state is whole once the traversal completes.
-            other.partial = false;
-        }
-        let (lhs, rhs) = if state_first {
-            (state, other)
-        } else {
-            (other, state)
-        };
-        match math {
-            Some(op) => self.math_exprs(op, lhs, rhs, span),
-            None => self.binary_exprs(BinaryOp::Add, lhs, rhs, span),
-        }
-    }
-
-    /// Whether `e` is a forwarded partial of a result the current code is traversing.
-    fn accumulates_into(&self, e: &Expr) -> bool {
-        let _ = e;
-        false
-    }
-
-    fn arith_assign(&mut self, target: &Ty, value: &Expr, op: AssignOp) -> Option<()> {
-        if let (Ty::Tile(a), Ty::Tile(b)) = (target, &value.ty) {
+    ) -> Option<()> {
+        if let (ValueType::Tensor(a), ValueType::Tensor(b)) = (target, &value.ty) {
             if !self.same_axes(a, b) || !elem_rounds(&b.elem, &a.elem) {
                 self.error(
                     value.span,
                     format!(
-                        "`{}` needs tiles over identical axes: {} vs {}",
+                        "`{}` needs tensors over identical axes: {} vs {}",
                         op.text(),
                         target,
                         value.ty
@@ -710,7 +644,7 @@ impl<'a> Checker<'a> {
             }
             return Some(());
         }
-        if let (Ty::Tile(a), Some(v)) = (target, value.ty.scalar_dtype()) {
+        if let (ValueType::Tensor(a), Some(v)) = (target, value.ty.scalar_dtype()) {
             if a.elem
                 .read_dtype()
                 .is_none_or(|t| DType::promote(t, v).is_some())
@@ -752,11 +686,11 @@ impl<'a> Checker<'a> {
         cond: &ast::Expr,
         then: &ast::Block,
         els: Option<&ast::Block>,
-    ) -> Option<StmtKind> {
-        let cond = self.expr(cond, Some(&Ty::Scalar(DType::Bool)))?;
+    ) -> Option<CheckedStmt> {
+        let cond = self.expr(cond, Some(&ValueType::Scalar(DType::Bool)))?;
         match &cond.ty {
-            Ty::Scalar(DType::Bool) => {}
-            Ty::Tile(s) if s.elem == crate::types::Elem::Dtype(DType::Bool) => {
+            ValueType::Scalar(DType::Bool) => {}
+            ValueType::Tensor(s) if s.elem == Elem::Dtype(DType::Bool) => {
                 self.error(cond.span, "a mask is a `bool` tile, not a scalar condition; there is no implicit reduction. Use `select(mask, a, b)`");
                 return None;
             }
@@ -768,40 +702,36 @@ impl<'a> Checker<'a> {
                 return None;
             }
         }
-        self.forbid_partial(&cond, "a branch condition");
         let facts_before = self.facts.clone();
         let unassigned_before = self.unassigned.clone();
         let pending_before = self.pending_full_assign.clone();
         let symbols_before = self.scalar_symbols.clone();
         let moved_before = self.moved.clone();
-        let done_before: Vec<bool> = self.yields.iter().map(|y| y.done).collect();
+        let reads_before = self.reads.clone();
 
         self.assume(&cond, false);
-        let then = self.scoped_block(then);
+        let then_body = self.scoped_block(then);
         self.facts = facts_before.clone();
         let unassigned_then = std::mem::replace(&mut self.unassigned, unassigned_before);
         let symbols_then = std::mem::replace(&mut self.scalar_symbols, symbols_before);
         let moved_then = std::mem::replace(&mut self.moved, moved_before.clone());
-        let done_then: Vec<bool> = self.yields.iter().map(|y| y.done).collect();
-        for (y, done) in self.yields.iter_mut().zip(&done_before) {
-            y.done = *done;
-        }
+        let reads_then = std::mem::replace(&mut self.reads, reads_before);
         self.pending_full_assign = pending_before.clone();
 
-        let els = match els {
+        let else_body = match els {
             Some(b) => {
                 self.assume(&cond, true);
                 self.scoped_block(b)
             }
-            None => Vec::new(),
+            None => CheckedBlock {
+                statements: Vec::new(),
+                terminator: BlockTerminator::Continue,
+            },
         };
         self.facts = facts_before;
         let moved_else = self.moved.clone();
-        let done_else: Vec<bool> = self.yields.iter().map(|y| y.done).collect();
-        if done_then != done_else {
-            self.error(cond.span, "one path of this `if` yields/returns and the other does not; every path through a result boundary produces exactly one value with one schema");
-        }
         self.unassigned.extend(unassigned_then);
+        self.reads.extend(reads_then);
         self.scalar_symbols
             .retain(|id, sym| symbols_then.get(id) == Some(sym));
         // A value is available after an `if` only when it is available on every
@@ -812,20 +742,28 @@ impl<'a> Checker<'a> {
             .into_iter()
             .filter(|(v, _)| self.unassigned.contains(v))
             .collect();
-        Some(StmtKind::If { cond, then, els })
+        Some(CheckedStmt::If {
+            condition: cond,
+            then_body,
+            else_body,
+        })
     }
 
     /// Path facts of a condition over symbolic integers (or of its negation).
-    fn assume(&mut self, cond: &Expr, negate: bool) {
-        let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
-            if let ExprKind::Unary {
-                op: ast::UnaryOp::Not,
-                expr,
-            } = &cond.kind
-            {
-                self.assume(expr, !negate);
+    fn assume(&mut self, cond: &CheckedExpr, negate: bool) {
+        let (op, lhs, rhs) = match &cond.kind {
+            CheckedExprKind::Primitive {
+                id: crate::intrinsics::PrimitiveId::Binary(op),
+                operands,
+            } if operands.len() == 2 => (*op, &operands[0], &operands[1]),
+            CheckedExprKind::Primitive {
+                id: crate::intrinsics::PrimitiveId::Unary(crate::syntax::ast::UnaryOp::Not),
+                operands,
+            } if operands.len() == 1 => {
+                self.assume(&operands[0].clone(), !negate);
+                return;
             }
-            return;
+            _ => return,
         };
         match (op, negate) {
             (BinaryOp::And, false) | (BinaryOp::Or, true) => {
@@ -856,356 +794,183 @@ impl<'a> Checker<'a> {
         targets: &[ast::Ident],
         iter: &ast::Expr,
         body: &ast::Block,
-    ) -> Option<StmtKind> {
-        match &iter.kind {
-            A::Range { .. } | A::Name(_)
-                if matches!(&iter.kind, A::Range { .. })
-                    || matches!(
-                        &iter.kind,
-                        A::Name(name)
-                            if self.lookup(&name.name).is_some_and(|id| matches!(self.vars[id].ty, Ty::Range(_)))
-                    ) =>
-            {
-                let [target] = targets else {
-                    self.error(iter.span, "a semantic range binds exactly one name");
-                    return None;
-                };
-                let range = self.expr(iter, None)?;
-                let Ty::Range(bound) = &range.ty else {
-                    unreachable!("range syntax and range bindings check as range values")
-                };
-                let (lo_sym, hi_sym) = match &range.kind {
-                    ExprKind::Range { lo, hi } => (
-                        lo.sym
-                            .clone()
-                            .expect("checked range lower bound is symbolic"),
-                        hi.sym
-                            .clone()
-                            .expect("checked range upper bound is symbolic"),
-                    ),
-                    _ => (Sym::constant(0), bound.clone()),
-                };
-                let cardinality = match hi_sym.sub(&lo_sym).as_constant() {
-                    Some(n) if n <= 0 => LoopCardinality::Zero,
-                    Some(1) => LoopCardinality::One,
-                    _ => LoopCardinality::RepeatedOrUnknown,
-                };
-                let floor = self.vars.len();
-                let moved_before = self.moved.clone();
-                self.push_scope();
-                let ty = Ty::Index(bound.clone());
-                let var = self.declare(&target.name, ty, target.span, VarKind::RangeIndex);
-                let atom = var_atom(&target.name, var);
-                self.facts
-                    .set_range(atom.clone(), lo_sym.clone(), hi_sym.sub(&Sym::constant(1)));
-                self.atoms.insert(var, atom);
-                if parallel {
-                    self.logical_parallel.push((floor, var));
-                }
-                // A complete logical `0..axis` traversal carries the same definite-
-                // initialization proof as the retired authored `owned(t)` iterator.
-                let prior_pending = self.pending_full_assign.clone();
-                let mut pending = Vec::new();
-                for tensor in self.unassigned.iter().copied() {
-                    let (Ty::Tensor(shaped) | Ty::Tile(shaped)) = &self.vars[tensor].ty else {
-                        continue;
-                    };
-                    let prefix = prior_pending
-                        .iter()
-                        .find(|(candidate, _)| *candidate == tensor)
-                        .map(|(_, axes)| axes.clone())
-                        .unwrap_or_default();
-                    let axis = prefix.len();
-                    let Some(Extent::Semantic(extent)) = shaped.axes.get(axis) else {
-                        continue;
-                    };
-                    if lo_sym.is_zero() && &hi_sym == extent {
-                        let mut axes = prefix;
-                        axes.push(var);
-                        pending.push((tensor, axes));
-                    }
-                }
-                self.pending_full_assign = pending;
-                self.init_loop_depth += 1;
-                let body = self.block(body);
-                self.init_loop_depth -= 1;
-                self.pending_full_assign = prior_pending;
-                if parallel {
-                    self.logical_parallel.pop();
-                }
-                self.pop_scope();
-                self.finish_loop_ownership(moved_before, floor, cardinality, iter.span);
-                let literal_bounds = match &range.kind {
-                    ExprKind::Range { lo, hi } => Some((lo.as_ref().clone(), hi.as_ref().clone())),
-                    _ => None,
-                };
-                let (lo, hi, value) = match literal_bounds {
-                    Some((lo, hi)) => (lo, hi, None),
-                    None => (
-                        Expr {
-                            kind: ExprKind::Int(0),
-                            ty: Ty::Scalar(DType::I32),
-                            sym: Some(Sym::constant(0)),
-                            partial: false,
-                            span: iter.span,
-                        },
-                        Expr {
-                            kind: ExprKind::Int(0),
-                            ty: Ty::Scalar(DType::I32),
-                            sym: Some(bound.clone()),
-                            partial: false,
-                            span: iter.span,
-                        },
-                        Some(range),
-                    ),
-                };
-                let kind = StmtKind::Range {
-                    kind: if parallel {
-                        sir::LoopKind::Parallel
-                    } else {
-                        sir::LoopKind::Ordered
-                    },
-                    var,
-                    lo,
-                    hi,
-                    value,
-                    body,
-                };
-                let loop_block = vec![Stmt {
-                    kind: kind.clone(),
-                    span: iter.span,
-                }];
-                let pending: Vec<_> = self.unassigned.iter().copied().collect();
-                for variable in pending {
-                    let Some(shaped) = self.vars[variable].ty.shaped() else {
-                        continue;
-                    };
-                    if super::definitely_initializes_var(
-                        &self.vars,
-                        &loop_block,
-                        variable,
-                        shaped,
-                        &self.facts,
-                    ) {
-                        self.unassigned.remove(&variable);
-                    }
-                }
-                Some(kind)
-            }
-            A::Name(name) => {
-                if parallel {
-                    self.error(iter.span, "`parallel for` currently requires an explicit bounded range such as `0..N`");
-                    return None;
-                }
-                let [target] = targets else {
-                    self.error(iter.span, "`for h in slice` binds exactly one name");
-                    return None;
-                };
-                let slice = match self.lookup(&name.name).map(|id| self.vars[id].ty.clone()) {
-                    Some(Ty::Slice(slice)) => slice,
-                    Some(Ty::Result(_)) => {
-                        self.error(iter.span, "a region result is traversed with `parallel`/`ordered [p] in results:`, which rebinds its slices; it is not a scalar iterator");
-                        return None;
-                    }
-                    _ => {
-                        self.error(
-                            iter.span,
-                            "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
-                        );
-                        return None;
-                    }
-                };
-                let (lo, hi) = self.root_domain(slice);
-                let floor = self.vars.len();
-                let moved_before = self.moved.clone();
-                self.push_scope();
-                let ty = if self.prover().nonneg(&lo) {
-                    Ty::Index(hi.clone())
-                } else {
-                    Ty::Scalar(DType::I32)
-                };
-                let var = self.declare(&target.name, ty, target.span, VarKind::SliceMember(slice));
-                let atom = var_atom(&target.name, var);
-                self.facts
-                    .set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
-                self.atoms.insert(var, atom);
-                self.structural_loops.push(var);
-                let body = self.block(body);
-                self.structural_loops.pop();
-                self.pop_scope();
-                self.finish_loop_ownership(
-                    moved_before,
-                    floor,
-                    LoopCardinality::RepeatedOrUnknown,
-                    iter.span,
-                );
-                Some(StmtKind::Members { var, slice, body })
-            }
-            A::Call {
-                callee,
-                bindings,
-                args,
-            } if bindings.is_empty() => {
-                if parallel {
-                    self.error(iter.span, "`parallel for` currently requires an explicit bounded range such as `0..N`");
-                    return None;
-                }
-                let A::Name(callee) = &callee.kind else {
-                    self.error(
-                        iter.span,
-                        "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
-                    );
-                    return None;
-                };
-                match callee.name.as_str() {
-                    "owned" | "axis" => {
-                        self.coordinates(callee.name == "owned", targets, args, body, iter.span)
-                    }
-                    "lanes" => {
-                        if self.target_form(iter.span, "`lanes`", None) {
-                            self.error(iter.span, "`lanes` has no structured IR form: participant distribution belongs to the selected mapping, and target code reads its participant with the target's index intrinsic");
-                        }
-                        None
-                    }
-                    other => {
-                        self.error(callee.span, format!("`{other}` is not an iterator; `for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice"));
-                        None
-                    }
-                }
+    ) -> Option<CheckedStmt> {
+        let is_range = matches!(iter.kind, A::Range { .. });
+        let is_range_value = matches!(
+            &iter.kind,
+            A::Name(name)
+                if self
+                    .lookup(&name.name)
+                    .is_some_and(|id| matches!(self.locals[id].ty, ValueType::Range { .. }))
+        );
+        if !is_range && !is_range_value {
+            self.error(
+                iter.span,
+                "`for` iterates a bounded range `lo..hi` or a `range[N]` value",
+            );
+            return None;
+        }
+        let [target] = targets else {
+            self.error(iter.span, "a range binds exactly one name");
+            return None;
+        };
+        let range = self.expr(iter, None)?;
+        let ValueType::Range { bound } = range.ty.clone() else {
+            self.error(iter.span, "a range loop source is a `range[N]` value");
+            return None;
+        };
+        let bound = bound.sym().cloned().unwrap_or_else(|| Sym::constant(1));
+        let (range_exprs, lo_sym, hi_sym) = match &range.kind {
+            CheckedExprKind::Primitive {
+                id: crate::intrinsics::PrimitiveId::RangeMake,
+                operands,
+            } if operands.len() == 2 => {
+                let lo = operands[0].sym.clone();
+                let hi = operands[1].sym.clone();
+                ((operands[0].clone(), operands[1].clone()), lo, hi)
             }
             _ => {
-                self.error(
+                let lo = CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: crate::intrinsics::PrimitiveId::RangeStart,
+                        operands: vec![range.clone()],
+                    },
+                    ValueType::Scalar(DType::I32),
+                    Some(Sym::constant(0)),
                     iter.span,
-                    "`for` iterates `lo..hi`, `owned(t)`, `axis(t, n)` or a slice",
                 );
-                None
-            }
-        }
-    }
-
-    fn coordinates(
-        &mut self,
-        owned: bool,
-        targets: &[ast::Ident],
-        args: &[ast::Arg],
-        body: &ast::Block,
-        span: Span,
-    ) -> Option<StmtKind> {
-        if args.iter().any(|a| a.name.is_some()) || args.len() != if owned { 1 } else { 2 } {
-            self.error(
-                span,
-                if owned {
-                    "`owned(t)` takes one tile or view"
-                } else {
-                    "`axis(t, n)` takes a tile or view and a constant axis"
-                },
-            );
-            return None;
-        }
-        let of = self.expr_inner(&args[0].value, None, true)?;
-        let Some(shaped) = of.ty.shaped().cloned() else {
-            self.error(
-                of.span,
-                format!(
-                    "coordinate loops range over a tile or view, found {}",
-                    of.ty
-                ),
-            );
-            return None;
-        };
-        let axes: Vec<usize> = if owned {
-            (0..shaped.rank()).collect()
-        } else {
-            let axis = self.expr(&args[1].value, Some(&Ty::Scalar(DType::I32)))?;
-            match axis
-                .sym
-                .as_ref()
-                .and_then(Sym::as_constant)
-                .and_then(|a| usize::try_from(a).ok())
-                .filter(|a| *a < shaped.rank())
-            {
-                Some(a) => vec![a],
-                None => {
-                    self.error(
-                        axis.span,
-                        format!("`axis` needs a constant axis below rank {}", shaped.rank()),
-                    );
-                    return None;
-                }
+                let hi = CheckedExpr::new(
+                    CheckedExprKind::Primitive {
+                        id: crate::intrinsics::PrimitiveId::RangeEnd,
+                        operands: vec![range.clone()],
+                    },
+                    ValueType::Scalar(DType::I32),
+                    Some(bound.clone()),
+                    iter.span,
+                );
+                ((lo, hi), Some(Sym::constant(0)), Some(bound.clone()))
             }
         };
-        if axes.len() != targets.len() {
-            self.error(
-                span,
-                format!(
-                    "the loop ranges over {} axes but binds {} names",
-                    axes.len(),
-                    targets.len()
-                ),
-            );
+        let (Some(lo_sym), Some(hi_sym)) = (lo_sym, hi_sym) else {
+            self.error(iter.span, "range bounds must be symbolic integers");
             return None;
-        }
-        let floor = self.vars.len();
+        };
+        let cardinality = match hi_sym.sub(&lo_sym).as_constant() {
+            Some(n) if n <= 0 => LoopCardinality::Zero,
+            Some(1) => LoopCardinality::One,
+            _ => LoopCardinality::RepeatedOrUnknown,
+        };
+        let floor = self.locals.len();
         let moved_before = self.moved.clone();
+        let reads_before = self.reads.clone();
         self.push_scope();
-        let mut vars = Vec::new();
-        for (target, axis) in targets.iter().zip(&axes) {
-            let (ty, lo, hi) = match &shaped.axes[*axis] {
-                Extent::Semantic(extent) => {
-                    (Ty::Index(extent.clone()), Sym::constant(0), extent.clone())
-                }
-                Extent::Structural(slice) => {
-                    let (lo, hi) = self.root_domain(*slice);
-                    (Ty::Coord(*slice), lo, hi)
-                }
+        let binder = self.declare(
+            &target.name,
+            ValueType::Index {
+                bound: crate::sir::sym_extent(hi_sym.clone()),
+            },
+            target.span,
+            LocalKind::Binder,
+            false,
+        );
+        let atom = var_atom(&target.name, binder);
+        self.facts
+            .set_range(atom.clone(), lo_sym.clone(), hi_sym.sub(&Sym::constant(1)));
+        self.atoms.insert(binder, atom);
+        if parallel {
+            self.logical_parallel.push((floor, binder));
+        }
+        self.loops.push(super::LoopCtx {
+            floor,
+            writes: Vec::new(),
+            whole_writes: Vec::new(),
+            atomics: Vec::new(),
+        });
+        // A complete logical `0..axis` traversal may collectively initialize
+        // uninitialized storage over that axis.
+        let prior_pending = self.pending_full_assign.clone();
+        let mut pending = Vec::new();
+        for tensor in self.unassigned.iter().copied() {
+            let ValueType::Tensor(shaped) = &self.locals[tensor].ty else {
+                continue;
             };
-            let var = self.declare(&target.name, ty, target.span, VarKind::Coordinate);
-            let atom = var_atom(&target.name, var);
-            self.facts
-                .set_range(atom.clone(), lo, hi.sub(&Sym::constant(1)));
-            self.atoms.insert(var, atom);
-            vars.push(var);
-        }
-        // Definite assignment: an `owned` loop whose first write is `t[coordinates] = …`
-        // initializes `t` and any uninitialized tile over identical axes.
-        let saved = if owned {
-            let pending: Vec<(VarId, Vec<VarId>)> = self
-                .unassigned
+            let prefix = prior_pending
                 .iter()
-                .copied()
-                .filter(|v| matches!(&self.vars[*v].ty, Ty::Tile(s) if self.same_axes(s, &shaped)))
-                .map(|v| (v, vars.clone()))
-                .collect();
-            Some(std::mem::replace(&mut self.pending_full_assign, pending))
-        } else {
-            None
-        };
-        let structural = axes
-            .iter()
-            .any(|axis| matches!(shaped.axes[*axis], Extent::Structural(_)));
-        if structural {
-            self.structural_loops.push(vars[0]);
+                .find(|(candidate, _)| *candidate == tensor)
+                .map(|(_, axes)| axes.clone())
+                .unwrap_or_default();
+            let axis = prefix.len();
+            let Some(ExtentExpr::Sym(extent)) = shaped.axes.get(axis) else {
+                continue;
+            };
+            if lo_sym.is_zero() && &hi_sym == extent {
+                let mut axes = prefix;
+                axes.push(binder);
+                pending.push((tensor, axes));
+            }
         }
-        let body = self.block(body);
-        if structural {
-            self.structural_loops.pop();
-        }
-        if let Some(saved) = saved {
-            self.pending_full_assign = saved;
+        self.pending_full_assign = pending;
+        self.init_loop_depth += 1;
+        self.loop_depth += 1;
+        let body_block = self.block(body);
+        self.loop_depth -= 1;
+        self.init_loop_depth -= 1;
+        self.pending_full_assign = prior_pending;
+        let ctx = self.loops.pop().expect("loop context is balanced");
+        if parallel {
+            self.logical_parallel.pop();
         }
         self.pop_scope();
-        self.finish_loop_ownership(
-            moved_before,
-            floor,
-            LoopCardinality::RepeatedOrUnknown,
-            span,
-        );
-        Some(StmtKind::Coordinates {
-            vars,
-            of,
-            axes,
-            body,
-        })
+        self.finish_loop_ownership(moved_before, floor, cardinality, iter.span);
+        self.reads = reads_before;
+        let mutation = LoopMutationSummary {
+            carried: {
+                let mut seen = HashSet::new();
+                ctx.writes
+                    .iter()
+                    .copied()
+                    .filter(|l| *l < floor && seen.insert(*l))
+                    .collect()
+            },
+            disjoint_writes: ctx.whole_writes.is_empty(),
+            atomics: ctx.atomics,
+        };
+        let kind = if parallel {
+            LoopKind::Independent
+        } else {
+            LoopKind::Ordered
+        };
+        let checked = CheckedStmt::Loop {
+            kind,
+            binder,
+            range: CheckedRange {
+                start: range_exprs.0,
+                end: range_exprs.1,
+            },
+            body: body_block,
+            mutation,
+        };
+        let loop_block = CheckedBlock {
+            statements: vec![checked.clone()],
+            terminator: BlockTerminator::Continue,
+        };
+        let pending: Vec<_> = self.unassigned.iter().copied().collect();
+        for variable in pending {
+            let Some(shaped) = self.locals[variable].ty.shaped().cloned() else {
+                continue;
+            };
+            if super::writes_cover(
+                &self.locals,
+                &loop_block,
+                variable,
+                &shaped.axes,
+                &[],
+                &self.facts,
+            ) {
+                self.unassigned.remove(&variable);
+            }
+        }
+        Some(checked)
     }
 
     /// Join ownership across a loop's zero/one/back-edge control flow.
@@ -1216,7 +981,7 @@ impl<'a> Checker<'a> {
     /// single-iteration loop carries its exit state forward.
     fn finish_loop_ownership(
         &mut self,
-        moved_before: HashSet<VarId>,
+        moved_before: HashSet<crate::sir::LocalId>,
         captured_floor: usize,
         cardinality: LoopCardinality,
         span: Span,
@@ -1242,7 +1007,7 @@ impl<'a> Checker<'a> {
                         span,
                         format!(
                             "loop may repeat after moving captured owned tensor `{}`; reinitialize it before the iteration ends",
-                            self.vars[id].name
+                            self.locals[id].name
                         ),
                     );
                 }
@@ -1253,86 +1018,31 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Whether a place selects every element of its root (`t`, `t[:, :]`).
-    fn covers_whole(&self, place: &Expr) -> bool {
-        match &place.kind {
-            ExprKind::Var(_) => true,
-            ExprKind::Index { base, indices } => {
-                indices.iter().all(|i| {
-                    matches!(
-                        i,
-                        sir::Index::Range {
-                            start: None,
-                            end: None
-                        }
-                    )
-                }) && self.covers_whole(base)
-            }
-            _ => false,
-        }
-    }
-
     // ---- result boundaries ----
 
-    fn yielded(&mut self, values: &[ast::Expr], expected: Option<Vec<Ty>>) -> Option<Vec<Expr>> {
-        let mut out = Vec::new();
-        for (i, v) in values.iter().enumerate() {
-            let hint = expected.as_ref().and_then(|tys| tys.get(i)).cloned();
-            let e = self.value(v, hint.as_ref())?;
-            if e.ty == Ty::Void {
-                self.error(e.span, "`void` is not a value");
-                return None;
-            }
-            out.push(e);
-        }
-        Some(out)
-    }
-
-    /// A value leaving its scope cannot carry a live slice handle, a coordinate, or a view of
-    /// storage that dies with the scope.
-    fn check_escape(&mut self, e: &Expr, floor: usize, boundary: &str) -> bool {
-        fn handle(ty: &Ty) -> bool {
-            match ty {
-                Ty::Slice(_) | Ty::Coord(_) | Ty::Range(_) => true,
-                Ty::Tuple(items) => items.iter().any(handle),
-                _ => false,
-            }
-        }
-        if handle(&e.ty) {
-            self.error(e.span, format!("a slice is a scoped borrow of its region and cannot escape through {boundary}; region results keep the correspondence instead"));
-            return false;
-        }
-        let parts: Vec<&Expr> = match &e.kind {
-            ExprKind::Tuple(items) => items.iter().collect(),
-            _ => vec![e],
-        };
-        for part in parts {
-            if matches!(part.ty, Ty::View(_)) {
-                if let Some(root) = self.root_var(part) {
-                    if root >= floor && matches!(self.vars[root].ty, Ty::Tile(_)) {
-                        let name = self.vars[root].name.clone();
-                        self.error(part.span, format!("this view borrows local tile `{name}`, which dies with its scope; {boundary} a tile (`load`) instead"));
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn return_stmt(&mut self, values: &[ast::Expr], span: Span) -> Option<StmtKind> {
-        if self.yields.iter().any(|y| y.loops > 0) {
+    fn return_stmt(&mut self, values: &[ast::Expr], span: Span) -> Option<PartialStmt> {
+        if self.loop_depth > 0 {
             self.error(
                 span,
-                "`return` inside an element loop is not one result per path; return after the loop",
+                "return inside a loop is not one result per path; return after the loop",
             );
             return None;
         }
-        let expected: Vec<Ty> = match &self.sig.result {
-            Ty::Void => Vec::new(),
-            Ty::Tuple(items) if values.len() != 1 => items.clone(),
+        let expected: Vec<ValueType> = match &self.sig.result {
+            ValueType::Void => Vec::new(),
+            ValueType::Tuple(items) if values.len() != 1 => items.as_slice().to_vec(),
             other => vec![other.clone()],
         };
+        if values.is_empty() && !self.sig.result.is_void() {
+            self.error(
+                span,
+                format!(
+                    "`{}` returns {} but this `return` has no values",
+                    self.sig.name, self.sig.result
+                ),
+            );
+            return None;
+        }
         if values.len() != expected.len() {
             self.error(
                 span,
@@ -1345,7 +1055,16 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let exprs = self.yielded(values, Some(expected.clone()))?;
+        let mut exprs = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            let hint = expected.get(i).cloned();
+            let e = self.expr(v, hint.as_ref())?;
+            if e.ty.is_void() {
+                self.error(e.span, "`void` is not a value");
+                return None;
+            }
+            exprs.push(e);
+        }
         for (e, ty) in exprs.iter().zip(&expected) {
             if !self.check_escape(e, self.sig.params.len(), "`return`") {
                 return None;
@@ -1360,17 +1079,38 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            if e.partial {
-                self.error(e.span, "a partial-domain value cannot be returned as a whole-domain result; combine it with `merge` or an ordered traversal");
+        }
+        Some(PartialStmt::Terminal(exprs))
+    }
+
+    /// A value leaving its scope cannot borrow storage that dies with the scope.
+    fn check_escape(&mut self, e: &CheckedExpr, floor: usize, boundary: &str) -> bool {
+        let parts: Vec<&CheckedExpr> = match &e.kind {
+            CheckedExprKind::Primitive {
+                id: crate::intrinsics::PrimitiveId::TuplePack,
+                operands,
+            } => operands.iter().collect(),
+            _ => vec![e],
+        };
+        for part in parts {
+            if matches!(self.class_of(part), ValueClass::Borrowed) {
+                if let Some(root) = self.root_var(part) {
+                    if root >= floor && matches!(self.kinds[root], LocalKind::State) {
+                        let name = self.locals[root].name.clone();
+                        self.error(part.span, format!("this view borrows local state `{name}`, which dies with its scope; {boundary} an owned tensor (`to_owned`) instead"));
+                        return false;
+                    }
+                }
             }
         }
-        if let Some(function) = self.yields.first_mut() {
-            function.done = true;
-        }
-        // A `return` from a terminal root stage also ends that stage's path.
-        if let Some(last) = self.yields.last_mut() {
-            last.done = true;
-        }
-        Some(StmtKind::Return(exprs))
+        true
     }
+}
+
+/// Every local referenced by a place's indices (points and range bounds, at
+/// any depth): the places an independent loop may mutate through its binder.
+/// A statement or a terminal return during block assembly.
+enum PartialStmt {
+    Statement(CheckedStmt),
+    Terminal(Vec<CheckedExpr>),
 }

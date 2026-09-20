@@ -1,5 +1,5 @@
-//! `cuda-estimate-unqualified-v0`: an additive execution-time estimate in nanoseconds
-//! (spec 12.4-12.5, plan 4.2). No result of this model is an execution upper bound.
+//! `cuda-estimate-unqualified-v0`: an additive execution-time estimate in nanoseconds.
+//! No result of this model is an execution upper bound.
 //!
 //! EVERY COEFFICIENT BELOW IS UNMEASURED. None was calibrated on any NVIDIA device; they
 //! are order-of-magnitude placeholders that make the estimate a consistent ranking of

@@ -1,232 +1,408 @@
-//! Dispatch and storage declarations shared by accounting and emission. These describe
-//! declared work/storage, not register allocation, occupancy or memory service.
-use seismic_lang::types::DType;
-pub mod geometry;
+//! The one common linear/runtime iteration geometry.
+//!
+//! Independent axes use the universal `LinearIterationMap`: retained extents,
+//! an overflow-checked row-major total (the exact runtime product retained
+//! for runtime domains, with the checked capacity bound), the physical linear
+//! participant count (a planning expression), one-pass or grid-stride
+//! traversal, delinearization for every logical axis, and a tail mask.
+//! Logical rank is not native grid rank. Ordered axes are ascending serial
+//! loops inside each independent point. Zero work is a retained launch
+//! condition skipped by the runtime; zero native grids are never submitted.
+//! Authored tile authority is deleted; only this mapping exists.
 
-/// Row-major coordinates assigned to a work item, with explicit tail extents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkMapping {
-    axes: Vec<AxisMapping>,
-    work_items: u64,
-}
+use seismic_lang::{
+    logical::{RuntimeExtent, RuntimeScalarExpr},
+    sym::Sym,
+    types::{ExtentExpr, RuntimeExtentId},
+};
+use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AxisMapping {
-    pub logical_extent: u64,
-    /// Number of work coordinates along this axis, before applying the step.
-    pub extent: u64,
-    pub stride: u64,
-    pub step: u64,
-}
-
-impl WorkMapping {
-    pub fn new(extents: &[u64], steps: &[u64]) -> Result<Self, String> {
-        if extents.len() != steps.len() {
-            return Err("work mapping needs one step per axis".into());
-        }
-        let geometry = geometry::mapping(&mut geometry::Concrete, extents, steps)?;
-        let axes = extents
-            .iter()
-            .zip(steps)
-            .enumerate()
-            .map(|(index, (&logical_extent, &step))| AxisMapping {
-                logical_extent,
-                extent: geometry.counts[index],
-                stride: geometry.strides[index],
-                step,
-            })
-            .collect();
-        let work_items = geometry.work_items;
-        Ok(Self { axes, work_items })
-    }
-    pub fn axes(&self) -> &[AxisMapping] {
-        &self.axes
-    }
-    pub fn work_items(&self) -> u64 {
-        self.work_items
-    }
-    /// Logical base coordinates for this work item. Empty domains and padding
-    /// lanes have no coordinates and must not be evaluated by code generation.
-    pub fn coordinates(&self, item: u64) -> Result<Vec<u64>, String> {
-        if item >= self.work_items {
-            return Err("work item is outside the mapped domain".into());
-        }
-        Ok(self
-            .axes
-            .iter()
-            .map(|axis| (item / axis.stride % axis.extent) * axis.step)
-            .collect())
-    }
-    pub fn extents(&self, item: u64) -> Result<Vec<u64>, String> {
-        Ok(self
-            .coordinates(item)?
-            .into_iter()
-            .zip(&self.axes)
-            .map(|(base, axis)| axis.step.min(axis.logical_extent - base))
-            .collect())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupDispatch {
-    pub work_items: u64,
-    pub lanes_per_item: u64,
-    pub items_per_group: u64,
-    pub groups: u64,
-    pub threads_per_group: u64,
-}
-impl GroupDispatch {
-    pub fn new(work_items: u64, lanes_per_item: u64, items_per_group: u64) -> Result<Self, String> {
-        if lanes_per_item == 0 || items_per_group == 0 {
-            return Err("dispatch widths must be positive".into());
-        }
-        let geometry = geometry::dispatch(
-            &mut geometry::Concrete,
-            work_items,
-            lanes_per_item,
-            items_per_group,
-        )?;
-        let threads_per_group = geometry.threads_per_group;
-        let groups = geometry.groups;
-        Ok(Self {
-            work_items,
-            lanes_per_item,
-            items_per_group,
-            groups,
-            threads_per_group,
-        })
-    }
-    pub fn dispatched_lanes(&self) -> u64 {
-        self.groups * self.threads_per_group
-    }
-    pub fn participating_lanes(&self) -> u64 {
-        self.work_items * self.lanes_per_item
-    }
-    pub fn padding_lanes(&self) -> u64 {
-        self.dispatched_lanes() - self.participating_lanes()
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TilePlacement {
-    /// Every participating lane owns a complete declared array.
-    Replicated,
-    /// Each lane owns ceil(capacity / lanes_per_item) array slots, with a minimum of one.
-    Distributed,
-    /// Each work item owns a disjoint shared array within its group.
-    GroupShared,
-    /// One shared array per group, common to all its work items: a tile of the outer owner
-    /// of a launch whose work items are the inner owners of one piece. Every lane of the
-    /// group cooperates on its element loops.
-    GroupWide,
-}
-impl TilePlacement {
-    /// The tile is an array in the group's shared memory.
-    pub fn group_memory(&self) -> bool {
-        matches!(self, Self::GroupShared | Self::GroupWide)
-    }
-}
-/// The element type a tile is held in inside a thread or threadgroup array. This is the one
-/// rule for local storage types; declarations, byte accounting and emission all follow the
-/// declaration it produces.
-///
-/// Half-width floats are held widened to `f32`: Apple's Metal compiler miscompiles
-/// thread-address-space `bfloat` arrays (bugs/26-09-19/metal-thread-local-bfloat-arrays.md),
-/// and `half` shares the path. Widening is exact; a value is rounded to its logical type
-/// before it is stored, and narrowed again only when published to device memory. A
-/// matrix-intrinsic operand keeps its native type: `simdgroup_load`/`store` address it as
-/// the matrix element type.
-pub fn local_storage_dtype(dtype: DType, native_operand: bool) -> DType {
-    match dtype {
-        DType::BF16 | DType::F16 if !native_operand => DType::F32,
-        other => other,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileDeclaration {
-    pub symbol: String,
-    pub dtype: DType,
-    pub capacity: u64,
-    pub placement: TilePlacement,
-}
-/// Physical array geometry shared by code generation and storage accounting.
-/// Empty logical tiles still require one element in a declared native array.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileLayout {
-    pub private_elements_per_lane: u64,
-    pub shared_elements_per_item: u64,
-    pub private_bytes_per_lane: u64,
-    pub shared_bytes_per_group: u64,
-}
-impl TileDeclaration {
-    pub fn layout(&self, dispatch: &GroupDispatch) -> Result<TileLayout, String> {
-        if dispatch.lanes_per_item == 0 || dispatch.items_per_group == 0 {
-            return Err("storage layout requires positive dispatch widths".into());
-        }
-        let layout = geometry::storage(
-            &mut geometry::Concrete,
-            self.capacity,
-            u64::from(self.dtype.bytes()),
-            &self.placement,
-            dispatch.lanes_per_item,
-            dispatch.items_per_group,
-        )?;
-        Ok(TileLayout {
-            private_elements_per_lane: layout.private_elements_per_lane,
-            shared_elements_per_item: layout.shared_elements_per_item,
-            private_bytes_per_lane: layout.private_bytes_per_lane,
-            shared_bytes_per_group: layout.shared_bytes_per_group,
-        })
-    }
-
-    /// Declared array storage. This is not native register bytes or a lifetime peak.
-    pub fn bytes(&self, dispatch: &GroupDispatch) -> Result<(u64, u64), String> {
-        let layout = self.layout(dispatch)?;
-        Ok((layout.private_bytes_per_lane, layout.shared_bytes_per_group))
-    }
-}
-
-/// Executable coordinate ownership within a logical work item. Replication is
-/// private storage replication; publications still need a unique participant.
+/// How participants traverse the linear domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ownership {
-    Replicated,
-    Cyclic { consecutive: u64 },
+pub enum Traversal {
+    /// Participant count equals the total; each participant visits exactly
+    /// one linear coordinate (no tail).
+    OnePass,
+    /// A fixed participant count covers the domain by grid stride; the tail
+    /// mask skips participants beyond the total.
+    GridStride,
 }
-impl Ownership {
-    pub fn period(self, lanes: u64) -> Result<u64, String> {
-        if lanes == 0 {
-            return Err("ownership requires positive participation".into());
-        }
+
+/// The overflow-checked row-major total of the retained extents.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinearTotal {
+    /// Every axis extent is static: the exact total.
+    Static(u64),
+    Runtime {
+        /// Retained runtime expression: the exact semantic total.
+        product: RuntimeScalarExpr,
+        /// Checked product of the axis capacities; the semantic total never
+        /// exceeds it, and its fit was proved during construction.
+        capacity: u64,
+        /// The workload's expected total, when every runtime axis states an
+        /// expected extent. Cost only; never geometry, resources, or semantics.
+        expected: Option<u64>,
+    },
+}
+
+impl LinearTotal {
+    /// The exact total, when every axis is static.
+    pub fn as_static(&self) -> Option<u64> {
         match self {
-            Self::Replicated => Ok(1),
-            Self::Cyclic { consecutive } if consecutive > 0 => lanes
-                .checked_mul(consecutive)
-                .ok_or_else(|| "ownership period overflow".into()),
-            _ => Err("cyclic ownership requires a positive consecutive extent".into()),
+            LinearTotal::Static(n) => Some(*n),
+            LinearTotal::Runtime { .. } => None,
         }
     }
-    pub fn owner(self, coordinate: u64, lanes: u64) -> Result<Option<u64>, String> {
-        self.period(lanes)?;
-        Ok(match self {
-            Self::Replicated => None,
-            Self::Cyclic { consecutive } => Some(coordinate / consecutive % lanes),
-        })
+
+    /// The resource/tuning bound of the total: exact for static domains, the
+    /// checked capacity product for runtime domains (semantics always use
+    /// the retained runtime product, never this bound).
+    pub fn bound(&self) -> u64 {
+        match self {
+            LinearTotal::Static(n) => *n,
+            LinearTotal::Runtime { capacity, .. } => *capacity,
+        }
+    }
+
+    /// The total to price work by: exact for static domains, the workload's
+    /// expected total for runtime domains that state one, else the bound.
+    pub fn expected(&self) -> u64 {
+        match self {
+            LinearTotal::Static(n) => *n,
+            LinearTotal::Runtime {
+                expected, capacity, ..
+            } => expected.unwrap_or(*capacity),
+        }
     }
 }
 
-/// Source work item participation, private value placement, and publication
-/// ownership retained by scalar instruction preparation and backend dispatch.
+/// The retained launch condition of one launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Participation {
-    Thread,
-    Subgroup { lanes: u32 },
+pub enum LaunchCondition {
+    /// The domain is statically empty: no native dispatch is submitted.
+    AlwaysSkip,
+    Execute,
 }
-impl Participation {
-    pub fn lanes(self) -> u32 {
+
+/// Why a linear iteration map could not be constructed. Overflow makes the
+/// alternative infeasible; it never wraps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinearMapError {
+    /// A static row-major product overflowed.
+    StaticOverflow,
+    /// The checked capacity product overflowed, so the runtime total cannot
+    /// be bounded.
+    CapacityOverflow,
+    /// An unresolved symbolic extent survived specialization.
+    UnresolvedSymbol,
+}
+
+impl std::fmt::Display for LinearMapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Thread => 1,
-            Self::Subgroup { lanes } => lanes,
+            LinearMapError::StaticOverflow => {
+                f.write_str("static row-major iteration total overflows")
+            }
+            LinearMapError::CapacityOverflow => {
+                f.write_str("runtime extent capacities overflow the iteration total")
+            }
+            LinearMapError::UnresolvedSymbol => {
+                f.write_str("an unresolved symbolic extent survived specialization")
+            }
         }
+    }
+}
+impl std::error::Error for LinearMapError {}
+
+/// The universal arbitrary-rank iteration map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearIterationMap {
+    /// Retained logical axis extents, outermost first (last axis fastest).
+    pub extents: Vec<ExtentExpr>,
+    /// Overflow-checked row-major total.
+    pub total: LinearTotal,
+    pub traversal: Traversal,
+    /// Whether participants beyond the total must be masked.
+    pub tail_mask: bool,
+    /// The containing independent domain is serialized (one participant):
+    /// the universal atomic-add strategy.
+    pub serialized: bool,
+    /// The physical linear participant count: a planning expression over
+    /// tuning parameters. Strategies set it after `linear()`/`serialized()`.
+    pub participants: Sym,
+}
+
+impl LinearIterationMap {
+    /// The universal map over `extents` (outermost first). The total is
+    /// overflow-checked; a runtime domain retains its exact runtime product
+    /// together with the checked capacity bound. Participants default to one
+    /// (the serial participant domain); grid-stride strategies set the
+    /// planning expression with `with_participants`.
+    pub fn linear(
+        extents: &[ExtentExpr],
+        runtime_extents: &BTreeMap<RuntimeExtentId, RuntimeExtent>,
+    ) -> Result<LinearIterationMap, LinearMapError> {
+        let mut product: Option<RuntimeScalarExpr> = None;
+        let mut capacity = 1u64;
+        let mut expected: Option<u64> = Some(1);
+        let mut all_static = true;
+        for extent in extents {
+            let (value_expr, factor_capacity, factor_expected, factor_is_static) = match extent {
+                ExtentExpr::Static(n) => {
+                    let n = *n;
+                    (RuntimeScalarExpr::Const(n as i64), n, Some(n), true)
+                }
+                ExtentExpr::Runtime(id) => {
+                    let runtime = runtime_extents
+                        .get(id)
+                        .ok_or(LinearMapError::UnresolvedSymbol)?;
+                    (
+                        RuntimeScalarExpr::Extent(*id),
+                        runtime.capacity,
+                        runtime.expected,
+                        false,
+                    )
+                }
+                ExtentExpr::Sym(sym) => {
+                    let constant = sym.as_constant().ok_or(LinearMapError::UnresolvedSymbol)?;
+                    let n = u64::try_from(constant).map_err(|_| LinearMapError::StaticOverflow)?;
+                    (RuntimeScalarExpr::Const(constant), n, Some(n), true)
+                }
+            };
+            product = Some(match product {
+                // Canonical form: no leading unit factor.
+                None => value_expr,
+                Some(acc) => RuntimeScalarExpr::Mul(Box::new(acc), Box::new(value_expr)),
+            });
+            // The expected total exists only when every runtime axis states one;
+            // an overflowing expectation is no expectation.
+            expected = match (expected, factor_expected) {
+                (Some(acc), Some(factor)) => acc.checked_mul(factor),
+                _ => None,
+            };
+            capacity = capacity.checked_mul(factor_capacity).ok_or_else(|| {
+                // An overflow of static factors is a static overflow; a
+                // runtime factor makes the capacity bound unprovable.
+                if all_static && factor_is_static {
+                    LinearMapError::StaticOverflow
+                } else {
+                    LinearMapError::CapacityOverflow
+                }
+            })?;
+            all_static &= factor_is_static;
+        }
+        let total = if all_static {
+            LinearTotal::Static(capacity)
+        } else {
+            LinearTotal::Runtime {
+                product: product.unwrap_or(RuntimeScalarExpr::Const(1)),
+                capacity,
+                expected,
+            }
+        };
+        Ok(LinearIterationMap {
+            extents: extents.to_vec(),
+            total,
+            traversal: Traversal::GridStride,
+            tail_mask: true,
+            serialized: false,
+            participants: Sym::constant(1),
+        })
+    }
+
+    /// A serialized domain: exactly one participant traverses everything
+    /// (the universal atomic-add strategy serializes the containing
+    /// independent domain). Built from an already-checked map of the same
+    /// extents.
+    pub fn serialized(map: &LinearIterationMap) -> LinearIterationMap {
+        LinearIterationMap {
+            extents: map.extents.clone(),
+            total: map.total.clone(),
+            traversal: Traversal::OnePass,
+            tail_mask: false,
+            serialized: true,
+            participants: Sym::constant(1),
+        }
+    }
+
+    /// The empty serial map: one participant, one visit (the participant
+    /// domain of a single mapped node whose extents are governed by the
+    /// enclosing structure).
+    pub fn serial() -> LinearIterationMap {
+        LinearIterationMap {
+            extents: Vec::new(),
+            total: LinearTotal::Static(1),
+            traversal: Traversal::OnePass,
+            tail_mask: false,
+            serialized: true,
+            participants: Sym::constant(1),
+        }
+    }
+
+    /// Set the physical linear participant count (a planning expression).
+    pub fn with_participants(mut self, participants: Sym) -> LinearIterationMap {
+        self.participants = participants;
+        self
+    }
+
+    /// The retained launch condition: zero work is skipped by the runtime and
+    /// zero native grids are never submitted.
+    pub fn launch_condition(&self) -> LaunchCondition {
+        match self.total.as_static() {
+            Some(0) => LaunchCondition::AlwaysSkip,
+            _ => LaunchCondition::Execute,
+        }
+    }
+
+    /// Delinearize one row-major coordinate into per-axis logical
+    /// coordinates (outermost first, last axis fastest). `None` when the
+    /// coordinate lies outside a static total (runtime totals delinearize
+    /// against their runtime values at execution).
+    pub fn delinearize(&self, linear: u64) -> Option<Vec<u64>> {
+        let total = self.total.as_static()?;
+        if linear >= total {
+            return None;
+        }
+        let rank = self.extents.len();
+        let mut coordinates = vec![0u64; rank];
+        let mut rest = linear;
+        for (axis, coordinate) in coordinates.iter_mut().enumerate() {
+            let stride: u64 = self.extents[axis + 1..]
+                .iter()
+                .map(|extent| extent.as_static())
+                .try_fold(1u64, |acc, n| Some(acc.checked_mul(n?)?))?;
+            *coordinate = rest / stride;
+            rest %= stride;
+        }
+        Some(coordinates)
+    }
+
+    /// The work-item total as a planning expression for geometry and
+    /// resources: exact for static domains, the checked capacity bound for
+    /// runtime domains (the resolved launch retains the exact runtime product).
+    pub fn total_symbol(&self) -> Sym {
+        match i64::try_from(self.total.bound()) {
+            Ok(bound) => Sym::constant(bound),
+            Err(_) => Sym::constant(i64::MAX),
+        }
+    }
+
+    /// The work-item total to price cost by: the workload's expected total
+    /// for a runtime domain that states one, else `total_symbol`. Never used
+    /// for geometry or resources.
+    pub fn cost_symbol(&self) -> Sym {
+        match i64::try_from(self.total.expected()) {
+            Ok(expected) => Sym::constant(expected),
+            Err(_) => Sym::constant(i64::MAX),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delinearizes_arbitrary_rank() {
+        let map = LinearIterationMap::linear(
+            &[
+                ExtentExpr::Static(4),
+                ExtentExpr::Static(3),
+                ExtentExpr::Static(5),
+            ],
+            &BTreeMap::new(),
+        )
+        .expect("the map builds");
+        assert_eq!(map.delinearize(0).unwrap(), vec![0, 0, 0]);
+        // Row-major: the last axis is fastest.
+        assert_eq!(map.delinearize(7).unwrap(), vec![0, 1, 2]);
+        assert_eq!(map.delinearize(59).unwrap(), vec![3, 2, 4]);
+        assert_eq!(map.delinearize(60), None);
+    }
+
+    #[test]
+    fn grid_stride_and_one_pass_cover_the_same_domain() {
+        let extents = vec![ExtentExpr::Static(7), ExtentExpr::Static(3)];
+        let grid_stride = LinearIterationMap::linear(&extents, &BTreeMap::new())
+            .expect("the map builds")
+            .with_participants(Sym::constant(8));
+        assert_eq!(grid_stride.traversal, Traversal::GridStride);
+        assert!(grid_stride.tail_mask);
+        let mut strided = Vec::new();
+        for participant in 0..8u64 {
+            let mut linear = participant;
+            while linear < 21 {
+                strided.push(grid_stride.delinearize(linear).unwrap());
+                linear += 8;
+            }
+        }
+        let one_pass = LinearIterationMap::serialized(&grid_stride);
+        assert_eq!(one_pass.traversal, Traversal::OnePass);
+        assert!(!one_pass.tail_mask);
+        assert!(one_pass.serialized);
+        let mut ascending = (0..21)
+            .map(|l| one_pass.delinearize(l).unwrap())
+            .collect::<Vec<_>>();
+        let mut sorted = strided.clone();
+        sorted.sort();
+        ascending.sort();
+        assert_eq!(sorted, ascending);
+    }
+
+    #[test]
+    fn zero_work_is_a_retained_launch_condition() {
+        let map = LinearIterationMap::linear(&[ExtentExpr::Static(0)], &BTreeMap::new())
+            .expect("the map builds");
+        assert_eq!(map.launch_condition(), LaunchCondition::AlwaysSkip);
+        assert_eq!(map.delinearize(0), None);
+        let map = LinearIterationMap::linear(&[ExtentExpr::Static(4)], &BTreeMap::new())
+            .expect("the map builds");
+        assert_eq!(map.launch_condition(), LaunchCondition::Execute);
+    }
+
+    #[test]
+    fn runtime_domains_retain_values_and_bound_capacities() {
+        let id = RuntimeExtentId(0);
+        let runtime = RuntimeExtent {
+            id,
+            value: RuntimeScalarExpr::Extent(id),
+            capacity: 4096,
+            expected: None,
+        };
+        let map = LinearIterationMap::linear(
+            &[ExtentExpr::Runtime(id)],
+            &BTreeMap::from([(id, runtime)]),
+        )
+        .expect("the map builds");
+        // Planning/resource accounting sees the checked capacity bound…
+        assert_eq!(map.total_symbol().as_constant(), Some(4096));
+        // …while the retained total stays the exact runtime product.
+        assert!(matches!(map.total, LinearTotal::Runtime { .. }));
+        // Delinearization of a runtime domain is an execution-time act.
+        assert_eq!(map.delinearize(0), None);
+    }
+
+    #[test]
+    fn overflow_is_an_error_never_a_wrap() {
+        let huge = ExtentExpr::Static(u64::MAX);
+        let map = LinearIterationMap::linear(&[huge, ExtentExpr::Static(2)], &BTreeMap::new());
+        assert_eq!(map.unwrap_err(), LinearMapError::StaticOverflow);
+        let id = RuntimeExtentId(0);
+        let runtime = RuntimeExtent {
+            id,
+            value: RuntimeScalarExpr::Extent(id),
+            capacity: u64::MAX,
+            expected: None,
+        };
+        let map = LinearIterationMap::linear(
+            &[ExtentExpr::Runtime(id), ExtentExpr::Runtime(id)],
+            &BTreeMap::from([(id, runtime)]),
+        );
+        assert_eq!(map.unwrap_err(), LinearMapError::CapacityOverflow);
+        let map = LinearIterationMap::linear(
+            &[ExtentExpr::Sym(Sym::param("unresolved"))],
+            &BTreeMap::new(),
+        );
+        assert_eq!(map.unwrap_err(), LinearMapError::UnresolvedSymbol);
     }
 }

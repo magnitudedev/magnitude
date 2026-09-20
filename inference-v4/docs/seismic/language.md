@@ -110,9 +110,17 @@ parallel for i in 0..N:
 ```
 
 A `parallel for` body cannot update captured scalar or owned local state. It may write through an
-exclusive tensor place when the checker proves distinct iterations write disjoint elements, or use
-a portable atomic operation with explicit semantics. The compiler may group, vectorize, block,
-fuse, stage, pipeline, or distribute either loop only while preserving its ordering contract.
+exclusive tensor place when the checker proves distinct visits write distinct elements: every
+loop binder must be established by a point index affine in it with a nonzero coefficient (once the
+other binders on that axis are established; several binders on one axis are established together
+when their coefficients form a mixed radix over the binders' ranges, as `i * C + j` with `j < C`),
+or by a slice `c*v + d : c*v + d + len` with `len <= c`. Data-dependent, nonlinear, and
+non-injective indices (`y[routes[i]]`, `y[i / 2]`, `y[i + j]`) are rejected. The other admitted
+update is `atomic(add|max|min, place, value)`: portable, defined for f32, f16, bf16, i32 and u32
+elements; `add` is the registry load/add/round/store and `max`/`min` are exact and
+order-independent (a NaN operand is ignored). The reference applies atomic updates in visit
+order. The compiler may group, vectorize, block, fuse, stage, pipeline, or distribute either loop
+only while preserving its ordering contract.
 
 ## Calls and implementations
 

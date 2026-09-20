@@ -1,9 +1,11 @@
-//! CUDA target configuration for constructive physical compilation.
+//! CUDA target configuration and the pipeline `Backend` implementation.
 
 mod estimate;
-pub use estimate::{EstimateModel, Totals, IDENTITY};
+pub use estimate::{EstimateModel, Totals, IDENTITY as COST_MODEL_IDENTITY};
 
+use seismic_compiler::pipeline::{Backend, EncodedPlan};
 use seismic_lang::sir::IntrinsicUse;
+use seismic_realization::executable::{self as realization, EffectiveTargetProfile, PlanFamily};
 
 pub const TARGET: &str = "cuda";
 pub const WARP: u32 = 32;
@@ -45,11 +47,11 @@ impl Limits {
     }
 }
 
+/// The CUDA backend and its effective target profile.
 pub struct Cuda {
-    pub(crate) limits: Limits,
-    pub(crate) target_profile: crate::target::TargetProfile,
-    pub(crate) physical_target_profile:
-        seismic_realization::executable::ExecutableTargetProfile<crate::physical::CudaCapability>,
+    limits: Limits,
+    target_profile: crate::target::TargetProfile,
+    physical_target_profile: EffectiveTargetProfile,
 }
 
 pub struct CudaCompiler<'a> {
@@ -88,7 +90,8 @@ impl Cuda {
         }
         estimate.validate()?;
         let target_profile = crate::target::TargetProfile::synthetic_baseline(limits.target());
-        let physical_target_profile = crate::physical::target_profile(&limits, &target_profile);
+        let physical_target_profile =
+            crate::physical::cuda_target_profile(&limits, &target_profile);
         Ok(Self {
             limits,
             target_profile,
@@ -108,7 +111,7 @@ impl Cuda {
         )
         .map_err(|error| error.to_string())?;
         backend.physical_target_profile =
-            crate::physical::target_profile(&backend.limits, &backend.target_profile);
+            crate::physical::cuda_target_profile(&backend.limits, &backend.target_profile);
         Ok(backend)
     }
 
@@ -121,87 +124,96 @@ impl Cuda {
     }
 }
 
-impl seismic_compiler::pipeline::Backend for Cuda {
+impl Backend for Cuda {
     type Dialect = crate::physical::CudaDialect;
-    type EncodedLaunch = crate::native::CudaLaunch;
+    type EncodedLaunch = crate::native::EncodedLaunch;
     type NativeArtifact = crate::native::Emitted;
 
     fn target(&self) -> &'static str {
         TARGET
     }
+
     fn capability_fingerprint(&self) -> String {
         self.physical_target_profile.capability_fingerprint.clone()
     }
+
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         self.target_profile.supports_intrinsic(intrinsic)
     }
-    fn target_profile(
-        &self,
-    ) -> &seismic_realization::executable::ExecutableTargetProfile<crate::physical::CudaCapability>
-    {
+
+    fn target_profile(&self) -> &EffectiveTargetProfile {
         &self.physical_target_profile
     }
+
     fn elaborate(
         &self,
         logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<seismic_realization::executable::PlanFamily<Self::Dialect>, String> {
-        crate::physical::elaborate(logical, &self.limits)
+    ) -> Result<PlanFamily<Self::Dialect>, String> {
+        crate::physical::elaborate(logical, &self.physical_target_profile)
+            .map_err(|error| error.to_string())
     }
+
     fn encode_launch(
         &self,
-        launch: &seismic_realization::executable::ResolvedLaunch<Self::Dialect>,
+        launch: &realization::ResolvedLaunch<Self::Dialect>,
     ) -> Result<Self::EncodedLaunch, String> {
-        crate::native::encode_launch(launch, &self.target_profile)
+        // The mechanical PTX emission happens once in `assemble`.
+        crate::native::encode_launch(launch)
     }
+
     fn assemble(
         &self,
-        encoded: seismic_compiler::pipeline::EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
+        encoded: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
     ) -> Result<Self::NativeArtifact, String> {
         crate::native::assemble(encoded)
     }
 }
 
-impl seismic_compiler::pipeline::Backend for CudaCompiler<'_> {
+impl Backend for CudaCompiler<'_> {
     type Dialect = crate::physical::CudaDialect;
-    type EncodedLaunch = crate::native::CudaLaunch;
+    type EncodedLaunch = crate::native::EncodedLaunch;
     type NativeArtifact = crate::PhysicalSequence;
 
     fn target(&self) -> &'static str {
         TARGET
     }
+
     fn capability_fingerprint(&self) -> String {
         self.planner
             .physical_target_profile
             .capability_fingerprint
             .clone()
     }
+
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         self.planner.target_profile.supports_intrinsic(intrinsic)
     }
-    fn target_profile(
-        &self,
-    ) -> &seismic_realization::executable::ExecutableTargetProfile<crate::physical::CudaCapability>
-    {
+
+    fn target_profile(&self) -> &EffectiveTargetProfile {
         &self.planner.physical_target_profile
     }
+
     fn elaborate(
         &self,
         logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<seismic_realization::executable::PlanFamily<Self::Dialect>, String> {
-        crate::physical::elaborate(logical, &self.planner.limits)
+    ) -> Result<PlanFamily<Self::Dialect>, String> {
+        self.planner.elaborate(logical)
     }
+
     fn encode_launch(
         &self,
-        launch: &seismic_realization::executable::ResolvedLaunch<Self::Dialect>,
+        launch: &realization::ResolvedLaunch<Self::Dialect>,
     ) -> Result<Self::EncodedLaunch, String> {
-        crate::native::encode_launch(launch, &self.planner.target_profile)
+        crate::native::encode_launch(launch)
     }
+
     fn assemble(
         &self,
-        encoded: seismic_compiler::pipeline::EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
+        encoded: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
     ) -> Result<Self::NativeArtifact, String> {
+        let emitted = self.planner.assemble(encoded)?;
         self.device
-            .compile_emitted(crate::native::assemble(encoded)?)
+            .compile_emitted(emitted)
             .map_err(|error| error.to_string())
     }
 }

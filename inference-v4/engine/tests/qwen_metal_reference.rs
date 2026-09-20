@@ -6,7 +6,7 @@ use reference::{Backend, TensorData, Workload};
 use seismic_lang::{
     interp::Rng,
     sir::{Mode, Program},
-    types::{DType, Elem, Ty},
+    types::{DType, Elem, ValueType},
 };
 use seismic_runtime::{
     plan::{PlanCompiler, Settings},
@@ -62,7 +62,12 @@ impl Harness<'_> {
             scalars.iter().map(|(n, v)| (n.to_string(), *v)).collect();
         let started = std::time::Instant::now();
         let mut expected = tensors.clone();
-        Backend::Interpreter(self.program, 64).run(entry, &shapes, &mut expected, &scalars);
+        Backend::Interpreter(self.program, HashMap::new()).run(
+            entry,
+            &shapes,
+            &mut expected,
+            &scalars,
+        );
         let interpreted = started.elapsed();
         let initial = tensors.clone();
         let mut actual = tensors;
@@ -135,41 +140,60 @@ impl Harness<'_> {
                 emitted.source = emitted.source.replace(from, to);
             }
             let pipeline = native.compile(emitted).unwrap();
-            let buffers = pipeline
+            // Parameter bindings by ordinal: ABI parameter ordinals are
+            // interface param ordinals.
+            let interface = compiled
+                .logical
+                .choice(compiled.logical.entry_choice)
+                .interface
+                .clone();
+            let parameters: Vec<(String, String)> = pipeline
                 .emitted
+                .abi
                 .buffers
                 .iter()
-                .map(|slot| {
-                    let tensor = &initial[&slot.parameter];
+                .filter_map(|binding| match binding.role {
+                    seismic_realization::executable::AbiRole::Parameter { ordinal } => {
+                        let name = interface.params.get(ordinal as usize)?.name.clone();
+                        Some((name, binding.plane.clone()))
+                    }
+                    seismic_realization::executable::AbiRole::Result => None,
+                })
+                .collect();
+            let buffers: Vec<_> = parameters
+                .iter()
+                .map(|(name, plane)| {
+                    let tensor = &initial[name];
                     let plane = match tensor {
                         TensorData::Dense { .. } => 0,
-                        TensorData::Packed { repr, .. } => repr.plane_index(&slot.plane).unwrap(),
+                        TensorData::Packed { repr, .. } => repr.plane_index(plane).unwrap(),
                     };
                     native.buffer_from(&tensor.device_bytes()[plane]).unwrap()
                 })
-                .collect::<Vec<_>>();
-            let values = pipeline
+                .collect();
+            let values: Vec<f64> = pipeline
                 .emitted
+                .abi
                 .scalars
+                .fields
                 .iter()
-                .map(|p| scalars[&p.name])
-                .collect::<Vec<_>>();
+                .map(|field| scalars[&field.parameter.name])
+                .collect();
             native
-                .run(
-                    &pipeline,
-                    &buffers.iter().collect::<Vec<_>>(),
-                    &pipeline.emitted.encode_scalars(&values).unwrap(),
-                    1,
-                )
+                .run(&seismic_metal::runtime::Invocation {
+                    pipeline: &pipeline,
+                    buffers: buffers.iter().collect::<Vec<_>>(),
+                    scalars: values,
+                })
                 .unwrap();
-            for (slot, buffer) in pipeline.emitted.buffers.iter().zip(&buffers) {
-                let mut tensor = initial[&slot.parameter].clone();
-                if !matches!(tensor, TensorData::Dense { .. }) {
+            for ((name, plane), buffer) in parameters.iter().zip(&buffers) {
+                let mut tensor = initial[name].clone();
+                if !matches!(tensor, TensorData::Dense { .. }) || !plane.is_empty() {
                     continue;
                 }
                 tensor.load_device_bytes(&buffer.read(buffer.len()));
                 let (e, a) = (
-                    reference::values(&expected[&slot.parameter]),
+                    reference::values(&expected[name]),
                     reference::values(&tensor),
                 );
                 let bad = e
@@ -182,14 +206,11 @@ impl Harness<'_> {
                     .zip(&a)
                     .map(|(e, a)| (e - a).abs())
                     .fold(0f32, f32::max);
-                println!(
-                    "   patched {}: {bad} mismatches, max_abs {worst:e}",
-                    slot.parameter
-                );
+                println!("   patched {name}: {bad} mismatches, max_abs {worst:e}");
             }
         }
         for param in &reference::entry(self.program, entry).params {
-            if !matches!(param.ty, Ty::Tensor(_)) || param.mode == Mode::In {
+            if !matches!(param.ty, ValueType::Tensor(_)) || param.mode == Mode::In {
                 continue;
             }
             let TensorData::Dense { dtype, .. } = &expected[&param.name] else {
@@ -278,7 +299,7 @@ fn random(
         .params
         .iter()
         .filter_map(|param| {
-            let Ty::Tensor(tensor) = &param.ty else {
+            let ValueType::Tensor(tensor) = &param.ty else {
                 return None;
             };
             let shape = reference::extents(tensor, &shapes);
