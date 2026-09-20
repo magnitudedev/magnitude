@@ -145,7 +145,8 @@ Evidence references must match verified uploads for that attempt. Repeated ident
 is idempotent; a changed reply is rejected. Receipt insertion and live authority validation
 share one database transaction, preventing cancellation or reassignment from racing acceptance.
 Evidence uploads reserve their declared bytes against an attempt budget before consuming
-the request. Uploading and verified objects are distinct states. Hash/length verification
+the request. Empty log files are valid zero-byte evidence objects and retain normal digest and
+authority checks; an absent HTTP body with an explicit zero length is an empty stream. Uploading and verified objects are distinct states. Hash/length verification
 and a fresh authority check precede publication; incomplete uploads cannot satisfy a result.
 Concurrent reservations count toward the same budget, and failed uploads release only their
 own reservation. Producers may upload package-sized objects up to 4 GiB within a 16 GiB attempt budget;
@@ -178,7 +179,9 @@ scheduler retains responsibility for releasing the allocated machine. Provider-n
 termination without a received result is an infrastructure failure, including exit zero. A final
 receipt read resolves the race between delivery and exit observation. Read-only status observation
 may retry transient transport failures; it never reruns native execution. Provider output is not
-copied into public errors or allowed to expose the guest credential.
+copied into public errors or allowed to expose the guest credential. Worker transport errors
+identify their operation and resource path without headers. Server-side infrastructure failures
+retain bounded, credential-redacted diagnostic logs; public error responses remain opaque.
 Run progress exposes owner-authorized build/test stages, attempt counts, dependency identities
 and current allocation states. The CLI emits stage changes while waiting; progress is not a test
 result and cannot establish acceptance. Reconnecting to wait on an existing run never resubmits
@@ -195,7 +198,7 @@ retained in detailed status and cannot substitute for the lab's successful compl
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,
-the coordinator stores bounded setup diagnostics in the artifact store, redacting credentials
+the coordinator stores bounded setup or terminal execution diagnostics in the artifact store, redacting credentials
 and URL capabilities. Completed blocked cases reference those objects, so the run owner can
 retrieve them after the guest is deleted. Diagnostic collection failure remains visible and
 cannot suppress cleanup or turn preparation failure into success.
@@ -360,7 +363,11 @@ Offline generation must establish an external connection before isolation and pr
 while a cached model is reloaded and generation is attested. Loopback remains available to the
 application and its test client. Network isolation is allowed only for a qualified disposable
 guest user and affects that user's external traffic, not the host management agent or other
-users. The fault owns its temporary rules; it never flushes shared firewall policy. Cleanup is
+users. An outward worker preserves only its trusted coordinator's resolved addresses and TCP
+port, plus the configured DNS resolvers on port 53, so assignment revocation and cancellation
+remain observable during the fault. These exceptions are recorded in isolation evidence; the
+candidate cannot choose them. The independent model-host connection must still fail during
+isolation. Loopback-only runners need no external exceptions. The fault owns its temporary rules; it never flushes shared firewall policy. Cleanup is
 registered before installation, restoration is checked after success or failure, and cleanup
 failures remain visible. A missing native isolation mechanism blocks the case.
 Interrupted model acquisition must observe positive incomplete transfer progress before the

@@ -7,7 +7,7 @@ import { checkedCommand, ProcessExecutor } from "../process"
 import { AzureInitialization, prepareAzureInitialization } from "./azure-initialization"
 import { azureInitializationWait } from "./azure-readiness"
 import { ArtifactStore } from "../artifact-store"
-import { retainInitializationDiagnostic } from "./initialization-diagnostics"
+import { retainWorkerDiagnostic } from "../worker-diagnostics"
 
 const vmApi = "2024-11-01"
 const nicApi = "2024-05-01"
@@ -129,7 +129,8 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       "--resource-group", config.resourceGroup, "--name", machine.name, "--command-id", "RunShellScript",
       "--scripts", "tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json", "--only-show-errors", "--output", "json"],
       { timeoutMs: 180_000, maxOutputBytes: 64 * 1024 })
-    return yield* retainInitializationDiagnostic(machine, reply.stdout).pipe(Effect.provideService(ArtifactStore, objects))
+    const output = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ value: Schema.Array(Schema.Struct({ message: Schema.String })) })))(reply.stdout)
+    return yield* retainWorkerDiagnostic(machine, "initialization", output.value.map(entry => entry.message).join("\n")).pipe(Effect.provideService(ArtifactStore, objects))
   }).pipe(Effect.mapError(() => fail("Could not retain initialization diagnostics")))
   return {
     inventory,

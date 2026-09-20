@@ -76,6 +76,6 @@ for (const state of ["Pending", "Running", "Succeeded", "Failed", "TimedOut", "C
   if (state === "foreign-command") expect(observed._tag).toBe("Left")
   else if (observed._tag === "Right") {
     expect(observed.right._tag).toBe(["Pending", "Running", "missing-view"].includes(state) ? "None" : "Some")
-    if (observed.right._tag === "Some") expect(observed.right.value).toEqual({ state, code: Option.some(state === "Failed" ? 17 : 0) })
+    if (observed.right._tag === "Some") expect(observed.right.value).toEqual({ state, code: Option.some(state === "Failed" ? 17 : 0), output: Option.some(Redacted.make("must not expose provider output or protected values\nprivate diagnostic fixture")) })
   } else expect.fail("Execution observation unexpectedly failed")
 }).pipe(Effect.provide(BunContext.layer))))

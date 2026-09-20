@@ -1,3 +1,4 @@
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Layer } from "effect"
 import { createServer, type AddressInfo } from "node:net"
 import { userInfo } from "node:os"
@@ -30,5 +31,5 @@ for (const injectFailure of [false, true]) test.skipIf(!enabled)(`native offline
   expect(cleanup).toEqual([])
   expect(yield* network.reachable(address)).toBe(true)
 })).pipe(Effect.provide(linuxNetworkFault.pipe(Layer.provide([
-  ProcessExecutorLive, Layer.succeed(DisposableDesktopUser, { home: userInfo().homedir }),
+  BunContext.layer, ProcessExecutorLive, Layer.succeed(DisposableDesktopUser, { home: userInfo().homedir }),
 ]))))), 30000)

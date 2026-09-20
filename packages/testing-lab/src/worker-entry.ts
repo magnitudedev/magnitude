@@ -17,6 +17,7 @@ import { configuredHarnessTools } from "./harnesses/suite"
 import { qualifyGuestUser } from "./guest-user"
 import { DisposableDesktopUser } from "./desktop-environment"
 import { NativeTerminalDriver } from "./terminal"
+import { NetworkControlPlane } from "./network-fault"
 
 export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type, root: string) => Effect.gen(function* () {
   const environment = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "TMPDIR", "USER", "LOGNAME", "SystemRoot", "TEMP", "APPDATA", "LOCALAPPDATA", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "RUSTUP_HOME", "LAB_EXPECTED_APPLE_TEAM_ID", "LAB_EXPECTED_WINDOWS_PUBLISHER", "LAB_WINDOWS_SIGNTOOL", "LAB_TERMINAL_NODE_EXECUTABLE"].flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []))
@@ -43,7 +44,9 @@ export const executeGuestInvocation = (invocation: typeof WorkerInvocation.Type,
 export const GuestExecutorLive = Layer.effect(GuestExecutor, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const processes = yield* ProcessExecutor
+  const control = yield* Effect.serviceOption(NetworkControlPlane)
   return { run: (invocation, root) => executeGuestInvocation(invocation, root).pipe(
+    Effect.provide(Option.match(control, { onNone: () => Layer.empty, onSome: value => Layer.succeed(NetworkControlPlane, value) })),
     Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes)) } satisfies GuestExecutor
 }))
 

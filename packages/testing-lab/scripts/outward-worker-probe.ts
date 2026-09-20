@@ -39,7 +39,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const storage = fileArtifactStore(join(root, "server-objects"))
   const registry = InputRegistryLive.pipe(Layer.provide(Layer.merge(database, storage)))
   const tickets = WorkerTicketsLive.pipe(Layer.provide(database))
-  const services = Layer.mergeAll(database, registry, tickets, runStoreLayer(100).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)),
+  const services = Layer.mergeAll(database, storage, registry, tickets, runStoreLayer(100).pipe(Layer.provide(database)), WorkStoreLive.pipe(Layer.provide(database)),
     WorkerInputsLive.pipe(Layer.provide(Layer.merge(registry, tickets))),
     WorkerEvidenceLive.pipe(Layer.provide(Layer.mergeAll(database, tickets, storage))),
     WorkerResultsLive.pipe(Layer.provide(Layer.merge(database, tickets))))

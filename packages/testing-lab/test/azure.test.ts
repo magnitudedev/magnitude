@@ -14,7 +14,7 @@ import { Allocating } from "../src/lease"
 import { targets } from "../src/catalog"
 import { LeaseId, RunId } from "../src/domain"
 import { ArtifactStore } from "../src/artifact-store"
-import { InitializationDiagnostic } from "../src/providers/initialization-diagnostics"
+import { WorkerDiagnostic } from "../src/worker-diagnostics"
 const target = targets.find(t => t.os === "ubuntu" && t.hardware === "intel")!
 const subscription = "5304c4b3-d605-4193-b0cb-766c065acfa6"
 const group = `/subscriptions/${subscription}/resourceGroups/magnitude-ci`
@@ -151,7 +151,7 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
         const evidence = Option.getOrThrow(result.left.evidence)[0]!
         const bytes = artifacts.get(evidence.sha256)!
         expect(bytes.byteLength).toBe(evidence.bytes)
-        const retained = Schema.decodeUnknownSync(Schema.parseJson(InitializationDiagnostic))(Buffer.from(bytes).toString())
+        const retained = Schema.decodeUnknownSync(Schema.parseJson(WorkerDiagnostic))(Buffer.from(bytes).toString())
         expect(retained.leaseId).toBe(l.leaseId)
         expect(retained.runId).toBe(l.runId)
         expect(retained.output).toContain("setup diagnostic:")

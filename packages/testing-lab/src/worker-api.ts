@@ -1,3 +1,4 @@
+import { redactWorkerOutput } from "./worker-diagnostics"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Effect, Option, Redacted, Schema, Stream } from "effect"
 import { Digest, InfrastructureFailure } from "./domain"
@@ -17,7 +18,7 @@ export const workerApi = HttpRouter.empty.pipe(
     const length = request.headers["content-length"]
     if (!length || !/^\d+$/.test(length)) return yield* new InvalidResult({ message: "Evidence requires an exact Content-Length" })
     const digest = yield* Schema.decodeUnknown(Digest)((yield* HttpRouter.params).digest)
-    yield* (yield* WorkerEvidence).upload(Redacted.make(header.slice(7)), digest, Number(length), request.stream.pipe(
+    yield* (yield* WorkerEvidence).upload(Redacted.make(header.slice(7)), digest, Number(length), (Number(length) === 0 ? Stream.empty : request.stream).pipe(
       Stream.mapError(() => new InfrastructureFailure({ operation: "worker-evidence", message: "Evidence request interrupted" }))))
     return HttpServerResponse.empty({ status: 204, headers: { "cache-control": "no-store" } })
   })),
@@ -44,6 +45,16 @@ export const workerApi = HttpRouter.empty.pipe(
     const invocation = yield* (yield* WorkerTickets).authorize(Redacted.make(header.slice(7)))
     return (yield* HttpServerResponse.schemaJson(WorkerInvocation)(invocation)).pipe(HttpServerResponse.setHeader("cache-control", "no-store"))
   })),
-  HttpRouter.catchAll(error => Effect.succeed(HttpServerResponse.unsafeJson({ error: ["WorkerAccessDenied", "InvalidResult", "ParseError", "RequestError"].includes(error._tag) ? error._tag : "WorkerUnavailable" },
-    { status: error._tag === "WorkerAccessDenied" ? 401 : error._tag === "InvalidResult" ? 409 : error._tag === "ParseError" || error._tag === "RequestError" ? 400 : 500, headers: { "cache-control": "no-store" } }))),
+  HttpRouter.catchAll(error => Effect.gen(function* () {
+    if (error._tag === "InfrastructureFailure") {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const token = request.headers.authorization?.replace(/^Bearer /, "")
+      const detail = redactWorkerOutput(token ? error.message.replaceAll(token, "[REDACTED]") : error.message).slice(0, 2048)
+      yield* Effect.logError("Worker API infrastructure failure").pipe(Effect.annotateLogs({
+        operation: error.operation, method: request.method, path: request.url.split("?")[0]!, detail,
+      }))
+    }
+    return HttpServerResponse.unsafeJson({ error: ["WorkerAccessDenied", "InvalidResult", "ParseError", "RequestError"].includes(error._tag) ? error._tag : "WorkerUnavailable" },
+      { status: error._tag === "WorkerAccessDenied" ? 401 : error._tag === "InvalidResult" ? 409 : error._tag === "ParseError" || error._tag === "RequestError" ? 400 : 500, headers: { "cache-control": "no-store" } })
+  })),
 )

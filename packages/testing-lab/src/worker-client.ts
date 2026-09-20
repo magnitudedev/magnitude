@@ -23,9 +23,9 @@ export const workerClientLayer = (origin: string, token: Redacted.Redacted<strin
   const headers = { authorization: `Bearer ${Redacted.value(token)}` }
   const send = (request: HttpClientRequest.HttpClientRequest, timeoutMs = 30_000) => http.execute(request).pipe(
     Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
-    Effect.mapError(() => failure("Worker coordinator request failed")),
-    Effect.timeoutFail({ duration: timeoutMs, onTimeout: () => failure("Worker coordinator request timed out") }),
-    Effect.flatMap(response => response.status >= 200 && response.status < 300 ? Effect.succeed(response) : Effect.fail(failure(`Worker coordinator returned HTTP ${response.status}`, response.status))),
+    Effect.mapError(() => failure(`Worker coordinator ${request.method} ${request.url.slice(url.origin.length)} request failed`)),
+    Effect.timeoutFail({ duration: timeoutMs, onTimeout: () => failure(`Worker coordinator ${request.method} ${request.url.slice(url.origin.length)} request timed out`) }),
+    Effect.flatMap(response => response.status >= 200 && response.status < 300 ? Effect.succeed(response) : Effect.fail(failure(`Worker coordinator ${request.method} ${request.url.slice(url.origin.length)} returned HTTP ${response.status}`, response.status))),
   )
   return {
     assignment: Effect.gen(function* () {

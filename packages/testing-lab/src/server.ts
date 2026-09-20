@@ -72,7 +72,7 @@ export const configuredCoordinator = Effect.gen(function* () {
       const bootstrap = yield* azureLinuxBootstrap(config.azure.value.allocation)
       byProvider.set("azure", Context.get(yield* Layer.build(outwardWorkerRunner({ origin: config.azure.value.workerOrigin,
         runtimes: config.runtimes.filter(runtime => runtime.provider === "azure"), pollMs: 1000 }).pipe(
-        Layer.provide(Layer.succeed(WorkerBootstraps, { providers: new Map([["azure" as const, bootstrap]]) })))), WorkerRunner))
+        Layer.provide(Layer.merge(storage, Layer.succeed(WorkerBootstraps, { providers: new Map([["azure" as const, bootstrap]]) }))))), WorkerRunner))
     }
     return { run: (machine, assignment) => {
       const selected = byProvider.get(machine.provider)

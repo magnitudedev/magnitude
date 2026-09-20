@@ -42,6 +42,9 @@ export const azureLinuxBootstrap = (config: typeof AzureBootstrapConfig.Type) =>
   const Execution = Schema.Struct({ id: Schema.String, properties: Schema.Struct({
     provisioningState: Schema.String,
     instanceView: Schema.optionalWith(Schema.Struct({ executionState: Schema.Literal("Unknown", "Pending", "Running", "Succeeded", "Failed", "TimedOut", "Canceled"),
+      output: Schema.optionalWith(Schema.NullOr(Schema.String), { as: "Option", exact: true }),
+      error: Schema.optionalWith(Schema.NullOr(Schema.String), { as: "Option", exact: true }),
+      executionMessage: Schema.optionalWith(Schema.NullOr(Schema.String), { as: "Option", exact: true }),
       exitCode: Schema.optionalWith(Schema.Int, { as: "Option", exact: true }) }), { as: "Option", exact: true }),
   }) })
   return {
@@ -55,7 +58,9 @@ export const azureLinuxBootstrap = (config: typeof AzureBootstrapConfig.Type) =>
       if (observed.id.toLowerCase() !== id.toLowerCase()) return yield* fail("Execution state belongs to another worker")
       const state = observed.properties.instanceView
       if (Option.isSome(state) && ["Succeeded", "Failed", "TimedOut", "Canceled"].includes(state.value.executionState)) {
-        return Option.some(yield* Schema.decodeUnknown(WorkerExit)({ state: state.value.executionState, ...Option.match(state.value.exitCode, { onNone: () => ({}), onSome: code => ({ code }) }) }).pipe(Effect.orDie))
+        const output = [state.value.output, state.value.error, state.value.executionMessage].flatMap(value => Option.toArray(value).filter((text): text is string => typeof text === "string")).join("\n").slice(-32 * 1024)
+        return Option.some(yield* Schema.decodeUnknown(WorkerExit)({ state: state.value.executionState,
+          ...(output ? { output } : {}), ...Option.match(state.value.exitCode, { onNone: () => ({}), onSome: code => ({ code }) }) }).pipe(Effect.orDie))
       }
       if (["Failed", "Canceled"].includes(observed.properties.provisioningState)) return Option.some(WorkerExit.make({ state: "Failed", code: Option.none() }))
       return Option.none()

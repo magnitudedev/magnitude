@@ -1,5 +1,5 @@
 import { assignmentInputs } from "./work-store"
-import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
+import { Context, DateTime, Effect, Layer, Option, Redacted, Schema } from "effect"
 import { posix, win32 } from "node:path"
 import { InfrastructureFailure, Provider } from "./domain"
 import { InputRegistry } from "./inputs"
@@ -10,11 +10,14 @@ import { WorkerInvocation } from "./worker-protocol"
 import { WorkerResults } from "./worker-results"
 import { WorkerTickets } from "./worker-tickets"
 import { GuestRuntime } from "./worker-runner"
+import { ArtifactStore } from "./artifact-store"
+import { retainWorkerDiagnostic } from "./worker-diagnostics"
 
 export const WorkerLaunch = Schema.Struct({ executable: Schema.NonEmptyString, args: Schema.Array(Schema.String), root: Schema.NonEmptyString,
   origin: Schema.NonEmptyString, token: Schema.Redacted(Schema.NonEmptyString), deadline: Schema.DateTimeUtc })
 export const WorkerExit = Schema.Struct({ state: Schema.Literal("Succeeded", "Failed", "TimedOut", "Canceled"),
-  code: Schema.optionalWith(Schema.Int, { as: "Option", exact: true }) })
+  code: Schema.optionalWith(Schema.Int, { as: "Option", exact: true }),
+  output: Schema.optionalWith(Schema.Redacted(Schema.String), { as: "Option", exact: true }).pipe(Schema.withConstructorDefault(() => Option.none())) })
 export interface WorkerBootstrap {
   /** Start once and return after delivery. Provider credentials stay in this privileged adapter. */
   readonly poll: (machine: Machine) => Effect.Effect<Option.Option<typeof WorkerExit.Type>, InfrastructureFailure>
@@ -33,6 +36,7 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
   const results = yield* WorkerResults
   const inputs = yield* InputRegistry
   const bootstraps = yield* WorkerBootstraps
+  const objects = yield* ArtifactStore
   return {
     run: (machine, assignment) => Effect.gen(function* () {
       const matches = config.runtimes.filter(runtime => runtime.provider === machine.provider && runtime.artifactHost === assignment.target.target.artifactHost)
@@ -74,13 +78,20 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
                 yield* validateTargetResult(assignment.target, delivered.value.result)
                 return delivered.value.result
               }
-              return yield* fail(`Guest process ended ${exited.value.state}${Option.match(exited.value.code, { onNone: () => "", onSome: code => ` (exit ${code})` })} without an accepted result`)
+              const diagnostic = yield* retainWorkerDiagnostic(machine, "execution", Option.match(exited.value.output, {
+                onNone: () => "Provider did not return execution output", onSome: Redacted.value,
+              }), [Redacted.value(ticket.token)]).pipe(Effect.provideService(ArtifactStore, objects), Effect.either)
+              return yield* new InfrastructureFailure({ operation: "outward-runner",
+                message: `Guest process ended ${exited.value.state}${Option.match(exited.value.code, { onNone: () => "", onSome: code => ` (exit ${code})` })} without an accepted result; ${diagnostic._tag === "Right" ? "execution diagnostics retained in run evidence" : "could not retain execution diagnostics"}`,
+                evidence: diagnostic._tag === "Right" ? Option.some([diagnostic.right]) : Option.none() })
             }
           }
           yield* Effect.sleep(config.pollMs)
         }
       }).pipe(Effect.timeoutFail({ duration: Math.max(1, deadline - Date.now()), onTimeout: () => fail("Guest execution exceeded its allocation deadline") }))).pipe(
-        Effect.mapError(error => fail(`${error._tag === "WorkerAccessDenied" ? "Worker authority ended before result collection" : error.message}${cleanupErrors.length ? `; ${cleanupErrors.join("; ")}` : ""}`)))
+        Effect.mapError(error => new InfrastructureFailure({ operation: "outward-runner",
+          message: `${error._tag === "WorkerAccessDenied" ? "Worker authority ended before result collection" : error.message}${cleanupErrors.length ? `; ${cleanupErrors.join("; ")}` : ""}`,
+          evidence: error._tag === "InfrastructureFailure" ? error.evidence : Option.none() })))
       return { ...result, cleanupErrors: [...result.cleanupErrors, ...cleanupErrors] }
     }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail(error.message))),
   } satisfies WorkerRunner

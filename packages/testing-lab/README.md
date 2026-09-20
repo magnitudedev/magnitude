@@ -11,7 +11,8 @@ checks: a producer compiles and packages, then a different clean consumer instal
 artifact graph. Both returned passing JSON/JUnit and released their workers. The GitHub run
 also retained 41 independently hash-verified evidence objects. A real coordinator restart
 recovered the same run onto a fresh worker and passed all 23 checks. Setup-failure evidence
-remains downloadable after worker deletion; cancelling a real GitHub build also cleaned up
+remains downloadable after worker deletion. A deliberate native worker exit also retained
+its terminal diagnostic after cleanup, verified through the ordinary evidence API. Cancelling a real GitHub build cleaned up
 its Azure resources. Remaining functional cases and other platform images are still required
 before the full matrix is usable. These results qualify the selected Ubuntu flow, not every catalog target.
 

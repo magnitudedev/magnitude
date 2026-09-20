@@ -14,6 +14,7 @@ import { validateTargetResult, WorkClaim } from "./work-store"
 import { GuestExecutorLive } from "./worker-entry"
 import { WorkerClient, workerClientLayer } from "./worker-client"
 import { WorkerInvocation, WorkerReply } from "./worker-protocol"
+import { NetworkControlPlane } from "./network-fault"
 
 export const OutwardWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, pollMs: Schema.Int.pipe(Schema.between(10, 30_000)) })
 const fail = (message: string) => new InfrastructureFailure({ operation: "outward-worker", message })
@@ -112,9 +113,10 @@ export const deliverOutwardWorkerResult = (config: typeof OutwardWorkerConfig.Ty
 export const outwardGuestMain = Effect.scoped(Effect.gen(function* () {
   yield* assertRuntime
   const config = yield* Schema.decodeUnknown(OutwardWorkerConfig)({ root: yield* Config.string("LAB_WORKER_ROOT"), pollMs: 10_000 })
-  const client = workerClientLayer(yield* Config.string("LAB_URL"), yield* Config.redacted("LAB_WORKER_TOKEN")).pipe(Layer.provide(FetchHttpClient.layer))
+  const origin = yield* Config.string("LAB_URL")
+  const client = workerClientLayer(origin, yield* Config.redacted("LAB_WORKER_TOKEN")).pipe(Layer.provide(FetchHttpClient.layer))
   const action = yield* Config.literal("execute", "deliver")("LAB_WORKER_ACTION").pipe(Config.withDefault("execute"))
   if (action === "deliver") yield* deliverOutwardWorkerResult(config).pipe(Effect.provide(client))
-  else yield* runOutwardWorker(config).pipe(Effect.provide([client, GuestExecutorLive]))
+  else yield* runOutwardWorker(config).pipe(Effect.provide([client, GuestExecutorLive.pipe(Layer.provide(Layer.succeed(NetworkControlPlane, { origin })))]))
 }))
 if (import.meta.main) BunRuntime.runMain(outwardGuestMain.pipe(Effect.provide([BunContext.layer, ProcessExecutorLive])))
