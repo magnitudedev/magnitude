@@ -9,7 +9,9 @@ import { DisposableDesktopUser } from "../src/desktop-environment"
 test("isolated consumers share one endpoint, profile and harness home with scoped native control", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-context-" })
-  const context = yield* Effect.scoped(prepareApplicationContext(root, 11489, { HOME: "/ambient", PATH: "/tools" }))
+  const context = yield* Effect.scoped(prepareApplicationContext(root, 11489, { HOME: "/ambient", PATH: "/tools" }).pipe(Effect.tap(value => Effect.gen(function* () {
+    if (process.platform !== "win32") expect(yield* fs.realPath(value.environment.MAGNITUDE_DESKTOP_STATE_DIR!)).toBe(value.environment.MAGNITUDE_DESKTOP_STATE_DIR)
+  }))))
   expect(context.mode).toBe("isolated")
   expect(context.environment.MAGNITUDE_DEV_DATA_DIR).toBe(context.profile)
   expect(context.environment.MAGNITUDE_DEV_PORT).toBe(String(context.port))

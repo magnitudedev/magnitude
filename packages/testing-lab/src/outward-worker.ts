@@ -7,7 +7,7 @@ import { outputObjects } from "./build-output"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
 import { Digest, InfrastructureFailure } from "./domain"
 import { GuestExecutor } from "./guest-executor"
-import { InputManifest } from "./inputs"
+import { artifactObjects, InputManifest } from "./inputs"
 import { ProcessExecutorLive } from "./process"
 import { assertRuntime } from "./runtime"
 import { validateTargetResult, WorkClaim } from "./work-store"
@@ -44,7 +44,7 @@ export const runOutwardWorker = (config: typeof OutwardWorkerConfig.Type) => Eff
       const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(Buffer.concat(Array.from(bytes)).toString("utf8"))
       if (manifest.kind !== input.kind) return yield* fail("Assigned input kind differs from its manifest")
       const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(entry => entry.kind === "file" ? [entry.sha256] : [])
-        : manifest.release.artifacts.map(artifact => Digest.make(artifact.sha256)))]
+        : artifactObjects(manifest).map(artifact => artifact.sha256))]
       yield* Effect.forEach(digests, digest => store.put(digest, client.download(digest)), { concurrency: 4, discard: true })
     }
     const reply = yield* executor.run(invocation, root)

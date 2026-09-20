@@ -18,7 +18,7 @@ export const prepareApplicationContext = (root: string, port: number, inherited:
   }
   const profile = join(root, "profile"), home = join(root, "home")
   const state = process.platform === "win32" ? join(profile, "state")
-    : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" })
+    : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-state-" }).pipe(Effect.flatMap(fs.realPath))
   yield* fs.makeDirectory(home, { recursive: true, mode: 0o700 })
   const context = ApplicationContext.make({ mode: "isolated", profile, port, harnessHome: join(profile, "harness-home"), environment: {
     ...inherited, HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"), LOCALAPPDATA: join(home, "AppData", "Local"),

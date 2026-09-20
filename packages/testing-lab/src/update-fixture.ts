@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { acceptsUpdateRelease, decodeUpdateRequest, ReleaseTarget, signUpdateRelease, UpdateConfiguration, UpdateRelease, verifyUpdateRequest } from "@magnitudedev/release/hosted-update"
 import { defineFSM } from "@magnitudedev/utils/fsm"
 import { Clock, Effect, Option, Ref, Runtime, Schema, Stream } from "effect"
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto"
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from "node:crypto"
 import { join } from "node:path"
 import { AssertionFailure, Digest, InfrastructureFailure } from "./domain"
 import { checkedCommand } from "./process"
@@ -11,6 +11,12 @@ export const UpdateFixtureArtifact = Schema.Struct({
   path: Schema.NonEmptyString, version: Schema.NonEmptyString, target: ReleaseTarget,
   bytes: Schema.Int.pipe(Schema.positive()), sha256: Digest,
 })
+/** Private run material, stored as an authorized object, never as result evidence. */
+export const UpdateFixtureAuthority = Schema.Struct({ schemaVersion: Schema.Literal(1),
+  origin: Schema.String.pipe(Schema.pattern(/^https:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}$/)),
+  certificate: Schema.NonEmptyString, tlsPrivateKey: Schema.NonEmptyString, publisherPrivateKey: Schema.NonEmptyString,
+})
+export type UpdateFixtureAuthority = typeof UpdateFixtureAuthority.Type
 export const UpdateFixtureDelivery = Schema.Literal("Exact", "Corrupt")
 class Empty extends Schema.TaggedClass<Empty>()("Empty", {}) {}
 class Offering extends Schema.TaggedClass<Offering>()("Offering", {
@@ -20,17 +26,33 @@ const lifecycle = defineFSM({ Empty, Offering }, { Empty: ["Offering"], Offering
 const fail = (message: string) => new InfrastructureFailure({ operation: "update-fixture", message })
 
 /** Owns a loopback-only HTTPS origin and temporary trust; never modifies the operating-system trust store. */
-export const updateFixture = (parent: string) => Effect.gen(function* () {
+export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped({ directory: parent, prefix: "update-fixture-" })
   yield* fs.chmod(directory, 0o700)
   const caPath = join(directory, "certificate.pem"), keyPath = join(directory, "tls-key.pem")
+  if (restored) yield* Schema.decodeUnknown(UpdateFixtureAuthority)(restored).pipe(Effect.mapError(() => fail("Malformed private update authority")))
   const opensslConfig = join(directory, "openssl.cnf")
-  yield* fs.writeFileString(opensslConfig, `[req]\nprompt = no\ndistinguished_name = subject\nx509_extensions = extensions\n[subject]\nCN = Magnitude isolated update fixture\n[extensions]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage = serverAuth\nsubjectAltName = IP:127.0.0.1,DNS:localhost\n`, { mode: 0o600 })
-  yield* checkedCommand("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", opensslConfig,
-    "-keyout", keyPath, "-out", caPath], { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
-  yield* fs.chmod(keyPath, 0o600)
-  const publisher = yield* Effect.try({ try: () => generateKeyPairSync("ed25519"), catch: () => fail("Could not create fixture publisher") })
+  if (restored) {
+    yield* Effect.try({ try: () => {
+      const certificate = new X509Certificate(restored.certificate)
+      if (!certificate.checkPrivateKey(createPrivateKey(restored.tlsPrivateKey)) || certificate.checkIP("127.0.0.1") !== "127.0.0.1"
+        || Date.parse(certificate.validTo) <= Date.now() || Date.parse(certificate.validFrom) > Date.now()
+        || Number(new URL(restored.origin).port) > 65535) throw new Error("Invalid fixture authority")
+    }, catch: () => fail("Restored update authority has invalid or expired loopback TLS material") })
+    yield* fs.writeFileString(caPath, restored.certificate, { mode: 0o600 })
+    yield* fs.writeFileString(keyPath, restored.tlsPrivateKey, { mode: 0o600 })
+  } else {
+    yield* fs.writeFileString(opensslConfig, `[req]\nprompt = no\ndistinguished_name = subject\nx509_extensions = extensions\n[subject]\nCN = Magnitude isolated update fixture\n[extensions]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage = serverAuth\nsubjectAltName = IP:127.0.0.1,DNS:localhost\n`, { mode: 0o600 })
+    yield* checkedCommand("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", opensslConfig,
+      "-keyout", keyPath, "-out", caPath], { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
+    yield* fs.chmod(keyPath, 0o600)
+  }
+  const publisher = yield* Effect.try({ try: () => {
+    const privateKey = restored ? createPrivateKey(restored.publisherPrivateKey) : generateKeyPairSync("ed25519").privateKey
+    if (privateKey.asymmetricKeyType !== "ed25519") throw new Error("Invalid fixture signing key")
+    return { privateKey, publicKey: createPublicKey(privateKey) }
+  }, catch: () => fail("Could not create fixture publisher") })
   const state = yield* Ref.make<Empty | Offering>(new Empty())
   const gate = yield* Effect.makeSemaphore(1)
   // Replay admission is synchronous inside the request Effect and bounded independently of server lifetime.
@@ -86,7 +108,7 @@ export const updateFixture = (parent: string) => Effect.gen(function* () {
     Effect.map(value => value._tag === "Some" ? value.value : new Response(null, { status: 504 })))
   const runtime = yield* Effect.runtime<never>()
   const key = yield* fs.readFileString(keyPath), cert = yield* fs.readFileString(caPath)
-  const server = yield* Effect.acquireRelease(Effect.try({ try: () => Bun.serve({ hostname: "127.0.0.1", port: 0,
+  const server = yield* Effect.acquireRelease(Effect.try({ try: () => Bun.serve({ hostname: "127.0.0.1", port: restored ? Number(new URL(restored.origin).port) : 0,
     tls: { key, cert }, maxRequestBodySize: 0,
     fetch: request => Runtime.runPromise(runtime)(handler(request)),
     error: () => new Response(null, { status: 500 }),
@@ -95,6 +117,7 @@ export const updateFixture = (parent: string) => Effect.gen(function* () {
   const configuration = yield* Schema.decodeUnknown(UpdateConfiguration)({ origin, acceptance: true, keyId: "lab-fixture",
     publicKey: publisher.publicKey.export({ type: "spki", format: "pem" }).toString(),
     artifactDelivery: { _tag: "PrivateAcceptance", origin },
+    ...(process.platform === "win32" ? { windowsPublisher: "Magnitude Update Acceptance" } : {}),
   })
   const configPath = join(directory, "configuration.json")
   yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(UpdateConfiguration))(configuration), { mode: 0o600 })
@@ -124,5 +147,7 @@ export const updateFixture = (parent: string) => Effect.gen(function* () {
     return release
   }))
   const withdraw = gate.withPermits(1)(Ref.update(state, current => current._tag === "Empty" ? current : lifecycle.transition(current, "Empty", {})))
-  return { origin, caPath, configPath, configuration, publish, withdraw }
+  const authority = UpdateFixtureAuthority.make({ schemaVersion: 1, origin, certificate: cert, tlsPrivateKey: key,
+    publisherPrivateKey: publisher.privateKey.export({ type: "pkcs8", format: "pem" }).toString() })
+  return { origin, caPath, configPath, configuration, publish, withdraw, authority }
 })

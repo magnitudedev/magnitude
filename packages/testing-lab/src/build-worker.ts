@@ -24,7 +24,8 @@ export const runBuildWorker = (assignment: WorkAssignment) => Effect.gen(functio
   }).pipe(Effect.mapError(error => new InfrastructureFailure({ operation: "build-worker", message: error.message })))
   const identity = yield* evidence("build-source.json", SourceManifest, source)
   const observed = yield* evidence("build-host.json", HostObservation, host)
-  const build = yield* (yield* SourceBuilder).prepare(source, assignment.input.digest, work.target.target, work.backend)
+  const build = yield* (yield* SourceBuilder).prepare(source, assignment.input.digest, work.target.target, work.backend,
+    assignment.plan.targets.some(target => work.consumers.includes(target.target.id) && target.cases.some(test => test.suite === "update")))
   let output: Option.Option<BuildOutput> = Option.none()
   const cases = yield* runCases(work.target.target, work.target.cases).pipe(Effect.provideService(CaseExecutor, {
     execute: test => test.id === "P1" ? build.compile : Effect.gen(function* () {

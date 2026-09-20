@@ -1,7 +1,7 @@
 import { assignmentInputs } from "./work-store"
 import { Cache, Context, Data, Effect, Exit, Layer, Redacted, Schema, Stream } from "effect"
 import { Digest, InfrastructureFailure, OwnerId } from "./domain"
-import { InputManifest, InputRegistry } from "./inputs"
+import { artifactObjects, InputManifest, InputRegistry } from "./inputs"
 import { sha256 } from "./snapshot"
 import { WorkerAccessDenied, WorkerTickets } from "./worker-tickets"
 
@@ -28,7 +28,7 @@ export const WorkerInputsLive = Layer.effect(WorkerInputs, Effect.gen(function* 
       const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(bytes.toString("utf8"))
       if (manifest.kind !== key.kind) return yield* new InfrastructureFailure({ operation: "worker-input", message: "Assigned manifest kind mismatch" })
       return new Set(manifest.kind === "source" ? manifest.entries.flatMap(entry => entry.kind === "file" ? [entry.sha256] : [])
-        : manifest.release.artifacts.map(artifact => Digest.make(artifact.sha256)))
+        : artifactObjects(manifest).map(artifact => artifact.sha256))
     }),
   })
   return {

@@ -1,6 +1,6 @@
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { decodeUpdateConfiguration, UpdateConfiguration, ReleaseTarget, signUpdateRequest, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
+import { decodeUpdateConfiguration, UpdateConfiguration, UpdateRelease, ReleaseTarget, signUpdateRequest, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
 import { Effect, Option, Schema } from "effect"
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import { existsSync, readFileSync } from "node:fs"
@@ -120,4 +120,33 @@ it("serves signed private updates over trusted HTTPS and closes its owned resour
     socket.once("error", error => done((error as NodeJS.ErrnoException).code === "ECONNREFUSED"))
   })
   expect(refused).toBe(true)
+}, 30_000)
+
+it("moves private update authority between disjoint build and consumer lifetimes", async () => {
+  await run(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const parent = yield* fs.makeTempDirectoryScoped({ prefix: "lab-update-transfer-" })
+    const built = yield* Effect.scoped(Effect.gen(function* () {
+      const fixture = yield* updateFixture(parent)
+      return { authority: fixture.authority, configuration: fixture.configuration }
+    }))
+    const consumer = yield* updateFixture(parent, built.authority)
+    expect(consumer.configuration).toEqual(built.configuration)
+    expect(yield* fs.readFileString(consumer.caPath)).toBe(built.authority.certificate)
+    const target = { os: "darwin", arch: "arm64", package: "mac-zip" } as const
+    const path = join(parent, "new.zip"), content = Buffer.from("transferred candidate")
+    yield* fs.writeFile(path, content)
+    const offered = yield* consumer.publish({ path, version: "2.0.0", target, bytes: content.length, sha256: Digest.make(createHash("sha256").update(content).digest("hex")) })
+    const trusted = yield* decodeUpdateConfiguration(yield* Schema.encode(UpdateConfiguration)(built.configuration), true)
+    expect(yield* verifyUpdateRelease(yield* Schema.encode(UpdateRelease)(offered), target, trusted.trustedPublishers)).toEqual(offered)
+    const collision = yield* Effect.scoped(updateFixture(parent, built.authority)).pipe(Effect.either)
+    expect(collision._tag).toBe("Left")
+    // Failed restoration must not close the existing listener.
+    const identity = generateKeyPairSync("ed25519")
+    const url = new URL(`/api/update?${new URLSearchParams({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "15.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now()/1000)), nonce: randomBytes(16).toString("base64url") })}`, consumer.origin)
+    expect((yield* fetchFixture(url.href, consumer.caPath, { authorization: yield* signUpdateRequest(identity.privateKey, url) })).status).toBe(200)
+    const wrongKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString()
+    const invalid = yield* Effect.scoped(updateFixture(parent, { ...built.authority, tlsPrivateKey: wrongKey })).pipe(Effect.either)
+    expect(invalid._tag).toBe("Left")
+  })))
 }, 30_000)

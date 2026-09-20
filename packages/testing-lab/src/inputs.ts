@@ -1,11 +1,18 @@
-import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { ReleaseManifestSchema, validateReleaseManifest } from "@magnitudedev/release/contracts"
 import { ArtifactStore } from "./artifact-store"
 import { Database, decodeRow } from "./database"
 import { Digest, InfrastructureFailure, Input, InvalidInput, OwnerId } from "./domain"
+import { isNewerVersion } from "@magnitudedev/release"
+import { decodeUpdateConfiguration, UpdateConfiguration } from "@magnitudedev/release/hosted-update"
+import { UpdateAcceptance } from "./update-acceptance"
 import { SourceManifest, validateManifest } from "./snapshot"
 
-export const ArtifactInput = Schema.Struct({ schemaVersion: Schema.Literal(1), kind: Schema.Literal("artifacts"), release: ReleaseManifestSchema })
+export const ArtifactInput = Schema.Struct({ schemaVersion: Schema.Literal(1), kind: Schema.Literal("artifacts"), release: ReleaseManifestSchema,
+  updateAcceptance: Schema.optionalWith(UpdateAcceptance, { as: "Option", exact: true }) })
+export const artifactReleases = (input: typeof ArtifactInput.Type) => [input.release, ...Option.match(input.updateAcceptance, { onNone: () => [], onSome: pair => [pair.previous, pair.candidate] })]
+export const artifactObjects = (input: typeof ArtifactInput.Type) => [...artifactReleases(input).flatMap(release => release.artifacts.map(artifact => ({ sha256: Digest.make(artifact.sha256), bytes: artifact.bytes }))),
+  ...Option.match(input.updateAcceptance, { onNone: () => [], onSome: pair => [pair.authority] })]
 export const InputManifest = Schema.Union(SourceManifest, ArtifactInput)
 export class InputDenied extends Schema.TaggedError<InputDenied>()("InputDenied", {}) {}
 type Owner = typeof OwnerId.Type
@@ -52,12 +59,19 @@ export const InputRegistryLive = Layer.effect(InputRegistry, Effect.gen(function
       if (manifest.kind !== input.kind) return yield* new InvalidInput({ message: "Input kind does not match its manifest" })
       if (manifest.kind === "source") yield* validateManifest(manifest)
       else {
-        yield* validateReleaseManifest(manifest.release).pipe(Effect.mapError(error => new InvalidInput({ message: error.message })))
-        if (manifest.release.artifacts.some(a => a.filename.includes("/") || a.filename.includes("\\") || a.filename === "." || a.filename === "..")) {
+        for (const release of artifactReleases(manifest)) yield* validateReleaseManifest(release).pipe(Effect.mapError(error => new InvalidInput({ message: error.message })))
+        if (Option.isSome(manifest.updateAcceptance)) {
+          const pair = manifest.updateAcceptance.value
+          if (pair.previous.sourceCommit !== manifest.release.sourceCommit || pair.candidate.sourceCommit !== manifest.release.sourceCommit || !isNewerVersion(pair.candidate.version, pair.previous.version)) {
+            return yield* new InvalidInput({ message: "Update acceptance pair differs from its source or version order" })
+          }
+          yield* Schema.encode(UpdateConfiguration)(pair.configuration).pipe(Effect.flatMap(wire => decodeUpdateConfiguration(wire, true)), Effect.mapError(() => new InvalidInput({ message: "Invalid update acceptance publisher configuration" })))
+        }
+        if (artifactReleases(manifest).flatMap(release => release.artifacts).some(a => a.filename.includes("/") || a.filename.includes("\\") || a.filename === "." || a.filename === "..")) {
           return yield* new InvalidInput({ message: "Artifact filenames must be basenames" })
         }
       }
-      const files = manifest.kind === "source" ? manifest.entries.filter(e => e.kind === "file") : manifest.release.artifacts
+      const files = manifest.kind === "source" ? manifest.entries.filter(e => e.kind === "file") : artifactObjects(manifest)
       const digests = [...new Set(files.map(file => file.sha256))]
       const lengths = new Map<string, number>()
       for (let offset = 0; offset < digests.length; offset += 1000) {

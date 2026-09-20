@@ -1004,3 +1004,26 @@ The pinned-fixture probe passed on a real Azure Windows Server 2025 guest (build
 NotSigned/None, and HashMismatch/Authenticode for the three cases. The report has no cleanup
 errors. This validates native inspection and corrupted embedded-signature detection, not a
 Windows 10/11 application, a full installer, third-party publisher policy, or production signing.
+
+### Source-built updater pair delivery
+
+Selecting update cases for a source run now builds the normal package plus two explicit
+same-source acceptance versions. Both fixture graphs include the matching application and ACN
+version; native inference archives are reused from that source build. Their public configuration
+and authorized private authority object travel with the admitted package graph to the clean worker.
+U1 can consume this pair without `--update-from`; an explicitly supplied historical baseline takes
+precedence. This tests updater functionality, not compatibility with older released code.
+
+Native build delivery passed locally for 0.1.3 and 0.1.4 at
+`/tmp/ml-update-native-20260920/update-acceptance.json`. The separate consumer restored the private
+feed, installed its baseline, retained settings and rejected corrupt delivery. Its replacement
+attempt at `journey-8wkLoV/report.json` failed macOS code-signature validation; the ordinary app
+recovered at the baseline version and cleanup reported no errors. No replacement pass is claimed.
+The diagnostic also exposed noncanonical `/tmp` state paths, now resolved before launching native
+helpers. The private fixture cert and key are not installed into the user's trust store.
+
+`update-acceptance-probe.ts` exercises an already-built pair with `LAB_UPDATE_PROBE_ROOT`,
+`LAB_UPDATE_PROBE_MANIFEST`, `LAB_UPDATE_PROBE_OBJECTS` and `LAB_UPDATE_PROBE_TARGET`.
+It records host identity and requires a new ready service at the expected version before recording
+an automatic relaunch. This local Mac diagnostic is separate from full scheduled U2–U6 coverage,
+which remains unfinished. The updated producer/consumer delivery is not yet deployed to Azure.

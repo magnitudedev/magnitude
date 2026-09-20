@@ -53,6 +53,7 @@ import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
 import { CliInterruption, verifyCliInterruption } from "./suites/cli-interruption"
 import { WorkAssignment, TargetResult } from "./work-store"
+import { prepareUpdateConsumer } from "./update-consumer"
 import { prepareUpdatePair, UpdatePair } from "./update-pair"
 import { UpdateBaseline, verifyUpdateBaseline } from "./suites/update"
 
@@ -177,8 +178,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       switch (test.id as string) {
         case "U1": {
           const baseline = assignment.plan.request.updateFrom
-          if (Option.isNone(baseline)) return yield* unavailable("Update tests require an admitted previous artifact manifest through --update-from")
-          const pair = yield* prepareUpdatePair(baseline.value.digest, (yield* manifest).release, target, join(config.root, "update-pair"))
+          const acceptance = admitted.updateAcceptance
+          if (Option.isNone(baseline) && Option.isNone(acceptance)) return yield* unavailable("Update tests require a source-built acceptance pair or an admitted previous artifact manifest through --update-from")
+          // An explicit historical baseline retains precedence; same-source fixtures do not claim migration compatibility.
+          const restored = Option.isNone(baseline) && Option.isSome(acceptance)
+            ? Option.some(yield* prepareUpdateConsumer(acceptance.value, target, join(config.root, "update-pair")).pipe(Effect.provideService(Scope.Scope, scope))) : Option.none()
+          const pair = Option.isSome(restored) ? restored.value.pair
+            : yield* prepareUpdatePair(Option.getOrThrow(baseline).digest, admitted.release, target, join(config.root, "update-pair"))
           const pairEvidence = yield* evidence("update-pair.json", UpdatePair, pair)
           // Native package managers have one installation. Suspend the primary journey and restore
           // its exact ownership after this separate baseline/profile fixture has completely closed.
@@ -195,9 +201,9 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             () => Effect.scoped(Effect.gen(function* () {
               const app = yield* ownership.replace(pair.previous)
               const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
-                : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" })
+                : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
               const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
-              const updateEnvironment = { ...baselineEnvironment, MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
+              const updateEnvironment = { ...baselineEnvironment, ...(Option.isSome(restored) ? { NODE_EXTRA_CA_CERTS: restored.value.fixture.caPath, SSL_CERT_FILE: restored.value.fixture.caPath } : {}), MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
               const updateSession = yield* desktopSession({ mode: "isolated", executable: app.executable, profile: updateEnvironment.MAGNITUDE_DEV_DATA_DIR,
                 evidence: join(evidenceDirectory, "update-baseline"), port: application.port, environment: updateEnvironment }, detail => { cleanupErrors.push(detail) })
               const observation = yield* verifyUpdateBaseline(updateSession, pair.previous.version)
@@ -207,7 +213,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
               yield* updateSession.stop
               yield* assertServiceExited(observation.reopenedOwner.servicePid)
               const profile = yield* captureRetainedProfile(updateEnvironment.MAGNITUDE_DEV_DATA_DIR)
-              return CaseObservation.make({ detail: "Installed the admitted previous version, verified desktop/service/CLI package identity and persisted theme across an application/service restart",
+              return CaseObservation.make({ detail: `${Option.isSome(restored) ? "Installed the same-source updater acceptance baseline" : "Installed the admitted previous version"}, verified desktop/service/CLI package identity and persisted theme across an application/service restart`,
                 evidence: [pairEvidence, hostEvidence, yield* evidence("update-baseline.json", UpdateBaseline, observation),
                   yield* evidence("update-baseline-package.json", PackageIdentity, identity), yield* evidence("update-baseline-profile.json", RetainedProfile, profile)] })
             })),

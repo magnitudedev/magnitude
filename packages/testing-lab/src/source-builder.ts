@@ -5,6 +5,7 @@ import { ArtifactStore } from "./artifact-store"
 import { snapshotArtifacts } from "./artifact-input"
 import { CaseObservation } from "./case-runner"
 import { AssertionFailure, Backend, Digest, Evidence, InfrastructureFailure, Target } from "./domain"
+import { buildUpdateAcceptance } from "./update-build"
 import { ArtifactInput } from "./inputs"
 import { command, CommandOutput, ProcessExecutor } from "./process"
 import { extractSource, sha256, SourceManifest } from "./snapshot"
@@ -15,7 +16,7 @@ export interface BuildStages {
   readonly package: Effect.Effect<{ readonly input: typeof ArtifactInput.Type; readonly digest: Digest; readonly evidence: readonly (typeof Evidence.Type)[] }, AssertionFailure | InfrastructureFailure>
 }
 export interface SourceBuilder {
-  readonly prepare: (source: SourceManifest, digest: Digest, target: Target, backend: typeof Backend.Type) => Effect.Effect<BuildStages, InfrastructureFailure>
+  readonly prepare: (source: SourceManifest, digest: Digest, target: Target, backend: typeof Backend.Type, updates?: boolean) => Effect.Effect<BuildStages, InfrastructureFailure>
 }
 export const SourceBuilder = Context.GenericTag<SourceBuilder>("@magnitudedev/testing-lab/SourceBuilder")
 export const SourceBuildConfig = Schema.Struct({ root: Schema.NonEmptyString, objects: Schema.NonEmptyString,
@@ -28,7 +29,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
   const objects = yield* ArtifactStore
   const executor = yield* ProcessExecutor
   return {
-    prepare: (source, digest, target, backend) => Effect.gen(function* () {
+    prepare: (source, digest, target, backend, updates = false) => Effect.gen(function* () {
       const platform = target.os === "macos" ? "darwin" : target.os === "windows" ? "win32" : "linux"
       if (platform !== process.platform || target.arch !== process.arch) return yield* failure("Build must execute on the selected native OS and architecture")
       if (yield* fs.exists(config.root)) return yield* failure("Source build requires a fresh workspace")
@@ -46,8 +47,8 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
         return Evidence.make({ path: `evidence/build-${name}.json`, sha256: hash, bytes: bytes.byteLength })
       })
       const receipts: (typeof Evidence.Type)[] = []
-      const invoke = (phase: string, args: readonly string[]) => Effect.gen(function* () {
-        const result = yield* command(process.execPath, args, { cwd: Option.some(workspace), env: { ...env, LAB_BUILD_PHASE: phase },
+      const invoke = (phase: string, args: readonly string[], extra: Readonly<Record<string, string>> = {}) => Effect.gen(function* () {
+        const result = yield* command(process.execPath, args, { cwd: Option.some(workspace), env: { ...env, ...extra, LAB_BUILD_PHASE: phase },
           inheritEnv: false, timeoutMs: 60 * 60_000, maxOutputBytes: 32 * 1024 * 1024 }).pipe(Effect.provideService(ProcessExecutor, executor))
         receipts.push(yield* record(phase, result))
         if (result.exitCode !== 0) return yield* new AssertionFailure({ message: `Source ${phase} exited ${result.exitCode}: ${(result.stderr || result.stdout).slice(-1800)}` })
@@ -64,8 +65,12 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
         const frozen = yield* snapshotArtifacts(join(output, "artifacts", "release-manifest.json"), config.objects).pipe(Effect.provideService(FileSystem.FileSystem, fs))
         const input = yield* Schema.decodeUnknown(Schema.parseJson(ArtifactInput))(frozen.json)
         if (input.release.sourceCommit !== source.commit) return yield* new AssertionFailure({ message: "Built package changed the source commit identity" })
-        yield* objects.put(frozen.digest, Stream.make(new TextEncoder().encode(frozen.json)))
-        return { input, digest: frozen.digest, evidence: [...receipts] }
+        const complete = updates ? ArtifactInput.make({ ...input, updateAcceptance: Option.some(yield* buildUpdateAcceptance(digest, input, config.root, config.objects, invoke).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ArtifactStore, objects), Effect.provideService(ProcessExecutor, executor))) }) : input
+        const wire = yield* Schema.encode(Schema.parseJson(ArtifactInput))(complete)
+        const packagedDigest = sha256(wire)
+        yield* objects.put(packagedDigest, Stream.make(new TextEncoder().encode(wire)))
+        return { input: complete, digest: packagedDigest, evidence: [...receipts] }
       }).pipe(Effect.mapError(error => error._tag === "AssertionFailure" || error._tag === "InfrastructureFailure" ? error : failure(error.message))))
       return { compile, package: packaged, evidence: () => [...receipts] }
     }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : failure(error.message))),

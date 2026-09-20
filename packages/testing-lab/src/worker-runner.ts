@@ -6,7 +6,7 @@ import { Context, DateTime, Effect, Layer, Option, Schema, Stream } from "effect
 import { join, posix, win32 } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
 import { Digest, InfrastructureFailure, Provider, Target } from "./domain"
-import { InputManifest, InputRegistry } from "./inputs"
+import { artifactObjects, InputManifest, InputRegistry } from "./inputs"
 import { WorkerTransport } from "./machines"
 import { WorkerRunner } from "./scheduler"
 import { sha256 } from "./snapshot"
@@ -61,7 +61,7 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
           const manifest = yield* Schema.decodeUnknown(Schema.parseJson(InputManifest))(bytes.toString("utf8"))
           if (manifest.kind !== input.kind) return yield* fail("Input manifest kind differs from assignment")
           const digests = [...new Set(manifest.kind === "source" ? manifest.entries.flatMap(e => e.kind === "file" ? [e.sha256] : [])
-            : manifest.release.artifacts.map(a => Digest.make(a.sha256)))]
+            : artifactObjects(manifest).map(a => a.sha256))]
           yield* store.put(input.digest, Stream.make(bytes))
           yield* transport.upload(machine, join(local, "objects", input.digest), remotePath.join(directory, "objects", input.digest))
           yield* Effect.forEach(digests, copyInput, { concurrency: 4, discard: true })

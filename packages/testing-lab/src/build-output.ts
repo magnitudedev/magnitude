@@ -1,3 +1,4 @@
+import { artifactObjects } from "./inputs"
 import { Effect, Schema, Stream } from "effect"
 import { ArtifactStore } from "./artifact-store"
 import { Backend, Digest, InfrastructureFailure, Target } from "./domain"
@@ -24,6 +25,12 @@ export const outputObjects = (output: BuildOutput) => Effect.gen(function* () {
   const input = yield* readManifest(output.artifactDigest, ArtifactInput)
   const wire = yield* Schema.encode(Schema.parseJson(ArtifactInput))(input).pipe(
     Effect.mapError(() => new InfrastructureFailure({ operation: "build-output", message: "Cannot encode output manifest" })))
-  return [{ digest: output.artifactDigest, bytes: Buffer.byteLength(wire) },
-    ...input.release.artifacts.map(item => ({ digest: Digest.make(item.sha256), bytes: item.bytes }))]
+  const files = [{ digest: output.artifactDigest, bytes: Buffer.byteLength(wire) },
+    ...artifactObjects(input).map(item => ({ digest: item.sha256, bytes: item.bytes }))]
+  const unique = new Map<Digest, typeof files[number]>()
+  for (const file of files) {
+    if (unique.has(file.digest) && unique.get(file.digest)!.bytes !== file.bytes) return yield* new InfrastructureFailure({ operation: "build-output", message: "Artifact graph assigns conflicting lengths to an object" })
+    unique.set(file.digest, file)
+  }
+  return [...unique.values()]
 })

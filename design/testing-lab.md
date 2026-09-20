@@ -323,6 +323,20 @@ temporarily replaces the package, closes the baseline app and restores the prior
 An originally absent installation remains lazy. Cleanup or restoration failure prevents later
 cases from using uncertain native state. Direct package restoration is fixture management and
 cannot qualify an application-driven update. Baseline traces and profile digests are retained.
+Source producers whose consumers select update cases additionally build a same-source acceptance
+pair through release-owned compilation and packaging. Each fixture has a complete version-matched
+application/service/runtime artifact graph; the normal package remains separate. These fixtures
+qualify updater functionality, not compatibility with historical released code. An explicit previous
+release input retains precedence for historical-baseline checks.
+
+The artifact manifest carries the pair's public publisher configuration and a content-addressed
+reference to its private TLS/signing authority. Private authority is an assigned input object, never
+result evidence. Producer admission verifies every release graph independently against the source,
+host, backend and consumer formats. Worker object access and revocation cover the complete graph.
+The clean consumer verifies authority hash/length, TLS identity/validity, and exact public configuration
+before restoring the original loopback origin. Expired fixture authority requires rebuilding the pair.
+Native helper state uses canonical paths, including macOS's `/tmp` to `/private/tmp` resolution.
+
 Private update fixtures own a loopback HTTPS listener, temporary TLS material and an ephemeral
 publisher. Their public configuration is compiled into acceptance packages before execution;
 ordinary production packages cannot be relabelled as accepting that trust. Certificate trust is

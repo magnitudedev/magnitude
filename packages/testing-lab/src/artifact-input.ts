@@ -1,6 +1,6 @@
 import { FileSystem } from "@effect/platform"
 import { decodeReleaseManifest } from "@magnitudedev/release/contracts"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import { dirname, join, resolve } from "node:path"
 import { ArtifactStore, fileArtifactStore } from "./artifact-store"
 import { Digest, InfrastructureFailure, InvalidInput } from "./domain"
@@ -32,6 +32,6 @@ export const snapshotArtifacts = (manifestPath: string, objects: string) => Effe
     }
     return [...new Set(digests)]
   }).pipe(Effect.provide(fileArtifactStore(objects)))
-  const json = yield* Schema.encode(Schema.parseJson(ArtifactInput))({ schemaVersion: 1, kind: "artifacts", release })
+  const json = yield* Schema.encode(Schema.parseJson(ArtifactInput))({ schemaVersion: 1, kind: "artifacts", release, updateAcceptance: Option.none() })
   return { digest: sha256(json), digests, json }
 })

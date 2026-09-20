@@ -59,14 +59,14 @@ for (const mode of ["success", "delivery-error", "corrupt-input", "wrong-claim",
     expect(yield* fs.readFileString(join(directory, "objects", sha256(baseline)))).toBe(baseline)
     expect(yield* fs.readFileString(join(directory, "objects", sha256(oldPackage)))).toBe(oldPackage)
     expect(yield* fs.readFileString(join(directory, "objects", sha256(payload)))).toBe(new TextDecoder().decode(payload))
-    if (mode === "revoked") return yield* Effect.never.pipe(Effect.ensuring(Effect.sync(() => { cleaned++ })))
+    if (mode === "revoked") return yield* Effect.never
     yield* fs.writeFile(join(directory, "objects", sha256(report)), report)
     const now = new Date().toISOString()
     return WorkerReply.make({ schemaVersion: 1, claim: { ...received.assignment.claim, fence: Fence.make(mode === "wrong-claim" ? 2 : 1) }, result: { output: Option.none(), cleanupErrors: [], cases: received.assignment.target.cases.map(test => ({
       targetId: received.assignment.claim.targetId, caseId: test.id, harness: test.harness, startedAt: now, endedAt: now,
       outcome: { status: "passed", detail: "Orchestration fixture, not native acceptance" }, evidence: [{ path: "evidence/result.txt", sha256: sha256(report), bytes: report.length }],
     })) } })
-  }).pipe(Effect.orDie) })
+  }).pipe(Effect.ensuring(mode === "revoked" ? Effect.sync(() => { cleaned++ }) : Effect.void), Effect.orDie) })
   const run = runOutwardWorker({ root, pollMs: 20 }).pipe(Effect.provide([client, executor]))
   const outcome = yield* run.pipe(Effect.either)
   expect(outcome._tag).toBe(mode === "success" ? "Right" : "Left")
