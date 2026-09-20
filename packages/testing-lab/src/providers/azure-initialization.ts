@@ -1,11 +1,12 @@
 import { FileSystem } from "@effect/platform"
-import { Effect, Redacted, Schema } from "effect"
+import { Effect, Option, Redacted, Schema } from "effect"
 import { Digest, InfrastructureFailure } from "../domain"
 import { checkedCommand } from "../process"
 import { sha256 } from "../snapshot"
 import { WindowsToolDownloads, renderWindowsToolPreparation } from "./windows-tools"
 import { WindowsRuntimePreparation, renderWindowsRuntimePreparation } from "./windows-initialization"
 import { InitializationDownload, renderLinuxInitialization, LinuxInitialization } from "./linux-initialization"
+import { NvidiaPreparation, nvidiaPreparationScript, nvidiaReadinessScript } from "./nvidia-preparation"
 
 const PinnedFile = Schema.Struct({ file: Schema.NonEmptyString, sha256: Digest })
 export const AzureRuntimeBlob = Schema.Struct({ account: Schema.String.pipe(Schema.pattern(/^[a-z0-9]{3,24}$/)),
@@ -19,6 +20,7 @@ export const LinuxAzureInitialization = Schema.Struct({ kind: Schema.Literal("li
   architecture: LinuxInitialization.fields.architecture,
   node: InitializationDownload, rustup: InitializationDownload,
   runtime: AzureRuntimeBlob,
+  gpu: Schema.optionalWith(NvidiaPreparation, { as: "Option", exact: true }),
 })
 export const WindowsAzureInitialization = Schema.Struct({ kind: Schema.Literal("windows"),
   toolsSetup: PinnedFile, runtimeSetup: PinnedFile, desktopSetup: PinnedFile,
@@ -27,6 +29,7 @@ export const WindowsAzureInitialization = Schema.Struct({ kind: Schema.Literal("
   adminUsername: WindowsRuntimePreparation.fields.adminUsername,
   architecture: WindowsRuntimePreparation.fields.architecture,
   runtime: AzureRuntimeBlob,
+  gpu: Schema.optionalWith(NvidiaPreparation, { as: "Option", exact: true }),
 })
 export const AzureInitialization = Schema.Union(PinnedFile, LinuxAzureInitialization, WindowsAzureInitialization)
 export type AzureInitialization = typeof AzureInitialization.Type
@@ -37,6 +40,10 @@ export const prepareAzureInitialization = (initialization: AzureInitialization, 
   readonly executable: string; readonly subscription: string; readonly adminUsername: string; readonly architecture: "x64" | "arm64"; readonly os: string; readonly version: string
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
+  if ("kind" in initialization && Option.isSome(initialization.gpu)) {
+    if (scope.architecture !== "x64" || !(scope.os === "ubuntu" && scope.version === "24.04" || scope.os === "windows" && scope.version === "11" || scope.os === "windows-server" && scope.version === "2025"))
+      return yield* fail("No supported Azure NVIDIA driver recipe for this OS/version and architecture")
+  }
   if ("kind" in initialization && initialization.kind === "windows") {
     const recipe = initialization
     if (recipe.distribution.os !== scope.os || recipe.distribution.version !== scope.version || recipe.adminUsername !== scope.adminUsername || recipe.architecture !== scope.architecture) return yield* fail("Windows initialization differs from allocation")
@@ -62,10 +69,12 @@ export const prepareAzureInitialization = (initialization: AzureInitialization, 
   if (recipe.runtime.blob !== `worker-runtime/${recipe.runtime.sha256}.tar.gz`) return yield* fail("Runtime blob name differs from its pinned digest")
   const identity = sha256(yield* Schema.encode(Schema.parseJson(LinuxAzureInitialization))(recipe))
   const download = yield* azureRuntimeDownload(recipe.runtime, scope)
+  const gpuScript = Option.isSome(recipe.gpu)
+    ? "\n" + (yield* nvidiaPreparationScript(recipe.gpu.value, "Linux")) + "\n" + nvidiaReadinessScript(recipe.gpu.value, "Linux") : ""
   const cloudInit = yield* renderLinuxInitialization({ distribution: recipe.distribution, adminUsername: recipe.adminUsername, architecture: recipe.architecture,
     node: recipe.node, rustup: recipe.rustup,
     runtime: download,
-  }, new TextDecoder().decode(bytes))
+  }, new TextDecoder().decode(bytes) + gpuScript)
   return { kind: "linux" as const, customData: Buffer.from(cloudInit).toString("base64"), identity }
 }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail("Cannot prepare configured worker initialization")))
 

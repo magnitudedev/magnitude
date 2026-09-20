@@ -5,6 +5,8 @@ import { AzureMachine } from "../machines"
 import { azureRuntimeDownload, prepareAzureInitialization } from "./azure-initialization"
 import { WindowsRuntimePreparation, windowsDesktopReadiness } from "./windows-initialization"
 
+import { nvidiaPreparationScript, nvidiaReadinessScript } from "./nvidia-preparation"
+
 const api = "2024-11-01"
 const fail = (message: string) => new InfrastructureFailure({ operation: "azure-windows-preparation", message })
 type Prepared = Extract<Effect.Effect.Success<ReturnType<typeof prepareAzureInitialization>>, { kind: "windows" }>
@@ -18,7 +20,7 @@ const Observation = Schema.Struct({ tags: Tags, properties: Schema.Struct({ inst
   executionState: Schema.String, exitCode: Schema.optionalWith(Schema.Int, { as: "Option", exact: true }),
 }), { as: "Option", exact: true }) }) })
 const Inventory = Schema.Struct({ value: Schema.Array(Schema.Struct({ id: Schema.String })) })
-const stages = ["lab-tools", "lab-runtime", "lab-desktop", "lab-ready"] as const
+const stages = ["lab-tools", "lab-runtime", "lab-gpu", "lab-desktop", "lab-ready"] as const
 
 /** Reconcile provider stage identities; never rerun a failed or ambiguously accepted native installer. */
 export const prepareWindowsMachine = (machine: typeof AzureMachine.Type, prepared: Prepared,
@@ -70,6 +72,7 @@ export const prepareWindowsMachine = (machine: typeof AzureMachine.Type, prepare
     return [{ name: "LAB_INITIALIZATION", value: Buffer.from(encoded).toString("base64") }]
   }).pipe(Effect.mapError(() => fail("Cannot prepare the protected Windows runtime configuration")))
   yield* stage("lab-runtime", prepared.runtimeScript, 2400, configuration)
+  if (Option.isSome(prepared.recipe.gpu)) yield* stage("lab-gpu", yield* nvidiaPreparationScript(prepared.recipe.gpu.value, "Windows"), 1200)
   yield* stage("lab-desktop", prepared.desktopScript, 180)
   const tags = yield* readTags()
   if (!tags["lab-desktop-restart"]) {
@@ -78,7 +81,9 @@ export const prepareWindowsMachine = (machine: typeof AzureMachine.Type, prepare
     yield* operations.restart
   } else if (tags["lab-desktop-restart"] !== prepared.identity) return yield* fail("Windows restart belongs to another preparation recipe")
   yield* operations.waitProvisioned
-  yield* stage("lab-ready", yield* windowsDesktopReadiness(prepared.recipe.runtime.sha256, prepared.recipe.adminUsername), 180)
+  const readiness = (yield* windowsDesktopReadiness(prepared.recipe.runtime.sha256, prepared.recipe.adminUsername)) +
+    (Option.isSome(prepared.recipe.gpu) ? "\n" + nvidiaReadinessScript(prepared.recipe.gpu.value, "Windows") : "")
+  yield* stage("lab-ready", readiness, 180)
 }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail("Invalid Windows preparation observation")),
   Effect.timeoutFail({ duration: Math.max(1, DateTime.toEpochMillis(machine.tags.expiresAt) - Date.now()),
     onTimeout: () => fail("Windows preparation exceeded its lease; allocation remains owned for cleanup") }))

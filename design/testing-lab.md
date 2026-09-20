@@ -243,6 +243,13 @@ installers. Restart intent is persisted before reboot so reconciliation cannot r
 prepared desktop. Readiness is refreshed against the live session; an older command receipt cannot
 satisfy a failed or ambiguous refresh. Stage execution and observation stay within the allocation
 lease, and failure diagnostics are retained before cleanup.
+NVIDIA guests require an explicit administrator-pinned driver recipe matching the target GPU and
+Azure VM family. Unsupported OS/driver combinations fail before allocation. Driver downloads are
+public Microsoft redistribution assets with length and digest checks. Windows installs drivers
+before its one-shot desktop reboot and observes the live device afterward; reconciliation must
+not repeat installation or reboot an already prepared desktop. Linux requires headers for its
+running kernel. Native GPU model and driver version must match before candidate execution;
+installer success alone cannot establish readiness or CUDA generation qualification.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,

@@ -6,8 +6,8 @@ machine, and tests the resulting packages on a different clean machine.
 
 **Current qualification:** complete Ubuntu runs finished locally (65/66 passed) and in GitHub
 Actions (64/66 passed), with clean resource removal and verified retained evidence. Hermes file
-editing remains a real failure; one Pi terminal readiness assertion is being corrected. Other
-targets remain in qualification. See the concise [coverage ledger](COVERAGE.md).
+editing remains a real failure. The Pi terminal correction passed on Fedora; Fedora Intel/AMD
+and Red Hat Intel each passed all 66 checks. Other targets remain in qualification. See the concise [coverage ledger](COVERAGE.md).
 
 ## Sign in once
 

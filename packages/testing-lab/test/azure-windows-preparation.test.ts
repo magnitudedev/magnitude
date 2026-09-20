@@ -1,14 +1,16 @@
 import { BunContext } from "@effect/platform-bun"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { expect, test } from "vitest"
 import { prepareWindowsMachine, windowsPreparationDiagnostics } from "../src/providers/azure-windows-preparation"
 import { WindowsAzureInitialization } from "../src/providers/azure-initialization"
+import { NvidiaPreparation } from "../src/providers/nvidia-preparation"
+import driverPins from "../tools/nvidia-drivers.json"
 import { windowsToolDownloads } from "../src/providers/windows-tools"
 import { AzureMachine, MachineTags } from "../src/machines"
 import { Digest, InfrastructureFailure, LeaseId, RunId } from "../src/domain"
 import { ProcessExecutor } from "../src/process"
 
-for (const mode of ["fresh", "resume", "lost-put", "lost-refresh", "failed", "missing-exit", "foreign-stage", "foreign-vm", "expired", "diagnostics"] as const) {
+for (const mode of ["gpu", "fresh", "resume", "lost-put", "lost-refresh", "failed", "missing-exit", "foreign-stage", "foreign-vm", "expired", "diagnostics"] as const) {
   test(`Windows native preparation reconciliation: ${mode}`, () => Effect.runPromise(Effect.gen(function* () {
     const digest = Digest.make("a".repeat(64)), subscription = "5304c4b3-d605-4193-b0cb-766c065acfa6"
     const machine = AzureMachine.make({ provider: "azure", name: "ml-123456789abc",
@@ -16,7 +18,7 @@ for (const mode of ["fresh", "resume", "lost-put", "lost-refresh", "failed", "mi
       tags: MachineTags.make({ schemaVersion: 1, runId: RunId.make(`run-${crypto.randomUUID()}`), leaseId: LeaseId.make(`lease-${crypto.randomUUID()}`),
         expiresAt: DateTime.unsafeMake(Date.now() + (mode === "expired" ? -1 : 3600_000)) }) })
     const pin = { file: "unused", sha256: digest }
-    const recipe = WindowsAzureInitialization.make({ kind: "windows", toolsSetup: pin, runtimeSetup: pin, desktopSetup: pin,
+    const recipe = WindowsAzureInitialization.make({ kind: "windows", gpu: mode === "gpu" ? Option.some(yield* Schema.decodeUnknown(NvidiaPreparation)(driverPins["windows-a10"])) : Option.none(), toolsSetup: pin, runtimeSetup: pin, desktopSetup: pin,
       downloads: yield* windowsToolDownloads, distribution: { os: "windows", version: "11" }, architecture: "x64", adminUsername: "labworker",
       runtime: { account: "labaccount", container: "artifacts", blob: `worker-runtime/${digest}.tar.gz`, sha256: digest, bytes: 100 } })
     const prepared = { kind: "windows" as const, identity: digest, recipe, toolsScript: "tools", runtimeScript: "runtime", desktopScript: "desktop" }
@@ -56,6 +58,11 @@ for (const mode of ["fresh", "resume", "lost-put", "lost-refresh", "failed", "mi
           expect(request.properties.source.script).not.toContain("private-capability")
           if (name === "lab-runtime") expect(Buffer.from(request.properties.protectedParameters[0]!.value, "base64").toString()).toContain("private-capability")
           if (mode === "lost-refresh") return yield* new InfrastructureFailure({ operation: "fixture", message: "readiness update was not accepted" })
+          if (mode === "gpu") {
+            if (name === "lab-gpu") { expect(commands.has("lab-runtime")).toBe(true); expect(restarts).toBe(0) }
+            if (name === "lab-desktop") expect(commands.has("lab-gpu")).toBe(true)
+            if (name.startsWith("lab-ready-")) { expect(restarts).toBe(1); expect(request.properties.source.script).toContain("--query-gpu=name,driver_version") }
+          }
           commands.set(name, body)
           if (mode === "lost-put") return yield* new InfrastructureFailure({ operation: "fixture", message: "response lost after acceptance" })
           return { stdout: "{}" }
@@ -76,9 +83,9 @@ for (const mode of ["fresh", "resume", "lost-put", "lost-refresh", "failed", "mi
       return
     }
     const result = yield* prepareWindowsMachine(machine, prepared, { executable: "az", subscription, location: "westus2" }, operations).pipe(Effect.provide(process), Effect.either)
-    const success = ["fresh", "resume", "lost-put"].includes(mode)
+    const success = ["gpu", "fresh", "resume", "lost-put"].includes(mode)
     expect(result._tag).toBe(success ? "Right" : "Left")
-    expect(puts).toBe(mode === "resume" ? 1 : mode === "foreign-vm" || mode === "expired" ? 0 : success ? 4 : 1)
+    expect(puts).toBe(mode === "resume" ? 1 : mode === "foreign-vm" || mode === "expired" ? 0 : mode === "gpu" ? 5 : success ? 4 : 1)
     expect(restarts).toBe(success && mode !== "resume" ? 1 : 0)
     expect(grants).toBe(success && mode !== "resume" ? 1 : 0)
   }).pipe(Effect.provide(BunContext.layer))))

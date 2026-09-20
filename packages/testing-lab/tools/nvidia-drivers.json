@@ -1,0 +1,38 @@
+{
+  "linux-a10": {
+    "model": "a10",
+    "version": "570.211.01",
+    "download": {
+      "url": "https://download.microsoft.com/download/2a04ca6a-9eec-40d9-9564-9cdea1ab795f/NVIDIA-Linux-x86_64-570.211.01-grid-azure.run",
+      "sha256": "7358f735854d38cbfd010f47ed101b9e266b7de9c428f88d0aca914422f886cd",
+      "bytes": 382077274
+    }
+  },
+  "linux-rtx-pro-6000": {
+    "model": "rtx-pro-6000",
+    "version": "595.58.03",
+    "download": {
+      "url": "https://download.microsoft.com/download/51239696-ec04-4c02-a6b3-1d9c608fb57c/NVIDIA-Linux-x86_64-595.58.03-grid-azure.run",
+      "sha256": "5dbfcd0998e6d3a2b4cf4f5f60587aef07401f3c7a9433c23697ec944a5c542b",
+      "bytes": 428443655
+    }
+  },
+  "windows-a10": {
+    "model": "a10",
+    "version": "574.24",
+    "download": {
+      "url": "https://download.microsoft.com/download/e9a86343-1981-4ac8-883a-49bf5e2c4d18/574.24_grid_win10_win11_server2022_dch_server2025_64bit_international_azure_swl.exe",
+      "sha256": "9ac73367b3b32dccd8ca99e368872c0df8c2f89206f568cfe7c3bd15f060bbca",
+      "bytes": 692528192
+    }
+  },
+  "windows-rtx-pro-6000": {
+    "model": "rtx-pro-6000",
+    "version": "596.86",
+    "download": {
+      "url": "https://download.microsoft.com/download/0f21fd13-2390-4c79-876a-87ae3dc724c6/596.86_grid_win10_win11_server2022_server2025_dch_64bit_international_azure_swl.exe",
+      "sha256": "242780736af5af2a3329e287b496645d5feaabe0cc249820b8037e60f10d7ae3",
+      "bytes": 748131264
+    }
+  }
+}

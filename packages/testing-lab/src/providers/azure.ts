@@ -144,6 +144,11 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       const image = config.images.find(i => i.targetId === target.id)
       if (!image) return yield* fail(`No qualified Azure image for ${target.id}`)
       if ((target.os === "windows") !== (image.os === "Windows")) return yield* fail("Image OS does not match target")
+      const gpu = Option.flatMap(image.initialization, setup => "kind" in setup ? setup.gpu : Option.none())
+      if (Option.isSome(gpu)) {
+        if (target.hardware !== gpu.value.model || !(gpu.value.model === "a10" ? /^Standard_NV\d+ads_A10_v5$/.test(image.size) : /^Standard_NC\d+.*RTX.*v6$/i.test(image.size)))
+          return yield* fail("GPU driver recipe does not match the requested hardware or Azure VM family")
+      } else if (target.hardware === "a10" || target.hardware === "rtx-pro-6000") return yield* fail("GPU targets require explicit native driver preparation")
       // Administrator-owned setup is separate from submitted source. Verify it before allocating anything.
       const initialization = yield* Option.match(image.initialization, { onNone: () => Effect.void, onSome: setup => Effect.gen(function* () {
         if ((image.os === "Windows") !== ("kind" in setup && setup.kind === "windows")) return yield* fail("Initialization recipe does not match the native image OS")
@@ -167,6 +172,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
         const password = `Az!${crypto.randomUUID()}a9`
         const body = { location: config.location, tags: encodedTags, ...(Option.isSome(image.plan) ? { plan: image.plan.value } : {}),
           properties: { hardwareProfile: { vmSize: image.size },
+            ...(Option.isSome(gpu) ? { securityProfile: { securityType: "Standard" } } : {}),
             storageProfile: { imageReference: image.image, osDisk: { name: `${machine.name}-os`, createOption: "FromImage", deleteOption: "Delete", diskSizeGB: image.diskGb,
               managedDisk: { storageAccountType: "Premium_LRS" } } },
             networkProfile: { networkInterfaces: [{ id: nicId(machine.name), properties: { primary: true, deleteOption: "Delete" } }] },
