@@ -47,6 +47,11 @@ All OpenCode checks passed. That run also recorded a cleanup inventory error aft
 Fedora images were incorrectly tagged as disposable workers. Their ownership tags were corrected
 and the janitor removed the VM; a fresh complete run must pass both tests and cleanup.
 Other platforms and the complete GitHub workflow remain unqualified.
+Hermes native diagnostics also exposed a driver error: a successful tool retry was rejected
+solely because an earlier call failed, and file-edit acceptance incorrectly required text deltas.
+The driver now distinguishes recovered tools and completed responses from streaming. H3 still
+requires observed streaming; H5 still requires the exact file change. Unresolved errors and
+unmatched calls fail. These changes await complete cloud qualification.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not

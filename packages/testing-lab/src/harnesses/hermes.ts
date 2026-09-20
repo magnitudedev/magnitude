@@ -27,7 +27,7 @@ export const hermes = (config: typeof HermesConfig.Type) => Effect.gen(function*
     const query = join(config.evidence, `${label}.prompt.txt`)
     yield* fs.writeFileString(query, message)
     const output = yield* command(config.executable, ["chat", "--query-file", query, "--format", "stream-json", "--oneshot", "--provider", "custom:magnitude",
-      "--model", config.model, "--reasoning", "none", "--toolsets", "file", "--max-turns", "8", "--run-budget", "240",
+      "--model", config.model, "--reasoning", "high", "--toolsets", "file", "--max-turns", "8", "--run-budget", "240",
       ...Option.match(session, { onNone: () => [], onSome: id => ["--resume", id] })],
       { cwd: Option.some(config.cwd), env: config.environment, inheritEnv: false, timeoutMs: 300_000, maxOutputBytes: 16 * 1024 * 1024 })
     yield* fs.writeFileString(join(config.evidence, `${label}.jsonl`), output.stdout)
@@ -40,7 +40,7 @@ export const hermes = (config: typeof HermesConfig.Type) => Effect.gen(function*
     if (last?.type !== "result" || last.exit_code !== 0 || Option.isSome(last.error) || !last.text.trim()) return yield* fail("Hermes did not finish with a successful result")
     if (events.filter(e => e.type === "result").length !== 1 || events.filter(e => e.type === "system").length !== 1) return yield* fail("Hermes emitted duplicate lifecycle events")
     if ((first.session_id && first.session_id !== last.session_id) || Option.exists(session, id => last.session_id !== id)) return yield* fail("Hermes did not preserve the selected session")
-    const pending = new Map<string, string>(), tools: string[] = []
+    const pending = new Map<string, string>(), unresolved = new Set<string>(), tools: string[] = []
     let streamed = ""
     for (const event of events) {
       if (event.type === "text") streamed += event.text
@@ -51,12 +51,17 @@ export const hermes = (config: typeof HermesConfig.Type) => Effect.gen(function*
       }
       if (event.type === "tool_result") {
         const id = Option.getOrElse(event.tool_call_id, () => event.name)
-        if (event.is_error || pending.get(id) !== event.name) return yield* fail(`Hermes tool ${event.name} failed or had no matching invocation`)
-        pending.delete(id); tools.push(event.name)
+        if (pending.get(id) !== event.name) return yield* fail(`Hermes tool ${event.name} had no matching invocation`)
+        pending.delete(id)
+        if (event.is_error) unresolved.add(event.name)
+        else { unresolved.delete(event.name); tools.push(event.name) }
       }
     }
-    if (pending.size || !streamed.trim() || !streamed.endsWith(last.text)) return yield* fail("Hermes result did not match completed streamed generation and tools")
-    return HermesTurn.make({ sessionId: last.session_id, text: last.text, streamed: true, tools })
+    if (pending.size || unresolved.size) return yield* fail("Hermes ended with incomplete or unresolved failed tools")
+    // Hermes may finish a tool turn through its result envelope without emitting text
+    // deltas. H3 requires actual streaming; H5 independently checks real tool effects.
+    if (streamed && !streamed.endsWith(last.text)) return yield* fail("Hermes streamed text differs from its terminal result")
+    return HermesTurn.make({ sessionId: last.session_id, text: last.text, streamed: streamed.trim().length > 0, tools })
   })
   return { prompt }
 })

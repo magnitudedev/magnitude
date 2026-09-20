@@ -37,8 +37,18 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
     ] : [
       { type: "system", subtype: "init", model: variant === "provider" ? "other-model" : "fixture-model", session_id: session },
       { type: "tool_use", name: "read_file", tool_call_id: "call-1" },
-      { type: "tool_result", name: "read_file", tool_call_id: "call-1", is_error: variant === "tool" },
-      { type: "text", text: "HELLO" },
+      { type: "tool_result", name: "read_file", tool_call_id: "call-1", is_error: variant === "tool" || variant === "recovered-tool" },
+      ...(variant === "recovered-tool" ? [
+        { type: "tool_use", name: "read_file", tool_call_id: "call-2" },
+        { type: "tool_result", name: "read_file", tool_call_id: "call-2", is_error: false },
+      ] : []),
+      ...(variant === "late-tool-error" ? [
+        { type: "tool_use", name: "read_file", tool_call_id: "call-2" },
+        { type: "tool_result", name: "read_file", tool_call_id: "call-2", is_error: true },
+      ] : []),
+      ...(variant === "unmatched-tool" ? [{ type: "tool_result", name: "patch", tool_call_id: "missing", is_error: false }] : []),
+      ...(variant === "unfinished-tool" ? [{ type: "tool_use", name: "patch", tool_call_id: "unfinished" }] : []),
+      ...(variant === "result-only" ? [] : [{ type: "text", text: variant === "stream-mismatch" ? "OTHER" : "HELLO" }]),
       ...(variant === "truncated" ? [] : [{ type: "result", session_id: session, text: "HELLO", exit_code: 0 }]),
     ]
     return { exitCode: variant === "exit" ? 1 : 0, stdout: events.map(value => json(value)).join("\n") + "\n", stderr: "" }
@@ -47,12 +57,19 @@ const check = (kind: "opencode" | "hermes", variant: string) => Effect.runPromis
     const config = { executable: kind, cwd: root, environment: { HOME: root }, evidence: root, model: "fixture-model" }
     const client = yield* kind === "opencode" ? openCode(config) : hermes(config)
     const result = yield* client.prompt("Read the fixture then say HELLO", Option.some("fixture-session")).pipe(Effect.either)
-    expect(result._tag).toBe(variant === "pass" ? "Right" : "Left")
-    if (result._tag === "Right") expect(result.right.text).toBe("HELLO")
+    expect(result._tag).toBe(["pass", "recovered-tool", "result-only"].includes(variant) ? "Right" : "Left")
+    if (result._tag === "Right") {
+      expect(result.right.text).toBe("HELLO")
+      if (kind === "hermes") expect(result.right.streamed).toBe(variant !== "result-only")
+    }
     if (kind === "hermes" && variant === "setup" && result._tag === "Left") expect(result.left.message).toContain("run hermes setup")
   }).pipe(Effect.provideService(ProcessExecutor, executor))
 })).pipe(Effect.provide(BunContext.layer)))
 
 test.each(["opencode", "hermes"] as const)("%s validates terminal output, selected model, tools and resumed session", async kind => {
   for (const variant of ["pass", "session", "provider", "tool", "truncated", "exit", "setup"]) await check(kind, variant)
+})
+
+test("Hermes distinguishes recovered tools, unresolved errors and completed text from streaming", async () => {
+  for (const variant of ["recovered-tool", "late-tool-error", "unmatched-tool", "unfinished-tool", "result-only", "stream-mismatch"]) await check("hermes", variant)
 })

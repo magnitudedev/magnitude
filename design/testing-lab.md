@@ -124,6 +124,11 @@ truncated, foreign or unfinished lifecycle evidence fails qualification. Instrum
 record events but cannot change provider configuration, prompts, tool behavior or generated output.
 Tool-result acceptance supplies a newly generated result that was absent from the original
 prompt and arguments; echoing known input cannot prove that the model consumed the tool result.
+Hermes file-tool qualification permits a failed call followed by a successful retry of that
+tool in the same native turn. Every invocation needs a matching result, no failed tool may
+remain unresolved, and the resulting file tree must match the exact intended change. Native
+error events remain in the evidence. A completed tool turn without text deltas cannot qualify
+streaming; streaming is asserted separately against an observed text-generating turn.
 
 ## Ownership and recovery
 
