@@ -195,7 +195,7 @@ retained in detailed status and cannot substitute for the lab's successful compl
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership.
-Credentials must not appear in command arguments, script text or returned provider errors;
+Run and provider credentials must not appear in command arguments, script text or returned provider errors;
 temporary delivery files are private and scoped. Guest launch uses the intended application
 user and a qualified display environment. Service-session execution cannot qualify an
 interactive desktop test, and accepting a launch request alone never establishes a test pass.

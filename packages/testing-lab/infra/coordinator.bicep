@@ -11,7 +11,7 @@ param databaseUrl string
 @secure()
 param coordinatorConfigBase64 string
 @secure()
-param workerInitializationBase64 string
+param workerInitializationBase64 string = ''
 @secure()
 param developerToken string
 
@@ -30,12 +30,11 @@ resource coordinator 'Microsoft.App/containerApps@2024-03-01' = {
       activeRevisionsMode: 'Single'
       ingress: { external: true, targetPort: 8080, transport: 'http', allowInsecure: false }
       registries: [{ server: registry.properties.loginServer, identity: identity.id }]
-      secrets: [
+      secrets: concat([
         { name: 'database-url', value: databaseUrl }
         { name: 'coordinator-config', value: coordinatorConfigBase64 }
-        { name: 'worker-initialization', value: workerInitializationBase64 }
         { name: 'developer-token', value: developerToken }
-      ]
+      ], empty(workerInitializationBase64) ? [] : [{ name: 'worker-initialization', value: workerInitializationBase64 }])
     }
     template: {
       revisionSuffix: revision
@@ -45,13 +44,12 @@ resource coordinator 'Microsoft.App/containerApps@2024-03-01' = {
         name: 'coordinator'
         image: image
         resources: { cpu: 2, memory: '4Gi' }
-        env: [
+        env: concat([
           { name: 'LAB_AZURE_CLIENT_ID', value: identity.properties.clientId }
           { name: 'LAB_DATABASE_URL', secretRef: 'database-url' }
           { name: 'LAB_COORDINATOR_CONFIG_BASE64', secretRef: 'coordinator-config' }
-          { name: 'LAB_WORKER_INITIALIZATION_BASE64', secretRef: 'worker-initialization' }
           { name: 'LAB_DEVELOPER_TOKEN', secretRef: 'developer-token' }
-        ]
+        ], empty(workerInitializationBase64) ? [] : [{ name: 'LAB_WORKER_INITIALIZATION_BASE64', secretRef: 'worker-initialization' }])
         probes: [
           { type: 'Startup', tcpSocket: { port: 8080 }, periodSeconds: 5, failureThreshold: 60 }
           { type: 'Liveness', tcpSocket: { port: 8080 }, periodSeconds: 30, failureThreshold: 3 }

@@ -65,6 +65,35 @@ jobs:
           bun lab wait --run "$LAB_RUN" \
             --json "$RUNNER_TEMP/lab-reports/results.json" \
             --junit "$RUNNER_TEMP/lab-reports/junit.xml"
+      - name: Download traces and diagnostics while this run can authenticate
+        if: ${{ always() && !cancelled() && steps.submit.outputs.run != '' }}
+        env:
+          LAB_RUN: ${{ steps.submit.outputs.run }}
+        shell: bash
+        run: |
+          if [ ! -f "$RUNNER_TEMP/lab-reports/results.json" ]; then exit 0; fi
+          mkdir -p "$RUNNER_TEMP/lab-reports/evidence"
+          python3 - <<'PY' > "$RUNNER_TEMP/lab-evidence-list"
+          import json, os, pathlib, re
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'lab-reports/results.json')) as f:
+              result = json.load(f)
+          seen = set()
+          for case in result['cases']:
+              for evidence in case['evidence']:
+                  digest = evidence['sha256']
+                  assert re.fullmatch(r'[0-9a-f]{64}', digest)
+                  if digest in seen:
+                      continue
+                  seen.add(digest)
+                  suffix = pathlib.PurePosixPath(evidence['path']).suffix
+                  if suffix not in {'.zip', '.png', '.json', '.log', '.txt'}:
+                      suffix = '.bin'
+                  print(digest, digest + suffix)
+          PY
+          while read -r digest filename; do
+            bun lab evidence --run "$LAB_RUN" --digest "$digest" \
+              --output "$RUNNER_TEMP/lab-reports/evidence/$filename"
+          done < "$RUNNER_TEMP/lab-evidence-list"
       - name: Release any unfinished work
         if: ${{ always() && steps.submit.outputs.run != '' }}
         timeout-minutes: 2

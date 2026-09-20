@@ -5,6 +5,9 @@ umask 077
 . /etc/os-release
 test "$ID" = ubuntu && test "$VERSION_ID" = 24.04
 export DEBIAN_FRONTEND=noninteractive
+# Restarting the Azure agent while its readiness command runs can sever observation.
+# Fresh application processes use the newly installed libraries after preparation.
+export NEEDRESTART_MODE=l
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates python3 git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
 
@@ -80,7 +83,7 @@ launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 022',
 pathlib.Path('/opt/magnitude-lab-worker').write_text(launcher)
 os.chmod('/opt/magnitude-lab-worker',0o755)
 receipt=pathlib.Path('/var/lib/magnitude-lab')
-receipt.mkdir(mode=0o755)
+receipt.mkdir(mode=0o755,exist_ok=True)
 (receipt/'runtime.json').write_text(json.dumps({'runtimeSha256':config['runtime']['sha256'],'nodeSha256':config['node']['sha256'],
  'rustupSha256':config['rustup']['sha256'],'architecture':config['architecture'],'bunVersion':config['bunVersion'],'rustVersion':rust_version}))
 for key in ['runtime','node']:(root/('download-'+key)).unlink()

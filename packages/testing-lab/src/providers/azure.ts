@@ -124,7 +124,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
     // Do not put guest output in returned errors: administrator setup may log private URLs.
     const reply = yield* checked(config.executable, ["vm", "run-command", "invoke", "--subscription", config.subscription,
       "--resource-group", config.resourceGroup, "--name", machine.name, "--command-id", "RunShellScript",
-      "--scripts", "cloud-init status --long --format json; tail -c 16384 /var/log/cloud-init-output.log", "--only-show-errors", "--output", "json"],
+      "--scripts", "tail -c 2200 /var/log/cloud-init-output.log; cloud-init status --long --format json", "--only-show-errors", "--output", "json"],
       { timeoutMs: 180_000, maxOutputBytes: 64 * 1024 })
     const directory = yield* fs.makeTempDirectory({ prefix: "lab-initialization-failure-" })
     const file = join(directory, `${machine.name}.json`)
