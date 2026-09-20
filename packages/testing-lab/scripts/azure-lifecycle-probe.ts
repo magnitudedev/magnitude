@@ -10,7 +10,7 @@ import { Allocating } from "../src/lease"
 import { MachineAllocator } from "../src/machines"
 import { azureAllocator, AzureConfig } from "../src/providers/azure"
 import { checkedCommand, ProcessExecutorLive } from "../src/process"
-import { azureLinuxBootstrap } from "../src/providers/azure-bootstrap"
+import { azureBootstrap } from "../src/providers/azure-bootstrap"
 import { WorkerLaunch } from "../src/outward-runner"
 import { sha256 } from "../src/snapshot"
 import { assertRuntime } from "../src/runtime"
@@ -44,7 +44,7 @@ BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {
     if (!output) return yield* fail("Guest command did not return a successful bounded host observation")
     const host = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ os: Schema.Literal("ubuntu"), version: Schema.String, arch: Schema.Literal("x86_64"), intel: Schema.Literal(true) })))(output)
     if (host.version !== target.version) return yield* fail("Actual guest version differs from target")
-    const bootstrap = yield* azureLinuxBootstrap(config)
+    const bootstrap = yield* azureBootstrap(config)
     const token = Redacted.make(crypto.randomUUID())
     const guestRoot = `/home/${config.adminUsername}/bootstrap-probe`
     const guestScript = "import os,json,hashlib,pwd; print(json.dumps(dict(user=pwd.getpwuid(os.getuid()).pw_name,root=os.environ['LAB_WORKER_ROOT'],origin=os.environ['LAB_URL'],credentialDigest=hashlib.sha256(os.environ['LAB_WORKER_TOKEN'].encode()).hexdigest())))"

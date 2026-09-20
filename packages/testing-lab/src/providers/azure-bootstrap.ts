@@ -6,6 +6,7 @@ import { type Machine, MachineTags } from "../machines"
 import { type WorkerBootstrap, WorkerExit } from "../outward-runner"
 import { checkedCommand, ProcessExecutor } from "../process"
 import { AzureConfig } from "./azure"
+import { windowsInteractiveScript } from "./windows-interactive"
 
 export const AzureBootstrapConfig = AzureConfig.pick("executable", "subscription", "resourceGroup", "adminUsername")
 const Observation = Schema.Struct({ id: Schema.String, name: Schema.String, location: Schema.NonEmptyString,
@@ -16,10 +17,10 @@ const fail = (message: string) => new InfrastructureFailure({ operation: "azure-
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 
 /** Managed Run Command delivers authority; the guest reports results through the worker API.
- * Linux images must already contain the configured runtime and display dependencies.
- * Windows needs an interactive-session launcher and is deliberately not admitted here.
+ * Images must already contain their configured runtime and desktop dependencies.
+ * Windows additionally requires an active session for the admitted desktop user.
  */
-export const azureLinuxBootstrap = (config: typeof AzureBootstrapConfig.Type) => Effect.gen(function* () {
+export const azureBootstrap = (config: typeof AzureBootstrapConfig.Type) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executor = yield* ProcessExecutor
   const group = `/subscriptions/${config.subscription}/resourceGroups/${config.resourceGroup}`
@@ -69,22 +70,24 @@ export const azureLinuxBootstrap = (config: typeof AzureBootstrapConfig.Type) =>
       machine = yield* verifyScope(machine)
       const deadline = Math.min(DateTime.toEpochMillis(launch.deadline), DateTime.toEpochMillis(machine.tags.expiresAt))
       if (deadline <= Date.now()) return yield* fail("Cannot start an expired worker")
-      if (!posix.isAbsolute(launch.executable) || !posix.isAbsolute(launch.root) ||
-        [launch.executable, launch.root, launch.origin, ...launch.args].some(value => value.includes("\0"))) return yield* fail("Linux worker paths must be absolute and launch arguments must not contain NUL")
       const vm = yield* request("GET", machine.id).pipe(Effect.flatMap(result => Schema.decodeUnknown(Schema.parseJson(Observation))(result.stdout)),
         Effect.mapError(() => fail("Cannot verify Azure worker identity")))
       const tags = yield* Schema.decodeUnknown(Schema.parseJson(MachineTags))(vm.tags["lab-lease"]).pipe(Effect.mapError(() => fail("Worker has invalid lease metadata")))
       if (vm.id.toLowerCase() !== machine.id.toLowerCase() || vm.name !== machine.name ||
         vm.tags["lab-owner"] !== "magnitude-testing-lab-v1" || vm.tags["lab-machine"] !== machine.name ||
         !Schema.equivalence(MachineTags)(tags, machine.tags)) return yield* fail("Worker ownership changed before credential delivery")
-      if (vm.properties.provisioningState !== "Succeeded" || vm.properties.storageProfile.osDisk.osType !== "Linux") return yield* fail("Linux bootstrap requires a provisioned Linux VM")
+      if (vm.properties.provisioningState !== "Succeeded") return yield* fail("Worker bootstrap requires a provisioned VM")
+      const windows = vm.properties.storageProfile.osDisk.osType === "Windows"
+      if (!windows && (!posix.isAbsolute(launch.executable) || !posix.isAbsolute(launch.root) ||
+        [launch.executable, launch.root, launch.origin, ...launch.args].some(value => value.includes("\0")))) return yield* fail("Linux worker paths must be absolute and launch arguments must not contain NUL")
       if (deadline <= Date.now()) return yield* fail("Worker expired while verifying its identity")
       // Azure's runAsUser uses sudo without preserving named protected parameters.
       // Receive them as root, then retain only the lab variables through an explicit user switch.
       // The credential remains an environment value, never a command argument or script literal.
       // Package builders require normal directory permissions. Invocation credentials and
       // workspaces use explicit 0600/0700 modes instead of imposing 077 on their children.
-      const script = ["#!/bin/sh", "set -eu", "umask 022", ': "${LAB_WORKER_TOKEN:?Missing worker credential}"',
+      const script = windows ? yield* windowsInteractiveScript({ user: config.adminUsername, executable: launch.executable, args: launch.args,
+        root: launch.root, origin: launch.origin, timeoutSeconds: Math.max(1, Math.ceil((deadline - Date.now()) / 1000)) }) : ["#!/bin/sh", "set -eu", "umask 022", ': "${LAB_WORKER_TOKEN:?Missing worker credential}"',
         `export LAB_WORKER_ROOT=${quote(launch.root)}`, `export LAB_URL=${quote(launch.origin)}`,
         "cd /",
         `exec /usr/bin/sudo -n -H --preserve-env=LAB_WORKER_TOKEN,LAB_WORKER_ROOT,LAB_URL -u ${quote(config.adminUsername)} -- ${[launch.executable, ...launch.args].map(quote).join(" ")}`].join("\n")

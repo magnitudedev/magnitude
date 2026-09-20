@@ -3,7 +3,13 @@
 These files deploy the coordinator infrastructure and prepare disposable Ubuntu 24.04, Debian 13 and Fedora 44 CPU
 workers for the existing outward worker protocol. A successful deployment is not proof of
 a completed app test. Debian/Fedora preparation is implemented but awaits native qualification.
-Windows, GPU driver setup and RHEL preparation remain separate work. RHEL 10
+Windows image preparation, GPU driver setup and RHEL preparation remain separate work.
+Windows delivery now supports an already prepared interactive desktop user: its configured
+runtime must be a native `.exe` with absolute local paths. The bootstrap creates a temporary
+Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,
+and removes the system-owned launcher and scoped credential. It does not create a login
+session or install build dependencies. The launcher has native Windows Server validation;
+Windows 10/11 app coverage is not established by that diagnostic. RHEL 10
 requires a Wayland/Xwayland session because [Red Hat removed the X.Org server](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.0_release_notes/removed-features);
 it must not inherit this Xvfb recipe.
 

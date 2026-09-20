@@ -757,8 +757,13 @@ sudo. The bootstrap now receives the credential in the agent context and explici
 the guest user while preserving only the three lab environment variables. No credential value
 is inserted into command arguments or script text. This qualifies bootstrap delivery on that
 Ubuntu image only; complete outward app execution and other Linux images remain unqualified.
-Windows is rejected by this bootstrap and requires an interactive-session launcher; a VM agent
-service-session launch cannot qualify the desktop suite. Microsoft's parameter semantics are
+The bootstrap now routes Windows delivery into a temporary Interactive scheduled task for the
+admitted local SID. A Windows Server 2025 diagnostic verified session 1, exact scoped-token
+delivery, native argument quoting (including empty values and trailing backslashes), success
+and nonzero child exits. Temporary task, credential-directory and autologon-password removal
+were verified after the successful launch. This qualifies the launcher mechanism, not Windows
+10/11 or Magnitude application behavior; prepared client images and their licensing remain required.
+A VM agent service-session launch cannot qualify the desktop suite. Microsoft's parameter semantics are
 specified in [Managed Run Command](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/run-command-managed).
 
 ## Bundled CLI interruption

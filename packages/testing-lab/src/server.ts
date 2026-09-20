@@ -17,7 +17,7 @@ import { MachineProviders, WorkerRunner } from "./scheduler"
 import { GuestRuntime, transportWorkerRunner, WorkerTransports } from "./worker-runner"
 import { InputRegistryLive } from "./inputs"
 import { AzureConfig, azureAllocator } from "./providers/azure"
-import { azureLinuxBootstrap } from "./providers/azure-bootstrap"
+import { azureBootstrap } from "./providers/azure-bootstrap"
 import { outwardWorkerRunner, WorkerBootstraps } from "./outward-runner"
 import { WorkerTicketsLive } from "./worker-tickets"
 import { WorkerResultsLive } from "./worker-results"
@@ -37,7 +37,7 @@ export const configuredCoordinator = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const config = yield* fs.readFileString(yield* Config.string("LAB_COORDINATOR_CONFIG")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(ServerConfig))))
   if (config.runtimes.some(runtime => runtime.provider === "namespace" ? Option.isNone(config.namespace)
-    : runtime.provider === "azure" ? Option.isNone(config.azure) || !runtime.artifactHost.startsWith("linux-") : true)) return yield* new InvalidInput({ message: "A runtime requires its configured provider; this entry point supports Namespace and Azure Linux execution" })
+    : runtime.provider === "azure" ? Option.isNone(config.azure) || !(runtime.artifactHost.startsWith("linux-") || runtime.artifactHost === "windows-x64-msvc") : true)) return yield* new InvalidInput({ message: "A runtime requires its configured provider; this entry point supports Namespace and Azure Linux/Windows execution" })
   for (const provider of ["namespace", "azure"] as const) if (Option.isSome<unknown>(config[provider]) && !config.runtimes.some(runtime => runtime.provider === provider)) return yield* new InvalidInput({ message: `${provider} allocation requires a configured guest runtime` })
   if (new Set(config.runtimes.map(runtime => `${runtime.provider}/${runtime.artifactHost}`)).size !== config.runtimes.length) return yield* new InvalidInput({ message: "Guest runtime identities must be unique" })
   if (config.credentials.length === 0 && Option.isNone(config.github) && Option.isNone(config.entra)) return yield* new InvalidInput({ message: "Configure at least one authentication method" })
@@ -69,7 +69,7 @@ export const configuredCoordinator = Effect.gen(function* () {
     if (Option.isSome(config.namespace)) byProvider.set("namespace", Context.get(yield* Layer.build(transportWorkerRunner(config.runtimes.filter(runtime => runtime.provider === "namespace")).pipe(
       Layer.provide(Layer.succeed(WorkerTransports, { transports })))), WorkerRunner))
     if (Option.isSome(config.azure)) {
-      const bootstrap = yield* azureLinuxBootstrap(config.azure.value.allocation)
+      const bootstrap = yield* azureBootstrap(config.azure.value.allocation)
       byProvider.set("azure", Context.get(yield* Layer.build(outwardWorkerRunner({ origin: config.azure.value.workerOrigin,
         runtimes: config.runtimes.filter(runtime => runtime.provider === "azure"), pollMs: 1000 }).pipe(
         Layer.provide(Layer.merge(storage, Layer.succeed(WorkerBootstraps, { providers: new Map([["azure" as const, bootstrap]]) }))))), WorkerRunner))

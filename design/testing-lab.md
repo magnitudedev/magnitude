@@ -202,6 +202,11 @@ and current allocation states. The CLI emits stage changes while waiting; progre
 result and cannot establish acceptance. Reconnecting to wait on an existing run never resubmits
 its input or acquires another allocation; reports retain the original run identity.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
+Windows delivery runs the worker in the admitted local user's interactive desktop session.
+A system-session process cannot qualify GUI behavior. A temporary, system-owned launcher
+delivers only attempt-scoped authority through a protected input, validates the actual user and
+session, observes the native task exit, and removes its task and credential files. Missing
+interactive login, launch timeout or failed cleanup remains an infrastructure failure.
 Fresh Azure Linux workers may prepare their trusted runtime through administrator-pinned
 cloud-init configuration or a pinned Linux preparation recipe. A recipe names its OS distribution
 and version: the allocator rejects a target mismatch before provisioning, and the guest rejects

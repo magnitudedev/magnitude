@@ -5,7 +5,7 @@ import { expect, test } from "vitest"
 import { LeaseId, RunId } from "../src/domain"
 import { AzureMachine, MachineTags } from "../src/machines"
 import { WorkerLaunch } from "../src/outward-runner"
-import { azureLinuxBootstrap } from "../src/providers/azure-bootstrap"
+import { azureBootstrap } from "../src/providers/azure-bootstrap"
 import { ProcessExecutor, ProcessExecutorLive, checkedCommand, type CommandSpec } from "../src/process"
 
 const config = { executable: "az", subscription: "5304c4b3-d605-4193-b0cb-766c065acfa6", resourceGroup: "magnitude-ci", adminUsername: "labworker" }
@@ -17,8 +17,9 @@ const launch = () => WorkerLaunch.make({ executable: "/bin/sh", args: ["-c", "pr
   root: "/tmp/lab attempt'", origin: "https://lab.example.com", token: Redacted.make("fixture-worker-secret"), deadline: DateTime.unsafeMake(Date.now() + 60_000) })
 const output = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: "", exitCode: 0 })
 
-for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "expired", "delivery-error"] as const) test(`Azure worker delivery: ${mode}`, async () => {
-  const vm = machine(), invocation = launch()
+for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "windows-success", "expired", "delivery-error"] as const) test(`Azure worker delivery: ${mode}`, async () => {
+  const vm = machine(), invocation = mode === "windows-success" ? WorkerLaunch.make({ ...launch(),
+    executable: "C:\\Lab Runtime\\bun.exe", args: ["C:\\Lab Runtime\\worker.ts", "quote\" space $HOME `exit`", "", "tail\\"], root: "C:\\Users\\labworker\\Lab runs" }) : launch()
   const requests: CommandSpec[] = [], files: string[] = []
   let script = ""
   const executor = Layer.succeed(ProcessExecutor, { run: (spec: CommandSpec) => Effect.sync(() => {
@@ -28,7 +29,7 @@ for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "exp
     if (spec.args.includes("GET")) return output({ id, name, location: "westus2", tags: {
       "lab-owner": "magnitude-testing-lab-v1", "lab-machine": name,
       "lab-lease": Schema.encodeSync(Schema.parseJson(MachineTags))(mode === "foreign-lease" ? machine().tags : vm.tags),
-    }, properties: { provisioningState: "Succeeded", storageProfile: { osDisk: { osType: mode === "windows" ? "Windows" : "Linux" } } } })
+    }, properties: { provisioningState: "Succeeded", storageProfile: { osDisk: { osType: mode.startsWith("windows") ? "Windows" : "Linux" } } } })
     const file = spec.args[spec.args.indexOf("--body") + 1]!.slice(1)
     files.push(file)
     expect(statSync(file).mode & 0o777).toBe(0o600)
@@ -42,14 +43,22 @@ for (const mode of ["success", "foreign-scope", "foreign-lease", "windows", "exp
     return mode === "delivery-error" ? { stdout: "", stderr: Redacted.value(invocation.token), exitCode: 1 } : output({})
   }) })
   const result = await Effect.runPromise(Effect.gen(function* () {
-    const bootstrap = yield* azureLinuxBootstrap(config)
+    const bootstrap = yield* azureBootstrap(config)
     yield* bootstrap.start(mode === "foreign-scope" ? { ...vm, id: id.replace("magnitude-ci", "another-group") } : vm,
       mode === "expired" ? { ...invocation, deadline: DateTime.unsafeMake(0) } : invocation)
   }).pipe(Effect.either, Effect.provide(Layer.merge(BunContext.layer, executor))))
-  expect(result._tag).toBe(mode === "success" ? "Right" : "Left")
+  expect(result._tag).toBe(mode === "success" || mode === "windows-success" ? "Right" : "Left")
   if (result._tag === "Left") expect(result.left.message).not.toContain(Redacted.value(invocation.token))
   for (const file of files) expect(existsSync(file)).toBe(false)
-  expect(requests.length).toBe(mode === "foreign-scope" || mode === "expired" ? 0 : mode === "success" || mode === "delivery-error" ? 2 : 1)
+  expect(requests.length).toBe(mode === "foreign-scope" || mode === "expired" ? 0 : mode === "success" || mode === "windows-success" || mode === "delivery-error" ? 2 : 1)
+  if (mode === "windows-success") {
+    const encoded = script.match(/FromBase64String\('([A-Za-z0-9+/=]+)'\)/)![1]!
+    expect(JSON.parse(Buffer.from(encoded, "base64").toString())).toMatchObject({ user: "labworker", executable: invocation.executable,
+      root: invocation.root, args: invocation.args, origin: invocation.origin })
+    expect(script).toContain("-LogonType Interactive")
+    expect(script).toContain(".SessionId -eq 0")
+    expect(script).toContain("Unregister-ScheduledTask")
+  }
   if (mode === "success") {
     // Execute the exact generated shell to catch interpolation bugs, rather than comparing quoting strings.
     const userSwitch = "/usr/bin/sudo -n -H --preserve-env=LAB_WORKER_TOKEN,LAB_WORKER_ROOT,LAB_URL -u 'labworker' -- "
@@ -72,7 +81,7 @@ for (const state of ["Pending", "Running", "Succeeded", "Failed", "TimedOut", "C
         exitCode: state === "Failed" ? 17 : 0, output: "must not expose provider output or protected values", error: "private diagnostic fixture" } }),
     } }) }
   }).pipe(Effect.orDie) })
-  const observed = yield* azureLinuxBootstrap(config).pipe(Effect.flatMap(bootstrap => bootstrap.poll(vm)), Effect.provide(executor), Effect.either)
+  const observed = yield* azureBootstrap(config).pipe(Effect.flatMap(bootstrap => bootstrap.poll(vm)), Effect.provide(executor), Effect.either)
   if (state === "foreign-command") expect(observed._tag).toBe("Left")
   else if (observed._tag === "Right") {
     expect(observed.right._tag).toBe(["Pending", "Running", "missing-view"].includes(state) ? "None" : "Some")
