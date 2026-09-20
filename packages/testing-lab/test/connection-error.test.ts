@@ -18,7 +18,7 @@ for (const behavior of ["preserve", "overwrite", "missing-alert"] as const) test
   let recovered = false
   const driver: DesktopDriver = {
     downloads: { begin: () => Effect.die("Unused"), transferring: () => Effect.die("Unused"), failed: () => Effect.die("Unused"), complete: () => Effect.die("Unused"), absent: () => Effect.die("Unused") },
-    updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
+    verifyLoginStartup: () => Effect.void, loginStartup: () => Effect.void, updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
     identity: () => Effect.die("Not used by this fixture"), host: () => Effect.succeed("unused"), navigate: () => Effect.void, ready: () => Effect.void, serviceFailure: () => Effect.succeed("unused"),
     search: () => Effect.void, details: () => Effect.void, download: () => Effect.void,
     load: () => Effect.void, disconnect: () => Effect.void, theme: () => Effect.void,

@@ -131,3 +131,11 @@ with recoverable platform warnings may proceed only when the lab setup itself co
 Detailed cloud-init status remains on the guest, and failure diagnostics are captured before
 cleanup. Static cloud-init remains useful for explicitly managed preparation inputs, but any
 capabilities embedded in a static file must be renewed by its owner.
+
+For unattended update qualification, disposable Ubuntu workers authorize only their configured
+worker user running the packaged `_install-application-update` command through real `pkexec`.
+The initializer installs a Polkit rule matching the executable and command line; it does not
+replace the updater, its signature checks, or the native package transaction. This qualifies
+preauthorized installation, not interactive password-prompt handling. The rule exists only on
+the disposable worker and disappears with it. The matching variables are documented by
+[Polkit](https://polkit.pages.freedesktop.org/polkit/polkit.8.html).

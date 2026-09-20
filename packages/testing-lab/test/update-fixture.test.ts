@@ -1,7 +1,7 @@
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { decodeUpdateConfiguration, UpdateConfiguration, UpdateRelease, ReleaseTarget, signUpdateRequest, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Fiber, Option, Schedule, Schema } from "effect"
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import { existsSync, readFileSync } from "node:fs"
 import { createRequire } from "node:module"
@@ -105,6 +105,30 @@ it("serves signed private updates over trusted HTTPS and closes its owned resour
     yield* fixture.publish(artifact)
     const recoveredResolve = yield* signed("/api/download", { release: "2.0.0" })
     const recoveredRedirect = yield* fetchFixture(recoveredResolve.url, fixture.caPath, recoveredResolve.headers)
+    expect(body(yield* fetchFixture(recoveredRedirect.headers.location!, fixture.caPath))).toEqual(content)
+    // Observe actual bytes in a separate native Electron/Node client before breaking its socket.
+    yield* Effect.scoped(Effect.gen(function* () {
+      const fault = yield* fixture.interruptDownload
+      expect((yield* Effect.scoped(fixture.interruptDownload).pipe(Effect.either))._tag).toBe("Left")
+      const receipt = join(parent, "prefix-received")
+      const interruptedFetch = `import {writeFileSync} from 'node:fs';if(!process.versions.electron||process.versions.bun)throw new Error('Native Electron required');let input='';for await(const part of process.stdin)input+=part;const data=JSON.parse(input);let bytes=0;try{const response=await fetch(data.url);for await(const part of response.body){bytes+=part.length;writeFileSync(data.receipt,String(bytes));}console.log(JSON.stringify({bytes,failed:false}));}catch{console.log(JSON.stringify({bytes,failed:true}));}`
+      const input = yield* Schema.encode(Schema.parseJson(Schema.Struct({ url: Schema.String, receipt: Schema.String })))({ url: recoveredRedirect.headers.location!, receipt })
+      const consumer = yield* command(electron, ["--input-type=module", "-e", interruptedFetch], {
+        env: { NODE_EXTRA_CA_CERTS: fixture.caPath, ELECTRON_RUN_AS_NODE: "1" }, stdin: Option.some(input), timeoutMs: 10_000,
+      }).pipe(Effect.forkScoped)
+      const offered = yield* fault.started
+      expect(offered.offeredBytes).toBeGreaterThan(0)
+      expect(offered.offeredBytes).toBeLessThan(offered.requestedBytes)
+      yield* fs.readFileString(receipt).pipe(Effect.retry(Schedule.spaced("10 millis").pipe(Schedule.intersect(Schedule.recurs(300)))))
+      yield* fault.cut
+      const outcome = yield* Fiber.join(consumer)
+      expect(outcome.exitCode).toBe(0)
+      const transferred = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ bytes: Schema.Number, failed: Schema.Boolean })))(outcome.stdout)
+      expect(transferred.failed).toBe(true)
+      expect(transferred.bytes).toBeGreaterThan(0)
+      expect(transferred.bytes).toBeLessThan(content.length)
+      expect((yield* fetchFixture(recoveredRedirect.headers.location!, fixture.caPath)).status).toBe(503)
+    }))
     expect(body(yield* fetchFixture(recoveredRedirect.headers.location!, fixture.caPath))).toEqual(content)
     yield* fixture.withdraw
     expect((yield* fetchFixture(location, fixture.caPath)).status).toBe(404)

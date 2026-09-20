@@ -15,6 +15,8 @@ export type DesktopLaunch = typeof DesktopLaunch.Type
 export interface DesktopDriver {
   readonly downloads: DesktopDownloads
   readonly updates: DesktopUpdates
+  readonly verifyLoginStartup: (enabled: boolean) => Effect.Effect<void, AssertionFailure>
+  readonly loginStartup: (enabled: boolean) => Effect.Effect<void, AssertionFailure>
   readonly navigate: (page: "discover" | "catalog" | "models" | "connections" | "usage" | "status" | "settings") => Effect.Effect<void, AssertionFailure>
   readonly identity: () => Effect.Effect<ApplicationIdentity, AssertionFailure>
   readonly host: () => Effect.Effect<string, AssertionFailure>
@@ -39,6 +41,29 @@ export const DesktopDriver = Context.GenericTag<DesktopDriver>("@magnitudedev/te
 // Playwright is the explicit Promise boundary. Test orchestration and lifecycle stay in Effect.
 const action = <A>(description: string, run: () => Promise<A>) => Effect.tryPromise({ try: run,
   catch: error => new AssertionFailure({ message: `${description}: ${error instanceof Error ? error.message.slice(0, 1800) : "Playwright failed"}` }) })
+export const setLoginStartup = (page: Page, openSettings: Effect.Effect<void, AssertionFailure>, enabled: boolean) => openSettings.pipe(Effect.zipRight(action("Set application login startup", async () => {
+  const region = page.getByTestId(automation.loginStartup)
+  await region.waitFor()
+  const wanted = enabled ? "Enabled" : "Disabled"
+  const current = await region.getAttribute("data-login-state")
+  if (current === "Unavailable" || enabled && current === "RequiresApproval") throw new Error(`Login startup needs OS attention: ${(await region.innerText()).slice(0, 1000)}`)
+  if (current !== wanted) await page.getByTestId(automation.loginStartupToggle).click()
+  await page.waitForFunction(({ id, wanted }) => {
+    const state = document.querySelector(`[data-testid="${id}"]`)?.getAttribute("data-login-state")
+    return state === wanted || state === "RequiresApproval" || state === "Unavailable"
+  }, { id: automation.loginStartup, wanted })
+  if (await region.getAttribute("data-login-state") !== wanted) throw new Error(`Login startup did not reach ${wanted}: ${(await region.innerText()).slice(0, 1000)}`)
+})))
+
+/** Assert the saved preference without repairing it through the UI. */
+export const verifyLoginStartup = (page: Page, openSettings: Effect.Effect<void, AssertionFailure>, enabled: boolean) => openSettings.pipe(Effect.zipRight(action("Verify application login startup", async () => {
+  const region = page.getByTestId(automation.loginStartup)
+  await region.waitFor()
+  const wanted = enabled ? "Enabled" : "Disabled"
+  const observed = await region.getAttribute("data-login-state")
+  if (observed !== wanted) throw new Error(`Expected retained login startup ${wanted}, observed ${observed}`)
+})))
+
 /** Observe the rendered error and reveal its file guidance through native disclosure semantics. */
 export const observeConnectionFailure = (page: Page, name: string, fileName: string) => action(`Observe ${name} configuration error`, async () => {
   const harness = page.getByTestId(automation.harness(name))
@@ -112,6 +137,8 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
     ? Effect.void : new AssertionFailure({ message: "Application did not exit cleanly through normal quit" })))
   return {
     updates,
+    verifyLoginStartup: enabled => verifyLoginStartup(page, navigate("settings"), enabled),
+    loginStartup: enabled => setLoginStartup(page, navigate("settings"), enabled),
     downloads,
     // Finalize diagnostics before native replacement retires the Playwright connection.
     // The caller separately observes the replacement owner; this proves only the old process exit.

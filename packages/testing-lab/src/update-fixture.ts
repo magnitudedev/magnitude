@@ -1,7 +1,7 @@
 import { FileSystem } from "@effect/platform"
 import { acceptsUpdateRelease, decodeUpdateRequest, ReleaseTarget, signUpdateRelease, UpdateConfiguration, UpdateRelease, verifyUpdateRequest } from "@magnitudedev/release/hosted-update"
 import { defineFSM } from "@magnitudedev/utils/fsm"
-import { Clock, Effect, Option, Ref, Runtime, Schema, Stream } from "effect"
+import { Clock, Deferred, Effect, Option, Ref, Runtime, Schema, Stream } from "effect"
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from "node:crypto"
 import { join } from "node:path"
 import { AssertionFailure, Digest, InfrastructureFailure } from "./domain"
@@ -17,6 +17,7 @@ export const UpdateFixtureAuthority = Schema.Struct({ schemaVersion: Schema.Lite
   certificate: Schema.NonEmptyString, tlsPrivateKey: Schema.NonEmptyString, publisherPrivateKey: Schema.NonEmptyString,
 })
 export type UpdateFixtureAuthority = typeof UpdateFixtureAuthority.Type
+export const InterruptedUpdateTransfer = Schema.Struct({ offeredBytes: Schema.Int.pipe(Schema.positive()), requestedBytes: Schema.Int.pipe(Schema.positive()) })
 export const UpdateFixtureDelivery = Schema.Literal("Exact", "Corrupt")
 class Empty extends Schema.TaggedClass<Empty>()("Empty", {}) {}
 class Offering extends Schema.TaggedClass<Offering>()("Offering", {
@@ -58,6 +59,8 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
   // Replay admission is synchronous inside the request Effect and bounded independently of server lifetime.
   const nonces = new Map<string, number>()
   let origin = ""
+  type Fault = { cut: boolean; controllers: Set<ReadableStreamDefaultController<Uint8Array>>; started: Deferred.Deferred<typeof InterruptedUpdateTransfer.Type> }
+  let activeFault: Fault | undefined
   const handler = (request: Request) => Effect.gen(function* () {
     const url = new URL(request.url)
     if (url.origin !== origin || request.method !== "GET") return new Response(null, { status: 400 })
@@ -74,7 +77,27 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
         if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || end >= current.release.bytes) return new Response(null, { status: 416 })
         if (request.headers.has("if-range") && request.headers.get("if-range") !== etag) return new Response(null, { status: 412 })
       }
-      return new Response(Bun.file(current.path).slice(start, end + 1), {
+      const fault = activeFault
+      if (fault?.cut) return new Response(null, { status: 503, headers: { "cache-control": "no-store" } })
+      let body: Blob | ReadableStream<Uint8Array> = Bun.file(current.path).slice(start, end + 1)
+      if (fault) {
+        const requestedBytes = end - start + 1
+        if (requestedBytes < 2) return new Response(null, { status: 503 })
+        const offeredBytes = Math.min(64 * 1024, requestedBytes - 1)
+        const prefix = yield* Effect.tryPromise({ try: () => Bun.file(current.path).slice(start, start + offeredBytes).bytes(), catch: () => fail("Cannot read interrupted update prefix") })
+        let owner: ReadableStreamDefaultController<Uint8Array> | undefined
+        body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            owner = controller
+            if (fault.cut) { controller.error(new Error("Test update connection interrupted")); return }
+            fault.controllers.add(controller)
+            controller.enqueue(prefix)
+            Runtime.runSync(runtime)(Deferred.succeed(fault.started, { offeredBytes, requestedBytes }))
+          },
+          cancel() { if (owner) fault.controllers.delete(owner) },
+        })
+      }
+      return new Response(body, {
         status: range ? 206 : 200, headers: {
           "content-length": String(end - start + 1), "content-type": "application/octet-stream", etag,
           "cache-control": "no-store", "accept-ranges": "bytes",
@@ -147,7 +170,23 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
     return release
   }))
   const withdraw = gate.withPermits(1)(Ref.update(state, current => current._tag === "Empty" ? current : lifecycle.transition(current, "Empty", {})))
+  /** Fault scope is exclusive and affects only this fixture's archive responses, never host networking. */
+  const interruptDownload = Effect.gen(function* () {
+    const started = yield* Deferred.make<typeof InterruptedUpdateTransfer.Type>()
+    const fault: Fault = { cut: false, controllers: new Set(), started }
+    const cut = Effect.sync(() => {
+      fault.cut = true
+      for (const controller of fault.controllers) { try { controller.error(new Error("Test update connection interrupted")) } catch { /* Client already closed. */ } }
+      fault.controllers.clear()
+    })
+    yield* Effect.acquireRelease(Effect.suspend(() => {
+      if (activeFault) return Effect.fail(fail("An update transfer fault is already active"))
+      activeFault = fault
+      return Effect.void
+    }), () => cut.pipe(Effect.zipRight(Effect.sync(() => { if (activeFault === fault) activeFault = undefined }))))
+    return { started: Deferred.await(started).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => fail("App did not start an update archive transfer") })), cut }
+  })
   const authority = UpdateFixtureAuthority.make({ schemaVersion: 1, origin, certificate: cert, tlsPrivateKey: key,
     publisherPrivateKey: publisher.privateKey.export({ type: "pkcs8", format: "pem" }).toString() })
-  return { origin, caPath, configPath, configuration, publish, withdraw, authority }
+  return { origin, caPath, configPath, configuration, publish, withdraw, authority, interruptDownload }
 })

@@ -6,7 +6,7 @@ const events: string[] = []
 const launchDriver = (config: DesktopLaunch) => Layer.scoped(DesktopDriver, Effect.acquireRelease(
   Effect.sync(() => { events.push(`open:${config.evidence}`); return {
     downloads: { begin: () => Effect.die("Unused"), transferring: () => Effect.die("Unused"), failed: () => Effect.die("Unused"), complete: () => Effect.die("Unused"), absent: () => Effect.die("Unused") },
-    updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
+    verifyLoginStartup: () => Effect.void, loginStartup: () => Effect.void, updates: { action: () => Effect.die("Unused"), automatic: () => Effect.die("Unused"), wait: () => Effect.die("Unused") },
     identity: () => Effect.die("Not used by this fixture"), host: () => Effect.succeed("test-version"),
     navigate: () => Effect.void, ready: () => Effect.void, serviceFailure: () => Effect.succeed("unused"), search: () => Effect.void,
     details: () => Effect.void, download: () => Effect.void, load: () => Effect.void,

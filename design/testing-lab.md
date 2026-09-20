@@ -230,7 +230,12 @@ Installing a replacement directly is fixture preparation, never proof of applica
 User-data retention compares the stopped application's complete isolated profile before and
 after native removal, including file contents, directories and symbolic links without following
 links outside the profile. Evidence contains hashes rather than file contents. Reinstall must
-consume the same candidate and retain an application setting across the removal boundary.
+consume the same candidate and retain an application setting across the removal boundary. Linux login cleanup first enables the real installed-user entry and
+captures the app/service descendant tree with process birth identities. Removal must leave no
+captured process alive and either remove the login entry or leave the exact saved preference
+dormant behind a missing TryExec executable. Reinstallation observes the retained enabled setting
+without toggling it to manufacture success. These native assertions require an installed Linux
+guest; other platforms must not report this qualification from an absent registration alone.
 
 Every rented resource is tagged with lab/run/lease identity and an absolute expiry. Cancellation,
 timeouts and failures release owned resources; reconciliation also inventories providers to find
@@ -349,6 +354,24 @@ the listener and removes its temporary trust and artifacts.
 Corrupt-delivery scenarios first verify the admitted artifact, then alter only the fixture's copy
 while preserving its length and authentic signed metadata. Recovery republishes the intact source;
 neither malformed metadata nor a failed source-admission check substitutes for download rejection.
+Updater cases share one scoped installation journey and restore the primary candidate before other
+suites resume. The baseline records settings and model file hashes before replacement. The updater
+must launch a new ready application/service owner at the admitted candidate version without a test
+launch command; a new owner at the old version is recovery from a failed installation, not success.
+Native package-database observation transfers cleanup ownership only within the same installation
+paths and target. The DEB payload check compares extracted admitted files with installed bytes and
+symlinks independently of the updater's own hash check. Post-update generation requires retained
+settings and the original model hashes before loading again. Both release versions share one
+scoped runtime origin so an automatically relaunched app can acquire its own admitted runtime.
+An unresolved native handoff forbids further package mutation; disposable allocation cleanup remains
+the final containment boundary.
+
+Update download faults affect only the fixture's archive connections. They offer a proper prefix,
+cut the response before its declared length, and reject further transfers until the fault scope
+closes. Native-client tests observe received prefix bytes before triggering the cut. App acceptance
+requires visible failure, the baseline still running, and successful intact download after recovery.
+Fault restoration precedes subsequent cases even when assertions fail or the case is cancelled.
+
 Settings persistence is checked across actual application process restarts using the same
 isolated profile; a page reload cannot satisfy it. Each launch preserves its own trace and
 process log, and the previous process is released before the next launches. Application quit

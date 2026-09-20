@@ -16,7 +16,21 @@ export const renderXdgLoginStartup = (executable: string, enabled: boolean) => {
   // GLib checks argv[0] before expanding %% escapes. A literal percent in the app
   // path would therefore fail admission. env execs the absolute path after expansion,
   // preserving the environment and PID without introducing shell interpretation.
-  return `[Desktop Entry]\nType=Application\nName=Magnitude\nExec=/usr/bin/env "${argument}" --background\nTerminal=false\nHidden=${!enabled}\n`
+  const tryExec = executable.replaceAll("\\", "\\\\").replaceAll(" ", "\\s").replaceAll("\t", "\\t")
+  return `[Desktop Entry]\nType=Application\nName=Magnitude\nExec=/usr/bin/env "${argument}" --background\nTryExec=${tryExec}\nTerminal=false\nHidden=${!enabled}\n`
+}
+
+const desktopString = (value: string): Option.Option<string> => {
+  let decoded = ""
+  const escapes: Readonly<Record<string, string>> = { s: " ", n: "\n", t: "\t", r: "\r", "\\": "\\" }
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index]!
+    if (character !== "\\") { decoded += character; continue }
+    const escaped = escapes[value[++index]!]
+    if (escaped === undefined) return Option.none()
+    decoded += escaped
+  }
+  return Option.some(decoded)
 }
 
 export const makeXdgLoginStartup = (options: {
@@ -58,8 +72,9 @@ export const makeXdgLoginStartup = (options: {
     }
     const tryExec = fields.get("TryExec")
     if (tryExec) {
-      if (!isAbsolute(tryExec)) return { _tag: "Unavailable", message: "The login entry has an unverified executable condition." } as const
-      const exists = yield* Effect.tryPromise({ try: () => access(tryExec, constants.X_OK).then(() => true), catch: failed }).pipe(Effect.orElseSucceed(() => false))
+      const executable = desktopString(tryExec)
+      if (Option.isNone(executable) || !isAbsolute(executable.value)) return { _tag: "Unavailable", message: "The login entry has an unverified executable condition." } as const
+      const exists = yield* Effect.tryPromise({ try: () => access(executable.value, constants.X_OK).then(() => true), catch: failed }).pipe(Effect.orElseSucceed(() => false))
       if (!exists) return { _tag: "Disabled" } as const
     }
     return { _tag: "Enabled" } as const

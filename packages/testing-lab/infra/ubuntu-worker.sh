@@ -9,7 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Fresh application processes use the newly installed libraries after preparation.
 export NEEDRESTART_MODE=l
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
+apt-get install -y -qq curl ca-certificates python3 python3-venv git xz-utils tar build-essential cmake libclang-dev libssl-dev pkg-config fakeroot rpm binutils nftables polkitd pkexec xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6
 
 python3 - <<'PY'
 import hashlib,json,os,pathlib,platform,pwd,re,shlex,shutil,subprocess,tomllib,urllib.request
@@ -18,6 +18,17 @@ expected={'x64':'x86_64','arm64':'aarch64'}[config['architecture']]
 if platform.machine()!=expected:raise SystemExit('Initialization architecture mismatch')
 account=pwd.getpwnam(config['adminUsername'])
 if account.pw_uid==0:raise SystemExit('Worker account must not be root')
+# Disposable worker authorization uses real pkexec/Polkit, limited to the packaged update command.
+# The candidate still verifies its signed update and performs the native apt transaction.
+update_program='/usr/lib/magnitude-desktop/resources/magnitude'
+rule='polkit.addRule(function(action, subject) {\n' + \
+ '  if (action.id === "org.freedesktop.policykit.exec" && subject.user === '+json.dumps(account.pw_name)+ \
+ ' && action.lookup("program") === '+json.dumps(update_program)+ \
+ ' && action.lookup("command_line").indexOf('+json.dumps(update_program+' _install-application-update ')+') === 0) return polkit.Result.YES;\n});\n'
+policy=pathlib.Path('/etc/polkit-1/rules.d/49-magnitude-lab-update.rules')
+policy.write_text(rule)
+policy.chmod(0o644)
+subprocess.run(['systemctl','start','polkit.service'],check=True)
 home=pathlib.Path(account.pw_dir)
 root=home/'lab-runtime'
 root.mkdir(mode=0o700)

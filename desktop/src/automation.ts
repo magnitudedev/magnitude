@@ -16,5 +16,7 @@ export const desktopAutomation = {
   sidebar: "desktop.sidebar",
   updates: "desktop.updates",
   updateAction: (action: string) => `desktop.update.${action}`,
+  loginStartup: "desktop.login-startup",
+  loginStartupToggle: "desktop.login-startup.toggle",
   updateAutomatic: "desktop.update.automatic",
 } as const

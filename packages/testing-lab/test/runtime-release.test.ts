@@ -103,3 +103,23 @@ test("candidate and baseline runtime environments remain independent across base
     expect(environment.MAGNITUDE_ICN_PATH).toBe("/ambient/development/installation.json")
   }).pipe(Effect.provide(fileArtifactStore(join(root, "objects"))))
 })).pipe(Effect.provide(Layer.merge(BunContext.layer, FetchHttpClient.layer)))))
+
+test("one inherited runtime origin serves both update versions without aliasing their manifests", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-update-runtime-" })
+  yield* Effect.gen(function* () {
+    const objects = yield* ArtifactStore
+    yield* objects.put(sha256(payload), Stream.make(payload))
+    const next = { ...manifest, version: "0.1.4", tag: "@magnitudedev/cli@0.1.4" }
+    const environment = yield* runtimeEnvironment(manifest, "darwin-arm64", {}, [next])
+    const origin = environment.MAGNITUDE_RELEASE_BASE_URL!
+    for (const value of [manifest, next]) {
+      const acquired = yield* acquireRelease(origin, value.version, join(root, `cache-${value.version}`))
+      expect(acquired.manifest).toEqual(value)
+      expect(yield* Effect.tryPromise(() => fetch(releaseUrl(origin, value.version, value.artifacts[0]!.filename)).then(response => response.text()))).toBe(new TextDecoder().decode(payload))
+    }
+    expect((yield* Effect.tryPromise(() => fetch(releaseUrl(origin, "0.1.5", "magnitude-release.json")))).status).toBe(404)
+    expect((yield* runtimeRelease(manifest, "darwin-arm64", [manifest]).pipe(Effect.either))._tag).toBe("Left")
+    expect((yield* runtimeRelease(manifest, "darwin-arm64", [{ ...next, artifacts: [{ ...next.artifacts[0], host: Option.some("linux-x64-gnu" as const) }] }]).pipe(Effect.either))._tag).toBe("Left")
+  }).pipe(Effect.provide(fileArtifactStore(join(root, "objects"))))
+})).pipe(Effect.provide(Layer.merge(BunContext.layer, FetchHttpClient.layer)))))

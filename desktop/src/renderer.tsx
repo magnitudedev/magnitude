@@ -491,9 +491,9 @@ function LoginSettingsView({ service }: { service: DesktopSession }) {
   const current = Result.isSuccess(state) ? state.value : null
   if (Result.isInitial(state)) return <LoginSkeleton />
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  return <section className={pageLayout.settingsCard}>
+  return <section data-testid={automation.loginStartup} data-login-state={current?._tag} className={pageLayout.settingsCard}>
     <div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div>
-    <Button variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
+    <Button data-testid={automation.loginStartupToggle} variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
     {current?._tag === "Unavailable" && <p className="mt-3 text-sm text-slate-500">{current.message}</p>}
     {current?._tag === "RequiresApproval" && <p className="mt-3 text-sm">Allow Magnitude in your system login settings to finish enabling startup.</p>}
     {Result.isFailure(state) && <p role="alert" className="mt-3 text-sm">Could not read login startup. {hostFailureMessage(state.cause)}</p>}

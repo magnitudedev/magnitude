@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path"
 import { createRequire } from "node:module"
 import { _electron } from "playwright"
 import { expect, test } from "vitest"
+import { setLoginStartup, verifyLoginStartup } from "../src/desktop-driver"
 import { playwrightUpdates } from "../src/update-controls"
 import { challengePresentation } from "../test-support/presentation-challenge"
 
@@ -19,7 +20,9 @@ test("update controls survive presentation changes and stop on a rendered failur
       <button data-testid="desktop.update.download" onclick="this.parentElement.dataset.updateState='Ready'">Download</button>
       <button data-testid="desktop.update.restart" onclick="this.parentElement.dataset.updateState='Closed'">Restart</button>
       <button data-testid="desktop.update.discard" onclick="this.parentElement.dataset.updateState='Idle';delete this.parentElement.dataset.updateVersion">Discard</button>
-    </section></body>`)
+    </section>
+    <section data-testid="desktop.login-startup" data-login-state="Disabled"><button data-testid="desktop.login-startup.toggle" onclick="this.dataset.changes=String(Number(this.dataset.changes??0)+1);setTimeout(()=>{this.parentElement.dataset.loginState=this.parentElement.dataset.loginState==='Enabled'?'Disabled':'Enabled'},50)">Enable</button></section>
+    </body>`)
   yield* fs.writeFileString(main, `const { app, BrowserWindow } = require('electron'); app.whenReady().then(() => {
     const window = new BrowserWindow({show: false}); window.loadFile(${yield* Schema.encode(Schema.parseJson(Schema.String))(html)});
   }); app.on('window-all-closed', () => app.quit());`)
@@ -29,6 +32,17 @@ test("update controls survive presentation changes and stop on a rendered failur
     app => Effect.promise(() => app.close()).pipe(Effect.interruptible, Effect.timeout("5 seconds"), Effect.orDie))
   const page = yield* Effect.promise(() => app.firstWindow())
   yield* Effect.promise(() => challengePresentation(page))
+  yield* setLoginStartup(page, Effect.void, true)
+  yield* setLoginStartup(page, Effect.void, true)
+  yield* verifyLoginStartup(page, Effect.void, true)
+  yield* setLoginStartup(page, Effect.void, false)
+  expect((yield* verifyLoginStartup(page, Effect.void, true).pipe(Effect.either))._tag).toBe("Left")
+  yield* verifyLoginStartup(page, Effect.void, false)
+  expect(yield* Effect.promise(() => page.getByTestId("desktop.login-startup.toggle").getAttribute("data-changes"))).toBe("2")
+  for (const state of ["Unavailable", "RequiresApproval"]) {
+    yield* Effect.promise(() => page.getByTestId("desktop.login-startup").evaluate((element, state) => element.setAttribute("data-login-state", state), state))
+    expect((yield* setLoginStartup(page, Effect.void, true).pipe(Effect.either))._tag).toBe("Left")
+  }
   const controls = playwrightUpdates(page, Effect.void)
   yield* controls.automatic(true)
   expect(yield* Effect.promise(() => page.getByTestId("desktop.update.automatic").isChecked())).toBe(true)

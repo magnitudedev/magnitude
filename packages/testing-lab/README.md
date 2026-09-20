@@ -1025,5 +1025,16 @@ helpers. The private fixture cert and key are not installed into the user's trus
 `update-acceptance-probe.ts` exercises an already-built pair with `LAB_UPDATE_PROBE_ROOT`,
 `LAB_UPDATE_PROBE_MANIFEST`, `LAB_UPDATE_PROBE_OBJECTS` and `LAB_UPDATE_PROBE_TARGET`.
 It records host identity and requires a new ready service at the expected version before recording
-an automatic relaunch. This local Mac diagnostic is separate from full scheduled U2–U6 coverage,
-which remains unfinished. The updated producer/consumer delivery is not yet deployed to Azure.
+an automatic relaunch. The scheduled U1–U6 journey now carries one isolated profile through baseline
+generation, the application's native updater, observed automatic relaunch, package-database and
+payload comparison, retained settings/model files, corrupt delivery and interrupted transfer recovery.
+It restores the primary candidate only after the updater owner has stopped; an unresolved handoff
+prevents further package mutation. This implementation is deployed for Ubuntu qualification, with
+the clean build completed and the native consumer still under test. No completed U1–U6 pass is
+claimed yet. Payload comparison currently requires DEB; Windows updater control is not connected.
+
+The Linux removal journey enables the real installed-user login entry before capturing app/service
+process identities. It verifies that the process tree exits and the entry is absent or dormant after
+uninstall, then checks the retained preference without toggling it on reinstall. A TryExec guard
+preserves the opt-in while preventing launch of an absent application. These lifecycle changes have
+local test coverage and await the next native cloud run.

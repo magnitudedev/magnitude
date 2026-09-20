@@ -6,7 +6,7 @@ import { AssertionFailure, Target } from "./domain"
 
 class Absent extends Schema.TaggedClass<Absent>()("Absent", { candidate: Candidate }) {}
 class Present extends Schema.TaggedClass<Present>()("Present", { application: InstalledApplication }) {}
-const lifecycle = defineFSM({ Absent, Present }, { Absent: ["Absent", "Present"], Present: ["Absent"] })
+const lifecycle = defineFSM({ Absent, Present }, { Absent: ["Absent", "Present"], Present: ["Absent", "Present"] })
 /** Explicit removal updates ownership, so final cleanup cannot uninstall the same package twice. */
 export const installationSession = (candidate: Candidate, onCleanupError: (detail: string) => void) => Effect.gen(function* () {
   const installer = yield* Installer
@@ -45,6 +45,15 @@ export const installationSession = (candidate: Candidate, onCleanupError: (detai
     yield* resetTo(next)
     return yield* install
   })))
+  /** Observation only: the application's updater already performed the replacement. */
+  const adoptReplacement = (observed: InstalledApplication) => semaphore.withPermits(1)(Effect.gen(function* () {
+    const present = yield* Ref.get(state)
+    if (present._tag !== "Present" || !Schema.equivalence(Target)(present.application.candidate.target, observed.candidate.target)
+      || ["root", "executable", "cli"].some(key => present.application[key as "root" | "executable" | "cli"] !== observed[key as "root" | "executable" | "cli"])) {
+      return yield* new AssertionFailure({ message: "Observed update does not belong to the owned installation" })
+    }
+    yield* Ref.set(state, lifecycle.transition(present, "Present", { application: observed }))
+  }))
   yield* Effect.addFinalizer(() => remove.pipe(Effect.catchAll(error => Effect.sync(() => { onCleanupError(error.message) }))))
-  return { get, remove, replace, reset, current }
+  return { get, remove, replace, reset, current, adoptReplacement }
 })

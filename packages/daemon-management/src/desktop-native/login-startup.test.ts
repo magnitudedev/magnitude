@@ -9,7 +9,7 @@ import { makeXdgLoginStartup, renderXdgLoginStartup } from "./login-startup"
 
 const setup = Effect.acquireRelease(Effect.promise(() => mkdtemp(join(tmpdir(), "magnitude-login-"))), root => Effect.promise(() => rm(root, { recursive: true, force: true })))
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect))
-const executable = "/opt/Magnitude/magnitude"
+const executable = process.execPath
 describe("graphical-session login startup", () => {
   it("is observational until changed and always launches the desktop in background", () => run(Effect.gen(function* () {
     const root = yield* setup
@@ -19,9 +19,23 @@ describe("graphical-session login startup", () => {
     expect(yield* Effect.promise(() => readFile(join(configHome, "autostart/dev.magnitude.desktop"), "utf8").catch(() => null))).toBeNull()
     expect((yield* startup.set(true))._tag).toBe("Enabled")
     const entry = yield* Effect.promise(() => readFile(join(configHome, "autostart/dev.magnitude.desktop"), "utf8"))
-    expect(entry).toContain('Exec=/usr/bin/env "/opt/Magnitude/magnitude" --background')
+    expect(entry).toContain(`Exec=/usr/bin/env "${executable}" --background`)
     expect(entry).not.toContain("magnitude-service")
     expect((yield* startup.set(false))._tag).toBe("Disabled")
+  })))
+  it.each(["Magnitude", "My App", "a\\b", "100%"])("disables a removed executable and restores the preference on reinstall: %s", name => run(Effect.gen(function* () {
+    const root = yield* setup
+    const executable = join(root, name)
+    const create = Effect.promise(() => writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 }))
+    yield* create
+    const startup = yield* makeXdgLoginStartup({ executable, configHome: join(root, "config"), configDirectories: [] })
+    expect((yield* startup.set(true))._tag).toBe("Enabled")
+    yield* Effect.promise(() => rm(executable))
+    expect((yield* startup.read)._tag).toBe("Disabled")
+    const retained = yield* Effect.promise(() => readFile(join(root, "config/autostart/dev.magnitude.desktop"), "utf8"))
+    expect(retained).toContain("Hidden=false")
+    yield* create
+    expect((yield* startup.read)._tag).toBe("Enabled")
   })))
   it("disabling overrides a system entry rather than exposing it again", () => run(Effect.gen(function* () {
     const root = yield* setup

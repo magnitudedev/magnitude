@@ -7,6 +7,8 @@ import { runtimeEnvironment } from "./runtime-release"
 import { prepareApplicationContext } from "./application-context"
 import { CaseExecutor, CaseObservation, runCases } from "./case-runner"
 import { prepareCandidate, selectInstaller } from "./candidate"
+import { captureRemovalProcesses, RemovalProcesses, verifyRemovalProcesses } from "./suites/uninstall-processes"
+import { captureRemovalLogin, RemovalLoginEntry, RemovedLoginEntry, verifyRemovedLogin } from "./suites/uninstall-login"
 import { RemovalReceipt, verifyNativeRemoval } from "./suites/uninstall"
 import { installationSession } from "./installation-session"
 import { selectedHarnesses } from "./catalog"
@@ -55,6 +57,7 @@ import { CliInterruption, verifyCliInterruption } from "./suites/cli-interruptio
 import { WorkAssignment, TargetResult } from "./work-store"
 import { prepareUpdateConsumer } from "./update-consumer"
 import { prepareUpdatePair, UpdatePair } from "./update-pair"
+import { updateJourney } from "./suites/update-journey"
 import { UpdateBaseline, verifyUpdateBaseline } from "./suites/update"
 
 export const CandidateWorkerConfig = Schema.Struct({ root: Schema.NonEmptyString, port: Schema.Int.pipe(Schema.between(1024, 65535)),
@@ -140,6 +143,9 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       return value
     }))
     const desktop = session.pipe(Effect.flatMap(value => value.driver))
+    let removalProcesses: Option.Option<typeof RemovalProcesses.Type> = Option.none()
+    let removalLogin: Option.Option<typeof RemovalLoginEntry.Type> = Option.none()
+    const loginRemovalSelected = assignment.target.cases.some(test => test.id === "X2")
     const retentionSelected = assignment.target.cases.some(test => test.id === "X3" || test.id === "X4")
     const retainedProfile = yield* Effect.cached(Effect.gen(function* () {
       const driver = yield* desktop
@@ -173,8 +179,47 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
       }
       return yield* harnessSuite(harness, config.model, join(evidenceDirectory, "harness", harness), application.harnessHome, prepared)
     })))
+    let updaterScope: Option.Option<Scope.CloseableScope> = Option.none()
+    let activeUpdateCase = "U1"
+    const updaterEvidence = new Map<string, (typeof Evidence.Type)[]>()
+    const closeUpdater = Effect.gen(function* () {
+      if (Option.isNone(updaterScope)) return
+      const owned = updaterScope.value
+      updaterScope = Option.none()
+      yield* Scope.close(owned, Exit.void)
+    })
+    yield* Scope.addFinalizer(scope, closeUpdater.pipe(Effect.catchAllCause(() => Effect.sync(() => {
+      fixtureCleanupFailed = true; cleanupErrors.push("Updater fixture scope did not close cleanly")
+    }))))
+    const updater = yield* Effect.cached(Effect.gen(function* () {
+      if (Option.isNone(admitted.updateAcceptance)) return yield* unavailable("Scheduled updater execution requires an admitted source-built acceptance pair")
+      const cleanupStart = cleanupErrors.length
+      if (Option.isSome(activeSession)) yield* activeSession.value.stop
+      if (cleanupErrors.length !== cleanupStart) {
+        fixtureCleanupFailed = true
+        return yield* unavailable("Primary application cleanup failed before update journey installation")
+      }
+      yield* installed
+      const owned = yield* Scope.make()
+      updaterScope = Option.some(owned)
+      return yield* updateJourney({ acceptance: admitted.updateAcceptance.value, target, root: join(config.root, "update-journey"),
+        evidence: join(evidenceDirectory, "update-journey"), environment, port: application.port, model: config.model }, yield* installation,
+        (name, schema, value) => evidence(`${activeUpdateCase}-${name}.json`, schema, value).pipe(Effect.tap(item => Effect.sync(() => {
+          updaterEvidence.set(activeUpdateCase, [...(updaterEvidence.get(activeUpdateCase) ?? []), item])
+        })), Effect.asVoid), detail => { fixtureCleanupFailed = true; cleanupErrors.push(`Updater: ${detail}`) }).pipe(Effect.provideService(Scope.Scope, owned))
+    }))
     const execute: CaseExecutor["execute"] = test => Effect.gen(function* () {
+      if (test.suite !== "update") yield* closeUpdater
       if (fixtureCleanupFailed) return yield* unavailable("Native fixture restoration failed; refusing further operations on an uncertain installation")
+      if (test.suite === "update" && Option.isSome(admitted.updateAcceptance) && Option.isNone(assignment.plan.request.updateFrom)) {
+        activeUpdateCase = test.id
+        const journey = yield* updater
+        const operation = { U1: journey.baseline, U2: journey.replacement, U3: journey.payload,
+          U4: journey.continuation, U5: journey.corrupt, U6: journey.interrupted }[test.id as "U1" | "U2" | "U3" | "U4" | "U5" | "U6"]
+        if (!operation) return yield* unavailable("Unknown updater case")
+        yield* operation
+        return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, hostEvidence] })
+      }
       switch (test.id as string) {
         case "U1": {
           const baseline = assignment.plan.request.updateFrom
@@ -470,6 +515,14 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
         case "C6": yield* (yield* cli).nativeRuntime; break
         case "X1": {
           const app = yield* installed
+          if (loginRemovalSelected) {
+            if (application.mode !== "installed-user" || target.os === "windows" || target.os === "macos") return yield* unavailable("Login/process removal currently requires a qualified installed Linux guest")
+            const driver = yield* desktop
+            yield* driver.ready()
+            yield* driver.loginStartup(true)
+            removalLogin = Option.some(yield* captureRemovalLogin(environment))
+            removalProcesses = Option.some(yield* captureRemovalProcesses(yield* driver.identity()))
+          }
           if (retentionSelected) yield* retainedProfile
           yield* (yield* session).stop
           yield* (yield* installation).remove
@@ -477,6 +530,13 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, processes))
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
             yield* evidence("X1-native-removal.json", RemovalReceipt, receipt)] })
+        }
+        case "X2": {
+          if (Option.isNone(removalProcesses) || Option.isNone(removalLogin)) return yield* unavailable("Removal has no captured live process tree and enabled login entry")
+          return CaseObservation.make({ detail: "Verified every captured application/service descendant exited and the enabled login entry cannot run after uninstall",
+            evidence: [yield* inputEvidence, yield* evidence("X2-processes.json", RemovalProcesses, yield* verifyRemovalProcesses(removalProcesses.value)),
+              yield* evidence("X2-enabled-login.json", RemovalLoginEntry, removalLogin.value),
+              yield* evidence("X2-removed-login.json", RemovedLoginEntry, yield* verifyRemovedLogin(removalLogin.value))] })
         }
         case "X3": {
           const receipt = yield* verifyRetainedProfile(application.profile, yield* retainedProfile).pipe(Effect.provideService(FileSystem.FileSystem, fs))
@@ -489,12 +549,22 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           if ((yield* driver.host()) !== (yield* manifest).release.version) return yield* new AssertionFailure({ message: "Reinstalled application version differs from admitted candidate" })
           yield* driver.verifyTheme("dark")
           yield* driver.ready()
+          if (Option.isSome(removalLogin)) yield* driver.verifyLoginStartup(true)
           break
         }
         default: return yield* unavailable(`Case ${test.id} is not yet connected to the candidate worker; no acceptance claimed`)
       }
       return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence, hostEvidence] })
     }).pipe(Effect.provide(Layer.mergeAll(Layer.succeed(FileSystem.FileSystem, fs), Layer.succeed(ArtifactStore, objects), Layer.succeed(ProcessExecutor, processes))), Effect.onExit(exit => Exit.isFailure(exit) ? Effect.gen(function* () {
+      if (test.suite === "update") {
+        const preparedPath = join(config.root, "update-journey", "profile", "updates", "update.json")
+        if (yield* fs.exists(preparedPath)) {
+          if (Number((yield* fs.stat(preparedPath)).size) < 1024 * 1024) {
+            const prepared = yield* fs.readFileString(preparedPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))))
+            updaterEvidence.set(test.id, [...(updaterEvidence.get(test.id) ?? []), yield* evidence(`${test.id}-prepared-update.json`, Schema.Unknown, prepared)])
+          }
+        }
+      }
       const identity = `${test.id}-${Option.getOrElse(test.harness, () => "shared")}`
       const detail = Cause.pretty(exit.cause).replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").slice(0, 32 * 1024)
       diagnostics.set(identity, yield* evidence(`${identity}-failure.json`, Schema.Struct({ detail: Schema.String }), { detail }))
@@ -503,7 +573,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     return results.map(result => {
       const diagnostic = diagnostics.get(`${result.caseId}-${Option.getOrElse(result.harness, () => "shared")}`)
 
-      const refs = [...result.evidence, applicationEvidence, ...(result.harness._tag === "Some" && result.harness.value === "hermes" ? harnessSetupEvidence : []), ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
+      const refs = [...result.evidence, applicationEvidence, ...(updaterEvidence.get(result.caseId) ?? []), ...(result.harness._tag === "Some" && result.harness.value === "hermes" ? harnessSetupEvidence : []), ...(result.caseId === "E6" ? backendEvidence : []), ...(result.caseId === "R4" ? recoveryEvidence : []), ...(result.caseId === "R3" ? offlineEvidence : []), ...(result.caseId === "R2" ? downloadEvidence : []), ...(diagnostic ? [diagnostic] : [])]
       return { ...result, evidence: [...new Map(refs.map(item => [item.sha256, item])).values()] }
     })
   })
@@ -532,6 +602,15 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const item = yield* publishEvidenceFile(evidenceDirectory, relative, maxBytes)
     finalCases[index] = { ...finalCases[index]!, evidence: [...finalCases[index]!.evidence, item] }
   }).pipe(Effect.catchAll(error => Effect.sync(() => { cleanupErrors.push(`Evidence ${relative}: ${error.message}`) })))
+  const updateEvidenceDirectory = join(evidenceDirectory, "update-journey")
+  if (yield* fs.exists(updateEvidenceDirectory)) {
+    const launches = ["", ...(yield* fs.readDirectory(updateEvidenceDirectory)).filter(name => /^relaunch-\d+$/.test(name))]
+    const selected = finalCases.filter(result => result.caseId.startsWith("U"))
+    for (const launch of launches) for (const file of ["ui-trace.zip", "desktop.log"]) {
+      const relative = join("update-journey", launch, file)
+      if (yield* fs.exists(join(evidenceDirectory, relative))) for (const result of selected) yield* exportFile(relative, result.caseId, file.endsWith("zip") ? 128 * 1024 * 1024 : 2 * 1024 * 1024)
+    }
+  }
   const baselineEvidence = join(evidenceDirectory, "update-baseline")
   if (yield* fs.exists(baselineEvidence)) {
     const launches = ["", ...(yield* fs.readDirectory(baselineEvidence)).filter(name => /^relaunch-\d+$/.test(name))]

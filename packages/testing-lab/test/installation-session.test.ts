@@ -121,3 +121,20 @@ test("cancellation waits for an admitted replacement and preserves its cleanup o
   }))
   expect(removed).toEqual(["0.1.3", "0.1.2"])
 })))
+
+for (const mode of ["updated", "foreign-path", "absent"] as const) test(`observed self-update retains exact cleanup ownership: ${mode}`, () => Effect.runPromise(Effect.gen(function* () {
+  const events: string[] = []
+  const application = InstalledApplication.make({ candidate, root: "/app", executable: "/app/exe", cli: "/app/cli", packageVersion: "0.1.3" })
+  const updated = { ...application, candidate: { ...candidate, version: "0.1.4" }, packageVersion: "0.1.4" }
+  yield* Effect.scoped(Effect.gen(function* () {
+    const session = yield* installationSession(candidate, detail => { throw new Error(detail) })
+    if (mode !== "absent") yield* session.get
+    const result = yield* session.adoptReplacement(mode === "foreign-path" ? { ...updated, root: "/foreign" } : updated).pipe(Effect.either)
+    expect(result._tag).toBe(mode === "updated" ? "Right" : "Left")
+    if (mode === "updated") expect((yield* session.get).packageVersion).toBe("0.1.4")
+  })).pipe(Effect.provideService(Installer, {
+    install: () => Effect.sync(() => { events.push("install:0.1.3"); return application }),
+    uninstall: value => Effect.sync(() => { events.push(`remove:${value.packageVersion}`) }),
+  }))
+  expect(events).toEqual(mode === "absent" ? [] : ["install:0.1.3", `remove:${mode === "updated" ? "0.1.4" : "0.1.3"}`])
+})))

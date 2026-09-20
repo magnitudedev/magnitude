@@ -163,6 +163,9 @@ report login registration unavailable and never register source executables.
 Linux desktop entries use the system env executable to exec the absolute application path with
 background intent, preserving the environment and process identity without a shell. This permits
 percent-containing paths in GLib, which checks the command before expanding desktop-entry escapes.
+A separately escaped TryExec guard names the application itself, making the retained user entry
+inactive while the executable is absent. Preference observation decodes desktop-entry string escapes
+before checking executable availability; removal does not erase the user’s opt-in for reinstall.
 Native acceptance validates and launches entries with spaces and reserved characters, checking
 the exact background argument rather than only comparing generated text.
 

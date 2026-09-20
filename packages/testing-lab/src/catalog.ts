@@ -42,7 +42,7 @@ const suiteCases: Readonly<Record<Suite, readonly string[]>> = {
   recovery: ["Cancel generation and generate again", "Recover an interrupted model download", "Generate offline from cached model bytes", "Recover an owned worker fault", "Stop and reload the model", "Restart without duplicate owning services"],
   cli: ["Run the exact bundled CLI version", "Inspect help, hardware and service status", "Use catalog and model lifecycle commands", "Manage harness connections through the bundled CLI", "Verify exit behavior and interruption", "Run without ambient development runtimes"],
   update: ["Install the previous version with persistent state", "Update using the normal application updater", "Verify replacement versions and bytes", "Preserve settings and generate after update", "Reject a corrupt or untrusted update", "Recover an interrupted update"],
-  uninstall: ["Remove package-owned registration and launchers", "Remove owned processes and login registration", "Preserve or delete user data according to product policy", "Reinstall without stale service state"],
+  uninstall: ["Remove package-owned registration and launchers", "Leave no owned processes or runnable login entry", "Preserve or delete user data according to product policy", "Reinstall without stale service state"],
 }
 const prefixes: Readonly<Record<Suite, string>> = { package: "P", install: "I", app: "A", endpoint: "E", harness: "H", recovery: "R", cli: "C", update: "U", uninstall: "X" }
 const prerequisites: Readonly<Record<string, readonly string[]>> = {
