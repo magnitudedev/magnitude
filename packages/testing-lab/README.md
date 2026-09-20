@@ -25,8 +25,14 @@ run did not compile source. The UI assertion is now fixed and locally tested. Op
 real tool use and process-restart recovery have subsequently passed against the packaged Mac app.
 Pinned Hermes has also passed programmatic generation/tools/resume and interactive keyboard
 selection, interruption, recovery and normal exit against that app. These changes are wired into
-the worker but have not yet passed the combined Azure run. Update and uninstall completion,
-then qualification of the remaining machines, are still outstanding.
+the worker but have not yet passed the combined Azure run. A separate Ubuntu updater run passed
+U1–U5: baseline generation, native replacement and automatic relaunch, exact installed bytes,
+retained settings/models and generation, and corrupt-update rejection. U6 exposed a fault-fixture
+bug: the fixture rejected the downloader's one-byte probe before any payload transfer. The fixture
+now permits the probe and interrupts the payload; its native HTTP regression passes. Linux login
+registration/removal helpers also passed their native fixtures. The combined clean-source run now
+selects all 66 cases across nine suites and all three harnesses; its result is still pending.
+Other platforms and the complete GitHub workflow remain unqualified.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
@@ -288,8 +294,14 @@ probe, not production coordinator deployment or a replacement for scheduled allo
 A current source snapshot built a DMG and update ZIP successfully on Namespace macOS26.6.2.
 The exact DMG passed local macOS15 launch/readiness/CLI checks and a fresh UI acquisition/model-load
 run (11 passed,11 blocked,zero failed cases,clean removal). The cloud app launched but its inference
-process exited before readiness; cloud generation remains unqualified. Provider cleanup completed;
-the empty-inventory CLI notice exposed and now has a tested parser fix. No borrowed Mac remains.
+process exited before readiness; cloud generation remains unqualified. A subsequent macOS15.7.5
+(24G624) diagnostic reproduced the native failure: the packaged runtime recognizes the Apple
+Paravirtual Metal device, but calibration returns 28 CPU metrics and no Metal metrics. The service
+correctly rejects that incomplete calibration before readiness. This is not a passing Metal
+generation result; the underlying calibration failure still needs resolution. Provider cleanup
+completed. Ephemeral shutdown can itself remove the devbox; release now checks inventory before
+attempting expiration. The empty-inventory CLI notice also has a tested parser fix. No borrowed
+Mac remains from these probes.
 
 Package identity now inspects installed Mach-O, ELF64 or PE32+ headers and checks the running
 desktop against the exact bundled service and CLI versions. The native host and Unix command
@@ -316,8 +328,9 @@ The worker connects H1–H6 to real Pi/OpenCode/Hermes processes, with shared ge
 conversation identifier recall, bounded read/edit fixtures and persisted-session reuse. Images must
 configure absolute `LAB_PI_EXECUTABLE`, `LAB_OPENCODE_EXECUTABLE`, `LAB_HERMES_EXECUTABLE` paths;
 the suite rejects versions outside the pinned tools set. Native event logs are retained per harness.
-Version checks alone do not qualify an immutable worker image. H7 dispatches Pi and OpenCode terminal journeys;
-Hermes H7 remains explicitly blocked until its terminal journey is implemented.
+Version checks alone do not qualify an immutable worker image. H7 dispatches Pi, OpenCode and
+Hermes terminal journeys. Each requires native interruption evidence and successful recovery;
+Hermes passed this against the packaged local Mac app, with combined Azure qualification pending.
 Worker images must also configure an absolute `LAB_TERMINAL_NODE_EXECUTABLE` for Node 24+.
 
 `TerminalDriver` owns a Node.js 24+ subprocess hosting `node-pty`, while the Effect worker

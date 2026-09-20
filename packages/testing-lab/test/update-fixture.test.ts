@@ -109,6 +109,10 @@ it("serves signed private updates over trusted HTTPS and closes its owned resour
     // Observe actual bytes in a separate native Electron/Node client before breaking its socket.
     yield* Effect.scoped(Effect.gen(function* () {
       const fault = yield* fixture.interruptDownload
+      // The real segmented updater probes one byte before opening payload ranges.
+      const probe = yield* fetchFixture(recoveredRedirect.headers.location!, fixture.caPath, { range: "bytes=0-0" })
+      expect(probe.status).toBe(206)
+      expect(body(probe)).toEqual(content.subarray(0, 1))
       expect((yield* Effect.scoped(fixture.interruptDownload).pipe(Effect.either))._tag).toBe("Left")
       const receipt = join(parent, "prefix-received")
       const interruptedFetch = `import {writeFileSync} from 'node:fs';if(!process.versions.electron||process.versions.bun)throw new Error('Native Electron required');let input='';for await(const part of process.stdin)input+=part;const data=JSON.parse(input);let bytes=0;try{const response=await fetch(data.url);for await(const part of response.body){bytes+=part.length;writeFileSync(data.receipt,String(bytes));}console.log(JSON.stringify({bytes,failed:false}));}catch{console.log(JSON.stringify({bytes,failed:true}));}`

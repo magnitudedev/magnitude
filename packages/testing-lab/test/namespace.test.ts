@@ -84,3 +84,39 @@ test("Namespace release verifies the provider's banner-prefixed empty inventory"
   expect(commands).toContain("shutdown")
   expect(commands).toContain("expire")
 })
+
+test("ephemeral shutdown can complete deletion without an expire request", async () => {
+  const allocation = lease()
+  let present = true
+  const commands: string[] = []
+  await run(Effect.gen(function* () {
+    const allocator = yield* MachineAllocator
+    const machine = (yield* allocator.inventory())[0]!
+    yield* allocator.release(machine)
+    yield* allocator.release(machine)
+  }), command => {
+    commands.push(command.args[0]!)
+    if (command.args[0] === "list") return output(present ? JSON.stringify([box(allocation)]) : emptyInventory)
+    if (command.args[0] === "shutdown") { present = false; return output("") }
+    throw new Error("Deleted ephemeral machine must not receive further mutations")
+  })
+  expect(commands.filter(c => c === "shutdown")).toHaveLength(1)
+  expect(commands).not.toContain("expire")
+})
+
+test("release refuses expiration when ownership changes during shutdown", async () => {
+  const allocation = lease()
+  let stopped = false
+  const commands: string[] = []
+  const result = await run(Effect.gen(function* () {
+    const allocator = yield* MachineAllocator
+    yield* allocator.release((yield* allocator.inventory())[0]!)
+  }).pipe(Effect.either), command => {
+    commands.push(command.args[0]!)
+    if (command.args[0] === "list") return output(JSON.stringify([box(stopped ? lease() : allocation)]))
+    if (command.args[0] === "shutdown") { stopped = true; return output("") }
+    throw new Error("Ownership changes must prevent expiration")
+  })
+  expect(result._tag).toBe("Left")
+  expect(commands).not.toContain("expire")
+})

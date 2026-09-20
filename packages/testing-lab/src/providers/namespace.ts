@@ -62,6 +62,11 @@ export const namespaceAllocator = (executable: string, images: ReadonlyArray<Nam
       const owned = yield* tagged(box)
       if (!Schema.equivalence(MachineTags)(owned.tags, machine.tags)) return yield* failed("Refusing to delete a machine with different ownership metadata")
       yield* checked(executable, ["shutdown", box.name, "--force"], { timeoutMs: 180_000 })
+      // Ephemeral devboxes can disappear during shutdown; inventory is authoritative.
+      const remaining = (yield* list()).find(b => b.id === machine.id)
+      if (!remaining) return
+      const stillOwned = yield* tagged(remaining)
+      if (!Schema.equivalence(MachineTags)(stillOwned.tags, machine.tags) || remaining.name !== box.name) return yield* failed("Namespace ownership changed during shutdown")
       yield* checked(executable, ["expire", box.name, "--force"], { timeoutMs: 180_000 })
       if ((yield* list()).some(b => b.id === machine.id)) return yield* failed("Namespace machine remains after expiration")
     }),

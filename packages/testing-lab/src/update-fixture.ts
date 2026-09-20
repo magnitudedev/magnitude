@@ -80,9 +80,10 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
       const fault = activeFault
       if (fault?.cut) return new Response(null, { status: 503, headers: { "cache-control": "no-store" } })
       let body: Blob | ReadableStream<Uint8Array> = Bun.file(current.path).slice(start, end + 1)
-      if (fault) {
+      // The production segmented downloader probes byte 0 before starting its transfers.
+      // Let that one-byte capability probe succeed; interrupt the actual payload requests.
+      if (fault && end > start) {
         const requestedBytes = end - start + 1
-        if (requestedBytes < 2) return new Response(null, { status: 503 })
         const offeredBytes = Math.min(64 * 1024, requestedBytes - 1)
         const prefix = yield* Effect.tryPromise({ try: () => Bun.file(current.path).slice(start, start + offeredBytes).bytes(), catch: () => fail("Cannot read interrupted update prefix") })
         let owner: ReadableStreamDefaultController<Uint8Array> | undefined

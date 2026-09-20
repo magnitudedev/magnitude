@@ -42,7 +42,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lab-reports"
           bun lab run --source . --no-wait \
             --target ubuntu-24.04-x64-cpu-intel \
-            --suite install,endpoint,cli --harness pi \
+            --suite package,install,app,endpoint,harness,recovery,cli,update,uninstall \
+            --harness pi,opencode,hermes \
             --deadline 180 --budget 25 --concurrency 1 \
             --objects "$RUNNER_TEMP/lab-objects" \
             > "$RUNNER_TEMP/lab-reports/admission.json"
@@ -54,7 +55,7 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f'run={run}\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write(f'Lab run: `{run}`\n\nUbuntu 24.04 Intel CPU: source build, packages, clean installation, app model download, endpoint generation and bundled CLI.\n')
+              f.write(f'Lab run: `{run}`\n\nUbuntu 24.04 Intel CPU: full source build and packaging, clean installation, packaged UI, endpoint and Pi/OpenCode/Hermes generation, bundled CLI, recovery, updates and uninstall/reinstall.\n')
           PY
       - name: Wait for app results
         env:

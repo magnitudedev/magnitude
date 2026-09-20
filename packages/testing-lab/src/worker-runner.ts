@@ -12,6 +12,7 @@ import { WorkerRunner } from "./scheduler"
 import { sha256 } from "./snapshot"
 import { WorkClaim, validateTargetResult } from "./work-store"
 import { WorkerInvocation, WorkerReply } from "./worker-protocol"
+import { retainWorkerDiagnostic } from "./worker-diagnostics"
 
 export const GuestRuntime = Schema.Struct({ provider: Provider, artifactHost: Target.fields.artifactHost,
   executable: Schema.NonEmptyString, args: Schema.Array(Schema.String), root: Schema.NonEmptyString,
@@ -72,7 +73,17 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
         const remoteJob = remotePath.join(directory, "invocation.json")
         yield* transport.upload(machine, job, remoteJob)
         const response = yield* transport.execute(machine, runtime.executable, [...runtime.args, remoteJob], Math.max(1, deadline - Date.now()))
-        if (response.exitCode !== 0) return yield* fail(`Guest worker exited ${response.exitCode}; execution did not produce an accepted result`)
+        if (response.exitCode !== 0) {
+          const diagnostic = yield* Effect.gen(function* () {
+            const item = yield* retainWorkerDiagnostic(machine, "execution", `stdout:\n${response.stdout}\nstderr:\n${response.stderr}`)
+            yield* inputs.upload(owner, item.sha256, fs.stream(join(local, "objects", item.sha256)).pipe(
+              Stream.mapError(() => fail("Cannot retain transported worker diagnostics"))))
+            return item
+          }).pipe(Effect.either)
+          return yield* new InfrastructureFailure({ operation: "worker-transport",
+            message: `Guest worker exited ${response.exitCode} without an accepted result; ${diagnostic._tag === "Right" ? "execution diagnostics retained in run evidence" : "could not retain execution diagnostics"}`,
+            evidence: diagnostic._tag === "Right" ? Option.some([diagnostic.right]) : Option.none() })
+        }
         const reply = yield* Schema.decodeUnknown(Schema.parseJson(WorkerReply))(response.stdout)
         if (!Schema.equivalence(WorkClaim)(assignment.claim, reply.claim)) return yield* fail("Guest result belongs to another assignment or attempt")
         yield* validateTargetResult(assignment.target, reply.result)

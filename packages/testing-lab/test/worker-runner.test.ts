@@ -21,8 +21,9 @@ import { WorkAssignment } from "../src/work-store"
 import { WorkerInvocation, WorkerReply } from "../src/worker-protocol"
 import { transportWorkerRunner, WorkerTransports } from "../src/worker-runner"
 import { temporaryDatabase } from "./postgres"
+import { WorkerDiagnostic } from "../src/worker-diagnostics"
 
-for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable"] as const) {
+for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable", "native-exit"] as const) {
   test(`transported workers reject unauthorized or mismatched results: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-worker-runner-" })
@@ -67,6 +68,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(baseline)))).toBe(baseline)
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(oldBytes)))).toBe(oldBytes)
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(bytes)))).toBe(bytes)
+          if (mode === "native-exit") return { exitCode: 42, stdout: "worker started", stderr: "native startup failed https://example.test/file?sig=private-capability token=private-token" }
           const output = mode === "corrupt-evidence" ? "corrupt evidence" : evidence
           yield* fs.writeFileString(join(dirname(args[0]!), "objects", sha256(evidence)), output)
           const now = new Date().toISOString()
@@ -85,6 +87,23 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       expect(executions).toBe(["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode) ? 0 : 1)
       if (["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode)) expect(uploads).toBe(0)
       expect(yield* inputs.missing(request.owner, [sha256(evidence)])).toEqual(mode === "success" ? [] : [sha256(evidence)])
+      if (mode === "native-exit") {
+        expect(result._tag).toBe("Left")
+        if (result._tag !== "Left") throw new Error("Expected native execution failure")
+        const items = Option.getOrThrow(result.left.evidence)
+        expect(items).toHaveLength(1)
+        // The transport's scoped staging directory is gone when run returns.
+        // Diagnostics must survive in coordinator storage and be owner-readable.
+        const chunks = yield* (yield* inputs.read(request.owner, items[0]!.sha256)).pipe(Stream.runCollect)
+        const wire = Buffer.concat(Array.from(chunks)).toString("utf8")
+        expect(sha256(wire)).toBe(items[0]!.sha256)
+        expect(Buffer.byteLength(wire)).toBe(items[0]!.bytes)
+        const diagnostic = yield* Schema.decodeUnknown(Schema.parseJson(WorkerDiagnostic))(wire)
+        expect(diagnostic.runId).toBe(assignment.claim.runId)
+        expect(diagnostic.output).toContain("native startup failed")
+        expect(diagnostic.output).not.toContain("private-capability")
+        expect(diagnostic.output).not.toContain("private-token")
+      }
     }).pipe(Effect.provide(Layer.mergeAll(database, registry, objectLayer)))
   })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))), 30_000)
 }
