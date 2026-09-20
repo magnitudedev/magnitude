@@ -6,8 +6,10 @@ coordinator's HTTPS API has been verified with Entra authentication and private 
 The ordinary artifact-only CLI path has passed 23 Ubuntu 24.04 Intel CPU checks covering
 installation, app model acquisition, Pi connections, real endpoint generation and bundled CLI
 behavior, with JSON/JUnit, authenticated evidence download and verified worker cleanup.
-Separate source producers/clean consumers, remaining cases, other image qualification and a
-real CI workflow run are still required before the full target matrix can execute.
+Separate source producers/clean consumers are implemented and deployed. A normal source run
+compiled successfully but exposed a packaging permission bug; the corrected flow is being
+qualified. Remaining cases, other image qualification and a real CI workflow run are still
+required before the full target matrix can execute.
 
 Use the Bun version pinned by the root `packageManager` (currently 1.4.2). `bun lab help`
 describes the CLI. `bun lab targets` lists the requested coverage; listing a target does not
@@ -18,6 +20,7 @@ bun lab run --source . --target macos-26-arm64-metal-apple-silicon
 bun lab run --source . --profile pr --concurrency 4 --budget 150
 bun lab run --artifacts ./dist/release-manifest.json --target macos-15-arm64-metal-apple-silicon
 bun lab status --run run-<uuid>
+bun lab wait --run run-<uuid> --json out/run.json --junit out/junit.xml
 bun lab results --run run-<uuid>
 bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-trace.zip
 bun lab cancel --run run-<uuid>
@@ -27,7 +30,9 @@ bun lab cancel --run run-<uuid>
 from `/v1/me`, snapshots dirty source and initialized submodules, queries which source objects
 are missing, uploads only those objects, registers the immutable input and submits the run.
 No commit or push is required. Interrupting the waiting CLI leaves the remote run running;
-use `cancel` for cancellation. `--no-wait` returns after submission.
+use `cancel` for cancellation. `--no-wait` returns after submission. `wait` reconnects to that
+run and writes its final reports without creating another build. `status` exposes build/test
+stages, attempts, machine identities and cleanup state; waiting clients print stage changes.
 
 Completed reports identify evidence by path, digest and length. `evidence` downloads one such
 object through the authenticated run API, checks its SHA-256, and publishes the local file only
@@ -44,8 +49,8 @@ been connected. Never present an iteration result as a fresh installer qualifica
 
 The API offers targets, planning, immutable object transfer/input registration, submission,
 status, results and cancellation. Authentication supports server-mapped credentials and
-Entra/GitHub OIDC. Live Entra acquisition and verification have passed; deployment and an
-actual GitHub workflow run remain unqualified.
+Entra/GitHub OIDC. Live Entra acquisition and verification have passed against the deployed
+coordinator; an actual GitHub workflow run remains unqualified.
 Owner/trust cannot be escalated by submitting different request fields. PostgreSQL owns run,
 work-attempt and lease state with fencing and bounded infrastructure retries. Test dependencies
 are ordered per harness; a failed prerequisite blocks dependent cases while independent checks
@@ -58,7 +63,8 @@ an interrupted allocation. The Namespace adapter verifies its catalog timestamp 
 version/build; this is a drift check, not an immutable provider image guarantee. The shared
 Spark remains opt-in and has not been exercised during implementation.
 The A10 (72 vCPU) and RTX PRO 6000 (144 vCPU) quota requests returned `ContactSupport`;
-the portal support request is prepared but awaits required contact details before submission.
+support case `2609200010000010` is submitted and independently confirmed Open under this
+subscription. The failed automatic requests were not pending quota approvals.
 Neither GPU family is currently qualified for lab execution.
 
 Azure images can supply an `initialization` file/digest pair. The allocator verifies that
@@ -393,8 +399,8 @@ and fresh guest runtime provisioning are not yet configured by this entry point.
 the file storage using `{"kind":"azure","config":<AzureArtifactConfig>}`.
 
 For remote deployment, terminate HTTPS at the ingress; the bearer credential mode is the initial
-private-service path. Entra/GitHub OIDC and outward worker polling are implemented; Bicep
-deployment and managed coordinator hosting remain unfinished. A real HTTP/PostgreSQL test covers upload, admission,
+private-service path. Entra/GitHub OIDC and outward worker polling are implemented; the Bicep
+deployment runs in Azure Container Apps with private PostgreSQL and Blob storage. A real HTTP/PostgreSQL test covers upload, admission,
 idempotent submission, automatic scheduling, results, owner isolation and configured startup.
 
 GitHub OIDC admission can be enabled with a `github` configuration containing `audience`

@@ -1,0 +1,81 @@
+name: Lab Ubuntu app flow
+
+on:
+  pull_request:
+  push:
+    branches: [testing]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: testing-lab-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-app:
+    # This runner submits and observes; Azure builds and tests on separate clean VMs.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 210
+    env:
+      LAB_URL: https://magnitude-lab.lemonpebble-25e896b9.westus2.azurecontainerapps.io
+      LAB_AUTH: github
+      LAB_OIDC_AUDIENCE: magnitude-testing-lab
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Submit this checkout
+        id: submit
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/lab-reports"
+          bun lab run --source . --no-wait \
+            --target ubuntu-24.04-x64-cpu-intel \
+            --suite install,endpoint,cli --harness pi \
+            --deadline 180 --budget 25 --concurrency 1 \
+            --objects "$RUNNER_TEMP/lab-objects" \
+            > "$RUNNER_TEMP/lab-reports/admission.json"
+          python3 - <<'PY'
+          import json, os, re
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'lab-reports/admission.json')) as f:
+              run = json.load(f)['state']['runId']
+          assert re.fullmatch(r'run-[0-9a-f-]{36}', run)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'run={run}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f'Lab run: `{run}`\n\nUbuntu 24.04 Intel CPU: source build, packages, clean installation, app model download, endpoint generation and bundled CLI.\n')
+          PY
+      - name: Wait for app results
+        env:
+          LAB_RUN: ${{ steps.submit.outputs.run }}
+        shell: bash
+        run: |
+          trap 'bun lab cancel --run "$LAB_RUN"; exit 130' INT TERM
+          bun lab wait --run "$LAB_RUN" \
+            --json "$RUNNER_TEMP/lab-reports/results.json" \
+            --junit "$RUNNER_TEMP/lab-reports/junit.xml"
+      - name: Release any unfinished work
+        if: ${{ always() && steps.submit.outputs.run != '' }}
+        timeout-minutes: 2
+        env:
+          LAB_RUN: ${{ steps.submit.outputs.run }}
+        run: bun lab cancel --run "$LAB_RUN"
+      - name: Save admission and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-ubuntu-app-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lab-reports
+          if-no-files-found: ignore
+          retention-days: 14

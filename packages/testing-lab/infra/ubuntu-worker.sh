@@ -67,7 +67,8 @@ pi --version
 opencode --version
 bun -e 'await import("./packages/testing-lab/src/outward-worker.ts")'
 '''],cwd=workspace,check=True)
-launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 077',
+# The root provisioning process remains private; package-building children need standard modes.
+launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 022',
  'export PATH='+shlex.quote(path),
  'export CARGO_HOME='+shlex.quote(str(home/'.cargo')),
  'export RUSTUP_HOME='+shlex.quote(str(home/'.rustup')),
@@ -95,3 +96,4 @@ bun packages/testing-lab/src/outward-worker.ts
 SCRIPT
 chmod 0755 /opt/magnitude-lab-display-worker
 rm /etc/magnitude-lab-initialization.json
+printf '%s\n' ready > /var/lib/magnitude-lab/ready

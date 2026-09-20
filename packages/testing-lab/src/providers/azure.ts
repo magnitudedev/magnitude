@@ -2,9 +2,10 @@ import { FileSystem } from "@effect/platform"
 import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { join } from "node:path"
 import { Digest, InfrastructureFailure, TargetId } from "../domain"
-import { sha256 } from "../snapshot"
 import { AzureMachine, MachineAllocator, MachineTags } from "../machines"
 import { checkedCommand, ProcessExecutor } from "../process"
+import { AzureInitialization, prepareAzureInitialization } from "./azure-initialization"
+import { azureInitializationWait } from "./azure-readiness"
 
 const vmApi = "2024-11-01"
 const nicApi = "2024-05-01"
@@ -18,7 +19,7 @@ const ImageReference = Schema.Union(
 )
 export const AzureImage = Schema.Struct({ targetId: TargetId, image: ImageReference, size: Schema.NonEmptyString,
   os: Schema.Literal("Linux", "Windows"), diskGb: Schema.Int.pipe(Schema.between(64, 2048)),
-  initialization: Schema.optionalWith(Schema.Struct({ file: Schema.NonEmptyString, sha256: Digest }), { as: "Option", exact: true }),
+  initialization: Schema.optionalWith(AzureInitialization, { as: "Option", exact: true }),
   plan: Schema.optionalWith(Schema.Struct({ name: Schema.String, product: Schema.String, publisher: Schema.String }), { as: "Option", exact: true }) })
 export type AzureImage = typeof AzureImage.Type
 export const AzureConfig = Schema.Struct({ executable: Schema.String, subscription: Schema.UUID, resourceGroup: Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9_.-]+$/)),
@@ -96,7 +97,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
     const remaining = DateTime.toEpochMillis(machine.tags.expiresAt) - Date.now()
     if (remaining <= 0) return yield* fail("Worker expired before initialization")
     yield* rest("PUT", id, vmApi, { location: config.location, properties: {
-      source: { script: "#!/bin/sh\nset -eu\nexec cloud-init status --wait\n" },
+      source: { script: azureInitializationWait() },
       asyncExecution: true, timeoutInSeconds: Math.max(1, Math.min(1200, Math.floor(remaining / 1000))),
     } })
     const View = Schema.Struct({ properties: Schema.Struct({ instanceView: Schema.optionalWith(Schema.Struct({
@@ -123,7 +124,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
     // Do not put guest output in returned errors: administrator setup may log private URLs.
     const reply = yield* checked(config.executable, ["vm", "run-command", "invoke", "--subscription", config.subscription,
       "--resource-group", config.resourceGroup, "--name", machine.name, "--command-id", "RunShellScript",
-      "--scripts", "tail -c 16384 /var/log/cloud-init-output.log", "--only-show-errors", "--output", "json"],
+      "--scripts", "cloud-init status --long --format json; tail -c 16384 /var/log/cloud-init-output.log", "--only-show-errors", "--output", "json"],
       { timeoutMs: 180_000, maxOutputBytes: 64 * 1024 })
     const directory = yield* fs.makeTempDirectory({ prefix: "lab-initialization-failure-" })
     const file = join(directory, `${machine.name}.json`)
@@ -142,16 +143,15 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       // Administrator-owned setup is separate from submitted source. Verify it before allocating anything.
       const initialization = yield* Option.match(image.initialization, { onNone: () => Effect.void, onSome: setup => Effect.gen(function* () {
         if (image.os !== "Linux") return yield* fail("Cloud initialization is supported only for Linux workers")
-        if (Number((yield* fs.stat(setup.file)).size) > 64 * 1024) return yield* fail("Worker initialization exceeds Azure's 64 KiB limit")
-        const bytes = yield* fs.readFile(setup.file)
-        if (bytes.byteLength > 64 * 1024 || sha256(bytes) !== setup.sha256) return yield* fail("Worker initialization digest differs from configured runtime")
-        return Buffer.from(bytes).toString("base64")
+        return yield* prepareAzureInitialization(setup, { executable: config.executable, subscription: config.subscription,
+          adminUsername: config.adminUsername, architecture: target.arch }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ProcessExecutor, executor))
       }).pipe(Effect.mapError(error => error._tag === "InfrastructureFailure" ? error : fail("Cannot read configured worker initialization"))) })
       const tags = MachineTags.make({ schemaVersion: 1, runId: lease.runId, leaseId: lease.leaseId, expiresAt: lease.expiresAt })
       const machine = AzureMachine.make({ provider: "azure", id: vmId(lease.resourceName), name: lease.resourceName, tags })
       let existing = yield* matching(machine)
       const encodedTags = { "lab-owner": marker, "lab-machine": machine.name, "lab-lease": yield* Schema.encode(Schema.parseJson(MachineTags))(tags).pipe(Effect.orDie),
-        ...(Option.isSome(image.initialization) ? { "lab-initialization": image.initialization.value.sha256 } : {}),
+        ...(initialization ? { "lab-initialization": initialization.identity } : {}),
         "lab-expires": DateTime.formatIso(lease.expiresAt) }
       if (!existing.some(r => r.id.toLowerCase() === nicId(machine.name).toLowerCase())) {
         const attempt = yield* rest("PUT", nicId(machine.name), nicApi, { location: config.location, tags: encodedTags,
@@ -167,7 +167,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
               managedDisk: { storageAccountType: "Premium_LRS" } } },
             networkProfile: { networkInterfaces: [{ id: nicId(machine.name), properties: { primary: true, deleteOption: "Delete" } }] },
             osProfile: { computerName: machine.name, adminUsername: config.adminUsername,
-              ...(initialization === undefined ? {} : { customData: initialization }),
+              ...(initialization === undefined ? {} : { customData: initialization.customData }),
               ...(image.os === "Windows" ? { adminPassword: password, windowsConfiguration: { provisionVMAgent: true, enableAutomaticUpdates: false } }
                 : { linuxConfiguration: { disablePasswordAuthentication: true, provisionVMAgent: true,
                   ssh: { publicKeys: [{ path: `/home/${config.adminUsername}/.ssh/authorized_keys`, keyData: config.sshPublicKey }] } } }) } } }
@@ -179,7 +179,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       // Azure does not inherit VM tags onto its managed disk. Tag it before admitting work,
       // and again before deletion, so a disk left by failed asynchronous deletion is discoverable.
       yield* tagDisk(machine, encodedTags)
-      if (Option.isSome(image.initialization)) yield* waitInitialized(machine, image.initialization.value.sha256).pipe(
+      if (initialization) yield* waitInitialized(machine, initialization.identity).pipe(
         Effect.catchAll(error => initializationDiagnostics(machine).pipe(Effect.either, Effect.flatMap(diagnostics =>
           Effect.fail(fail(`${error.message}; ${diagnostics._tag === "Right" ? `private diagnostics: ${diagnostics.right}` : diagnostics.left.message}`))))))
       return machine

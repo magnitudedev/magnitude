@@ -87,7 +87,7 @@ workers stay in West US 2. Pass the database password through a private secure-p
 never a shell argument or Git file. PostgreSQL backup retention is seven days.
 
 Bundle `src/server.ts` with the repository-pinned Bun using `bun build --target=bun`. Place the
-result as `coordinator.js` beside `Dockerfile` and `entrypoint.sh` in a private build context.
+result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh` and `ubuntu-worker.sh` in a private build context.
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
@@ -113,7 +113,19 @@ for every object. Conditional writes preserve immutable content addresses, and c
 plus byte limits and SHA-256 verification protect downloads. Source manifests verify owner-scoped
 object metadata in batches so admission does not require a database round trip per source file.
 
-The initial runtime download capability is time-limited. Its expiry must be tracked and its
-configuration renewed before subsequent allocations; automatic capability renewal or prepared
-image publication remains required before unattended long-term operation. Never present a
-one-time valid URL as a permanently provisioned worker image.
+For unattended allocations, use an initialization recipe with `kind: "ubuntu"`, a pinned
+`setup: { file, sha256 }`, `adminUsername`, `architecture`, the existing `node`/`rustup`
+downloads, and `runtime: { account, container, blob, sha256, bytes }`. The runtime blob name
+must be `worker-runtime/<sha256>.tar.gz`. The coordinator uses its managed identity to issue
+a fresh one-hour user-delegation SAS with read permission for only that blob. It validates
+the returned scope and expiry before provisioning. No subscription credential enters the guest.
+The VM's preparation identity pins the recipe and setup bytes independently of each capability.
+The managed identity needs blob data access and permission to issue user-delegation keys at
+the storage account; Storage Blob Data Contributor provides these permissions.
+
+The setup writes its root-owned completion receipt last. Admission waits for cloud-init and
+that receipt; cloud-init fatal errors and incomplete setup always fail. Completed cloud-init
+with recoverable platform warnings may proceed only when the lab setup itself completed.
+Detailed cloud-init status remains on the guest, and failure diagnostics are captured before
+cleanup. Static cloud-init remains useful for explicitly managed preparation inputs, but any
+capabilities embedded in a static file must be renewed by its owner.

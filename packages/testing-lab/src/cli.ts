@@ -27,6 +27,7 @@ const help = `Magnitude testing lab
   bun lab run --source . --profile pr --json out/run.json --junit out/junit.xml
   bun lab run --artifacts ./dist/release-manifest.json --profile quick
   bun lab status --run run-<uuid>
+  bun lab wait --run run-<uuid> --json out/run.json --junit out/junit.xml
   bun lab results --run run-<uuid>
   bun lab evidence --run run-<uuid> --digest <sha256-from-results> --output ui-trace.zip
   bun lab cancel --run run-<uuid>
@@ -44,7 +45,8 @@ Results exit 0 only when every selected case passed and cleanup completed.
 --suite replaces profile selection and requires explicit comma-separated --target values.
 --harness selects clients for custom suites; it defaults to pi,opencode,hermes.
 With --profile quick, --harness replaces the default Pi client without changing cases.
---json and --junit write completed reports for run or results. They cannot be used with --no-wait.
+--json and --junit write completed reports for run, wait or results. They cannot be used with --no-wait.
+Use wait to reconnect to an existing run without uploading or submitting another candidate.
 Serve reads LAB_COORDINATOR_CONFIG and LAB_DATABASE_URL; credential values come from
 the environment variables named in the server configuration.
 `
@@ -65,7 +67,7 @@ export const parseArguments = (args: readonly string[]) => Effect.gen(function* 
   if (options.has("update-from") && command !== "run") return yield* new InvalidInput({ message: "--update-from is only valid for run" })
   if ((options.has("digest") || options.has("output")) && command !== "evidence") return yield* new InvalidInput({ message: "--digest and --output are only valid for evidence" })
   if (command === "run" && options.has("source") === options.has("artifacts")) return yield* new InvalidInput({ message: "Specify exactly one of --source or --artifacts" })
-  if ((options.has("json") || options.has("junit")) && (!["run", "results"].includes(command) || options.has("no-wait"))) return yield* new InvalidInput({ message: "Reports require a completed run or results command without --no-wait" })
+  if ((options.has("json") || options.has("junit")) && (!["run", "wait", "results"].includes(command) || options.has("no-wait"))) return yield* new InvalidInput({ message: "Reports require run, wait or results without --no-wait" })
   return { command, options }
 })
 export const selectionFromOptions = (options: ReadonlyMap<string, string>) => Effect.gen(function* () {
@@ -99,6 +101,18 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     yield* print(RunResult, result)
     process.exitCode = resultExitCode(result)
   })
+  const wait = (id: RunId) => Effect.gen(function* () {
+    const client = yield* LabClient
+    yield* Console.error(`Waiting for ${id}; interrupting this client leaves the remote run active. Use lab cancel to stop it.`)
+    let previousProgress = ""
+    for (;;) {
+      const result = yield* client.result(id)
+      if (Option.isSome(result)) return yield* completed(result.value)
+      const progress = formatProgress(yield* client.progress(id))
+      if (progress !== previousProgress) { yield* Console.error(progress); previousProgress = progress }
+      yield* Effect.sleep("3 seconds")
+    }
+  })
   const required = (name: string) => Effect.fromNullable(options.get(name)).pipe(Effect.mapError(() => new InvalidInput({ message: `Missing --${name}` })))
   if (command === "help" || command === "--help") return yield* Console.log(help)
   if (command === "serve") return yield* serveConfiguredCoordinator
@@ -121,12 +135,13 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     const request = yield* fs.readFileString(yield* required("request")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(RunRequest))))
     return yield* print(RunPlan, yield* planRun(request))
   }
-  if (["status", "results", "cancel"].includes(command)) {
+  if (["status", "results", "wait", "cancel"].includes(command)) {
     const id = yield* Schema.decodeUnknown(RunId)(yield* required("run"))
     return yield* remote(Effect.gen(function* () {
       const client = yield* LabClient
       if (command === "status") return yield* print(RunProgress, yield* client.progress(id))
       if (command === "cancel") return yield* print(RunRecord, yield* client.cancel(id))
+      if (command === "wait") return yield* wait(id)
       const result = yield* client.result(id)
       if (Option.isNone(result)) { yield* Console.error("Run is still in progress"); process.exitCode = 2; return }
       yield* completed(result.value)
@@ -167,18 +182,7 @@ export const cli = (args: readonly string[]) => Effect.gen(function* () {
     const run = yield* client.submit(request)
     yield* print(RunRecord, run)
     if (options.has("no-wait")) return
-    yield* Console.error(`Waiting for ${run.state.runId}; interrupting this client leaves the remote run active. Use lab cancel to stop it.`)
-    let previousProgress = ""
-    for (;;) {
-      const result = yield* client.result(run.state.runId)
-      if (Option.isSome(result)) {
-        yield* completed(result.value)
-        return
-      }
-      const progress = formatProgress(yield* client.progress(run.state.runId))
-      if (progress !== previousProgress) { yield* Console.error(progress); previousProgress = progress }
-      yield* Effect.sleep("3 seconds")
-    }
+    yield* wait(run.state.runId)
   }))
 })
 if (import.meta.main) BunRuntime.runMain(cli(process.argv.slice(2)).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive])))

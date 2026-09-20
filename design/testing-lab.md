@@ -181,11 +181,17 @@ may retry transient transport failures; it never reruns native execution. Provid
 copied into public errors or allowed to expose the guest credential.
 Run progress exposes owner-authorized build/test stages, attempt counts, dependency identities
 and current allocation states. The CLI emits stage changes while waiting; progress is not a test
-result and cannot establish acceptance.
+result and cannot establish acceptance. Reconnecting to wait on an existing run never resubmits
+its input or acquires another allocation; reports retain the original run identity.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
 Fresh Azure Linux workers may prepare their trusted runtime through administrator-pinned
-cloud-init configuration. The allocator verifies its digest and size before creating resources,
-binds that digest to the VM, and requires successful native initialization before admitting it.
+cloud-init configuration or a pinned Ubuntu preparation recipe. The allocator verifies setup
+bytes before creating resources and binds the preparation identity to the VM. A renewable recipe
+pins archive identity and issues a fresh one-hour, blob-only read capability per allocation;
+capability renewal does not alter the pinned preparation identity or grant provider credentials.
+Native readiness requires completed cloud-init and the lab setup's final completion receipt.
+Fatal cloud-init errors or a missing receipt fail admission. Recoverable platform warnings are
+retained in detailed status and cannot substitute for the lab's successful completion receipt.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
 provider credential; downloaded tooling has explicit length and digest checks. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership.

@@ -103,7 +103,7 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
         if (spec.args[0] === "resource") return output(rows)
         if (spec.args[0] === "vm") {
           diagnostics = true
-          expect(spec.args).toContain("tail -c 16384 /var/log/cloud-init-output.log")
+          expect(spec.args).toContain("cloud-init status --long --format json; tail -c 16384 /var/log/cloud-init-output.log")
           return output({ value: [{ message: "private setup diagnostic" }] })
         }
         const method = spec.args[spec.args.indexOf("--method") + 1], url = spec.args[spec.args.indexOf("--url") + 1]!
