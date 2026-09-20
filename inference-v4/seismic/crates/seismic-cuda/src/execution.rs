@@ -30,7 +30,24 @@ impl Execution {
         threads_per_block: u32,
         limits: Limits,
     ) -> Result<Self, String> {
-        let target = crate::ptx::prepare(&program)?;
+        Self::new_for_target(
+            program,
+            threads_per_block,
+            limits,
+            crate::target::PtxTarget::SCALAR_BASELINE,
+        )
+    }
+
+    /// Prepare terminal PTX for the target selected from the execution device's normalized
+    /// profile. `new` remains the hardware-independent scalar-baseline constructor used by
+    /// existing inspection tools and tests.
+    pub fn new_for_target(
+        program: ScalarProgram,
+        threads_per_block: u32,
+        limits: Limits,
+        selected_target: crate::target::PtxTarget,
+    ) -> Result<Self, String> {
+        let target = crate::ptx::prepare(&program, selected_target)?;
         Self::from_plan(
             Arc::new(program),
             Arc::new(target),
@@ -123,12 +140,22 @@ pub struct Launches {
 impl Launches {
     /// PTX text of every launch, printed from the retained terminal programs.
     pub fn ptx(&self) -> Vec<String> {
-        self.phases.iter().map(|phase| crate::ptx::print(phase.target_plan())).collect()
+        self.phases
+            .iter()
+            .map(|phase| crate::ptx::print(phase.target_plan()))
+            .collect()
     }
 }
 impl std::fmt::Debug for Launches {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let geometry: Vec<(u64, u64)> = self.phases.iter().map(|p| (p.dispatch().groups, p.dispatch().threads_per_group)).collect();
-        f.debug_struct("Launches").field("name", &self.name).field("blocks_x_threads", &geometry).finish()
+        let geometry: Vec<(u64, u64)> = self
+            .phases
+            .iter()
+            .map(|p| (p.dispatch().groups, p.dispatch().threads_per_group))
+            .collect();
+        f.debug_struct("Launches")
+            .field("name", &self.name)
+            .field("blocks_x_threads", &geometry)
+            .finish()
     }
 }

@@ -19,7 +19,7 @@ use seismic_lang::sym::{Atom, Sym};
 use seismic_lang::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use seismic_lang::types::{DType, Elem};
 use seismic_realization::{
-    BufferSpec,
+    BufferRole, BufferSpec,
     dispatch::{GroupDispatch, TileDeclaration, TilePlacement},
 };
 use std::collections::{HashMap, HashSet};
@@ -201,6 +201,58 @@ enum Realization {
     Frag {
         name: String,
     },
+}
+
+#[derive(Clone)]
+struct MatrixView {
+    name: String,
+    space: TSpa,
+    dtype: DType,
+    offset: TE,
+    row_stride: TE,
+    column_stride: TE,
+    rows: TE,
+    columns: TE,
+}
+
+impl MatrixView {
+    fn index(&self, row: TE, column: TE) -> TE {
+        TE::binary(
+            BinaryOp::Add,
+            self.offset.clone(),
+            TE::binary(
+                BinaryOp::Add,
+                TE::binary(BinaryOp::Mul, row, self.row_stride.clone(), TT::I32),
+                TE::binary(
+                    BinaryOp::Mul,
+                    column,
+                    self.column_stride.clone(),
+                    TT::I32,
+                ),
+                TT::I32,
+            ),
+            TT::I32,
+        )
+    }
+
+    fn read(&self, row: TE, column: TE) -> TE {
+        TE::Read {
+            name: self.name.clone(),
+            index: Box::new(self.index(row, column).cast(TT::I64)),
+            space: self.space,
+            ty: self.dtype.into(),
+        }
+    }
+
+    fn leading_and_transpose(&self) -> Result<(TE, bool), String> {
+        if self.column_stride == TE::integer(1) {
+            Ok((self.row_stride.clone(), false))
+        } else if self.row_stride == TE::integer(1) {
+            Ok((self.column_stride.clone(), true))
+        } else {
+            Err("logical matrix atoms require a unit stride along one operand axis".into())
+        }
+    }
 }
 
 struct Printer<'a> {
@@ -629,6 +681,11 @@ impl Printer<'_> {
         let mut index = 0usize;
         let mut resources: Vec<Resource> = Vec::new();
         for (i, (name, ty)) in self.f.params.iter().enumerate() {
+            // Source ABI names are semantic identities and are not required to be
+            // valid (or collision-free after sanitization) in MSL.  In particular,
+            // owned results are named `$return.N`.  Native names are deliberately
+            // ordinal so backend spelling can never leak into the source ABI.
+            let native_name = native_parameter_name(i);
             let variable = self
                 .f
                 .vars
@@ -681,10 +738,18 @@ impl Printer<'_> {
                     };
                     match &s.elem {
                         Elem::Dtype(d) => {
-                            resources.push(Resource { declaration: format!("device {}* {name}", ctype(*d)), identifier: name.clone(), binding: Binding::Buffer(index) });
+                            resources.push(Resource { declaration: format!("device {}* {native_name}", ctype(*d)), identifier: native_name.clone(), binding: Binding::Buffer(index) });
                             self.buffers.push(BufferSpec {
                                 parameter: name.clone(),
                                 plane: "".into(),
+                                role: self
+                                    .f
+                                    .result_bindings
+                                    .iter()
+                                    .find(|binding| binding.parameter == i)
+                                    .map_or(BufferRole::Parameter, |binding| BufferRole::Result {
+                                        path: binding.path.clone(),
+                                    }),
                                 bytes: plane_bytes(elements, d.bytes())?,
                                 alignment: d.bytes() as usize,
                             });
@@ -710,13 +775,21 @@ impl Printer<'_> {
                                 )
                                 .map_err(|_| "packed plane size exceeds usize")?;
                                 resources.push(Resource {
-                                    declaration: format!("device const {}* {name}_{}", ctype(dtype), plane.name),
-                                    identifier: format!("{name}_{}", plane.name),
+                                    declaration: format!("device const {}* {native_name}_{}", ctype(dtype), plane.name),
+                                    identifier: format!("{native_name}_{}", plane.name),
                                     binding: Binding::Buffer(index),
                                 });
                                 self.buffers.push(BufferSpec {
                                     parameter: name.clone(),
                                     plane: plane.name.into(),
+                                    role: self
+                                        .f
+                                        .result_bindings
+                                        .iter()
+                                        .find(|binding| binding.parameter == i)
+                                        .map_or(BufferRole::Parameter, |binding| BufferRole::Result {
+                                            path: binding.path.clone(),
+                                        }),
                                     bytes,
                                     alignment: dtype.bytes() as usize,
                                 });
@@ -732,7 +805,7 @@ impl Printer<'_> {
                     self.real.insert(
                         variable,
                         Realization::Param {
-                            name: name.clone(),
+                            name: native_name,
                             shape,
                             elem: s.elem.clone(),
                         },
@@ -773,6 +846,7 @@ impl Printer<'_> {
                 BufferSpec {
                     parameter: name,
                     plane: String::new(),
+                    role: BufferRole::Internal,
                     bytes: scratch.bytes,
                     alignment: scratch.dtype.bytes() as usize,
                 }
@@ -1060,7 +1134,7 @@ impl Printer<'_> {
                     purpose: BarrierPurpose::Owners,
                 })
             }
-            StmtKind::Range { var, lo, hi, body } => {
+            StmtKind::Range { var, lo, hi, body, .. } => {
                 let name = self.index_name(*var);
                 let bound = self.ranges.len();
                 if let VarKind::Index(atom) = &self.vars()[*var].kind {
@@ -2592,6 +2666,12 @@ impl Printer<'_> {
                     return Ok(());
                 }
                 match &value.kind {
+                    ExprKind::Intrinsic { op: name, args } if name.produces_owned_result() => {
+                        if op != AssignOp::Assign {
+                            return Err("logical matrix result requires plain assignment".into());
+                        }
+                        return self.logical_matrix_into(*v, *name, args, operation);
+                    }
                     ExprKind::TileAlloc { shape, dtype } => {
                         let Elem::Dtype(dtype) = dtype else {
                             return Err("unresolved or packed local tile dtype".into());
@@ -3115,10 +3195,14 @@ impl Printer<'_> {
     }
     fn device_elements(&self, name: &str, dtype: DType) -> Result<usize, String> {
         if let Some(slot) = self.buffers.iter().find(|b| {
+            let Some(parameter) = self.f.params.iter().position(|(logical, _)| logical == &b.parameter) else {
+                return false;
+            };
+            let native = native_parameter_name(parameter);
             if b.plane.is_empty() {
-                b.parameter == name
+                native == name
             } else {
-                format!("{}_{}", b.parameter, b.plane) == name
+                format!("{native}_{}", b.plane) == name
             }
         }) {
             return Ok(slot.bytes / dtype.bytes() as usize);
@@ -5258,6 +5342,457 @@ impl Printer<'_> {
         });
     }
 
+    fn matrix_view(&mut self, operand: &Expr) -> Result<MatrixView, String> {
+        let Realization::View {
+            space,
+            param,
+            elem,
+            offset,
+            strides,
+            shape,
+        } = self.view_of(operand)?
+        else {
+            return Err("logical matrix operand has no addressable view".into());
+        };
+        if !matches!(space, TSpa::Device | TSpa::Threadgroup)
+            || strides.len() != 2
+            || shape.len() != 2
+        {
+            return Err("logical matrix operand must be a rank-two device or threadgroup view".into());
+        }
+        let Elem::Dtype(dtype) = elem else {
+            return Err("logical matrix operand must have dense elements".into());
+        };
+        Ok(MatrixView {
+            name: param,
+            space,
+            dtype,
+            offset: self.target_sym(&offset)?.cast(TT::I32),
+            row_stride: self.target_sym(&strides[0])?.cast(TT::I32),
+            column_stride: self.target_sym(&strides[1])?.cast(TT::I32),
+            rows: self.target_sym(&shape[0])?.cast(TT::I32),
+            columns: self.target_sym(&shape[1])?.cast(TT::I32),
+        })
+    }
+
+    /// Realize one logical product with an explicit numerical order: full interior 8x8x8
+    /// atoms use native SIMD-group MMA in ascending K-block order, publishing each accumulator
+    /// block at its logical dtype; K and output-edge tails then continue with ascending scalar
+    /// `fma` operations. This is a backend-intrinsic numerical effect, not exact equivalence to
+    /// the interpreter's all-scalar ascending-K reference.
+    fn logical_matrix_into(
+        &mut self,
+        destination: VarId,
+        operation: seismic_lang::intrinsics::Operation,
+        args: &[Expr],
+        site: OperationId,
+    ) -> Result<(), String> {
+        let CollectiveImplementation::LogicalMatrix {
+            operation: planned,
+            destination: planned_destination,
+            plan,
+        } = self.collective(operation)?
+        else {
+            return Err("logical matrix collective implementation mismatch".into());
+        };
+        if planned != operation || planned_destination != destination {
+            return Err("logical matrix destination differs from its prepared implementation".into());
+        }
+        let Ty::Tile(result) = &self.vars()[destination].ty else {
+            return Err("logical matrix destination is not an owned tile".into());
+        };
+        let Elem::Dtype(dtype) = result.elem else {
+            return Err("logical matrix destination has unresolved elements".into());
+        };
+        let result_shape = result.shape.clone();
+        if dtype != plan.accumulation_dtype {
+            return Err("logical matrix destination dtype differs from its plan".into());
+        }
+        let realized = self.declare_tile(
+            destination,
+            &result_shape,
+            dtype,
+            site,
+            Purpose::Value,
+        )?;
+        let Realization::Shared { name, dims, .. } = realized else {
+            return Err("logical matrix destination must use compiler-owned threadgroup storage".into());
+        };
+        if dims.len() != 2 {
+            return Err("logical matrix destination storage is not rank two".into());
+        }
+        let output = MatrixView {
+            name,
+            space: TSpa::Threadgroup,
+            dtype,
+            offset: TE::integer(0),
+            row_stride: dims[1].physical_value.clone().cast(TT::I32),
+            column_stride: TE::integer(1),
+            rows: dims[0].value.clone().cast(TT::I32),
+            columns: dims[1].value.clone().cast(TT::I32),
+        };
+        let left = self.matrix_view(&args[0])?;
+        let right = self.matrix_view(&args[1])?;
+        let accumulator = if operation == seismic_lang::intrinsics::Operation::MatrixMatmulAdd {
+            Some(self.matrix_view(&args[2])?)
+        } else {
+            None
+        };
+        if left.dtype != plan.left_dtype
+            || right.dtype != plan.right_dtype
+            || accumulator.as_ref().is_some_and(|view| view.dtype != dtype)
+        {
+            return Err("logical matrix operand dtypes differ from the selected plan".into());
+        }
+
+        let rows = output.rows.clone();
+        let columns = output.columns.clone();
+        let inner = left.columns.clone();
+        let total = TE::binary(BinaryOp::Mul, rows.clone(), columns.clone(), TT::I32);
+        let flat = self.fresh("matrix_element");
+        let row = self.fresh("matrix_row");
+        let column = self.fresh("matrix_column");
+        self.target(TS::For {
+            name: flat.clone(),
+            start: TE::variable(GROUP_LANE, TT::U32).cast(TT::I32),
+            end: total.clone(),
+            step: SUBGROUP * self.simdgroups,
+        });
+        self.indent += 1;
+        self.target(TS::Let {
+            name: row.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Div,
+                TE::variable(&flat, TT::I32),
+                columns.clone(),
+                TT::I32,
+            ),
+        });
+        self.target(TS::Let {
+            name: column.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Rem,
+                TE::variable(&flat, TT::I32),
+                columns.clone(),
+                TT::I32,
+            ),
+        });
+        let initial = accumulator.as_ref().map_or_else(
+            || TE::Float(0f64.to_bits(), dtype.into()),
+            |view| {
+                view.read(
+                    TE::variable(&row, TT::I32),
+                    TE::variable(&column, TT::I32),
+                )
+                .cast(dtype.into())
+            },
+        );
+        self.target(TS::Write {
+            name: output.name.clone(),
+            index: output.index(
+                TE::variable(&row, TT::I32),
+                TE::variable(&column, TT::I32),
+            ),
+            space: TSpa::Threadgroup,
+            ty: dtype.into(),
+            value: initial,
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+        self.barrier(BarrierSite {
+            operation: site,
+            variable: destination,
+            purpose: BarrierPurpose::MatrixInitialize,
+        })?;
+
+        let eight = TE::integer(8);
+        let full = |extent: TE| {
+            TE::binary(
+                BinaryOp::Mul,
+                TE::binary(BinaryOp::Div, extent, eight.clone(), TT::I32),
+                eight.clone(),
+                TT::I32,
+            )
+        };
+        let full_rows = full(rows.clone());
+        let full_columns = full(columns.clone());
+        let full_inner = full(inner.clone());
+        let block = self.fresh("matrix_block");
+        let block_row = self.fresh("matrix_block_row");
+        let block_column = self.fresh("matrix_block_column");
+        let block_inner = self.fresh("matrix_block_inner");
+        let column_blocks = TE::binary(
+            BinaryOp::Div,
+            full_columns.clone(),
+            eight.clone(),
+            TT::I32,
+        );
+        // Keep the emitted body well-formed even when there are no complete column atoms. The
+        // trip count remains zero, but native compilers may still diagnose a literal division by
+        // zero in an unreachable loop body.
+        let column_block_divisor = TE::Builtin(
+            "max".into(),
+            vec![column_blocks.clone(), TE::integer(1)],
+            TT::I32,
+        );
+        let block_count = TE::binary(
+            BinaryOp::Mul,
+            TE::binary(
+                BinaryOp::Div,
+                full_rows.clone(),
+                eight.clone(),
+                TT::I32,
+            ),
+            column_blocks.clone(),
+            TT::I32,
+        );
+        self.target(TS::For {
+            name: block.clone(),
+            start: TE::variable("sg_id", TT::U32).cast(TT::I32),
+            end: block_count,
+            step: self.simdgroups,
+        });
+        self.indent += 1;
+        self.target(TS::Let {
+            name: block_row.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Mul,
+                TE::binary(
+                    BinaryOp::Div,
+                    TE::variable(&block, TT::I32),
+                    column_block_divisor.clone(),
+                    TT::I32,
+                ),
+                eight.clone(),
+                TT::I32,
+            ),
+        });
+        self.target(TS::Let {
+            name: block_column.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Mul,
+                TE::binary(
+                    BinaryOp::Rem,
+                    TE::variable(&block, TT::I32),
+                    column_block_divisor,
+                    TT::I32,
+                ),
+                eight,
+                TT::I32,
+            ),
+        });
+        let accumulator_fragment = self.fresh("matrix_accumulator");
+        let left_fragment = self.fresh("matrix_left");
+        let right_fragment = self.fresh("matrix_right");
+        let accumulator_layout = crate::collective::FragmentLayout::metal(dtype)?;
+        let left_layout = crate::collective::FragmentLayout::metal(left.dtype)?;
+        let right_layout = crate::collective::FragmentLayout::metal(right.dtype)?;
+        self.target(TS::Fragment {
+            name: accumulator_fragment.clone(),
+            layout: accumulator_layout,
+        });
+        self.target(TS::Fragment {
+            name: left_fragment.clone(),
+            layout: left_layout,
+        });
+        self.target(TS::Fragment {
+            name: right_fragment.clone(),
+            layout: right_layout,
+        });
+        self.target(TS::MatrixLoad {
+            fragment: accumulator_fragment.clone(),
+            layout: accumulator_layout,
+            base: output.name.clone(),
+            offset: output.index(
+                TE::variable(&block_row, TT::I32),
+                TE::variable(&block_column, TT::I32),
+            ),
+            leading: output.row_stride.clone(),
+            space: TSpa::Threadgroup,
+            transpose: false,
+        });
+        self.target(TS::For {
+            name: block_inner.clone(),
+            start: TE::integer(0),
+            end: full_inner.clone(),
+            step: 8,
+        });
+        self.indent += 1;
+        let (left_leading, left_transpose) = left.leading_and_transpose()?;
+        let (right_leading, right_transpose) = right.leading_and_transpose()?;
+        self.target(TS::MatrixLoad {
+            fragment: left_fragment.clone(),
+            layout: left_layout,
+            base: left.name.clone(),
+            offset: left.index(
+                TE::variable(&block_row, TT::I32),
+                TE::variable(&block_inner, TT::I32),
+            ),
+            leading: left_leading,
+            space: left.space,
+            transpose: left_transpose,
+        });
+        self.target(TS::MatrixLoad {
+            fragment: right_fragment.clone(),
+            layout: right_layout,
+            base: right.name.clone(),
+            offset: right.index(
+                TE::variable(&block_inner, TT::I32),
+                TE::variable(&block_column, TT::I32),
+            ),
+            leading: right_leading,
+            space: right.space,
+            transpose: right_transpose,
+        });
+        self.target(TS::MatrixMultiplyAccumulate {
+            fragments: [
+                accumulator_fragment.clone(),
+                left_fragment,
+                right_fragment,
+                accumulator_fragment.clone(),
+            ],
+            layouts: [
+                accumulator_layout,
+                left_layout,
+                right_layout,
+                accumulator_layout,
+            ],
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+        self.target(TS::MatrixStore {
+            fragment: accumulator_fragment,
+            layout: accumulator_layout,
+            base: output.name.clone(),
+            offset: output.index(
+                TE::variable(&block_row, TT::I32),
+                TE::variable(&block_column, TT::I32),
+            ),
+            leading: output.row_stride.clone(),
+            space: TSpa::Threadgroup,
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+        self.barrier(BarrierSite {
+            operation: site,
+            variable: destination,
+            purpose: BarrierPurpose::MatrixAtoms,
+        })?;
+
+        let tail_flat = self.fresh("matrix_tail_element");
+        let tail_row = self.fresh("matrix_tail_row");
+        let tail_column = self.fresh("matrix_tail_column");
+        let tail_inner = self.fresh("matrix_tail_inner");
+        let sum = self.fresh("matrix_tail_sum");
+        self.target(TS::For {
+            name: tail_flat.clone(),
+            start: TE::variable(GROUP_LANE, TT::U32).cast(TT::I32),
+            end: total,
+            step: SUBGROUP * self.simdgroups,
+        });
+        self.indent += 1;
+        self.target(TS::Let {
+            name: tail_row.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Div,
+                TE::variable(&tail_flat, TT::I32),
+                columns.clone(),
+                TT::I32,
+            ),
+        });
+        self.target(TS::Let {
+            name: tail_column.clone(),
+            ty: TT::I32,
+            value: TE::binary(
+                BinaryOp::Rem,
+                TE::variable(&tail_flat, TT::I32),
+                columns,
+                TT::I32,
+            ),
+        });
+        self.target(TS::Let {
+            name: sum.clone(),
+            ty: dtype.into(),
+            value: output.read(
+                TE::variable(&tail_row, TT::I32),
+                TE::variable(&tail_column, TT::I32),
+            ),
+        });
+        let interior = TE::binary(
+            BinaryOp::And,
+            TE::binary(
+                BinaryOp::Lt,
+                TE::variable(&tail_row, TT::I32),
+                full_rows,
+                TT::Bool,
+            ),
+            TE::binary(
+                BinaryOp::Lt,
+                TE::variable(&tail_column, TT::I32),
+                full_columns,
+                TT::Bool,
+            ),
+            TT::Bool,
+        );
+        self.target(TS::For {
+            name: tail_inner.clone(),
+            start: TE::Select(
+                Box::new(interior),
+                Box::new(full_inner),
+                Box::new(TE::integer(0)),
+            ),
+            end: inner,
+            step: 1,
+        });
+        self.indent += 1;
+        let product = TE::Builtin(
+            "fma".into(),
+            vec![
+                left.read(
+                    TE::variable(&tail_row, TT::I32),
+                    TE::variable(&tail_inner, TT::I32),
+                )
+                .cast(dtype.into()),
+                right
+                    .read(
+                        TE::variable(&tail_inner, TT::I32),
+                        TE::variable(&tail_column, TT::I32),
+                    )
+                    .cast(dtype.into()),
+                TE::variable(&sum, dtype.into()),
+            ],
+            dtype.into(),
+        );
+        self.target(TS::Assign {
+            name: sum.clone(),
+            value: product,
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+        self.target(TS::Write {
+            name: output.name.clone(),
+            index: output.index(
+                TE::variable(&tail_row, TT::I32),
+                TE::variable(&tail_column, TT::I32),
+            ),
+            space: TSpa::Threadgroup,
+            ty: dtype.into(),
+            value: TE::variable(sum, dtype.into()),
+        });
+        self.indent -= 1;
+        self.target(TS::End);
+        self.barrier(BarrierSite {
+            operation: site,
+            variable: destination,
+            purpose: BarrierPurpose::IntrinsicStore,
+        })
+    }
+
     fn intrinsic_stmt(
         &mut self,
         name: &seismic_lang::intrinsics::Operation,
@@ -5442,6 +5977,11 @@ impl Printer<'_> {
                 });
                 Ok(())
             }
+            seismic_lang::intrinsics::Operation::MatrixMatmul
+            | seismic_lang::intrinsics::Operation::MatrixMatmulAdd => Err(
+                "logical matrix intrinsic reached Metal source emission without a realization"
+                    .into(),
+            ),
             other @ (seismic_lang::intrinsics::Operation::SimdSum
             | seismic_lang::intrinsics::Operation::SimdMax
             | seismic_lang::intrinsics::Operation::SimdMin
@@ -5855,6 +6395,10 @@ fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+fn native_parameter_name(ordinal: usize) -> String {
+    format!("seismic_param_{ordinal}")
 }
 
 fn row_major_syms(shape: &[i64]) -> Vec<Sym> {

@@ -13,7 +13,7 @@ use seismic_compiler::selection::SelectionError;
 use seismic_lang::family::CandidateRef;
 use seismic_lang::intrinsics::Operation;
 use seismic_lang::sir::{Block, CallId, Expr, ExprKind, Index, VarId};
-use seismic_lang::syntax::ast::RegionMode;
+use seismic_lang::sir::RegionMode;
 use seismic_lang::types::{DType, Elem, Shaped, Ty};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -164,6 +164,31 @@ impl Ledger {
             TileOwner::Inner(per_group) => Quantity::product([bits, per_group.clone()]),
             TileOwner::Piece | TileOwner::Outer => bits,
         })
+    }
+
+    pub fn shared_bits_for(&self, launch: Option<(CandidateRef, usize)>) -> Vec<Quantity> {
+        self.placed().into_iter()
+            .filter(|root| self.tiles.get(root).is_some_and(|tile| tile.launch == launch))
+            .filter_map(|root| self.placed_bits(root))
+            .collect()
+    }
+
+    /// Declared private bits per lane contributed by this candidate to one launch. A complete
+    /// tile passed to a call is replicated because the callee may address any coordinate;
+    /// ordinary large tiles follow the lane-distributed storage rule. Borrowed snapshots and
+    /// threadgroup-placed roots declare no private array.
+    pub fn private_bits(&self, launch: Option<(CandidateRef, usize)>) -> Vec<Quantity> {
+        let placed = self.placed();
+        self.tiles.iter()
+            .filter(move |(variable, tile)| tile.launch == launch && !tile.snapshot && !placed.contains(variable))
+            .map(|(variable, tile)| {
+                if self.call_arguments.iter().any(|(_, _, root)| root == variable) {
+                    tile.replicated_bits.clone()
+                } else {
+                    tile.private_bits.clone()
+                }
+            })
+            .collect()
     }
 }
 
@@ -393,6 +418,47 @@ impl Accounting for MetalAccounting {
             Operation::SimdSum | Operation::SimdMax | Operation::SimdMin => walker.ops(Quantity::Constant(COLLECTIVE_OPS)),
             Operation::ShuffleIndex => walker.ops(Quantity::Constant(FOLD_SHUFFLE_OPS)),
             Operation::LaneIndex | Operation::Matrix => {}
+            Operation::MatrixMatmul | Operation::MatrixMatmulAdd => {
+                let left = args.first().and_then(|arg| arg.ty.shaped()).ok_or_else(|| {
+                    SelectionError::UnsupportedMapping(
+                        "logical Metal matrix left operand is not shaped".into(),
+                    )
+                })?;
+                let right = args.get(1).and_then(|arg| arg.ty.shaped()).ok_or_else(|| {
+                    SelectionError::UnsupportedMapping(
+                        "logical Metal matrix right operand is not shaped".into(),
+                    )
+                })?;
+                let geometry = vec![
+                    walker.bound.axis(&left.axes[0]),
+                    walker.bound.axis(&left.axes[1]),
+                    walker.bound.axis(&right.axes[1]),
+                ];
+                let atoms = rule("logical_matrix_atoms", geometry.clone(), |values| {
+                    let [rows, inner, columns] = values else {
+                        return Err(arity("logical_matrix_atoms"));
+                    };
+                    rows.checked_div(8)
+                        .and_then(|rows| rows.checked_mul(inner / 8))
+                        .and_then(|blocks| blocks.checked_mul(columns / 8))
+                        .ok_or_else(|| "logical matrix atom count overflows u64".into())
+                });
+                let tails = rule("logical_matrix_tail_fmas", geometry, |values| {
+                    let [rows, inner, columns] = values else {
+                        return Err(arity("logical_matrix_tail_fmas"));
+                    };
+                    let total = rows.checked_mul(*inner)
+                        .and_then(|value| value.checked_mul(*columns))
+                        .ok_or_else(|| "logical matrix scalar work overflows u64".to_string())?;
+                    let native = (rows / 8).checked_mul(inner / 8)
+                        .and_then(|value| value.checked_mul(columns / 8))
+                        .and_then(|blocks| blocks.checked_mul(8 * 8 * 8))
+                        .ok_or_else(|| "logical matrix native work overflows u64".to_string())?;
+                    Ok(total.saturating_sub(native))
+                });
+                walker.work.matrix_multiplies.push(walker.scaled(atoms));
+                walker.ops(tails);
+            }
         }
         Ok(())
     }

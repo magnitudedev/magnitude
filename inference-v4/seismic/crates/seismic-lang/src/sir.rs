@@ -6,9 +6,9 @@
 //! binding); which definition implements an occurrence is a selection decision made
 //! over `family`, never here.
 
-use super::syntax::ast::{AssignOp, BinaryOp, Mode, RegionMode, UnaryOp};
+use super::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use super::types::{DType, Elem, Extent, RegionId, SliceId, Ty};
-use crate::intrinsics::Operation;
+use crate::intrinsics::{CapabilityId, IntrinsicId, Operation};
 use crate::span::Span;
 use crate::sym::Sym;
 
@@ -17,6 +17,22 @@ pub struct DefId(pub u32);
 
 /// Index into `Body::vars`.
 pub type VarId = usize;
+
+/// Compiler-only parameter passing mode used by the existing execution IR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    In,
+    Out,
+    Inout,
+}
+
+/// Compiler-only execution-region classification retained below the source AST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RegionMode {
+    Parallel,
+    Ordered,
+    Pipeline,
+}
 
 /// Index into `Body::calls`: one static call occurrence within a definition body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,6 +131,10 @@ pub struct Definition {
     pub id: DefId,
     pub name: String,
     pub kind: DefKind,
+    /// Capability namespaces explicitly declared by this source body.
+    pub requires: Vec<CapabilityId>,
+    /// Exact typed intrinsic signatures used directly by this body.
+    pub intrinsic_uses: Vec<IntrinsicUse>,
     /// Index into `Program::families`.
     pub family: usize,
     pub shape_params: Vec<String>,
@@ -131,6 +151,14 @@ pub struct Definition {
     /// Index into `Program::files`.
     pub file: usize,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicUse {
+    pub id: IntrinsicId,
+    pub operation: Operation,
+    pub arguments: Vec<Ty>,
+    pub result: Ty,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,6 +292,13 @@ pub enum Pattern {
     Tuple(Vec<Pattern>),
 }
 
+/// Source-level loop semantics, independent of any physical execution width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LoopKind {
+    Ordered,
+    Parallel,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
     /// `let`/`let mut`: one producer occurrence in this lexical scope.
@@ -283,9 +318,13 @@ pub enum StmtKind {
     Stages(Vec<Stage>),
     /// `for i in lo..hi`
     Range {
+        kind: LoopKind,
         var: VarId,
+        /// Static/conservative bounds used by selection and analysis.
         lo: Expr,
         hi: Expr,
+        /// A runtime range value when the source is a binding rather than a literal.
+        value: Option<Expr>,
         body: Block,
     },
     /// `for i, j in owned(t)` (all axes) / `for k in axis(t, n)` (`axes == [n]`)
@@ -420,6 +459,11 @@ pub enum ExprKind {
     /// A shape parameter used as a value.
     ShapeParam(String),
     Tuple(Vec<Expr>),
+    /// A bounded logical half-open range value.
+    Range {
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+    },
     Field {
         base: Box<Expr>,
         index: usize,

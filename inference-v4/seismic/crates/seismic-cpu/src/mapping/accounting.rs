@@ -1,13 +1,13 @@
 //! The CPU's accounting over the shared structural walk: two work classes (scalar element
 //! operations and memory bits), every tile a scratch slot of the executing worker, no target
 //! intrinsics and no atomic updates.
+use seismic_compiler::selection::SelectionError;
 use seismic_compiler::selection::quantity::Quantity;
 use seismic_compiler::selection::structure::{Accounting, Bound, TileEvent, Walker};
-use seismic_compiler::selection::SelectionError;
 use seismic_lang::family::CandidateRef;
 use seismic_lang::intrinsics::Operation;
 use seismic_lang::sir::Expr;
-use seismic_lang::syntax::ast::RegionMode;
+use seismic_lang::sir::RegionMode;
 use seismic_lang::types::{Elem, Shaped, Ty};
 
 /// Element operations of decoding one packed element at its consumption: word load, shift,

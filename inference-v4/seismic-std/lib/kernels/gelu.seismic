@@ -2,9 +2,9 @@
 # src/math/erff.rs (FreeBSD msun / SunPro). See ../../THIRD_PARTY.md.
 # FP32 arithmetic, signed zero, NaN propagation and saturation at |x| >= 6.
 # All work is portable IR, including piecewise control and existing exp calls.
-fn erf_values[N](source: tile[N] f32) -> tile[N] f32:
-    let mut result = tile[N] f32
-    for i in owned(result):
+fn erf_values[N](source: tensor[N] f32) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    for i in 0..N:
         let x = source[i]
         let magnitude = abs(x)
         if magnitude < 0.84375:
@@ -50,9 +50,8 @@ fn erf_values[N](source: tile[N] f32) -> tile[N] f32:
     return result
 
 # Erf-form GELU in FP32; the output dtype owns the final publication.
-fn gelu[M, N](x: tensor[M, N] T, out out: tensor[M, N] U):
-    parallel [rows] in 0..M:
-        for row in rows:
-            let source = f32(x[row])
-            let probability = erf_values(source * 0.7071067811865476)
-            publish 0.5 * source * (1.0 + probability) to out[row]
+fn gelu[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U):
+    parallel for rows in 0..M:
+        let source = f32(x[rows])
+        let probability = erf_values(to_owned(source * 0.7071067811865476))
+        result[rows] = 0.5 * source * (1.0 + f32(probability))

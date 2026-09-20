@@ -3,7 +3,7 @@
 //! required to build this crate or load hardware-independent tools.
 use libloading::Library;
 use std::{
-    ffi::{c_char, c_int, c_uint, c_void, CStr},
+    ffi::{CStr, c_char, c_int, c_uint, c_void},
     rc::Rc,
 };
 pub type Handle = *mut c_void;

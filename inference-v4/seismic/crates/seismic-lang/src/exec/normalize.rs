@@ -28,8 +28,13 @@ pub fn bind_values(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> Vec<usize> {
                 bind_expr(tile, vars, &mut result, false);
                 bind_values(body, vars);
             }
-            StmtKind::LoadLoop { domain, views, body, .. } => {
-                bind_expr(&mut domain.view,vars,&mut result,false);
+            StmtKind::LoadLoop {
+                domain,
+                views,
+                body,
+                ..
+            } => {
+                bind_expr(&mut domain.view, vars, &mut result, false);
                 for view in views {
                     bind_expr(view, vars, &mut result, false);
                 }
@@ -51,9 +56,16 @@ pub fn bind_values(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> Vec<usize> {
 /// Resolve ordinary and streamed load realization in the operations themselves.
 /// The input must have explicit value bindings.
 pub fn select_loads(body: &mut [Stmt], borrow_read_only: bool) {
-    let modes = loads::sites(body).iter().map(|site| {
-        if borrow_read_only && site.can_borrow { LoadMode::Borrow } else { LoadMode::Materialize }
-    }).collect::<Vec<_>>();
+    let modes = loads::sites(body)
+        .iter()
+        .map(|site| {
+            if borrow_read_only && site.can_borrow {
+                LoadMode::Borrow
+            } else {
+                LoadMode::Materialize
+            }
+        })
+        .collect::<Vec<_>>();
     loads::resolve(body, &modes).expect("modes are selected from the checked domain");
 }
 
@@ -148,12 +160,16 @@ fn bind_expr(expr: &mut Expr, vars: &mut Vec<Var>, bindings: &mut Vec<Stmt>, alr
 /// order. Values spanning these domains need the realization phase handoff.
 pub fn work_domain(body: &mut Vec<Stmt>) {
     fn flush(serial: &mut Vec<Stmt>, phases: &mut Vec<Stmt>) {
-        if serial.is_empty() { return; }
+        if serial.is_empty() {
+            return;
+        }
         phases.push(Stmt {
             id: None,
             span: serial[0].span,
             kind: StmtKind::Parallel {
-                vars: Vec::new(), extents: Vec::new(), body: std::mem::take(serial),
+                vars: Vec::new(),
+                extents: Vec::new(),
+                body: std::mem::take(serial),
             },
         });
     }
@@ -169,9 +185,15 @@ pub fn work_domain(body: &mut Vec<Stmt>) {
     }
     flush(&mut serial, &mut phases);
     if phases.is_empty() {
-        phases.push(Stmt { id: None, span: Default::default(), kind: StmtKind::Parallel {
-            vars: Vec::new(), extents: Vec::new(), body: Vec::new(),
-        }});
+        phases.push(Stmt {
+            id: None,
+            span: Default::default(),
+            kind: StmtKind::Parallel {
+                vars: Vec::new(),
+                extents: Vec::new(),
+                body: Vec::new(),
+            },
+        });
     }
     *body = phases;
 }
@@ -193,12 +215,17 @@ pub fn lift_owned_reductions(body: &mut Vec<Stmt>) -> Vec<usize> {
                 } => {
                     ids.insert(*v);
                 }
-                StmtKind::Owned { vars, body, .. }
-                | StmtKind::Parallel { vars, body, .. } => {
+                StmtKind::Owned { vars, body, .. } | StmtKind::Parallel { vars, body, .. } => {
                     ids.extend(vars);
                     definitions(body, ids);
                 }
-                StmtKind::LoadLoop { vars,offset,body,.. } => {ids.extend(vars);ids.extend(offset);definitions(body,ids);}
+                StmtKind::LoadLoop {
+                    vars, offset, body, ..
+                } => {
+                    ids.extend(vars);
+                    ids.extend(offset);
+                    definitions(body, ids);
+                }
                 StmtKind::Range { var, body, .. } | StmtKind::Lanes { var, body, .. } => {
                     ids.insert(*var);
                     definitions(body, ids);
@@ -222,11 +249,7 @@ pub fn lift_owned_reductions(body: &mut Vec<Stmt>) -> Vec<usize> {
                         .iter()
                         .all(|d| d.as_constant().is_some_and(|n| n > 0))
                 });
-                if nonempty
-                    && !body
-                        .iter()
-                        .any(|s| super::effects::tensor_effect(s))
-                {
+                if nonempty && !body.iter().any(|s| super::effects::tensor_effect(s)) {
                     let mut defined = std::collections::HashSet::new();
                     definitions(body, &mut defined);
                     loop {
@@ -352,30 +375,57 @@ pub fn remove_empty_ranges(body: &mut Vec<Stmt>) -> Vec<usize> {
 /// Structural value identity ignores source locations. The caller still owns
 /// reaching definitions and memory versions; equality alone permits no motion.
 pub fn value_identity(expr: &Expr) -> Expr {
-    let mut e=expr.clone();
-    fn visit(e:&mut Expr) {
-        e.span=crate::span::Span::default();
+    let mut e = expr.clone();
+    fn visit(e: &mut Expr) {
+        e.span = crate::span::Span::default();
         match &mut e.kind {
-            ExprKind::Index{base,indices}=>{
+            ExprKind::Index { base, indices } => {
                 visit(base);
-                for i in indices {match i {Index::Point(e)=>visit(e),Index::Slice{start,end}=>for e in start.iter_mut().chain(end){visit(e)}}}
+                for i in indices {
+                    match i {
+                        Index::Point(e) => visit(e),
+                        Index::Slice { start, end } => {
+                            for e in start.iter_mut().chain(end) {
+                                visit(e)
+                            }
+                        }
+                    }
+                }
             }
-            ExprKind::Load{view,..}|ExprKind::Transpose(view)|ExprKind::Unary{expr:view,..}|ExprKind::Cast{expr:view,..}|ExprKind::Accessor{base:view,..}|ExprKind::Lanes{base:view,..}=>visit(view),
-            ExprKind::Binary{lhs,rhs,..}=>{visit(lhs);visit(rhs);},
-            ExprKind::Call{args,..}|ExprKind::Builtin{args,..}|ExprKind::Intrinsic{args,..}|ExprKind::Tuple(args)=>for e in args {visit(e)},
-            _=>{}
+            ExprKind::Load { view, .. }
+            | ExprKind::Transpose(view)
+            | ExprKind::Unary { expr: view, .. }
+            | ExprKind::Cast { expr: view, .. }
+            | ExprKind::Accessor { base: view, .. }
+            | ExprKind::Lanes { base: view, .. } => visit(view),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                visit(lhs);
+                visit(rhs);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::Builtin { args, .. }
+            | ExprKind::Intrinsic { args, .. }
+            | ExprKind::Tuple(args) => {
+                for e in args {
+                    visit(e)
+                }
+            }
+            _ => {}
         }
         // A scalar temporary records its precision as a cast. Casting a value
         // already at that same precision is idempotent; narrower intermediate
         // casts remain part of identity and cannot unlock sharing accidentally.
         if let ExprKind::Cast { dtype, expr } = &e.kind {
-            if expr.ty == super::types::Ty::Scalar(*dtype) { *e = (**expr).clone(); }
+            if expr.ty == super::types::Ty::Scalar(*dtype) {
+                *e = (**expr).clone();
+            }
         }
-        if let Some(sym)=&e.sym {
+        if let Some(sym) = &e.sym {
             // Equal checked symbolic coordinates have one structural identity,
             // whether written as i, i+0, or a checked scalar alias.
-            e.kind=ExprKind::ShapeParam(sym.to_string());
+            e.kind = ExprKind::ShapeParam(sym.to_string());
         }
     }
-    visit(&mut e);e
+    visit(&mut e);
+    e
 }

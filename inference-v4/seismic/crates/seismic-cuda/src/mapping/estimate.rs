@@ -40,7 +40,13 @@ pub struct EstimateModel {
 
 impl Default for EstimateModel {
     fn default() -> Self {
-        EstimateModel { launch_ns: 20_000.0, visit_ns: 20.0, ops_per_second: 2.0e8, concurrent_threads: 6_144, memory_bytes_per_second: 273.0e9 }
+        EstimateModel {
+            launch_ns: 20_000.0,
+            visit_ns: 20.0,
+            ops_per_second: 2.0e8,
+            concurrent_threads: 6_144,
+            memory_bytes_per_second: 273.0e9,
+        }
     }
 }
 
@@ -54,14 +60,28 @@ pub struct Totals {
 
 impl Work {
     pub(crate) fn totals(&self, site: &dyn Fn(SiteId) -> Option<i64>) -> Result<Totals, String> {
-        let sum = |terms: &[Quantity]| terms.iter().try_fold(0u64, |acc, q| acc.checked_add(q.eval(site)?).ok_or_else(|| "work total overflows u64".to_string()));
-        Ok(Totals { ops: sum(&self.ops)?, visits: sum(&self.visits)?, memory_bits: sum(&self.memory_bits)? })
+        let sum = |terms: &[Quantity]| {
+            terms.iter().try_fold(0u64, |acc, q| {
+                acc.checked_add(q.eval(site)?)
+                    .ok_or_else(|| "work total overflows u64".to_string())
+            })
+        };
+        Ok(Totals {
+            ops: sum(&self.ops)?,
+            visits: sum(&self.visits)?,
+            memory_bits: sum(&self.memory_bits)?,
+        })
     }
 }
 
 impl EstimateModel {
     pub fn validate(&self) -> Result<(), String> {
-        let positive = [self.launch_ns, self.visit_ns, self.ops_per_second, self.memory_bytes_per_second];
+        let positive = [
+            self.launch_ns,
+            self.visit_ns,
+            self.ops_per_second,
+            self.memory_bytes_per_second,
+        ];
         if positive.iter().any(|c| !c.is_finite() || *c <= 0.0) || self.concurrent_threads == 0 {
             return Err("estimate coefficients must be finite and positive, with at least one concurrent thread".into());
         }
@@ -70,7 +90,9 @@ impl EstimateModel {
 
     fn nanoseconds(value: f64) -> Result<u64, String> {
         if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
-            return Err(format!("estimate {value} ns is outside the representable range"));
+            return Err(format!(
+                "estimate {value} ns is outside the representable range"
+            ));
         }
         Ok(value.ceil() as u64)
     }
@@ -79,7 +101,9 @@ impl EstimateModel {
     /// the pieces that run concurrently, plus its memory traffic.
     pub fn scope_ns(&self, launches: u64, totals: &Totals, pieces: u64) -> Result<u64, String> {
         let concurrency = pieces.clamp(1, self.concurrent_threads) as f64;
-        let compute = (totals.ops as f64 / self.ops_per_second * 1e9 + totals.visits as f64 * self.visit_ns) / concurrency;
+        let compute = (totals.ops as f64 / self.ops_per_second * 1e9
+            + totals.visits as f64 * self.visit_ns)
+            / concurrency;
         let memory = totals.memory_bits as f64 / 8.0 / self.memory_bytes_per_second * 1e9;
         Self::nanoseconds(launches as f64 * self.launch_ns + compute + memory)
     }

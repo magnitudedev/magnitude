@@ -5,6 +5,9 @@ a candidate under its prescribed mapping, and of an execution-cost estimate from
 them.** It exists to give joint selection hard limits and an objective. It claims
 no more than its derivation supports.
 
+Physical tiles, windows, staging phases, and publications named below are compiler-owned execution
+IR concepts retained during migration. They are not source types or source statements.
+
 ## Authority levels
 
 | Level | What it is | Examples | May be used as |

@@ -185,7 +185,7 @@ pub fn cases() -> Vec<Case> {
             ..case(
                 "attention_decode",
                 "attention_decode",
-                &[("T", 5), ("H", 4), ("KV", 2), ("W", 8)],
+                &[("T", 5), ("G", 2), ("KV", 2), ("W", 8)],
                 A,
             )
         },

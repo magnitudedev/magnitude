@@ -8,7 +8,8 @@ use crate::sir::{
 };
 use crate::span::{line_col, Span};
 use crate::sym::Sym;
-use crate::syntax::ast::{AssignOp, Mode};
+use crate::syntax::ast::AssignOp;
+use crate::sir::Mode;
 use crate::types::{DType, Elem};
 use crate::types::{Extent, SliceId, Ty};
 use std::collections::HashMap;
@@ -182,6 +183,16 @@ impl<'a> Interpreter<'a> {
                         .ok_or_else(|| format!("unresolved index bound for `{}`", param.name))?;
                     scalar(DType::I32, Some(bound), *v)?
                 }
+                (Arg::Range(start, end), Ty::Range(bound)) => {
+                    let bound = bound.eval(&|n| shapes.get(n).copied()).and_then(|n| u64::try_from(n).ok())
+                        .ok_or_else(|| format!("unresolved range bound for `{}`", param.name))?;
+                    let mut first = crate::abi::ScalarParameter::plain(format!("{}_start", param.name), DType::I32);
+                    first.range = Some(crate::abi::RangeScalar { parameter: param.name.clone(), endpoint: crate::abi::RangeEndpoint::Start, bound });
+                    let mut last = crate::abi::ScalarParameter::plain(format!("{}_end", param.name), DType::I32);
+                    last.range = Some(crate::abi::RangeScalar { parameter: param.name.clone(), endpoint: crate::abi::RangeEndpoint::End, bound });
+                    crate::abi::ScalarLayout::words(&[first, last])?.encode(&[*start as f64, *end as f64])?;
+                    Value::Range(*start, *end)
+                }
                 _ => {
                     return Err(format!(
                         "argument {i} does not match parameter type {}",
@@ -257,6 +268,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 (Ty::Scalar(_) | Ty::Index(_), Value::Scalar(..))
+                | (Ty::Range(_), Value::Range(..))
                 | (Ty::Tuple(_), Value::Tuple(_))
                 | (Ty::Result(_), Value::Result(_))
                 | (Ty::Native(_), Value::Native(_)) => {}
@@ -706,8 +718,22 @@ impl<'a> Interpreter<'a> {
                 Ok(Flow::Next)
             }
             StmtKind::Stages(stages) => self.stages(stages, f),
-            StmtKind::Range { var, lo, hi, body } => {
-                let bounds = [(self.int(lo, f)?, self.int(hi, f)?)];
+            StmtKind::Range {
+                var,
+                lo,
+                hi,
+                value,
+                body,
+                ..
+            } => {
+                let bounds = if let Some(value) = value {
+                    let Value::Range(lo, hi) = self.expr(value, f)? else {
+                        return Err("range loop source is not a range".into());
+                    };
+                    [(lo, hi)]
+                } else {
+                    [(self.int(lo, f)?, self.int(hi, f)?)]
+                };
                 self.counted(&[*var], &bounds, body, f)
             }
             StmtKind::Coordinates {

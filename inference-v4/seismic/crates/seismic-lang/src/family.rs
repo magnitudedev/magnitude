@@ -10,16 +10,27 @@
 //! (`seismic-compiler::selection::Backend`); the solver picks a `Witness`;
 //! `instantiate` reproduces exactly that witness.
 
+use super::sir::IntrinsicUse;
 use super::sir::{CallId, DefId, Program};
 use super::types::{Elem, RegionId, SliceId};
-use crate::precision::PrecisionPolicy;
 use crate::precision::NumericalEffect;
+use crate::precision::PrecisionPolicy;
 use std::collections::BTreeMap;
 
 mod construct;
 mod normalize;
 
 pub use construct::construct;
+
+/// Effective backend environment used while constructing a selectable family. The callback
+/// answers for one exact, typed intrinsic use after hardware, driver/toolchain and backend
+/// implementation support have been intersected. There is deliberately no permissive default:
+/// every production caller must supply the environment it will actually execute on.
+pub struct TargetEnvironment<'a> {
+    pub target: &'a str,
+    pub capability_fingerprint: &'a str,
+    pub supports_intrinsic: &'a dyn Fn(&IntrinsicUse) -> Result<(), String>,
+}
 
 /// Concrete semantic specialization of an entry. Every field is part of selection identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -49,6 +60,8 @@ pub struct CandidateRef {
 pub struct Family {
     pub entry: String,
     pub target: String,
+    /// Exact effective capability identity used to remove unsupported candidates.
+    pub capability_fingerprint: String,
     pub workload: Workload,
     /// Whether realization may exercise numerical freedoms (for unconstrained exploration or
     /// one accepted qualified witness). Strict construction keeps conditional freedoms such as

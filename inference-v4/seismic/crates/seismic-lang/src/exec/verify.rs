@@ -16,11 +16,54 @@ pub fn executable_phases(function: &LoweredIr, indices: &[Vec<VarId>]) -> Result
     check(function, Some(indices))
         .map_err(|error| format!("{}: invalid Executable phase IR: {error}", function.name))
 }
-fn check(
-    function: &LoweredIr,
-    phase_indices: Option<&[Vec<VarId>]>,
-) -> Result<(), String> {
+fn check(function: &LoweredIr, phase_indices: Option<&[Vec<VarId>]>) -> Result<(), String> {
     function.ownership.validate(function)?;
+    if function.source_param_count > function.params.len() {
+        return Err("source parameter prefix exceeds the entry ABI".into());
+    }
+    fn leaves(ty: &Ty, path: &mut Vec<u32>, out: &mut Vec<(Vec<u32>, Ty)>) -> Result<(), String> {
+        match ty {
+            Ty::Tensor(_) => out.push((path.clone(), ty.clone())),
+            Ty::Tuple(items) => {
+                for (ordinal, item) in items.iter().enumerate() {
+                    path.push(ordinal as u32);
+                    leaves(item, path, out)?;
+                    path.pop();
+                }
+            }
+            Ty::Void => {}
+            _ => {
+                return Err("entry result must be an owned tensor or tuple of owned tensors".into());
+            }
+        }
+        Ok(())
+    }
+    let mut expected = Vec::new();
+    leaves(&function.result, &mut Vec::new(), &mut expected)?;
+    if expected.len() != function.result_bindings.len() {
+        return Err("entry result leaf count disagrees with its hidden destinations".into());
+    }
+    if function.params.len() - function.source_param_count != expected.len() {
+        return Err("entry ABI has a hidden parameter that is not a result destination".into());
+    }
+    let mut result_names = HashSet::new();
+    for (ordinal, ((path, ty), binding)) in
+        expected.iter().zip(&function.result_bindings).enumerate()
+    {
+        if path != &binding.path || binding.parameter != function.source_param_count + ordinal {
+            return Err("entry result destination has an invalid path or ABI position".into());
+        }
+        let Some((name, parameter_ty)) = function.params.get(binding.parameter) else {
+            return Err("entry result destination is outside the ABI".into());
+        };
+        if parameter_ty != ty || !function.ownership.results.contains(name) {
+            return Err("entry result destination type or ownership metadata disagrees".into());
+        }
+        result_names.insert(name.clone());
+    }
+    if result_names != function.ownership.results.iter().cloned().collect() {
+        return Err("entry result ownership metadata contains a non-result binding".into());
+    }
     for requirement in &function.alias_requirements {
         if [requirement.left, requirement.right]
             .iter()
@@ -120,7 +163,26 @@ impl Verifier<'_> {
         for statement in body {
             match &statement.kind {
                 StmtKind::Assign { target, op, value } => {
-                    self.expr(value, bound)?;
+                    if matches!(&value.kind, ExprKind::Intrinsic { op, .. } if op.produces_owned_result())
+                    {
+                        let ExprKind::Var(id) = target.kind else {
+                            return Err(
+                                "owned intrinsic result requires a direct local destination".into(),
+                            );
+                        };
+                        if *op != AssignOp::Assign || !matches!(value.ty, Ty::Tile(_)) {
+                            return Err("owned intrinsic result requires plain assignment of an owned tile value".into());
+                        }
+                        if !matches!(self.var(id)?.kind, VarKind::Local) {
+                            return Err(
+                                "owned intrinsic result destination is not a compiler-owned local"
+                                    .into(),
+                            );
+                        }
+                        self.result_intrinsic(value, bound)?;
+                    } else {
+                        self.expr(value, bound)?;
+                    }
                     if !assignable(&target.ty, &value.ty) {
                         return Err(format!(
                             "assignment changes type/shape from {} to {}",
@@ -242,6 +304,20 @@ impl Verifier<'_> {
         }
         Ok(())
     }
+
+    fn result_intrinsic(&self, expr: &Expr, bound: &HashSet<VarId>) -> Result<(), String> {
+        let ExprKind::Intrinsic { op, args } = &expr.kind else {
+            return Err("owned intrinsic result is not an intrinsic expression".into());
+        };
+        if !op.produces_owned_result() {
+            return Err("value intrinsic was classified as an owned result incorrectly".into());
+        }
+        for argument in args {
+            self.expr(argument, bound)?;
+        }
+        Ok(())
+    }
+
     fn expr(&self, expr: &Expr, bound: &HashSet<VarId>) -> Result<(), String> {
         validate_type(&expr.ty)?;
         match &expr.kind {
@@ -350,6 +426,11 @@ impl Verifier<'_> {
                 return Err("unexpanded construct call".into());
             }
             ExprKind::Intrinsic { op, args } => {
+                if op.produces_owned_result() {
+                    return Err(
+                        "owned intrinsic result is nested without a direct destination".into(),
+                    );
+                }
                 for argument in args {
                     self.expr(argument, bound)?;
                 }
@@ -376,8 +457,11 @@ impl Verifier<'_> {
                         let [condition, yes, no] = args.as_slice() else {
                             return Err("eager value selection requires three arguments".into());
                         };
-                        if condition.ty != Ty::Scalar(DType::Bool) || !matches!(yes.ty, Ty::Scalar(_))
-                            || yes.ty != no.ty || expr.ty != yes.ty {
+                        if condition.ty != Ty::Scalar(DType::Bool)
+                            || !matches!(yes.ty, Ty::Scalar(_))
+                            || yes.ty != no.ty
+                            || expr.ty != yes.ty
+                        {
                             return Err("eager value selection requires a bool and equal scalar value types".into());
                         }
                     }

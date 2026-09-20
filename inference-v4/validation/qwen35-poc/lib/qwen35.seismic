@@ -6,27 +6,27 @@
 # layer 4a + b; attention layer a is model layer 4a + 3. Every norm is folded into the
 # projection that consumes it, and the attention output gate into its output projection.
 fn qwen35_decode[D, LA, H, KV, R, S, NK, GV, RW, C, F, V, T, B](
-    embed: tensor[V, D] q4g64, final_norm: tensor[1, D] bf16,
-    in_norm: tensor[4 * LA, 1, D] bf16, post_norm: tensor[4 * LA, 1, D] bf16,
-    q_proj: tensor[LA, H * 2 * (R + S), D] q4g64, k_proj: tensor[LA, KV * (R + S), D] q4g64,
-    v_proj: tensor[LA, KV * (R + S), D] q4g64, o_proj: tensor[LA, D, H * (R + S)] q4g64,
-    q_norm: tensor[LA, R + S] bf16, k_norm: tensor[LA, R + S] bf16,
-    qkv_proj: tensor[3 * LA, (2 * NK + NK * GV) * RW, D] q4g64, z_proj: tensor[3 * LA, NK * GV * RW, D] q4g64,
-    a_proj: tensor[3 * LA, NK * GV, D] q4g64, b_proj: tensor[3 * LA, NK * GV, D] q4g64,
-    conv: tensor[3 * LA, (2 * NK + NK * GV) * RW, C] bf16, rate: tensor[3 * LA, NK * GV] f32, dt_bias: tensor[3 * LA, NK * GV] f32,
-    rnorm: tensor[3 * LA, RW] bf16, out_proj: tensor[3 * LA, D, NK * GV * RW] q4g64,
-    gate_proj: tensor[4 * LA, F, D] q4g64, up_proj: tensor[4 * LA, F, D] q4g64, down_proj: tensor[4 * LA, D, F] q4g64,
-    inout kcache: tensor[LA, T, KV, R + S] bf16, inout vcache: tensor[LA, T, KV, R + S] bf16,
-    inout window: tensor[3 * LA, C - 1, (2 * NK + NK * GV) * RW] bf16, inout delta: tensor[3 * LA, NK * GV, RW, RW] f32,
-    token: index[V], pos: index[T], visible: tensor[1, 2] i32,
-    inout x: tensor[1, D] bf16,
-    inout qg: tensor[1, H * 2 * (R + S)] bf16, inout kin: tensor[1, KV * (R + S)] bf16, inout vin: tensor[1, KV * (R + S)] bf16,
-    inout q: tensor[1, H, R + S] bf16, inout gate: tensor[1, H * (R + S)] bf16, inout attended: tensor[1, H, R + S] bf16, inout attended_flat: tensor[1, H * (R + S)] bf16,
-    inout projected: tensor[1, (2 * NK + NK * GV) * RW] bf16, inout z: tensor[1, NK * GV * RW] bf16,
-    inout a_in: tensor[1, NK * GV] bf16, inout b_in: tensor[1, NK * GV] bf16, inout qkv: tensor[2 * NK + NK * GV, RW] bf16,
-    inout beta: tensor[NK * GV] bf16, inout decay: tensor[NK * GV] f32, inout rout: tensor[NK * GV, RW] bf16, inout rgated: tensor[1, NK * GV * RW] bf16,
-    inout h: tensor[1, F] bf16, inout logits_out: tensor[1, V] f32,
-    inout amax_vals: tensor[V / B] f32, inout amax_idx: tensor[V / B] i32, inout next: tensor[1] i32):
+    embed: &tensor[V, D] q4g64, final_norm: &tensor[1, D] bf16,
+    in_norm: &tensor[4 * LA, 1, D] bf16, post_norm: &tensor[4 * LA, 1, D] bf16,
+    q_proj: &tensor[LA, H * 2 * (R + S), D] q4g64, k_proj: &tensor[LA, KV * (R + S), D] q4g64,
+    v_proj: &tensor[LA, KV * (R + S), D] q4g64, o_proj: &tensor[LA, D, H * (R + S)] q4g64,
+    q_norm: &tensor[LA, R + S] bf16, k_norm: &tensor[LA, R + S] bf16,
+    qkv_proj: &tensor[3 * LA, (2 * NK + NK * GV) * RW, D] q4g64, z_proj: &tensor[3 * LA, NK * GV * RW, D] q4g64,
+    a_proj: &tensor[3 * LA, NK * GV, D] q4g64, b_proj: &tensor[3 * LA, NK * GV, D] q4g64,
+    conv: &tensor[3 * LA, (2 * NK + NK * GV) * RW, C] bf16, rate: &tensor[3 * LA, NK * GV] f32, dt_bias: &tensor[3 * LA, NK * GV] f32,
+    rnorm: &tensor[3 * LA, RW] bf16, out_proj: &tensor[3 * LA, D, NK * GV * RW] q4g64,
+    gate_proj: &tensor[4 * LA, F, D] q4g64, up_proj: &tensor[4 * LA, F, D] q4g64, down_proj: &tensor[4 * LA, D, F] q4g64,
+    kcache: &mut tensor[LA, T, KV, R + S] bf16, vcache: &mut tensor[LA, T, KV, R + S] bf16,
+    window: &mut tensor[3 * LA, C - 1, (2 * NK + NK * GV) * RW] bf16, delta: &mut tensor[3 * LA, NK * GV, RW, RW] f32,
+    token: index[V], pos: index[T], visible: &tensor[1, 2] i32,
+    x: &mut tensor[1, D] bf16,
+    qg: &mut tensor[1, H * 2 * (R + S)] bf16, kin: &mut tensor[1, KV * (R + S)] bf16, vin: &mut tensor[1, KV * (R + S)] bf16,
+    q: &mut tensor[1, H, R + S] bf16, gate: &mut tensor[1, H * (R + S)] bf16, attended: &mut tensor[1, H, R + S] bf16, attended_flat: &mut tensor[1, H * (R + S)] bf16,
+    projected: &mut tensor[1, (2 * NK + NK * GV) * RW] bf16, z: &mut tensor[1, NK * GV * RW] bf16,
+    a_in: &mut tensor[1, NK * GV] bf16, b_in: &mut tensor[1, NK * GV] bf16, qkv: &mut tensor[2 * NK + NK * GV, RW] bf16,
+    beta: &mut tensor[NK * GV] bf16, decay: &mut tensor[NK * GV] f32, rout: &mut tensor[NK * GV, RW] bf16, rgated: &mut tensor[1, NK * GV * RW] bf16,
+    h: &mut tensor[1, F] bf16, logits_out: &mut tensor[1, V] f32,
+    amax_vals: &mut tensor[V / B] f32, amax_idx: &mut tensor[V / B] i32, next: &mut tensor[1] i32):
   embedding(embed, token, x)
   for a in 0..LA:
     for b in 0..3:
@@ -34,19 +34,19 @@ fn qwen35_decode[D, LA, H, KV, R, S, NK, GV, RW, C, F, V, T, B](
       norm_projection(x, in_norm[4 * a + b], z_proj[3 * a + b], 0.000001, z)
       norm_projection(x, in_norm[4 * a + b], a_proj[3 * a + b], 0.000001, a_in)
       norm_projection(x, in_norm[4 * a + b], b_proj[3 * a + b], 0.000001, b_in)
-      recurrent_prepare(projected, conv[3 * a + b], window[3 * a + b], window[3 * a + b], a_in, b_in, rate[3 * a + b], dt_bias[3 * a + b], 0.000128, qkv, beta, decay)
-      delta_step[NK = NK, GV = GV](qkv, beta, decay, delta[3 * a + b], delta[3 * a + b], rout, true)
+      recurrent_prepare(projected, conv[3 * a + b], to_owned(window[3 * a + b]), window[3 * a + b], a_in, b_in, rate[3 * a + b], dt_bias[3 * a + b], 0.000128, qkv, beta, decay)
+      delta_step[NK = NK, GV = GV](qkv, beta, decay, to_owned(delta[3 * a + b]), delta[3 * a + b], rout, true)
       gated_norm(rout, rnorm[3 * a + b], z, 0.000001, rgated)
-      projection_add(rgated, out_proj[3 * a + b], x, x)
+      projection_add(rgated, out_proj[3 * a + b], to_owned(x), x)
       norm_gated_projection(x, post_norm[4 * a + b], gate_proj[4 * a + b], up_proj[4 * a + b], 0.000001, h)
-      projection_add(h, down_proj[4 * a + b], x, x)
+      projection_add(h, down_proj[4 * a + b], to_owned(x), x)
     norm_projection(x, in_norm[4 * a + 3], q_proj[a], 0.000001, qg)
     norm_projection(x, in_norm[4 * a + 3], k_proj[a], 0.000001, kin)
     norm_projection(x, in_norm[4 * a + 3], v_proj[a], 0.000001, vin)
     attention_prepare[R = R](qg, kin, vin, q_norm[a], k_norm[a], pos, 10000000.0, 0.000001, q, gate, kcache[a], vcache[a])
     attention(q, kcache[a], vcache[a], visible, attended, 0.0625)
-    gate_projection_add(attended_flat, gate, o_proj[a], x, x)
+    gate_projection_add(attended_flat, gate, o_proj[a], to_owned(x), x)
     norm_gated_projection(x, post_norm[4 * a + 3], gate_proj[4 * a + 3], up_proj[4 * a + 3], 0.000001, h)
-    projection_add(h, down_proj[4 * a + 3], x, x)
+    projection_add(h, down_proj[4 * a + 3], to_owned(x), x)
   norm_logits(x, final_norm, embed, 0.000001, logits_out)
   argmax_row[B = B](logits_out, amax_vals, amax_idx, next)

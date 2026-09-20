@@ -8,11 +8,8 @@ use crate::{Buffer, Device, ExecutionObservation, Kernel};
 use crate::{DeviceTimingScope, Executable};
 use seismic_compiler::selection::{Budget, Strategy};
 use seismic_lang::types::Elem;
-use seismic_lang::{
-    family::Workload,
-    precision::PrecisionPolicy,
-    sir::Program,
-};
+use seismic_lang::{family::Workload, precision::PrecisionPolicy, sir::Program};
+use seismic_realization::BufferRole;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 pub trait Bindings {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
@@ -35,12 +32,21 @@ impl CompiledPlan {
     pub fn step_count(&self) -> usize {
         1
     }
-    /// Kernels natively compiled so far; selection runs at the first preparation.
+    /// Kernels selected and natively compiled for this plan.
     pub fn kernel_count(&self) -> usize {
         usize::from(self.enclosing.kernel.borrow().is_some())
     }
     pub fn execute(&mut self, bindings: &dyn Bindings) -> Result<(), String> {
-        self.prepare(bindings)?.execute_sequential()
+        self.execute_with_results(bindings).map(|_| ())
+    }
+    /// Execute with source bindings and return compiler-allocated owned result planes.
+    pub fn execute_with_results(
+        &mut self,
+        bindings: &dyn Bindings,
+    ) -> Result<InvocationResults, String> {
+        let mut submission = self.prepare(bindings)?;
+        submission.execute_sequential()?;
+        Ok(submission.results_for(0)?.clone())
     }
     pub fn execute_observed(
         &mut self,
@@ -51,35 +57,72 @@ impl CompiledPlan {
     pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
         self.enclosing.prepare(bindings)
     }
-    /// The selected kernel, compiling it if this entry has not been prepared yet.
+    /// The selected, natively compiled kernel.
     pub fn kernel(&self) -> Result<Rc<RefCell<Kernel>>, String> {
         self.enclosing.kernel()
     }
     /// Bind the entry's ABI positionally, in the order of `Kernel::buffers`/`scalars`.
     pub fn execute_buffers(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
+        self.execute_buffers_with_results(buffers, scalars)
+            .map(|_| ())
+    }
+    /// Bind only source parameters. Owned result storage is allocated by the runtime and
+    /// returned after synchronous completion.
+    pub fn execute_buffers_with_results(
+        &mut self,
+        buffers: &[Buffer],
+        scalars: &[f64],
+    ) -> Result<InvocationResults, String> {
         let kernel = self.enclosing.kernel()?;
         let mut submission = {
             let abi = kernel
                 .try_borrow()
                 .map_err(|_| "shared kernel is already executing")?;
-            if buffers.len() != abi.buffers().len() || scalars.len() != abi.scalars().len() {
+            let parameters = abi
+                .buffers()
+                .iter()
+                .filter(|spec| matches!(spec.role, BufferRole::Parameter))
+                .collect::<Vec<_>>();
+            if buffers.len() != parameters.len() || scalars.len() != abi.scalars().len() {
                 return Err("entry binding count differs from its logical ABI".into());
+            }
+            let mut supplied = buffers.iter();
+            let mut bound = Vec::with_capacity(abi.buffers().len());
+            let mut results = Vec::new();
+            for spec in abi.buffers() {
+                let buffer = match &spec.role {
+                    BufferRole::Parameter => supplied.next().unwrap().view(0..spec.bytes)?,
+                    BufferRole::Result { path } => {
+                        let buffer = self
+                            .enclosing
+                            .device
+                            .buffer(spec.bytes)
+                            .map_err(|error| error.to_string())?;
+                        results.push(ResultPlane {
+                            path: path.clone(),
+                            plane: spec.plane.clone(),
+                            buffer: buffer.clone(),
+                        });
+                        buffer
+                    }
+                    BufferRole::Internal => {
+                        return Err("internal storage escaped into the entry ABI".into());
+                    }
+                };
+                bound.push(buffer);
             }
             Submission {
                 invocations: vec![BoundInvocation {
                     entry: self.enclosing.entry.clone(),
                     kernel: kernel.clone(),
-                    buffers: abi
-                        .buffers()
-                        .iter()
-                        .zip(buffers)
-                        .map(|(s, b)| b.view(0..s.bytes))
-                        .collect::<Result<_, _>>()?,
+                    buffers: bound,
                     scalars: scalars.to_vec(),
+                    results,
                 }],
             }
         };
-        submission.execute_sequential()
+        submission.execute_sequential()?;
+        Ok(submission.results_for(0)?.clone())
     }
 }
 
@@ -88,7 +131,15 @@ struct BoundInvocation {
     kernel: Rc<RefCell<Kernel>>,
     buffers: Vec<Buffer>,
     scalars: Vec<f64>,
+    results: InvocationResults,
 }
+#[derive(Clone)]
+pub struct ResultPlane {
+    pub path: Vec<u32>,
+    pub plane: String,
+    pub buffer: Buffer,
+}
+pub type InvocationResults = Vec<ResultPlane>;
 /// Bound code and allocation pins. Preparation does not execute numerical work.
 /// Appending preserves source order and extends resource lifetime through completion.
 #[derive(Default)]
@@ -104,6 +155,12 @@ impl Submission {
     }
     pub fn is_empty(&self) -> bool {
         self.invocations.is_empty()
+    }
+    pub fn results_for(&self, invocation: usize) -> Result<&InvocationResults, String> {
+        self.invocations
+            .get(invocation)
+            .map(|bound| &bound.results)
+            .ok_or_else(|| format!("submission has no invocation {invocation}"))
     }
     pub fn execute_sequential(&mut self) -> Result<(), String> {
         for invocation in &self.invocations {
@@ -285,20 +342,36 @@ impl Enclosing {
     }
     fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
         let kernel = self.kernel()?;
-        let (buffers, scalars) = {
+        let (buffers, scalars, results) = {
             let abi = kernel
                 .try_borrow()
                 .map_err(|_| "shared kernel is already executing")?;
-            let buffers = abi
-                .buffers()
-                .iter()
-                .map(|s| {
-                    bindings
-                        .buffer(&s.parameter, &s.plane)
-                        .ok_or_else(|| format!("unbound tensor {}.{}", s.parameter, s.plane))?
-                        .view(0..s.bytes)
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            let mut buffers = Vec::with_capacity(abi.buffers().len());
+            let mut results = Vec::new();
+            for spec in abi.buffers() {
+                let buffer = match &spec.role {
+                    BufferRole::Parameter => bindings
+                        .buffer(&spec.parameter, &spec.plane)
+                        .ok_or_else(|| format!("unbound tensor {}.{}", spec.parameter, spec.plane))?
+                        .view(0..spec.bytes)?,
+                    BufferRole::Result { path } => {
+                        let buffer = self
+                            .device
+                            .buffer(spec.bytes)
+                            .map_err(|error| error.to_string())?;
+                        results.push(ResultPlane {
+                            path: path.clone(),
+                            plane: spec.plane.clone(),
+                            buffer: buffer.clone(),
+                        });
+                        buffer
+                    }
+                    BufferRole::Internal => {
+                        return Err("internal storage escaped into the entry ABI".into());
+                    }
+                };
+                buffers.push(buffer);
+            }
             let scalars = abi
                 .scalars()
                 .iter()
@@ -308,7 +381,7 @@ impl Enclosing {
                         .ok_or_else(|| format!("unbound scalar {}", s.name))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            (buffers, scalars)
+            (buffers, scalars, results)
         };
         Ok(Submission {
             invocations: vec![BoundInvocation {
@@ -316,6 +389,7 @@ impl Enclosing {
                 kernel,
                 buffers,
                 scalars,
+                results,
             }],
         })
     }
@@ -375,6 +449,10 @@ impl<'a> PlanCompiler<'a> {
             settings: self.settings.clone(),
             kernel: RefCell::new(None),
         });
+        // Selection, realization, and native compilation are part of plan construction.
+        // Binding and execution must not be the first point at which an invalid artifact is
+        // discovered.
+        enclosing.kernel()?;
         self.entries.push(enclosing.clone());
         Ok(CompiledPlan { enclosing })
     }

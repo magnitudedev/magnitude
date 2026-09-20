@@ -5,13 +5,17 @@ use super::value::{Backing, Flow, Piece, Shaped, Value, S};
 use super::{round_to, Interpreter, TensorData};
 use crate::sir::{Expr, ExprKind, Index, Math, ReduceOp};
 use crate::syntax::ast::{AssignOp, BinaryOp};
-use crate::types::{Extent, Ty};
 use crate::types::{DType, Elem};
+use crate::types::{Extent, Ty};
 
 /// An elementwise operand: a broadcast scalar or row-major tile data.
 pub(super) enum Operand {
     Scalar(S),
-    Tile { dtype: DType, shape: Vec<usize>, data: Vec<f64> },
+    Tile {
+        dtype: DType,
+        shape: Vec<usize>,
+        data: Vec<f64>,
+    },
 }
 
 pub(super) fn hint(ty: &Ty) -> Option<DType> {
@@ -93,34 +97,54 @@ impl<'a> Interpreter<'a> {
 
     /// Row-major decoded values of a selection; every element must be initialized.
     pub(super) fn gather(&self, s: &Shaped) -> Result<Vec<f64>, String> {
-        s.flats().into_iter().map(|flat| self.read_flat(s, flat)).collect()
+        s.flats()
+            .into_iter()
+            .map(|flat| self.read_flat(s, flat))
+            .collect()
     }
 
     pub(super) fn operand(&self, v: &Value) -> Result<Operand, String> {
         match v {
             Value::Scalar(d, x) => Ok(Operand::Scalar((*d, *x))),
-            Value::Tile(s) | Value::View(s) => Ok(Operand::Tile { dtype: self.dtype_of(s), shape: s.shape.clone(), data: self.gather(s)? }),
+            Value::Tile(s) | Value::View(s) => Ok(Operand::Tile {
+                dtype: self.dtype_of(s),
+                shape: s.shape.clone(),
+                data: self.gather(s)?,
+            }),
             other => Err(format!("{} is not a numerical operand", other.kind())),
         }
     }
 
-    pub(super) fn elementwise(&self, operands: &[Operand], fallback: DType, fun: &mut dyn FnMut(&[S]) -> Result<S, String>) -> Result<Value, String> {
+    pub(super) fn elementwise(
+        &self,
+        operands: &[Operand],
+        fallback: DType,
+        fun: &mut dyn FnMut(&[S]) -> Result<S, String>,
+    ) -> Result<Value, String> {
         let mut shape: Option<&Vec<usize>> = None;
         for o in operands {
             if let Operand::Tile { shape: s, .. } = o {
                 if shape.is_some_and(|p| p != s) {
-                    return Err(format!("elementwise shape mismatch: {:?} vs {s:?}", shape.unwrap_or(s)));
+                    return Err(format!(
+                        "elementwise shape mismatch: {:?} vs {s:?}",
+                        shape.unwrap_or(s)
+                    ));
                 }
                 shape = Some(s);
             }
         }
         let at = |i: usize| -> Vec<S> {
-            operands.iter().map(|o| match o {
-                Operand::Scalar(s) => *s,
-                Operand::Tile { dtype, data, .. } => (*dtype, data[i]),
-            }).collect()
+            operands
+                .iter()
+                .map(|o| match o {
+                    Operand::Scalar(s) => *s,
+                    Operand::Tile { dtype, data, .. } => (*dtype, data[i]),
+                })
+                .collect()
         };
-        let Some(shape) = shape else { return fun(&at(0)).map(Value::scalar) };
+        let Some(shape) = shape else {
+            return fun(&at(0)).map(Value::scalar);
+        };
         let n: usize = shape.iter().product();
         let mut dtype = fallback;
         let mut data = Vec::with_capacity(n);
@@ -134,22 +158,38 @@ impl<'a> Interpreter<'a> {
 
     /// Write `value` through `dst` (`dst op= value`), rounding to the destination dtype.
     /// A scalar broadcasts. Sources are read completely before the first write.
-    pub(super) fn write(&mut self, dst: &Shaped, op: AssignOp, value: &Value) -> Result<(), String> {
+    pub(super) fn write(
+        &mut self,
+        dst: &Shaped,
+        op: AssignOp,
+        value: &Value,
+    ) -> Result<(), String> {
         let source = self.operand(value)?;
         if let Operand::Tile { shape, .. } = &source {
             if shape != &dst.shape {
-                return Err(format!("shape mismatch: value {shape:?} vs destination {:?}", dst.shape));
+                return Err(format!(
+                    "shape mismatch: value {shape:?} vs destination {:?}",
+                    dst.shape
+                ));
             }
         }
         let dtype = self.dtype_of(dst);
         let flats = dst.flats();
-        let current = if op == AssignOp::Assign { Vec::new() } else { self.gather(dst)? };
+        let current = if op == AssignOp::Assign {
+            Vec::new()
+        } else {
+            self.gather(dst)?
+        };
         for (i, flat) in flats.into_iter().enumerate() {
             let v = match &source {
                 Operand::Scalar(s) => *s,
                 Operand::Tile { dtype, data, .. } => (*dtype, data[i]),
             };
-            let v = if op == AssignOp::Assign { v } else { scalar::assign(op, (dtype, current[i]), v)? };
+            let v = if op == AssignOp::Assign {
+                v
+            } else {
+                scalar::assign(op, (dtype, current[i]), v)?
+            };
             self.write_flat(dst, flat, v)?;
         }
         Ok(())
@@ -160,17 +200,34 @@ impl<'a> Interpreter<'a> {
     pub(super) fn snapshot(&self, v: Value) -> Result<Value, String> {
         Ok(match v {
             Value::Tile(s) if matches!(s.backing, Backing::Owned(_)) && !s.exclusive() => {
-                Value::Tile(Shaped::owned(self.dtype_of(&s), s.shape.clone(), self.gather(&s)?))
+                Value::Tile(Shaped::owned(
+                    self.dtype_of(&s),
+                    s.shape.clone(),
+                    self.gather(&s)?,
+                ))
             }
-            Value::Tuple(items) => Value::Tuple(items.into_iter().map(|i| self.snapshot(i)).collect::<Result<_, _>>()?),
+            Value::Tuple(items) => Value::Tuple(
+                items
+                    .into_iter()
+                    .map(|i| self.snapshot(i))
+                    .collect::<Result<_, _>>()?,
+            ),
             other => other,
         })
     }
 
     // ----- symbols and geometry --------------------------------------------------------
 
-    pub(super) fn piece(&self, f: &Frame<'a>, slice: crate::types::SliceId) -> Result<Piece, String> {
-        f.slices.get(slice.0 as usize).copied().flatten().ok_or_else(|| format!("slice#{} is not bound here", slice.0))
+    pub(super) fn piece(
+        &self,
+        f: &Frame<'a>,
+        slice: crate::types::SliceId,
+    ) -> Result<Piece, String> {
+        f.slices
+            .get(slice.0 as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| format!("slice#{} is not bound here", slice.0))
     }
 
     pub(super) fn extent(&self, e: &Extent, f: &Frame<'a>) -> Result<usize, String> {
@@ -208,6 +265,7 @@ impl<'a> Interpreter<'a> {
     /// The storage an expression designates, without reading it.
     pub(super) fn place(&mut self, e: &'a Expr, f: &mut Frame<'a>) -> Result<Shaped, String> {
         match &e.kind {
+            ExprKind::Range { .. } => return Err("a range value is only consumed by a loop".into()),
             ExprKind::Index { base, indices } => {
                 let b = self.place(base, f)?;
                 self.index(b, &base.ty, &e.ty, indices, f)
@@ -223,18 +281,40 @@ impl<'a> Interpreter<'a> {
     /// The checker's atom for the extent of a runtime-bounded range (`@dyn#n`), if `axis` of
     /// `ty` is exactly one.
     fn dynamic_atom(ty: &Ty, axis: usize) -> Option<String> {
-        let Extent::Semantic(sym) = ty.shaped()?.axes.get(axis)? else { return None };
+        let Extent::Semantic(sym) = ty.shaped()?.axes.get(axis)? else {
+            return None;
+        };
         sym.atoms().into_iter().find_map(|a| match a {
-            crate::sym::Atom::Param(p) if p.starts_with('@') && sym == &crate::sym::Sym::param(&p) => Some(p),
+            crate::sym::Atom::Param(p)
+                if p.starts_with('@') && sym == &crate::sym::Sym::param(&p) =>
+            {
+                Some(p)
+            }
             _ => None,
         })
     }
 
-    fn index(&mut self, b: Shaped, bt: &Ty, rt: &Ty, indices: &'a [Index], f: &mut Frame<'a>) -> Result<Shaped, String> {
+    fn index(
+        &mut self,
+        b: Shaped,
+        bt: &Ty,
+        rt: &Ty,
+        indices: &'a [Index],
+        f: &mut Frame<'a>,
+    ) -> Result<Shaped, String> {
         if indices.len() > b.shape.len() {
-            return Err(format!("{} indices into a rank-{} value", indices.len(), b.shape.len()));
+            return Err(format!(
+                "{} indices into a rank-{} value",
+                indices.len(),
+                b.shape.len()
+            ));
         }
-        let mut out = Shaped { backing: b.backing.clone(), shape: Vec::new(), strides: Vec::new(), offset: b.offset };
+        let mut out = Shaped {
+            backing: b.backing.clone(),
+            shape: Vec::new(),
+            strides: Vec::new(),
+            offset: b.offset,
+        };
         for (axis, extent) in b.shape.iter().copied().enumerate() {
             let stride = b.strides[axis];
             let Some(index) = indices.get(axis) else {
@@ -277,7 +357,11 @@ impl<'a> Interpreter<'a> {
             };
             // A runtime-bounded range is clamped to its axis; its realized length is the value
             // of the checker's extent atom from here on.
-            let dynamic = if matches!(index, Index::Range { .. }) { Self::dynamic_atom(rt, out.shape.len()) } else { None };
+            let dynamic = if matches!(index, Index::Range { .. }) {
+                Self::dynamic_atom(rt, out.shape.len())
+            } else {
+                None
+            };
             let (lo, hi) = match &dynamic {
                 Some(_) => {
                     let hi = hi.clamp(0, extent as i64);
@@ -302,26 +386,53 @@ impl<'a> Interpreter<'a> {
         match &e.kind {
             ExprKind::Int(v) => {
                 let d = hint(&e.ty).unwrap_or(DType::I32);
-                Ok(Value::Scalar(d, if d.is_float() { round_to(d, *v as f64) } else { *v as f64 }))
+                Ok(Value::Scalar(
+                    d,
+                    if d.is_float() {
+                        round_to(d, *v as f64)
+                    } else {
+                        *v as f64
+                    },
+                ))
             }
             ExprKind::Float(v) => {
                 let d = hint(&e.ty).filter(|d| d.is_float()).unwrap_or(DType::F32);
                 Ok(Value::Scalar(d, round_to(d, *v)))
             }
             ExprKind::Bool(b) => Ok(Value::Scalar(DType::Bool, u8::from(*b) as f64)),
-            ExprKind::Var(id) => f.vars.get(*id).and_then(|v| v.clone()).ok_or_else(|| format!("`{}` is read before it has a value", f.body.vars[*id].name)),
-            ExprKind::ShapeParam(name) => f.shapes.get(name).map(|v| Value::int(*v)).ok_or_else(|| format!("shape parameter {name} is unbound")),
-            ExprKind::Tuple(items) => Ok(Value::Tuple(items.iter().map(|i| self.expr(i, f)).collect::<Result<_, _>>()?)),
+            ExprKind::Var(id) => f.vars.get(*id).and_then(|v| v.clone()).ok_or_else(|| {
+                format!("`{}` is read before it has a value", f.body.vars[*id].name)
+            }),
+            ExprKind::ShapeParam(name) => f
+                .shapes
+                .get(name)
+                .map(|v| Value::int(*v))
+                .ok_or_else(|| format!("shape parameter {name} is unbound")),
+            ExprKind::Tuple(items) => Ok(Value::Tuple(
+                items
+                    .iter()
+                    .map(|i| self.expr(i, f))
+                    .collect::<Result<_, _>>()?,
+            )),
+            ExprKind::Range { .. } => Err("a range value is only consumed by a loop".into()),
             ExprKind::Field { base, index } => match self.expr(base, f)? {
                 Value::Tuple(mut items) if *index < items.len() => Ok(items.swap_remove(*index)),
                 other => Err(format!("component {index} of {}", other.kind())),
             },
             ExprKind::TileAlloc => {
-                let Ty::Tile(s) = &e.ty else { return Err("tile allocation without a tile type".into()) };
-                let shape = s.axes.iter().map(|a| self.extent(a, f)).collect::<Result<Vec<_>, _>>()?;
+                let Ty::Tile(s) = &e.ty else {
+                    return Err("tile allocation without a tile type".into());
+                };
+                let shape = s
+                    .axes
+                    .iter()
+                    .map(|a| self.extent(a, f))
+                    .collect::<Result<Vec<_>, _>>()?;
                 match f.elem(&s.elem) {
                     Elem::Dtype(d) => Ok(Value::Tile(Shaped::uninit(d, shape))),
-                    other => Err(format!("local tile allocation requires a dense dtype, found {other}")),
+                    other => Err(format!(
+                        "local tile allocation requires a dense dtype, found {other}"
+                    )),
                 }
             }
             ExprKind::Filled { like, value } => {
@@ -331,21 +442,36 @@ impl<'a> Interpreter<'a> {
                     _ => self.dtype_of(&like),
                 };
                 let n = like.count();
-                Ok(Value::Tile(Shaped::owned(dtype, like.shape, vec![round_to(dtype, *value); n])))
+                Ok(Value::Tile(Shaped::owned(
+                    dtype,
+                    like.shape,
+                    vec![round_to(dtype, *value); n],
+                )))
             }
             ExprKind::Index { base, indices } => {
                 let b = self.place(base, f)?;
-                let element = indices.len() == b.shape.len() && indices.iter().all(|i| matches!(i, Index::Point(_) | Index::Coord(_)));
+                let element = indices.len() == b.shape.len()
+                    && indices
+                        .iter()
+                        .all(|i| matches!(i, Index::Point(_) | Index::Coord(_)));
                 let s = self.index(b, &base.ty, &e.ty, indices, f)?;
                 if element {
-                    Ok(Value::Scalar(self.dtype_of(&s), self.read_flat(&s, s.offset)?))
+                    Ok(Value::Scalar(
+                        self.dtype_of(&s),
+                        self.read_flat(&s, s.offset)?,
+                    ))
                 } else {
                     Ok(Value::View(s))
                 }
             }
             ExprKind::Member { result, slices } => {
-                let Value::Result(r) = self.expr(result, f)? else { return Err("member selection on a value that is not a region result".into()) };
-                let at = slices.iter().map(|s| self.piece(f, *s)).collect::<Result<Vec<_>, _>>()?;
+                let Value::Result(r) = self.expr(result, f)? else {
+                    return Err("member selection on a value that is not a region result".into());
+                };
+                let at = slices
+                    .iter()
+                    .map(|s| self.piece(f, *s))
+                    .collect::<Result<Vec<_>, _>>()?;
                 r.member(&at).cloned()
             }
             ExprKind::Transpose(inner) => Ok(match self.expr(inner, f)? {
@@ -355,26 +481,58 @@ impl<'a> Interpreter<'a> {
             }),
             ExprKind::Reshape { base, axes } => {
                 let v = self.expr(base, f)?;
-                let Some(s) = v.shaped() else { return Err(format!("reshape of {}", v.kind())) };
+                let Some(s) = v.shaped() else {
+                    return Err(format!("reshape of {}", v.kind()));
+                };
                 if matches!(self.elem_of(s), Elem::Repr(_)) {
                     return Err("reshape requires dense storage".into());
                 }
-                let target = axes.iter().map(|a| self.extent(a, f).map(|n| n as i64)).collect::<Result<Vec<_>, _>>()?;
-                let signed = |v: &[usize]| v.iter().map(|n| i64::try_from(*n).map_err(|_| "reshape extent overflow".to_string())).collect::<Result<Vec<_>, _>>();
-                let strides = crate::layout::reshape_strides(&signed(&s.shape)?, &signed(&s.strides)?, &target)?;
-                let out = Shaped { backing: s.backing.clone(), shape: target.into_iter().map(|n| n as usize).collect(), strides: strides.into_iter().map(|n| n as usize).collect(), offset: s.offset };
-                Ok(if matches!(v, Value::Tile(_)) { Value::Tile(out) } else { Value::View(out) })
+                let target = axes
+                    .iter()
+                    .map(|a| self.extent(a, f).map(|n| n as i64))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let signed = |v: &[usize]| {
+                    v.iter()
+                        .map(|n| {
+                            i64::try_from(*n).map_err(|_| "reshape extent overflow".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let strides = crate::layout::reshape_strides(
+                    &signed(&s.shape)?,
+                    &signed(&s.strides)?,
+                    &target,
+                )?;
+                let out = Shaped {
+                    backing: s.backing.clone(),
+                    shape: target.into_iter().map(|n| n as usize).collect(),
+                    strides: strides.into_iter().map(|n| n as usize).collect(),
+                    offset: s.offset,
+                };
+                Ok(if matches!(v, Value::Tile(_)) {
+                    Value::Tile(out)
+                } else {
+                    Value::View(out)
+                })
             }
             ExprKind::Load(view) => {
                 let s = self.place(view, f)?;
                 if matches!(self.elem_of(&s), Elem::Repr(_)) {
                     return Ok(Value::Tile(s));
                 }
-                Ok(Value::Tile(Shaped::owned(self.dtype_of(&s), s.shape.clone(), self.gather(&s)?)))
+                Ok(Value::Tile(Shaped::owned(
+                    self.dtype_of(&s),
+                    s.shape.clone(),
+                    self.gather(&s)?,
+                )))
             }
             ExprKind::Decode(view) => {
                 let s = self.place(view, f)?;
-                let data = self.gather(&s)?.into_iter().map(|x| round_to(DType::F32, x)).collect();
+                let data = self
+                    .gather(&s)?
+                    .into_iter()
+                    .map(|x| round_to(DType::F32, x))
+                    .collect();
                 Ok(Value::Tile(Shaped::owned(DType::F32, s.shape, data)))
             }
             ExprKind::Cast { dtype, expr } => {
@@ -385,7 +543,9 @@ impl<'a> Interpreter<'a> {
             ExprKind::Unary { op, expr } => {
                 let v = self.expr(expr, f)?;
                 let operand = self.operand(&v)?;
-                self.elementwise(&[operand], hint(&e.ty).unwrap_or(DType::F32), &mut |a| scalar::unary(*op, a[0]))
+                self.elementwise(&[operand], hint(&e.ty).unwrap_or(DType::F32), &mut |a| {
+                    scalar::unary(*op, a[0])
+                })
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.expr(lhs, f)?;
@@ -398,7 +558,9 @@ impl<'a> Interpreter<'a> {
                 let r = self.expr(rhs, f)?;
                 let h = hint(&e.ty);
                 let operands = [self.operand(&l)?, self.operand(&r)?];
-                self.elementwise(&operands, h.unwrap_or(DType::F32), &mut |a| scalar::binary(*op, a[0], a[1], h))
+                self.elementwise(&operands, h.unwrap_or(DType::F32), &mut |a| {
+                    scalar::binary(*op, a[0], a[1], h)
+                })
             }
             ExprKind::Math { op, args } => self.math(*op, args, e, f),
             ExprKind::Select { cond, then, els } => {
@@ -422,7 +584,9 @@ impl<'a> Interpreter<'a> {
                     Ok(scalar::cast(d, if a[0].1 != 0.0 { a[1] } else { a[2] }))
                 })
             }
-            ExprKind::Reduce { value, axis, op, .. } => {
+            ExprKind::Reduce {
+                value, axis, op, ..
+            } => {
                 let s = self.place(value, f)?;
                 self.reduce(&s, *axis, *op)
             }
@@ -432,17 +596,29 @@ impl<'a> Interpreter<'a> {
             },
             ExprKind::ExtentOf { base, axis } => {
                 let s = self.place(base, f)?;
-                s.shape.get(*axis).map(|n| Value::int(*n as i64)).ok_or_else(|| format!("extent of axis {axis} of a rank-{} value", s.shape.len()))
+                s.shape
+                    .get(*axis)
+                    .map(|n| Value::int(*n as i64))
+                    .ok_or_else(|| {
+                        format!("extent of axis {axis} of a rank-{} value", s.shape.len())
+                    })
             }
             ExprKind::Geometry { base, axis, valid } => {
                 let s = self.place(base, f)?;
-                let extent = *s.shape.get(*axis).ok_or_else(|| format!("geometry of axis {axis} of a rank-{} value", s.shape.len()))? as i64;
+                let extent = *s.shape.get(*axis).ok_or_else(|| {
+                    format!("geometry of axis {axis} of a rank-{} value", s.shape.len())
+                })? as i64;
                 if *valid {
                     return Ok(Value::int(extent));
                 }
                 let capacity = match base.ty.shaped().and_then(|t| t.axes.get(*axis)) {
                     Some(Extent::Structural(slice)) => self.piece(f, *slice)?.width,
-                    Some(Extent::Semantic(sym)) => f.caps.iter().find(|(p, _)| sym == &crate::sym::Sym::param(p)).map(|(_, piece)| piece.width).unwrap_or(extent),
+                    Some(Extent::Semantic(sym)) => f
+                        .caps
+                        .iter()
+                        .find(|(p, _)| sym == &crate::sym::Sym::param(p))
+                        .map(|(_, piece)| piece.width)
+                        .unwrap_or(extent),
                     None => extent,
                 };
                 Ok(Value::int(capacity.max(extent)))
@@ -455,7 +631,11 @@ impl<'a> Interpreter<'a> {
             ExprKind::Intrinsic { op, args } => self.intrinsic(*op, args, e, f),
             ExprKind::Accessor { base, name } => {
                 let s = self.place(base, f)?;
-                let axis = base.ty.shaped().and_then(|t| t.packed_axis).unwrap_or(s.shape.len().saturating_sub(1));
+                let axis = base
+                    .ty
+                    .shaped()
+                    .and_then(|t| t.packed_axis)
+                    .unwrap_or(s.shape.len().saturating_sub(1));
                 self.accessor(&s, axis, name)
             }
             ExprKind::Atomic { op, place, value } => {
@@ -473,23 +653,38 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn math(&mut self, op: Math, args: &'a [Expr], e: &'a Expr, f: &mut Frame<'a>) -> Result<Value, String> {
+    fn math(
+        &mut self,
+        op: Math,
+        args: &'a [Expr],
+        e: &'a Expr,
+        f: &mut Frame<'a>,
+    ) -> Result<Value, String> {
         let mut operands = Vec::with_capacity(args.len());
         for a in args {
             let v = self.expr(a, f)?;
             operands.push(self.operand(&v)?);
         }
-        self.elementwise(&operands, hint(&e.ty).unwrap_or(DType::F32), &mut |a| scalar::math(op, a))
+        self.elementwise(&operands, hint(&e.ty).unwrap_or(DType::F32), &mut |a| {
+            scalar::math(op, a)
+        })
     }
 
     /// Reduction along one axis in ascending index order. Sums round every step to the
     /// accumulation dtype; max/min/argmax keep the smaller index on ties.
     fn reduce(&self, s: &Shaped, axis: usize, op: ReduceOp) -> Result<Value, String> {
         if axis >= s.shape.len() {
-            return Err(format!("reduce along axis {axis} of a rank-{} value", s.shape.len()));
+            return Err(format!(
+                "reduce along axis {axis} of a rank-{} value",
+                s.shape.len()
+            ));
         }
         // Floating reductions are carried in f32 whatever the operand's element type.
-        let input = if self.dtype_of(s).is_float() { DType::F32 } else { self.dtype_of(s) };
+        let input = if self.dtype_of(s).is_float() {
+            DType::F32
+        } else {
+            self.dtype_of(s)
+        };
         let data = self.gather(s)?;
         let operation = match op {
             ReduceOp::Sum => crate::exec::ir::ReduceOp::Sum,
@@ -523,12 +718,20 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                out.push(if op == ReduceOp::Argmax { arg as f64 } else { acc });
+                out.push(if op == ReduceOp::Argmax {
+                    arg as f64
+                } else {
+                    acc
+                });
             }
         }
         let mut shape = s.shape.clone();
         shape.remove(axis);
         let dtype = contract.output();
-        Ok(if shape.is_empty() { Value::Scalar(dtype, out[0]) } else { Value::Tile(Shaped::owned(dtype, shape, out)) })
+        Ok(if shape.is_empty() {
+            Value::Scalar(dtype, out[0])
+        } else {
+            Value::Tile(Shaped::owned(dtype, shape, out))
+        })
     }
 }

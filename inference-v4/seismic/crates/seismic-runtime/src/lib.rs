@@ -145,6 +145,7 @@ pub struct Selection {
     pub seed_estimate: u64,
     pub status: ProofStatus,
     pub estimate_model: String,
+    pub capability_fingerprint: String,
     pub numerical_assessment: seismic_lang::precision::NumericalAssessment,
     pub qualification: Option<QualificationIdentity>,
     pub lower_bound: u64,
@@ -296,10 +297,10 @@ impl Device {
     /// this device's is an error.
     pub fn compile_selected(&self, selected: impl Into<SelectedExecution>) -> Result<Kernel, String> {
         fn retained<E>(selected: Selected<E>) -> (E, Selection) {
-            let Selected { execution, family, witness, estimate, seed, seed_estimate, status, estimate_model, numerical_assessment, qualification, lower_bound, unresolved, timings, search } = selected;
+            let Selected { execution, family, witness, estimate, seed, seed_estimate, status, estimate_model, capability_fingerprint, numerical_assessment, qualification, lower_bound, unresolved, timings, search } = selected;
             let shapes = family.workload.shapes.iter().map(|(name, value)| (name.clone(), *value)).collect();
             let elements = family.workload.elems.iter().map(|(name, element)| (name.clone(), element.to_string())).collect();
-            (execution, Selection { entry: family.entry.clone(), witness, seed, estimate, seed_estimate, status, estimate_model, numerical_assessment, qualification, lower_bound, unresolved, shapes, elements, timings, search, emit: None, native_compile: Default::default() })
+            (execution, Selection { entry: family.entry.clone(), witness, seed, estimate, seed_estimate, status, estimate_model, capability_fingerprint, numerical_assessment, qualification, lower_bound, unresolved, shapes, elements, timings, search, emit: None, native_compile: Default::default() })
         }
         let started = std::time::Instant::now();
         match (&self.0, selected.into()) {

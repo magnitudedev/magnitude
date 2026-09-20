@@ -4,6 +4,7 @@
 use super::SelectionError;
 use seismic_lang::exec::lowered_ir::LoweredIr;
 use seismic_lang::family::{CandidateRef, Family, SequenceId, SiteId, Witness};
+use seismic_lang::sir::IntrinsicUse;
 use seismic_lang::sir::Program;
 use std::collections::BTreeMap;
 
@@ -34,6 +35,23 @@ pub struct Constraint {
     pub reason: String,
 }
 
+/// One conditionally present contribution to a finite resource. The value is tabulated over
+/// `scope`; it contributes exactly when every candidate in `guard` is selected.
+pub struct ResourceTerm {
+    pub guard: Vec<CandidateRef>,
+    pub scope: Vec<SiteId>,
+    pub amount: Box<dyn Fn(&[i64]) -> Result<u64, String> + Send + Sync>,
+}
+
+/// An additive hard capacity checked across independently selected occurrences. Unlike a
+/// conjunction-guarded [`Constraint`], this represents sibling contributions without
+/// enumerating their Cartesian product.
+pub struct ResourceConstraint {
+    pub terms: Vec<ResourceTerm>,
+    pub capacity: u64,
+    pub reason: String,
+}
+
 /// One local term of the estimated execution cost. It depends on exactly `scope`, is
 /// active when every `guard` candidate and every `intervals` member is selected, and adds
 /// to the objective. Units are the backend's estimate units (nanoseconds).
@@ -50,6 +68,14 @@ pub trait Backend {
 
     fn target(&self) -> &'static str;
 
+    /// Stable identity of the effective hardware/driver/toolchain/backend capability
+    /// intersection used to admit intrinsic-bearing candidates.
+    fn capability_fingerprint(&self) -> String;
+
+    /// Whether this exact typed intrinsic use has an implemented realization in the effective
+    /// target environment. The error is retained as the candidate rejection diagnostic.
+    fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String>;
+
     /// Identity of the estimate model behind `factors`.
     fn estimate_model(&self) -> String;
 
@@ -64,6 +90,8 @@ pub trait Backend {
     fn bind_structure(&self, program: &Program, family: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError>;
 
     fn constraints(&self, program: &Program, family: &Family) -> Result<Vec<Constraint>, SelectionError>;
+
+    fn resources(&self, program: &Program, family: &Family) -> Result<Vec<ResourceConstraint>, SelectionError>;
 
     /// Every legal contiguous interval of every sequence (spec section 11.3), without
     /// profitability filtering.

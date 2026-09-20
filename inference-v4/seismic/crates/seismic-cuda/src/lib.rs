@@ -6,4 +6,9 @@ pub mod execution;
 pub mod mapping;
 pub mod ptx;
 mod runtime;
+pub mod target;
 pub use runtime::{Buffer, Device, DeviceInfo, Kernel, NativeImage, NativeResources, Sequence};
+pub use target::{
+    ComputeCapability, DriverApiVersion, FactSource, PtxTarget, PtxVersion, TargetError,
+    TargetObservation, TargetProfile, TargetRequirement, TargetTier,
+};

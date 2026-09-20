@@ -1,32 +1,31 @@
 # One step of the gated delta rule for every value head, one state row per work item:
 # row *= decay; remembered = row . key; row += (value - remembered) * beta * key;
-# out = row . query. Grouped value heads use key head h / GV; tiled heads use h % NK.
+# result = row . query. Grouped value heads use key head h / GV; tiled heads use h % NK.
 # The engine binds this semantic mapping from the artifact description.
-fn delta_step[NK, GV, W](qkv: tensor[2 * NK + NK * GV, W] A, beta: tensor[NK * GV] A, decay: tensor[NK * GV] f32,
-                                state: tensor[NK * GV, W, W] f32, out next_state: tensor[NK * GV, W, W] f32, out out: tensor[NK * GV, W] A, grouped: bool):
-    parallel [heads, rows] in (0..(NK * GV), 0..W):
-        for h in heads:
-            for i in rows:
-                let row = load(state[h, i])
-                let mut key_head = h % NK
-                if grouped:
-                    key_head = h / GV
-                let key = load(qkv[NK + key_head])
-                let query = load(qkv[key_head])
-                let mut p = tile[W] f32
-                for j in owned(p):
-                    p[j] = row[j] * decay[h] * f32(key[j])
-                let remembered = sum_any_order(p)
-                let residual = (f32(qkv[2 * NK + h, i]) - remembered) * f32(beta[h])
-                let mut nrow = tile[W] f32
-                for j in owned(nrow):
-                    nrow[j] = fma(residual, f32(key[j]), row[j] * decay[h])
-                publish nrow to next_state[h, i]
-                let mut pq = tile[W] f32
-                for j in owned(pq):
-                    pq[j] = nrow[j] * f32(query[j])
-                let o = sum_any_order(pq)
-                let mut ot = tile[1] f32
-                for j in owned(ot):
-                    ot[j] = o
-                publish ot to out[h, i : i + 1]
+fn delta_step[NK, GV, W](qkv: &tensor[2 * NK + NK * GV, W] A, beta: &tensor[NK * GV] A, decay: &tensor[NK * GV] f32,
+                                state: &tensor[NK * GV, W, W] f32, next_state: &mut tensor[NK * GV, W, W] f32, result: &mut tensor[NK * GV, W] A, grouped: bool):
+    parallel for heads in 0..(NK * GV):
+        parallel for rows in 0..W:
+            let row = load(state[heads, rows])
+            let mut key_head = heads % NK
+            if grouped:
+                key_head = heads / GV
+            let key = load(qkv[NK + key_head])
+            let query = load(qkv[key_head])
+            let mut p = tensor[W] f32
+            for j in 0..W:
+                p[j] = row[j] * decay[heads] * f32(key[j])
+            let remembered = sum_any_order(p)
+            let residual = (f32(qkv[2 * NK + heads, rows]) - remembered) * f32(beta[heads])
+            let mut nrow = tensor[W] f32
+            for j in 0..W:
+                nrow[j] = fma(residual, f32(key[j]), row[j] * decay[heads])
+            next_state[heads, rows] = nrow
+            let mut pq = tensor[W] f32
+            for j in 0..W:
+                pq[j] = nrow[j] * f32(query[j])
+            let o = sum_any_order(pq)
+            let mut ot = tensor[1] f32
+            for j in 0..1:
+                ot[j] = o
+            result[heads, rows : rows + 1] = ot

@@ -1,189 +1,91 @@
 # Seismic execution
 
-**This document defines what an authored structure means when it executes, which
-adjacent work may share a realization, and how a witness becomes one concrete
-execution.** Source rules are in [Language](language.md); target rules are in
+This document connects the logical source language to selected physical execution. Source meaning
+is defined by [Language](language.md); target realization is defined by
 [Backends](backends.md).
 
 ## Reference semantics
 
-The reference interpreter executes the structured IR directly and is the semantic
-oracle. It accepts any legal partition from its caller: a width per static binder.
-A conforming reference program produces the same results under every legal partition.
-Every production backend execution must satisfy the caller's entry precision policy
-against the reference interpreter, including its requirements for rounding, exceptional
-values and observable outputs.
+The interpreter executes function bodies and is the semantic oracle. `for` visits its half-open
+range in ascending order. `parallel for` is executed sequentially by the interpreter but means that
+visits are independent: source cannot observe an order between them.
 
-`reduce(t, axis, sum|max|min, unordered=true)` permits a backend to reassociate that
-reduction; the interpreter still accumulates in ascending order. The execution IR carries
-the effect (`ordered = not unordered`), and a backend may use a reassociating algorithm
-only there. The containing alternative remains numerically unknown until compiler proof
-or whole-witness qualification establishes a bound accepted by the compilation policy.
-The same rule applies to approximate transcendental operations and target intrinsics.
+An implementation must preserve source value, ownership, mutation, and ordering effects. Numerical
+operations additionally carry exact, bounded, or qualification-required contracts. A production
+execution is admitted only when its composed evidence satisfies the entry policy.
 
-## Regions
+## Logical loops and state
 
-| Form | Meaning |
+| Source form | Meaning |
 | --- | --- |
-| `parallel` | Independent visits, one slice per binder per visit. A body cannot mutate enclosing state; it may publish to provably disjoint views and yield a result. |
-| `ordered` | Visits in ascending lexicographic order, last binder fastest. Each visit completes before the next begins. A body may update enclosing `let mut` state. |
-| `pipeline` | Ordered visits whose body is one linear stage chain. Each state object has exactly one updating stage. Preparation may run ahead only across stable reads. |
-| `merge` clause | Canonical near-equal contiguous partition of the axis; adjacent partials combine level by level, an odd value is forwarded. Empty domain gives the identity; one part gives its partial. |
-| Refinement | A region over an enclosing slice partitions that slice. It owns a new site. |
-| Rebinding | A region over a region result revisits the producer's pieces. It creates no site and reruns nothing. |
+| `for i in range` | Ordered ascending visits. Captured `let mut` state may be updated. |
+| `parallel for i in range` | Independent visits. Captured scalar or owned local state may not be updated. |
 
-One static binder is one site. Every dynamic instance of the binder uses the same
-selected value. A binder applied to several tensors is one joint traversal.
+An exclusive tensor may be written in `parallel for` only when the checker proves different visits
+write disjoint places, or through an explicitly atomic operation. Lexical position fixes production:
+a binding outside a loop is evaluated once; a binding inside is evaluated once per visit.
 
-Lexical position fixes production: a binding before an inner region is produced once
-per enclosing visit; inside, once per inner visit. Execution never moves,
-duplicates, or merges producers.
+The compiler may block, vectorize, fuse, stage, pipeline, or distribute loops. These are physical
+mapping choices, not additional source constructs. Ordered dependence and parallel independence are
+hard constraints on every mapping.
 
-## Stages and completion
+## Ownership during execution
 
-Consecutive `stage` statements are one linear chain; a stage receives the previous
-stage's yield positionally. Outside a pipeline, a stage and all work it started
-complete before the next stage starts, at the scope of the enclosing owner: the
-invocation, one parallel visit, or one ordered visit. A region completes before the
-statement after it. Region exit discharges every completion obligation inside it.
+- An owned tensor argument transfers ownership into the call.
+- A shared borrow permits reads and may overlap other shared borrows.
+- An exclusive mutable borrow permits mutation and may not overlap another live borrow.
+- Slices are borrows of their backing allocation.
+- `to_owned` and `clone` create new logical ownership; a physical copy may be elided only when this
+  is unobservable.
+- Returned tensors and tuple members are owned. The ABI may use hidden destinations or legal reuse.
 
-Inside a pipeline, stages of one visit run in chain order and carried-state updates
-of visit `i` precede those of visit `i+1`.
+Invocation validation checks shapes, bounded indices and ranges, allocation extents, representation,
+and exclusive-borrow non-aliasing before work is submitted.
 
-A helper call is never a launch, materialization, or completion boundary by itself.
+## Calls and candidate selection
 
-## Region results
+A static call occurrence selects one applicable definition from its function family. For backend
+`B`, portable bodies and applicable `lower ... for B` bodies are alternatives. Backend-specific
+helpers are callable only from definitions for the same backend. Capability requirements and exact
+typed intrinsic uses filter unsupported candidates before selection.
 
-A region used as an expression yields exactly one value of one schema per visit.
-The result keeps the producer's partition: consumers revisit the same pieces and
-select the member of the current visit. Results are immutable, may nest, and may
-pass through stage ports and helper calls. They cannot be counted, indexed by
-number, flattened, or escape the compiled composition. Their cardinality is never
-semantic data.
+Instantiation is a deterministic function of the checked program, target profile, workload, and
+witness. It does not choose or repair. The selected logical body is lowered into compiler-owned
+execution IR containing physical loops, allocations, transfers, launches, and synchronization.
 
-Storage of a result is derived, never declared: one backing per yielded member, with
-one leading piece axis per binder of every enclosing producer, sized by the selected
-piece counts, alive until the last consumer.
+## Physical execution units
 
-## Partial values
+Execution units and fusion intervals belong to compiler IR. They are derived from logical
+statements and calls in authored order. A backend may offer a prescribed realization for a
+contiguous interval when it proves:
 
-A value yielded from a region, or reduced over a structural axis, depends on the
-partition until it is combined. It may be forwarded, stored in results, combined by
-a `merge` clause, accumulated into state by `+`, `max`, or `min` within a traversal
-of the same result, or consumed while traversing that exact result partition. It cannot
-escape as a whole-domain result. This rule is structural and independent of precision.
+1. source order and dependencies are preserved;
+2. loop coordinates correspond;
+3. ownership, mutation, and value lifetimes are preserved;
+4. numerical effects remain admissible;
+5. synchronization and participation are complete; and
+6. all target resource limits hold.
 
-## Execution units
+Legality admits an alternative; it does not rank it. The solver chooses an exact cover of the
+available intervals together with function implementations and other finite mapping decisions.
 
-An execution unit is a static portion of one authored block with a prescribed
-backend execution. Units partition the block's statements in authored order.
+## Physical IR boundary
 
-| Unit kind | Statement |
-| --- | --- |
-| Elementwise | Tile-valued binding or tile state update computed pointwise over identical axes, with scalar broadcast |
-| Local | Reduction, scalar work, loop, branch, helper call, or any other non-elementwise computation |
-| Call | Static call occurrence |
-| Publish | `publish` |
-| Region | Nested region, as statement or bound expression |
-| Stage | One stage of a chain |
+Physical blocks, local arrays, participant groups, launch phases, barriers, and staging buffers may
+appear after logical checking. They are never authored as source types or source control flow. The
+execution IR is verified before backend realization, and realized resource use is checked again
+before native compilation.
 
-- A single-consumer pure tile-valued `let` adjacent to its consumer's unit joins that
-  unit. One that is not adjacent stays its own unit. A multi-consumer `let` is one
-  producer in every grouping.
-- Operators within one statement never split.
-- A stage outside a pipeline carries a completion after it. A fused interval may
-  cross a completion only through a realization that preserves it.
-- A block with fewer than two units has no sequence and no grouping decision.
-- Bodies of loops, branches, stages, and regions have their own sequences. Dynamic
-  visits never create units.
+## Current migration limits
 
-## Contiguous fusion
+- Logical `range[N]` values need a dedicated checked/execution representation; the temporary front
+  end bridge retains only the existing domain form.
+- `parallel for` currently bridges through the existing ordered range node after front-end
+  independence checks; explicit logical-parallel IR and physical mapping are still required.
+- Borrow analysis is lexical and conservative; non-lexical lifetime and disjoint mutable-slice
+  proofs remain to be implemented.
+- Owned-result ABI binding and hidden destinations are not yet complete across every runtime path.
+- Existing compiler IR still contains physical constructs inherited from the prior source model.
+  Those are migration internals, not supported source syntax.
 
-A fusion candidate is a contiguous interval of one sequence with one prescribed
-realization. The backend lists every legal interval, including the singletons that
-are separate execution. The solver picks an exact cover. Nothing else fuses.
-
-An interval is legal only when its realization establishes all of:
-
-1. **Order.** Units stay in authored order. A joint traversal interleaves them per
-   coordinate only when every dependence, state update, failure, and completion is
-   preserved.
-2. **Correspondence.** The units iterate provably corresponding coordinates within
-   the already granted owner. Equal extents or equal selected widths are not proof.
-   Required width equalities are exported as constraints on the sites.
-3. **Production and numerics.** Every producer keeps its occurrence, multiplicity,
-   snapshot semantics, and conversions. No reassociation, no common-producer
-   discovery.
-4. **Interfaces.** Values leaving the interval keep their representation and
-   lifetime. Only compiler-owned intermediates may disappear. A `publish` is never
-   removed.
-5. **Completion and participation.** Every port, ordered visit, and collective
-   participation rule still holds.
-6. **Resources.** Hard capacity limits hold for the combined group.
-
-Legality admits a candidate to the solver. It says nothing about profit. A legal
-group with a high estimate stays a candidate.
-
-## Instantiation
-
-Instantiation is a deterministic function of the program, the family, and the
-witness. It returns one execution IR or a diagnostic. It never chooses and never
-repairs.
-
-| Subject | Rule |
-| --- | --- |
-| Entry | Parameters become the invocation ABI in declaration order. Tensors and views bind buffers; scalars bind scalar arguments; a bounded index binds a checked runtime scalar. |
-| Aliasing | Every written tensor parameter must be disjoint from every other tensor parameter, except that a declared `alias` pair may coincide exactly. The requirement travels with the execution and is checked at invocation. |
-| Calls | The selected candidate's body is inlined. Views stay references. |
-| Slice | Piece `p` of a binder with lower bound `lo` and width `w` is `[lo + p·w, lo + (p+1)·w)`. |
-| Root `parallel` region of the entry | One launch whose work items are the pieces. |
-| Every other region | Ordered loops over pieces inside its owner, first binder outermost. |
-| Root stages and invocation-scope statements | Consecutive root statements, executed in order with completion between them. |
-| Tile computation | One element loop per unit; one loop for a selected elementwise interval. A dependency between its units that is not elementwise is a diagnostic. |
-| Selected interval of root `parallel` regions | One launch over the shared pieces; differing binder geometry under the selected widths is a diagnostic. |
-| `merge` | The canonical adjacent-pair recurrence over the selected part count. |
-| Region result | Local tiles with leading piece axes. |
-| Reduction | The execution IR's reduction carries its numerical contract: ordered unless the source said `unordered=true`. |
-| Runtime-bounded range | Bounds clamped to the axis; the extent is a runtime value. |
-| Data-dependent point index | Runtime bounds check with defined failure. |
-
-The execution IR is verified before it is returned. The backend then realizes it by
-its own fixed rules ([Backends](backends.md)).
-
-## Current limitations
-
-- **Divisor widths only.** A width must divide its static extent. Instantiation
-  rejects any other width. The language contract for tails stands (a selected body
-  must be correct for every valid extent up to its capacity), but no tail piece is
-  generated yet.
-- **Runtime extents.** A domain with a runtime extent is instantiated only at width
-  one. Runtime-length history is authored as a semantic range, not a slice.
-- **Region results stay inside one launch.** A result produced in one launch and
-  consumed in another has no mapping, nor does a root traversal of a result.
-- **Synchronous pipeline only.** One visit prepares, then consumes, on the same
-  participant. Ring depth is fixed at one and is not a site.
-- **Invocation-scope loops** cannot contain regions or calls. A root region result
-  is supported only when a `merge` clause reduces it within its launch.
-- **Intervals do not span a helper call.** See [Compiler](compiler.md#source-stability).
-- **Intervals do not span a lowering-boundary call.** Every call statement is a `Call`
-  unit and the family reports when a callee's root block is solely parallel regions,
-  but instantiation realizes a selected interval of root `parallel` *region* units
-  only. A composition entry pays one launch per callee region.
-- **Runtime-extent tiles are shared by capacity.** Element loops over a tile with a runtime
-  extent divide its capacity among the lanes (a short extent leaves some lanes with less
-  work), and matrix lowerings whose predicates name a runtime extent are inapplicable.
-  Attention over runtime-length history writes its score tile cooperatively into
-  threadgroup memory with the ordered `matmul` chain and runs its value product
-  history-major; it is not windowed.
-- `lanes` loops and `atomic(max|min)` have no structured form; `atomic(add)` is
-  checked but cannot be instantiated.
-
-Each limitation is reported as its own diagnosed outcome. None selects a different
-execution silently.
-
-## Acceptance
-
-- Reference fixtures agree under at least two different partitions.
-- For every supported kernel, the selected Metal execution agrees with the
-  interpreter.
-- Instantiating the same witness twice yields the same execution IR.
+Each unsupported boundary is diagnosed. It does not silently select a different algorithm.

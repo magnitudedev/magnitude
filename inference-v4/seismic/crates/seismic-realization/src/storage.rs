@@ -32,7 +32,14 @@ pub fn plane_byte_offset(elem: &Elem, plane: &str, element_offset: i64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::types::DType;
+    use seismic_lang::{
+        exec::{
+            lowered_ir::ResultBinding,
+            types::{Shaped, Ty},
+        },
+        sym::Sym,
+        types::DType,
+    };
     #[test]
     fn planes_preserve_packet_geometry_and_reject_partial_groups() {
         let packed = Elem::Repr("q4g64".into());
@@ -48,6 +55,35 @@ mod tests {
         );
         assert!(plane_byte_offset(&Elem::Dtype(DType::F32), "words", 0).is_err());
     }
+
+    #[test]
+    fn entry_storage_distinguishes_source_parameters_from_owned_results() {
+        let tensor = || Ty::Tensor(Shaped::new(vec![Sym::constant(4)], Elem::Dtype(DType::F32)));
+        let params = vec![
+            ("x".into(), tensor()),
+            ("$return.0".into(), tensor()),
+            ("$return.1".into(), tensor()),
+        ];
+        let results = vec![
+            ResultBinding {
+                path: vec![0],
+                parameter: 1,
+            },
+            ResultBinding {
+                path: vec![1],
+                parameter: 2,
+            },
+        ];
+
+        let (buffers, scalars) = parameter_types(&params, &[], &results).unwrap();
+
+        assert!(scalars.is_empty());
+        assert_eq!(buffers.len(), 3);
+        assert_eq!(buffers[0].role, crate::BufferRole::Parameter);
+        assert_eq!(buffers[1].role, crate::BufferRole::Result { path: vec![0] });
+        assert_eq!(buffers[2].role, crate::BufferRole::Result { path: vec![1] });
+        assert!(buffers.iter().all(|buffer| buffer.bytes == 16));
+    }
 }
 
 /// Entry storage ABI derived solely from specialized parameter types. This is
@@ -62,11 +98,21 @@ pub fn parameters(
     ),
     String,
 > {
-    parameter_types(&function.params, &function.index_params)
+    let (buffers, mut scalars) = parameter_types(
+        &function.params,
+        &function.index_params,
+        &function.result_bindings,
+    )?;
+    for scalar in &mut scalars {
+        *scalar =
+            seismic_lang::abi::ScalarParameter::from_lowered(function, &scalar.name, scalar.dtype)?;
+    }
+    Ok((buffers, scalars))
 }
 pub fn parameter_types(
     params: &[(String, seismic_lang::exec::types::Ty)],
     index_params: &[(String, seismic_lang::sym::Sym)],
+    result_bindings: &[seismic_lang::exec::lowered_ir::ResultBinding],
 ) -> Result<
     (
         Vec<crate::BufferSpec>,
@@ -77,7 +123,15 @@ pub fn parameter_types(
     use seismic_lang::{abi::ScalarParameter, exec::types::Ty};
     let mut buffers = Vec::new();
     let mut scalars = Vec::new();
-    for (name, ty) in params {
+    for (ordinal, (name, ty)) in params.iter().enumerate() {
+        let role = result_bindings
+            .iter()
+            .find(|binding| binding.parameter == ordinal)
+            .map_or(crate::BufferRole::Parameter, |binding| {
+                crate::BufferRole::Result {
+                    path: binding.path.clone(),
+                }
+            });
         match ty {
             Ty::Tensor(t) => {
                 let count = t.shape.iter().try_fold(1u64, |n, x| {
@@ -90,6 +144,7 @@ pub fn parameter_types(
                     Elem::Dtype(d) => buffers.push(crate::BufferSpec {
                         parameter: name.clone(),
                         plane: String::new(),
+                        role: role.clone(),
                         bytes: count
                             .checked_mul(u64::from(d.bytes()))
                             .and_then(|v| usize::try_from(v).ok())
@@ -102,6 +157,7 @@ pub fn parameter_types(
                             buffers.push(crate::BufferSpec {
                                 parameter: name.clone(),
                                 plane: plane.name.into(),
+                                role: role.clone(),
                                 bytes: plane
                                     .storage_elements(count)
                                     .and_then(|v| v.checked_mul(u64::from(plane.dtype().bytes())))
@@ -126,6 +182,7 @@ pub fn parameter_types(
                             .ok_or("unresolved index bound")
                     })
                     .transpose()?,
+                range: None,
             }),
             _ => return Err("entry parameters must be tensors or scalars".into()),
         }

@@ -6,13 +6,27 @@ pub(crate) use borrowing::LoadLifetimes;
 /// A streamed binding's snapshot may borrow only when the complete piece body
 /// preserves its backing memory and does not mutate the loaded tile.
 pub fn stream_load_can_borrow(body: &[Stmt], var: VarId, source: &Expr) -> bool {
-    let mut roots=Vec::new();
-    fn root(e:&Expr)->Option<VarId>{match &e.kind {ExprKind::Var(v)=>Some(*v),ExprKind::Index{base,..}|ExprKind::Transpose(base)=>root(base),ExprKind::Builtin{name:Builtin::Reshape,args}=>root(&args[0]),_=>None}}
-    let Some(v)=root(source) else {return false;};
+    let mut roots = Vec::new();
+    fn root(e: &Expr) -> Option<VarId> {
+        match &e.kind {
+            ExprKind::Var(v) => Some(*v),
+            ExprKind::Index { base, .. } | ExprKind::Transpose(base) => root(base),
+            ExprKind::Builtin {
+                name: Builtin::Reshape,
+                args,
+            } => root(&args[0]),
+            _ => None,
+        }
+    }
+    let Some(v) = root(source) else {
+        return false;
+    };
     roots.push(v);
-    !body
-        .iter()
-        .any(|stmt| tensor_effect(stmt) || tile_mutated(stmt, var) || roots.iter().any(|v|tile_mutated(stmt,*v)))
+    !body.iter().any(|stmt| {
+        tensor_effect(stmt)
+            || tile_mutated(stmt, var)
+            || roots.iter().any(|v| tile_mutated(stmt, *v))
+    })
 }
 
 pub(crate) fn expressions(e: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
@@ -57,8 +71,14 @@ fn statement(s: &Stmt, predicate: &impl Fn(&Expr) -> bool) -> bool {
         StmtKind::Owned { tile, body, .. } => {
             expressions(tile, predicate) || body.iter().any(|s| statement(s, predicate))
         }
-        StmtKind::LoadLoop { domain, views, body, .. } => {
-            expressions(&domain.view,predicate) || views.iter().any(|e| expressions(e, predicate))
+        StmtKind::LoadLoop {
+            domain,
+            views,
+            body,
+            ..
+        } => {
+            expressions(&domain.view, predicate)
+                || views.iter().any(|e| expressions(e, predicate))
                 || body.iter().any(|s| statement(s, predicate))
         }
         StmtKind::If { cond, then, els } => {
@@ -92,29 +112,48 @@ pub fn expression_can_be_omitted(expr: &Expr) -> bool {
     !expressions(expr, &|e| match &e.kind {
         ExprKind::Call { .. }
         | ExprKind::Intrinsic { .. }
-        | ExprKind::Builtin { name: Builtin::Store | Builtin::Atomic, .. } => true,
+        | ExprKind::Builtin {
+            name: Builtin::Store | Builtin::Atomic,
+            ..
+        } => true,
         // A reshape observes layout validity even if only its extent is used.
         // Type-compatible dimensions alone do not prove a borrowed view can
         // be reshaped without copying (e.g. a noncontiguous tensor slice).
-        ExprKind::Builtin { name: Builtin::Reshape, .. } => true,
+        ExprKind::Builtin {
+            name: Builtin::Reshape,
+            ..
+        } => true,
         // Symbolic points were checked under the retained source conditions.
         // Data-dependent points still carry an execution-time bounds check;
         // dropping a coordinate cannot silently drop that failure. Slices use
         // the language's clamped-window semantics, so they need no such rule.
-        ExprKind::Index { indices, .. } => indices.iter().any(|index| {
-            matches!(index, Index::Point(point) if point.sym.is_none())
-        }),
+        ExprKind::Index { indices, .. } => indices
+            .iter()
+            .any(|index| matches!(index, Index::Point(point) if point.sym.is_none())),
         ExprKind::Binary { op, lhs, rhs } if matches!(op, Div | Rem | Shl | Shr) => {
             let dtype = match &e.ty {
                 Ty::Scalar(d) => Some(*d),
-                Ty::Tile(s) => match s.elem { Elem::Dtype(d) => Some(d), _ => None },
+                Ty::Tile(s) => match s.elem {
+                    Elem::Dtype(d) => Some(d),
+                    _ => None,
+                },
                 _ => None,
             };
-            let Some(dtype) = dtype.filter(|d| d.is_int()) else { return false; };
-            let constant = |e: &Expr| e.sym.as_ref()?.as_constant()
-                .map(|n| crate::numeric::integer_value(dtype, n as u32));
+            let Some(dtype) = dtype.filter(|d| d.is_int()) else {
+                return false;
+            };
+            let constant = |e: &Expr| {
+                e.sym
+                    .as_ref()?
+                    .as_constant()
+                    .map(|n| crate::numeric::integer_value(dtype, n as u32))
+            };
             match op {
-                Div | Rem => !crate::numeric::integer_division_is_defined(dtype, constant(lhs), constant(rhs)),
+                Div | Rem => !crate::numeric::integer_division_is_defined(
+                    dtype,
+                    constant(lhs),
+                    constant(rhs),
+                ),
                 Shl | Shr => !crate::numeric::integer_shift_is_defined(constant(rhs)),
                 _ => unreachable!(),
             }
@@ -130,7 +169,13 @@ pub fn can_substitute_symbolic_value(expr: &Expr) -> bool {
     expr.sym.is_some()
         && expression_can_be_omitted(expr)
         && !expressions(expr, &|e| {
-            matches!(e.kind, ExprKind::Builtin { name: Builtin::Extent, .. })
+            matches!(
+                e.kind,
+                ExprKind::Builtin {
+                    name: Builtin::Extent,
+                    ..
+                }
+            )
         })
 }
 
@@ -141,7 +186,9 @@ pub fn tile_mutated(s: &Stmt, var: VarId) -> bool {
     let mentions = |e: &Expr| expressions(e, &|e| matches!(e.kind,ExprKind::Var(v) if v==var));
     if statement(s, &|e| match &e.kind {
         ExprKind::Call { args, .. } => args.iter().any(&mentions),
-        ExprKind::Intrinsic { op, args } => op.writes_arguments().iter()
+        ExprKind::Intrinsic { op, args } => op
+            .writes_arguments()
+            .iter()
             .any(|a| args.get(*a).is_none_or(&mentions)),
         _ => false,
     }) {
@@ -154,10 +201,7 @@ pub fn tile_mutated(s: &Stmt, var: VarId) -> bool {
         | StmtKind::Range { body, .. }
         | StmtKind::LoadLoop { body, .. }
         | StmtKind::Lanes { body, .. } => body.iter().any(|s| tile_mutated(s, var)),
-        StmtKind::If { then, els, .. } => then
-            .iter()
-            .chain(els)
-            .any(|s| tile_mutated(s, var)),
+        StmtKind::If { then, els, .. } => then.iter().chain(els).any(|s| tile_mutated(s, var)),
         _ => false,
     }
 }
@@ -171,7 +215,10 @@ pub fn tensor_parameter_read_only(body: &[Stmt], root: VarId) -> bool {
         match &e.kind {
             ExprKind::Var(v) => Some(*v),
             ExprKind::Index { base, .. } | ExprKind::Transpose(base) => backing(base),
-            ExprKind::Builtin { name: Builtin::Reshape, args } => args.first().and_then(backing),
+            ExprKind::Builtin {
+                name: Builtin::Reshape,
+                args,
+            } => args.first().and_then(backing),
             _ => None,
         }
     }
@@ -179,10 +226,15 @@ pub fn tensor_parameter_read_only(body: &[Stmt], root: VarId) -> bool {
         for s in body {
             visit(s);
             match &s.kind {
-                StmtKind::Range { body, .. } | StmtKind::Parallel { body, .. }
-                | StmtKind::Owned { body, .. } | StmtKind::Lanes { body, .. }
+                StmtKind::Range { body, .. }
+                | StmtKind::Parallel { body, .. }
+                | StmtKind::Owned { body, .. }
+                | StmtKind::Lanes { body, .. }
                 | StmtKind::LoadLoop { body, .. } => walk(body, visit),
-                StmtKind::If { then, els, .. } => { walk(then, visit); walk(els, visit); }
+                StmtKind::If { then, els, .. } => {
+                    walk(then, visit);
+                    walk(els, visit);
+                }
                 _ => {}
             }
         }
@@ -192,25 +244,45 @@ pub fn tensor_parameter_read_only(body: &[Stmt], root: VarId) -> bool {
         let before = aliases.len();
         walk(body, &mut |s| {
             if let StmtKind::Assign { target, value, .. } = &s.kind {
-                if matches!(value.ty, super::types::Ty::Tensor(_)) && backing(value).is_some_and(|v| aliases.contains(&v)) {
-                    if let ExprKind::Var(v) = target.kind { aliases.insert(v); }
+                if matches!(value.ty, super::types::Ty::Tensor(_))
+                    && backing(value).is_some_and(|v| aliases.contains(&v))
+                {
+                    if let ExprKind::Var(v) = target.kind {
+                        aliases.insert(v);
+                    }
                 }
             }
         });
-        if before == aliases.len() { break; }
+        if before == aliases.len() {
+            break;
+        }
     }
     let aliases_input = |e: &Expr| backing(e).is_some_and(|v| aliases.contains(&v));
     let mut writes_element = false;
     walk(body, &mut |s| {
         if let StmtKind::Assign { target, .. } = &s.kind {
-            if matches!(target.kind, ExprKind::Index { .. }) && aliases_input(target) { writes_element = true; }
+            if matches!(target.kind, ExprKind::Index { .. }) && aliases_input(target) {
+                writes_element = true;
+            }
         }
     });
-    !writes_element && !body.iter().any(|s| statement(s, &|e| match &e.kind {
-        ExprKind::Builtin { name: Builtin::Store, args } => args.get(1).is_none_or(&aliases_input),
-        ExprKind::Builtin { name: Builtin::Atomic, args } => args.first().is_none_or(&aliases_input),
-        ExprKind::Call { args, .. } => args.iter().any(&aliases_input),
-        ExprKind::Intrinsic { op, args } => op.writes_arguments().iter().any(|&i| args.get(i).is_none_or(&aliases_input)),
-        _ => false,
-    }))
+    !writes_element
+        && !body.iter().any(|s| {
+            statement(s, &|e| match &e.kind {
+                ExprKind::Builtin {
+                    name: Builtin::Store,
+                    args,
+                } => args.get(1).is_none_or(&aliases_input),
+                ExprKind::Builtin {
+                    name: Builtin::Atomic,
+                    args,
+                } => args.first().is_none_or(&aliases_input),
+                ExprKind::Call { args, .. } => args.iter().any(&aliases_input),
+                ExprKind::Intrinsic { op, args } => op
+                    .writes_arguments()
+                    .iter()
+                    .any(|&i| args.get(i).is_none_or(&aliases_input)),
+                _ => false,
+            })
+        })
 }

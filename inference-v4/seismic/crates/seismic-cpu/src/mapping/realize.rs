@@ -49,13 +49,7 @@ impl Execution {
     pub fn listing(&self) -> String {
         let mut out = String::new();
         for (ordinal, phase) in self.sequence.phases.iter().enumerate() {
-            out.push_str(&format!(
-                "; {} phase {ordinal}: {} work item(s), {} scratch bytes per worker\n{}\n",
-                self.sequence.name,
-                phase.program.work_items,
-                phase.program.scratch_bytes,
-                phase.program.function.display()
-            ));
+            out.push_str(&format!("; {} phase {ordinal}: {} work item(s), {} scratch bytes per worker\n{}\n", self.sequence.name, phase.program.work_items, phase.program.scratch_bytes, phase.program.function.display()));
         }
         out
     }
@@ -73,11 +67,7 @@ pub(super) fn realize(limits: &Limits, mut lowered: LoweredIr) -> Result<Executi
     }
     let name = lowered.name.clone();
     let classify = |reason: String| {
-        if reason.contains("no static") || reason.contains("not static") || reason.contains("no proven capacity") {
-            SelectionError::AnalysisUnavailable(format!("`{name}`: {reason}"))
-        } else {
-            SelectionError::UnsupportedMapping(format!("`{name}`: {reason}"))
-        }
+        if reason.contains("no static") || reason.contains("not static") || reason.contains("no proven capacity") { SelectionError::AnalysisUnavailable(format!("`{name}`: {reason}")) } else { SelectionError::UnsupportedMapping(format!("`{name}`: {reason}")) }
     };
     let codegen = crate::codegen::Policy::host().map_err(|reason| SelectionError::UnsupportedMapping(format!("`{name}`: {reason}")))?;
     let conditions = InvocationConditions::from_lowered(&lowered).map_err(&classify)?;
@@ -88,10 +78,7 @@ pub(super) fn realize(limits: &Limits, mut lowered: LoweredIr) -> Result<Executi
             return Err(SelectionError::UnsupportedMapping(format!("`{name}` phase {ordinal}: participant operations have no CPU mapping")));
         }
         if u64::try_from(phase.program.scratch_bytes).map_or(true, |bytes| bytes > limits.max_scratch_bytes) {
-            return Err(SelectionError::IncompatibleComposition(format!(
-                "`{name}` phase {ordinal}: {} scratch bytes per worker exceed the {} byte limit",
-                phase.program.scratch_bytes, limits.max_scratch_bytes
-            )));
+            return Err(SelectionError::IncompatibleComposition(format!("`{name}` phase {ordinal}: {} scratch bytes per worker exceed the {} byte limit", phase.program.scratch_bytes, limits.max_scratch_bytes)));
         }
     }
     Ok(Execution { sequence, conditions, codegen })

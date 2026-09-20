@@ -17,9 +17,11 @@ mod search;
 /// The shared structural walk of candidate bodies, parameterized by a backend `Accounting`.
 pub mod structure;
 
-pub use analyze::{analyze, analyze_with, SearchAnalysis};
-pub use backend::{Backend, Constraint, Factor, Interval, IntervalRef};
-pub use search::{replay, select, select_qualified, Budget, Strategy};
+pub use analyze::{SearchAnalysis, analyze, analyze_with};
+pub use backend::{
+    Backend, Constraint, Factor, Interval, IntervalRef, ResourceConstraint, ResourceTerm,
+};
+pub use search::{Budget, Strategy, construct_family, replay, select, select_qualified};
 
 use seismic_lang::family::{Family, Witness};
 use seismic_lang::precision::NumericalAssessment;
@@ -50,6 +52,8 @@ pub struct Selected<E> {
     pub status: ProofStatus,
     /// Identity of the estimate model, e.g. `metal-estimate-unqualified-v0`.
     pub estimate_model: String,
+    /// Effective intrinsic capability identity used during candidate filtering.
+    pub capability_fingerprint: String,
     /// Numerical status of the complete selected witness under the requested precision policy.
     pub numerical_assessment: NumericalAssessment,
     /// Identity of the whole-witness qualification selected for execution, when any.
@@ -69,6 +73,7 @@ pub struct Qualification {
     pub program: [u8; 32],
     pub target: String,
     pub numerical_environment: String,
+    pub capability_fingerprint: String,
     pub estimate_model: String,
     pub entry: String,
     pub shapes: BTreeMap<String, i64>,
@@ -82,6 +87,7 @@ pub struct Qualification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QualificationIdentity {
     pub numerical_environment: String,
+    pub capability_fingerprint: String,
     pub corpus: String,
     pub method: String,
 }
@@ -106,20 +112,31 @@ impl Qualification {
             return Err("qualified outputs do not satisfy the workload precision policy".into());
         }
         let entry = entry.into();
-        let family = seismic_lang::family::construct(program, &entry, backend.target(), workload)?;
+        let family = construct_family(program, &entry, workload, backend)
+            .map_err(|error| error.to_string())?;
         family.validate(&witness)?;
-        let root = family.occurrences.first().ok_or("qualification entry has no root occurrence")?;
-        let reference = root.candidates.iter().find(|candidate| candidate.reference)
+        let root = family
+            .occurrences
+            .first()
+            .ok_or("qualification entry has no root occurrence")?;
+        let reference = root
+            .candidates
+            .iter()
+            .find(|candidate| candidate.reference)
             .ok_or("qualification entry has no portable reference body")?;
         let definition = program.definition(reference.via);
-        let mut expected: std::collections::BTreeSet<String> = definition.params.iter()
-            .filter(|parameter| !matches!(parameter.mode, seismic_lang::syntax::ast::Mode::In))
+        let mut expected: std::collections::BTreeSet<String> = definition
+            .params
+            .iter()
+            .filter(|parameter| !matches!(parameter.mode, seismic_lang::sir::Mode::In))
             .map(|parameter| parameter.name.clone())
             .collect();
         if !matches!(definition.result, seismic_lang::types::Ty::Void) {
             expected.insert("$return".into());
         }
-        let observed: std::collections::BTreeSet<String> = assessment.outputs.iter()
+        let observed: std::collections::BTreeSet<String> = assessment
+            .outputs
+            .iter()
             .map(|output| output.output.clone())
             .collect();
         if observed != expected || assessment.outputs.len() != expected.len() {
@@ -132,6 +149,7 @@ impl Qualification {
             program: program.identity(),
             target: backend.target().into(),
             numerical_environment: backend.numerical_environment(),
+            capability_fingerprint: backend.capability_fingerprint(),
             estimate_model: backend.estimate_model(),
             entry,
             shapes: workload.shapes.clone(),
@@ -146,6 +164,7 @@ impl Qualification {
     pub fn identity(&self) -> QualificationIdentity {
         QualificationIdentity {
             numerical_environment: self.numerical_environment.clone(),
+            capability_fingerprint: self.capability_fingerprint.clone(),
             corpus: self.corpus.clone(),
             method: self.method.clone(),
         }
@@ -242,7 +261,9 @@ impl std::fmt::Display for SelectionError {
             }
             SelectionError::SelectionIncomplete(m) => write!(f, "selection incomplete: {m}"),
             SelectionError::AnalysisUnavailable(m) => write!(f, "analysis unavailable: {m}"),
-            SelectionError::MissingQualification(m) => write!(f, "missing numerical qualification: {m}"),
+            SelectionError::MissingQualification(m) => {
+                write!(f, "missing numerical qualification: {m}")
+            }
             SelectionError::Reconstruction(m) => write!(f, "reconstruction defect: {m}"),
         }
     }

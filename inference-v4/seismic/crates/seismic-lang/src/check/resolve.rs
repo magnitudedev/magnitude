@@ -1,13 +1,13 @@
 //! Declarations: signatures, `where` predicates, contract families, lowering attachment
 //! and explicit target coverage. One flat global namespace.
 
-use crate::intrinsics::{self, IntrinsicResult, Semantics};
+use crate::intrinsics::{self, CapabilityId};
 use crate::repr;
-use crate::sir::{ContractFamily, DefId, DefKind, Predicate};
+use crate::sir::{ContractFamily, DefId, DefKind, Mode, Predicate};
 use crate::span::{Diagnostic, Span};
 use crate::sym::{Atom, Sym};
-use crate::syntax::ast::{self, BinaryOp, ExprKind as A, Mode, ShapedHead, TypeKind};
-use crate::types::{DType, Elem, Extent, NativeTy, Shaped, Ty};
+use crate::syntax::ast::{self, BinaryOp, ExprKind as A, ShapedHead, TypeKind};
+use crate::types::{DType, Elem, Extent, Shaped, Ty};
 use std::collections::HashMap;
 
 /// A diagnostic attributed to a source file (index into the compiled file list).
@@ -21,8 +21,18 @@ pub(crate) struct Located {
 pub(crate) struct SigParam {
     pub name: String,
     pub mode: Mode,
+    pub ownership: ParamOwnership,
     pub ty: Ty,
     pub span: Span,
+}
+
+/// Logical call ownership, kept beside the legacy mode used by existing SIR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParamOwnership {
+    Value,
+    Owned,
+    Shared,
+    Exclusive,
 }
 
 /// A declaration's checked interface. Shapes are semantic extents over its own shape parameters.
@@ -41,12 +51,55 @@ pub(crate) struct Sig {
 pub(crate) struct Declared<'a> {
     pub sig: Sig,
     pub kind: DefKind,
+    pub requires: Vec<(CapabilityId, Span)>,
     pub family: usize,
     pub elem_bindings: Vec<(String, Elem)>,
     pub body: &'a ast::Block,
     pub file: usize,
     pub span: Span,
     pub name_span: Span,
+}
+
+fn requirements(
+    paths: &[ast::CapabilityPath],
+    target: Option<&str>,
+) -> Result<Vec<(CapabilityId, Span)>, Vec<Diagnostic>> {
+    let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
+    for path in paths {
+        let id = CapabilityId::new(&path.backend.name, &path.capability.name);
+        match target {
+            None => diagnostics.push(Diagnostic::new(
+                path.span,
+                format!(
+                    "portable functions cannot require backend capability `{}`",
+                    id.path()
+                ),
+            )),
+            Some(backend) if backend != path.backend.name => diagnostics.push(Diagnostic::new(
+                path.span,
+                format!(
+                    "capability `{}` belongs to backend `{}`, but this declaration is for `{backend}`",
+                    id.path(), path.backend.name
+                ),
+            )),
+            Some(_) if intrinsics::capability(&path.backend.name, &path.capability.name).is_none() => {
+                diagnostics.push(Diagnostic::new(
+                    path.span,
+                    format!("`{}` is not a known capability namespace", id.path()),
+                ));
+            }
+            Some(_) if out.iter().any(|(existing, _)| existing == &id) => diagnostics.push(
+                Diagnostic::new(path.span, format!("capability `{}` is required more than once", id.path())),
+            ),
+            Some(_) => out.push((id, path.span)),
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(out)
+    } else {
+        Err(diagnostics)
+    }
 }
 
 pub(crate) struct Resolved<'a> {
@@ -157,60 +210,6 @@ pub(crate) fn elem_of(
     ))
 }
 
-/// The native type `target.name(args)` from the target's intrinsic table.
-pub(crate) fn native_type(
-    target: &ast::Ident,
-    name: &ast::Ident,
-    args: &[ast::Expr],
-    span: Span,
-) -> Result<NativeTy, Diagnostic> {
-    let Some(table) = intrinsics::table(&target.name) else {
-        return Err(Diagnostic::new(
-            target.span,
-            format!("`{}` is not a target namespace", target.name),
-        ));
-    };
-    let Some(intrinsic) = table.iter().find(|i| {
-        i.operation.name() == name.name && matches!(i.result, IntrinsicResult::Frag8x8OfNamedDtype)
-    }) else {
-        return Err(Diagnostic::new(
-            name.span,
-            format!(
-                "`{}.{}` is not a native type of target `{}`",
-                target.name, name.name, target.name
-            ),
-        ));
-    };
-    let [arg] = args else {
-        return Err(Diagnostic::new(
-            span,
-            format!("`{}.{}` takes one dtype name", target.name, name.name),
-        ));
-    };
-    let dtype = match &arg.kind {
-        A::Name(n) => DType::from_name(&n.name),
-        _ => None,
-    };
-    let Some(dtype) = dtype else {
-        return Err(Diagnostic::new(arg.span, "expected a dtype name"));
-    };
-    let Semantics::Fragment { rows, columns } = intrinsic.operation.semantics() else {
-        return Err(Diagnostic::new(
-            name.span,
-            format!(
-                "`{}.{}` does not declare a native fragment",
-                target.name, name.name
-            ),
-        ));
-    };
-    Ok(NativeTy {
-        target: target.name.clone(),
-        name: name.name.clone(),
-        shape: vec![Sym::constant(rows as i64), Sym::constant(columns as i64)],
-        elem: Some(Elem::Dtype(dtype)),
-    })
-}
-
 fn type_from_ast(
     t: &ast::TypeExpr,
     shape_params: &[String],
@@ -223,6 +222,7 @@ fn type_from_ast(
             None => Err(Diagnostic::new(name.span, format!("unknown type `{}`", name.name))),
         },
         TypeKind::Index(bound) => Ok(Ty::Index(shape_sym(bound, shape_params)?)),
+        TypeKind::Range(bound) => Ok(Ty::Range(shape_sym(bound, shape_params)?)),
         TypeKind::Shaped { head, shape, elem } => {
             if shape.is_empty() {
                 return Err(Diagnostic::new(t.span, "a tensor, view or tile type needs a shape"));
@@ -234,8 +234,7 @@ fn type_from_ast(
             let shaped = Shaped::new(axes, elem_of(elem, elem_params)?);
             Ok(match head {
                 ShapedHead::Tensor => Ty::Tensor(shaped),
-                ShapedHead::View => Ty::View(shaped),
-                ShapedHead::Tile => Ty::Tile(shaped),
+                ShapedHead::SharedTensor | ShapedHead::MutTensor => Ty::View(shaped),
             })
         }
         TypeKind::Tuple(items) => {
@@ -250,7 +249,6 @@ fn type_from_ast(
             Ok(Ty::Tuple(out))
         }
         TypeKind::Void => Ok(Ty::Void),
-        TypeKind::Native { target, name, args } => Ok(Ty::Native(native_type(target, name, args, t.span)?)),
     }
 }
 
@@ -329,42 +327,40 @@ pub(crate) fn signature_of(
         if ty == Ty::Void {
             return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
         }
-        if p.mode != Mode::In
-            && !matches!(
-                ty,
-                Ty::Tensor(_) | Ty::View(_) | Ty::Tile(_) | Ty::Native(_)
-            )
-        {
-            return Err(Diagnostic::new(
-                p.ty.span,
-                format!(
-                    "`out`/`inout` applies to tensors, views, tiles and native values, not {ty}"
-                ),
-            ));
-        }
+        let ownership = match &p.ty.kind {
+            TypeKind::Shaped { head: ShapedHead::Tensor, .. } => ParamOwnership::Owned,
+            TypeKind::Shaped { head: ShapedHead::SharedTensor, .. } => ParamOwnership::Shared,
+            TypeKind::Shaped { head: ShapedHead::MutTensor, .. } => ParamOwnership::Exclusive,
+            _ => ParamOwnership::Value,
+        };
+        let mode = match ownership {
+            ParamOwnership::Exclusive => Mode::Inout,
+            _ => Mode::In,
+        };
         params.push(SigParam {
             name: p.name.name.clone(),
-            mode: p.mode,
+            mode,
+            ownership,
             ty,
             span: p.name.span,
         });
     }
-    let mut aliases = Vec::new();
-    for (a, b) in &s.aliases {
-        let find = |id: &ast::Ident| {
-            params
-                .iter()
-                .position(|p| p.name == id.name)
-                .ok_or_else(|| {
-                    Diagnostic::new(
-                        id.span,
-                        format!("`alias` names unknown parameter `{}`", id.name),
-                    )
-                })
-        };
-        aliases.push((find(a)?, find(b)?));
-    }
+    let aliases = Vec::new();
     let result = match &s.result {
+        Some(t)
+            if matches!(
+                t.kind,
+                TypeKind::Shaped {
+                    head: ShapedHead::SharedTensor | ShapedHead::MutTensor,
+                    ..
+                }
+            ) =>
+        {
+            return Err(Diagnostic::new(
+                t.span,
+                "borrowed tensors cannot be returned; return an owned `tensor`",
+            ));
+        }
         Some(t) => type_from_ast(t, &shape_params, &mut elem_params)?,
         None => Ty::Void,
     };
@@ -394,6 +390,7 @@ pub(crate) fn kinds_overlap(a: &Ty, b: &Ty) -> bool {
         (Ty::Scalar(_) | Ty::Index(_), Ty::Scalar(_) | Ty::Index(_)) => {
             a.scalar_dtype() == b.scalar_dtype()
         }
+        (Ty::Range(_), Ty::Range(_)) => true,
         (Ty::Tensor(x), Ty::Tensor(y))
         | (Ty::View(x), Ty::View(y))
         | (Ty::Tile(x), Ty::Tile(y)) => {
@@ -432,7 +429,7 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
         .params
         .iter()
         .zip(&b.params)
-        .find(|(p, q)| p.mode != q.mode)
+        .find(|(p, q)| p.mode != q.mode || p.ownership != q.ownership)
     {
         return Some(format!(
             "parameter `{}` has a different mode than `{}` of an overlapping definition of `{}`",
@@ -513,6 +510,7 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
         match (a, b) {
             (Ty::Scalar(a), Ty::Scalar(b)) => a == b,
             (Ty::Index(a), Ty::Index(b)) => a == &rename_shape(b, shape_names),
+            (Ty::Range(a), Ty::Range(b)) => a == &rename_shape(b, shape_names),
             (Ty::Tensor(a), Ty::Tensor(b))
             | (Ty::View(a), Ty::View(b))
             | (Ty::Tile(a), Ty::Tile(b)) => {
@@ -587,7 +585,7 @@ pub(crate) fn resolve<'a>(
         for decl in &parsed.decls {
             let ast::Decl::Fn(f) = decl else { continue };
             if let Some(target) = &f.target {
-                if intrinsics::table(&target.name).is_none() {
+                if !intrinsics::known_backend(&target.name) {
                     diagnostics.push(Located {
                         file: *file,
                         diagnostic: Diagnostic::new(
@@ -600,6 +598,19 @@ pub(crate) fn resolve<'a>(
             }
             match signature_of(&f.name.name, &f.signature, &[]) {
                 Ok(sig) => {
+                    let requires = match requirements(
+                        &f.requires,
+                        f.target.as_ref().map(|target| target.name.as_str()),
+                    ) {
+                        Ok(requires) => requires,
+                        Err(found) => {
+                            diagnostics.extend(found.into_iter().map(|diagnostic| Located {
+                                file: *file,
+                                diagnostic,
+                            }));
+                            continue;
+                        }
+                    };
                     if let Err(diagnostic) = check_signature_target(
                         &sig,
                         f.target.as_ref().map(|t| t.name.as_str()),
@@ -616,6 +627,7 @@ pub(crate) fn resolve<'a>(
                         kind: DefKind::Body {
                             target: f.target.as_ref().map(|t| t.name.clone()),
                         },
+                        requires,
                         family: 0,
                         elem_bindings: Vec::new(),
                         body: &f.body,
@@ -698,7 +710,7 @@ pub(crate) fn resolve<'a>(
                 continue;
             };
             let target = l.target.name.clone();
-            if intrinsics::table(&target).is_none() {
+            if !intrinsics::known_backend(&target) {
                 diagnostics.push(Located {
                     file: *file,
                     diagnostic: Diagnostic::new(
@@ -709,6 +721,16 @@ pub(crate) fn resolve<'a>(
                 continue;
             }
             let kind = DefKind::Lower { target };
+            let requires = match requirements(&l.requires, Some(&l.target.name)) {
+                Ok(requires) => requires,
+                Err(found) => {
+                    diagnostics.extend(found.into_iter().map(|diagnostic| Located {
+                        file: *file,
+                        diagnostic,
+                    }));
+                    continue;
+                }
+            };
             let body = &l.body;
             let mut attach: Vec<(usize, Sig, Vec<(String, Elem)>)> = Vec::new();
             {
@@ -765,6 +787,7 @@ pub(crate) fn resolve<'a>(
                 declared.push(Declared {
                     sig,
                     kind: kind.clone(),
+                    requires: requires.clone(),
                     family,
                     elem_bindings,
                     body,

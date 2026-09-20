@@ -4,8 +4,8 @@
 //! choice variables of the ancestors that make it active, and its interval selections.
 //! Activity is a conjunction of choice literals carried as factor guards; inactive
 //! variables are pinned to one canonical value so they never multiply the search.
-use super::{Constraint, Factor, Interval, SelectionError};
-use magnitude_solver::model::{Constraint as Rel, Cost, Literal};
+use super::{Constraint, Factor, Interval, ResourceConstraint, SelectionError};
+use magnitude_solver::model::{Constraint as Rel, Cost, LinearTerm, Literal};
 use magnitude_solver::{Domain, Model, ModelBuilder, VarId};
 use seismic_lang::family::{
     CandidateRef, Family, OccurrenceId, Requirement, SequenceId, SiteId, Witness,
@@ -35,8 +35,16 @@ pub(super) struct Export<'f> {
     sites: Vec<Slot>,
     /// Selection variable and `(sequence, start, end)` per backend interval.
     intervals: Vec<(VarId, SequenceId, u32, u32)>,
+    resources: Vec<ResourceValue>,
     /// Canonical inactive assignment of every variable.
     inactive: Vec<i64>,
+}
+
+struct ResourceValue {
+    variable: VarId,
+    guard: Vec<CandidateRef>,
+    scope: Vec<SiteId>,
+    rows: BTreeMap<Vec<i64>, i64>,
 }
 
 struct Rows {
@@ -235,6 +243,7 @@ impl<'f> Export<'f> {
         family: &'f Family,
         domains: &BTreeMap<SiteId, Vec<i64>>,
         constraints: &[Constraint],
+        resources: &[ResourceConstraint],
         intervals: &[Interval],
         factors: &[Factor],
         qualified: Option<&Witness>,
@@ -244,13 +253,13 @@ impl<'f> Export<'f> {
                 return Err(SelectionError::InvalidSource(format!(
                     "entry `{}` has no occurrence",
                     family.entry
-                )))
+                )));
             }
             Some(root) if root.candidates.is_empty() => {
                 return Err(SelectionError::MissingCoverage(format!(
                     "entry `{}` has no applicable implementation for target `{}`",
                     family.entry, family.target
-                )))
+                )));
             }
             Some(_) => (),
         }
@@ -263,6 +272,7 @@ impl<'f> Export<'f> {
             sites: Vec::new(),
             inactive: Vec::new(),
         };
+        let mut resource_values = Vec::new();
 
         // Implementation choices. Activity needs ancestors' variables, so allocate first.
         for (i, o) in family.occurrences.iter().enumerate() {
@@ -539,6 +549,77 @@ impl<'f> Export<'f> {
             }
         }
 
+        // Additive capacities across independently selected occurrences. Each contribution is
+        // represented by one resource variable: its exact tabulated amount while active and
+        // zero whenever any candidate/site owner in its guard is inactive. The final linear
+        // inequality is polynomial in occurrences and avoids enumerating sibling choices.
+        for resource in resources {
+            let mut linear = Vec::with_capacity(resource.terms.len());
+            for (ordinal, term) in resource.terms.iter().enumerate() {
+                let what = format!("resource `{}` term {ordinal}", resource.reason);
+                let Some(table) = x.rows(&term.scope, &what)? else {
+                    continue;
+                };
+                let mut guards = Vec::new();
+                for candidate in &term.guard {
+                    x.checked(*candidate)?;
+                    guards.extend(x.activity(*candidate));
+                }
+                for site in &term.scope {
+                    guards.extend(x.site_activity(*site)?);
+                }
+                guards.sort_unstable_by_key(|literal| (literal.variable.0, literal.value));
+                guards.dedup();
+
+                let mut rows = Vec::with_capacity(table.rows.len());
+                let mut retained_rows = BTreeMap::new();
+                let mut values = vec![0i64];
+                for (tuple, args) in table.rows {
+                    let amount = (term.amount)(&args).map_err(|error| {
+                        SelectionError::AnalysisUnavailable(format!("{what} at {args:?}: {error}"))
+                    })?;
+                    let amount = i64::try_from(amount).map_err(|_| {
+                        SelectionError::AnalysisUnavailable(format!(
+                            "{what}: amount {amount} exceeds the solver integer range"
+                        ))
+                    })?;
+                    values.push(amount);
+                    let mut row = tuple;
+                    retained_rows.insert(row.clone(), amount);
+                    row.push(amount);
+                    rows.push(row);
+                }
+                values.sort_unstable();
+                values.dedup();
+                let amount = x.variable(
+                    format!("resource_{}_{}", resource.reason, ordinal),
+                    Domain::set(values),
+                    0,
+                    &guards,
+                );
+                let mut variables = table.vars;
+                variables.push(amount);
+                x.b.guarded_constraint(
+                    guards,
+                    Rel::Table {
+                        variables,
+                        tuples: rows,
+                    },
+                );
+                linear.push(LinearTerm::new(amount, 1));
+                resource_values.push(ResourceValue {
+                    variable: amount,
+                    guard: term.guard.clone(),
+                    scope: term.scope.clone(),
+                    rows: retained_rows,
+                });
+            }
+            x.b.constraint(Rel::LinearLe {
+                terms: linear,
+                rhs: i128::from(resource.capacity),
+            });
+        }
+
         // Local cost factors, each over exactly its scope.
         for factor in factors {
             let what = format!("factor `{}`", factor.label);
@@ -590,6 +671,7 @@ impl<'f> Export<'f> {
             choices,
             sites,
             intervals: selections,
+            resources: resource_values,
             inactive,
         })
     }
@@ -718,6 +800,26 @@ impl<'f> Export<'f> {
             || covers != witness.covers.len()
         {
             return Err("witness assigns inactive occurrences, sites or sequences".into());
+        }
+        for resource in &self.resources {
+            let active = resource.guard.iter().all(|candidate| {
+                witness.choices.get(&candidate.occurrence) == Some(&candidate.candidate)
+            }) && resource.scope.iter().all(|site| witness.sites.contains_key(site));
+            if active {
+                let key: Result<Vec<i64>, String> =
+                    resource
+                        .scope
+                        .iter()
+                        .map(|site| {
+                            witness.sites.get(site).copied().ok_or_else(|| {
+                                format!("active resource site {} has no value", site.0)
+                            })
+                        })
+                        .collect();
+                values[resource.variable.0] = *resource.rows.get(&key?).ok_or_else(|| {
+                    "active resource has no amount for the witness site tuple".to_string()
+                })?;
+            }
         }
         Ok(values)
     }

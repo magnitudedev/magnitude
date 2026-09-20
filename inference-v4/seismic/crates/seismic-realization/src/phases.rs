@@ -1582,7 +1582,9 @@ impl Scope<'_> {
                     self.indices(vars, &mut inner)?;
                     self.body(body, &mut inner)?;
                 }
-                StmtKind::Range { var, lo, hi, body } => {
+                StmtKind::Range {
+                    var, lo, hi, body, ..
+                } => {
                     self.use_symbols(lo, bound);
                     self.use_symbols(hi, bound);
                     let mut inner = bound.clone();

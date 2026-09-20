@@ -6,7 +6,7 @@
 use seismic_lang::interp::{Rng, TensorData};
 use seismic_lang::program::{collect_files, compile};
 use seismic_lang::repr;
-use seismic_lang::syntax::ast::Mode;
+use seismic_lang::sir::Mode;
 use seismic_lang::types::{DType, Elem};
 use seismic_lang::types::{Extent, Ty};
 use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};

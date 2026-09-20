@@ -15,14 +15,14 @@ use seismic_realization::{Dispatch, ScalarProgram};
 use std::collections::{HashMap, HashSet};
 
 /// Pure IR planning: no driver, native compilation, resource query or measurement.
-pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
+pub fn prepare(program: &ScalarProgram, target: Target) -> Result<TargetPlan, String> {
     let optimized = optimize::optimize(&program.function)?;
     let f = &optimized;
     let mut builder = Builder {
         f,
         program,
         plan: TargetPlan {
-            target: Target::Sm80Ptx70,
+            target,
             registers: Vec::new(),
             parameters: Vec::new(),
             body: Vec::new(),
@@ -120,7 +120,12 @@ pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
         Comparison::GreaterEqual,
         DataType::U64,
         linear.into(),
-        Operand::Unsigned(program.work_items.checked_mul(u64::from(program.participation.lanes())).ok_or("CUDA participant count overflow")?),
+        Operand::Unsigned(
+            program
+                .work_items
+                .checked_mul(u64::from(program.participation.lanes()))
+                .ok_or("CUDA participant count overflow")?,
+        ),
     );
     builder.predicated(Operation::Return, false);
     builder.origin = Origin::InvocationAbi;
@@ -169,8 +174,17 @@ pub fn prepare(program: &ScalarProgram) -> Result<TargetPlan, String> {
     }
     if program.dispatch == Dispatch::ParallelRoot {
         if program.participation.lanes() > 1 {
-            builder.binary_op(Binary::Divide, DataType::U64, Rounding::Default, builder.value(params[3]), linear.into(), Operand::Unsigned(u64::from(program.participation.lanes())));
-        } else { builder.mov(DataType::U64, builder.value(params[3]), linear.into()); }
+            builder.binary_op(
+                Binary::Divide,
+                DataType::U64,
+                Rounding::Default,
+                builder.value(params[3]),
+                linear.into(),
+                Operand::Unsigned(u64::from(program.participation.lanes())),
+            );
+        } else {
+            builder.mov(DataType::U64, builder.value(params[3]), linear.into());
+        }
         builder.binary_op(
             Binary::Multiply(Multiply::Low),
             DataType::U64,
@@ -238,11 +252,7 @@ fn bits(t: Type) -> DataType {
     }
 }
 fn value_type(t: Type) -> DataType {
-    if t.is_float() {
-        float(t)
-    } else {
-        bits(t)
-    }
+    if t.is_float() { float(t) } else { bits(t) }
 }
 /// Binary32 or binary64 arithmetic type of a float SSA value.
 fn float(t: Type) -> DataType {
@@ -273,7 +283,10 @@ fn condition_only(f: &ir::Function) -> HashSet<Value> {
     for block in f.layout.blocks() {
         for inst in f.layout.block_insts(block) {
             let data = &f.dfg.insts[inst];
-            if matches!(data, D::IntCompare { .. } | D::IntCompareImm { .. } | D::FloatCompare { .. }) {
+            if matches!(
+                data,
+                D::IntCompare { .. } | D::IntCompareImm { .. } | D::FloatCompare { .. }
+            ) {
                 candidates.extend(f.dfg.inst_results(inst).first().copied());
             }
             let condition = match data {
@@ -395,7 +408,11 @@ impl Builder<'_> {
     fn operand(&self, value: Value) -> Operand {
         let value = self.f.dfg.resolve_aliases(value);
         if let ir::ValueDef::Result(inst, _) = self.f.dfg.value_def(value) {
-            if let D::UnaryImm { opcode: O::Iconst, imm } = self.f.dfg.insts[inst] {
+            if let D::UnaryImm {
+                opcode: O::Iconst,
+                imm,
+            } = self.f.dfg.insts[inst]
+            {
                 if (0..=i64::from(i32::MAX)).contains(&imm.bits()) {
                     return Operand::Signed(imm.bits());
                 }
@@ -405,9 +422,23 @@ impl Builder<'_> {
     }
     /// Constant moves whose register no instruction reads (every use took the immediate).
     fn drop_unread_constants(&mut self) {
-        let read: HashSet<RegisterId> = self.plan.instructions().flat_map(|i| i.effects().register_reads).collect();
+        let read: HashSet<RegisterId> = self
+            .plan
+            .instructions()
+            .flat_map(|i| i.effects().register_reads)
+            .collect();
         self.plan.body.retain(|item| match item {
-            Item::Instruction(Instruction { predicate: None, operation: Operation::Unary { operation: Unary::Move, destination, source: Operand::Signed(_), .. }, .. }) => read.contains(destination),
+            Item::Instruction(Instruction {
+                predicate: None,
+                operation:
+                    Operation::Unary {
+                        operation: Unary::Move,
+                        destination,
+                        source: Operand::Signed(_),
+                        ..
+                    },
+                ..
+            }) => read.contains(destination),
             _ => true,
         });
     }
@@ -416,7 +447,12 @@ impl Builder<'_> {
     fn condition(&mut self, value: Value) -> Result<(), String> {
         let value = self.f.dfg.resolve_aliases(value);
         if !self.conditions.contains(&value) {
-            self.compare(Comparison::NotEqual, DataType::U32, self.value(value).into(), Operand::Unsigned(0));
+            self.compare(
+                Comparison::NotEqual,
+                DataType::U32,
+                self.value(value).into(),
+                Operand::Unsigned(0),
+            );
             return Ok(());
         }
         let ir::ValueDef::Result(inst, _) = self.f.dfg.value_def(value) else {
@@ -426,14 +462,29 @@ impl Builder<'_> {
             D::IntCompare { args, cond, .. } => {
                 let (cc, signed) = int_cc(*cond);
                 let at = self.f.dfg.value_type(args[0]);
-                self.compare(cc, if signed { sint(at) } else { uint(at) }, self.value(args[0]).into(), self.operand(args[1]));
+                self.compare(
+                    cc,
+                    if signed { sint(at) } else { uint(at) },
+                    self.value(args[0]).into(),
+                    self.operand(args[1]),
+                );
             }
             D::IntCompareImm { arg, cond, imm, .. } => {
                 let (cc, signed) = int_cc(*cond);
                 let at = self.f.dfg.value_type(*arg);
-                self.compare(cc, if signed { sint(at) } else { uint(at) }, self.value(*arg).into(), Operand::Signed(imm.bits()));
+                self.compare(
+                    cc,
+                    if signed { sint(at) } else { uint(at) },
+                    self.value(*arg).into(),
+                    Operand::Signed(imm.bits()),
+                );
             }
-            D::FloatCompare { args, cond, .. } => self.compare(float_cc(*cond), float(self.f.dfg.value_type(args[0])), self.value(args[0]).into(), self.value(args[1]).into()),
+            D::FloatCompare { args, cond, .. } => self.compare(
+                float_cc(*cond),
+                float(self.f.dfg.value_type(args[0])),
+                self.value(args[0]).into(),
+                self.value(args[1]).into(),
+            ),
             _ => return Err("condition-only value has no defining comparison".into()),
         }
         Ok(())
@@ -560,14 +611,18 @@ impl Builder<'_> {
                     predicate: self.predicate,
                 });
             }
-            D::Ternary { .. } if op == O::Fma && t != types::F32 => return Err("PTX fused multiply-add is realized for f32 only".into()),
+            D::Ternary { .. } if op == O::Fma && t != types::F32 => {
+                return Err("PTX fused multiply-add is realized for f32 only".into());
+            }
             D::Ternary { args, .. } if op == O::Fma => self.push(Operation::Fma {
                 destination: output()?,
                 a: self.value(args[0]).into(),
                 b: self.value(args[1]).into(),
                 c: self.value(args[2]).into(),
             }),
-            D::Binary { args, .. } if op == O::Umulhi => self.unsigned_high_product(output()?, t, args[0], args[1])?,
+            D::Binary { args, .. } if op == O::Umulhi => {
+                self.unsigned_high_product(output()?, t, args[0], args[1])?
+            }
             D::Binary { args, .. } if op == O::Smulhi => {
                 // High half of the signed product: the unsigned one, less each operand where
                 // the other is negative (two's complement).
@@ -576,22 +631,58 @@ impl Builder<'_> {
                 let correction = self.temp(t)?;
                 for (sign, other) in [(a, b), (b, a)] {
                     self.compare(Comparison::Less, sint(t), sign.into(), Operand::Signed(0));
-                    self.push(Operation::Select { data_type: uint(t), destination: correction, when_true: other.into(), when_false: Operand::Unsigned(0), predicate: self.predicate });
-                    self.binary_op(Binary::Subtract, uint(t), Rounding::Default, out, out.into(), correction.into());
+                    self.push(Operation::Select {
+                        data_type: uint(t),
+                        destination: correction,
+                        when_true: other.into(),
+                        when_false: Operand::Unsigned(0),
+                        predicate: self.predicate,
+                    });
+                    self.binary_op(
+                        Binary::Subtract,
+                        uint(t),
+                        Rounding::Default,
+                        out,
+                        out.into(),
+                        correction.into(),
+                    );
                 }
             }
             D::Binary { args, .. } if matches!(op, O::Umin | O::Umax | O::Smin | O::Smax) => {
                 let (a, b) = (self.value(args[0]), self.operand(args[1]));
-                let data_type = if matches!(op, O::Umin | O::Umax) { uint(t) } else { sint(t) };
-                self.compare(if matches!(op, O::Umin | O::Smin) { Comparison::Less } else { Comparison::Greater }, data_type, a.into(), b);
-                self.push(Operation::Select { data_type: bits(t), destination: output()?, when_true: a.into(), when_false: b, predicate: self.predicate });
+                let data_type = if matches!(op, O::Umin | O::Umax) {
+                    uint(t)
+                } else {
+                    sint(t)
+                };
+                self.compare(
+                    if matches!(op, O::Umin | O::Smin) {
+                        Comparison::Less
+                    } else {
+                        Comparison::Greater
+                    },
+                    data_type,
+                    a.into(),
+                    b,
+                );
+                self.push(Operation::Select {
+                    data_type: bits(t),
+                    destination: output()?,
+                    when_true: a.into(),
+                    when_false: b,
+                    predicate: self.predicate,
+                });
             }
             D::Binary { args, .. } => self.binary(
                 op,
                 output()?,
                 t,
                 self.value(args[0]).into(),
-                if t.is_int() { self.operand(args[1]) } else { self.value(args[1]).into() },
+                if t.is_int() {
+                    self.operand(args[1])
+                } else {
+                    self.value(args[1]).into()
+                },
             )?,
             D::BinaryImm64 { arg, imm, .. } => self.binary(
                 op,
@@ -605,39 +696,93 @@ impl Builder<'_> {
                 self.mov(bits(t), output()?, self.value(*arg).into())
             }
             D::Call { func_ref, .. } => {
-                if let Some((_, operation)) = self.program.backend_calls.iter().find(|(reference,_)|reference==func_ref) {
-                    let args=self.f.dfg.inst_args(inst);
+                if let Some((_, operation)) = self
+                    .program
+                    .backend_calls
+                    .iter()
+                    .find(|(reference, _)| reference == func_ref)
+                {
+                    let args = self.f.dfg.inst_args(inst);
                     match operation {
                         seismic_realization::ParticipantOperation::LaneIndex => {
-                            if !args.is_empty() || t != types::I32 { return Err("invalid lane-index call ABI".into()); }
-                            self.mov(DataType::U32, output()?, Operand::Special(SpecialRegister::LaneIndex));
+                            if !args.is_empty() || t != types::I32 {
+                                return Err("invalid lane-index call ABI".into());
+                            }
+                            self.mov(
+                                DataType::U32,
+                                output()?,
+                                Operand::Special(SpecialRegister::LaneIndex),
+                            );
                         }
                         seismic_realization::ParticipantOperation::ShuffleIndex => {
-                            if args.len()!=2 || t!=types::F32 || self.f.dfg.value_type(args[0])!=types::F32 || self.f.dfg.value_type(args[1])!=types::I32 {return Err("shuffle-index requires f32 value and i32 lane".into());}
-                            let source=self.temp(types::I32)?;let result=self.temp(types::I32)?;
-                            self.mov(DataType::B32,source,self.value(args[0]).into());
-                            self.push(Operation::Shuffle{mode:ShuffleMode::Index,destination:result,source,lane:self.value(args[1]).into()});
-                            self.mov(DataType::B32,output()?,result.into());
+                            if args.len() != 2
+                                || t != types::F32
+                                || self.f.dfg.value_type(args[0]) != types::F32
+                                || self.f.dfg.value_type(args[1]) != types::I32
+                            {
+                                return Err("shuffle-index requires f32 value and i32 lane".into());
+                            }
+                            let source = self.temp(types::I32)?;
+                            let result = self.temp(types::I32)?;
+                            self.mov(DataType::B32, source, self.value(args[0]).into());
+                            self.push(Operation::Shuffle {
+                                mode: ShuffleMode::Index,
+                                destination: result,
+                                source,
+                                lane: self.value(args[1]).into(),
+                            });
+                            self.mov(DataType::B32, output()?, result.into());
                         }
-                        seismic_realization::ParticipantOperation::Reduce(seismic_lang::exec::ir::ReduceOp::Sum) => {
-                            if args.len()!=1 || t!=types::F32 || self.f.dfg.value_type(args[0])!=types::F32 { return Err("warp sum requires f32 input and output".into()); }
-                            let accumulator=self.temp(types::F32)?;
-                            self.mov(DataType::F32,accumulator,self.value(args[0]).into());
-                            for delta in [16,8,4,2,1] {
-                                let input=self.temp(types::I32)?;let exchange=self.temp(types::I32)?;let received=self.temp(types::F32)?;
-                                self.mov(DataType::B32,input,accumulator.into());
-                                self.push(Operation::Shuffle{mode:ShuffleMode::Butterfly,destination:exchange,source:input,lane:Operand::Unsigned(delta)});
-                                self.mov(DataType::B32,received,exchange.into());
-                                self.binary_op(Binary::Add,DataType::F32,Rounding::NearestEven,accumulator,accumulator.into(),received.into());
+                        seismic_realization::ParticipantOperation::Reduce(
+                            seismic_lang::exec::ir::ReduceOp::Sum,
+                        ) => {
+                            if args.len() != 1
+                                || t != types::F32
+                                || self.f.dfg.value_type(args[0]) != types::F32
+                            {
+                                return Err("warp sum requires f32 input and output".into());
+                            }
+                            let accumulator = self.temp(types::F32)?;
+                            self.mov(DataType::F32, accumulator, self.value(args[0]).into());
+                            for delta in [16, 8, 4, 2, 1] {
+                                let input = self.temp(types::I32)?;
+                                let exchange = self.temp(types::I32)?;
+                                let received = self.temp(types::F32)?;
+                                self.mov(DataType::B32, input, accumulator.into());
+                                self.push(Operation::Shuffle {
+                                    mode: ShuffleMode::Butterfly,
+                                    destination: exchange,
+                                    source: input,
+                                    lane: Operand::Unsigned(delta),
+                                });
+                                self.mov(DataType::B32, received, exchange.into());
+                                self.binary_op(
+                                    Binary::Add,
+                                    DataType::F32,
+                                    Rounding::NearestEven,
+                                    accumulator,
+                                    accumulator.into(),
+                                    received.into(),
+                                );
                             }
                             // Uniform source results include NaN payloads: publish the
                             // same lane-zero tree result to every participant.
-                            let input=self.temp(types::I32)?;let broadcast=self.temp(types::I32)?;
-                            self.mov(DataType::B32,input,accumulator.into());
-                            self.push(Operation::Shuffle{mode:ShuffleMode::Index,destination:broadcast,source:input,lane:Operand::Unsigned(0)});
-                            self.mov(DataType::B32,output()?,broadcast.into());
+                            let input = self.temp(types::I32)?;
+                            let broadcast = self.temp(types::I32)?;
+                            self.mov(DataType::B32, input, accumulator.into());
+                            self.push(Operation::Shuffle {
+                                mode: ShuffleMode::Index,
+                                destination: broadcast,
+                                source: input,
+                                lane: Operand::Unsigned(0),
+                            });
+                            self.mov(DataType::B32, output()?, broadcast.into());
                         }
-                        _=>return Err("participant operation has no selected PTX implementation".into()),
+                        _ => {
+                            return Err(
+                                "participant operation has no selected PTX implementation".into()
+                            );
+                        }
                     }
                     return Ok(());
                 }
@@ -714,7 +859,11 @@ impl Builder<'_> {
             O::Fpromote | O::Fdemote => Operation::Convert {
                 destination_type: float(t),
                 source_type: float(at),
-                rounding: if op == O::Fpromote { Rounding::Default } else { Rounding::NearestEven },
+                rounding: if op == O::Fpromote {
+                    Rounding::Default
+                } else {
+                    Rounding::NearestEven
+                },
                 destination: out,
                 source,
             },
@@ -833,13 +982,43 @@ impl Builder<'_> {
 
     /// High half of the unsigned product (division by a constant). 32-bit: one wide multiply.
     /// 64-bit: the schoolbook sum of the four 32x32 wide products.
-    fn unsigned_high_product(&mut self, out: RegisterId, t: Type, a: Value, b: Value) -> Result<(), String> {
+    fn unsigned_high_product(
+        &mut self,
+        out: RegisterId,
+        t: Type,
+        a: Value,
+        b: Value,
+    ) -> Result<(), String> {
         let (a, b): (Operand, Operand) = (self.value(a).into(), self.value(b).into());
-        let shift = |builder: &mut Self, destination: RegisterId, source: RegisterId| builder.binary_op(Binary::ShiftRight, DataType::U64, Rounding::Default, destination, source.into(), Operand::Unsigned(32));
-        let narrow = |builder: &mut Self, destination: RegisterId, source: Operand| builder.push(Operation::Convert { destination_type: DataType::U32, source_type: DataType::U64, rounding: Rounding::Default, destination, source });
+        let shift = |builder: &mut Self, destination: RegisterId, source: RegisterId| {
+            builder.binary_op(
+                Binary::ShiftRight,
+                DataType::U64,
+                Rounding::Default,
+                destination,
+                source.into(),
+                Operand::Unsigned(32),
+            )
+        };
+        let narrow = |builder: &mut Self, destination: RegisterId, source: Operand| {
+            builder.push(Operation::Convert {
+                destination_type: DataType::U32,
+                source_type: DataType::U64,
+                rounding: Rounding::Default,
+                destination,
+                source,
+            })
+        };
         if t == types::I32 {
             let wide = self.temp(types::I64)?;
-            self.binary_op(Binary::Multiply(Multiply::Wide), DataType::U32, Rounding::Default, wide, a, b);
+            self.binary_op(
+                Binary::Multiply(Multiply::Wide),
+                DataType::U32,
+                Rounding::Default,
+                wide,
+                a,
+                b,
+            );
             shift(self, wide, wide);
             narrow(self, out, wide.into());
             return Ok(());
@@ -849,30 +1028,82 @@ impl Builder<'_> {
         }
         let mut halves = Vec::new();
         for operand in [a, b] {
-            let (low, high, shifted) = (self.temp(types::I32)?, self.temp(types::I32)?, self.temp(types::I64)?);
+            let (low, high, shifted) = (
+                self.temp(types::I32)?,
+                self.temp(types::I32)?,
+                self.temp(types::I64)?,
+            );
             narrow(self, low, operand);
-            self.binary_op(Binary::ShiftRight, DataType::U64, Rounding::Default, shifted, operand, Operand::Unsigned(32));
+            self.binary_op(
+                Binary::ShiftRight,
+                DataType::U64,
+                Rounding::Default,
+                shifted,
+                operand,
+                Operand::Unsigned(32),
+            );
             narrow(self, high, shifted.into());
             halves.push((low, high));
         }
         let ((a0, a1), (b0, b1)) = (halves[0], halves[1]);
-        let product = |builder: &mut Self, x: RegisterId, y: RegisterId| -> Result<RegisterId, String> {
-            let wide = builder.temp(types::I64)?;
-            builder.binary_op(Binary::Multiply(Multiply::Wide), DataType::U32, Rounding::Default, wide, x.into(), y.into());
-            Ok(wide)
-        };
-        let (p00, p01, p10, p11) = (product(self, a0, b0)?, product(self, a0, b1)?, product(self, a1, b0)?, product(self, a1, b1)?);
+        let product =
+            |builder: &mut Self, x: RegisterId, y: RegisterId| -> Result<RegisterId, String> {
+                let wide = builder.temp(types::I64)?;
+                builder.binary_op(
+                    Binary::Multiply(Multiply::Wide),
+                    DataType::U32,
+                    Rounding::Default,
+                    wide,
+                    x.into(),
+                    y.into(),
+                );
+                Ok(wide)
+            };
+        let (p00, p01, p10, p11) = (
+            product(self, a0, b0)?,
+            product(self, a0, b1)?,
+            product(self, a1, b0)?,
+            product(self, a1, b1)?,
+        );
         let (middle, part) = (self.temp(types::I64)?, self.temp(types::I64)?);
         shift(self, middle, p00);
         for cross in [p01, p10] {
-            self.binary_op(Binary::And, DataType::B64, Rounding::Default, part, cross.into(), Operand::Unsigned(0xFFFF_FFFF));
-            self.binary_op(Binary::Add, DataType::U64, Rounding::Default, middle, middle.into(), part.into());
+            self.binary_op(
+                Binary::And,
+                DataType::B64,
+                Rounding::Default,
+                part,
+                cross.into(),
+                Operand::Unsigned(0xFFFF_FFFF),
+            );
+            self.binary_op(
+                Binary::Add,
+                DataType::U64,
+                Rounding::Default,
+                middle,
+                middle.into(),
+                part.into(),
+            );
         }
         shift(self, middle, middle);
-        self.binary_op(Binary::Add, DataType::U64, Rounding::Default, out, p11.into(), middle.into());
+        self.binary_op(
+            Binary::Add,
+            DataType::U64,
+            Rounding::Default,
+            out,
+            p11.into(),
+            middle.into(),
+        );
         for cross in [p01, p10] {
             shift(self, part, cross);
-            self.binary_op(Binary::Add, DataType::U64, Rounding::Default, out, out.into(), part.into());
+            self.binary_op(
+                Binary::Add,
+                DataType::U64,
+                Rounding::Default,
+                out,
+                out.into(),
+                part.into(),
+            );
         }
         Ok(())
     }

@@ -24,7 +24,8 @@ use seismic_lang::sir::{
     SliceParent, Stmt, StmtKind, VarId,
 };
 use seismic_lang::sym::Sym;
-use seismic_lang::syntax::ast::{AssignOp, RegionMode};
+use seismic_lang::syntax::ast::AssignOp;
+use seismic_lang::sir::RegionMode;
 use seismic_lang::types::{Elem, Extent, RegionId, Shaped, SliceId, Ty};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -751,6 +752,10 @@ pub fn each_expr_in<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
             | ExprKind::Math { args: items, .. }
             | ExprKind::Call { args: items, .. }
             | ExprKind::Intrinsic { args: items, .. } => items.iter().for_each(|i| expr(i, f)),
+            ExprKind::Range { lo, hi } => {
+                expr(lo, f);
+                expr(hi, f);
+            }
             ExprKind::Field { base, .. }
             | ExprKind::Filled { like: base, .. }
             | ExprKind::Member { result: base, .. }
@@ -1394,6 +1399,10 @@ impl<A: Accounting> Walker<'_, '_, A> {
                     self.expr(item)?;
                 }
             }
+            ExprKind::Range { lo, hi } => {
+                self.expr(lo)?;
+                self.expr(hi)?;
+            }
             ExprKind::Field { base, .. }
             | ExprKind::Member { result: base, .. }
             | ExprKind::Transpose(base)
@@ -1469,9 +1478,11 @@ impl<A: Accounting> Walker<'_, '_, A> {
                 self.ops(folded);
             }
             ExprKind::Call { call, args } => {
-                if self.invocation() && self.host_loops > 0 {
-                    return self.unsupported("a call inside an invocation-scope loop");
-                }
+                // Calls are logical composition, not native launches.  Preserve the
+                // enclosing loop multiplicity and non-invocation scope for the callee;
+                // instantiation inlines the selected body into that scope.  Rejecting
+                // this shape made ordinary helpers (for example a reduction used by
+                // each row of a normalization) impossible to express.
                 self.account.calls.insert(*call, self.scope());
                 for (ordinal, arg) in args.iter().enumerate() {
                     A::call_argument(self, *call, ordinal, arg)?;

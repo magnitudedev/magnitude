@@ -1,16 +1,17 @@
 //! Calls: casts, toolchain operations, target intrinsics, and calls of contract families
 //! with one candidate binding per definition that unifies with the arguments.
 
-use super::resolve::Sig;
+use super::resolve::{ParamOwnership, Sig};
 use super::Checker;
 use crate::intrinsics::{self, Intrinsic, IntrinsicParam, IntrinsicResult, Operation, Semantics};
 use crate::sir::{
     self, CallId, CallSite, CandidateBinding, DefId, DefKind, Expr, ExprKind, Math, ReduceOp,
-    VarKind,
+    VarId, VarKind,
 };
 use crate::span::Span;
 use crate::sym::{Atom, Sym};
-use crate::syntax::ast::{self, BinaryOp, ExprKind as A, Mode};
+use crate::syntax::ast::{self, BinaryOp, ExprKind as A};
+use crate::sir::Mode;
 use crate::types::{DType, Elem, Extent, NativeTy, Shaped, Ty};
 use std::collections::HashMap;
 
@@ -80,17 +81,31 @@ impl<'a> Checker<'a> {
         let name = match &callee.kind {
             A::Name(name) => name,
             A::Attr { base, name } => {
-                let namespace = match &base.kind {
-                    A::Name(ns) if self.lookup(&ns.name).is_none() => ns,
+                let (backend, capability) = match &base.kind {
+                    A::Attr {
+                        base: root,
+                        name: capability,
+                    } => match &root.kind {
+                        A::Name(backend) if self.lookup(&backend.name).is_none() => {
+                            (backend, capability)
+                        }
+                        _ => {
+                            self.error(
+                                callee.span,
+                                "capability intrinsics use `<backend>.<capability>.<operation>`",
+                            );
+                            return None;
+                        }
+                    },
                     _ => {
                         self.error(
                             callee.span,
-                            "only named functions and `target.intrinsic` operations can be called",
+                            "capability intrinsics use `<backend>.<capability>.<operation>`",
                         );
                         return None;
                     }
                 };
-                return self.intrinsic(namespace, name, args, span);
+                return self.intrinsic(backend, capability, name, args, span);
             }
             _ => {
                 self.error(callee.span, "only named functions can be called; functions and operations resolve statically");
@@ -109,6 +124,8 @@ impl<'a> Checker<'a> {
             || matches!(
                 name.name.as_str(),
                 "load"
+                    | "to_owned"
+                    | "clone"
                     | "decode"
                     | "zeros_like"
                     | "ones_like"
@@ -152,6 +169,40 @@ impl<'a> Checker<'a> {
             ok
         };
         match name.name.as_str() {
+            "to_owned" | "clone" => {
+                if !positional(self, 1) {
+                    return None;
+                }
+                let value = self.expr(&args[0].value, None)?;
+                let shape = match (&value.ty, name.name.as_str()) {
+                    (Ty::View(shape), "to_owned") => shape.clone(),
+                    (Ty::Tile(shape), "to_owned") => shape.clone(),
+                    (Ty::Tensor(shape), "clone") => shape.clone(),
+                    (found, "to_owned") => {
+                        self.error(
+                            value.span,
+                            format!("`to_owned` materializes a borrowed or computed tensor value, found {found}"),
+                        );
+                        return None;
+                    }
+                    (found, _) => {
+                        self.error(
+                            value.span,
+                            format!("`clone` duplicates an owned tensor, found {found}"),
+                        );
+                        return None;
+                    }
+                };
+                // Temporary bridge: `Load` already denotes a deep snapshot, while
+                // the logical result is recorded as owned tensor storage.
+                Some(Expr {
+                    partial: value.partial,
+                    kind: ExprKind::Load(Box::new(value)),
+                    ty: Ty::Tensor(shape),
+                    sym: None,
+                    span,
+                })
+            }
             "load" => {
                 if !positional(self, 1) {
                     return None;
@@ -753,51 +804,76 @@ impl<'a> Checker<'a> {
 
     fn intrinsic(
         &mut self,
-        namespace: &ast::Ident,
+        backend: &ast::Ident,
+        capability: &ast::Ident,
         name: &ast::Ident,
         args: &[ast::Arg],
         span: Span,
     ) -> Option<Expr> {
-        let Some(table) = intrinsics::table(&namespace.name) else {
+        if !intrinsics::known_backend(&backend.name) {
             self.error(
-                namespace.span,
-                format!("`{}` is not a value or a target namespace", namespace.name),
+                backend.span,
+                format!("`{}` is not a value or a backend namespace", backend.name),
             );
             return None;
-        };
-        let Some(intrinsic) = table.into_iter().find(|i| i.operation.name() == name.name) else {
+        }
+        let Some(capability_id) = intrinsics::capability(&backend.name, &capability.name) else {
             self.error(
-                name.span,
+                capability.span,
                 format!(
-                    "target `{}` has no intrinsic `{}`",
-                    namespace.name, name.name
+                    "`{}.{}` is not a known capability namespace",
+                    backend.name, capability.name
                 ),
             );
             return None;
         };
         if !self.target_form(
             span,
-            &format!("`{}.{}`", namespace.name, name.name),
-            Some(&namespace.name),
+            &format!("`{}.{}.{}`", backend.name, capability.name, name.name),
+            Some(&backend.name),
         ) {
             return None;
         }
-        self.intrinsic_call(&namespace.name, &intrinsic, args, span)
+        let Some(intrinsic) = intrinsics::lookup(&backend.name, &capability.name, &name.name)
+        else {
+            self.error(
+                name.span,
+                format!(
+                    "capability `{}` has no intrinsic `{}`",
+                    capability_id.path(),
+                    name.name
+                ),
+            );
+            return None;
+        };
+        self.use_capability(
+            &capability_id,
+            span,
+            &format!("intrinsic `{}`", intrinsic.id.path()),
+        );
+        self.intrinsic_call(&intrinsic, args, span)
     }
 
     fn intrinsic_call(
         &mut self,
-        target: &str,
         intrinsic: &Intrinsic,
         args: &[ast::Arg],
         span: Span,
     ) -> Option<Expr> {
+        let target = intrinsic.id.capability.backend.as_str();
         let operation = intrinsic.operation;
+        if matches!(
+            operation,
+            Operation::MatrixMatmul | Operation::MatrixMatmulAdd
+        ) {
+            return self.matrix_intrinsic(intrinsic, args, span);
+        }
         if args.len() != intrinsic.params.len() || args.iter().any(|a| a.name.is_some()) {
             self.error(
                 span,
                 format!(
-                    "`{target}.{operation}` takes {} positional argument(s)",
+                    "`{}` takes {} positional argument(s)",
+                    intrinsic.id.path(),
                     intrinsic.params.len()
                 ),
             );
@@ -879,6 +955,9 @@ impl<'a> Checker<'a> {
                     }
                     out.push(e);
                 }
+                IntrinsicParam::MatrixOperand => {
+                    unreachable!("logical matrix intrinsics are checked separately")
+                }
             }
         }
         for e in &out {
@@ -945,8 +1024,11 @@ impl<'a> Checker<'a> {
                     elem: Some(Elem::Dtype(named_dtype.unwrap_or(DType::F32))),
                 })
             }
+            IntrinsicResult::LogicalMatrix => {
+                unreachable!("logical matrix intrinsics are checked separately")
+            }
         };
-        Some(Expr {
+        let expression = Expr {
             kind: ExprKind::Intrinsic {
                 op: operation,
                 args: out,
@@ -955,7 +1037,161 @@ impl<'a> Checker<'a> {
             sym: None,
             partial: false,
             span,
-        })
+        };
+        self.record_intrinsic(intrinsic, &expression);
+        Some(expression)
+    }
+
+    fn record_intrinsic(&mut self, intrinsic: &Intrinsic, expression: &Expr) {
+        let ExprKind::Intrinsic { args, .. } = &expression.kind else {
+            return;
+        };
+        let used = sir::IntrinsicUse {
+            id: intrinsic.id.clone(),
+            operation: intrinsic.operation,
+            arguments: args.iter().map(|argument| argument.ty.clone()).collect(),
+            result: expression.ty.clone(),
+        };
+        if !self.intrinsic_uses.contains(&used) {
+            self.intrinsic_uses.push(used);
+        }
+    }
+
+    fn matrix_intrinsic(
+        &mut self,
+        intrinsic: &Intrinsic,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Option<Expr> {
+        let operation = intrinsic.operation;
+        let mut positional = Vec::new();
+        let mut accumulation = None;
+        for argument in args {
+            match argument.name.as_ref().map(|name| name.name.as_str()) {
+                None => positional.push(&argument.value),
+                Some("accumulation") if operation == Operation::MatrixMatmul => {
+                    if accumulation.replace(&argument.value).is_some() {
+                        self.error(
+                            argument.value.span,
+                            "`accumulation` is supplied more than once",
+                        );
+                        return None;
+                    }
+                }
+                Some(name) => {
+                    self.error(
+                        argument.value.span,
+                        format!("`{}` has no named argument `{name}`", intrinsic.id.path()),
+                    );
+                    return None;
+                }
+            }
+        }
+        let expected = if operation == Operation::MatrixMatmul {
+            2
+        } else {
+            3
+        };
+        if positional.len() != expected {
+            self.error(
+                span,
+                format!(
+                    "`{}` takes {expected} positional argument(s)",
+                    intrinsic.id.path()
+                ),
+            );
+            return None;
+        }
+        let mut checked = Vec::new();
+        for operand in positional {
+            let expression = self.expr(operand, None)?;
+            if !matches!(&expression.ty, Ty::Tensor(shape) | Ty::View(shape) | Ty::Tile(shape) if shape.rank() == 2)
+            {
+                self.error(
+                    expression.span,
+                    format!(
+                        "`{}` needs rank-two logical tensor operands, found {}",
+                        intrinsic.id.path(),
+                        expression.ty
+                    ),
+                );
+                return None;
+            }
+            self.forbid_partial(&expression, "a logical matrix intrinsic operand");
+            checked.push(expression);
+        }
+        let left = checked[0].ty.shaped().expect("checked rank-two operand");
+        let right = checked[1].ty.shaped().expect("checked rank-two operand");
+        if !self.same_extent(&left.axes[1], &right.axes[0]) {
+            self.error(
+                span,
+                format!(
+                    "`{}` inner axes differ: {} versus {}",
+                    intrinsic.id.path(),
+                    left.axes[1],
+                    right.axes[0]
+                ),
+            );
+            return None;
+        }
+        let (element, result_axes) = if operation == Operation::MatrixMatmul {
+            let Some(accumulation) = accumulation else {
+                self.error(
+                    span,
+                    "`matrix.matmul` requires the named argument `accumulation=<dtype>`",
+                );
+                return None;
+            };
+            let dtype = match &accumulation.kind {
+                A::Name(name) => DType::from_name(&name.name),
+                _ => None,
+            };
+            let Some(dtype) = dtype.filter(|dtype| dtype.is_numeric()) else {
+                self.error(
+                    accumulation.span,
+                    "matrix accumulation must name a numeric dtype",
+                );
+                return None;
+            };
+            (
+                Elem::Dtype(dtype),
+                vec![left.axes[0].clone(), right.axes[1].clone()],
+            )
+        } else {
+            let accumulator = checked[2]
+                .ty
+                .shaped()
+                .expect("checked rank-two accumulator");
+            let expected_axes = [&left.axes[0], &right.axes[1]];
+            if accumulator
+                .axes
+                .iter()
+                .zip(expected_axes)
+                .any(|(actual, expected)| !self.same_extent(actual, expected))
+            {
+                self.error(
+                    checked[2].span,
+                    format!(
+                        "`{}` accumulator shape does not match the matrix product",
+                        intrinsic.id.path()
+                    ),
+                );
+                return None;
+            }
+            (accumulator.elem.clone(), accumulator.axes.clone())
+        };
+        let expression = Expr {
+            kind: ExprKind::Intrinsic {
+                op: operation,
+                args: checked,
+            },
+            ty: Ty::Tensor(Shaped::new(result_axes, element)),
+            sym: None,
+            partial: false,
+            span,
+        };
+        self.record_intrinsic(intrinsic, &expression);
+        Some(expression)
     }
 
     // ---- contract families ----
@@ -1058,6 +1294,7 @@ impl<'a> Checker<'a> {
             Ty::View(s) => Ty::View(shaped(s)?),
             Ty::Tile(s) => Ty::Tile(shaped(s)?),
             Ty::Index(n) => Ty::Index(Self::substitute(n, binding)?),
+            Ty::Range(n) => Ty::Range(Self::substitute(n, binding)?),
             Ty::Tuple(items) => Ty::Tuple(
                 items
                     .iter()
@@ -1082,6 +1319,20 @@ impl<'a> Checker<'a> {
                 _ => mismatch(),
             },
             (Ty::Index(_), _) if arg.scalar_dtype() == Some(DType::I32) => Ok(()),
+            (Ty::Range(p), Ty::Range(a)) => match single_param(p) {
+                Some(name) => match binding.shapes.get(&name) {
+                    Some(bound) if !self.prover().zero(&bound.semantic().unwrap().sub(a)) => {
+                        mismatch()
+                    }
+                    Some(_) => Ok(()),
+                    None => {
+                        binding.shapes.insert(name, Extent::Semantic(a.clone()));
+                        Ok(())
+                    }
+                },
+                None if self.prover().zero(&p.sub(a)) => Ok(()),
+                None => mismatch(),
+            },
             (Ty::Tensor(p), Ty::Tensor(a) | Ty::View(a))
             | (Ty::View(p), Ty::Tensor(a) | Ty::View(a) | Ty::Tile(a))
             | (Ty::Tile(p), Ty::Tile(a)) => {
@@ -1377,8 +1628,10 @@ impl<'a> Checker<'a> {
                     .map(|slot| &sig.params[slot])
             });
             let hint = param.and_then(|p| p.ty.scalar_dtype()).map(Ty::Scalar);
-            let out = param.is_some_and(|p| p.mode == Mode::Out);
-            args.push(self.expr_inner(&arg.value, hint.as_ref(), out)?);
+            let write_only_candidate = param.is_some_and(|p| {
+                p.mode == Mode::Out || p.ownership == ParamOwnership::Exclusive
+            });
+            args.push(self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?);
         }
 
         let mut candidates: Vec<(usize, Vec<usize>, Binding)> = Vec::new();
@@ -1405,6 +1658,35 @@ impl<'a> Checker<'a> {
             return None;
         };
         candidates.retain(|(d, _, _)| resolved.declared[*d].family == family);
+
+        for (argument_ordinal, argument) in args.iter().enumerate() {
+            let Some(root) = self.root_var(argument) else { continue };
+            let VarKind::Param(own_parameter) = self.vars[root].kind else { continue };
+            if self.sig.params[own_parameter].ownership != ParamOwnership::Exclusive { continue; }
+            let forwarded: Vec<_> = candidates.iter().filter_map(|(definition, order, _)| {
+                order.iter().position(|ordinal| *ordinal == argument_ordinal)
+                    .filter(|parameter| resolved.declared[*definition].sig.params[*parameter].ownership == ParamOwnership::Exclusive)
+                    .map(|parameter| (*definition, parameter))
+            }).collect();
+            if forwarded.len() == candidates.len() {
+                self.summary.init_passes.push((forwarded, own_parameter));
+            }
+        }
+
+        // An uninitialized owned tensor may cross an exclusive borrow only when every
+        // applicable implementation definitely initializes the whole parameter on all paths.
+        for (argument_ordinal, argument) in args.iter().enumerate() {
+            let Some(root) = self.root_var(argument).filter(|root| self.unassigned.contains(root)) else { continue };
+            let full = !self.env.enforce || candidates.iter().all(|(definition, order, _)| {
+                order.iter().position(|ordinal| *ordinal == argument_ordinal)
+                    .is_some_and(|parameter| self.env.summaries[*definition].full_init.contains(&parameter))
+            });
+            if !full {
+                self.error(argument.span, format!("`{}` is uninitialized and `{}` does not initialize that exclusive tensor on every path", self.vars[root].name, name.name));
+                return None;
+            }
+            self.unassigned.remove(&root);
+        }
 
         // A structural extent is never a number, also through a generic helper.
         if self.env.enforce {
@@ -1456,6 +1738,85 @@ impl<'a> Checker<'a> {
                 return None;
             }
         };
+
+        // Logical ownership is checked at the static call boundary. Borrows end
+        // with the call in this foundation; `let`-bound slice borrows are tracked
+        // separately by the body checker.
+        let mut accesses: HashMap<VarId, ParamOwnership> = HashMap::new();
+        let mut moved_roots = Vec::new();
+        for (parameter, ordinal) in first_sig.params.iter().zip(first_order) {
+            let ownership = parameter.ownership;
+            if ownership == ParamOwnership::Value {
+                continue;
+            }
+            let argument = &args[*ordinal];
+            let Some(root) = self.root_var(argument) else {
+                if matches!(ownership, ParamOwnership::Shared | ParamOwnership::Owned)
+                    && matches!(argument.ty, Ty::Tensor(_) | Ty::View(_))
+                {
+                    // A fresh logical value may be borrowed or moved into this
+                    // call. It has no caller-visible storage root to invalidate or
+                    // with which it could alias.
+                    continue;
+                }
+                self.error(
+                    argument.span,
+                    format!(
+                        "parameter `{}` requires a tensor place for {:?} access",
+                        parameter.name, ownership
+                    ),
+                );
+                return None;
+            };
+            if let Some(previous) = accesses.get(&root) {
+                let compatible =
+                    *previous == ParamOwnership::Shared && ownership == ParamOwnership::Shared;
+                if !compatible {
+                    self.error(
+                        argument.span,
+                        format!(
+                            "overlapping tensor arguments cannot combine {:?} and {:?} access",
+                            previous, ownership
+                        ),
+                    );
+                    return None;
+                }
+            } else {
+                accesses.insert(root, ownership);
+            }
+            if ownership == ParamOwnership::Owned {
+                moved_roots.push(root);
+            }
+        }
+        for root in moved_roots {
+            self.moved.insert(root);
+        }
+
+        // Calling a backend-specific helper is itself a use of every capability
+        // promised by that helper. The caller must therefore declare a superset;
+        // portable family calls do not inherit requirements from selectable lowerings.
+        let helper_requirements: Vec<_> = candidates
+            .iter()
+            .filter(|(definition, _, _)| {
+                matches!(
+                    resolved.declared[*definition].kind,
+                    DefKind::Body { target: Some(_) }
+                )
+            })
+            .flat_map(|(definition, _, _)| {
+                resolved.declared[*definition]
+                    .requires
+                    .iter()
+                    .map(|(capability, _)| capability.clone())
+            })
+            .collect();
+        for capability in helper_requirements {
+            self.use_capability(
+                &capability,
+                span,
+                &format!("backend-specific helper `{}`", name.name),
+            );
+        }
 
         // Effects of `out`/`inout` parameters.
         let modes: Vec<(Mode, usize)> = first_sig

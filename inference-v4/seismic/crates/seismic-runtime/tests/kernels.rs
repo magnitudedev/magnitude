@@ -6,7 +6,7 @@ use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPoli
 use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData, Uniform};
 use seismic_lang::repr;
 use seismic_lang::sir::{Definition, Program};
-use seismic_lang::syntax::ast::Mode;
+use seismic_lang::sir::Mode;
 use seismic_lang::types::{DType, Elem};
 use seismic_lang::types::{Extent, Ty};
 use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
@@ -90,6 +90,27 @@ fn cases() -> Vec<Case> {
             &[("M", 4), ("N", 5), ("K", 64)],
             TUV,
         ),
+        // Direct coverage for the logical Metal matrix lowering: one complete native 8x8x8
+        // atom and a shape where every axis has a scalar tail. Both compare against the
+        // interpreter under the ordinary qualified tolerance policy; native MMA is not Exact.
+        Case {
+            modes: BOTH,
+            ..case(
+                "linear logical matrix full atom",
+                "linear",
+                &[("M", 8), ("N", 8), ("K", 8)],
+                &[("T", "f32"), ("U", "f32"), ("V", "f32")],
+            )
+        },
+        Case {
+            modes: BOTH,
+            ..case(
+                "linear logical matrix tails",
+                "linear",
+                &[("M", 9), ("N", 9), ("K", 9)],
+                &[("T", "f32"), ("U", "f32"), ("V", "f32")],
+            )
+        },
         case(
             "linear q4g64 M=1",
             "linear",
@@ -197,7 +218,7 @@ fn cases() -> Vec<Case> {
             ..case(
                 "attention_decode",
                 "attention_decode",
-                &[("T", 5), ("H", 4), ("KV", 2), ("W", 8)],
+                &[("T", 5), ("G", 2), ("KV", 2), ("W", 8)],
                 A,
             )
         },
@@ -397,7 +418,7 @@ fn run(
     let mut scalars = HashMap::new();
     for param in &definition.params {
         match &param.ty {
-            Ty::Tensor(shaped) => {
+            Ty::Tensor(shaped) | Ty::View(shaped) => {
                 let shape = shaped
                     .axes
                     .iter()

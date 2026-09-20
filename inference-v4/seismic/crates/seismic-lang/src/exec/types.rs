@@ -19,7 +19,11 @@ impl Shaped {
             Elem::Repr(_) => Some(shape.len().saturating_sub(1)),
             _ => None,
         };
-        Shaped { shape, elem, packed_axis }
+        Shaped {
+            shape,
+            elem,
+            packed_axis,
+        }
     }
 }
 
@@ -56,14 +60,30 @@ impl Ty {
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn shape(s: &Shaped) -> String {
-            format!("[{}] {}", s.shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "), s.elem)
+            format!(
+                "[{}] {}",
+                s.shape
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                s.elem
+            )
         }
         match self {
             Ty::Scalar(d) => write!(f, "{}", d.name()),
             Ty::Tensor(s) => write!(f, "tensor{}", shape(s)),
             Ty::Tile(s) => write!(f, "tile{}", shape(s)),
             Ty::Frag(s) => write!(f, "frag{}", shape(s)),
-            Ty::Tuple(items) => write!(f, "({})", items.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::Tuple(items) => write!(
+                f,
+                "({})",
+                items
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Ty::Void => write!(f, "void"),
         }
     }

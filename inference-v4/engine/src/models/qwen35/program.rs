@@ -43,3 +43,11 @@ pub fn program() -> Result<Program, String> {
             .join("\n")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn authored_program_checks() {
+        super::program().unwrap();
+    }
+}

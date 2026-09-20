@@ -1,231 +1,215 @@
 # Logical multi-token equations. Temporal recurrence is ordered; projections and
-# feedforward work span all rows. Owner domains and ordering are authored here;
-# slice widths belong to selection.
-fn qwen_embedding_rows[M, V, D](table: tensor[V, D] EW, tokens: tensor[M] i32,
-    out embedded: tensor[M, D] A, out out: tensor[M, D] f32):
-    parallel [rows] in 0..M:
-        for row in rows:
-            let values = load(table[tokens[row]])
-            publish f32(values) to embedded[row]
-    cast_rows(embedded, out)
+# feedforward work span all rows.
+fn qwen_embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M] i32)
+    -> (tensor[M, D] A, tensor[M, D] f32):
+    let mut embedded = tensor[M, D] A
+    let mut result = tensor[M, D] f32
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            embedded[row, col] = f32(table[tokens[row], col])
+    cast_rows(embedded, result)
+    return embedded, result
 
 
-fn qwen_readout_rows[M, V, D](hidden: tensor[M, D] f32, norm: tensor[D] NW,
-    weight: tensor[V, D] OW, out last: tensor[1, D] f32,
-    out normalized: tensor[1, D] A, out logits: tensor[1, V] f32, epsilon: f32):
-    parallel [rows] in 0..1:
-        for row in rows:
-            let values = load(hidden[M - 1])
-            publish values to last[row]
+fn qwen_readout_rows[M, V, D](hidden: &tensor[M, D] f32, norm: &tensor[D] NW,
+    weight: &tensor[V, D] OW, epsilon: f32) -> (tensor[1, D] A, tensor[1, V] f32):
+    let mut last = tensor[1, D] f32
+    let mut normalized = tensor[1, D] A
+    let mut logits = tensor[1, V] f32
+    parallel for row in 0..1:
+        parallel for col in 0..D:
+            last[row, col] = hidden[M - 1, col]
     rms_norm(last, norm, normalized, epsilon)
     linear(normalized, weight, logits)
+    return normalized, logits
 
 
-# Project only caller-selected vocabulary rows, preserving their order and
-# duplicates. Normalization publishes the same activation precision as full readout.
-fn qwen_readout_selected[M, V, D, S](hidden: tensor[M, D] f32, norm: tensor[D] NW,
-    weight: tensor[V, D] OW, selected: tensor[S] i32, out last: tensor[1, D] f32,
-    out normalized: tensor[1, D] A, out logits: tensor[1, S] f32, epsilon: f32):
-    parallel [rows] in 0..1:
-        for row in rows:
-            let values = load(hidden[M - 1])
-            publish values to last[row]
+fn qwen_readout_selected[M, V, D, S](hidden: &tensor[M, D] f32,
+    norm: &tensor[D] NW, weight: &tensor[V, D] OW, selected: &tensor[S] i32,
+    epsilon: f32) -> (tensor[1, D] A, tensor[1, S] f32):
+    let mut last = tensor[1, D] f32
+    let mut normalized = tensor[1, D] A
+    let mut logits = tensor[1, S] f32
+    parallel for row in 0..1:
+        parallel for col in 0..D:
+            last[row, col] = hidden[M - 1, col]
     rms_norm(last, norm, normalized, epsilon)
     qwen_selected_projection(normalized, weight, selected, logits)
+    return normalized, logits
 
 
-# The selected vocabulary row is decoded to F32 once per output; the contraction is
-# the standard ordered F32 FMA chain over D.
-fn qwen_selected_projection[V, D, S](normalized: tensor[1, D] A,
-    weight: tensor[V, D] OW, selected: tensor[S] i32, out logits: tensor[1, S] f32):
-    parallel [rows, cols] in (0..1, 0..S):
-        for row in rows:
-            let xt = load(normalized[row:row + 1])
-            for col in cols:
-                let mut acc = zeros_like(logits[row:row + 1, col:col + 1], dtype=f32)
-                let token = selected[col]
-                let wt = f32(weight[token:token + 1])
-                matmul(xt, wt, into=acc)
-                publish acc to logits[row:row + 1, col:col + 1]
+fn qwen_selected_projection[V, D, S](normalized: &tensor[1, D] A,
+    weight: &tensor[V, D] OW, selected: &tensor[S] i32,
+    logits: &mut tensor[1, S] f32):
+    parallel for row in 0..1:
+        parallel for col in 0..S:
+            let mut acc = to_owned(zeros_like(logits[row:row + 1, col:col + 1], dtype=f32))
+            acc = matmul(to_owned(normalized[row:row + 1]), to_owned(f32(weight[selected[col]:selected[col] + 1])), acc)
+            logits[row:row + 1, col:col + 1] = acc
 
-# Rows are appended in token order within each head owner; a later row wins a
-# repeated destination exactly as in sequential decoding.
-fn qwen_append_rows[M, T, KV, W](key: tensor[M, KV, W] A, value: tensor[M, KV, W] A,
-    inout history_key: tensor[T, KV, W] A, inout history_value: tensor[T, KV, W] A,
-    destinations: tensor[M] i32):
-    parallel [heads] in 0..KV:
-        for head in heads:
-            for row in 0..M:
-                let kt = load(key[row, head])
-                let vt = load(value[row, head])
-                publish kt to history_key[destinations[row], head]
-                publish vt to history_value[destinations[row], head]
 
-# Ordered logical spans can be physically discontiguous or nonmonotonic. Carry
-# the same online softmax state across all spans, then consume fresh causal rows.
-# Empty spans do not expose unowned history or change the running normalization.
-fn qwen_attention_rows[M, T, H, KV, W, R](q: tensor[M, H, W] A, k: tensor[T, KV, W] A,
-    v: tensor[T, KV, W] A, fresh_key: tensor[M, KV, W] A, fresh_value: tensor[M, KV, W] A,
-    visible: tensor[M, R, 2] i32, out out: tensor[M, H, W] A, scale: f32):
-    parallel [rows, kv_heads] in (0..M, 0..KV):
-        for row in rows:
-            for kv_head in kv_heads:
-                let qt = load(q[row, kv_head * (H / KV):(kv_head + 1) * (H / KV)])
-                let mut m = tile[H / KV] f32
-                let mut l = tile[H / KV] f32
-                let mut acc = tile[H / KV, W] f32
-                for i in owned(m):
-                    m[i] = -inf
-                    l[i] = 0.0
-                for i, j in owned(acc):
+fn qwen_append_rows[M, T, KV, W](key: &tensor[M, KV, W] A,
+    value: &tensor[M, KV, W] A, history_key: &mut tensor[T, KV, W] A,
+    history_value: &mut tensor[T, KV, W] A, destinations: &tensor[M] i32):
+    parallel for head in 0..KV:
+        for row in 0..M:
+            history_key[destinations[row], head] = key[row, head]
+            history_value[destinations[row], head] = value[row, head]
+
+
+fn qwen_attention_rows[M, T, G, KV, W, R](q: &tensor[M, KV * G, W] A,
+    k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
+    fresh_key: &tensor[M, KV, W] A, fresh_value: &tensor[M, KV, W] A,
+    visible: &tensor[M, R, 2] i32, out: &mut tensor[M, KV * G, W] A, scale: f32):
+    parallel for row in 0..M:
+        parallel for kv_head in 0..KV:
+            let qt = q[row, kv_head * G:(kv_head + 1) * G]
+            let mut m = tensor[G] f32
+            let mut l = tensor[G] f32
+            let mut acc = tensor[G, W] f32
+            for i in 0..G:
+                m[i] = -inf
+                l[i] = 0.0
+                for j in 0..W:
                     acc[i, j] = 0.0
-                for span in 0..R:
-                    let lo = visible[row, span, 0]
-                    let hi = visible[row, span, 1]
-                    let kt = load(k[lo:hi, kv_head])
-                    let vt = load(v[lo:hi, kv_head])
-                    if extent(kt, 0) > 0:
-                        attention_update(qt, kt, vt, m, l, acc, scale)
-                let fresh_kt = load(fresh_key[0:row + 1, kv_head])
-                let fresh_vt = load(fresh_value[0:row + 1, kv_head])
-                attention_update(qt, fresh_kt, fresh_vt, m, l, acc, scale)
-                let mut y = tile[H / KV, W] f32
-                for i, j in owned(y):
+            for span in 0..R:
+                let lo = visible[row, span, 0]
+                let hi = visible[row, span, 1]
+                if hi > lo:
+                    attention_update(qt, k[lo:hi, kv_head], v[lo:hi, kv_head], m, l, acc, scale)
+            attention_update(qt, fresh_key[0:row + 1, kv_head], fresh_value[0:row + 1, kv_head], m, l, acc, scale)
+            let mut y = tensor[G, W] f32
+            for i in 0..G:
+                for j in 0..W:
                     y[i, j] = acc[i, j] / l[i]
-                publish y to out[row, kv_head * (H / KV):(kv_head + 1) * (H / KV)]
+            out[row, kv_head * G:(kv_head + 1) * G] = y
 
-# Multi-row recurrent preparation. The convolution window of row r is the C - 1
-# inputs preceding it: accepted `window` rows first, then earlier rows of this
-# batch. The successor window holds the last C - 1 inputs after all M rows.
-fn qwen_recurrent_prepare_rows[M, NK, NV, W, C](projected: tensor[M, (2 * NK + NV) * W] A, conv: tensor[(2 * NK + NV) * W, C] CW,
-                                   window: tensor[C - 1, (2 * NK + NV) * W] A,
-                                   out next_window: tensor[C - 1, (2 * NK + NV) * W] A,
-                                   alpha: tensor[M, NV] A, beta_in: tensor[M, NV] A,
-                                   rate: tensor[NV] f32, dt_bias: tensor[NV] f32, eps: f32,
-                                   out qkv: tensor[M, 2 * NK + NV, W] A, out beta: tensor[M, NV] A, out decay: tensor[M, NV] f32):
-    parallel [rows, heads] in (0..M, 0..2 * NK + NV):
-        for row in rows:
-            for h in heads:
-                let x = load(projected[row, h * W:(h + 1) * W])
-                let win = load(window[0:C - 1, h * W:(h + 1) * W])
-                let wt = load(conv[h * W:(h + 1) * W, 0:C])
-                let mut y = tile[W] f32
-                for i in owned(y):
-                    let mut s = f32(wt[i, C - 1]) * f32(x[i])
-                    for j in 0..C - 1:
-                        let mut previous = f32(0.0)
-                        if row + j < C - 1:
-                            previous = f32(win[row + j, i])
-                        else:
-                            previous = f32(projected[row + j - (C - 1), h * W + coord(i)])
-                        s = fma(f32(wt[i, j]), previous, s)
-                    y[i] = s / (1.0 + exp(-s))
-                let mut inv = f32(1.0)
-                if h < 2 * NK:
-                    let ss = sum_any_order(y * y)
-                    inv = rsqrt(ss + eps)
-                    if h < NK:
-                        inv = inv * rsqrt(f32(W))
-                publish y * inv to qkv[row, h]
-    parallel [rows, value_heads] in (0..M, 0..NV):
-        for row in rows:
-            for hv in value_heads:
-                let mut b = tile[1] f32
-                let mut d = tile[1] f32
-                for i in owned(b):
-                    b[i] = 1.0 / (1.0 + exp(-f32(beta_in[row, hv])))
-                for i in owned(d):
-                    let sh = f32(alpha[row, hv]) + dt_bias[hv]
-                    d[i] = exp(rate[hv] * (max(sh, 0.0) + log(1.0 + exp(-abs(sh)))))
-                publish b to beta[row, hv:hv + 1]
-                publish d to decay[row, hv:hv + 1]
-    parallel [heads] in 0..2 * NK + NV:
-        for h in heads:
-            let mut nw = tile[C - 1, W] f32
-            for j, i in owned(nw):
-                if M + coord(j) < C - 1:
-                    nw[j, i] = f32(window[M + coord(j), h * W + coord(i)])
+
+fn qwen_recurrent_prepare_rows[M, NK, NV, W, C](
+    projected: &tensor[M, (2 * NK + NV) * W] A,
+    conv: &tensor[(2 * NK + NV) * W, C] CW,
+    window: &tensor[C - 1, (2 * NK + NV) * W] A,
+    next_window: &mut tensor[C - 1, (2 * NK + NV) * W] A,
+    alpha: &tensor[M, NV] A, beta_in: &tensor[M, NV] A,
+    rate: &tensor[NV] f32, dt_bias: &tensor[NV] f32, eps: f32,
+    qkv: &mut tensor[M, 2 * NK + NV, W] A, beta: &mut tensor[M, NV] A,
+    decay: &mut tensor[M, NV] f32):
+    parallel for row in 0..M:
+      parallel for h in 0..2 * NK + NV:
+        let mut y = tensor[W] f32
+        for i in 0..W:
+            let mut s = f32(conv[h * W + i, C - 1]) * f32(projected[row, h * W + i])
+            for j in 0..C - 1:
+                let mut previous = f32(0.0)
+                if row + j < C - 1:
+                    previous = f32(window[row + j, h * W + i])
                 else:
-                    nw[j, i] = f32(projected[M + coord(j) - (C - 1), h * W + coord(i)])
-            publish nw to next_window[0:C - 1, h * W:(h + 1) * W]
+                    previous = f32(projected[row + j - (C - 1), h * W + i])
+                s = fma(f32(conv[h * W + i, j]), previous, s)
+            y[i] = s / (1.0 + exp(-s))
+        let mut inv = f32(1.0)
+        if h < 2 * NK:
+            inv = rsqrt(sum_any_order(to_owned(f32(y) * f32(y))) + eps)
+            if h < NK:
+                inv = inv * rsqrt(f32(W))
+        qkv[row, h] = f32(y) * inv
+    parallel for row in 0..M:
+        parallel for hv in 0..NV:
+            beta[row, hv] = 1.0 / (1.0 + exp(-f32(beta_in[row, hv])))
+            let shifted = f32(alpha[row, hv]) + dt_bias[hv]
+            decay[row, hv] = exp(rate[hv] * (max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))))
+    parallel for column in 0..(2 * NK + NV) * W:
+        for j in 0..C - 1:
+            if M + j < C - 1:
+                next_window[j, column] = window[M + j, column]
+            else:
+                next_window[j, column] = projected[M + j - (C - 1), column]
 
-# Gated delta rule over M tokens, one state row per owner. The token recurrence is
-# ordered inside each (value head, state row) owner; owners are independent.
-fn qwen_delta_rows[M, NK, GV, W](qkv: tensor[M, 2 * NK + NK * GV, W] A, beta: tensor[M, NK * GV] A, decay: tensor[M, NK * GV] f32,
-                         state: tensor[NK * GV, W, W] f32, out next_state: tensor[NK * GV, W, W] f32, out out: tensor[M, NK * GV, W] A, grouped: bool):
-    parallel [heads, state_rows] in (0..NK * GV, 0..W):
-        for h in heads:
-            let mut key_head = h % NK
-            if grouped:
-                key_head = h / GV
-            for i in state_rows:
-                let mut row = load(state[h, i])
-                for t in 0..M:
-                    let key = load(qkv[t, NK + key_head])
-                    let query = load(qkv[t, key_head])
-                    let mut p = tile[W] f32
-                    for j in owned(p):
-                        p[j] = row[j] * decay[t, h] * f32(key[j])
-                    let remembered = sum_any_order(p)
-                    let residual = (f32(qkv[t, 2 * NK + h, i]) - remembered) * f32(beta[t, h])
-                    let mut nrow = tile[W] f32
-                    for j in owned(nrow):
-                        nrow[j] = fma(residual, f32(key[j]), row[j] * decay[t, h])
-                    let mut pq = tile[W] f32
-                    for j in owned(pq):
-                        pq[j] = nrow[j] * f32(query[j])
-                    let o = sum_any_order(pq)
-                    let mut ot = tile[1] f32
-                    for j in owned(ot):
-                        ot[j] = o
-                    publish ot to out[t, h, i:i + 1]
-                    row = nrow
-                publish row to next_state[h, i]
 
-# The engine binds `hidden` and `out` to the same residual rows.
-fn qwen_attention_sequence[M, D, T, H, KV, P, S, SH, SW, R](hidden: tensor[M, D] f32,
-    input_norm: tensor[D] NW, query_gate_weight: tensor[H * 2 * (2 * P + S), D] QW,
-    key_weight: tensor[KV * (2 * P + S), D] KW, value_weight: tensor[KV * (2 * P + S), D] VW,
-    query_norm: tensor[2 * P + S] f32, key_norm: tensor[2 * P + S] f32,
-    output_weight: tensor[D, H * (2 * P + S)] OW, coordinates: tensor[M, 4] i32,
-    visible: tensor[M, R, 2] i32, inout history_key: tensor[T, KV, 2 * P + S] A,
-    inout history_value: tensor[T, KV, 2 * P + S] A,
-    out normalized: tensor[M, D] A, out query_gate: tensor[M, H * 2 * (2 * P + S)] A,
-    out key: tensor[M, KV * (2 * P + S)] A, out value: tensor[M, KV * (2 * P + S)] A,
-    out query: tensor[M, H, 2 * P + S] A, out prepared_key: tensor[M, KV, 2 * P + S] A,
-    out gate: tensor[M, H * (2 * P + S)] A, out attended: tensor[M, H, 2 * P + S] A,
-    out activated: tensor[M, H * (2 * P + S)] A, out gated: tensor[M, H * (2 * P + S)] A,
-    out projected: tensor[M, D] A, out out: tensor[M, D] f32,
-    destinations: tensor[M] i32, base: f32, epsilon: f32, scale: f32) alias(hidden, out):
+fn qwen_delta_rows[M, NK, GV, W](qkv: &tensor[M, 2 * NK + NK * GV, W] A,
+    beta: &tensor[M, NK * GV] A, decay: &tensor[M, NK * GV] f32,
+    state: &tensor[NK * GV, W, W] f32,
+    next_state: &mut tensor[NK * GV, W, W] f32,
+    out: &mut tensor[M, NK * GV, W] A, grouped: bool):
+    parallel for h in 0..NK * GV:
+      parallel for i in 0..W:
+        let mut key_head = h % NK
+        if grouped:
+            key_head = h / GV
+        let mut row = to_owned(state[h, i])
+        for t in 0..M:
+            let key = qkv[t, NK + key_head]
+            let query = qkv[t, key_head]
+            let remembered = sum_any_order(to_owned(f32(row) * decay[t, h] * f32(key)))
+            let residual = (f32(qkv[t, 2 * NK + h, i]) - remembered) * f32(beta[t, h])
+            for j in 0..W:
+                row[j] = fma(residual, f32(key[j]), row[j] * decay[t, h])
+            out[t, h, i] = sum_any_order(to_owned(f32(row) * f32(query)))
+        next_state[h, i] = row
+
+
+fn qwen_attention_sequence[M, D, T, G, KV, P, S, SH, SW, R](hidden: &tensor[M, D] f32,
+    input_norm: &tensor[D] NW, query_gate_weight: &tensor[KV * G * 2 * (2 * P + S), D] QW,
+    key_weight: &tensor[KV * (2 * P + S), D] KW,
+    value_weight: &tensor[KV * (2 * P + S), D] VW,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    output_weight: &tensor[D, KV * G * (2 * P + S)] OW, coordinates: &tensor[M, 4] i32,
+    visible: &tensor[M, R, 2] i32, history_key: &mut tensor[T, KV, 2 * P + S] A,
+    history_value: &mut tensor[T, KV, 2 * P + S] A, destinations: &tensor[M] i32,
+    base: f32, epsilon: f32, scale: f32) -> tensor[M, D] f32:
+    let mut normalized = tensor[M, D] A
+    let mut query_gate = tensor[M, KV * G * 2 * (2 * P + S)] A
+    let mut key = tensor[M, KV * (2 * P + S)] A
+    let mut value = tensor[M, KV * (2 * P + S)] A
+    let mut query = tensor[M, KV * G, 2 * P + S] A
+    let mut prepared_key = tensor[M, KV, 2 * P + S] A
+    let mut gate = tensor[M, KV * G * (2 * P + S)] A
+    let mut attended = tensor[M, KV * G, 2 * P + S] A
+    let mut activated = tensor[M, KV * G * (2 * P + S)] A
+    let mut gated = tensor[M, KV * G * (2 * P + S)] A
+    let mut projected = tensor[M, D] A
+    let mut result = tensor[M, D] f32
     rms_norm(hidden, input_norm, normalized, epsilon)
     linear(normalized, query_gate_weight, query_gate)
     linear(normalized, key_weight, key)
     linear(normalized, value_weight, value)
     rotary_prepare[P = P, S = S, SH = SH, SW = SW](query_gate, key, query_norm, key_norm, coordinates, query, prepared_key, gate, base, epsilon)
-    qwen_attention_rows(query, history_key, history_value, prepared_key, reshape(value, (M, KV, 2 * P + S)), visible, attended, scale)
+    qwen_attention_rows[G = G](query, history_key, history_value, prepared_key, reshape(value, (M, KV, 2 * P + S)), visible, attended, scale)
     qwen_append_rows(prepared_key, reshape(value, (M, KV, 2 * P + S)), history_key, history_value, destinations)
     sigmoid(gate, activated)
-    multiply(reshape(attended, (M, H * (2 * P + S))), activated, gated)
+    multiply(reshape(attended, (M, KV * G * (2 * P + S))), activated, gated)
     linear(gated, output_weight, projected)
-    add(hidden, projected, out)
+    add(hidden, projected, result)
+    return result
 
 
-# The engine binds `hidden` and `out` to the same residual rows.
-fn qwen_recurrent_sequence[M, H, NK, GV, W, C](hidden: tensor[M, H] f32, input_norm: tensor[H] NW,
-    qkv_weight: tensor[(2 * NK + NK * GV) * W, H] QW, gate_weight: tensor[NK * GV * W, H] GW,
-    alpha_weight: tensor[NK * GV, H] AW, beta_weight: tensor[NK * GV, H] BW,
-    convolution: tensor[(2 * NK + NK * GV) * W, C] f32,
-    rate: tensor[NK * GV] f32, time_bias: tensor[NK * GV] f32,
-    recurrent_norm: tensor[W] RN, output_weight: tensor[H, NK * GV * W] OW,
-    window: tensor[C - 1, (2 * NK + NK * GV) * W] A, delta: tensor[NK * GV, W, W] f32,
-    out next_window: tensor[C - 1, (2 * NK + NK * GV) * W] A, out next_delta: tensor[NK * GV, W, W] f32,
-    out normalized: tensor[M, H] A, out projected: tensor[M, (2 * NK + NK * GV) * W] A,
-    out gate: tensor[M, NK * GV * W] A, out alpha: tensor[M, NK * GV] A, out beta_input: tensor[M, NK * GV] A,
-    out qkv: tensor[M, 2 * NK + NK * GV, W] A, out beta: tensor[M, NK * GV] A, out decay: tensor[M, NK * GV] f32,
-    out mixed: tensor[M, NK * GV, W] A, out mixed_norm: tensor[M, NK * GV, W] A,
-    out activated: tensor[M, NK * GV * W] A, out gated: tensor[M, NK * GV * W] A,
-    out output_projection: tensor[M, H] A, out out: tensor[M, H] f32,
-    epsilon: f32, preparation_epsilon: f32, grouped: bool) alias(hidden, out):
+fn qwen_recurrent_sequence[M, H, NK, GV, W, C](hidden: &tensor[M, H] f32,
+    input_norm: &tensor[H] NW, qkv_weight: &tensor[(2 * NK + NK * GV) * W, H] QW,
+    gate_weight: &tensor[NK * GV * W, H] GW, alpha_weight: &tensor[NK * GV, H] AW,
+    beta_weight: &tensor[NK * GV, H] BW,
+    convolution: &tensor[(2 * NK + NK * GV) * W, C] f32,
+    rate: &tensor[NK * GV] f32, time_bias: &tensor[NK * GV] f32,
+    recurrent_norm: &tensor[W] RN, output_weight: &tensor[H, NK * GV * W] OW,
+    window: &tensor[C - 1, (2 * NK + NK * GV) * W] A,
+    delta: &tensor[NK * GV, W, W] f32, epsilon: f32,
+    preparation_epsilon: f32, grouped: bool)
+    -> (tensor[C - 1, (2 * NK + NK * GV) * W] A, tensor[NK * GV, W, W] f32, tensor[M, H] f32):
+    let mut next_window = tensor[C - 1, (2 * NK + NK * GV) * W] A
+    let mut next_delta = tensor[NK * GV, W, W] f32
+    let mut normalized = tensor[M, H] A
+    let mut projected = tensor[M, (2 * NK + NK * GV) * W] A
+    let mut gate = tensor[M, NK * GV * W] A
+    let mut alpha = tensor[M, NK * GV] A
+    let mut beta_input = tensor[M, NK * GV] A
+    let mut qkv = tensor[M, 2 * NK + NK * GV, W] A
+    let mut beta = tensor[M, NK * GV] A
+    let mut decay = tensor[M, NK * GV] f32
+    let mut mixed = tensor[M, NK * GV, W] A
+    let mut mixed_norm = tensor[M, NK * GV, W] A
+    let mut activated = tensor[M, NK * GV * W] A
+    let mut gated = tensor[M, NK * GV * W] A
+    let mut output_projection = tensor[M, H] A
+    let mut result = tensor[M, H] f32
     rms_norm(hidden, input_norm, normalized, epsilon)
     linear(normalized, qkv_weight, projected)
     linear(normalized, gate_weight, gate)
@@ -237,4 +221,5 @@ fn qwen_recurrent_sequence[M, H, NK, GV, W, C](hidden: tensor[M, H] f32, input_n
     silu(gate, activated)
     multiply(reshape(mixed_norm, (M, NK * GV * W)), activated, gated)
     linear(gated, output_weight, output_projection)
-    add(hidden, output_projection, out)
+    add(hidden, output_projection, result)
+    return next_window, next_delta, result

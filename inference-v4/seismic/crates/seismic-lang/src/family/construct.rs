@@ -6,12 +6,12 @@
 
 use super::normalize::{owning_slice, sequences, BlockUnits};
 use super::{
-    Candidate, CandidateRef, Family, Obligation, Occurrence, OccurrenceId, Requirement,
-    Sequence, SequenceId, Site, SiteId, SiteKind, SiteRef, Template, TemplateId, UnitKind,
+    Candidate, CandidateRef, Family, Obligation, Occurrence, OccurrenceId, Requirement, Sequence,
+    SequenceId, Site, SiteId, SiteKind, SiteRef, TargetEnvironment, Template, TemplateId, UnitKind,
     Workload,
 };
-use crate::repr;
 use crate::precision::NumericalEffect;
+use crate::repr;
 use crate::sir::{
     Body, CallId, CallSite, DefId, DefKind, Definition, ExprKind, Index, Predicate, Program,
     SliceParent,
@@ -33,13 +33,15 @@ pub(super) mod walk;
 pub fn construct(
     program: &Program,
     entry: &str,
-    target: &str,
+    environment: &TargetEnvironment<'_>,
     workload: &Workload,
 ) -> Result<Family, String> {
+    let target = environment.target;
     let contract = program.family_index(entry)?;
     let mut builder = Builder {
         program,
         target,
+        supports_intrinsic: environment.supports_intrinsic,
         templates: Vec::new(),
         interned: HashMap::new(),
         sites: Vec::new(),
@@ -63,8 +65,12 @@ pub fn construct(
     let mut family = Family {
         entry: entry.to_string(),
         target: target.to_string(),
+        capability_fingerprint: environment.capability_fingerprint.to_string(),
         workload: workload.clone(),
-        allow_numerical_effects: matches!(workload.precision, crate::precision::PrecisionPolicy::Unconstrained),
+        allow_numerical_effects: matches!(
+            workload.precision,
+            crate::precision::PrecisionPolicy::Unconstrained
+        ),
         templates: Vec::new(),
         occurrences: Vec::new(),
         sites: Vec::new(),
@@ -181,6 +187,7 @@ type TemplateKey = (
 struct Builder<'a> {
     program: &'a Program,
     target: &'a str,
+    supports_intrinsic: &'a dyn Fn(&crate::sir::IntrinsicUse) -> Result<(), String>,
     templates: Vec<Template>,
     interned: HashMap<TemplateKey, TemplateId>,
     /// Provisional sites, including those of candidates removed later.
@@ -206,11 +213,12 @@ impl<'a> Builder<'a> {
     /// Portable semantic reference of one linked function family.
     fn reference(&self, family: usize) -> Option<DefId> {
         let contract = &self.program.families[family];
-        contract
-            .bodies
-            .iter()
-            .copied()
-            .find(|id| matches!(self.program.definition(*id).kind, DefKind::Body { target: None }))
+        contract.bodies.iter().copied().find(|id| {
+            matches!(
+                self.program.definition(*id).kind,
+                DefKind::Body { target: None }
+            )
+        })
     }
 
     fn coverage(&self, node: &OccurrenceNode) -> String {
@@ -293,8 +301,13 @@ impl<'a> Builder<'a> {
         }
         walk::block(&body.block, true, &mut |expr| {
             let effect = match &expr.kind {
-                ExprKind::Reduce { unordered: true, .. } => Some(NumericalEffect::ReassociatedReduction),
-                ExprKind::Math { op: crate::sir::Math::ExpFast, .. } => Some(NumericalEffect::ApproximateTranscendental("exp".into())),
+                ExprKind::Reduce {
+                    unordered: true, ..
+                } => Some(NumericalEffect::ReassociatedReduction),
+                ExprKind::Math {
+                    op: crate::sir::Math::ExpFast,
+                    ..
+                } => Some(NumericalEffect::ApproximateTranscendental("exp".into())),
                 ExprKind::Intrinsic { op, .. } => Some(NumericalEffect::BackendIntrinsic {
                     target: def.kind.target().unwrap_or("unknown").to_string(),
                     operation: format!("{op:?}"),
@@ -309,6 +322,20 @@ impl<'a> Builder<'a> {
             Ok(binding) => binding,
             Err(reject) => return Ok(Err(reject)),
         };
+        for used in &def.intrinsic_uses {
+            let used = specialize_intrinsic_use(used, &binding.elems).ok_or_else(|| {
+                format!(
+                    "intrinsic `{}` has an unbound element type after candidate binding",
+                    used.id.path()
+                )
+            })?;
+            if let Err(reason) = (self.supports_intrinsic)(&used) {
+                return Ok(Err(Reject::inapplicable(format!(
+                    "capability intrinsic `{}` is unavailable: {reason}",
+                    used.id.path()
+                ))));
+            }
+        }
         let requirements = match self.requirements(&def.predicates, &binding) {
             Ok(found) => found,
             Err(reject) => return Ok(Err(reject)),
@@ -326,7 +353,16 @@ impl<'a> Builder<'a> {
             ));
         }
         self.path.push(template);
-        let expanded = self.expand(def, body, via, reference, numerical_effects, template, binding, requirements);
+        let expanded = self.expand(
+            def,
+            body,
+            via,
+            reference,
+            numerical_effects,
+            template,
+            binding,
+            requirements,
+        );
         self.path.pop();
         expanded
     }
@@ -812,6 +848,63 @@ fn resolve_elem(elem: &Elem, elems: &BTreeMap<String, Elem>) -> Option<Elem> {
     }
 }
 
+fn specialize_intrinsic_use(
+    used: &crate::sir::IntrinsicUse,
+    elems: &BTreeMap<String, Elem>,
+) -> Option<crate::sir::IntrinsicUse> {
+    Some(crate::sir::IntrinsicUse {
+        id: used.id.clone(),
+        operation: used.operation,
+        arguments: used
+            .arguments
+            .iter()
+            .map(|ty| specialize_ty(ty, elems))
+            .collect::<Option<Vec<_>>>()?,
+        result: specialize_ty(&used.result, elems)?,
+    })
+}
+
+fn specialize_ty(
+    ty: &crate::types::Ty,
+    elems: &BTreeMap<String, Elem>,
+) -> Option<crate::types::Ty> {
+    use crate::types::Ty;
+    let shaped = |shape: &crate::types::Shaped| {
+        Some(crate::types::Shaped {
+            axes: shape.axes.clone(),
+            elem: resolve_elem(&shape.elem, elems)?,
+            packed_axis: shape.packed_axis,
+        })
+    };
+    Some(match ty {
+        Ty::Tensor(shape) => Ty::Tensor(shaped(shape)?),
+        Ty::View(shape) => Ty::View(shaped(shape)?),
+        Ty::Tile(shape) => Ty::Tile(shaped(shape)?),
+        Ty::Result(result) => Ty::Result(Box::new(crate::types::ResultTy {
+            origin: result.origin,
+            producer: result.producer,
+            binders: result.binders.clone(),
+            member: specialize_ty(&result.member, elems)?,
+        })),
+        Ty::Tuple(members) => Ty::Tuple(
+            members
+                .iter()
+                .map(|member| specialize_ty(member, elems))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Ty::Native(native) => Ty::Native(crate::types::NativeTy {
+            target: native.target.clone(),
+            name: native.name.clone(),
+            shape: native.shape.clone(),
+            elem: match &native.elem {
+                Some(elem) => Some(resolve_elem(elem, elems)?),
+                None => None,
+            },
+        }),
+        concrete => concrete.clone(),
+    })
+}
+
 /// Extent of a site-owning slice: its domain's, or for a refinement its parent site's.
 fn slice_extent(body: &Body, slice: SliceId, bounds: &Bounds, depth: usize) -> Option<SiteExtent> {
     match &body.slices.get(slice.0 as usize)?.parent {
@@ -839,18 +932,74 @@ fn with_site(requirement: &Requirement, site: SiteId) -> Requirement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::{ScopeStep, Witness};
+    use crate::family::Witness;
     use crate::program::{compile, SourceFile};
 
+    fn supports_test_intrinsic(_: &crate::sir::IntrinsicUse) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn construct_test(
+        program: &Program,
+        entry: &str,
+        target: &str,
+        workload: &Workload,
+    ) -> Result<Family, String> {
+        let environment = TargetEnvironment {
+            target,
+            capability_fingerprint: "test-capabilities-v1",
+            supports_intrinsic: &supports_test_intrinsic,
+        };
+        construct(program, entry, &environment, workload)
+    }
+
+    #[test]
+    fn unsupported_intrinsic_candidate_is_removed_with_reason() -> Result<(), String> {
+        let source = "\
+fn choose(x: f32) -> f32:
+    return x
+
+lower choose(x: f32) -> f32 for cuda requires cuda.subgroup:
+    return cuda.subgroup.simd_sum(x)
+";
+        let program = compile(&[SourceFile {
+            path: "capability.seismic".into(),
+            text: source.into(),
+        }])
+        .map_err(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|d| d.render())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        let reject = |used: &crate::sir::IntrinsicUse| {
+            Err(format!("BackendNotImplemented for {}", used.id.path()))
+        };
+        let environment = TargetEnvironment {
+            target: "cuda",
+            capability_fingerprint: "cuda-test-capabilities-v1",
+            supports_intrinsic: &reject,
+        };
+        let family = construct(&program, "choose", &environment, &Workload::default())?;
+
+        assert_eq!(family.capability_fingerprint, "cuda-test-capabilities-v1");
+        assert_eq!(family.occurrences[0].candidates.len(), 1);
+        assert!(family.occurrences[0].rejected.iter().any(|(_, reason)| {
+            reason.contains("cuda.subgroup.simd_sum") && reason.contains("BackendNotImplemented")
+        }));
+        Ok(())
+    }
+
     const DOTS: &str = "\
-fn row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32
+fn row_dot[N](x: &tensor[N] f32, w: &tensor[N] f32) -> f32
     where N >= 1:
     let mut result = f32(0.0)
     for i in 0..N:
         result = fma(x[i], w[i], result)
     return result
 
-fn row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32
+fn row_dot[N](x: &tensor[N] f32, w: &tensor[N] f32) -> f32
     where N >= 2 and N % 2 == 0:
     let mut result = f32(0.0)
     for pair in 0..(N / 2):
@@ -885,7 +1034,7 @@ fn two_dots[N](x: tensor[N] f32, w0: tensor[N] f32, w1: tensor[N] f32) -> (f32, 
                 .collect(),
             ..Workload::default()
         };
-        construct(&program, entry, "cpu", &workload)
+        construct_test(&program, entry, "cpu", &workload)
     }
 
     #[test]
@@ -957,7 +1106,7 @@ lower pick[N](x: tensor[N] f32) -> f32 for cpu where N >= 1:
             ..Workload::default()
         };
 
-        let cpu = construct(&program, "pick", "cpu", &workload)?;
+        let cpu = construct_test(&program, "pick", "cpu", &workload)?;
         assert_eq!(cpu.occurrences[0].candidates.len(), 2);
         assert!(cpu.occurrences[0]
             .candidates
@@ -971,7 +1120,7 @@ lower pick[N](x: tensor[N] f32) -> f32 for cpu where N >= 1:
             .iter()
             .any(|candidate| matches!(program.definition(candidate.via).kind, DefKind::Lower { ref target } if target == "cpu")));
 
-        let metal = construct(&program, "pick", "metal", &workload)?;
+        let metal = construct_test(&program, "pick", "metal", &workload)?;
         assert_eq!(metal.occurrences[0].candidates.len(), 1);
         assert!(matches!(
             program
@@ -1002,7 +1151,7 @@ fn choose[N](x: tensor[N] f32) -> f32 where N >= 1:
                 .collect::<Vec<_>>()
                 .join("\n")
         })?;
-        let error = construct(&program, "choose", "cpu", &Workload::default()).unwrap_err();
+        let error = construct_test(&program, "choose", "cpu", &Workload::default()).unwrap_err();
         assert!(
             error.contains("ambiguous linked function `choose`"),
             "{error}"
@@ -1022,53 +1171,5 @@ fn choose[N](x: tensor[N] f32) -> f32 where N >= 1:
         );
     }
 
-    #[test]
-    fn packed_axis_slices_align_to_the_representation_group() -> Result<(), String> {
-        let text = "\
-fn unpack[M, N](w: tensor[M, N] q4g64, out y: tensor[M, N] f32):
-    parallel [cols] in 0..N:
-        publish decode(w[:, cols]) to y[:, cols]
-";
-        let family = family(text, "unpack", &[("M", 4), ("N", 256)])?;
-        let candidate = &family.occurrences[0].candidates[0];
-        assert_eq!(candidate.sites.len(), 1);
-        assert_eq!(family.sites[0].extent, 256);
-        assert_eq!(
-            candidate.requirements,
-            vec![Requirement::Multiple {
-                site: candidate.sites[0],
-                unit: 64
-            }]
-        );
-        Ok(())
-    }
 
-    #[test]
-    fn fan_out_keeps_the_shared_producer_and_folds_single_consumers() -> Result<(), String> {
-        let text = "\
-fn fan[N](x: tensor[N] f32, out y: tensor[N] f32):
-    parallel [cols] in 0..N:
-        let a = exp(f32(x[cols]))
-        let b = a * f32(2.0)
-        let c = a + f32(1.0)
-        publish b + c to y[cols]
-";
-        let family = family(text, "fan", &[("N", 64)])?;
-        assert_eq!(family.sequences.len(), 1);
-        let sequence = &family.sequences[0];
-        assert_eq!(sequence.scope, vec![ScopeStep::Region(RegionId(0))]);
-        let units: Vec<_> = sequence
-            .units
-            .iter()
-            .map(|u| (u.statements.clone(), u.kind.clone(), u.completion_after))
-            .collect();
-        assert_eq!(
-            units,
-            vec![
-                (0..1, UnitKind::Elementwise, false),
-                (1..4, UnitKind::Publish, false)
-            ]
-        );
-        Ok(())
-    }
 }

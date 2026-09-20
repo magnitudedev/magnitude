@@ -14,12 +14,15 @@ mod expr;
 pub(crate) mod resolve;
 mod stmt;
 
+use crate::intrinsics::CapabilityId;
 use crate::sir::{
-    self, CallSite, DefKind, Predicate, RegionDecl, SliceDecl, SliceParent, Var, VarId, VarKind,
+    self, CallSite, DefKind, IntrinsicUse, Predicate, RegionDecl, SliceDecl, SliceParent, Var,
+    VarId, VarKind,
 };
 use crate::span::{Diagnostic, Span};
 use crate::sym::{Atom, Facts, Prover, Sym};
-use crate::syntax::ast::{self, Mode, RegionMode};
+use crate::syntax::ast;
+use crate::sir::Mode;
 use crate::types::{Extent, RegionId, ResultTy, Shaped, SliceId, Ty};
 use resolve::{Declared, Located, Resolved, Sig};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -46,6 +49,10 @@ pub(crate) struct Summary {
     pub reduces: BTreeSet<String>,
     /// `(callee definition, callee parameter, own parameter)`: passed along unchanged.
     pub passes: Vec<(usize, String, String)>,
+    /// Exclusive tensor parameters definitely initialized on every path before return.
+    pub full_init: BTreeSet<usize>,
+    /// Exclusive own parameter forwarded to every candidate parameter at one call site.
+    pub init_passes: Vec<(Vec<(usize, usize)>, usize)>,
 }
 
 pub(crate) struct Env<'a> {
@@ -55,46 +62,13 @@ pub(crate) struct Env<'a> {
     pub enforce: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum YieldKind {
-    Function,
-    Region,
-    Stage,
-    Merge,
-}
-
-/// One result boundary: a function (`return`), a region visit, a stage or a merge body (`yield`).
+/// The function return boundary.
 #[derive(Clone, Debug)]
 pub(crate) struct YieldCtx {
-    pub kind: YieldKind,
     /// The current path has produced its value.
     pub done: bool,
     /// Enclosing element loops since the boundary; a value per loop visit is not one per path.
     pub loops: usize,
-    pub schema: Option<Vec<Ty>>,
-    pub partials: Vec<bool>,
-    /// A `yield` on this boundary was itself rejected; do not also report it missing.
-    pub failed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FrameKind {
-    Region {
-        id: RegionId,
-        mode: RegionMode,
-        origin: Option<RegionId>,
-    },
-    Stage {
-        pipeline: bool,
-    },
-    Merge,
-}
-
-/// An ownership scope. Variables with id below `floor` are enclosing.
-#[derive(Clone, Debug)]
-pub(crate) struct Frame {
-    pub kind: FrameKind,
-    pub floor: usize,
 }
 
 pub(crate) struct Checker<'a> {
@@ -104,6 +78,9 @@ pub(crate) struct Checker<'a> {
     pub kind: DefKind,
     /// The target whose forms this body may name: a backend-specific function or lowering target.
     pub target: Option<String>,
+    pub requires: Vec<(CapabilityId, Span)>,
+    pub used_capabilities: BTreeSet<CapabilityId>,
+    pub intrinsic_uses: Vec<IntrinsicUse>,
     pub vars: Vec<Var>,
     pub scopes: Vec<HashMap<String, VarId>>,
     pub slices: Vec<SliceDecl>,
@@ -115,8 +92,10 @@ pub(crate) struct Checker<'a> {
     pub unassigned: HashSet<VarId>,
     /// Tiles the current `owned` loop assigns by its first write at the loop's own coordinates.
     pub pending_full_assign: Vec<(VarId, Vec<VarId>)>,
+    /// Active logical ranges may collectively initialize uninitialized storage;
+    /// coverage is proved over the completed loop before that storage becomes readable.
+    pub init_loop_depth: usize,
     pub dyn_slices: Vec<(Option<sir::Expr>, Option<sir::Expr>, Sym, Atom)>,
-    pub frames: Vec<Frame>,
     pub yields: Vec<YieldCtx>,
     pub view_roots: HashMap<VarId, VarId>,
     /// For each `let`-bound view: how many writes had happened when it was bound.
@@ -128,12 +107,19 @@ pub(crate) struct Checker<'a> {
     pub reads: Vec<VarId>,
     /// Variable floors of the enclosing element loops over a structural extent.
     pub structural_loops: Vec<usize>,
+    /// Temporary checker-side representation of independent logical loops until
+    /// the structured IR gains an explicit `parallel for` node.
+    pub logical_parallel: Vec<(usize, VarId)>,
     pub published: HashSet<VarId>,
     pub summary: Summary,
     pub diagnostics: Vec<Diagnostic>,
     pub counter: usize,
     /// Names whose binding was rejected; uses of them are not reported again.
     pub poisoned: HashSet<String>,
+    /// Owned tensor bindings consumed by a source-level move.
+    pub moved: HashSet<VarId>,
+    /// Lexically live slice/view borrows: binding -> (storage root, exclusive).
+    pub borrows: HashMap<VarId, (VarId, bool)>,
 }
 
 impl<'a> Checker<'a> {
@@ -146,6 +132,9 @@ impl<'a> Checker<'a> {
             sig: &declared.sig,
             kind: declared.kind.clone(),
             target,
+            requires: declared.requires.clone(),
+            used_capabilities: BTreeSet::new(),
+            intrinsic_uses: Vec::new(),
             vars: Vec::new(),
             scopes: vec![HashMap::new()],
             slices: Vec::new(),
@@ -156,8 +145,8 @@ impl<'a> Checker<'a> {
             scalar_symbols: HashMap::new(),
             unassigned: HashSet::new(),
             pending_full_assign: Vec::new(),
+            init_loop_depth: 0,
             dyn_slices: Vec::new(),
-            frames: Vec::new(),
             yields: Vec::new(),
             view_roots: HashMap::new(),
             view_bound: HashMap::new(),
@@ -166,11 +155,14 @@ impl<'a> Checker<'a> {
             mutated: Vec::new(),
             reads: Vec::new(),
             structural_loops: Vec::new(),
+            logical_parallel: Vec::new(),
             published: HashSet::new(),
             summary: Summary::default(),
             diagnostics: Vec::new(),
             counter: 0,
             poisoned: HashSet::new(),
+            moved: HashSet::new(),
+            borrows: HashMap::new(),
         };
         // Shape parameters are positive extents unless a `where` admits zero.
         for p in &c.sig.shape_params {
@@ -208,6 +200,24 @@ impl<'a> Checker<'a> {
 
     pub fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::new(span, message));
+    }
+
+    pub fn use_capability(&mut self, capability: &CapabilityId, span: Span, use_site: &str) {
+        self.used_capabilities.insert(capability.clone());
+        if !self
+            .requires
+            .iter()
+            .any(|(declared, _)| declared == capability)
+        {
+            self.error(
+                span,
+                format!(
+                    "{use_site} requires capability `{}`; add `requires {}` to this declaration",
+                    capability.path(),
+                    capability.path()
+                ),
+            );
+        }
     }
 
     pub fn lookup(&self, name: &str) -> Option<VarId> {
@@ -341,6 +351,7 @@ impl<'a> Checker<'a> {
             | (Ty::View(x), Ty::View(y))
             | (Ty::Tile(x), Ty::Tile(y)) => x.elem == y.elem && self.same_axes(x, y),
             (Ty::Index(x), Ty::Index(y)) => self.prover().zero(&x.sub(y)),
+            (Ty::Range(x), Ty::Range(y)) => self.prover().zero(&x.sub(y)),
             (Ty::Tuple(x), Ty::Tuple(y)) => {
                 x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.same_ty(p, q))
             }
@@ -432,9 +443,7 @@ impl<'a> Checker<'a> {
     /// traverses the exact result partition they belong to. This is structural authority,
     /// independent of numerical precision.
     pub fn partial_free(&self) -> bool {
-        self.frames.iter().any(|frame| {
-            matches!(frame.kind, FrameKind::Merge | FrameKind::Region { origin: Some(_), .. })
-        })
+        false
     }
 
     pub fn forbid_partial(&mut self, e: &sir::Expr, use_: &str) {
@@ -572,6 +581,34 @@ impl<'a> Checker<'a> {
             self.error(span, "a write needs a place: an `out`/`inout` parameter, local `let mut` state, or a mutable view of one");
             return None;
         };
+        if self
+            .borrows
+            .iter()
+            .any(|(borrow, (borrowed, _))| *borrowed == root && *borrow != binding)
+        {
+            self.error(
+                span,
+                format!(
+                    "cannot mutate `{}` while a tensor borrow is live",
+                    self.vars[root].name
+                ),
+            );
+            return None;
+        }
+        for (floor, index) in self.logical_parallel.clone().into_iter().rev() {
+            if root >= floor {
+                continue;
+            }
+            if whole || !expr::mentions_var(place, index) {
+                self.error(
+                    span,
+                    format!(
+                        "a `parallel for` body may mutate captured tensor storage only through an index that depends on its loop variable"
+                    ),
+                );
+                return None;
+            }
+        }
         let name = self.vars[root].name.clone();
         match &self.vars[root].kind {
             VarKind::Param(i) if self.sig.params[*i].mode == Mode::In => {
@@ -593,31 +630,6 @@ impl<'a> Checker<'a> {
         }
         let mut selected = HashSet::new();
         self.selecting_slices(place, &mut selected);
-        for frame in self.frames.clone().iter().rev().filter(|f| f.floor > root) {
-            match &frame.kind {
-                FrameKind::Merge => {
-                    self.error(span, format!("a `merge` body has no externally visible effects; it cannot write `{name}`"));
-                    return None;
-                }
-                FrameKind::Region {
-                    id,
-                    mode: RegionMode::Parallel,
-                    ..
-                } => {
-                    if whole {
-                        self.error(span, format!("a `parallel` body cannot mutate enclosing state `{name}`; yield per-slice values and combine them with `merge` or an ordered traversal"));
-                        return None;
-                    }
-                    let binders = self.regions[id.0 as usize].binders.clone();
-                    if let Some(missing) = binders.iter().find(|b| !selected.contains(b)) {
-                        let binder = self.slice_name(*missing);
-                        self.error(span, format!("cannot prove `parallel` visits write disjoint views of `{name}`: binder `{binder}` does not select the destination"));
-                        return None;
-                    }
-                }
-                _ => {}
-            }
-        }
         // State carried across the coordinates of a slice is one aggregate per tuned piece.
         if whole && !self.partial_free() && self.structural_loops.iter().any(|floor| *floor > root)
         {
@@ -635,7 +647,11 @@ impl<'a> Checker<'a> {
 
     // ---- result ----
 
-    fn finish(mut self, block: sir::Block, span: Span) -> (sir::Body, Summary, Vec<Diagnostic>) {
+    fn finish(
+        mut self,
+        block: sir::Block,
+        span: Span,
+    ) -> (sir::Body, Summary, Vec<IntrinsicUse>, Vec<Diagnostic>) {
         // Coverage of `out` parameters is judged on bodies that are otherwise well-formed.
         let well_formed = self.diagnostics.is_empty();
         for (i, p) in self.sig.params.iter().enumerate().filter(|_| well_formed) {
@@ -663,6 +679,17 @@ impl<'a> Checker<'a> {
                 ),
             );
         }
+        for (capability, declared_at) in self.requires.clone() {
+            if !self.used_capabilities.contains(&capability) {
+                self.error(
+                    declared_at,
+                    format!(
+                        "capability `{}` is required but not used directly or through a backend-specific helper",
+                        capability.path()
+                    ),
+                );
+            }
+        }
         let body = sir::Body {
             vars: self.vars,
             slices: self.slices,
@@ -670,7 +697,7 @@ impl<'a> Checker<'a> {
             calls: self.calls,
             block,
         };
-        (body, self.summary, self.diagnostics)
+        (body, self.summary, self.intrinsic_uses, self.diagnostics)
     }
 }
 
@@ -689,6 +716,7 @@ pub(crate) fn elem_rounds(value: &crate::types::Elem, target: &crate::types::Ele
 struct CheckedBody {
     body: sir::Body,
     summary: Summary,
+    intrinsic_uses: Vec<IntrinsicUse>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -696,20 +724,165 @@ fn check_definition(env: &Env, def: usize) -> CheckedBody {
     let declared = &env.resolved.declared[def];
     let mut c = Checker::new(env, def);
     c.yields.push(YieldCtx {
-        kind: YieldKind::Function,
         done: false,
         loops: 0,
-        schema: None,
-        partials: Vec::new(),
-        failed: false,
     });
     let stmts = c.block(declared.body);
-    let (body, summary, diagnostics) = c.finish(stmts, declared.name_span);
+    let facts = c.facts.clone();
+    let (body, mut summary, intrinsic_uses, diagnostics) = c.finish(stmts, declared.name_span);
+    for (parameter, declared_param) in declared.sig.params.iter().enumerate() {
+        if declared_param.ownership == resolve::ParamOwnership::Exclusive {
+            if let Ty::Tensor(shaped) | Ty::View(shaped) = &declared_param.ty {
+                if definitely_initializes(&body, parameter, shaped, &facts) {
+                    summary.full_init.insert(parameter);
+                }
+            }
+        }
+    }
     CheckedBody {
         body,
         summary,
+        intrinsic_uses,
         diagnostics,
     }
+}
+
+fn definitely_initializes(
+    body: &sir::Body,
+    parameter: usize,
+    shaped: &Shaped,
+    facts: &Facts,
+) -> bool {
+    let Some(variable) = body
+        .vars
+        .iter()
+        .position(|var| var.kind == sir::VarKind::Param(parameter))
+    else {
+        return false;
+    };
+    definitely_initializes_var(&body.vars, &body.block, variable, shaped, facts)
+}
+
+pub(crate) fn definitely_initializes_var(
+    vars: &[sir::Var],
+    block: &sir::Block,
+    variable: VarId,
+    shaped: &Shaped,
+    facts: &Facts,
+) -> bool {
+    fn root(expr: &sir::Expr) -> Option<VarId> {
+        match &expr.kind {
+            sir::ExprKind::Var(var) => Some(*var),
+            sir::ExprKind::Index { base, .. }
+            | sir::ExprKind::Reshape { base, .. }
+            | sir::ExprKind::Transpose(base)
+            | sir::ExprKind::Accessor { base, .. } => root(base),
+            _ => None,
+        }
+    }
+    fn point_covers(
+        vars: &[sir::Var],
+        point: &sir::Expr,
+        extent: &Sym,
+        loops: &[(VarId, Sym)],
+    ) -> bool {
+        match &point.kind {
+            sir::ExprKind::Var(var) => loops.iter().any(|(loop_var, bound)| loop_var == var && bound == extent),
+            _ => {
+                if extent.as_constant() == Some(1) && point.sym.as_ref().is_some_and(Sym::is_zero) {
+                    return true;
+                }
+                // Nested full loops form a bijective mixed-radix enumeration of a
+                // flattened axis: `h * W + i`, and its higher-rank generalization.
+                let mut total = Sym::constant(1);
+                let mut linear = Sym::constant(0);
+                for (var, bound) in loops {
+                    let atom = var_atom(&vars[*var].name, *var);
+                    linear = linear.mul(bound).add(&Sym::atom(atom));
+                    total = total.mul(bound);
+                }
+                &total == extent && point.sym.as_ref() == Some(&linear)
+            }
+        }
+    }
+    fn index_covers(
+        vars: &[sir::Var],
+        index: &sir::Index,
+        extent: &Sym,
+        loops: &[(VarId, Sym)],
+        facts: &Facts,
+    ) -> bool {
+        match index {
+            sir::Index::Point(point) => point_covers(vars, point, extent, loops),
+            sir::Index::Range { start, end } => {
+                let full = start.as_ref().is_none_or(|start| start.sym.as_ref().is_some_and(Sym::is_zero))
+                    && end.as_ref().is_none_or(|end| end.sym.as_ref() == Some(extent));
+                full || loops.iter().any(|(var, partitions)| {
+                    let width = extent.quot(partitions);
+                    if !Prover::new(facts).zero(&width.mul(partitions).sub(extent)) {
+                        return false;
+                    }
+                    let coordinate = Sym::atom(var_atom(&vars[*var].name, *var));
+                    let expected_start = coordinate.mul(&width);
+                    let expected_end = coordinate.add(&Sym::constant(1)).mul(&width);
+                    start.as_ref().and_then(|value| value.sym.as_ref()) == Some(&expected_start)
+                        && end.as_ref().and_then(|value| value.sym.as_ref()) == Some(&expected_end)
+                })
+            }
+            sir::Index::Coord(_) | sir::Index::Slice(_) => false,
+        }
+    }
+    fn target_covers(
+        vars: &[sir::Var],
+        target: &sir::Expr,
+        variable: VarId,
+        extents: &[Extent],
+        loops: &[(VarId, Sym)],
+        facts: &Facts,
+    ) -> bool {
+        if root(target) != Some(variable) {
+            return false;
+        }
+        let sir::ExprKind::Index { indices, .. } = &target.kind else {
+            return matches!(target.kind, sir::ExprKind::Var(_));
+        };
+        if indices.len() > extents.len() {
+            return false;
+        }
+        indices.iter().zip(extents).all(|(index, extent)| {
+            let Extent::Semantic(extent) = extent else { return false };
+            index_covers(vars, index, extent, loops, facts)
+        })
+        // Omitted trailing indices denote the complete remaining tensor slice.
+    }
+    fn writes(
+        vars: &[sir::Var],
+        block: &sir::Block,
+        variable: VarId,
+        extents: &[Extent],
+        loops: &[(VarId, Sym)],
+        facts: &Facts,
+    ) -> bool {
+        block.iter().any(|statement| match &statement.kind {
+            sir::StmtKind::Assign { target, .. } | sir::StmtKind::Publish { destination: target, .. } => {
+                target_covers(vars, target, variable, extents, loops, facts)
+            }
+            sir::StmtKind::If { then, els, .. } => {
+                writes(vars, then, variable, extents, loops, facts)
+                    && writes(vars, els, variable, extents, loops, facts)
+            }
+            sir::StmtKind::Range { var, lo, hi, value: None, body: nested, .. } => {
+                let Some(bound) = hi.sym.clone().filter(|_| lo.sym.as_ref().is_some_and(Sym::is_zero)) else {
+                    return false;
+                };
+                let mut nested_loops = loops.to_vec();
+                nested_loops.push((*var, bound));
+                writes(vars, nested, variable, extents, &nested_loops, facts)
+            }
+            _ => false,
+        })
+    }
+    writes(vars, block, variable, &shaped.axes, &[], facts)
 }
 
 /// Close numeric and reduction uses over parameters passed along unchanged to callees.
@@ -725,6 +898,14 @@ fn close_summaries(summaries: &mut [Summary]) {
                 }
                 if summaries[callee].reduces.contains(&callee_param)
                     && summaries[i].reduces.insert(own)
+                {
+                    changed = true;
+                }
+            }
+            for (candidates, own) in summaries[i].init_passes.clone() {
+                if !candidates.is_empty()
+                    && candidates.iter().all(|(callee, parameter)| summaries[*callee].full_init.contains(parameter))
+                    && summaries[i].full_init.insert(own)
                 {
                     changed = true;
                 }
@@ -787,6 +968,12 @@ pub(crate) fn check_program(
             id: sir::DefId(def as u32),
             name: declared.sig.name.clone(),
             kind: declared.kind.clone(),
+            requires: declared
+                .requires
+                .iter()
+                .map(|(capability, _)| capability.clone())
+                .collect(),
+            intrinsic_uses: checked.intrinsic_uses,
             family: declared.family,
             shape_params: declared.sig.shape_params.clone(),
             elem_params: declared.sig.elem_params.clone(),
@@ -827,70 +1014,53 @@ mod tests {
     }
 
     #[test]
-    fn reference_sources_check() {
-        let program = check(&[
-            (
-                "rms_norm.seismic",
-                include_str!("../../../../../seismic-std/lib/kernels/rms_norm.seismic"),
-            ),
-            (
-                "linear.seismic",
-                include_str!("../../../../../seismic-std/lib/kernels/linear.seismic"),
-            ),
-            (
-                "matmul.seismic",
-                include_str!("../../../../../seismic-std/lib/constructs/matmul.seismic"),
-            ),
-            (
-                "matmul-cpu.seismic",
-                include_str!("../../../../../seismic-std/lib/constructs/matmul-cpu.seismic"),
-            ),
-        ])
+    fn logical_call_sources_check() {
+        let program = check(&[(
+            "logical.seismic",
+            "fn add[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut output = result\n    parallel for row in 0..M:\n        for col in 0..N:\n            output[row, col] = x[row, col] + y[row, col]\n    return output\n\nfn linear[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32:\n    return add(x, y, result)\n",
+        )])
         .unwrap_or_else(|e| panic!("{e}"));
         let linear = program.family("linear").expect("linear is defined");
         let body = &program.definition(linear.bodies[0]).body;
-        // `matmul(load(x[rows, k]), load(weight[cols, k]), into=acc)` binds M, N, K structurally.
+        // Logical borrowed operands and the owned result bind M and N structurally.
         let call = &body.calls[0];
         assert!(!call.bindings.is_empty());
-        assert!(call.bindings[0]
-            .shape_args
-            .iter()
-            .all(|(_, e)| matches!(e, crate::types::Extent::Structural(_))));
+        assert_eq!(call.bindings[0].shape_args.len(), 2);
         assert_eq!(call.bindings[0].arg_order, vec![0, 1, 2]);
     }
 
     #[test]
-    fn region_results_stages_and_merge_check() {
+    fn returned_tuple_results_check() {
         check(&[(
-            "sum.seismic",
-            "fn sum_squares[N](x: tensor[N] f32, out y: tensor[1] f32):\n    stage prepare:\n        let partials = parallel [p] in 0..N:\n            let values = f32(x[p])\n            yield reduce(values * values, 0, sum)\n        yield partials\n    stage finish(partials):\n        let mut total = f32(0.0)\n        ordered [piece] in partials:\n            total = total + partials[piece]\n        publish total to y[0]\n\nfn merged[K](x: tensor[K] f32, out y: tensor[1] f32):\n    let t = parallel [part] in 0..K:\n        yield reduce(f32(x[part]), 0, sum)\n    merge (left, right) identity f32(0.0):\n        yield left + right\n    publish t to y[0]\n",
+            "tuple.seismic",
+            "fn split[N](left: tensor[N] f32, right: tensor[N] f32) -> (tensor[N] f32, tensor[N] f32):\n    return left, right\n\nfn swap[N](left: tensor[N] f32, right: tensor[N] f32) -> (tensor[N] f32, tensor[N] f32):\n    let a, b = split(left, right)\n    return b, a\n",
         )])
         .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
-    fn slice_width_query_rejected() {
-        rejected("fn f[M, N](x: tensor[M, N] f32, out y: tensor[M, N] f32):\n    parallel [cols] in 0..N:\n        let v = x[:, cols]\n        let w = extent(v, 1)\n        publish f32(v) to y[:, cols]\n", "structural extent is never a number");
+    fn slice_width_query_is_a_logical_value() {
+        check(&[("case.seismic", "fn f[M, N](x: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32:\n    let v = x[:, 0]\n    let w = extent(v, 0)\n    return result\n")]).unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]
-    fn unrelated_same_width_slices_rejected() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[N] f32):\n    parallel [a] in 0..N:\n        let t = f32(x[a])\n        ordered [b] in 0..N:\n            let u = f32(x[b])\n            let s = t + u\n        publish t to y[a]\n", "unrelated slices");
+    fn borrowed_slice_cannot_outlive_exclusive_access() {
+        rejected("fn f[N](x: &mut tensor[N] f32):\n    let slice = x[:]\n    x[0] = 1.0\n    let value = slice[0]\n", "tensor borrow is live");
     }
 
     #[test]
     fn mask_as_if_condition_rejected() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[N] f32):\n    parallel [p] in 0..N:\n        let t = f32(x[p])\n        let m = t > 0.0\n        if m:\n            publish t to y[p]\n        else:\n            publish t * 2.0 to y[p]\n", "a mask is a `bool` tile");
+        rejected("fn f[N](x: &tensor[N] f32, result: tensor[N] f32) -> tensor[N] f32:\n    let mask = f32(x) > 0.0\n    if mask:\n        return result\n    else:\n        return result\n", "a mask is a `bool` tile");
     }
 
     #[test]
-    fn yield_on_one_path_rejected() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[N] f32, flag: i32):\n    let r = parallel [p] in 0..N:\n        let t = f32(x[p])\n        if flag > 0:\n            yield t\n    parallel [p] in r:\n        publish r[p] to y[p]\n", "one path of this `if` yields");
+    fn return_on_one_path_rejected() {
+        rejected("fn f[N](result: tensor[N] f32, flag: bool) -> tensor[N] f32:\n    if flag:\n        return result\n", "one path of this `if` yields/returns");
     }
 
     #[test]
     fn parallel_mutating_enclosing_state_rejected() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[1] f32):\n    let mut total = f32(0.0)\n    parallel [p] in 0..N:\n        total = total + f32(1.0)\n    publish total to y[0]\n", "`parallel` body cannot mutate enclosing state");
+        rejected("fn f[N](x: &tensor[N] f32) -> f32:\n    let mut total = f32(0.0)\n    parallel for i in 0..N:\n        total = total + x[i]\n    return total\n", "parallel for");
     }
 
     #[test]
@@ -904,19 +1074,19 @@ mod tests {
     }
 
     #[test]
-    fn let_mut_is_required_for_writable_view_aliases() {
+    fn let_mut_is_required_for_writable_borrows() {
         rejected(
-            "fn f[N](out y: tensor[N] f32):\n    let alias = y[:]\n    publish zeros_like(alias, dtype=f32) to alias\n",
-            "immutable `let` binding",
+            "fn f[N](y: tensor[N] f32) -> tensor[N] f32:\n    let alias = y\n    alias = clone(alias)\n    return alias\n",
+            "not mutable state",
         );
         check(&[(
             "case.seismic",
-            "fn f[N](out y: tensor[N] f32):\n    let mut alias = y[:]\n    publish zeros_like(alias, dtype=f32) to alias\n",
+            "fn f[N](y: tensor[N] f32) -> tensor[N] f32:\n    let mut alias = y\n    alias = clone(alias)\n    return alias\n",
         )])
         .unwrap_or_else(|e| panic!("{e}"));
         rejected(
-            "fn f[N](x: tensor[N] f32):\n    let mut alias = x[:]\n    publish zeros_like(alias, dtype=f32) to alias\n",
-            "read-only parameter",
+            "fn f[N](x: &tensor[N] f32):\n    x[0] = 0.0\n",
+            "only tile elements are assigned",
         );
     }
 
@@ -942,41 +1112,41 @@ mod tests {
     }
 
     #[test]
-    fn implementation_contracts_preserve_shapes_elements_and_aliases() {
+    fn implementation_contracts_preserve_shapes_elements_and_ownership() {
         rejected(
-            "fn f[M, N](x: tensor[M, N] f32, out y: tensor[M, N] f32):\n    publish x to y\n\nlower f[M, N](x: tensor[M, M] f32, out y: tensor[M, N] f32) for cpu:\n    publish x to y\n",
+            "fn f[M, N](x: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32:\n    return result\n\nlower f[M, N](x: &tensor[M, M] f32, result: tensor[M, N] f32) -> tensor[M, N] f32 for cpu:\n    return result\n",
             "equivalent parameter shape and element relationships",
         );
         rejected(
-            "fn f[M](x: tensor[M] f32, out y: tensor[M] f32) alias(x, y):\n    publish x to y\n\nlower f[M](x: tensor[M] f32, out y: tensor[M] f32) for cpu:\n    publish x to y\n",
-            "identical `alias` permissions",
+            "fn f[M](x: &tensor[M] f32, result: tensor[M] f32) -> tensor[M] f32:\n    return result\n\nlower f[M](x: tensor[M] f32, result: tensor[M] f32) -> tensor[M] f32 for cpu:\n    return result\n",
+            "no definition of `f` has this parameter structure",
         );
         rejected(
-            "fn f[M, N](x: tensor[M, N] f32) -> tile[M, N] f32:\n    return load(x)\n\nlower f[M, N](x: tensor[M, N] f32) -> tile[N, M] f32 for cpu:\n    return load(x.T)\n",
+            "fn f[M, N](x: tensor[M, N] f32) -> tensor[M, N] f32:\n    return x\n\nlower f[M, N](x: tensor[M, N] f32) -> tensor[N, M] f32 for cpu:\n    return x\n",
             "equivalent results",
         );
 
         check(&[(
             "case.seismic",
-            "fn f[M](x: tensor[M] T, out y: tensor[M] T):\n    publish x to y\n\nlower f[M](x: tensor[M] bf16, out y: tensor[M] bf16) for cpu:\n    publish x to y\n",
+            "fn f[M](x: tensor[M] T) -> tensor[M] T:\n    return x\n\nlower f[M](x: tensor[M] bf16) -> tensor[M] bf16 for cpu:\n    return x\n",
         )])
         .unwrap_or_else(|error| panic!("concrete element specialization was rejected:\n{error}"));
 
         rejected(
-            "fn split[M](x: tensor[M] T, w: tensor[M] T, out y: tensor[M] T):\n    publish x to y\n\nlower split[M](x: tensor[M] U, w: tensor[M] V, out y: tensor[M] U) for cpu:\n    publish x to y\n",
+            "fn split[M](x: tensor[M] T, w: &tensor[M] T) -> tensor[M] T:\n    return x\n\nlower split[M](x: tensor[M] U, w: &tensor[M] V) -> tensor[M] U for cpu:\n    return x\n",
             "equivalent parameter shape and element relationships",
         );
         rejected(
-            "fn mixed[M](x: tensor[M] T, w: tensor[M] T, out y: tensor[M] T):\n    publish x to y\n\nlower mixed[M](x: tensor[M] bf16, w: tensor[M] U, out y: tensor[M] bf16) for cpu:\n    publish x to y\n",
+            "fn mixed[M](x: tensor[M] T, w: &tensor[M] T) -> tensor[M] T:\n    return x\n\nlower mixed[M](x: tensor[M] bf16, w: &tensor[M] U) -> tensor[M] bf16 for cpu:\n    return x\n",
             "equivalent parameter shape and element relationships",
         );
         rejected(
-            "fn concrete[M](x: tensor[M] bf16, out y: tensor[M] bf16):\n    publish x to y\n\nlower concrete[M](x: tensor[M] T, out y: tensor[M] T) for cpu:\n    publish x to y\n",
+            "fn concrete[M](x: tensor[M] bf16) -> tensor[M] bf16:\n    return x\n\nlower concrete[M](x: tensor[M] T) -> tensor[M] T for cpu:\n    return x\n",
             "equivalent parameter shape and element relationships",
         );
         check(&[(
             "case.seismic",
-            "fn converge[M](x: tensor[M] T, w: tensor[M] U, out y: tensor[M] T):\n    publish x to y\n\nlower converge[M](x: tensor[M] V, w: tensor[M] V, out y: tensor[M] V) for cpu:\n    publish x to y\n",
+            "fn converge[M](x: tensor[M] T, w: &tensor[M] U) -> tensor[M] T:\n    return x\n\nlower converge[M](x: tensor[M] V, w: &tensor[M] V) -> tensor[M] V for cpu:\n    return x\n",
         )])
         .unwrap_or_else(|error| panic!("independent element parameters could not converge:\n{error}"));
     }
@@ -984,24 +1154,342 @@ mod tests {
     #[test]
     fn portable_body_cannot_name_target_intrinsics() {
         rejected(
-            "fn f(x: f32) -> f32:\n    return metal.simd_sum(x)\n",
+            "fn f(x: f32) -> f32:\n    return metal.subgroup.simd_sum(x)\n",
             "cannot appear in a portable body",
         );
     }
 
     #[test]
-    fn structural_binding_into_numeric_helper_rejected() {
-        rejected("fn width[K](v: view[K] f32) -> i32:\n    return extent(v, 0)\n\nfn f[N](x: tensor[N] f32, out y: tensor[N] f32):\n    parallel [p] in 0..N:\n        let w = width(x[p])\n        publish f32(x[p]) to y[p]\n", "binds it to a structural extent");
+    fn capability_requirements_are_explicit_exact_and_used() {
+        rejected(
+            "fn f(x: f32) -> f32 for metal:\n    return metal.subgroup.simd_sum(x)\n",
+            "add `requires metal.subgroup`",
+        );
+        rejected(
+            "fn f(x: f32) -> f32 for metal requires cuda.subgroup:\n    return x\n",
+            "belongs to backend `cuda`",
+        );
+        rejected(
+            "fn f(x: f32) -> f32 for metal requires metal.threads:\n    return x\n",
+            "not a known capability namespace",
+        );
+        rejected(
+            "fn f(x: f32) -> f32 for metal requires metal.subgroup:\n    return x\n",
+            "required but not used",
+        );
+        rejected(
+            "fn f(x: f32) -> f32 requires metal.subgroup:\n    return x\n",
+            "portable functions cannot require",
+        );
+
+        let program = check(&[(
+            "case.seismic",
+            "fn f(x: f32) -> f32 for metal requires metal.subgroup:\n    return metal.subgroup.simd_max(x)\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        let definition = &program.definitions[0];
+        assert_eq!(definition.requires[0].path(), "metal.subgroup");
+        assert_eq!(definition.intrinsic_uses.len(), 1);
+        assert_eq!(
+            definition.intrinsic_uses[0].id.path(),
+            "metal.subgroup.simd_max"
+        );
+        assert_eq!(
+            definition.intrinsic_uses[0].arguments,
+            vec![crate::types::Ty::Scalar(crate::types::DType::F32)]
+        );
+        assert_eq!(
+            definition.intrinsic_uses[0].result,
+            crate::types::Ty::Scalar(crate::types::DType::F32)
+        );
     }
 
     #[test]
-    fn result_member_of_different_origin_rejected() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[N] f32):\n    let r = parallel [p] in 0..N:\n        yield f32(x[p])\n    parallel [q] in 0..N:\n        publish r[q] to y[q]\n", "does not come from this result's origin");
+    fn backend_helper_requirements_propagate_to_callers() {
+        let leaf = "fn leaf(x: f32) -> f32 for metal requires metal.subgroup:\n    return metal.subgroup.simd_sum(x)\n\n";
+        rejected(
+            &format!("{leaf}fn caller(x: f32) -> f32 for metal:\n    return leaf(x)\n"),
+            "backend-specific helper `leaf` requires capability `metal.subgroup`",
+        );
+        check(&[(
+            "case.seismic",
+            &format!(
+                "{leaf}fn caller(x: f32) -> f32 for metal requires metal.subgroup:\n    return leaf(x)\n"
+            ),
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn logical_matrix_intrinsic_records_typed_use() {
+        let program = check(&[(
+            "case.seismic",
+            "fn mm[M, K, N](a: tensor[M, K] f16, b: tensor[K, N] f16) -> tensor[M, N] f32 for metal requires metal.matrix:\n    return metal.matrix.matmul(a, b, accumulation=f32)\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        let used = &program.definitions[0].intrinsic_uses[0];
+        assert_eq!(used.id.path(), "metal.matrix.matmul");
+        assert!(used.operation.produces_owned_result());
+        assert_eq!(used.arguments.len(), 2);
+        assert!(matches!(used.result, crate::types::Ty::Tensor(_)));
+        assert_eq!(
+            used.result.shaped().map(|shape| &shape.elem),
+            Some(&crate::types::Elem::Dtype(crate::types::DType::F32))
+        );
+    }
+
+    #[test]
+    fn owned_tensors_move_and_copies_are_explicit() {
+        rejected(
+            "fn f[N](x: tensor[N] f32) -> tensor[N] f32:\n    let y = x\n    let z = x\n    return y\n",
+            "use of moved owned tensor `x`",
+        );
+        rejected(
+            "fn f[N](x: tensor[N] f32, seed: tensor[N] f32) -> tensor[N] f32:\n    let mut state = seed\n    state = x\n    let again = x\n    return state\n",
+            "use of moved owned tensor `x`",
+        );
+        check(&[(
+            "case.seismic",
+            "fn f[N](x: tensor[N] f32) -> tensor[N] f32:\n    let copy = clone(x)\n    return x\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        check(&[(
+            "case.seismic",
+            "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn call_ownership_distinguishes_move_shared_and_exclusive_access() {
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn caller[N](x: tensor[N] f32) -> tensor[N] f32:\n    take(x)\n    return x\n",
+            "use of moved owned tensor `x`",
+        );
+        check(&[(
+            "case.seismic",
+            "fn read[N](x: &tensor[N] f32) -> f32:\n    return f32(x[0])\n\nfn caller[N](x: tensor[N] f32) -> f32:\n    return read(x) + read(x)\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        rejected(
+            "fn conflict[N](write: &mut tensor[N] f32, read: &tensor[N] f32):\n    return\n\nfn caller[N](x: &mut tensor[N] f32):\n    conflict(x, x)\n",
+            "overlapping tensor arguments",
+        );
+    }
+
+    #[test]
+    fn exclusive_call_requires_a_full_initialization_effect() {
+        check(&[("case.seismic", "fn fill[N](x: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        x[i] = f32(i)\n\nfn make[N]() -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    fill(result)\n    return result\n")])
+            .unwrap_or_else(|error| panic!("{error}"));
+        check(&[("case.seismic", "fn fill2[M, N](x: &mut tensor[M, N] f32):\n    parallel for i in 0..M:\n        parallel for j in 0..N:\n            x[i, j] = f32(i + j)\n\nfn wrapper[M, N](x: &mut tensor[M, N] f32):\n    fill2(x)\n\nfn make[M, N]() -> tensor[M, N] f32:\n    let mut result = tensor[M, N] f32\n    wrapper(result)\n    return result\n")])
+            .unwrap_or_else(|error| panic!("{error}"));
+        rejected(
+            "fn partial[N](x: &mut tensor[N] f32):\n    x[0] = 1.0\n\nfn make[N]() -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    partial(result)\n    return result\n",
+            "does not initialize that exclusive tensor on every path",
+        );
+        rejected(
+            "fn conditional[N](x: &mut tensor[N] f32, yes: bool):\n    if yes:\n        for i in 0..N:\n            x[i] = f32(i)\n\nfn make[N](yes: bool) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    conditional(result, yes)\n    return result\n",
+            "does not initialize that exclusive tensor on every path",
+        );
+    }
+
+    #[test]
+    fn full_initialization_summaries_cross_files_and_cover_logical_slices() {
+        check(&[
+            (
+                "fill.seismic",
+                "fn fill_rows[M, N](value: &tensor[N] f32, result: &mut tensor[M, N] f32):\n    parallel for row in 0..M:\n        result[row] = value\n\nfn fill_singleton[N](value: &tensor[N] f32, result: &mut tensor[1, N] f32):\n    parallel for col in 0..N:\n        result[0, col] = value[col]\n\nfn fill_slice[M, N](value: &tensor[M, N] f32, result: &mut tensor[M, N] f32):\n    result[0:M] = value\n",
+            ),
+            (
+                "caller.seismic",
+                "fn make_rows[M, N](value: &tensor[N] f32) -> tensor[M, N] f32:\n    let mut result = tensor[M, N] f32\n    fill_rows(value, result)\n    return result\n\nfn make_singleton[N](value: &tensor[N] f32) -> tensor[1, N] f32:\n    let mut result = tensor[1, N] f32\n    fill_singleton(value, result)\n    return result\n\nfn make_slice[M, N](value: &tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut result = tensor[M, N] f32\n    fill_slice(value, result)\n    return result\n",
+            ),
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn full_initialization_proves_exact_affine_coverage_and_transparent_reshape() {
+        check(&[
+            (
+                "fills.seismic",
+                "fn fill_partitioned[G, P](value: &tensor[G] f32, result: &mut tensor[P * G] f32):\n    parallel for part in 0..P:\n        result[part * G:(part + 1) * G] = value\n\nfn fill_flat[H, W](value: f32, result: &mut tensor[H * W] f32):\n    parallel for h in 0..H:\n        parallel for i in 0..W:\n            result[h * W + i] = value\n",
+            ),
+            (
+                "callers.seismic",
+                "fn make_partitioned[G, P](value: &tensor[G] f32) -> tensor[P * G] f32:\n    let mut result = tensor[P * G] f32\n    fill_partitioned[P = P](value, result)\n    return result\n\nfn make_reshaped[H, W](value: f32) -> tensor[H, W] f32:\n    let mut result = tensor[H, W] f32\n    fill_flat[H = H, W = W](value, reshape(result, (H * W,)))\n    return result\n\nfn make_local[M, N](value: &tensor[N] f32) -> tensor[M, N] f32:\n    let mut result = tensor[M, N] f32\n    parallel for row in 0..M:\n        result[row] = value\n    let first = result[0, 0]\n    return result\n",
+            ),
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        rejected(
+            "fn gap[G, P](value: &tensor[G] f32, result: &mut tensor[P * G] f32):\n    parallel for part in 0..P:\n        result[part * G:(part + 1) * G - 1] = value\n\nfn make[G, P](value: &tensor[G] f32) -> tensor[P * G] f32:\n    let mut result = tensor[P * G] f32\n    gap[P = P](value, result)\n    return result\n",
+            "does not initialize that exclusive tensor on every path",
+        );
+    }
+
+    #[test]
+    fn branch_ownership_is_independent_and_joins_on_all_paths() {
+        check(&[(
+            "case.seismic",
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn caller[N](x: tensor[N] f32, choose: bool):\n    if choose:\n        take(x)\n    else:\n        take(x)\n    return\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        check(&[(
+            "case.seismic",
+            "fn caller[N](x: tensor[N] f32, choose: bool) -> tensor[N] f32:\n    if choose:\n        let a = clone(x)\n    else:\n        let b = clone(x)\n    return x\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn caller[N](x: tensor[N] f32, choose: bool) -> tensor[N] f32:\n    if choose:\n        take(x)\n    else:\n        let copy = clone(x)\n    return x\n",
+            "use of moved owned tensor `x`",
+        );
+    }
+
+    #[test]
+    fn nested_branch_ownership_joins_recursively() {
+        check(&[(
+            "case.seismic",
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn caller[N](x: tensor[N] f32, outer: bool, inner: bool):\n    if outer:\n        if inner:\n            take(x)\n        else:\n            take(x)\n    else:\n        take(x)\n    return\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn loop_ownership_distinguishes_zero_one_and_repeated_execution() {
+        check(&[(
+            "case.seismic",
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn zero[N](x: tensor[N] f32) -> tensor[N] f32:\n    for i in 0..0:\n        take(x)\n    return x\n\nfn one[N](x: tensor[N] f32):\n    for i in 0..1:\n        take(x)\n    return\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn one[N](x: tensor[N] f32) -> tensor[N] f32:\n    for i in 0..1:\n        take(x)\n    return x\n",
+            "use of moved owned tensor `x`",
+        );
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn many[N](x: tensor[N] f32):\n    for i in 0..2:\n        take(x)\n    return\n",
+            "loop may repeat after moving captured owned tensor `x`",
+        );
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn unknown[N](x: tensor[N] f32):\n    for i in 0..N:\n        take(x)\n    return\n",
+            "loop may repeat after moving captured owned tensor `x`",
+        );
+    }
+
+    #[test]
+    fn repeated_loop_accepts_restored_state_and_joins_nested_paths() {
+        check(&[(
+            "case.seismic",
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn restored[N](seed: tensor[N] f32, choose: bool) -> tensor[N] f32:\n    let mut state = clone(seed)\n    for i in 0..2:\n        take(state)\n        if choose:\n            state = clone(seed)\n        else:\n            state = clone(seed)\n    return state\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn not_restored[N](seed: tensor[N] f32, choose: bool):\n    let mut state = clone(seed)\n    for i in 0..2:\n        take(state)\n        if choose:\n            state = clone(seed)\n        else:\n            let copy = clone(seed)\n    return\n",
+            "loop may repeat after moving captured owned tensor `state`",
+        );
+        rejected(
+            "fn take[N](x: tensor[N] f32):\n    return\n\nfn nested[N](x: tensor[N] f32):\n    for outer in 0..2:\n        for inner in 0..1:\n            take(x)\n    return\n",
+            "loop may repeat after moving captured owned tensor `x`",
+        );
+    }
+
+    #[test]
+    fn lexical_slice_borrows_enforce_shared_and_exclusive_access() {
+        check(&[(
+            "case.seismic",
+            "fn f[N](x: &tensor[N] f32) -> f32:\n    let a = x[:]\n    let b = x[:]\n    return f32(a[0]) + f32(b[0])\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        rejected(
+            "fn f[N](x: &mut tensor[N] f32):\n    let mut slice = x[:]\n    x[0] = 1.0\n",
+            "exclusive tensor borrow is live",
+        );
+    }
+
+    #[test]
+    fn logical_parallel_for_requires_iteration_disjoint_writes() {
+        check(&[(
+            "case.seismic",
+            "fn fill[N](x: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        x[i] = 1.0\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        rejected(
+            "fn fill[N](x: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        x[0] = 1.0\n",
+            "depends on its loop variable",
+        );
+        rejected(
+            "fn sum[N](x: &tensor[N] f32) -> f32:\n    let mut total = f32(0.0)\n    parallel for i in 0..N:\n        total = total + f32(x[i])\n    return total\n",
+            "parallel for",
+        );
+    }
+
+    #[test]
+    fn range_types_are_checked_and_borrowed_results_are_rejected() {
+        check(&[(
+            "case.seismic",
+            "fn bounded[N](span: range[N], at: index[N]):\n    return\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        rejected(
+            "fn bad[N](x: &tensor[N] f32) -> &tensor[N] f32:\n    return x\n",
+            "borrowed tensors cannot be returned",
+        );
+    }
+
+    #[test]
+    fn bounded_ranges_and_loop_kind_survive_checked_sir() {
+        let program = check(&[(
+            "case.seismic",
+            "fn loops[N](x: &mut tensor[N] f32, selected: range[N]):\n    for i in selected:\n        x[i] = 1.0\n    parallel for j in 0..N:\n        x[j] = 2.0\n    return\n",
+        )])
+        .unwrap_or_else(|error| panic!("{error}"));
+        let definition = &program.definitions[0];
+        assert!(matches!(
+            definition.params[1].ty,
+            crate::types::Ty::Range(_)
+        ));
+        assert!(matches!(
+            definition.body.block[0].kind,
+            crate::sir::StmtKind::Range {
+                kind: crate::sir::LoopKind::Ordered,
+                ..
+            }
+        ));
+        assert!(matches!(
+            definition.body.block[1].kind,
+            crate::sir::StmtKind::Range {
+                kind: crate::sir::LoopKind::Parallel,
+                ..
+            }
+        ));
+
+        rejected(
+            "fn bad[N](x: &mut tensor[N] f32):\n    for i in N..0:\n        x[i] = 1.0\n",
+            "range must prove",
+        );
+        rejected(
+            "fn bad[N](selected: range[N]) -> i32:\n    return selected + 1\n",
+            "range",
+        );
+    }
+
+    #[test]
+    fn scalar_cannot_bind_tensor_helper_parameter() {
+        rejected("fn first[K](v: &tensor[K] f32) -> f32:\n    return v[0]\n\nfn f[N](x: &tensor[N] f32) -> f32:\n    return first(x[0])\n", "expects");
+    }
+
+    #[test]
+    fn returned_tuple_arity_is_checked() {
+        rejected("fn pair[N](a: tensor[N] f32, b: tensor[N] f32) -> (tensor[N] f32, tensor[N] f32):\n    return a, b\n\nfn f[N](a: tensor[N] f32, b: tensor[N] f32) -> tensor[N] f32:\n    let only = pair(a, b)\n    return only\n", "returns");
     }
 
     #[test]
     fn concrete_lowering_requires_caller_elem_and_unordered_is_numerical_policy() {
-        let source = "fn mm[M, K](a: tile[M, K] T, inout into: tile[M] f32):\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] bf16, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nlower mm[M, K](a: tile[M, K] T, inout into: tile[M] f32) for cpu:\n    for i in owned(into):\n        into[i] = into[i] + f32(a[i, 0])\nfn g[M, K](x: tensor[M, K] A, out y: tensor[M] f32):\n    let mut acc = reduce(f32(x), 1, sum, unordered=true)\n    mm(load(x), acc)\n    publish acc to y\n";
+        let source = "fn mm[M, K](a: &tensor[M, K] T, into: tensor[M] f32) -> tensor[M] f32:\n    let mut result = into\n    for i in 0..M:\n        result[i] = result[i] + f32(a[i, 0])\n    return result\nlower mm[M, K](a: &tensor[M, K] bf16, into: tensor[M] f32) -> tensor[M] f32 for cpu:\n    let mut result = into\n    for i in 0..M:\n        result[i] = result[i] + f32(a[i, 0])\n    return result\nlower mm[M, K](a: &tensor[M, K] T, into: tensor[M] f32) -> tensor[M] f32 for cpu:\n    let mut result = into\n    for i in 0..M:\n        result[i] = result[i] + f32(a[i, 0])\n    return result\nfn g[M, K](x: &tensor[M, K] A, acc: tensor[M] f32) -> tensor[M] f32:\n    return mm(x, acc)\n";
         let program = check(&[("case.seismic", source)]).unwrap_or_else(|e| panic!("{e}"));
         let g = program
             .definitions
@@ -1028,12 +1516,12 @@ mod tests {
             generic.elem_args,
             vec![("T".to_string(), crate::types::Elem::Param("A".to_string()))]
         );
-        check(&[("unordered.seismic", "fn f[N](x: tensor[N] f32, out y: tensor[1] f32):\n    publish reduce(f32(x), 0, sum, unordered=true) to y[0]\n")]).expect("unordered sum is a selectable numerical alternative");
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[1] i32):\n    publish reduce(f32(x), 0, argmax, unordered=true) to y[0]\n", "never accepts `unordered`");
+        check(&[("unordered.seismic", "fn f[N](x: &tensor[N] f32) -> f32:\n    return reduce(f32(x), 0, sum, unordered=true)\n")]).expect("unordered sum is a selectable numerical alternative");
+        rejected("fn f[N](x: &tensor[N] f32) -> i32:\n    return reduce(f32(x), 0, argmax, unordered=true)\n", "never accepts `unordered`");
     }
 
     #[test]
-    fn partial_value_cannot_be_published() {
-        rejected("fn f[N](x: tensor[N] f32, out y: tensor[N] f32):\n    parallel [p] in 0..N:\n        let t = f32(x[p])\n        let count = reduce(t, 0, sum)\n        publish t * count to y[p]\n", "partial-domain value");
+    fn parallel_for_requires_disjoint_tensor_writes() {
+        rejected("fn f[N](x: &tensor[N] f32, result: tensor[N] f32) -> tensor[N] f32:\n    let mut output = result\n    parallel for i in 0..N:\n        output[0] = x[i]\n    return output\n", "depends on its loop variable");
     }
 }

@@ -207,7 +207,9 @@ pub struct Predicate {
 /// contract for this form. No guessed latency or throughput is attached here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Primitive {
-    Shuffle { mode: ShuffleMode },
+    Shuffle {
+        mode: ShuffleMode,
+    },
     Unary {
         operation: Unary,
         data_type: DataType,
@@ -253,11 +255,19 @@ pub enum Origin {
     Ssa { instruction: u32, block: u32 },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ShuffleMode { Butterfly, Index }
+pub enum ShuffleMode {
+    Butterfly,
+    Index,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
     /// Full-warp, convergent register communication with completion before use.
-    Shuffle { mode: ShuffleMode, destination: RegisterId, source: RegisterId, lane: Operand },
+    Shuffle {
+        mode: ShuffleMode,
+        destination: RegisterId,
+        source: RegisterId,
+        lane: Operand,
+    },
     Unary {
         operation: Unary,
         data_type: DataType,
@@ -455,7 +465,16 @@ impl Instruction {
             }
         }
         match self.operation {
-            Operation::Shuffle { destination, source, lane, .. } => { effect.register_writes.push(destination); effect.register_reads.push(source); operand(&mut effect, lane); }
+            Operation::Shuffle {
+                destination,
+                source,
+                lane,
+                ..
+            } => {
+                effect.register_writes.push(destination);
+                effect.register_reads.push(source);
+                operand(&mut effect, lane);
+            }
             Operation::Unary {
                 destination,
                 source,
@@ -612,10 +631,7 @@ pub struct WorkDomain {
     pub dispatch: Dispatch,
     pub scratch_bytes_per_item: usize,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Target {
-    Sm80Ptx70,
-}
+pub type Target = crate::target::PtxTarget;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetPlan {
     pub(super) target: Target,
@@ -715,8 +731,24 @@ impl TargetPlan {
                 }
             }
             match instruction.operation {
-                Operation::Shuffle { destination, source, lane, .. } => {
-                    if self.domain.lanes_per_item != 32 || instruction.predicate.is_some() || !match lane { Operand::Register(r)=>self.registers[r.0].class==RegisterClass::Bits32,Operand::Unsigned(n)=>n<32,_=>false } || self.registers[destination.0].class != RegisterClass::Bits32 || self.registers[source.0].class != RegisterClass::Bits32 {
+                Operation::Shuffle {
+                    destination,
+                    source,
+                    lane,
+                    ..
+                } => {
+                    if self.domain.lanes_per_item != 32
+                        || instruction.predicate.is_some()
+                        || !match lane {
+                            Operand::Register(r) => {
+                                self.registers[r.0].class == RegisterClass::Bits32
+                            }
+                            Operand::Unsigned(n) => n < 32,
+                            _ => false,
+                        }
+                        || self.registers[destination.0].class != RegisterClass::Bits32
+                        || self.registers[source.0].class != RegisterClass::Bits32
+                    {
                         return Err("PTX shuffle requires a convergent full warp and 32-bit register operands".into());
                     }
                 }

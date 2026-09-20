@@ -3,13 +3,13 @@
 //! snapshot is one aligned bump allocation of that thread's scratch in device global memory,
 //! so tile accesses are memory traffic like tensor accesses. The intrinsic table is lane
 //! index, shuffle and sum; there is no matrix coverage.
-use seismic_compiler::selection::quantity::Quantity;
-use seismic_compiler::selection::structure::{external, Accounting, Bound, TileEvent, Walker};
 use seismic_compiler::selection::SelectionError;
+use seismic_compiler::selection::quantity::Quantity;
+use seismic_compiler::selection::structure::{Accounting, Bound, TileEvent, Walker, external};
 use seismic_lang::family::CandidateRef;
 use seismic_lang::intrinsics::Operation;
 use seismic_lang::sir::{CallId, Expr, ExprKind};
-use seismic_lang::syntax::ast::RegionMode;
+use seismic_lang::sir::RegionMode;
 use seismic_lang::types::{Shaped, Ty};
 
 /// Every tile and every materialized snapshot is one bump allocation of the per-thread
@@ -106,16 +106,34 @@ impl Accounting for CudaAccounting {
 
     fn packed_element(bound: &Bound<'_>, shaped: &Shaped) -> Option<Quantity> {
         let group = bound.packed_group(&shaped.elem)?;
-        let span = shaped.axes.get(shaped.packed_axis.unwrap_or(shaped.rank().saturating_sub(1))).map(|extent| bound.axis(extent));
+        let span = shaped
+            .axes
+            .get(
+                shaped
+                    .packed_axis
+                    .unwrap_or(shaped.rank().saturating_sub(1)),
+            )
+            .map(|extent| bound.axis(extent));
         Some(match span {
-            Some(span) => Quantity::exceeds(span, group, PACKED_CODE_OPS + PACKED_COEFFICIENT_OPS, PACKED_CODE_OPS),
+            Some(span) => Quantity::exceeds(
+                span,
+                group,
+                PACKED_CODE_OPS + PACKED_COEFFICIENT_OPS,
+                PACKED_CODE_OPS,
+            ),
             None => Quantity::Constant(PACKED_CODE_OPS + PACKED_COEFFICIENT_OPS),
         })
     }
 
     /// The owner thread folds every element in authored ascending order, whether or not the
     /// contract permits reassociation.
-    fn reduction(bound: &Bound<'_>, value: &Expr, _axis: usize, _unordered: bool, _result: &Ty) -> Quantity {
+    fn reduction(
+        bound: &Bound<'_>,
+        value: &Expr,
+        _axis: usize,
+        _unordered: bool,
+        _result: &Ty,
+    ) -> Quantity {
         bound.elements(&value.ty)
     }
 
@@ -128,8 +146,15 @@ impl Accounting for CudaAccounting {
             None => event.bound.dtype(&event.shaped.elem).is_some(),
         };
         if reserved {
-            let scratch_bits = Quantity::Aligned(Box::new(event.bound.tile_bits(event.shaped)), SCRATCH_ALIGNMENT_BITS);
-            ledger.tiles.push(Tile { scratch_bits, launch: event.launch, pieces: event.pieces.clone() });
+            let scratch_bits = Quantity::Aligned(
+                Box::new(event.bound.tile_bits(event.shaped)),
+                SCRATCH_ALIGNMENT_BITS,
+            );
+            ledger.tiles.push(Tile {
+                scratch_bits,
+                launch: event.launch,
+                pieces: event.pieces.clone(),
+            });
         }
     }
 
@@ -140,7 +165,12 @@ impl Accounting for CudaAccounting {
 
     /// A snapshot of external storage handed straight to a call: the load rule borrows it, so
     /// no copy is charged; its stored bits are read once per distinct view.
-    fn call_argument(walker: &mut Walker<'_, '_, Self>, _call: CallId, _ordinal: usize, arg: &Expr) -> Result<(), SelectionError> {
+    fn call_argument(
+        walker: &mut Walker<'_, '_, Self>,
+        _call: CallId,
+        _ordinal: usize,
+        arg: &Expr,
+    ) -> Result<(), SelectionError> {
         match &arg.kind {
             ExprKind::Load(view) if external(&view.ty) => {
                 walker.expr(view)?;
@@ -148,7 +178,9 @@ impl Accounting for CudaAccounting {
                     walker.tile(None, shaped, true);
                 }
                 if let Some(shaped) = view.ty.shaped() {
-                    let bits = walker.bound.stored_bits(walker.bound.elements(&arg.ty), &shaped.elem);
+                    let bits = walker
+                        .bound
+                        .stored_bits(walker.bound.elements(&arg.ty), &shaped.elem);
                     let distinct = Quantity::product([walker.distinct_reads(view), bits]);
                     walker.work.memory_bits.push(distinct);
                 }
@@ -158,7 +190,11 @@ impl Accounting for CudaAccounting {
         }
     }
 
-    fn intrinsic(walker: &mut Walker<'_, '_, Self>, op: &Operation, _args: &[Expr]) -> Result<(), SelectionError> {
+    fn intrinsic(
+        walker: &mut Walker<'_, '_, Self>,
+        op: &Operation,
+        _args: &[Expr],
+    ) -> Result<(), SelectionError> {
         match op {
             Operation::SimdSum => {
                 walker.ledger().participants = true;
@@ -175,7 +211,11 @@ impl Accounting for CudaAccounting {
             | Operation::MatrixLoad
             | Operation::MatrixLoadTranspose
             | Operation::MatrixStore
-            | Operation::MatrixMultiplyAccumulate => return walker.unsupported(&format!("intrinsic `{op}`")),
+            | Operation::MatrixMultiplyAccumulate
+            | Operation::MatrixMatmul
+            | Operation::MatrixMatmulAdd => {
+                return walker.unsupported(&format!("intrinsic `{op}`"));
+            }
         }
         Ok(())
     }

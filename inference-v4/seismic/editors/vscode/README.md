@@ -1,13 +1,17 @@
 # Seismic for VS Code
 
 Local syntax highlighting, comment toggling, bracket matching, indentation, and
-folding for `.seismic` files. No compiler or language server required.
+folding for `.seismic` files. The grammar covers the logical language surface:
+owned and borrowed tensors, bounded `index`/`range` types, ordered `for` and
+independent `parallel for`, backend `requires` clauses, and qualified capability
+operations such as `metal.matrix.matmul`. Former physical authoring forms are not
+highlighted as current source constructs. No compiler or language server is bundled.
 
 From this directory, package and install:
 
 ```sh
 npx --yes @vscode/vsce package --allow-missing-repository --skip-license
-code --install-extension seismic-language-0.0.3.vsix
+code --install-extension seismic-language-0.0.4.vsix
 ```
 
 Alternatively, use **Extensions: Install from VSIX...** in VS Code's command

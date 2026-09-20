@@ -51,7 +51,12 @@ pub(super) struct Shaped {
 
 impl Shaped {
     pub fn tensor(id: usize, shape: &[usize]) -> Shaped {
-        Shaped { backing: Backing::Tensor(id), shape: shape.to_vec(), strides: row_major(shape), offset: 0 }
+        Shaped {
+            backing: Backing::Tensor(id),
+            shape: shape.to_vec(),
+            strides: row_major(shape),
+            offset: 0,
+        }
     }
 
     pub fn owned(dtype: DType, shape: Vec<usize>, data: Vec<f64>) -> Shaped {
@@ -61,11 +66,23 @@ impl Shaped {
 
     pub fn uninit(dtype: DType, shape: Vec<usize>) -> Shaped {
         let n = shape.iter().product();
-        Shaped::from_dense(shape, Dense { dtype, data: vec![f64::NAN; n], init: vec![false; n] })
+        Shaped::from_dense(
+            shape,
+            Dense {
+                dtype,
+                data: vec![f64::NAN; n],
+                init: vec![false; n],
+            },
+        )
     }
 
     fn from_dense(shape: Vec<usize>, dense: Dense) -> Shaped {
-        Shaped { strides: row_major(&shape), shape, offset: 0, backing: Backing::Owned(Rc::new(RefCell::new(dense))) }
+        Shaped {
+            strides: row_major(&shape),
+            shape,
+            offset: 0,
+            backing: Backing::Owned(Rc::new(RefCell::new(dense))),
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -98,7 +115,12 @@ impl Shaped {
     /// Whether this selection is exactly its owned buffer in row-major order, unshared.
     pub fn exclusive(&self) -> bool {
         match &self.backing {
-            Backing::Owned(rc) => Rc::strong_count(rc) == 1 && self.offset == 0 && self.strides == row_major(&self.shape) && rc.borrow().data.len() == self.count(),
+            Backing::Owned(rc) => {
+                Rc::strong_count(rc) == 1
+                    && self.offset == 0
+                    && self.strides == row_major(&self.shape)
+                    && rc.borrow().data.len() == self.count()
+            }
             Backing::Tensor(_) => false,
         }
     }
@@ -107,7 +129,12 @@ impl Shaped {
         if self.shape.len() != 2 {
             return Err(format!("transpose of a rank-{} value", self.shape.len()));
         }
-        Ok(Shaped { backing: self.backing.clone(), shape: vec![self.shape[1], self.shape[0]], strides: vec![self.strides[1], self.strides[0]], offset: self.offset })
+        Ok(Shaped {
+            backing: self.backing.clone(),
+            shape: vec![self.shape[1], self.shape[0]],
+            strides: vec![self.strides[1], self.strides[0]],
+            offset: self.offset,
+        })
     }
 }
 
@@ -129,14 +156,30 @@ pub(super) struct ResultVal {
 
 impl ResultVal {
     pub fn new(pieces: Vec<Vec<Piece>>, values: Vec<Value>) -> ResultVal {
-        let index = pieces.iter().enumerate().map(|(i, p)| (p.iter().map(|q| q.lo).collect(), i)).collect();
-        ResultVal { pieces, values, index }
+        let index = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.iter().map(|q| q.lo).collect(), i))
+            .collect();
+        ResultVal {
+            pieces,
+            values,
+            index,
+        }
     }
 
     pub fn member(&self, at: &[Piece]) -> Result<&Value, String> {
         let key: Vec<i64> = at.iter().map(|p| p.lo).collect();
         match self.index.get(&key) {
-            Some(i) if self.pieces[*i].iter().zip(at).all(|(a, b)| a.lo == b.lo && a.hi == b.hi) && self.pieces[*i].len() == at.len() => Ok(&self.values[*i]),
+            Some(i)
+                if self.pieces[*i]
+                    .iter()
+                    .zip(at)
+                    .all(|(a, b)| a.lo == b.lo && a.hi == b.hi)
+                    && self.pieces[*i].len() == at.len() =>
+            {
+                Ok(&self.values[*i])
+            }
             _ => Err("slice is not a member of this region result".into()),
         }
     }
@@ -152,6 +195,7 @@ pub(super) struct Frag {
 #[derive(Clone, Debug)]
 pub(super) enum Value {
     Scalar(DType, f64),
+    Range(i64, i64),
     Tile(Shaped),
     View(Shaped),
     Tuple(Vec<Value>),
@@ -180,6 +224,7 @@ impl Value {
     pub fn kind(&self) -> &'static str {
         match self {
             Value::Scalar(..) => "a scalar",
+            Value::Range(..) => "a range",
             Value::Tile(_) => "a tile",
             Value::View(_) => "a view",
             Value::Tuple(_) => "a tuple",

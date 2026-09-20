@@ -21,6 +21,10 @@ pub fn expr<'a>(e: &'a Expr, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
                 expr(item, nested, f);
             }
         }
+        ExprKind::Range { lo, hi } => {
+            expr(lo, nested, f);
+            expr(hi, nested, f);
+        }
         ExprKind::Field { base, .. }
         | ExprKind::Filled { like: base, .. }
         | ExprKind::Member { result: base, .. }
@@ -48,7 +52,12 @@ pub fn expr<'a>(e: &'a Expr, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
                 }
             }
         }
-        ExprKind::Binary { lhs, rhs, .. } | ExprKind::Atomic { place: lhs, value: rhs, .. } => {
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::Atomic {
+            place: lhs,
+            value: rhs,
+            ..
+        } => {
             expr(lhs, nested, f);
             expr(rhs, nested, f);
         }
@@ -77,7 +86,11 @@ fn region<'a>(r: &'a Region, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
 pub fn stmt<'a>(s: &'a Stmt, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
     match &s.kind {
         StmtKind::Bind { value, .. } | StmtKind::Expr(value) => expr(value, nested, f),
-        StmtKind::Assign { target, value, .. } | StmtKind::Publish { value, destination: target } => {
+        StmtKind::Assign { target, value, .. }
+        | StmtKind::Publish {
+            value,
+            destination: target,
+        } => {
             expr(target, nested, f);
             expr(value, nested, f);
         }
@@ -89,9 +102,12 @@ pub fn stmt<'a>(s: &'a Stmt, nested: bool, f: &mut dyn FnMut(&'a Expr)) {
                 }
             }
         }
-        StmtKind::Range { lo, hi, body, .. } => {
+        StmtKind::Range { lo, hi, value, body, .. } => {
             expr(lo, nested, f);
             expr(hi, nested, f);
+            if let Some(value) = value {
+                expr(value, nested, f);
+            }
             if nested {
                 block(body, nested, f);
             }
@@ -155,7 +171,9 @@ pub fn stmts<'a>(b: &'a Block, f: &mut dyn FnMut(&'a Stmt)) {
         match &s.kind {
             StmtKind::Region(r) => region_blocks(r, f),
             StmtKind::Stages(stages) => stages.iter().for_each(|stage| stmts(&stage.body, f)),
-            StmtKind::Range { body, .. } | StmtKind::Coordinates { body, .. } | StmtKind::Members { body, .. } => stmts(body, f),
+            StmtKind::Range { body, .. }
+            | StmtKind::Coordinates { body, .. }
+            | StmtKind::Members { body, .. } => stmts(body, f),
             StmtKind::If { then, els, .. } => {
                 stmts(then, f);
                 stmts(els, f);

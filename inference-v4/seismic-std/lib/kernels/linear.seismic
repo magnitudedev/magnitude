@@ -2,31 +2,18 @@
 # every output; publication rounds to the output type. The first body is the reference ordered
 # F32 FMA chain over K (`matmul`); the second contracts the whole K extent under
 # `matmul_any_order` and requires numerical evidence accepted by the compilation policy.
-fn linear[M, N, K](x: tensor[M, K] T, weight: tensor[N, K] U, out y: tensor[M, N] V):
-    parallel [rows, cols] in (0..M, 0..N):
-        let mut acc = zeros_like(y[rows, cols], dtype=f32)
-        ordered [k] in 0..K:
-            matmul(load(x[rows, k]), load(weight[cols, k]), into=acc)
-        publish acc to y[rows, cols]
+fn linear[M, N, K](x: &tensor[M, K] T, weight: &tensor[N, K] U, y: &mut tensor[M, N] V):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut acc = f32(0.0)
+            for k in 0..K:
+                acc = fma(f32(x[rows, k]), f32(weight[cols, k]), acc)
+            y[rows, cols] = acc
 
-fn linear[M, N, K](x: tensor[M, K] T, weight: tensor[N, K] U, out y: tensor[M, N] V):
-    parallel [rows, cols] in (0..M, 0..N):
-        let mut acc = zeros_like(y[rows, cols], dtype=f32)
-        matmul_any_order(load(x[rows]), load(weight[cols]), into=acc)
-        publish acc to y[rows, cols]
-
-
-# into[i, j] += sum over k of a[i, k] * b[j, k], accumulated in F32, as an alternative
-# family distinct from `matmul`: the association of the sum is unspecified, and the
-# affine decode of a packed operand may be distributed over it (for one coefficient group,
-# sum x * (q * scale + bias) = scale * sum(x * q) + bias * sum(x)). Every operand value is
-# consumed at its declared precision. The reference body is the ascending F32 sum of
-# products. Callers opt in by calling this contract instead of `matmul`; it is not a
-# windowed chain, so a caller passes the whole contraction extent. Its Metal lowerings are
-# beside those of `matmul` (constructs/matmul-metal.seismic).
-fn matmul_any_order[M, N, K](a: tile[M, K] T, b: tile[N, K] U, inout into: tile[M, N] f32):
-    for i, j in owned(into):
-        let mut s = f32(0.0)
-        for k in axis(a, 1):
-            s = s + f32(a[i, k]) * f32(b[j, k])
-        into[i, j] = into[i, j] + s
+fn linear[M, N, K](x: &tensor[M, K] T, weight: &tensor[N, K] U, y: &mut tensor[M, N] V):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut acc = f32(0.0)
+            for k in 0..K:
+                acc = acc + f32(x[rows, k]) * f32(weight[cols, k])
+            y[rows, cols] = acc

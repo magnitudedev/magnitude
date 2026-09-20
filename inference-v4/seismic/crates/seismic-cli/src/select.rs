@@ -3,9 +3,7 @@ use crate::{load_program, options, Options};
 use seismic_compiler::selection::{self, Backend, Budget, ProofStatus, Selected, Strategy};
 use seismic_cpu::mapping::Cpu;
 use seismic_cuda::mapping::Cuda;
-use seismic_lang::family::{
-    self, CandidateRef, Family, OccurrenceId, Requirement, SiteKind, UnitKind, Witness,
-};
+use seismic_lang::family::{CandidateRef, Family, OccurrenceId, Requirement, SiteId, SiteKind, UnitKind, Witness};
 use seismic_lang::sir::{DefId, DefKind, Program};
 use seismic_metal::mapping::{EstimateModel, Limits, Metal};
 use std::collections::BTreeMap;
@@ -50,7 +48,7 @@ fn metal() -> Result<(Metal, String), String> {
     let limits = Limits {
         max_threads_per_threadgroup: DEFAULT_MAX_THREADS_PER_THREADGROUP,
         max_threadgroup_bytes: DEFAULT_MAX_THREADGROUP_BYTES,
-        max_private_bytes: seismic_metal::mapping::PRIVATE_BYTES,
+        max_private_bytes: seismic_metal::mapping::CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
     };
     Ok((
         Metal::new(limits, EstimateModel::default()).map_err(|e| e.to_string())?,
@@ -178,7 +176,13 @@ pub fn analyze_search(args: &[String]) -> Result<(), String> {
     let o = options(args, FLAGS)?;
     let (_, program) = load_program(&o)?;
     let target = o.target.as_str();
-    let family = family::construct(&program, o.entry()?, target, &o.workload)?;
+    let family = match target {
+        "cpu" => selection::construct_family(&program, o.entry()?, &o.workload, &cpu()?.0),
+        "cuda" => selection::construct_family(&program, o.entry()?, &o.workload, &cuda()?.0),
+        "metal" => selection::construct_family(&program, o.entry()?, &o.workload, &metal()?.0),
+        other => return Err(format!("unknown selection target `{other}`")),
+    }
+    .map_err(|error| error.to_string())?;
     let a = selection::analyze(&family);
     println!(
         "search structure of `{}` on {target} for {} (counts, not a time prediction)",
@@ -281,7 +285,7 @@ fn cover(cover: Option<&Vec<(u32, u32)>>) -> String {
 fn report<E>(
     program: &Program,
     selected: &Selected<E>,
-    domains: &BTreeMap<family::SiteId, Vec<i64>>,
+    domains: &BTreeMap<SiteId, Vec<i64>>,
     capacities: &str,
 ) -> String {
     macro_rules! say {
@@ -438,6 +442,7 @@ fn report<E>(
         "\nestimate model: {} (estimates, not measurements)",
         selected.estimate_model
     );
+    say!(out, "capability profile: {}", selected.capability_fingerprint);
     say!(out, "  seed estimate     {}", selected.seed_estimate);
     say!(out, "  selected estimate {}", selected.estimate);
     say!(out, "  proved lower bound {}", selected.lower_bound);

@@ -143,7 +143,11 @@ impl Shaped {
             Elem::Repr(_) => Some(axes.len().saturating_sub(1)),
             _ => None,
         };
-        Shaped { axes, elem, packed_axis }
+        Shaped {
+            axes,
+            elem,
+            packed_axis,
+        }
     }
 
     pub fn rank(&self) -> usize {
@@ -184,8 +188,8 @@ pub enum Ty {
     View(Shaped),
     /// Owned logical block.
     Tile(Shaped),
-    /// `lo..hi`
-    Domain,
+    /// `range[N]`, retaining its semantic upper bound.
+    Range(Sym),
     Slice(SliceId),
     /// Tile coordinate over a structural axis (binder of `owned`/`axis`). Coordinates over
     /// semantic axes are `Index`.
@@ -225,7 +229,15 @@ impl fmt::Display for Extent {
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn shape(s: &Shaped) -> String {
-            format!("[{}] {}", s.axes.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "), s.elem)
+            format!(
+                "[{}] {}",
+                s.axes
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                s.elem
+            )
         }
         match self {
             Ty::Scalar(d) => write!(f, "{}", d.name()),
@@ -233,11 +245,19 @@ impl fmt::Display for Ty {
             Ty::Tensor(s) => write!(f, "tensor{}", shape(s)),
             Ty::View(s) => write!(f, "view{}", shape(s)),
             Ty::Tile(s) => write!(f, "tile{}", shape(s)),
-            Ty::Domain => write!(f, "domain"),
+            Ty::Range(bound) => write!(f, "range[{bound}]"),
             Ty::Slice(s) => write!(f, "slice#{}", s.0),
             Ty::Coord(s) => write!(f, "coord(slice#{})", s.0),
             Ty::Result(r) => write!(f, "result#{}<{}>", r.origin.0, r.member),
-            Ty::Tuple(items) => write!(f, "({})", items.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::Tuple(items) => write!(
+                f,
+                "({})",
+                items
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Ty::Void => write!(f, "void"),
             Ty::Native(n) => write!(f, "{}.{}", n.target, n.name),
         }

@@ -6,17 +6,17 @@ selects among the authored implementations, contiguous fusion groups, and numeri
 dimensions, and realizes the selection through prescribed backend mappings. It never
 invents execution structure.
 
-The governing specification is
-`specs/26-09-18/seismic-structured-authoring-spec.md`. These documents state the
-contract of the implemented system.
+The governing language specification is
+`specs/26-09-19/seismic-logical-language-and-capabilities-spec.md`. These documents
+describe the logical source contract and identify temporary physical-IR migration gaps.
 
 ## Principles
 
-1. **Structure is authored; numbers are selected.** An implementation fixes its
-   algorithm, independent domains, producer and state scopes, stage order, and
-   combination order. Authors never write widths, candidate lists, or hardware
-   constants. Portable code cannot observe a selected width, piece count, or
-   physical mapping.
+1. **Semantics are authored; mapping is selected.** An implementation fixes its
+   algorithm, ownership, ordered and independent loops, values, and state scopes.
+   Authors never write physical blocks, storage classes, participant groups, launch
+   geometry, candidate lists, or hardware constants. Portable code cannot observe a
+   selected physical mapping.
 
 2. **Optimization is selection over a finite supplied family.** The decisions are:
    one applicable implementation per active static call occurrence, one exact cover
@@ -63,13 +63,13 @@ contract of the implemented system.
 
 | Owner | Establishes | Does not |
 | --- | --- | --- |
-| Kernel or library author | Algorithm, regions, producers, state, stages, merges, alternative portable bodies, target lowerings, backend-specific helpers | Declare tolerances, evidence, widths, candidate lists, or hardware constants |
+| Kernel or library author | Algorithm, logical tensors and borrows, ordered and independent loops, state, alternative portable bodies, target lowerings, backend-specific helpers | Declare physical blocks, storage classes, schedules, candidate lists, or hardware constants |
 | Lowering author | A target implementation within the ownership its signature grants | Restructure the caller or widen its scope |
-| Checker | Types, shapes, bounds, modes, aliasing, slice opacity, region results, stages, partial obligations, target coverage declarations | Prove bodies equivalent |
+| Checker | Types, shapes, bounded indices/ranges, moves, borrows, initialization, loop independence, capability declarations and uses | Prove bodies equivalent |
 | Family construction | Applicable candidates per occurrence, numerical sites, execution-unit sequences, obligations | Enumerate compositions; drop what it cannot analyze |
 | Backend mapping | Site domains, hard limits, legal intervals, local cost factors, a constructive seed, deterministic realization | Rank, filter by profitability, or search |
 | Numerical assessment | Exact reference status, conservative proof bounds, or matching whole-witness qualification | Treat unknown as zero or infer application tolerance |
-| Solver | The joint assignment under a budget, with precision as hard constraints and performance as the objective | Invent calls, stages, groupings, sites, or acceptable error |
+| Solver | The joint assignment under a budget, with precision as hard constraints and performance as the objective | Invent calls, source loops, ownership effects, or acceptable error |
 | Instantiation and emission | Exactly the witness | Any second tiling, fusion, staging, or placement policy |
 | Runtime | Native compilation of a checked selection, binding, validation, submission, completion | Select, substitute, or fall back |
 
@@ -77,8 +77,8 @@ contract of the implemented system.
 
 | Package | Responsibility |
 | --- | --- |
-| `seismic-lang` | Syntax, checker, structured IR, reference interpreter, joint family, instantiation to the execution IR; the symbolic prover, representations, intrinsics, ABI. |
-| `seismic-compiler` | Joint selection: solver export, seed validation, budgeted search, witness audit, replay, search analysis; the `Backend` contract; the target-neutral structural walk and mapping helpers every backend shares. |
+| `seismic-lang` | Logical syntax, ownership/borrow checker, checked IR, reference interpreter, joint family, and the bridge to execution IR; the symbolic prover, representations, capabilities, and ABI. |
+| `seismic-compiler` | Joint selection: solver export, seed validation, budgeted search, witness audit, replay, search analysis; the `Backend` contract; logical-to-physical mapping helpers shared by backends. |
 | `magnitude-solver` | Generic exact and neighborhood search with guards, residual decomposition, and proof reuse. Knows nothing about Seismic. |
 | `seismic-realization` | Target-neutral realization contracts shared by backends: invocation ABI and conditions, launch phases, tile placement, and the local storage type rule. |
 | `seismic-metal` | The Metal mapping, realized execution, MSL emission, device runtime. |
@@ -126,10 +126,10 @@ the caller's precision policy.
 
 ## Current scope
 
-- Metal, CPU, and CUDA are backends on the structured pipeline.
+- Metal, CPU, and CUDA are backends on the logical-to-physical compilation pipeline.
 - Width domains offer only divisors of static extents, so tail pieces do not occur.
-- `pipeline` has one mapping: synchronous, same participant, ring depth one.
-- A region result cannot cross a launch.
+- Compiler-owned physical staging currently has only a synchronous, same-participant mapping.
+- Some intermediate physical results cannot yet cross a launch.
 - The estimate model is unqualified. No performance claim follows from a selection.
 - Static numerical proof coverage is conservative; unproved alternatives require matching
   whole-witness qualification or remain available only to unconstrained exploration.

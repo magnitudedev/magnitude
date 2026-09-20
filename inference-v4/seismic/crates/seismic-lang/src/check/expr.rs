@@ -224,11 +224,41 @@ impl<'a> Checker<'a> {
                     span,
                 })
             }
-            A::Range { .. } => {
-                self.error(span, "a domain `lo..hi` is written as the source of a region or a `for` loop; it is not data");
-                None
+            A::Range { lo, hi } => {
+                let lo = self.expr(lo, Some(&Ty::Scalar(DType::I32)))?;
+                let hi = self.expr(hi, Some(&Ty::Scalar(DType::I32)))?;
+                let (Some(lo_sym), Some(hi_sym)) = (lo.sym.clone(), hi.sym.clone()) else {
+                    self.error(span, "range bounds must be symbolic integers");
+                    return None;
+                };
+                let bound = match expected {
+                    Some(Ty::Range(bound)) => bound.clone(),
+                    _ => hi_sym.clone(),
+                };
+                if !self.prover().nonneg(&lo_sym)
+                    || !self.prover().nonneg(&hi_sym.sub(&lo_sym))
+                    || !self.prover().nonneg(&bound.sub(&hi_sym))
+                {
+                    self.error(
+                        span,
+                        format!(
+                            "range must prove `0 <= start <= end <= {bound}`; found `{lo_sym}..{hi_sym}`"
+                        ),
+                    );
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Range {
+                        lo: Box::new(lo),
+                        hi: Box::new(hi),
+                    },
+                    ty: Ty::Range(bound),
+                    sym: None,
+                    partial: false,
+                    span,
+                })
             }
-            A::Tile { shape, elem } => self.tile_alloc(shape, elem, span),
+            A::Tensor { shape, elem } => self.tensor_alloc(shape, elem, span),
             A::Call {
                 callee,
                 bindings,
@@ -244,15 +274,30 @@ impl<'a> Checker<'a> {
             }
             A::Unary { op, expr } => self.unary(*op, expr, expected, span),
             A::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, expected, span),
-            A::Region(_) => {
-                self.error(span, "a result-producing region appears only as the value of `let`, `yield` or `return`");
-                None
-            }
         }
     }
 
     fn name(&mut self, n: &ast::Ident, allow_unassigned: bool) -> Option<Expr> {
         if let Some(id) = self.lookup(&n.name) {
+            if self.moved.contains(&id) {
+                self.error(n.span, format!("use of moved owned tensor `{}`", n.name));
+                return None;
+            }
+            if !self.borrows.contains_key(&id)
+                && self
+                    .borrows
+                    .values()
+                    .any(|(root, exclusive)| *root == id && *exclusive)
+            {
+                self.error(
+                    n.span,
+                    format!(
+                        "cannot access `{}` while an exclusive tensor borrow is live",
+                        n.name
+                    ),
+                );
+                return None;
+            }
             if self.unassigned.contains(&id) && !allow_unassigned {
                 self.error(n.span, format!("`{}` is read before every element is assigned; an uninitialized tile cannot be read, yielded or published", n.name));
                 return None;
@@ -385,6 +430,13 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn tensor_alloc(&mut self, shape: &[ast::Expr], elem: &ast::Ident, span: Span) -> Option<Expr> {
+        let mut allocation = self.tile_alloc(shape, elem, span)?;
+        let Ty::Tile(shaped) = allocation.ty else { unreachable!() };
+        allocation.ty = Ty::Tensor(shaped);
+        Some(allocation)
+    }
+
     // ---- operators ----
 
     /// Operands of an elementwise operation: scalars and dense tiles over identical axes.
@@ -419,7 +471,16 @@ impl<'a> Checker<'a> {
                     self.error(operand.span, format!("{what} consumes tile values; a {} is borrowed storage: read it with `load(v)` or a cast such as `f32(v)`", operand.ty));
                     return None;
                 }
-                Ty::Slice(_) | Ty::Coord(_) | Ty::Domain => {
+                Ty::Range(_) => {
+                    self.error(
+                        operand.span,
+                        format!(
+                            "{what} is not defined on a bounded range; ranges are consumed by `for`"
+                        ),
+                    );
+                    return None;
+                }
+                Ty::Slice(_) | Ty::Coord(_) => {
                     self.error(operand.span, format!("{what} on a slice: slices are opaque geometry with no numeric, ordering, equality or identity-observation operator"));
                     return None;
                 }

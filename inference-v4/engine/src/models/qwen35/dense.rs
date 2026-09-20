@@ -23,12 +23,10 @@ pub struct DenseInvocation {
     pub activation: DType,
     pub epsilon: f32,
 }
-/// Owns intermediate publications and native code. One instance may execute one
-/// invocation at a time. The caller owns the F32 residual and destination buffers.
+/// Owns native code and weights. The compiler/runtime own all result destinations.
 pub struct DenseSuffix {
     plan: CompiledPlan,
     weights: DenseWeights,
-    scratch: HashMap<String, Buffer>,
     epsilon: f32,
 }
 impl DenseSuffix {
@@ -87,45 +85,29 @@ impl DenseSuffix {
         ]);
         let plan = PlanCompiler::new(device, program, settings)
             .compile_entry("qwen_dense_suffix", &shapes, &elements)?;
-        let mut scratch = HashMap::new();
-        for (name, width) in [
-            ("normalized", hidden),
-            ("gate", intermediate),
-            ("up", intermediate),
-            ("activated", intermediate),
-            ("product", intermediate),
-            ("projected", hidden),
-        ] {
-            let bytes = usize::try_from(*width)
-                .ok()
-                .and_then(|w| w.checked_mul(rows))
-                .and_then(|n| n.checked_mul(activation.bytes() as usize))
-                .ok_or("dense suffix intermediate allocation overflow")?;
-            scratch.insert(name.into(), device.buffer(bytes)?);
-        }
         Ok(Self {
             plan,
             weights,
-            scratch,
             epsilon,
         })
     }
-    pub fn execute(&mut self, residual: &Buffer, output: &Buffer) -> Result<(), String> {
-        self.plan.execute(&Invocation {
+    pub fn execute(&mut self, residual: &Buffer) -> Result<Buffer, String> {
+        let results = self.plan.execute_with_results(&Invocation {
             weights: &self.weights,
-            scratch: &self.scratch,
             epsilon: self.epsilon,
             residual,
-            output,
-        })
+        })?;
+        results
+            .into_iter()
+            .find(|result| result.path == [6] && result.plane.is_empty())
+            .map(|result| result.buffer)
+            .ok_or_else(|| "dense suffix returned no F32 residual result".into())
     }
 }
 struct Invocation<'a> {
     weights: &'a DenseWeights,
-    scratch: &'a HashMap<String, Buffer>,
     epsilon: f32,
     residual: &'a Buffer,
-    output: &'a Buffer,
 }
 impl Bindings for Invocation<'_> {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
@@ -144,8 +126,7 @@ impl Bindings for Invocation<'_> {
         }
         match root {
             "residual" => Some(self.residual),
-            "out" => Some(self.output),
-            _ => self.scratch.get(root),
+            _ => None,
         }
     }
     fn scalar(&self, name: &str) -> Option<f64> {

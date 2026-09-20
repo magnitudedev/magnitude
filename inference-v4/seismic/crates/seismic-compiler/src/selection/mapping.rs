@@ -10,7 +10,7 @@ use seismic_lang::family::{
     CandidateRef, Family, OccurrenceId, Requirement, Site, SiteId, SiteKind, UnitKind, Witness,
 };
 use seismic_lang::sir::{DefKind, Program, SliceParent};
-use seismic_lang::syntax::ast::RegionMode;
+use seismic_lang::sir::RegionMode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

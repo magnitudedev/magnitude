@@ -55,6 +55,8 @@ pub(super) struct ResultValue {
 #[derive(Clone, Debug)]
 pub(super) enum Value<'a> {
     Scalar(Expr),
+    /// Logical half-open range, lowered to scalar bounds only at loop emission.
+    Range(Expr, Expr),
     /// Tensor, view, tile or native fragment reference.
     Shaped(Expr),
     /// A folded single-consumer tile binding, computed by its consumer.

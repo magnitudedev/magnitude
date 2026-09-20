@@ -10,7 +10,7 @@ use crate::{
     reduction::{ReductionPlan, Site},
     storage::StoragePlan,
 };
-use seismic_lang::{exec::ir::*, exec::types::Ty, sym::Sym};
+use seismic_lang::{exec::ir::*, exec::types::Ty, intrinsics::Operation, sym::Sym};
 use seismic_realization::dispatch::{GroupDispatch, TileDeclaration, TilePlacement};
 use seismic_realization::execution::Multiplicity;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -69,6 +69,8 @@ pub enum BarrierPurpose {
     Owned,
     Lanes,
     IntrinsicStore,
+    MatrixInitialize,
+    MatrixAtoms,
     Reuse(Purpose),
     /// Completion of an inner owner region: every SIMD group of the threadgroup has finished
     /// its visit before the outer owner continues. The site names the region's first binder.
@@ -617,7 +619,10 @@ pub fn plan_selected<'a>(vars: &'a [Var], body: &'a [Stmt], phases: &'a [Phase],
                     for arg in args {
                         self.expression(arg, operation, ordinal, None)?;
                     }
-                    if self.partial_owned && op.collective() {
+                    if self.partial_owned
+                        && (op.collective()
+                            || matches!(op, Operation::MatrixMatmul | Operation::MatrixMatmulAdd))
+                    {
                         return Err("subgroup intrinsic requires full-lane participation".into());
                     }
                     if matches!(
@@ -635,7 +640,13 @@ pub fn plan_selected<'a>(vars: &'a [Var], body: &'a [Stmt], phases: &'a [Phase],
                         );
                     }
                     let implementation =
-                        crate::collective::implementation(*op, args, output, &self.bound)?;
+                        crate::collective::implementation(
+                            *op,
+                            args,
+                            &expr.ty,
+                            output,
+                            &self.bound,
+                        )?;
                     if let Implementation::Declare { fragment, layout } = &implementation {
                         self.fragments.push(FragmentAllocation {
                             operation,
@@ -897,6 +908,29 @@ pub fn plan_selected<'a>(vars: &'a [Var], body: &'a [Stmt], phases: &'a [Phase],
                             continue;
                         }
                         match &value.kind {
+                            ExprKind::Intrinsic { op, .. } if op.produces_owned_result() => {
+                                self.materialize(operation, var, Purpose::Value)?;
+                                let placement = self.storage.declaration(var)?.placement.clone();
+                                self.bound.insert(var, Some(placement.clone()));
+                                self.publish(
+                                    operation,
+                                    var,
+                                    BarrierPurpose::MatrixInitialize,
+                                    Some(placement.clone()),
+                                )?;
+                                self.publish(
+                                    operation,
+                                    var,
+                                    BarrierPurpose::MatrixAtoms,
+                                    Some(placement.clone()),
+                                )?;
+                                self.publish(
+                                    operation,
+                                    var,
+                                    BarrierPurpose::IntrinsicStore,
+                                    Some(placement),
+                                )?;
+                            }
                             ExprKind::TileAlloc { .. } => {
                                 self.materialize(operation, var, Purpose::Value)?;
                                 self.bound.insert(
@@ -1071,7 +1105,7 @@ pub fn plan_selected<'a>(vars: &'a [Var], body: &'a [Stmt], phases: &'a [Phase],
                         let binder = *vars.first().ok_or("an inner owner region has no binder")?;
                         self.barrier(operation, binder, BarrierPurpose::Owners, MemorySpace::Group)?;
                     }
-                    StmtKind::Range { var, lo, hi, body } => {
+                    StmtKind::Range { var, lo, hi, body, .. } => {
                         let outer = self.partial_owned;
                         self.partial_owned |= !self.uniform_sym(lo) || !self.uniform_sym(hi);
                         if self.partial_owned {

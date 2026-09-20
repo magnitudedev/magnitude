@@ -15,7 +15,7 @@ use crate::{
 use packed::PackedRows;
 use seismic_lang::types::{DType, Elem};
 use seismic_runtime::{
-    plan::{PlanCompiler, Settings, StepObservation, Submission},
+    plan::{InvocationResults, PlanCompiler, Settings, StepObservation, Submission},
     Buffer, Device, Error, ExecutionObservation,
 };
 use std::{
@@ -90,25 +90,31 @@ fn execute_stage(
     block: Option<usize>,
     observations: &mut Option<Vec<DecoderStepObservation>>,
     submission: &mut Option<Submission>,
-) -> Result<(), String> {
+) -> Result<InvocationResults, String> {
+    let mut prepared = composition.prepare(tensors, scalars)?;
+    let results = prepared.results_for(0)?.clone();
     if let Some(submission) = submission {
-        submission.append(composition.prepare(tensors, scalars)?);
-        Ok(())
+        submission.append(prepared);
     } else if let Some(observations) = observations {
-        observations.extend(
-            composition
-                .execute_observed(tensors, scalars)?
-                .into_iter()
-                .map(|step| DecoderStepObservation {
-                    stage: stage.into(),
-                    block,
-                    step,
-                }),
-        );
-        Ok(())
+        observations.extend(prepared.execute_steps_observed()?.into_iter().map(|step| {
+            DecoderStepObservation {
+                stage: stage.into(),
+                block,
+                step,
+            }
+        }));
     } else {
-        composition.execute(tensors, scalars)
+        prepared.execute_sequential()?;
     }
+    Ok(results)
+}
+
+fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, String> {
+    results
+        .iter()
+        .find(|result| result.path == path && result.plane.is_empty())
+        .map(|result| result.buffer.clone())
+        .ok_or_else(|| format!("owned result path {path:?} has no dense buffer"))
 }
 /// Explicit numerical output; state-only execution omits the vocabulary projection.
 pub enum Readout<'a> {
@@ -322,8 +328,8 @@ impl Decoder {
             "qwen_embedding_rows",
             shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
             weights(vec![("table", import(&description.embedding, activation)?)]),
-            &["tokens", "out"],
-            &["embedded"],
+            &["tokens"],
+            &[],
             HashMap::new(),
         )?
         .control_domain("tokens", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
@@ -350,7 +356,7 @@ impl Decoder {
                             ("D", g.hidden),
                             ("T", history_capacity as u64),
                             ("R", 1),
-                            ("H", g.attention_heads),
+                            ("G", g.attention_heads / g.kv_heads),
                             ("KV", g.kv_heads),
                             ("P", g.rotary_width / 2),
                             ("S", g.attention_width - g.rotary_width),
@@ -368,26 +374,13 @@ impl Decoder {
                         ]),
                         &[
                             "hidden",
-                            "out",
                             "destinations",
                             "coordinates",
                             "visible",
                             "history_key",
                             "history_value",
                         ],
-                        &[
-                            "normalized",
-                            "query_gate",
-                            "key",
-                            "value",
-                            "query",
-                            "prepared_key",
-                            "gate",
-                            "attended",
-                            "activated",
-                            "gated",
-                            "projected",
-                        ],
+                        &[],
                         scalar(&[
                             ("base", g.rotary_base),
                             ("epsilon", g.epsilon),
@@ -441,29 +434,8 @@ impl Decoder {
                             ("recurrent_norm", import(&r.norm, activation)?),
                             ("output_weight", import(&r.output, activation)?),
                         ]),
-                        &[
-                            "hidden",
-                            "out",
-                            "window",
-                            "delta",
-                            "next_window",
-                            "next_delta",
-                        ],
-                        &[
-                            "normalized",
-                            "projected",
-                            "gate",
-                            "alpha",
-                            "beta_input",
-                            "qkv",
-                            "beta",
-                            "decay",
-                            "mixed",
-                            "mixed_norm",
-                            "activated",
-                            "gated",
-                            "output_projection",
-                        ],
+                        &["hidden", "window", "delta"],
+                        &[],
                         scalar(&[
                             ("epsilon", g.epsilon),
                             ("preparation_epsilon", g.epsilon * g.recurrent_width as f64),
@@ -493,15 +465,8 @@ impl Decoder {
                             ("up_weight", import(&ff.up, activation)?),
                             ("down_weight", import(&ff.down, activation)?),
                         ]),
-                        &["residual", "out"],
-                        &[
-                            "normalized",
-                            "gate",
-                            "up",
-                            "activated",
-                            "product",
-                            "projected",
-                        ],
+                        &["residual"],
+                        &[],
                         scalar(&[("eps", g.epsilon)]),
                     )?
                 }
@@ -531,23 +496,8 @@ impl Decoder {
                             ("shared_up", import(&ff.shared_up, activation)?),
                             ("shared_down", import(&ff.shared_down, activation)?),
                         ]),
-                        &["residual", "out"],
-                        &[
-                            "normalized",
-                            "logits",
-                            "routes",
-                            "scores",
-                            "gate",
-                            "up",
-                            "product",
-                            "projected",
-                            "sg",
-                            "su",
-                            "sa",
-                            "sp",
-                            "shared",
-                            "coefficient",
-                        ],
+                        &["residual"],
+                        &[],
                         scalar(&[
                             ("eps", g.epsilon),
                             ("normalize", f64::from(experts.normalize_selected)),
@@ -570,8 +520,8 @@ impl Decoder {
             "qwen_readout_selected",
             shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden), ("S", 1)])?,
             readout_weights.clone(),
-            &["hidden", "selected", "logits"],
-            &["last", "normalized"],
+            &["hidden", "selected"],
+            &[],
             scalar(&[("epsilon", g.epsilon)]),
         )?
         .control_domain("selected", IntegerRange { min: 0, max: i128::from(g.vocabulary) - 1 })?;
@@ -579,8 +529,8 @@ impl Decoder {
             "qwen_readout_rows",
             shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
             readout_weights,
-            &["hidden", "logits"],
-            &["last", "normalized"],
+            &["hidden"],
+            &[],
             scalar(&[("epsilon", g.epsilon)]),
         )?;
         let hidden_bytes = usize::try_from(g.hidden)
@@ -923,26 +873,58 @@ impl Decoder {
         let position =
             i32::try_from(state.position()).map_err(|_| "rotary position exceeds index domain")?;
         let coordinates: Vec<[i32; 4]> = if let Some(input) = conditioned {
-            input.coordinates.iter().map(|&[t,h,w]| [t,h,w,0]).collect()
+            input
+                .coordinates
+                .iter()
+                .map(|&[t, h, w]| [t, h, w, 0])
+                .collect()
         } else {
-            tokens.iter().enumerate().map(|(i,_)| [position + i as i32; 4]).collect()
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(i, _)| [position + i as i32; 4])
+                .collect()
         };
-        rows.coordinates.write(&coordinates.iter().flatten().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+        rows.coordinates.write(
+            &coordinates
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
         let mut overlays = Vec::new();
         if let Some(input) = conditioned {
-            let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-            let row_bytes = usize::try_from(self.geometry.hidden).map_err(|_| "hidden width overflow")?.checked_mul(4).ok_or("hidden row bytes overflow")?;
+            let mut compiler =
+                PlanCompiler::new(&self.device, &self.program, self.settings.clone());
+            let row_bytes = usize::try_from(self.geometry.hidden)
+                .map_err(|_| "hidden width overflow")?
+                .checked_mul(4)
+                .ok_or("hidden row bytes overflow")?;
             for feature in &input.features {
-                let offset = feature.destination.checked_mul(row_bytes).ok_or("feature destination overflow")?;
-                let length = feature.count.checked_mul(row_bytes).ok_or("feature destination overflow")?;
-                let out = rows.hidden.view(offset..offset.checked_add(length).ok_or("feature destination overflow")?)?;
-                let composition = Composition::compile(&mut compiler, CompositionSpec {
-                    entry: "cast_rows".into(),
-                    shapes: shape(&[("M", feature.count as u64), ("K", self.geometry.hidden)])?,
-                    elements: HashMap::from([("T".into(), Elem::Dtype(DType::F32)), ("U".into(), Elem::Dtype(DType::F32))]),
-                    weights: HashMap::new(), external: names(&["input", "out"]), intermediates: HashSet::new(), scalars: HashMap::new(),
-                })?;
-                overlays.push((composition, HashMap::from([("input".into(), feature.source.clone()), ("out".into(), out)])));
+                let offset = feature
+                    .destination
+                    .checked_mul(row_bytes)
+                    .ok_or("feature destination overflow")?;
+                let length = feature
+                    .count
+                    .checked_mul(row_bytes)
+                    .ok_or("feature destination overflow")?;
+                let composition = Composition::compile(
+                    &mut compiler,
+                    CompositionSpec {
+                        entry: "cast_rows".into(),
+                        shapes: shape(&[("M", feature.count as u64), ("K", self.geometry.hidden)])?,
+                        elements: HashMap::from([
+                            ("T".into(), Elem::Dtype(DType::F32)),
+                            ("U".into(), Elem::Dtype(DType::F32)),
+                        ]),
+                        weights: HashMap::new(),
+                        external: names(&["input", "out"]),
+                        intermediates: HashSet::new(),
+                        scalars: HashMap::new(),
+                    },
+                )?;
+                overlays.push((composition, feature.source.clone(), offset, length));
             }
         }
         let ranges = if ranges.is_empty() {
@@ -968,6 +950,7 @@ impl Decoder {
                 .collect::<Vec<_>>(),
         )?;
         let mut advance = state.begin(tokens.len())?;
+        let mut state_results = Vec::new();
         advance.execute(|transition| {
             rows.destinations.write(
                 &transition
@@ -976,26 +959,35 @@ impl Decoder {
                     .flat_map(|&d| (d as i32).to_le_bytes())
                     .collect::<Vec<_>>(),
             )?;
-            execute_stage(
+            let embedding = execute_stage(
                 &mut rows.embedding,
-                &HashMap::from([
-                    ("out".into(), rows.hidden.clone()),
-                    ("tokens".into(), rows.tokens.clone()),
-                ]),
+                &HashMap::from([("tokens".into(), rows.tokens.clone())]),
                 &HashMap::new(),
                 "embedding",
                 None,
                 &mut observations,
                 &mut submission,
             )?;
-            for (composition, tensors) in &mut overlays {
-                execute_stage(composition, tensors, &HashMap::new(), "conditioning", None, &mut observations, &mut submission)?;
+            let mut hidden = result_buffer(&embedding, &[1])?;
+            for (composition, source, offset, length) in &mut overlays {
+                let out = hidden.view(
+                    *offset
+                        ..offset
+                            .checked_add(*length)
+                            .ok_or("feature destination overflow")?,
+                )?;
+                execute_stage(
+                    composition,
+                    &HashMap::from([("input".into(), source.clone()), ("out".into(), out)]),
+                    &HashMap::new(),
+                    "conditioning",
+                    None,
+                    &mut observations,
+                    &mut submission,
+                )?;
             }
             for (block_index, block) in rows.blocks.iter_mut().enumerate() {
-                let mut tensors = HashMap::from([
-                    ("hidden".into(), rows.hidden.clone()),
-                    ("out".into(), rows.hidden.clone()),
-                ]);
+                let mut tensors = HashMap::from([("hidden".into(), hidden.clone())]);
                 let parameters = if block.attention {
                     let i = block.state_index;
                     tensors.extend([
@@ -1011,12 +1003,10 @@ impl Decoder {
                     tensors.extend([
                         ("window".into(), transition.previous[i].clone()),
                         ("delta".into(), transition.previous[i + 1].clone()),
-                        ("next_window".into(), transition.following[i].clone()),
-                        ("next_delta".into(), transition.following[i + 1].clone()),
                     ]);
                     HashMap::new()
                 };
-                execute_stage(
+                let mixed = execute_stage(
                     &mut block.mixer,
                     &tensors,
                     &parameters,
@@ -1025,26 +1015,32 @@ impl Decoder {
                     &mut observations,
                     &mut submission,
                 )?;
-                execute_stage(
+                hidden = if block.attention {
+                    result_buffer(&mixed, &[])?
+                } else {
+                    let i = block.state_index;
+                    state_results.push((i, result_buffer(&mixed, &[0])?));
+                    state_results.push((i + 1, result_buffer(&mixed, &[1])?));
+                    result_buffer(&mixed, &[2])?
+                };
+                let feedforward = execute_stage(
                     &mut block.feedforward,
-                    &HashMap::from([
-                        ("residual".into(), rows.hidden.clone()),
-                        ("out".into(), rows.hidden.clone()),
-                    ]),
+                    &HashMap::from([("residual".into(), hidden.clone())]),
                     &HashMap::new(),
                     "feedforward",
                     Some(block_index),
                     &mut observations,
                     &mut submission,
                 )?;
+                hidden = result_buffer(&feedforward, &[6])
+                    .or_else(|_| result_buffer(&feedforward, &[14]))?;
             }
             if let Some(selected) = selected.as_mut() {
-                execute_stage(
+                let results = execute_stage(
                     &mut selected.readout,
                     &HashMap::from([
-                        ("hidden".into(), rows.hidden.clone()),
+                        ("hidden".into(), hidden.clone()),
                         ("selected".into(), selected.ids.clone()),
-                        ("logits".into(), selected.logits.clone()),
                     ]),
                     &HashMap::new(),
                     "readout_selected",
@@ -1052,25 +1048,27 @@ impl Decoder {
                     &mut observations,
                     &mut submission,
                 )?;
+                selected.logits = result_buffer(&results, &[1])?;
             } else if !matches!(&readout, Readout::StateOnly | Readout::Selected(_)) {
-                execute_stage(
+                let results = execute_stage(
                     &mut rows.readout,
-                    &HashMap::from([
-                        ("hidden".into(), rows.hidden.clone()),
-                        ("logits".into(), rows.logits.clone()),
-                    ]),
+                    &HashMap::from([("hidden".into(), hidden.clone())]),
                     &HashMap::new(),
                     "readout",
                     None,
                     &mut observations,
                     &mut submission,
                 )?;
+                rows.logits = result_buffer(&results, &[1])?;
             }
             if let Some(submission) = &mut submission {
                 batch_observation = Some(submission.execute_batched()?);
             }
             Ok(())
         })?;
+        for (index, buffer) in state_results {
+            advance.replace_following(index, buffer)?;
+        }
         let output = match readout {
             Readout::StateOnly => ReadoutOutput::StateOnly,
             Readout::Selected(_) => {

@@ -202,9 +202,28 @@ fn intrinsic_operands(stmts: &[Stmt]) -> std::collections::HashSet<VarId> {
                     visit(then, operands);
                     visit(els, operands);
                 }
-                StmtKind::Expr(expr) | StmtKind::Assign { value: expr, .. } => {
+                StmtKind::Expr(expr) => {
                     if let ExprKind::Intrinsic { op, args } = &expr.kind {
                         if matches!(
+                            op,
+                            seismic_lang::intrinsics::Operation::MatrixLoad
+                                | seismic_lang::intrinsics::Operation::MatrixLoadTranspose
+                                | seismic_lang::intrinsics::Operation::MatrixStore
+                        ) {
+                            if let Some(root) = args.get(1).and_then(tile_root) {
+                                operands.insert(root);
+                            }
+                        }
+                    }
+                }
+                StmtKind::Assign { target, value, .. } => {
+                    if let ExprKind::Intrinsic { op, args } = &value.kind {
+                        if op.produces_owned_result() {
+                            if let ExprKind::Var(destination) = target.kind {
+                                operands.insert(destination);
+                            }
+                            operands.extend(args.iter().filter_map(tile_root));
+                        } else if matches!(
                             op,
                             seismic_lang::intrinsics::Operation::MatrixLoad
                                 | seismic_lang::intrinsics::Operation::MatrixLoadTranspose
@@ -670,6 +689,9 @@ impl StorageFamily {
                 StmtKind::Assign { target, value, .. } => {
                     if let ExprKind::Var(var) = target.kind {
                         match &value.kind {
+                            ExprKind::Intrinsic { op, .. } if op.produces_owned_result() => {
+                                requests.values.insert(var);
+                            }
                             ExprKind::TileAlloc { .. } => {
                                 requests.values.insert(var);
                             }

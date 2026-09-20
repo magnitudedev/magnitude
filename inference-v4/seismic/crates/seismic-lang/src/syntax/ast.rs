@@ -143,13 +143,15 @@ impl Decl {
     }
 }
 
-/// `fn name[shape](params) [alias(..)] [-> result] [for target] [where pred]: body`
+/// `fn name[shape](params) [-> result] [for target] [requires capability] [where pred]: body`
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
     pub signature: Signature,
     pub name: Ident,
     /// `None` is a portable function; `Some` restricts the function to that backend.
     pub target: Option<Ident>,
+    /// Capability namespaces explicitly required by this backend-specific body.
+    pub requires: Vec<CapabilityPath>,
     pub body: Block,
     pub span: Span,
 }
@@ -158,8 +160,6 @@ pub struct FnDecl {
 pub struct Signature {
     pub shape: Vec<Ident>,
     pub params: Vec<Param>,
-    /// `alias(a, b)` pairs permitted to overlap.
-    pub aliases: Vec<(Ident, Ident)>,
     /// `None` means `void`.
     pub result: Option<TypeExpr>,
     /// Conjuncts of the `where` clause.
@@ -172,6 +172,8 @@ pub struct LowerDecl {
     pub name: Ident,
     pub signature: Signature,
     pub target: Ident,
+    /// Capability namespaces explicitly required by this lowering body.
+    pub requires: Vec<CapabilityPath>,
     /// Conjuncts following `for target where`; for the long form these are also stored here,
     /// not in `signature.predicates`.
     pub predicates: Vec<Expr>,
@@ -179,16 +181,16 @@ pub struct LowerDecl {
     pub span: Span,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Mode {
-    In,
-    Out,
-    Inout,
+/// A backend capability namespace such as `metal.matrix`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityPath {
+    pub backend: Ident,
+    pub capability: Ident,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
-    pub mode: Mode,
     pub name: Ident,
     pub ty: TypeExpr,
 }
@@ -205,7 +207,9 @@ pub enum TypeKind {
     Scalar(Ident),
     /// `index[N]`
     Index(Box<Expr>),
-    /// `tensor[shape] elem`, `view[shape] elem`, `tile[shape] elem`
+    /// `range[N]`: a bounded logical half-open range.
+    Range(Box<Expr>),
+    /// `tensor[shape] elem`, `&tensor[shape] elem`, or `&mut tensor[shape] elem`.
     Shaped {
         head: ShapedHead,
         shape: Vec<Expr>,
@@ -213,19 +217,16 @@ pub enum TypeKind {
     },
     Tuple(Vec<TypeExpr>),
     Void,
-    /// `metal.simdgroup_matrix(f32)`: target namespace, type name, arguments.
-    Native {
-        target: Ident,
-        name: Ident,
-        args: Vec<Expr>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShapedHead {
+    /// Owned logical tensor.
     Tensor,
-    View,
-    Tile,
+    /// Shared logical tensor borrow (`&tensor`).
+    SharedTensor,
+    /// Exclusive mutable logical tensor borrow (`&mut tensor`).
+    MutTensor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,35 +248,6 @@ pub enum Pattern {
     Tuple(Vec<Pattern>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RegionMode {
-    Parallel,
-    Ordered,
-    Pipeline,
-}
-
-/// `mode [binders] in source: body [merge (l, r) identity e: body]`
-#[derive(Clone, Debug, PartialEq)]
-pub struct Region {
-    pub mode: RegionMode,
-    pub binders: Vec<Ident>,
-    /// One expression, or the members of a parenthesized product `(d0, d1)`. Each is a
-    /// domain `lo..hi`, an enclosing slice, or (single source only) a region result.
-    pub sources: Vec<Expr>,
-    pub body: Block,
-    pub merge: Option<Merge>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Merge {
-    pub left: Pattern,
-    pub right: Pattern,
-    pub identity: Expr,
-    pub body: Block,
-    pub span: Span,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
     Let {
@@ -289,15 +261,10 @@ pub enum StmtKind {
         op: AssignOp,
         value: Expr,
     },
-    /// A region in statement position (no result).
-    Region(Region),
-    Stage {
-        name: Ident,
-        ports: Vec<Ident>,
-        body: Block,
-    },
-    /// `for targets in iter`: `iter` is `lo..hi`, `owned(t)`, `axis(t, n)` or a slice name.
+    /// `for targets in iter`: `iter` is a bounded range or a range value.
     For {
+        /// `false` is ordered `for`; `true` is independent `parallel for`.
+        parallel: bool,
         targets: Vec<Ident>,
         iter: Expr,
         body: Block,
@@ -307,11 +274,6 @@ pub enum StmtKind {
         then: Block,
         els: Option<Block>,
     },
-    Publish {
-        value: Expr,
-        destination: Expr,
-    },
-    Yield(Vec<Expr>),
     Return(Vec<Expr>),
     Expr(Expr),
 }
@@ -335,8 +297,8 @@ pub enum ExprKind {
         lo: Box<Expr>,
         hi: Box<Expr>,
     },
-    /// `tile[shape] elem`
-    Tile {
+    /// `tensor[shape] elem`: uninitialized owned logical tensor storage.
+    Tensor {
         shape: Vec<Expr>,
         elem: Ident,
     },
@@ -364,8 +326,6 @@ pub enum ExprKind {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// A result-producing region; only as the value of `let`, `yield` or `return`.
-    Region(Box<Region>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

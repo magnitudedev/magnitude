@@ -42,10 +42,6 @@ struct Printer {
     level: usize,
 }
 
-fn is_region(e: &Expr) -> bool {
-    matches!(e.kind, ExprKind::Region(_))
-}
-
 impl Printer {
     fn indent(&mut self) {
         for _ in 0..self.level {
@@ -76,6 +72,7 @@ impl Printer {
                 if let Some(target) = &f.target {
                     let _ = write!(self.out, " for {}", target.name);
                 }
+                self.requires(&f.requires);
                 self.predicates(&f.signature.predicates);
                 self.out.push_str(":\n");
                 self.block(&f.body);
@@ -84,6 +81,7 @@ impl Printer {
                 let _ = write!(self.out, "lower {}", l.name.name);
                 self.signature(&l.signature);
                 let _ = write!(self.out, " for {}", l.target.name);
+                self.requires(&l.requires);
                 self.predicates(&l.predicates);
                 self.out.push_str(":\n");
                 self.block(&l.body);
@@ -99,21 +97,10 @@ impl Printer {
         }
         self.out.push('(');
         self.list(&s.params, |p, param| {
-            p.out.push_str(match param.mode {
-                Mode::In => "",
-                Mode::Out => "out ",
-                Mode::Inout => "inout ",
-            });
             let _ = write!(p.out, "{}: ", param.name.name);
             p.ty(&param.ty);
         });
         self.out.push(')');
-        if !s.aliases.is_empty() {
-            self.out.push(' ');
-            self.list(&s.aliases, |p, (a, b)| {
-                let _ = write!(p.out, "alias({}, {})", a.name, b.name);
-            });
-        }
         if let Some(result) = &s.result {
             self.out.push_str(" -> ");
             self.ty(result);
@@ -127,6 +114,20 @@ impl Printer {
         }
     }
 
+    fn requires(&mut self, capabilities: &[CapabilityPath]) {
+        if capabilities.is_empty() {
+            return;
+        }
+        self.out.push_str(" requires ");
+        self.list(capabilities, |p, capability| {
+            let _ = write!(
+                p.out,
+                "{}.{}",
+                capability.backend.name, capability.capability.name
+            );
+        });
+    }
+
     fn ty(&mut self, ty: &TypeExpr) {
         match &ty.kind {
             TypeKind::Scalar(name) => self.out.push_str(&name.name),
@@ -135,11 +136,16 @@ impl Printer {
                 self.expr(bound, 0);
                 self.out.push(']');
             }
+            TypeKind::Range(bound) => {
+                self.out.push_str("range[");
+                self.expr(bound, 0);
+                self.out.push(']');
+            }
             TypeKind::Shaped { head, shape, elem } => {
                 self.out.push_str(match head {
                     ShapedHead::Tensor => "tensor",
-                    ShapedHead::View => "view",
-                    ShapedHead::Tile => "tile",
+                    ShapedHead::SharedTensor => "&tensor",
+                    ShapedHead::MutTensor => "&mut tensor",
                 });
                 self.shape_and_elem(shape, elem);
             }
@@ -149,14 +155,6 @@ impl Printer {
                 self.out.push(')');
             }
             TypeKind::Void => self.out.push_str("void"),
-            TypeKind::Native { target, name, args } => {
-                let _ = write!(self.out, "{}.{}", target.name, name.name);
-                if !args.is_empty() {
-                    self.out.push('(');
-                    self.list(args, |p, arg| p.expr(arg, 0));
-                    self.out.push(')');
-                }
-            }
         }
     }
 
@@ -194,12 +192,10 @@ impl Printer {
         }
     }
 
-    /// A trailing value; a region value ends its own line.
+    /// A trailing expression value.
     fn value(&mut self, value: &Expr) {
         self.expr(value, 0);
-        if !is_region(value) {
-            self.out.push('\n');
-        }
+        self.out.push('\n');
     }
 
     fn values(&mut self, keyword: &str, values: &[Expr]) {
@@ -208,9 +204,7 @@ impl Printer {
             self.out.push(' ');
         }
         self.list(values, |p, v| p.expr(v, 0));
-        if !values.last().is_some_and(is_region) {
-            self.out.push('\n');
-        }
+        self.out.push('\n');
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
@@ -231,35 +225,20 @@ impl Printer {
                 let _ = write!(self.out, " {} ", op.text());
                 self.value(value);
             }
-            StmtKind::Region(region) => self.region(region),
-            StmtKind::Stage { name, ports, body } => {
-                let _ = write!(self.out, "stage {}", name.name);
-                if !ports.is_empty() {
-                    self.out.push('(');
-                    self.names(ports);
-                    self.out.push(')');
-                }
-                self.suite(body);
-            }
             StmtKind::For {
+                parallel,
                 targets,
                 iter,
                 body,
             } => {
-                self.out.push_str("for ");
+                self.out
+                    .push_str(if *parallel { "parallel for " } else { "for " });
                 self.names(targets);
                 self.out.push_str(" in ");
                 self.expr(iter, 0);
                 self.suite(body);
             }
             StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els.as_ref()),
-            StmtKind::Publish { value, destination } => {
-                self.out.push_str("publish ");
-                self.expr(value, 0);
-                self.out.push_str(" to ");
-                self.value(destination);
-            }
-            StmtKind::Yield(values) => self.values("yield", values),
             StmtKind::Return(values) => self.values("return", values),
             StmtKind::Expr(e) => self.value(e),
         }
@@ -284,36 +263,6 @@ impl Printer {
                 self.out.push_str("else");
                 self.suite(els);
             }
-        }
-    }
-
-    /// Header, body and `merge` clause at the current level; ends with a newline.
-    fn region(&mut self, region: &Region) {
-        self.out.push_str(match region.mode {
-            RegionMode::Parallel => "parallel [",
-            RegionMode::Ordered => "ordered [",
-            RegionMode::Pipeline => "pipeline [",
-        });
-        self.names(&region.binders);
-        self.out.push_str("] in ");
-        match region.sources.as_slice() {
-            [source] => self.expr(source, 0),
-            sources => {
-                self.out.push('(');
-                self.list(sources, |p, s| p.expr(s, 0));
-                self.out.push(')');
-            }
-        }
-        self.suite(&region.body);
-        if let Some(merge) = &region.merge {
-            self.indent();
-            self.out.push_str("merge (");
-            self.pattern(&merge.left);
-            self.out.push_str(", ");
-            self.pattern(&merge.right);
-            self.out.push_str(") identity ");
-            self.expr(&merge.identity, 0);
-            self.suite(&merge.body);
         }
     }
 
@@ -360,8 +309,8 @@ impl Printer {
                     self.out.push(')');
                 }
             }
-            ExprKind::Tile { shape, elem } => {
-                self.out.push_str("tile");
+            ExprKind::Tensor { shape, elem } => {
+                self.out.push_str("tensor");
                 self.shape_and_elem(shape, elem);
             }
             ExprKind::Call {
@@ -437,7 +386,6 @@ impl Printer {
                     self.out.push(')');
                 }
             }
-            ExprKind::Region(region) => self.region(region),
         }
     }
 }

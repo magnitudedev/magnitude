@@ -14,7 +14,7 @@ use seismic_lang::{
     types::{DType, Elem},
 };
 use seismic_runtime::{
-    plan::{PlanCompiler, Settings, Submission},
+    plan::{InvocationResults, PlanCompiler, Settings, Submission},
     Buffer, Device, Error,
 };
 use std::{
@@ -74,6 +74,13 @@ pub struct Encoder {
 }
 fn names(values: &[&str]) -> HashSet<String> {
     values.iter().map(|s| s.to_string()).collect()
+}
+fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, String> {
+    results
+        .iter()
+        .find(|result| result.path == path && result.plane.is_empty())
+        .map(|result| result.buffer.clone())
+        .ok_or_else(|| format!("owned result path {path:?} has no dense buffer"))
 }
 fn spec(
     entry: &str,
@@ -146,13 +153,16 @@ impl Encoder {
             return Err("invalid vision encoder geometry".into());
         }
         let mut bind = |roles: Vec<(&str, &WeightDescriptor)>| -> Result<HashMap<String, ResidentWeight>, String> {
-            roles.into_iter().map(|(name, role)| {
-                let weight = import(role, DType::BF16)?;
-                if !weight.belongs_to(&device) || weight.descriptor() != role {
-                    return Err(format!("vision weight {name} differs from its role or execution owner"));
-                }
-                Ok((name.into(), weight))
-            }).collect()
+            roles
+                .into_iter()
+                .map(|(name, role)| {
+                    let weight = import(role, DType::BF16)?;
+                    if !weight.belongs_to(&device) || weight.descriptor() != role {
+                        return Err(format!("vision weight {name} differs from its role or execution owner"));
+                    }
+                    Ok((name.into(), weight))
+                })
+                .collect()
         };
         let stem = spec(
             "qwen_vision_stem",
@@ -169,8 +179,8 @@ impl Encoder {
                 ("bias", &description.patch.bias),
                 ("table", &description.positions),
             ])?,
-            &["pixels", "indices", "coefficients", "out"],
-            &["reordered", "projected"],
+            &["pixels", "indices", "coefficients"],
+            &[],
             false,
         )?;
         let mut blocks = Vec::new();
@@ -197,21 +207,8 @@ impl Encoder {
                     ("down_weight", &b.down.weight),
                     ("down_bias", &b.down.bias),
                 ])?,
-                &["hidden", "coordinates", "out"],
-                &[
-                    "normalized",
-                    "projected",
-                    "query",
-                    "key",
-                    "value",
-                    "attended",
-                    "mixed",
-                    "residual",
-                    "normalized2",
-                    "up",
-                    "activated",
-                    "down",
-                ],
+                &["hidden", "coordinates"],
+                &[],
                 true,
             )?);
         }
@@ -226,8 +223,8 @@ impl Encoder {
                 ("down_weight", &description.merger_down.weight),
                 ("down_bias", &description.merger_down.bias),
             ])?,
-            &["hidden", "out"],
-            &["normalized", "up", "activated"],
+            &["hidden"],
+            &[],
             true,
         )?;
         Ok(Self {
@@ -255,13 +252,6 @@ impl Encoder {
             return Err("image pixels differ from encoder geometry or are nonfinite".into());
         }
         let output_rows = rows / (g.image.merge * g.image.merge);
-        let allocate = |rows: usize, width: usize, bytes: usize| {
-            let size = rows
-                .checked_mul(width)
-                .and_then(|n| n.checked_mul(bytes))
-                .ok_or("vision allocation overflow")?;
-            self.device.buffer(size)
-        };
         let pixels = self.device.buffer_from(image.pixels.data())?;
         let coordinates = self.device.buffer_from(
             &controls
@@ -290,68 +280,71 @@ impl Encoder {
                 .collect::<Vec<_>>(),
         )?;
         let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-        let mut prepare = |template: &CompositionSpec,
-                           count: usize,
-                           bindings: HashMap<String, Buffer>,
-                           controls: &[&str]|
-         -> Result<Submission, Error> {
-            let mut spec = template.clone();
-            spec.shapes.insert(
-                "M".into(),
-                i64::try_from(count).map_err(|_| "vision rows overflow")?,
-            );
-            let composition =
-                Composition::compile(&mut compiler, spec)?.control_inputs(controls)?;
-            Ok(composition.prepare(&bindings, &HashMap::new())?)
-        };
-        let mut hidden = allocate(rows, g.hidden, 2)?;
-        let mut submission = prepare(
+        let mut prepare =
+            |template: &CompositionSpec,
+             count: usize,
+             bindings: HashMap<String, Buffer>,
+             controls: &[&str]|
+             -> Result<(Submission, seismic_runtime::plan::InvocationResults), Error> {
+                let mut spec = template.clone();
+                spec.shapes.insert(
+                    "M".into(),
+                    i64::try_from(count).map_err(|_| "vision rows overflow")?,
+                );
+                let composition =
+                    Composition::compile(&mut compiler, spec)?.control_inputs(controls)?;
+                let submission = composition.prepare(&bindings, &HashMap::new())?;
+                let results = submission.results_for(0)?.clone();
+                Ok((submission, results))
+            };
+        let (mut submission, stem_results) = prepare(
             &self.stem,
             rows,
             HashMap::from([
                 ("pixels".into(), pixels),
                 ("indices".into(), indices),
                 ("coefficients".into(), coefficients),
-                ("out".into(), hidden.clone()),
             ]),
             &["indices"],
         )?;
+        let mut hidden = result_buffer(&stem_results, &[])?;
         for block in &self.blocks {
-            let out = allocate(rows, g.hidden, 2)?;
-            submission.append(prepare(
+            let (prepared, results) = prepare(
                 block,
                 rows,
                 HashMap::from([
                     ("hidden".into(), hidden),
                     ("coordinates".into(), coordinates.clone()),
-                    ("out".into(), out.clone()),
                 ]),
                 &["coordinates"],
-            )?);
-            hidden = out;
+            )?;
+            submission.append(prepared);
+            hidden = result_buffer(&results, &[])?;
         }
-        let compact = allocate(output_rows, g.output, 2)?;
-        submission.append(prepare(
+        let (prepared, results) = prepare(
             &self.merger,
             output_rows,
-            HashMap::from([("hidden".into(), hidden), ("out".into(), compact.clone())]),
+            HashMap::from([("hidden".into(), hidden)]),
             &[],
-        )?);
-        let buffer = allocate(output_rows, g.output, 4)?;
+        )?;
+        submission.append(prepared);
+        let compact = result_buffer(&results, &[])?;
         let conversion = spec(
             "qwen_vision_feature_output",
             &[("M", output_rows), ("D", g.output)],
             HashMap::new(),
-            &["source", "out"],
+            &["source"],
             &[],
             false,
         )?;
-        submission.append(prepare(
+        let (prepared, results) = prepare(
             &conversion,
             output_rows,
-            HashMap::from([("source".into(), compact), ("out".into(), buffer.clone())]),
+            HashMap::from([("source".into(), compact)]),
             &[],
-        )?);
+        )?;
+        submission.append(prepared);
+        let buffer = result_buffer(&results, &[])?;
         Ok(PendingImage {
             submission,
             features: Features {

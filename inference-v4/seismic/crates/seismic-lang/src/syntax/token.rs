@@ -24,6 +24,7 @@ pub enum Tok {
 pub enum Kw {
     Fn,
     Lower,
+    Requires,
     Where,
     For,
     In,
@@ -50,9 +51,10 @@ pub enum Kw {
 }
 
 impl Kw {
-    pub const ALL: [Kw; 25] = [
+    pub const ALL: [Kw; 26] = [
         Kw::Fn,
         Kw::Lower,
+        Kw::Requires,
         Kw::Where,
         Kw::For,
         Kw::In,
@@ -86,6 +88,7 @@ impl Kw {
         match self {
             Kw::Fn => "fn",
             Kw::Lower => "lower",
+            Kw::Requires => "requires",
             Kw::Where => "where",
             Kw::For => "for",
             Kw::In => "in",

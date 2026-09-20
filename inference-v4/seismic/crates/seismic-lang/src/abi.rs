@@ -10,13 +10,19 @@ pub struct ScalarParameter {
     pub dtype: DType,
     /// Exclusive upper bound for a declared index. Zero admits no values.
     pub index_bound: Option<u64>,
+    pub range: Option<RangeScalar>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeEndpoint { Start, End }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeScalar { pub parameter: String, pub endpoint: RangeEndpoint, pub bound: u64 }
 impl ScalarParameter {
     pub fn plain(name: impl Into<String>, dtype: DType) -> Self {
         Self {
             name: name.into(),
             dtype,
             index_bound: None,
+            range: None,
         }
     }
     pub fn from_lowered(
@@ -35,13 +41,23 @@ impl ScalarParameter {
                     .ok_or_else(|| format!("unresolved or negative index bound for `{name}`"))
             })
             .transpose()?;
+        let range = lowered.range_params.iter().find_map(|r| {
+            let endpoint = if r.start == name { RangeEndpoint::Start } else if r.end == name { RangeEndpoint::End } else { return None; };
+            Some((r, endpoint))
+        }).map(|(r, endpoint)| {
+            let bound = r.bound.as_constant().and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| format!("unresolved or negative range bound for `{}`", r.name))?;
+            Ok::<_, String>(RangeScalar { parameter: r.name.clone(), endpoint, bound })
+        }).transpose()?;
         if index_bound.is_some() && dtype != DType::I32 {
             return Err("index parameter must have i32 storage".into());
         }
+        if range.is_some() && dtype != DType::I32 { return Err("range endpoint must have i32 storage".into()); }
         Ok(Self {
             name: name.into(),
             dtype,
             index_bound,
+            range,
         })
     }
 }
@@ -65,6 +81,15 @@ impl ScalarLayout {
         Self::layout(parameters, Some(8))
     }
     fn layout(parameters: &[ScalarParameter], slot: Option<usize>) -> Result<Self, String> {
+        for (i, parameter) in parameters.iter().enumerate() {
+            if let Some(range) = &parameter.range {
+                let mate = match range.endpoint { RangeEndpoint::Start => parameters.get(i + 1), RangeEndpoint::End => i.checked_sub(1).and_then(|j| parameters.get(j)) };
+                let expected = match range.endpoint { RangeEndpoint::Start => RangeEndpoint::End, RangeEndpoint::End => RangeEndpoint::Start };
+                if !mate.and_then(|p| p.range.as_ref()).is_some_and(|other| other.parameter == range.parameter && other.endpoint == expected && other.bound == range.bound) {
+                    return Err(format!("range `{}` endpoints must be an adjacent start/end pair", range.parameter));
+                }
+            }
+        }
         let mut fields = Vec::new();
         let mut bytes = 0usize;
         let mut max_alignment = 1;
@@ -73,6 +98,7 @@ impl ScalarLayout {
             if parameter.index_bound.is_some() && dtype != DType::I32 {
                 return Err("index parameter must have i32 storage".into());
             }
+            if parameter.range.is_some() && dtype != DType::I32 { return Err("range endpoint must have i32 storage".into()); }
             let alignment = slot.unwrap_or(dtype.bytes() as usize);
             max_alignment = max_alignment.max(alignment);
             bytes = align(bytes, alignment)?;
@@ -120,6 +146,20 @@ impl ScalarLayout {
                         field.parameter.name
                     ));
                 }
+            }
+        }
+        for field in &self.fields {
+            let Some(range) = &field.parameter.range else { continue };
+            if range.endpoint != RangeEndpoint::Start { continue; }
+            let end = self.fields.iter().find(|f| f.parameter.range.as_ref().is_some_and(|r| r.parameter == range.parameter && r.endpoint == RangeEndpoint::End))
+                .ok_or_else(|| format!("range `{}` has no end endpoint", range.parameter))?;
+            let read = |f: &ScalarField| -> Result<i32, String> {
+                let data = bytes.get(f.offset..f.offset + 4).ok_or("range endpoint exceeds layout")?;
+                Ok(i32::from_le_bytes(data.try_into().map_err(|_| "invalid range storage width")?))
+            };
+            let (start, finish) = (read(field)?, read(end)?);
+            if start < 0 || finish < start || finish as u64 > range.bound {
+                return Err(format!("range `{}` must satisfy 0 <= start <= end <= {}", range.parameter, range.bound));
             }
         }
         Ok(())
@@ -178,6 +218,7 @@ impl ScalarLayout {
                 .ok_or("scalar field exceeds layout")?
                 .copy_from_slice(&bits.to_le_bytes()[..width]);
         }
+        self.validate_bytes(&out)?;
         Ok(out)
     }
 }
@@ -211,5 +252,20 @@ mod tests {
         assert_eq!(&encoded[10..12], &0x4080u16.to_le_bytes());
         assert!(layout.encode(&[2.0, 2.0, 3.0, 4.0, 0.0]).is_err());
         assert_eq!(ScalarLayout::words(&schema).unwrap().bytes, 40);
+    }
+
+    #[test]
+    fn range_pair_has_stable_layout_and_joint_validation() {
+        let range = |name: &str, endpoint| ScalarParameter {
+            name: name.into(), dtype: DType::I32, index_bound: None,
+            range: Some(RangeScalar { parameter: "rows".into(), endpoint, bound: 8 }),
+        };
+        let schema = [range("rows_start", RangeEndpoint::Start), range("rows_end", RangeEndpoint::End)];
+        let layout = ScalarLayout::words(&schema).unwrap();
+        assert_eq!(layout.fields.iter().map(|f| (f.parameter.name.as_str(), f.offset)).collect::<Vec<_>>(), [("rows_start", 0), ("rows_end", 8)]);
+        assert!(layout.encode(&[2.0, 8.0]).is_ok());
+        assert!(layout.encode(&[-1.0, 2.0]).is_err());
+        assert!(layout.encode(&[4.0, 3.0]).is_err());
+        assert!(layout.encode(&[0.0, 9.0]).is_err());
     }
 }

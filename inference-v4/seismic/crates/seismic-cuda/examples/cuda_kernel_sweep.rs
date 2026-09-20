@@ -17,7 +17,7 @@ use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPoli
 use seismic_lang::interp::{Arg, Interpreter, Rng, TensorData, Uniform};
 use seismic_lang::repr;
 use seismic_lang::sir::Program;
-use seismic_lang::syntax::ast::Mode;
+use seismic_lang::sir::Mode;
 use seismic_lang::types::{DType, Elem, Extent, Ty};
 use std::collections::HashMap;
 
@@ -37,7 +37,7 @@ fn run(program: &Program, device: &Device, backend: &Cuda, case: &cases::Case, p
     let mut scalars = HashMap::new();
     for param in &definition.params {
         match &param.ty {
-            Ty::Tensor(shaped) => {
+            Ty::Tensor(shaped) | Ty::View(shaped) => {
                 let shape = shaped.axes.iter().map(|axis| match axis {
                     Extent::Semantic(sym) => sym.eval(&|n| workload.shapes.get(n).copied()).and_then(|v| usize::try_from(v).ok()).ok_or_else(|| format!("{}: unresolved extent {sym}", param.name)),
                     Extent::Structural(_) => Err(format!("{}: structural entry extent", param.name)),

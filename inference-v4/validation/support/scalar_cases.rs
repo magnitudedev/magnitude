@@ -4,7 +4,10 @@ use seismic_lang::{
     program::{compile, SourceFile},
 };
 use std::collections::HashMap;
-pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend: &str) {
+pub fn exercise(
+    mut run: impl FnMut(&LoweredIr, &[Vec<u8>], &[f64]) -> Result<Vec<Vec<u8>>, String>,
+    backend: &str,
+) {
     let program = compile(&[SourceFile {
         path: "scalar-semantics.seismic".into(),
         text: include_str!("../programs/scalar-semantics.seismic").into(),
@@ -12,6 +15,18 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     .unwrap_or_else(|e| panic!("{e:?}"));
     let lower =
         |name| seismic_lang::lower::lower(&program, name, backend, &HashMap::new()).unwrap();
+    let mut execute = |ir: &LoweredIr, buffers: &mut [Vec<u8>], scalars: &[f64]| {
+        let buffer_count = ir.params[..ir.source_param_count]
+            .iter()
+            .filter(|(_, ty)| matches!(ty, seismic_lang::exec::types::Ty::Tensor(_)))
+            .count();
+        let results = run(ir, &buffers[..buffer_count], scalars)
+            .unwrap_or_else(|error| panic!("{}: {error}", ir.name));
+        let result_start = buffers.len() - results.len();
+        for (destination, result) in buffers[result_start..].iter_mut().zip(results) {
+            *destination = result;
+        }
+    };
     let bytes = |values: Vec<f32>| {
         values
             .into_iter()
@@ -19,7 +34,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
             .collect::<Vec<_>>()
     };
     let mut empty = [bytes(vec![7.0]), bytes(vec![9.0])];
-    run(&lower("empty_window"), &mut empty, &[]);
+    execute(&lower("empty_window"), &mut empty, &[]);
     assert_eq!(
         empty[1],
         bytes(vec![0.0]),
@@ -33,7 +48,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         ]),
         vec![0; 8],
     ];
-    run(&lower("explicit_fma"), &mut values, &[]);
+    execute(&lower("explicit_fma"), &mut values, &[]);
     assert_eq!(
         values[1],
         bytes(vec![0.0, f32::from_bits(0xa8800000)]),
@@ -45,7 +60,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     row[64] = 19.0;
     let input = [row.clone(), vec![f32::NEG_INFINITY; 65], vec![f32::NAN; 65]].concat();
     let mut values = [bytes(input), vec![0; 12], vec![0; 12], vec![0; 12]];
-    run(&lower("reduction_extrema"), &mut values, &[]);
+    execute(&lower("reduction_extrema"), &mut values, &[]);
     assert_eq!(
         values[1],
         bytes(vec![-8.0, f32::NEG_INFINITY, f32::INFINITY]),
@@ -67,7 +82,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     for (input, expected) in [(row, 7), (vec![f32::NEG_INFINITY; 65], 0)] {
         let target = input[expected];
         let mut values = [bytes(input), vec![0; 4], vec![0; 4]];
-        run(&lower("argmax_lookup"), &mut values, &[]);
+        execute(&lower("argmax_lookup"), &mut values, &[]);
         assert_eq!(values[1], target.to_le_bytes());
         assert_eq!(values[2], (expected as i32).to_le_bytes());
     }
@@ -80,7 +95,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         .flat_map(u16::to_le_bytes)
         .collect();
     let mut values = [bf, hf, vec![0; 8]];
-    run(&lower("narrow_sum"), &mut values, &[]);
+    execute(&lower("narrow_sum"), &mut values, &[]);
     assert_eq!(
         values[2],
         bytes(vec![1.0, 1.0]),
@@ -100,7 +115,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         narrow(0x3c00, 0x1000),
         vec![0; 12],
     ];
-    run(&lower("ordered_large_sum"), &mut values, &[]);
+    execute(&lower("ordered_large_sum"), &mut values, &[]);
     assert_eq!(
         values[3],
         bytes(vec![1.0, 1.0, 1.0]),
@@ -115,7 +130,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         vec![0; 8],
         vec![0; 8],
     ];
-    run(&lower("integer_extrema"), &mut values, &[]);
+    execute(&lower("integer_extrema"), &mut values, &[]);
     for (got, expected) in values[1..]
         .iter()
         .zip([[i32::MIN, i32::MIN], [i32::MIN, 17], [0, 8]])
@@ -135,7 +150,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         .collect::<Vec<_>>();
     for position in 0..4 {
         let mut buffers = [input.clone(), vec![0; 4]];
-        run(
+        execute(
             &seismic_lang::lower::lower(&program, "bounded_index", backend, &HashMap::new())
                 .unwrap(),
             &mut buffers,
@@ -144,14 +159,14 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         assert_eq!(buffers[1], input[position * 4..position * 4 + 4]);
     }
     let mut buffers = [input.clone(), vec![0; 16]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "tile_copy", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
     );
     assert_eq!(buffers[1], input, "tile copy must not alias source");
     let mut buffers = [input.clone(), vec![0; 16]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "changed_source", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
@@ -165,7 +180,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         "producer must retain original source values"
     );
     let mut buffers = [vec![0; 4]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "loop_carried", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
@@ -173,7 +188,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     assert_eq!(float(&buffers[0]), 7.0, "loop-carried tile value");
     for (choose, expected) in [(0.0, 11.0), (1.0, 7.0)] {
         let mut buffers = [vec![0; 4]];
-        run(
+        execute(
             &seismic_lang::lower::lower(&program, "branch_merge", backend, &HashMap::new())
                 .unwrap(),
             &mut buffers,
@@ -182,7 +197,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         assert_eq!(float(&buffers[0]), expected, "branch merge");
     }
     let mut buffers = [0x3f81u16.to_le_bytes().to_vec(), vec![0; 4]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "bf16_rounding", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
@@ -193,7 +208,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         "BF16 multiply rounds before widening"
     );
     let mut buffers = [vec![0; 4]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "mixed_scalars", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[1.0, 2.0, 4.0, 0.0],
@@ -218,7 +233,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
                 .collect::<Vec<_>>(),
             vec![0; expected.len()],
         ];
-        run(
+        execute(
             &seismic_lang::lower::lower(&program, name, backend, &HashMap::new()).unwrap(),
             &mut buffers,
             &[],
@@ -230,7 +245,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
         .flat_map(|i| (i as f32).to_le_bytes())
         .collect::<Vec<_>>();
     let mut buffers = [input.clone(), vec![255; 4]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "loaded_mutation", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[],
@@ -241,7 +256,7 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>], &[f64]), backend
     );
     assert_eq!(buffers[1], vec![0; 4]);
     let mut buffers = [0x3c01u16.to_le_bytes().to_vec(), vec![0; 4]];
-    run(
+    execute(
         &seismic_lang::lower::lower(&program, "half_rounding", backend, &HashMap::new()).unwrap(),
         &mut buffers,
         &[1.0009765625],

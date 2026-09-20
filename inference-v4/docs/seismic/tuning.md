@@ -5,6 +5,9 @@ and numerical sites, chosen together under one estimate, within a budget.** It
 happens in IR, before any native source exists. Its result is a checked witness
 with an honest proof status.
 
+Sites, pieces, physical tiles, and staging phases discussed here are compiler-owned mapping IR.
+They are not authored source types or control-flow constructs.
+
 ## Decisions
 
 | Decision | Domain | Identity |

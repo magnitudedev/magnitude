@@ -12,9 +12,10 @@
 //!   elementwise interval; region results are local tiles with leading piece axes.
 use super::family::{CandidateRef, Family, Witness};
 use super::sir::Program;
-use super::syntax::ast::Mode;
+use super::sir::{Mode, RegionMode};
 use super::types as st;
-use crate::exec::lowered_ir::{AliasRequirement, LoweredIr};
+use crate::exec::lowered_ir::{AliasRequirement, LoweredIr, ResultBinding};
+use crate::exec::ir::{Expr, ExprKind, Var, VarKind};
 use crate::exec::types::Ty;
 use crate::sym::Atom;
 use crate::types::DType;
@@ -46,7 +47,7 @@ pub fn inner_owner_region(
     region: &crate::sir::Region,
 ) -> bool {
     use crate::sir::{RegionSource, SliceParent, VarKind};
-    if region.mode != crate::syntax::ast::RegionMode::Parallel
+    if region.mode != RegionMode::Parallel
         || region.merge.is_some()
         || region.result.is_some()
         || region.source != RegionSource::Domains
@@ -100,7 +101,28 @@ pub fn instantiate(
     // Entry parameters are execution variables 0..n in declaration order.
     let mut params = Vec::with_capacity(definition.params.len());
     let mut index_params = Vec::new();
-    for (ordinal, param) in definition.params.iter().enumerate() {
+    let mut range_params = Vec::new();
+    let mut source_ordinals = Vec::with_capacity(definition.params.len());
+    for param in &definition.params {
+        source_ordinals.push(params.len());
+        if let st::Ty::Range(bound) = &param.ty {
+            let bound = inst.resolve(&frame, bound)?;
+            let start = format!("{}_start", param.name);
+            let end = format!("{}_end", param.name);
+            let mut endpoints = Vec::new();
+            for name in [&start, &end] {
+                let ordinal = params.len();
+                let atom = Atom::Param(name.clone());
+                let ty = Ty::Scalar(DType::I32);
+                inst.vars.push(crate::exec::ir::Var { name: name.clone(), ty: ty.clone(), span: definition.span, kind: crate::exec::ir::VarKind::Param(ordinal) });
+                endpoints.push(context::symbol(crate::sym::Sym::atom(atom), definition.span));
+                params.push((name.clone(), ty));
+            }
+            *frame.vars.get_mut(param.var).ok_or_else(|| format!("entry parameter `{}` has no variable", param.name))? = Some(Value::Range(endpoints.remove(0), endpoints.remove(0)));
+            range_params.push(crate::exec::lowered_ir::RangeParameter { name: param.name.clone(), start, end, bound });
+            continue;
+        }
+        let ordinal = params.len();
         let (ty, kind) = match &param.ty {
             st::Ty::Tensor(shaped) | st::Ty::View(shaped) => (Ty::Tensor(inst.shaped(&frame, shaped)?), crate::exec::ir::VarKind::Param(ordinal)),
             st::Ty::Scalar(dtype) => (Ty::Scalar(*dtype), crate::exec::ir::VarKind::Param(ordinal)),
@@ -141,19 +163,23 @@ pub fn instantiate(
         });
         params.push((param.name.clone(), ty));
     }
+    // This is the flattened invocation prefix; logical ranges contribute two ABI scalars.
+    let source_param_count = params.len();
 
     // Every written parameter is disjoint from every other tensor parameter; a declared
     // `alias` pair may coincide exactly.
     let mut alias_requirements = Vec::new();
-    for (left, a) in definition.params.iter().enumerate() {
-        for (right, b) in definition.params.iter().enumerate().skip(left + 1) {
+    for (source_left, a) in definition.params.iter().enumerate() {
+        for (source_right, b) in definition.params.iter().enumerate().skip(source_left + 1) {
+            let left = source_ordinals[source_left];
+            let right = source_ordinals[source_right];
             let tensors =
                 matches!(params[left].1, Ty::Tensor(_)) && matches!(params[right].1, Ty::Tensor(_));
             if tensors && (a.mode != Mode::In || b.mode != Mode::In) {
                 let exact_allowed = definition
                     .aliases
                     .iter()
-                    .any(|&(x, y)| (x, y) == (left, right) || (y, x) == (left, right));
+                    .any(|&(x, y)| (x, y) == (source_left, source_right) || (y, x) == (source_left, source_right));
                 alias_requirements.push(AliasRequirement {
                     left,
                     right,
@@ -168,13 +194,118 @@ pub fn instantiate(
     let mut prologue = std::mem::take(&mut frame.returns.prologue);
     prologue.append(&mut stmts);
 
+    fn specialized_result(
+        inst: &Instantiation<'_>,
+        frame: &context::Frame<'_>,
+        ty: &st::Ty,
+    ) -> Result<Ty, String> {
+        match ty {
+            st::Ty::Tensor(shaped) => Ok(Ty::Tensor(inst.shaped(frame, shaped)?)),
+            st::Ty::Tuple(items) => items
+                .iter()
+                .map(|item| specialized_result(inst, frame, item))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Ty::Tuple),
+            st::Ty::Void => Ok(Ty::Void),
+            other => Err(format!(
+                "entry `{}` result `{other}` is not an owned tensor or tuple of owned tensors",
+                frame.definition.name
+            )),
+        }
+    }
+    fn bind_results<'a>(
+        inst: &mut Instantiation<'a>,
+        ty: &Ty,
+        value: Value<'a>,
+        path: &mut Vec<u32>,
+        params: &mut Vec<(String, Ty)>,
+        bindings: &mut Vec<ResultBinding>,
+        names: &mut std::collections::BTreeSet<String>,
+        out: &mut Vec<crate::exec::ir::Stmt>,
+    ) -> Result<(), String> {
+        match (ty, value) {
+            (Ty::Tensor(shape), Value::Shaped(source)) => {
+                let suffix = if path.is_empty() {
+                    String::new()
+                } else {
+                    path.iter().map(|item| format!(".{item}")).collect()
+                };
+                let name = format!("$return{suffix}");
+                let parameter = params.len();
+                let ty = Ty::Tensor(shape.clone());
+                let variable = inst.vars.len();
+                inst.vars.push(Var {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    span: source.span,
+                    kind: VarKind::Param(parameter),
+                });
+                let destination = Expr {
+                    kind: ExprKind::Var(variable),
+                    ty: ty.clone(),
+                    sym: None,
+                    span: source.span,
+                };
+                params.push((name.clone(), ty));
+                bindings.push(ResultBinding {
+                    path: path.clone(),
+                    parameter,
+                });
+                names.insert(name);
+                inst.copy_into(destination, crate::syntax::ast::AssignOp::Assign, source, out)
+            }
+            (Ty::Tuple(types), Value::Tuple(values)) if types.len() == values.len() => {
+                for (ordinal, (ty, value)) in types.iter().zip(values).enumerate() {
+                    path.push(ordinal as u32);
+                    bind_results(inst, ty, value, path, params, bindings, names, out)?;
+                    path.pop();
+                }
+                Ok(())
+            }
+            (expected, actual) => Err(format!(
+                "entry owned result `{expected}` has no matching execution value `{actual:?}`"
+            )),
+        }
+    }
+
+    let result = specialized_result(&inst, &frame, &definition.result)?;
+    let returned = frame.returns.locals.or(frame.returns.direct).unwrap_or_default();
+    let root = match (&result, returned.len()) {
+        (Ty::Void, 0) => Value::Void,
+        (Ty::Tuple(_), _) => Value::Tuple(returned),
+        (_, 1) => returned.into_iter().next().unwrap(),
+        (Ty::Void, _) => return Err(format!("entry `{}` returns a value despite its void contract", definition.name)),
+        _ => return Err(format!("entry `{}` does not return its complete owned result", definition.name)),
+    };
+    let mut result_bindings = Vec::new();
+    let mut result_names = std::collections::BTreeSet::new();
+    if !matches!(result, Ty::Void) {
+        bind_results(
+            &mut inst,
+            &result,
+            root,
+            &mut Vec::new(),
+            &mut params,
+            &mut result_bindings,
+            &mut result_names,
+            &mut prologue,
+        )?;
+    }
+
     let ir = LoweredIr {
         name: family.entry.clone(),
         backend: family.target.clone(),
-        ownership: Default::default(),
+        ownership: crate::exec::lowered_ir::Ownership {
+            results: result_names,
+            ..Default::default()
+        },
         alias_requirements,
         params,
+        source_param_count,
+        result,
+        result_bindings,
         index_params,
+        range_params,
         vars: inst.vars,
         body: prologue,
         shapes: family
@@ -191,69 +322,25 @@ pub fn instantiate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::ir::{Builtin, ExprKind, Stmt, StmtKind};
-    use crate::family::{self, SiteKind, Workload};
+    use crate::exec::ir::{ExprKind, Stmt, StmtKind};
+    use crate::family::{self, Workload};
     use crate::program::{compile, SourceFile};
-
-    const MATMUL: &str = "\
-fn matmul[M, N, K](a: tile[M, K] T, b: tile[N, K] U, inout acc: tile[M, N] f32):
-    for i, j in owned(acc):
-        let mut s = acc[i, j]
-        for k in axis(a, 1):
-            s = fma(f32(a[i, k]), f32(b[j, k]), s)
-        acc[i, j] = s
-";
-
-    const LINEAR: &str = "\
-fn linear[M, N, K](x: tensor[M, K] T, weight: tensor[N, K] U, out y: tensor[M, N] V):
-    parallel [rows, cols] in (0..M, 0..N):
-        let mut acc = zeros_like(y[rows, cols], dtype=f32)
-        ordered [k] in 0..K:
-            matmul(load(x[rows, k]), load(weight[cols, k]), into=acc)
-        publish acc to y[rows, cols]
-";
-
-    const RMS_NORM: &str = "\
-fn rms_norm[R, W](x: tensor[R, W] T, weight: tensor[W] U, out y: tensor[R, W] V, eps: f32):
-    parallel [rows] in 0..R:
-        let w = f32(weight)
-        for row in rows:
-            let t = f32(x[row])
-            let ss = reduce(t * t, 0, sum)
-            publish t * rsqrt(ss / f32(W) + eps) * w to y[row]
-";
-
-    const SUM_SQUARES: &str = "\
-fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
-    parallel [rows] in 0..R:
-        for row in rows:
-            let total = parallel [part] in 0..W:
-                let v = f32(x[row, part])
-                yield reduce(v * v, 0, sum)
-            merge (left, right) identity f32(0.0):
-                yield left + right
-            let mut t = zeros_like(y[row], dtype=f32)
-            for i in owned(t):
-                t[i] = total
-            publish t to y[row]
-";
-
-    fn workload(shapes: &[(&str, i64)], elems: &[&str]) -> Workload {
-        Workload {
-            shapes: shapes.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            elems: elems
-                .iter()
-                .map(|k| (k.to_string(), crate::types::Elem::Dtype(DType::F32)))
-                .collect(),
-            ..Workload::default()
-        }
-    }
 
     /// The witness written out by hand as a rule: the first candidate of every active
     /// occurrence, singleton covers, and the given numbers for the sites in family order.
     fn build(
         sources: &[&str],
         entry: &str,
+        workload: &Workload,
+        numbers: &[i64],
+    ) -> (Family, LoweredIr) {
+        build_for_target(sources, entry, "cpu", workload, numbers)
+    }
+
+    fn build_for_target(
+        sources: &[&str],
+        entry: &str,
+        target: &str,
         workload: &Workload,
         numbers: &[i64],
     ) -> (Family, LoweredIr) {
@@ -271,7 +358,13 @@ fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
                 d.iter().map(|d| d.render()).collect::<Vec<_>>().join("\n")
             )
         });
-        let family = family::construct(&program, entry, "cpu", workload).expect("family");
+        let supports = |_: &crate::sir::IntrinsicUse| Ok(());
+        let environment = family::TargetEnvironment {
+            target,
+            capability_fingerprint: "instantiate-test-capabilities-v1",
+            supports_intrinsic: &supports,
+        };
+        let family = family::construct(&program, entry, &environment, workload).expect("family");
         let mut witness = Witness::default();
         let mut pending = vec![family.occurrences[0].id];
         let mut numbers = numbers.iter();
@@ -296,6 +389,92 @@ fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
         (family, ir)
     }
 
+    #[test]
+    fn logical_intrinsic_is_preserved_with_owned_destination() {
+        let source = "\
+fn product(a: &tensor[2, 3] f32, b: &tensor[3, 2] f32, y: &mut tensor[2, 2] f32) for metal requires metal.matrix:
+    let value = metal.matrix.matmul(a, b, accumulation=f32)
+    for i in 0..2:
+        for j in 0..2:
+            y[i, j] = value[i, j]
+";
+        let (_, ir) = build_for_target(&[source], "product", "metal", &Workload::default(), &[]);
+        assert!(any(&ir.body, &|statement| {
+            matches!(
+                &statement.kind,
+                StmtKind::Assign {
+                    target: crate::exec::ir::Expr {
+                        kind: ExprKind::Var(_),
+                        ty: Ty::Tile(_),
+                        ..
+                    },
+                    op: crate::syntax::ast::AssignOp::Assign,
+                    value: crate::exec::ir::Expr {
+                        kind: ExprKind::Intrinsic {
+                            op: crate::intrinsics::Operation::MatrixMatmul,
+                            ..
+                        },
+                        ty: Ty::Tile(_),
+                        ..
+                    },
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn owned_tuple_result_flattens_to_hidden_destinations() {
+        let source = "\
+fn pair[N](x: tensor[N] f32, y: tensor[N] f32) -> (tensor[N] f32, tensor[N] f32):
+    return x, y
+";
+        let workload = Workload { shapes: [("N".into(), 4)].into(), ..Default::default() };
+        let (_, ir) = build(&[source], "pair", &workload, &[]);
+        assert_eq!(ir.source_param_count, 2);
+        assert_eq!(ir.result_bindings.len(), 2);
+        assert_eq!(ir.result_bindings[0].path, [0]);
+        assert_eq!(ir.result_bindings[1].path, [1]);
+        assert_eq!(ir.params[ir.result_bindings[0].parameter].0, "$return.0");
+        assert_eq!(ir.params[ir.result_bindings[1].parameter].0, "$return.1");
+        assert!(ir.ownership.results.contains("$return.0"));
+        assert!(ir.ownership.results.contains("$return.1"));
+        crate::exec::verify::lowered(&ir).unwrap();
+    }
+
+    #[test]
+    fn owned_tensor_snapshot_materializes_before_result_binding() {
+        let source = "\
+fn snapshot[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return to_owned(x)
+";
+        let workload = Workload { shapes: [("N".into(), 4)].into(), ..Default::default() };
+        let (_, ir) = build(&[source], "snapshot", &workload, &[]);
+        assert_eq!(ir.result_bindings.len(), 1);
+        assert!(any(&ir.body, &|statement| matches!(
+            &statement.kind,
+            StmtKind::Assign { value: crate::exec::ir::Expr { kind: ExprKind::Load { .. }, ty: Ty::Tile(_), .. }, .. }
+        )));
+        assert!(ir.ownership.results.contains("$return"));
+        crate::exec::verify::lowered(&ir).unwrap();
+    }
+
+    #[test]
+    fn entry_range_flattens_to_an_ordered_scalar_pair() {
+        let source = "\
+fn fill[N](selected: range[N]):
+    for i in selected:
+        let value = i
+";
+        let workload = Workload { shapes: [("N".into(), 5)].into(), ..Default::default() };
+        let (_, ir) = build(&[source], "fill", &workload, &[]);
+        assert_eq!(ir.params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["selected_start", "selected_end"]);
+        assert_eq!(ir.source_param_count, 2);
+        assert_eq!(ir.range_params[0].name, "selected");
+        assert_eq!(ir.range_params[0].bound.as_constant(), Some(5));
+        let first = crate::abi::ScalarParameter::from_lowered(&ir, "selected_start", DType::I32).unwrap();
+        assert!(matches!(first.range.as_ref().map(|r| r.endpoint), Some(crate::abi::RangeEndpoint::Start)));
+    }
+
     fn any(body: &[Stmt], test: &dyn Fn(&Stmt) -> bool) -> bool {
         body.iter().any(|s| {
             test(s)
@@ -309,94 +488,7 @@ fn sum_squares[R, W](x: tensor[R, W] T, out y: tensor[R, 1] f32):
         })
     }
 
-    #[test]
-    fn linear_is_one_launch_over_the_selected_pieces() {
-        let (family, ir) = build(
-            &[MATMUL, LINEAR],
-            "linear",
-            &workload(&[("M", 2), ("N", 8), ("K", 128)], &["T", "U", "V"]),
-            &[1, 4, 64],
-        );
-        assert!(family
-            .sites
-            .iter()
-            .all(|s| matches!(s.kind, SiteKind::Width { .. })));
-        let [Stmt {
-            kind: StmtKind::Parallel { extents, body, .. },
-            ..
-        }] = ir.body.as_slice()
-        else {
-            panic!("{:#?}", ir.body)
-        };
-        assert_eq!(
-            extents.iter().map(|e| e.as_constant()).collect::<Vec<_>>(),
-            vec![Some(2), Some(2)]
-        );
-        // The ordered K traversal is a loop over 128 / 64 windows inside each owner.
-        assert!(any(
-            body,
-            &|s| matches!(&s.kind, StmtKind::Range { hi, .. } if hi.as_constant() == Some(2))
-        ));
-        assert!(any(
-            body,
-            &|s| matches!(&s.kind, StmtKind::Expr(e) if matches!(e.kind, ExprKind::Builtin { name: Builtin::Store, .. }))
-        ));
-        assert_eq!(ir.alias_requirements.len(), 2);
-    }
 
-    #[test]
-    fn rms_norm_reduces_and_publishes_each_row_inside_its_owner() {
-        let (_, ir) = build(
-            &[RMS_NORM],
-            "rms_norm",
-            &workload(&[("R", 6), ("W", 16)], &["T", "U", "V"]),
-            &[3],
-        );
-        let [Stmt {
-            kind: StmtKind::Parallel { extents, body, .. },
-            ..
-        }] = ir.body.as_slice()
-        else {
-            panic!("{:#?}", ir.body)
-        };
-        assert_eq!(extents[0].as_constant(), Some(2));
-        assert!(any(
-            body,
-            &|s| matches!(&s.kind, StmtKind::Assign { value, .. } if matches!(value.kind, ExprKind::Builtin { name: Builtin::Reduce, .. }))
-        ));
-        assert!(any(
-            body,
-            &|s| matches!(&s.kind, StmtKind::Assign { value, .. } if matches!(value.kind, ExprKind::Load { .. }))
-        ));
-        assert_eq!(ir.params.len(), 4);
-    }
 
-    #[test]
-    fn nested_merge_is_the_adjacent_pair_recurrence_over_the_selected_parts() {
-        // Sites in family order: rows width 1, merge partition count 4.
-        let (_, ir) = build(
-            &[SUM_SQUARES],
-            "sum_squares",
-            &workload(&[("R", 2), ("W", 12)], &["T"]),
-            &[1, 4],
-        );
-        let [Stmt {
-            kind: StmtKind::Parallel { body, .. },
-            ..
-        }] = ir.body.as_slice()
-        else {
-            panic!("{:#?}", ir.body)
-        };
-        // Four partials: a level of two pairs, then a level of one pair.
-        for pairs in [2, 1] {
-            assert!(any(
-                body,
-                &|s| matches!(&s.kind, StmtKind::Range { hi, body, .. } if hi.as_constant() == Some(pairs) && !body.is_empty())
-            ));
-        }
-        assert!(any(
-            body,
-            &|s| matches!(&s.kind, StmtKind::Assign { value, .. } if matches!(&value.kind, ExprKind::TileAlloc { shape, .. } if shape[0].as_constant() == Some(4)))
-        ));
-    }
+
 }

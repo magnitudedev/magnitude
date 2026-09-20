@@ -49,15 +49,6 @@ fn binary_op(tok: &Tok) -> Option<BinaryOp> {
     })
 }
 
-fn region_mode(tok: &Tok) -> Option<RegionMode> {
-    match tok {
-        Tok::Kw(Kw::Parallel) => Some(RegionMode::Parallel),
-        Tok::Kw(Kw::Ordered) => Some(RegionMode::Ordered),
-        Tok::Kw(Kw::Pipeline) => Some(RegionMode::Pipeline),
-        _ => None,
-    }
-}
-
 fn is_place(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Name(_) | ExprKind::Index { .. } | ExprKind::Attr { .. } => true,
@@ -166,17 +157,6 @@ impl Parser {
         }
     }
 
-    fn expect_word(&mut self, word: &str) -> PResult<Span> {
-        if self.at_word(word) {
-            Ok(self.bump().span)
-        } else {
-            Err(self.error(format!(
-                "expected `{word}`, found {}",
-                self.peek().describe()
-            )))
-        }
-    }
-
     fn expect_name(&mut self) -> PResult<Ident> {
         match self.peek().clone() {
             Tok::Name(name) => {
@@ -255,6 +235,7 @@ impl Parser {
         } else {
             None
         };
+        let requires = self.requires_clause(&mut continued)?;
         signature.predicates = self.where_clause(&mut continued, true)?;
         self.expect_op(Op::Colon)?;
         let body = self.body(continued)?;
@@ -262,6 +243,7 @@ impl Parser {
             signature,
             name,
             target,
+            requires,
             body,
             span: start.to(self.prev_span()),
         })
@@ -282,6 +264,7 @@ impl Parser {
         }
         self.bump();
         let target = self.expect_name()?;
+        let requires = self.requires_clause(&mut continued)?;
         let predicates = self.where_clause(&mut continued, true)?;
         self.expect_op(Op::Colon)?;
         let body = self.body(continued)?;
@@ -289,6 +272,7 @@ impl Parser {
             name,
             signature,
             target,
+            requires,
             predicates,
             body,
             span: start.to(self.prev_span()),
@@ -296,7 +280,7 @@ impl Parser {
     }
 
     /// A header may continue on one deeper-indented line (and further lines at that
-    /// indentation) starting with `alias`, `->`, `where` or, in a lowering, `for`. The
+    /// indentation) starting with `->`, `for`, `requires` or `where`. The
     /// `Indent` consumed here is closed by `body` or `end_header`.
     fn continue_header(&mut self, continued: &mut bool, lower: bool) {
         if !matches!(self.peek(), Tok::Newline) {
@@ -310,9 +294,8 @@ impl Parser {
             return;
         };
         let continues = match self.peek_at(skip) {
-            Tok::Op(Op::Arrow) | Tok::Kw(Kw::Where) => true,
+            Tok::Op(Op::Arrow) | Tok::Kw(Kw::Requires) | Tok::Kw(Kw::Where) => true,
             Tok::Kw(Kw::For) => lower,
-            Tok::Name(n) => n == "alias" && matches!(self.peek_at(skip + 1), Tok::Op(Op::LParen)),
             _ => false,
         };
         if continues {
@@ -321,7 +304,7 @@ impl Parser {
         }
     }
 
-    /// `[Shape, ..](params) [alias(a, b), ..] [-> type]`; predicates are filled by the caller.
+    /// `[Shape, ..](params) [-> type]`; predicates are filled by the caller.
     fn signature(&mut self, continued: &mut bool, lower: bool) -> PResult<Signature> {
         let mut shape = Vec::new();
         if self.eat_op(Op::LBracket) {
@@ -338,26 +321,8 @@ impl Parser {
         }
         self.expect_op(Op::RParen)?;
         self.continue_header(continued, lower);
-        let mut aliases = Vec::new();
-        if self.at_alias() {
-            loop {
-                self.bump();
-                self.expect_op(Op::LParen)?;
-                let a = self.expect_name()?;
-                self.expect_op(Op::Comma)?;
-                let b = self.expect_name()?;
-                self.expect_op(Op::RParen)?;
-                aliases.push((a, b));
-                if !self.eat_op(Op::Comma) {
-                    break;
-                }
-                if !self.at_alias() {
-                    return Err(self.error(format!(
-                        "expected `alias(a, b)`, found {}",
-                        self.peek().describe()
-                    )));
-                }
-            }
+        if self.at_word("alias") {
+            return Err(self.error("`alias` clauses are no longer part of Seismic source".into()));
         }
         self.continue_header(continued, lower);
         let mut result = None;
@@ -371,14 +336,9 @@ impl Parser {
         Ok(Signature {
             shape,
             params,
-            aliases,
             result,
             predicates: Vec::new(),
         })
-    }
-
-    fn at_alias(&self) -> bool {
-        self.at_word("alias") && matches!(self.peek_at(1), Tok::Op(Op::LParen))
     }
 
     fn where_clause(&mut self, continued: &mut bool, lower: bool) -> PResult<Vec<Expr>> {
@@ -390,33 +350,65 @@ impl Parser {
         Ok(predicates)
     }
 
-    /// `[out | inout] name: type`. `out`/`inout` are modes only before a parameter name, so
-    /// `out: tensor[N] f32` is a read-only parameter named `out`.
+    fn requires_clause(&mut self, continued: &mut bool) -> PResult<Vec<CapabilityPath>> {
+        self.continue_header(continued, true);
+        if !self.eat_kw(Kw::Requires) {
+            return Ok(Vec::new());
+        }
+        self.comma_list(|parser| {
+            let backend = parser.expect_name()?;
+            parser.expect_op(Op::Dot)?;
+            let capability = parser.expect_name()?;
+            let span = backend.span.to(capability.span);
+            Ok(CapabilityPath {
+                backend,
+                capability,
+                span,
+            })
+        })
+    }
+
     fn param(&mut self) -> PResult<Param> {
-        let mode = match (self.peek(), self.peek_at(1)) {
-            (Tok::Name(m), Tok::Name(_)) if m == "out" => Mode::Out,
-            (Tok::Name(m), Tok::Name(_)) if m == "inout" => Mode::Inout,
-            _ => Mode::In,
-        };
-        if mode != Mode::In {
-            self.bump();
+        if matches!((self.peek(), self.peek_at(1)), (Tok::Name(mode), Tok::Name(_)) if mode == "out" || mode == "inout") {
+            return Err(self.error(
+                "`out` and `inout` parameter modes were removed; use an owned return or `&mut tensor`"
+                    .into(),
+            ));
         }
         let name = self.expect_name()?;
         self.expect_op(Op::Colon)?;
         let ty = self.type_expr()?;
-        Ok(Param { mode, name, ty })
+        Ok(Param { name, ty })
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
         let kind = match self.peek().clone() {
+            Tok::Op(Op::Amp) => {
+                self.bump();
+                let mutable = self.eat_kw(Kw::Mut);
+                let tensor = self.expect_name()?;
+                if tensor.name != "tensor" || !self.at_op(Op::LBracket) {
+                    return Err(Diagnostic::new(
+                        tensor.span,
+                        "a borrow type is `&tensor[...] T` or `&mut tensor[...] T`",
+                    ));
+                }
+                self.shaped(if mutable {
+                    ShapedHead::MutTensor
+                } else {
+                    ShapedHead::SharedTensor
+                })?
+            }
             Tok::Kw(Kw::Void) => {
                 self.bump();
                 TypeKind::Void
             }
             Tok::Kw(Kw::Tile) => {
-                self.bump();
-                self.shaped(ShapedHead::Tile)?
+                return Err(self.error(
+                    "`tile` is compiler-internal; source types use `tensor` and tensor borrows"
+                        .into(),
+                ));
             }
             Tok::Op(Op::LParen) => {
                 self.bump();
@@ -431,33 +423,34 @@ impl Parser {
                 let name = self.expect_name()?;
                 match self.peek() {
                     Tok::Op(Op::LBracket) if word == "tensor" => self.shaped(ShapedHead::Tensor)?,
-                    Tok::Op(Op::LBracket) if word == "view" => self.shaped(ShapedHead::View)?,
+                    Tok::Op(Op::LBracket) if word == "view" => {
+                        return Err(Diagnostic::new(
+                            name.span,
+                            "`view` was removed; use `&tensor` or `&mut tensor`",
+                        ));
+                    }
                     Tok::Op(Op::LBracket) if word == "index" => {
                         self.bump();
                         let bound = self.expr()?;
                         self.expect_op(Op::RBracket)?;
                         TypeKind::Index(Box::new(bound))
                     }
+                    Tok::Op(Op::LBracket) if word == "range" => {
+                        self.bump();
+                        let bound = self.expr()?;
+                        self.expect_op(Op::RBracket)?;
+                        TypeKind::Range(Box::new(bound))
+                    }
                     Tok::Op(Op::LBracket) => {
                         return Err(self.error(format!(
-                            "`{word}` takes no shape; shaped types are `tensor`, `view` and `tile`"
+                            "`{word}` takes no shape; the shaped type is `tensor`"
                         )))
                     }
                     Tok::Op(Op::Dot) => {
-                        self.bump();
-                        let ty = self.expect_name()?;
-                        let mut args = Vec::new();
-                        if self.eat_op(Op::LParen) {
-                            if !self.at_op(Op::RParen) {
-                                args = self.comma_list(Self::expr)?;
-                            }
-                            self.expect_op(Op::RParen)?;
-                        }
-                        TypeKind::Native {
-                            target: name,
-                            name: ty,
-                            args,
-                        }
+                        return Err(Diagnostic::new(
+                            name.span,
+                            "backend-native types are compiler-internal and cannot appear in source",
+                        ));
                     }
                     _ => TypeKind::Scalar(name),
                 }
@@ -550,42 +543,21 @@ impl Parser {
         let kind = match self.peek() {
             Tok::Kw(Kw::For) => {
                 self.bump();
-                let targets = self.comma_list(Self::expect_name)?;
-                self.expect_kw(Kw::In)?;
-                let iter = self.expr()?;
-                self.expect_op(Op::Colon)?;
-                StmtKind::For {
-                    targets,
-                    iter,
-                    body: self.block()?,
-                }
+                self.logical_for(false)?
+            }
+            Tok::Kw(Kw::Parallel) if self.peek_at(1) == &Tok::Kw(Kw::For) => {
+                self.bump();
+                self.bump();
+                self.logical_for(true)?
             }
             Tok::Kw(Kw::If) => self.if_stmt()?,
-            Tok::Kw(Kw::Stage) => {
-                self.bump();
-                let name = self.expect_name()?;
-                let mut ports = Vec::new();
-                if self.eat_op(Op::LParen) {
-                    if !self.at_op(Op::RParen) {
-                        ports = self.comma_list(Self::expect_name)?;
-                    }
-                    self.expect_op(Op::RParen)?;
-                }
-                self.expect_op(Op::Colon)?;
-                StmtKind::Stage {
-                    name,
-                    ports,
-                    body: self.block()?,
-                }
-            }
-            Tok::Kw(Kw::Parallel | Kw::Ordered | Kw::Pipeline) => StmtKind::Region(self.region()?),
-            Tok::Kw(Kw::Else) => return Err(self.error("`else` without a matching `if`".into())),
-            Tok::Kw(Kw::Merge) => {
+            Tok::Kw(Kw::Parallel | Kw::Ordered | Kw::Pipeline | Kw::Stage | Kw::Merge) => {
                 return Err(self.error(
-                    "`merge` must directly follow a `parallel` region at the same indentation"
+                    "legacy region, stage, and merge syntax was removed; use `for` or `parallel for`"
                         .into(),
-                ))
+                ));
             }
+            Tok::Kw(Kw::Else) => return Err(self.error("`else` without a matching `if`".into())),
             Tok::Indent => return Err(self.error("unexpected indentation".into())),
             _ => return self.simple_statements(out),
         };
@@ -594,6 +566,20 @@ impl Parser {
             span: start.to(self.prev_span()),
         });
         Ok(())
+    }
+
+    /// Parse the common tail of ordered `for` and independent `parallel for`.
+    fn logical_for(&mut self, parallel: bool) -> PResult<StmtKind> {
+        let targets = self.comma_list(Self::expect_name)?;
+        self.expect_kw(Kw::In)?;
+        let iter = self.expr()?;
+        self.expect_op(Op::Colon)?;
+        Ok(StmtKind::For {
+            parallel,
+            targets,
+            iter,
+            body: self.block()?,
+        })
     }
 
     /// At `if`. `else if` nests an `if` as the only statement of the `else` block.
@@ -618,77 +604,6 @@ impl Parser {
             });
         }
         Ok(StmtKind::If { cond, then, els })
-    }
-
-    /// At a region mode: `mode [binders] in source: block [merge (l, r) identity e: block]`.
-    fn region(&mut self) -> PResult<Region> {
-        let start = self.span();
-        let mode = match region_mode(self.peek()) {
-            Some(mode) => mode,
-            None => {
-                return Err(self.error(format!(
-                    "expected `parallel`, `ordered` or `pipeline`, found {}",
-                    self.peek().describe()
-                )))
-            }
-        };
-        self.bump();
-        self.expect_op(Op::LBracket)?;
-        let binders = self.comma_list(Self::expect_name)?;
-        self.expect_op(Op::RBracket)?;
-        self.expect_kw(Kw::In)?;
-        let source = self.expr()?;
-        let source_span = source.span;
-        let sources = match source.kind {
-            ExprKind::Tuple(members) => members,
-            _ => vec![source],
-        };
-        if sources.len() > 1 && sources.len() != binders.len() {
-            return Err(Diagnostic::new(
-                source_span,
-                format!(
-                    "a product of {} domains needs {} binders, found {}",
-                    sources.len(),
-                    sources.len(),
-                    binders.len()
-                ),
-            ));
-        }
-        self.expect_op(Op::Colon)?;
-        let body = self.block()?;
-        let mut merge = None;
-        if self.at_kw(Kw::Merge) {
-            if mode != RegionMode::Parallel {
-                return Err(
-                    self.error("`merge` combines the results of a `parallel` region".into())
-                );
-            }
-            let merge_start = self.bump().span;
-            self.expect_op(Op::LParen)?;
-            let left = self.pattern_atom()?;
-            self.expect_op(Op::Comma)?;
-            let right = self.pattern_atom()?;
-            self.expect_op(Op::RParen)?;
-            self.expect_word("identity")?;
-            let identity = self.expr()?;
-            self.expect_op(Op::Colon)?;
-            let body = self.block()?;
-            merge = Some(Merge {
-                left,
-                right,
-                identity,
-                body,
-                span: merge_start.to(self.prev_span()),
-            });
-        }
-        Ok(Region {
-            mode,
-            binders,
-            sources,
-            body,
-            merge,
-            span: start.to(self.prev_span()),
-        })
     }
 
     /// `a`, `a, b`, `(a, b)`, nested.
@@ -742,30 +657,20 @@ impl Parser {
                     value,
                 }
             }
-            Tok::Kw(Kw::Publish) => {
-                self.bump();
-                let value = self.expr()?;
-                self.expect_word("to")?;
-                StmtKind::Publish {
-                    value,
-                    destination: self.expr()?,
-                }
+            Tok::Kw(Kw::Publish | Kw::Yield) => {
+                return Err(self.error(
+                    "`publish` and `yield` were removed; assign values or return owned results"
+                        .into(),
+                ));
             }
-            Tok::Kw(kw @ (Kw::Yield | Kw::Return)) => {
-                let kw = *kw;
+            Tok::Kw(Kw::Return) => {
                 self.bump();
-                let values = if kw == Kw::Return && (self.at_line_end() || self.at_op(Op::Semi)) {
+                let values = if self.at_line_end() || self.at_op(Op::Semi) {
                     Vec::new()
-                } else if region_mode(self.peek()).is_some() {
-                    vec![self.value(&mut ended)?]
                 } else {
                     self.comma_list(Self::expr)?
                 };
-                if kw == Kw::Yield {
-                    StmtKind::Yield(values)
-                } else {
-                    StmtKind::Return(values)
-                }
+                StmtKind::Return(values)
             }
             _ => {
                 let target = self.expr()?;
@@ -801,23 +706,10 @@ impl Parser {
         ))
     }
 
-    /// The value of `let`/`yield`/`return`: an expression or a result-producing region.
+    /// The value of `let`: an expression.
     fn value(&mut self, ended: &mut bool) -> PResult<Expr> {
-        match region_mode(self.peek()) {
-            Some(RegionMode::Pipeline) => {
-                Err(self.error("a `pipeline` region produces no result".into()))
-            }
-            Some(_) => {
-                let region = self.region()?;
-                *ended = true;
-                let span = region.span;
-                Ok(Expr {
-                    kind: ExprKind::Region(Box::new(region)),
-                    span,
-                })
-            }
-            None => self.expr(),
-        }
+        *ended = false;
+        self.expr()
     }
 
     // ---- expressions ----
@@ -997,14 +889,26 @@ impl Parser {
             Tok::Kw(Kw::Inf) => ExprKind::Inf,
             Tok::Kw(Kw::True) => ExprKind::Bool(true),
             Tok::Kw(Kw::False) => ExprKind::Bool(false),
-            Tok::Name(name) => ExprKind::Name(Ident { name, span }),
-            Tok::Kw(Kw::Tile) => {
+            Tok::Name(name) if name == "tensor" => {
                 self.bump();
                 let (shape, elem) = self.shape_and_elem()?;
                 return Ok(Expr {
-                    kind: ExprKind::Tile { shape, elem },
+                    kind: ExprKind::Tensor { shape, elem },
                     span: span.to(self.prev_span()),
                 });
+            }
+            Tok::Name(name) if name == "owned" && matches!(self.peek_at(1), Tok::Op(Op::LParen)) => {
+                return Err(self.error(
+                    "`owned(...)` traversal was removed; iterate a bounded range with `for`"
+                        .into(),
+                ));
+            }
+            Tok::Name(name) => ExprKind::Name(Ident { name, span }),
+            Tok::Kw(Kw::Tile) => {
+                return Err(self.error(
+                    "`tile` allocation is compiler-internal; allocate a logical `tensor`"
+                        .into(),
+                ));
             }
             Tok::Op(Op::LParen) => {
                 self.bump();
@@ -1084,44 +988,28 @@ mod tests {
     }
 
     #[test]
-    fn reference_sources_round_trip() {
-        let rms = round_trip(include_str!(
-            "../../../../../seismic-std/lib/kernels/rms_norm.seismic"
-        ));
-        assert!(rms.decls.len() >= 3);
-        let Decl::Fn(f) = &rms.decls[0] else {
+    fn logical_sources_round_trip() {
+        let file = round_trip(
+            "fn update[M, N](x: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut output = result\n    parallel for row in 0..M:\n        for col in 0..N:\n            output[row, col] = x[row, col] + 1.0\n    return output\n\nlower update[M, N](x: &tensor[M, N] f32, result: tensor[M, N] f32) -> tensor[M, N] f32 for cpu:\n    let mut output = result\n    for row in 0..M:\n        for col in 0..N:\n            output[row, col] = x[row, col] + 1.0\n    return output\n",
+        );
+        assert_eq!(file.decls.len(), 2);
+        let Decl::Fn(function) = &file.decls[0] else {
             panic!("expected fn")
         };
-        assert!(f.target.is_none());
-        assert_eq!(
-            f.signature
-                .params
-                .iter()
-                .map(|p| p.mode)
-                .collect::<Vec<_>>(),
-            [Mode::In, Mode::In, Mode::Out, Mode::In]
-        );
-
-        let linear = round_trip(include_str!(
-            "../../../../../seismic-std/lib/kernels/linear.seismic"
+        assert!(function.target.is_none());
+        assert!(matches!(
+            function.signature.params[0].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::SharedTensor,
+                ..
+            }
         ));
-        let Decl::Fn(f) = &linear.decls[0] else {
-            panic!("expected fn")
-        };
-        let Block { stmts, .. } = &f.body;
-        let StmtKind::Region(region) = &stmts[0].kind else {
-            panic!("expected region")
-        };
-        assert_eq!(
-            (region.mode, region.binders.len(), region.sources.len()),
-            (RegionMode::Parallel, 2, 2)
-        );
-        assert!(matches!(region.sources[0].kind, ExprKind::Range { .. }));
-
-        let matmul = round_trip(include_str!(
-            "../../../../../seismic-std/lib/constructs/matmul.seismic"
+        assert!(function.signature.result.is_some());
+        assert!(matches!(
+            function.body.stmts[1].kind,
+            StmtKind::For { parallel: true, .. }
         ));
-        assert_eq!(only_fn(&matmul).signature.params[2].mode, Mode::Inout);
+        assert!(matches!(file.decls[1], Decl::Lower(_)));
     }
 
     #[test]
@@ -1129,9 +1017,9 @@ mod tests {
         let file = round_trip(
             "fn row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32\n    where N >= 2 and N % 2 == 0:\n    let mut result = f32(0.0)\n    for pair in 0..(N / 2):\n        result = fma(x[2 * pair], w[2 * pair], result)\n    return result\n\n\
              lower row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32\n    for cpu where N >= 1:\n    return row_dot_cpu(x, w)\n\n\
-             fn update[M](a: tile[M, M] f32,\n             inout acc: tile[M, M] f32) -> void:\n    acc += a\n\n\
-             lower update[M](a: tile[M, M] f32, inout acc: tile[M, M] f32) -> void\n    for metal\n    where M == 8 and full(M):\n    let mut left = metal.simdgroup_matrix(f32)\n    metal.simdgroup_load(left, a, 0, 0)\n\n\
-             fn prepare[R, K](x: view[R, K] bf16, pos: index[K])\n    -> (tile[R, K] f32, metal.simdgroup_matrix(f32)) for metal:\n    return f32(x), native(x)\n",
+             fn update[M](a: &tensor[M, M] f32,\n             acc: tensor[M, M] f32) -> tensor[M, M] f32:\n    let mut result = acc\n    for i in 0..M:\n        for j in 0..M:\n            result[i, j] = result[i, j] + a[i, j]\n    return result\n\n\
+             lower update[M](a: &tensor[M, M] f32, acc: tensor[M, M] f32) -> tensor[M, M] f32\n    for metal\n    requires metal.matrix\n    where M == 8 and full(M):\n    return metal.matrix.matmul(a, acc, accumulation=f32)\n\n\
+             fn prepare[R, K](x: &tensor[R, K] bf16, pos: index[K])\n    -> tensor[R, K] f32 for metal requires metal.matrix:\n    return metal.matrix.matmul(x, x, accumulation=f32)\n",
         );
         assert_eq!(file.decls.len(), 5);
         let Decl::Fn(f) = &file.decls[0] else {
@@ -1150,99 +1038,103 @@ mod tests {
         let Decl::Fn(f) = &file.decls[2] else {
             panic!("expected fn")
         };
-        assert!(f.body.stmts.len() == 1 && f.signature.result.is_none());
+        assert!(f.body.stmts.len() == 3 && f.signature.result.is_some());
         let Decl::Lower(l) = &file.decls[3] else {
             panic!("expected lower")
         };
         assert_eq!(l.predicates.len(), 2);
-        assert_eq!(l.body.stmts.len(), 2);
+        assert_eq!(l.requires.len(), 1);
+        assert_eq!(l.body.stmts.len(), 1);
         let Decl::Fn(f) = &file.decls[4] else {
             panic!("expected fn")
         };
-        assert!(
-            matches!(&f.signature.result, Some(TypeExpr { kind: TypeKind::Tuple(items), .. }) if items.len() == 2)
-        );
+        assert!(matches!(
+            &f.signature.result,
+            Some(TypeExpr {
+                kind: TypeKind::Shaped { .. },
+                ..
+            })
+        ));
+        assert_eq!(f.requires.len(), 1);
     }
 
     #[test]
-    fn modes_aliases_and_contextual_words() {
+    fn ownership_and_contextual_words() {
         let file = round_trip(
-            "fn f(out out: tensor[M] f32, out: tensor[M] f32, inout inout: tile[M] T, to: f32) alias(out, inout), alias(to, out) -> f32:\n    publish to to out[:]\n    return to\n",
+            "fn f[M](owned: tensor[M] f32, shared: &tensor[M] f32, exclusive: &mut tensor[M] f32, to: f32) -> tensor[M] f32:\n    exclusive[0] = shared[0] + to\n    return owned\n",
         );
         let f = only_fn(&file);
         assert!(f.target.is_none());
-        let params: Vec<_> = f
-            .signature
-            .params
-            .iter()
-            .map(|p| (p.mode, p.name.name.as_str()))
-            .collect();
-        assert_eq!(
-            params,
-            [
-                (Mode::Out, "out"),
-                (Mode::In, "out"),
-                (Mode::Inout, "inout"),
-                (Mode::In, "to")
-            ]
-        );
-        assert_eq!(f.signature.aliases.len(), 2);
+        assert!(matches!(f.signature.params[0].ty.kind, TypeKind::Shaped { head: ShapedHead::Tensor, .. }));
+        assert!(matches!(f.signature.params[1].ty.kind, TypeKind::Shaped { head: ShapedHead::SharedTensor, .. }));
+        assert!(matches!(f.signature.params[2].ty.kind, TypeKind::Shaped { head: ShapedHead::MutTensor, .. }));
+        assert_eq!(f.signature.params[3].name.name, "to");
     }
 
     #[test]
-    fn region_results_merge_and_stages() {
+    fn logical_ownership_ranges_and_loops_round_trip() {
         let file = round_trip(
-            "fn sum[K](x: tensor[K] f32, out y: tensor[1] f32):\n    stage prepare:\n        let total = parallel [part] in 0..K:\n            yield reduce(f32(x[part]), 0, sum)\n        merge (left, right) identity f32(0.0):\n            yield left + right\n        let mut running = f32(-inf)\n        let checkpoints = ordered [p, q] in rectangles:\n            let (m, (l, a)) = rectangles[p, q]\n            (running, m) = (running + m, l * a)\n            yield running, m\n        yield total, checkpoints\n\n    stage finish(total, checkpoints):\n        publish total to y[0]\n",
+            "fn update[N](owned: tensor[N] f32, shared: &tensor[N] f32, exclusive: &mut tensor[N] f32, at: index[N], span: range[N]) -> tensor[N] f32:\n    for i in 0..N:\n        exclusive[i] = shared[i]\n    parallel for i in 0..N:\n        exclusive[i] = shared[i]\n    return owned\n",
         );
-        let body = &only_fn(&file).body;
-        let StmtKind::Stage { body: prepare, .. } = &body.stmts[0].kind else {
-            panic!("expected stage")
-        };
-        assert_eq!(prepare.stmts.len(), 4);
-        let StmtKind::Let {
-            value:
-                Expr {
-                    kind: ExprKind::Region(region),
-                    ..
-                },
-            ..
-        } = &prepare.stmts[0].kind
-        else {
-            panic!("expected region")
-        };
-        assert!(region.merge.is_some());
-        assert!(matches!(&body.stmts[1].kind, StmtKind::Stage { ports, .. } if ports.len() == 2));
-        assert!(parse(
-            "fn f():\n    let t = pipeline [k] in 0..K:\n        stage a:\n            g()\n"
-        )
-        .is_err());
-        assert!(
-            parse("fn f():\n    parallel [a, b] in (0..M, 0..N, 0..K):\n        g()\n").is_err()
-        );
+        let function = only_fn(&file);
+        assert!(matches!(
+            function.signature.params[0].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::Tensor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.signature.params[1].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::SharedTensor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.signature.params[2].ty.kind,
+            TypeKind::Shaped {
+                head: ShapedHead::MutTensor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.signature.params[4].ty.kind,
+            TypeKind::Range(_)
+        ));
+        assert!(matches!(
+            function.body.stmts[0].kind,
+            StmtKind::For {
+                parallel: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.body.stmts[1].kind,
+            StmtKind::For { parallel: true, .. }
+        ));
     }
 
     #[test]
-    fn pipeline_and_statements() {
+    fn returned_values_and_loop_forms() {
         let file = round_trip(
-            "fn gp[N, K](x: tensor[1, K] bf16, gate: tensor[N, K] q4g64, out: tensor[1, N] bf16) where N >= 1:\n    parallel [cols] in 0..N:\n        let mut g = zeros_like(out[:, cols], dtype=f32)\n\n        pipeline [k] in 0..K:\n            stage prepare:\n                let a, gw = prepare_inputs[R = 64](x[:, k], gate[cols, k])\n                yield a, gw\n\n            stage accumulate(a, gw):\n                matmul(a, gw, into=g)\n\n        let y = g / (1.0 + exp(-g)) * g.T\n        let t = tile[2, K - 1] f32\n        for i, j in owned(t): t[i, j] = 0.0; g[i, j] += 3.402823466e38\n        if not (K > 1 or N == 2) and K % 2 == 0: return\n        else if K << 1 > 4: y[0:1, 1:] *= 1e-30\n        else:\n            y[:2] -= -(1 - 2) - 3\n        publish bf16(y) to out[:, cols]\n",
+            "fn prefix[K](x: &tensor[K] f32, result: tensor[K] f32) -> tensor[K] f32:\n    let mut output = result\n    let mut running = f32(0.0)\n    for i in 0..K:\n        running = running + x[i]\n        output[i] = running\n    return output\n",
         );
         let body = &only_fn(&file).body;
-        let StmtKind::Region(outer) = &body.stmts[0].kind else {
-            panic!("expected region")
-        };
-        assert_eq!(outer.body.stmts.len(), 7);
-        let StmtKind::Region(pipeline) = &outer.body.stmts[1].kind else {
-            panic!("expected pipeline")
-        };
-        assert_eq!(
-            (pipeline.mode, pipeline.body.stmts.len()),
-            (RegionMode::Pipeline, 2)
+        assert!(matches!(body.stmts[2].kind, StmtKind::For { parallel: false, .. }));
+        assert!(matches!(body.stmts[3].kind, StmtKind::Return(_)));
+    }
+
+    #[test]
+    fn logical_parallel_and_statements() {
+        let file = round_trip(
+            "fn transform[N](x: &tensor[N] f32, result: tensor[N] f32, enabled: bool) -> tensor[N] f32 where N >= 1:\n    let mut output = result\n    parallel for i in 0..N:\n        if enabled: output[i] = x[i] + 1.0; output[i] *= 2.0\n        else if N > 1: output[i] = x[i] - 1.0\n        else:\n            output[i] = x[i]\n    return output\n",
         );
-        let StmtKind::For { body: inline, .. } = &outer.body.stmts[4].kind else {
+        let body = &only_fn(&file).body;
+        let StmtKind::For { body: inline, parallel: true, .. } = &body.stmts[1].kind else {
             panic!("expected for")
         };
-        assert_eq!(inline.stmts.len(), 2);
-        let StmtKind::If { els: Some(els), .. } = &outer.body.stmts[5].kind else {
+        let StmtKind::If { els: Some(els), .. } = &inline.stmts[0].kind else {
             panic!("expected if")
         };
         assert!(matches!(
@@ -1286,5 +1178,27 @@ mod tests {
         assert!(parse("fn f():\n    f(x) = 1\n").is_err());
         assert!(parse("lower f for cpu:\n    g()\n").is_err());
         assert!(parse("fn f(x: f32) -> f32\n    where x > 0 = portable\n").is_err());
+    }
+
+    #[test]
+    fn retired_source_forms_are_hard_errors() {
+        for source in [
+            "fn f[N](out x: tensor[N] f32):\n    return\n",
+            "fn f[N](inout x: tensor[N] f32):\n    return\n",
+            "fn f[N](x: view[N] f32):\n    return\n",
+            "fn f[N](x: tile[N] f32):\n    return\n",
+            "fn f[N](x: tensor[N] f32) alias(x, x):\n    return\n",
+            "fn f[N](x: tensor[N] f32):\n    let y = tile[N] f32\n",
+            "fn f[N](x: tensor[N] f32):\n    publish x to x\n",
+            "fn f[N](x: tensor[N] f32):\n    yield x\n",
+            "fn f[N](x: tensor[N] f32):\n    parallel [i] in 0..N:\n        g(i)\n",
+            "fn f[N](x: tensor[N] f32):\n    ordered [i] in 0..N:\n        g(i)\n",
+            "fn f[N](x: tensor[N] f32):\n    pipeline [i] in 0..N:\n        g(i)\n",
+            "fn f():\n    stage s:\n        g()\n",
+            "fn f():\n    merge (a, b) identity 0:\n        return\n",
+            "fn f(x: metal.fragment):\n    return\n",
+        ] {
+            assert!(parse(source).is_err(), "retired syntax parsed successfully:\n{source}");
+        }
     }
 }

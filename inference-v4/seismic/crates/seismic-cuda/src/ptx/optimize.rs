@@ -12,15 +12,17 @@
 //! elimination), folding of branches on constants (which the e-graph pass leaves in place),
 //! and the same mid-end once more over the reduced control flow. Floating-point results are
 //! unchanged: the e-graph rules neither reassociate nor contract floating-point arithmetic.
+use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{self, InstBuilder, InstructionData, Opcode};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
 
 fn flags() -> Result<settings::Flags, String> {
     let mut builder = settings::builder();
-    builder.set("opt_level", "speed").map_err(|e| format!("scalar SSA optimization flags: {e}"))?;
+    builder
+        .set("opt_level", "speed")
+        .map_err(|e| format!("scalar SSA optimization flags: {e}"))?;
     Ok(settings::Flags::new(builder))
 }
 
@@ -31,7 +33,9 @@ fn mid_end(context: &mut Context, flags: &settings::Flags) -> Result<(), String>
     context.eliminate_unreachable_code(flags).map_err(failed)?;
     context.remove_constant_phis(flags).map_err(failed)?;
     context.func.dfg.resolve_all_aliases();
-    context.egraph_pass(flags, &mut ControlPlane::default()).map_err(failed)
+    context
+        .egraph_pass(flags, &mut ControlPlane::default())
+        .map_err(failed)
 }
 
 /// `op_imm x, c` becomes `op x, (iconst c)`, the constant zero-extended from the operand type
@@ -42,7 +46,12 @@ fn expand_immediate_forms(function: &mut ir::Function) -> Result<(), String> {
         while let Some(inst) = cursor.next_inst() {
             let (arg, imm, opcode, condition) = match cursor.func.dfg.insts[inst] {
                 InstructionData::BinaryImm64 { opcode, arg, imm } => (arg, imm, opcode, None),
-                InstructionData::IntCompareImm { opcode, arg, cond, imm } => (arg, imm, opcode, Some(cond)),
+                InstructionData::IntCompareImm {
+                    opcode,
+                    arg,
+                    cond,
+                    imm,
+                } => (arg, imm, opcode, Some(cond)),
                 _ => continue,
             };
             let ty = cursor.func.dfg.value_type(arg);
@@ -83,11 +92,23 @@ fn fold_constant_branches(function: &mut ir::Function) -> bool {
     let mut folded = false;
     let blocks: Vec<ir::Block> = function.layout.blocks().collect();
     for block in blocks {
-        let Some(inst) = function.layout.last_inst(block) else { continue };
-        let InstructionData::Brif { arg, blocks, .. } = function.dfg.insts[inst] else { continue };
+        let Some(inst) = function.layout.last_inst(block) else {
+            continue;
+        };
+        let InstructionData::Brif { arg, blocks, .. } = function.dfg.insts[inst] else {
+            continue;
+        };
         let condition = function.dfg.resolve_aliases(arg);
-        let ir::ValueDef::Result(definition, _) = function.dfg.value_def(condition) else { continue };
-        let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = function.dfg.insts[definition] else { continue };
+        let ir::ValueDef::Result(definition, _) = function.dfg.value_def(condition) else {
+            continue;
+        };
+        let InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = function.dfg.insts[definition]
+        else {
+            continue;
+        };
         let taken = blocks[usize::from(imm.bits() == 0)];
         let target = taken.block(&function.dfg.value_lists);
         let args: Vec<ir::BlockArg> = taken.args(&function.dfg.value_lists).collect();

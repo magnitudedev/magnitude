@@ -1,8 +1,11 @@
 # Seismic backends
 
-**A backend contributes a mapping: the physical meaning of authored structure on one
-target, the hard limits of that target, an estimate of cost, and a deterministic
-realization of a witness.** A backend never searches and never ranks.
+**A backend maps checked logical loops, ownership effects, and operations to physical execution on
+one target, with hard limits, an estimate, and deterministic realization.** A backend never
+searches or ranks.
+
+This document names physical region, tile, staging, and publication nodes where they still exist in
+the execution IR. They are compiler-owned migration internals, not Seismic source syntax.
 
 ## The `Backend` contract
 
@@ -42,7 +45,7 @@ realization.
 
 ### Structure
 
-| Authored structure | Metal realization |
+| Temporary physical IR structure | Metal realization |
 | --- | --- |
 | Root `parallel` region of the entry | One launch dispatched over its pieces, one SIMD group of 32 threads per piece |
 | Root `ordered` or `pipeline` region | One single-piece launch with serial windows |
@@ -256,7 +259,7 @@ candidates; a body that requires another target's primitives is never applicable
 
 ### Structure
 
-| Authored structure | CPU realization |
+| Temporary physical IR structure | CPU realization |
 | --- | --- |
 | Root `parallel` region of the entry | One phase; its pieces are claimed one at a time by the worker threads of the device |
 | Root `ordered` or `pipeline` region | One single-piece phase with serial windows |

@@ -58,7 +58,8 @@ The plan compiler holds one closed checked program and one device.
   are never identity, so changing control inputs or the decode position reuses the
   compiled kernel and never retunes.
 - An unknown linked function is an error when requested as an entry.
-- Selection and native compilation run at the first preparation of an entry, under
+- Selection and native compilation run during `compile_entry`, before any invocation bindings
+  are accepted, under
   the search budget in the compiler's settings, with the backend of the plan's device
   (`Device::select`) built from the device's queried facts. The budget is the only tuning
   input a host supplies. `Settings.precision` is a hard numerical contract and
@@ -70,8 +71,8 @@ The plan compiler holds one closed checked program and one device.
   phase timings and search statistics, and the wall time of `emit` (Metal; the CPU and
   CUDA backends do not separate emission) and `native_compile` measured in
   `Device::compile_selected`.
-- A failed selection or compilation is an error for that entry. Nothing is retained
-  and nothing else is substituted; a later preparation retries the same request.
+- A failed selection or compilation is an error from `compile_entry`. Nothing is retained
+  and nothing else is substituted; a later compilation request retries the same identity.
 - Reuse is per plan compiler, in memory. There is no persisted selection or native
   artifact cache. A persisted witness is deployed by replay ([Tuning](tuning.md)),
   which re-audits it against the current program, workload, and backend.
@@ -82,9 +83,9 @@ different compilation. Display names and timestamps are not identity.
 
 ## Binding
 
-An entry's ABI derives from its parameters in declaration order: one or more buffer
-planes per tensor (a packed representation has several), and one scalar per scalar or
-bounded index parameter.
+An entry's ABI derives from ownership-qualified parameters and owned results: one or more buffer
+planes per tensor (a packed representation has several), one scalar per scalar or bounded
+index/range value, and any compiler-generated hidden destinations for owned results.
 
 - **By name.** A host supplies a resolver from `(parameter, plane)` to a buffer and
   from a scalar name to a value. An unbound tensor plane or scalar is an error.
@@ -101,10 +102,10 @@ Before every submission:
 - Binding counts equal the retained ABI.
 - A buffer the execution requires to be independent shares its allocation with no
   other argument.
-- Every alias requirement of the entry holds: a written tensor parameter overlaps no
-  other tensor parameter, except that a declared `alias` pair may coincide exactly.
-  The check uses allocation identity and allocation-relative offsets, not parameter
-  names or exposed addresses.
+- Every ownership requirement holds: an exclusive mutable borrow overlaps no other live borrow,
+  while shared borrows may overlap. Moved owned inputs are uniquely consumed for the invocation.
+  Checks use allocation identity and allocation-relative offsets, not parameter names or exposed
+  addresses.
 - Byte sizes and typed alignment are checked by the native binding path.
 - A batched submission validates every invocation before encoding any.
 

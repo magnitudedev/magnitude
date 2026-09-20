@@ -47,7 +47,9 @@ pub enum StmtKind {
     /// `modes` is unresolved before selection; afterward it contains one load mode per binding.
     LoadLoop { domain: IterationDomain, offset: Option<VarId>, modes: Option<Vec<LoadMode>>, vars: Vec<VarId>, views: Vec<Expr>, axes: Vec<usize>, piece: Atom, capacity: Option<i64>, body: Vec<Stmt> },
     Owned { vars: Vec<VarId>, tile: Expr, body: Vec<Stmt> },
-    Range { var: VarId, lo: Sym, hi: Sym, body: Vec<Stmt> },
+    /// Logical scalar loop. `independent` preserves source `parallel for`; it is
+    /// not a physical width or scheduling decision.
+    Range { independent: bool, var: VarId, lo: Sym, hi: Sym, body: Vec<Stmt> },
     /// Lowering scope: iterate `extent` across the subgroup's lanes, `width` consecutive per lane.
     Lanes { var: VarId, extent: Sym, width: i64, body: Vec<Stmt> },
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
@@ -87,7 +89,10 @@ impl PartialEq for Expr {
 /// Selected realization of a value-semantic load. Borrowing requires a lifetime
 /// proof; it does not change the program's observable snapshot semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoadMode { Materialize, Borrow }
+pub enum LoadMode {
+    Materialize,
+    Borrow,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
@@ -97,30 +102,69 @@ pub enum ExprKind {
     Float(f64),
     Bool(bool),
     Var(VarId),
-    TileAlloc { shape: Vec<Sym>, dtype: Elem },
+    TileAlloc {
+        shape: Vec<Sym>,
+        dtype: Elem,
+    },
     /// Execution-stage load with its storage decision resolved.
-    Load { view: Box<Expr>, mode: LoadMode },
+    Load {
+        view: Box<Expr>,
+        mode: LoadMode,
+    },
     /// Indexing of a tensor or tile: a view, or an element when every axis is a point.
-    Index { base: Box<Expr>, indices: Vec<Index> },
+    Index {
+        base: Box<Expr>,
+        indices: Vec<Index>,
+    },
     Transpose(Box<Expr>),
     /// Lowering-scope accessor on a packed tile: `words`, `scale`, `bias`.
-    Accessor { base: Box<Expr>, name: String },
+    Accessor {
+        base: Box<Expr>,
+        name: String,
+    },
     /// Lowering-scope lane distribution of a tile axis: `t.lanes(K)`.
-    Lanes { base: Box<Expr>, extent: Sym },
-    Builtin { name: Builtin, args: Vec<Expr> },
+    Lanes {
+        base: Box<Expr>,
+        extent: Sym,
+    },
+    Builtin {
+        name: Builtin,
+        args: Vec<Expr>,
+    },
     /// Call of a function or construct with inferred shape and element arguments.
-    Call { callee: String, shape_args: Vec<Sym>, elem_args: Vec<Elem>, args: Vec<Expr> },
-    Intrinsic { op: crate::intrinsics::Operation, args: Vec<Expr> },
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Cast { dtype: DType, expr: Box<Expr> },
+    Call {
+        callee: String,
+        shape_args: Vec<Sym>,
+        elem_args: Vec<Elem>,
+        args: Vec<Expr>,
+    },
+    Intrinsic {
+        op: crate::intrinsics::Operation,
+        args: Vec<Expr>,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Cast {
+        dtype: DType,
+        expr: Box<Expr>,
+    },
     Tuple(Vec<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Index {
     Point(Expr),
-    Slice { start: Option<Expr>, end: Option<Expr> },
+    Slice {
+        start: Option<Expr>,
+        end: Option<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +202,12 @@ pub enum ReduceOp {
 
 impl ReduceOp {
     pub fn from_tag(tag: i64) -> Option<Self> {
-        Some(match tag { 0 => Self::Sum, 1 => Self::Max, 2 => Self::Min, 3 => Self::Argmax, _ => return None })
+        Some(match tag {
+            0 => Self::Sum,
+            1 => Self::Max,
+            2 => Self::Min,
+            3 => Self::Argmax,
+            _ => return None,
+        })
     }
 }

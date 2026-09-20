@@ -4,9 +4,7 @@ use super::plan::*;
 use std::fmt::Write;
 
 pub fn print(plan: &TargetPlan) -> String {
-    let mut out = String::from(match plan.target() {
-        Target::Sm80Ptx70 => ".version 7.0\n.target sm_80\n.address_size 64\n\n",
-    });
+    let mut out = plan.target().header();
     for library in plan.libraries() {
         out.push_str(library.source());
         out.push('\n');
@@ -188,7 +186,23 @@ pub fn print(plan: &TargetPlan) -> String {
                         register(plan, predicate)
                     )
                     .unwrap(),
-                    Operation::Shuffle { mode, destination, source, lane } => write!(out, "shfl.sync.{}.b32 {}, {}, {}, 31, 0xffffffff", match mode { ShuffleMode::Butterfly => "bfly", ShuffleMode::Index => "idx" }, register(plan,destination), register(plan,source), operand(plan,lane)).unwrap(),
+                    Operation::Shuffle {
+                        mode,
+                        destination,
+                        source,
+                        lane,
+                    } => write!(
+                        out,
+                        "shfl.sync.{}.b32 {}, {}, {}, 31, 0xffffffff",
+                        match mode {
+                            ShuffleMode::Butterfly => "bfly",
+                            ShuffleMode::Index => "idx",
+                        },
+                        register(plan, destination),
+                        register(plan, source),
+                        operand(plan, lane)
+                    )
+                    .unwrap(),
                     Operation::Fma {
                         destination,
                         a,

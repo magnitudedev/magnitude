@@ -6,12 +6,12 @@ use seismic_lang::{
 };
 use std::collections::HashMap;
 pub fn exercise(
-    mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]) -> Result<(), String>,
+    mut run: impl FnMut(&LoweredIr, &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String>,
     backend: &str,
 ) {
     let p = compile(&[SourceFile {
         path: "stream.seismic".into(),
-        text: "fn stream[T](x: tensor[T] f32, visible: tensor[2] i32, out: tensor[1] f32):\n  acc = tile[1] f32\n  for i in owned(acc): acc[i] = 0.0\n  t = load(x[visible[0]:visible[1]])\n  acc[0] = reduce(t, 0, sum, ordered=true)\n  store(acc, out)\n".into(),
+        text: "fn stream[T](x: &tensor[T] f32, visible: &tensor[2] i32, result: tensor[1] f32) -> tensor[1] f32:\n    let mut output = result\n    let mut total = f32(0.0)\n    for i in visible[0]..visible[1]:\n        total = total + x[i]\n    output[0] = total\n    return output\n".into(),
     }]).unwrap();
     for piece in [None, Some(1), Some(17), Some(64), Some(200)] {
         let l = seismic_lang::lower::lower_with(
@@ -47,7 +47,7 @@ pub fn exercise(
                     .collect(),
                 vec![0; 4],
             ];
-            run(&l, &mut buffers)
+            let results = run(&l, &buffers)
                 .unwrap_or_else(|e| panic!("piece={piece:?} [{start},{end}): {e}"));
             // Data-dependent slices clamp; unlike points, out-of-range
             // endpoints and reversed windows are valid empty/partial views.
@@ -55,7 +55,7 @@ pub fn exercise(
             let clipped_start = start.clamp(0, clipped_end as i32) as usize;
             let expected: f32 = input[clipped_start..clipped_end].iter().sum();
             assert_eq!(
-                f32::from_le_bytes(buffers[2].as_slice().try_into().unwrap()),
+                f32::from_le_bytes(results[0].as_slice().try_into().unwrap()),
                 expected,
                 "piece={piece:?} [{start},{end})"
             );

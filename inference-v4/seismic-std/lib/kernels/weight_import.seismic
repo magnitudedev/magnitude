@@ -1,9 +1,9 @@
-# Stored float values are decoded by their element type. Transforms publish f32
+# Stored float values are decoded by their element type. Transforms write f32
 # before the destination's explicit storage conversion.
-fn import_weight[N](source: tensor[N] T, out out: tensor[N] U, negative_exp: bool):
-    parallel [items] in 0..N:
+fn import_weight[N](source: &tensor[N] T, result: &mut tensor[N] U, negative_exp: bool):
+    parallel for items in 0..N:
         let y = f32(source[items])
         if negative_exp:
-            publish -exp(y) to out[items]
+            result[items] = -exp(y)
         else:
-            publish y to out[items]
+            result[items] = y

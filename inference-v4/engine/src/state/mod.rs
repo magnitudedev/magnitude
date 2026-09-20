@@ -371,6 +371,24 @@ impl StateAdvance<'_> {
     ) -> Result<(), Error> {
         Self::execute_batch(std::slice::from_mut(self), |bindings| run(bindings[0]))
     }
+
+    /// Replace a preallocated proposal component with a compiler-owned result after the
+    /// synchronous numerical execution that produced it. The accepted state adopts that
+    /// allocation on commit; aborted advances drop it normally.
+    pub fn replace_following(&mut self, index: usize, buffer: Buffer) -> Result<(), String> {
+        if !self.completed {
+            return Err("proposal results can be adopted only after successful completion".into());
+        }
+        let expected = self
+            .following
+            .get(index)
+            .ok_or("proposal component index is out of bounds")?;
+        if !buffer.belongs_to(&self.state.store.device) || buffer.len() != expected.len() {
+            return Err("proposal result differs from its state component allocation".into());
+        }
+        self.following[index] = buffer;
+        Ok(())
+    }
     /// One synchronous completion covers every row's constituent work. No row
     /// can become committable if the shared execution fails or unwinds.
     pub fn execute_batch(

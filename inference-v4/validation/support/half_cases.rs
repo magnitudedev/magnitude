@@ -22,8 +22,11 @@ fn half_value(bits: u16) -> f32 {
         sign * (1.0 + f32::from(fraction) / 1024.0) * 2.0f32.powi(i32::from(exp) - 15)
     }
 }
-pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) {
-    let text="fn encode[N](x: tensor[N] f32, out: tensor[N] f16):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n\nfn decode[N](x: tensor[N] f16, out: tensor[N] f32):\n  for row in parallel:\n    t = load(x[row:row+1])\n    store(t,out[row:row+1])\n";
+pub fn exercise(
+    mut run: impl FnMut(&LoweredIr, &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String>,
+    backend: &str,
+) {
+    let text="fn encode[N](x: &tensor[N] f32, result: tensor[N] f16) -> tensor[N] f16:\n    let mut output = result\n    parallel for row in 0..N:\n        output[row] = f16(x[row])\n    return output\n\nfn decode[N](x: &tensor[N] f16, result: tensor[N] f32) -> tensor[N] f32:\n    let mut output = result\n    parallel for row in 0..N:\n        output[row] = f32(x[row])\n    return output\n";
     let program = compile(&[SourceFile {
         path: "half.seismic".into(),
         text: text.into(),
@@ -40,8 +43,8 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) 
         &HashMap::from([("N".into(), 65536)]),
     )
     .unwrap();
-    run(&lowered, &mut buffers);
-    for (bits, bytes) in (0..=u16::MAX).zip(buffers[1].chunks_exact(4)) {
+    let results = run(&lowered, &buffers).unwrap();
+    for (bits, bytes) in (0..=u16::MAX).zip(results[0].chunks_exact(4)) {
         let expected = half_value(bits);
         let actual = f32::from_le_bytes(bytes.try_into().unwrap());
         if expected.is_nan() {
@@ -91,8 +94,8 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) 
         &HashMap::from([("N".into(), samples.len() as i64)]),
     )
     .unwrap();
-    run(&lowered, &mut buffers);
-    for ((value, expected), bytes) in samples.iter().zip(buffers[1].chunks_exact(2)) {
+    let results = run(&lowered, &buffers).unwrap();
+    for ((value, expected), bytes) in samples.iter().zip(results[0].chunks_exact(2)) {
         assert_eq!(
             u16::from_le_bytes(bytes.try_into().unwrap()),
             *expected,
@@ -118,8 +121,8 @@ pub fn exercise(mut run: impl FnMut(&LoweredIr, &mut [Vec<u8>]), backend: &str) 
         &HashMap::from([("N".into(), 4)]),
     )
     .unwrap();
-    run(&lowered, &mut buffers);
-    for bytes in buffers[1].chunks_exact(2) {
+    let results = run(&lowered, &buffers).unwrap();
+    for bytes in results[0].chunks_exact(2) {
         assert!(
             u16::from_le_bytes(bytes.try_into().unwrap()) & 0x7fff > 0x7c00,
             "half NaN encoding cannot become infinity"

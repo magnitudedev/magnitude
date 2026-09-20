@@ -11,9 +11,16 @@ pub use cranelift_codegen::isa::CallConv;
 pub struct BufferSpec {
     pub parameter: String,
     pub plane: String,
+    pub role: BufferRole,
     pub bytes: usize,
     /// Required base-address alignment for this typed storage plane.
     pub alignment: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BufferRole {
+    Parameter,
+    Result { path: Vec<u32> },
+    Internal,
 }
 /// Derived source invocation requirements retained through preparation/emission.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -76,6 +83,7 @@ impl InvocationConditions {
                         .intermediates
                         .contains(&p.parameter)
                         .then_some(i)
+                        .or_else(|| function.ownership.results.contains(&p.parameter).then_some(i))
                 })
                 .collect(),
         })
@@ -95,6 +103,19 @@ impl InvocationConditions {
         buffers: &[BufferSpec],
         locate: impl Fn(usize) -> (u64, u64),
     ) -> Result<(), String> {
+        for &independent in &self.independent_buffers {
+            let (id, _) = locate(independent);
+            for other in 0..buffers.len() {
+                if other != independent && locate(other).0 == id {
+                    return Err(format!(
+                        "owned binding {} must have an independent allocation",
+                        buffers
+                            .get(independent)
+                            .map_or("?", |buffer| buffer.parameter.as_str())
+                    ));
+                }
+            }
+        }
         for &(a, b, exact_allowed) in &self.alias_pairs {
             let (left, right) = (
                 buffers.get(a).ok_or("invalid alias ABI slot")?,

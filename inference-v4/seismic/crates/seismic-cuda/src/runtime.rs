@@ -1,12 +1,12 @@
 use crate::{
     driver::{Allocation, Context, Driver, Event, Handle, Module},
-    ptx,
     execution::{Execution, Limits},
+    ptx,
 };
 use seismic_lang::abi::ScalarParameter;
 use seismic_realization::{BufferSpec, ScalarProgram};
 use std::{
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
     rc::Rc,
 };
 
@@ -30,6 +30,7 @@ pub struct DeviceInfo {
 pub struct Device {
     context: Rc<Context>,
     pub info: DeviceInfo,
+    target_profile: crate::target::TargetProfile,
 }
 #[derive(Clone, Debug)]
 pub struct NativeResources {
@@ -54,7 +55,11 @@ impl Buffer {
     /// retain this base fact; their offsets are checked separately by accounting.
     pub fn allocation_alignment(&self) -> u64 {
         let address = self.allocation.pointer;
-        if address == 0 { 1 } else { 1u64 << address.trailing_zeros() }
+        if address == 0 {
+            1
+        } else {
+            1u64 << address.trailing_zeros()
+        }
     }
     pub fn len(&self) -> usize {
         self.len
@@ -125,11 +130,6 @@ impl Device {
         };
         let major = attribute(75)?;
         let minor = attribute(76)?;
-        if major < 8 {
-            return Err(format!(
-                "CUDA scalar PTX baseline requires SM 8.0 or newer; device is {major}.{minor}"
-            ));
-        }
         let mut name = [0 as std::ffi::c_char; 256];
         let mut version = 0;
         let mut memory = 0usize;
@@ -160,13 +160,31 @@ impl Device {
             registers_32bit_per_multiprocessor: attribute(82)?,
             shared_bytes_per_multiprocessor: u64::from(attribute(81)?),
         };
+        let target_profile = crate::target::TargetProfile::from_observation(
+            crate::target::TargetObservation::driver(info.compute_capability, info.driver_version)
+                .map_err(|error| error.to_string())?,
+            crate::target::TargetLimits {
+                max_threads_per_block: info.max_threads_per_block,
+                max_grid_x: info.max_grid_x,
+                warp_size: info.warp_size,
+                max_scratch_bytes: info.global_memory_bytes / 4,
+            },
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             context: Context::new(driver, device)?,
             info,
+            target_profile,
         })
     }
+    pub fn target_profile(&self) -> &crate::target::TargetProfile {
+        &self.target_profile
+    }
     /// Natively compile exactly the realized launches of one selected entry.
-    pub fn compile_launches(&self, launches: crate::execution::Launches) -> Result<Sequence, String> {
+    pub fn compile_launches(
+        &self,
+        launches: crate::execution::Launches,
+    ) -> Result<Sequence, String> {
         self.compile_executions(launches.phases)
     }
     /// Consume the complete selected launch sequence, without re-preparing IR.
@@ -179,23 +197,37 @@ impl Device {
             execution.validate_limits(self.execution_limits())?;
             if execution.program().public_buffer_count != first.public_buffer_count
                 || execution.program().buffers != first.buffers
-                || execution.program().scalars != first.scalars {
+                || execution.program().scalars != first.scalars
+            {
                 return Err("CUDA phases must share the same invocation bindings".into());
             }
         }
         let public_buffers = first.buffers[..first.public_buffer_count].to_vec();
-        let internal = first.buffers[first.public_buffer_count..].iter()
-            .map(|spec| self.buffer(spec.bytes)).collect::<Result<Vec<_>, _>>()?;
-        let phases = executions.into_iter()
+        let internal = first.buffers[first.public_buffer_count..]
+            .iter()
+            .map(|spec| self.buffer(spec.bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let phases = executions
+            .into_iter()
             .map(|execution| self.compile_execution(execution))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Sequence { phases, public_buffers, internal })
+        Ok(Sequence {
+            phases,
+            public_buffers,
+            internal,
+        })
     }
     fn execution_limits(&self) -> Limits {
-        Limits { max_threads_per_block: self.info.max_threads_per_block, max_grid_x: self.info.max_grid_x }
+        Limits {
+            max_threads_per_block: self.info.max_threads_per_block,
+            max_grid_x: self.info.max_grid_x,
+        }
     }
     fn compile_code(&self, execution: &Execution) -> Result<CompiledCode, String> {
         execution.validate_limits(self.execution_limits())?;
+        self.target_profile
+            .admits(execution.target_plan().target())
+            .map_err(|error| error.to_string())?;
         let threads_per_block = execution.dispatch().threads_per_group as u32;
         let source = ptx::print(execution.target_plan());
         let context = &self.context;
@@ -276,12 +308,20 @@ impl Device {
                 compilation_log,
                 driver_version: self.info.driver_version,
                 compute_capability: self.info.compute_capability,
+                target: execution.target_plan().target(),
+                target_fingerprint: self.target_profile.fingerprint().to_owned(),
             },
         })
     }
     /// Compile and allocate exactly the prevalidated selected execution.
     pub fn compile_execution(&self, execution: Execution) -> Result<Kernel, String> {
-        let CompiledCode { module, function, native, source, image } = self.compile_code(&execution)?;
+        let CompiledCode {
+            module,
+            function,
+            native,
+            source,
+            image,
+        } = self.compile_code(&execution)?;
         let context = &self.context;
         let storage = execution.storage();
         let table = Allocation::new(context, storage.buffer_table_bytes)?;
@@ -336,6 +376,8 @@ pub struct NativeImage {
     pub compilation_log: String,
     pub driver_version: i32,
     pub compute_capability: (i32, i32),
+    pub target: crate::target::PtxTarget,
+    pub target_fingerprint: String,
 }
 impl Kernel {
     pub fn native_image(&self) -> &NativeImage {
@@ -391,8 +433,17 @@ impl Kernel {
                 return Err("CUDA resident view violates typed storage alignment".into());
             }
         }
-        self.execution.program().conditions.validate_aliases(&self.execution.program().buffers, |i| (0, buffers[i].pointer()))?;
-        let words = seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
+        self.execution
+            .program()
+            .conditions
+            .validate_aliases(&self.execution.program().buffers, |i| {
+                (
+                    Rc::as_ptr(&buffers[i].allocation) as usize as u64,
+                    buffers[i].offset as u64,
+                )
+            })?;
+        let words =
+            seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
         let bytes = words
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -413,7 +464,9 @@ impl Kernel {
         // The first host invocation supplies storage. Subsequent uploads refresh
         // the current resident bindings rather than allocating per invocation.
         if self.tensors.is_empty() && !self.execution.program().buffers.is_empty() {
-            self.tensors = self.execution.program()
+            self.tensors = self
+                .execution
+                .program()
                 .buffers
                 .iter()
                 .map(|spec| {
@@ -428,7 +481,11 @@ impl Kernel {
         let resident = self.tensors.clone();
         // Validate scalar values before modifying caller-owned resident contents.
         seismic_realization::encode_scalars(&self.execution.program().scalars, scalars)?;
-        for ((tensor, buffer), spec) in resident.iter().zip(buffers).zip(&self.execution.program().buffers) {
+        for ((tensor, buffer), spec) in resident
+            .iter()
+            .zip(buffers)
+            .zip(&self.execution.program().buffers)
+        {
             tensor.write(&buffer[..spec.bytes])?;
         }
         self.bind(&resident, scalars)
@@ -507,7 +564,9 @@ impl Kernel {
             let status = i32::from_le_bytes(bytes.try_into().unwrap());
             if status != 0 {
                 self.ready = false;
-                return Err(format!("CUDA work item {index} failed with status {status}; outputs may be partially written"));
+                return Err(format!(
+                    "CUDA work item {index} failed with status {status}; outputs may be partially written"
+                ));
             }
         }
         let mut milliseconds = 0.0f32;
@@ -534,7 +593,11 @@ impl Kernel {
         if self.tensors.len() != self.execution.program().buffers.len() {
             return Err("CUDA tensors have not been bound".into());
         }
-        for ((tensor, buffer), spec) in self.tensors.iter().zip(buffers).zip(&self.execution.program().buffers)
+        for ((tensor, buffer), spec) in self
+            .tensors
+            .iter()
+            .zip(buffers)
+            .zip(&self.execution.program().buffers)
         {
             tensor.read(&mut buffer[..spec.bytes])?;
         }
@@ -576,16 +639,32 @@ impl Sequence {
             .map(|kernel| (kernel.execution.program(), &kernel.native))
     }
     /// The CUDA event interval of every launch, in launch order (the timing probe's view).
-    pub fn execute_launches(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<Vec<f64>, String> {
+    pub fn execute_launches(
+        &mut self,
+        buffers: &[Buffer],
+        scalars: &[f64],
+    ) -> Result<Vec<f64>, String> {
         if buffers.len() != self.public_buffers.len() {
             return Err("CUDA sequence public binding count mismatch".into());
         }
-        let bindings = buffers.iter().chain(&self.internal).cloned().collect::<Vec<_>>();
+        let bindings = buffers
+            .iter()
+            .chain(&self.internal)
+            .cloned()
+            .collect::<Vec<_>>();
         let result = (|| {
             for kernel in &mut self.phases {
                 kernel.bind(&bindings, scalars)?;
             }
-            self.phases.iter_mut().enumerate().map(|(index, kernel)| kernel.launch_timed().map_err(|error| format!("CUDA phase {index}: {error}"))).collect()
+            self.phases
+                .iter_mut()
+                .enumerate()
+                .map(|(index, kernel)| {
+                    kernel
+                        .launch_timed()
+                        .map_err(|error| format!("CUDA phase {index}: {error}"))
+                })
+                .collect()
         })();
         for kernel in &mut self.phases {
             kernel.release_bindings();
@@ -602,7 +681,11 @@ impl Sequence {
         if buffers.len() != self.public_buffers.len() {
             return Err("CUDA sequence public binding count mismatch".into());
         }
-        let bindings = buffers.iter().chain(&self.internal).cloned().collect::<Vec<_>>();
+        let bindings = buffers
+            .iter()
+            .chain(&self.internal)
+            .cloned()
+            .collect::<Vec<_>>();
         let result = (|| {
             for kernel in &mut self.phases {
                 kernel.bind(&bindings, scalars)?;

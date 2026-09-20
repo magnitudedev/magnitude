@@ -88,7 +88,7 @@ impl Analysis<'_>{
                 for(id,u)in yes{self.uniform.entry(id).and_modify(|v|*v &=u).or_insert(u && before.get(&id).copied().unwrap_or(true));}
             }
             StmtKind::Parallel{vars,body,..}|StmtKind::Owned{vars,body,..}=>{for &var in vars{self.bind_index(var,!divergent);}self.loop_body(body,divergent)?;}
-            StmtKind::Range{var,lo,hi,body}=>{let d=divergent||!self.symbol(lo)||!self.symbol(hi);self.bind_index(*var,!d);self.loop_body(body,d)?;}
+            StmtKind::Range{var,lo,hi,body,..}=>{let d=divergent||!self.symbol(lo)||!self.symbol(hi);self.bind_index(*var,!d);self.loop_body(body,d)?;}
             StmtKind::Lanes{var,extent,width,body}=>{
                 self.bind_index(*var,false);
                 let run=Sym::constant(32*width);

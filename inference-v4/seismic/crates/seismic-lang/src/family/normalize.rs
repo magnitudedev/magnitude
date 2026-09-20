@@ -6,7 +6,7 @@ use super::{
 };
 use crate::sir::{Body, Program, SliceParent, StmtKind};
 use crate::sym::Sym;
-use crate::syntax::ast::RegionMode;
+use crate::sir::RegionMode;
 use crate::types::{Elem, Extent, RegionId, SliceId};
 use std::collections::{BTreeMap, BTreeSet};
 

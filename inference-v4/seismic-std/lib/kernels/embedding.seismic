@@ -1,4 +1,4 @@
 # One packed embedding row, decoded to the activation dtype.
-fn embedding[V, K](table: tensor[V, K] q4g64, token: index[V], out out: tensor[1, K] bf16):
-    parallel [cols] in 0..K:
-        publish f32(table[token, cols]) to out[0, cols]
+fn embedding[V, K](table: &tensor[V, K] q4g64, token: index[V], result: &mut tensor[1, K] bf16):
+    parallel for cols in 0..K:
+        result[0, cols] = f32(table[token, cols])

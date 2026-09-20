@@ -207,6 +207,15 @@ impl<'a, 'b> Emitter<'a, 'b> {
             multiplicity: Arc::new(Multiplicity::Constant(1)),
         };
         for (parameter_index, (name, ty)) in lowered.params.iter().enumerate() {
+            let role = lowered
+                .result_bindings
+                .iter()
+                .find(|binding| binding.parameter == parameter_index)
+                .map_or(seismic_realization::BufferRole::Parameter, |binding| {
+                    seismic_realization::BufferRole::Result {
+                        path: binding.path.clone(),
+                    }
+                });
             // Phase storage parameters are appended after existing locals. ABI
             // ordinals therefore need not equal IR variable identities.
             // A bounded index parameter is an `Index` variable whose atom is the parameter
@@ -229,7 +238,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                         Elem::Dtype(dtype) => {
                             scalar_type(*dtype)?;
                             let pointer =
-                                s.parameter(buffers, name, "", count, dtype.bytes() as i64)?;
+                                s.parameter(buffers, name, "", count, dtype.bytes() as i64, role.clone())?;
                             Storage::Dense {
                                 pointer,
                                 dtype: *dtype,
@@ -249,7 +258,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                             let mut planes = Vec::new();
                             for plane in r.planes() {
                                 let n = plane.storage_elements(count as u64).and_then(|n| i64::try_from(n).ok()).ok_or("packed plane extent overflow")?;
-                                planes.push(s.parameter(buffers, name, plane.name, n, i64::from(plane.dtype().bytes()))?);
+                                planes.push(s.parameter(buffers, name, plane.name, n, i64::from(plane.dtype().bytes()), role.clone())?);
                             }
                             Storage::Packed { planes, name: name_.clone() }
                         }
@@ -303,6 +312,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         plane: &str,
         count: i64,
         width: i64,
+        role: seismic_realization::BufferRole,
     ) -> Result<Value, String> {
         let bytes = count
             .checked_mul(width)
@@ -324,6 +334,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
         self.buffers.push(BufferSpec {
             parameter: name.into(),
             plane: plane.into(),
+            role,
             bytes,
             alignment: usize::try_from(width).map_err(|_| "invalid storage alignment")?,
         });
@@ -1169,7 +1180,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                     s.body(body)
                 })
             }
-            StmtKind::Range { var, lo, hi, body } => {
+            StmtKind::Range { var, lo, hi, body, .. } => {
                 let range = lo.eval_interval(&|name| self.static_range(name))
                     .zip(hi.eval_interval(&|name| self.static_range(name)))
                     .map(|((least, _), (_, bound))| (least, bound - 1));

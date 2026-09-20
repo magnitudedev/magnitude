@@ -5,8 +5,8 @@
 use super::super::{Requirement, SiteId};
 use super::walk;
 use crate::sir::{Body, ExprKind, Predicate, StmtKind, VarId};
-use crate::types::{Elem, Ty};
 use crate::sym::{Atom, Sym};
+use crate::types::{Elem, Ty};
 use std::collections::BTreeMap;
 
 /// How a definition's shape and element parameters are bound at one occurrence.
@@ -40,7 +40,11 @@ const UNDECIDABLE: &str = "predicate not decidable over a structural extent";
 const RUNTIME: &str = "predicate not decidable over a runtime extent";
 
 /// Requirements of `predicates` under `binding`, or the reason the definition is inapplicable.
-pub fn requirements(predicates: &[Predicate], binding: &Binding, site: &dyn Fn(SiteId) -> SiteExtent) -> Result<Vec<Requirement>, String> {
+pub fn requirements(
+    predicates: &[Predicate],
+    binding: &Binding,
+    site: &dyn Fn(SiteId) -> SiteExtent,
+) -> Result<Vec<Requirement>, String> {
     let mut out = Vec::new();
     for predicate in predicates {
         let e = match predicate {
@@ -51,7 +55,10 @@ pub fn requirements(predicates: &[Predicate], binding: &Binding, site: &dyn Fn(S
                     if known.bounded {
                         return Err(format!("`full({param})` over a runtime extent"));
                     }
-                    out.push(Requirement::Divides { site: *id, extent: known.extent });
+                    out.push(Requirement::Divides {
+                        site: *id,
+                        extent: known.extent,
+                    });
                 }
                 continue;
             }
@@ -61,12 +68,21 @@ pub fn requirements(predicates: &[Predicate], binding: &Binding, site: &dyn Fn(S
         if binding.dynamic.iter().any(|name| params.contains(name)) {
             return Err(format!("{RUNTIME}: `{}`", describe(predicate)));
         }
-        let bound: Vec<&(String, SiteId)> = binding.structural.iter().filter(|(name, _)| params.contains(name)).collect();
+        let bound: Vec<&(String, SiteId)> = binding
+            .structural
+            .iter()
+            .filter(|(name, _)| params.contains(name))
+            .collect();
         match bound.as_slice() {
             [] => {
                 let value = e
                     .eval(&|name| binding.shapes.get(name).copied())
-                    .ok_or_else(|| format!("predicate `{}` is not evaluable over the bound shapes", describe(predicate)))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "predicate `{}` is not evaluable over the bound shapes",
+                            describe(predicate)
+                        )
+                    })?;
                 let holds = match predicate {
                     Predicate::NonNegative(_) => value >= 0,
                     Predicate::Zero(_) => value == 0,
@@ -84,16 +100,33 @@ pub fn requirements(predicates: &[Predicate], binding: &Binding, site: &dyn Fn(S
 }
 
 /// `predicate` over the single structurally bound parameter `param`.
-fn structural(predicate: &Predicate, e: &Sym, param: &str, site: SiteId, binding: &Binding) -> Result<Requirement, String> {
+fn structural(
+    predicate: &Predicate,
+    e: &Sym,
+    param: &str,
+    site: SiteId,
+    binding: &Binding,
+) -> Result<Requirement, String> {
     let undecidable = || format!("{UNDECIDABLE}: `{}`", describe(predicate));
-    let residual = binding.shapes.iter().fold(e.clone(), |r, (name, value)| r.subst(&Atom::Param(name.clone()), &Sym::constant(*value)));
+    let residual = binding.shapes.iter().fold(e.clone(), |r, (name, value)| {
+        r.subst(&Atom::Param(name.clone()), &Sym::constant(*value))
+    });
     if let Some((c, rest)) = residual.linear_in(&Atom::Param(param.to_string())) {
         let k = rest.as_constant().ok_or_else(undecidable)?;
         // c * P + k
         return match predicate {
-            Predicate::NonNegative(_) if c > 0 => Ok(Requirement::AtLeast { site, value: -k.div_euclid(c) }),
-            Predicate::NonNegative(_) => Ok(Requirement::AtMost { site, value: k.div_euclid(-c) }),
-            Predicate::Zero(_) if k % c == 0 => Ok(Requirement::Equal { site, value: -k / c }),
+            Predicate::NonNegative(_) if c > 0 => Ok(Requirement::AtLeast {
+                site,
+                value: -k.div_euclid(c),
+            }),
+            Predicate::NonNegative(_) => Ok(Requirement::AtMost {
+                site,
+                value: k.div_euclid(-c),
+            }),
+            Predicate::Zero(_) if k % c == 0 => Ok(Requirement::Equal {
+                site,
+                value: -k / c,
+            }),
             Predicate::Zero(_) => Err(format!("predicate `{}` cannot hold", describe(predicate))),
             _ => Err(undecidable()),
         };
@@ -101,7 +134,9 @@ fn structural(predicate: &Predicate, e: &Sym, param: &str, site: SiteId, binding
     // k * (P % unit) == 0
     if let (Predicate::Zero(_), [Atom::Rem(num, den)]) = (predicate, residual.atoms().as_slice()) {
         let unit = den.eval(&|name| binding.shapes.get(name).copied());
-        let multiple = residual.linear_in(&Atom::Rem(num.clone(), den.clone())).is_some_and(|(_, rest)| rest.is_zero());
+        let multiple = residual
+            .linear_in(&Atom::Rem(num.clone(), den.clone()))
+            .is_some_and(|(_, rest)| rest.is_zero());
         if let (true, true, Some(unit)) = (multiple, **num == Sym::param(param), unit) {
             return Ok(Requirement::Multiple { site, unit });
         }
@@ -129,7 +164,9 @@ impl<'a> Bounds<'a> {
         });
         let mut symbols = BTreeMap::new();
         walk::block(&body.block, true, &mut |e| {
-            let (ExprKind::Var(var), Some(sym)) = (&e.kind, &e.sym) else { return };
+            let (ExprKind::Var(var), Some(sym)) = (&e.kind, &e.sym) else {
+                return;
+            };
             let params = sym.params();
             let [name] = params.as_slice() else { return };
             if *sym != Sym::param(name) || shapes.contains_key(name) {
@@ -162,9 +199,15 @@ impl<'a> Bounds<'a> {
     pub fn extent(&self, lo: &Sym, hi: &Sym) -> Option<SiteExtent> {
         let length = hi.sub(lo);
         if let Some(extent) = length.eval(&|name| self.shapes.get(name).copied()) {
-            return Some(SiteExtent { extent: extent.max(1), bounded: false });
+            return Some(SiteExtent {
+                extent: extent.max(1),
+                bounded: false,
+            });
         }
         let (_, upper) = length.eval_interval(&|name| self.range(name, self.symbols.len() + 1))?;
-        Some(SiteExtent { extent: upper.max(1), bounded: true })
+        Some(SiteExtent {
+            extent: upper.max(1),
+            bounded: true,
+        })
     }
 }

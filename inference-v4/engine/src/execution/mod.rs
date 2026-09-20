@@ -6,7 +6,7 @@ use seismic_lang::{
     types::{DType, Elem, Extent, Shaped, Ty},
 };
 use seismic_runtime::{
-    plan::{Bindings, CompiledPlan, PlanCompiler, StepObservation, Submission},
+    plan::{Bindings, CompiledPlan, InvocationResults, PlanCompiler, StepObservation, Submission},
     Buffer, Device, Error,
 };
 use std::collections::{HashMap, HashSet};
@@ -50,7 +50,7 @@ fn extents(tensor: &Shaped, shapes: &HashMap<String, i64>) -> Result<Vec<usize>,
 }
 fn tensor<'a>(params: &'a [Param], name: &str) -> Option<&'a Shaped> {
     params.iter().find_map(|p| match &p.ty {
-        Ty::Tensor(t) if p.name == name => Some(t),
+        Ty::Tensor(t) | Ty::View(t) if p.name == name => Some(t),
         _ => None,
     })
 }
@@ -94,7 +94,7 @@ impl Composition {
             if !weight.belongs_to(compiler.device()) {
                 return Err(format!("weight {name} belongs to another resource domain").into());
             }
-            let Ty::Tensor(t) = &params
+            let (Ty::Tensor(t) | Ty::View(t)) = &params
                 .iter()
                 .find(|p| &p.name == name)
                 .ok_or_else(|| format!("unknown weight {name}"))?
@@ -140,7 +140,7 @@ impl Composition {
             }
         }
         for Param { name, ty, .. } in params {
-            if matches!(ty, Ty::Tensor(_))
+            if matches!(ty, Ty::Tensor(_) | Ty::View(_))
                 && !weights.contains_key(name)
                 && !external.contains(name)
                 && !intermediates.contains(name)
@@ -166,7 +166,7 @@ impl Composition {
             if !external.contains(name) {
                 continue;
             }
-            let Ty::Tensor(tensor) = ty else {
+            let (Ty::Tensor(tensor) | Ty::View(tensor)) = ty else {
                 continue;
             };
             let element = match &tensor.elem {
@@ -187,7 +187,7 @@ impl Composition {
             if weights.contains_key(name) || external.contains(name) {
                 continue;
             }
-            if let Ty::Tensor(t) = ty {
+            if let Ty::Tensor(t) | Ty::View(t) = ty {
                 let element = match &t.elem {
                     Elem::Param(p) => elements.get(p).ok_or("unbound scratch dtype")?,
                     e => e,
@@ -276,8 +276,10 @@ impl Composition {
         &mut self,
         tensors: &HashMap<String, Buffer>,
         scalars: &HashMap<String, f64>,
-    ) -> Result<(), String> {
-        self.invoke(tensors, scalars, false).map(|_| ())
+    ) -> Result<InvocationResults, String> {
+        let mut submission = self.prepare(tensors, scalars)?;
+        submission.execute_sequential()?;
+        Ok(submission.results_for(0)?.clone())
     }
     pub fn execute_observed(
         &mut self,

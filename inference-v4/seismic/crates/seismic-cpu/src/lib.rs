@@ -76,14 +76,16 @@ impl Kernel {
             .collect::<Result<Vec<_>, _>>()?;
         let mut pointers = buffers
             .iter()
-            .zip(root_indices)
+            .zip(root_indices.iter().copied())
             .map(|(buffer, index)| {
                 // Views were checked at construction; the retained mutable borrow prevents
                 // host access or reallocation through physical completion.
                 unsafe { borrows[index].as_mut_ptr().cast::<u8>().add(buffer.offset) }
             })
             .collect::<Vec<_>>();
-        self.conditions.validate_aliases(&self.buffers, |i| (0, pointers[i] as u64))?;
+        self.conditions.validate_aliases(&self.buffers, |i| {
+            (root_indices[i] as u64, buffers[i].offset as u64)
+        })?;
         pointers.extend(self.retained.iter_mut().map(|storage| storage.as_mut_ptr().cast::<u8>()));
         for (ordinal, phase) in self.phases.iter().enumerate() {
             // Pointer capacities and scalar encodings match the checked compiled ABI; phases

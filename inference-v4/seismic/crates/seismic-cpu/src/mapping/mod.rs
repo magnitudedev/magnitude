@@ -9,7 +9,7 @@ mod accounting;
 mod estimate;
 mod realize;
 
-pub use estimate::{EstimateModel, Totals, IDENTITY};
+pub use estimate::{EstimateModel, IDENTITY, Totals};
 pub use realize::Execution;
 
 use accounting::CpuAccounting;
@@ -91,25 +91,16 @@ impl Cpu {
             let mut launches: BTreeSet<Option<(CandidateRef, usize)>> = account.ledger.tiles.iter().map(|t| t.launch).collect();
             launches.retain(|launch| launch.is_some() || account.context.scope.invocation);
             for launch in launches {
-                let bits: Vec<Quantity> = account.context.guards.iter().filter_map(|g| analysis.accounts.get(g))
-                    .flat_map(|a| a.ledger.tiles.iter().filter(|t| t.launch == launch).map(|t| t.bits.clone())).collect();
+                let bits: Vec<Quantity> = account.context.guards.iter().filter_map(|g| analysis.accounts.get(g)).flat_map(|a| a.ledger.tiles.iter().filter(|t| t.launch == launch).map(|t| t.bits.clone())).collect();
                 // The one hard limit: scratch bytes one worker holds for one phase. A violation
                 // lowers the highest site of the offending tiles.
                 let (bits, limit) = (Quantity::Sum(bits), self.limits.max_scratch_bytes);
                 let (held, needed) = (bits.clone(), bits.clone());
-                out.push(Legality {
-                    guard: account.context.guards.clone(),
-                    reads: vec![bits.clone()],
-                    holds: Arc::new(move |site| held.eval(site).is_ok_and(|bits| bits.div_ceil(8) <= limit)),
-                    needed: Arc::new(move |site| needed.eval(site).map(|bits| format!("{} bytes", bits.div_ceil(8)))),
-                    repairs: vec![(vec![bits], false)],
-                    reason: format!("`{name}`: scratch tiles of one phase fit {} bytes per worker", self.limits.max_scratch_bytes),
-                });
+                out.push(Legality { guard: account.context.guards.clone(), reads: vec![bits.clone()], holds: Arc::new(move |site| held.eval(site).is_ok_and(|bits| bits.div_ceil(8) <= limit)), needed: Arc::new(move |site| needed.eval(site).map(|bits| format!("{} bytes", bits.div_ceil(8)))), repairs: vec![(vec![bits], false)], reason: format!("`{name}`: scratch tiles of one phase fit {} bytes per worker", self.limits.max_scratch_bytes) });
             }
         }
         out
     }
-
 }
 
 impl Costs<CpuAccounting> for EstimateModel {
@@ -140,17 +131,20 @@ impl Backend for Cpu {
         TARGET
     }
 
+    fn capability_fingerprint(&self) -> String {
+        "seismic-cpu-capabilities-v1:none".into()
+    }
+
+    fn supports_intrinsic(&self, intrinsic: &seismic_lang::sir::IntrinsicUse) -> Result<(), String> {
+        Err(format!("the CPU backend does not implement backend intrinsic `{}`", intrinsic.id.path()))
+    }
+
     fn estimate_model(&self) -> String {
         IDENTITY.into()
     }
 
     fn numerical_environment(&self) -> String {
-        format!(
-            "seismic-cpu-v1:{}:workers={}:scratch={}",
-            std::env::consts::ARCH,
-            self.limits.workers,
-            self.limits.max_scratch_bytes
-        )
+        format!("seismic-cpu-v1:{}:workers={}:scratch={}", std::env::consts::ARCH, self.limits.workers, self.limits.max_scratch_bytes)
     }
 
     fn bind_structure(&self, program: &Program, family: &Family) -> Result<BTreeMap<SiteId, Vec<i64>>, SelectionError> {
@@ -160,6 +154,10 @@ impl Backend for Cpu {
 
     fn constraints(&self, program: &Program, family: &Family) -> Result<Vec<Constraint>, SelectionError> {
         mapping::constraints(family, self.legalities(&self.analysis(program, family)?))
+    }
+
+    fn resources(&self, _: &Program, _: &Family) -> Result<Vec<seismic_compiler::selection::ResourceConstraint>, SelectionError> {
+        Ok(Vec::new())
     }
 
     fn intervals(&self, program: &Program, family: &Family) -> Result<Vec<Interval>, SelectionError> {

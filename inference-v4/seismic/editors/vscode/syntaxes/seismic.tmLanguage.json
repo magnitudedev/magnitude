@@ -13,15 +13,31 @@
     },
     {
       "name": "keyword.control.seismic",
-      "match": "\\b(?:fn|lower|where|for|in|if|else|let|mut|parallel|ordered|pipeline|stage|yield|return|merge|publish)\\b"
+      "match": "\\b(?:fn|lower|requires|where|for|in|if|else|let|mut|parallel|return)\\b"
     },
-    { "name": "storage.modifier.seismic", "match": "\\b(?:out|inout)\\b" },
-    { "name": "keyword.other.seismic", "match": "\\b(?:alias|to|identity)\\b" },
+    {
+      "match": "(&)(?=\\s*(?:mut\\s+)?tensor\\b)",
+      "captures": {
+        "1": { "name": "storage.modifier.reference.seismic" }
+      }
+    },
     { "name": "keyword.operator.word.seismic", "match": "\\b(?:and|or|not)\\b" },
     { "name": "constant.language.seismic", "match": "\\b(?:true|false|inf)\\b" },
-    { "name": "support.type.backend.seismic", "match": "\\b(?:cpu|cuda|metal)(?=\\s*\\.)" },
+    {
+      "match": "\\b(cuda|metal)(\\.)([A-Za-z_][A-Za-z0-9_]*)(?:(\\.)([A-Za-z_][A-Za-z0-9_]*))?\\b",
+      "captures": {
+        "1": { "name": "support.type.backend.seismic" },
+        "2": { "name": "punctuation.accessor.seismic" },
+        "3": { "name": "support.class.capability.seismic" },
+        "4": { "name": "punctuation.accessor.seismic" },
+        "5": { "name": "support.function.intrinsic.seismic" }
+      }
+    },
     { "name": "support.constant.backend.seismic", "match": "(?<=\\bfor\\s)(?:cpu|cuda|metal)\\b" },
-    { "name": "storage.type.seismic", "match": "\\b(?:tile|tensor|view|index|void|f32|bf16|f16|i32|u32|bool)\\b" },
+    {
+      "name": "storage.type.seismic",
+      "match": "\\b(?:tensor|index|range|void|f32|tf32|bf16|f16|fp8_e4m3|fp8_e5m2|fp6_e2m3|fp6_e3m2|fp4_e2m1|i32|u32|bool)\\b"
+    },
     { "name": "entity.name.type.parameter.seismic", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" },
     { "name": "constant.numeric.seismic", "match": "\\b(?:0[xX][0-9a-fA-F_]+|[0-9][0-9_]*(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\b" },
     { "name": "entity.name.function.call.seismic", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()" },

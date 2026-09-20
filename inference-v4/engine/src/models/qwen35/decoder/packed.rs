@@ -5,13 +5,12 @@ use crate::inputs::TokenId;
 
 pub(super) struct PackedRows {
     embedding: Composition,
-    feedforwards: Vec<Composition>,
     hidden: Buffer,
     tokens: Buffer,
 }
 impl PackedRows {
     pub(super) fn compositions(&self) -> impl Iterator<Item = &Composition> {
-        std::iter::once(&self.embedding).chain(self.feedforwards.iter())
+        std::iter::once(&self.embedding)
     }
 }
 struct Member {
@@ -33,15 +32,6 @@ impl Decoder {
         let dimensions = [("M", count)];
         let packed = PackedRows {
             embedding: base.embedding.with_dimensions(&mut compiler, &dimensions)?,
-            feedforwards: base
-                .blocks
-                .iter()
-                .map(|block| {
-                    block
-                        .feedforward
-                        .with_dimensions(&mut compiler, &dimensions)
-                })
-                .collect::<Result<_, _>>()?,
             hidden: self.device.buffer(
                 count
                     .checked_mul(base.hidden.len())
@@ -94,6 +84,7 @@ impl Decoder {
                 self.settings.clone(),
             )?);
         }
+        let block_count = self.rows.get(&(1, 1)).expect("base geometry").blocks.len();
         let packed = self
             .packed
             .get_mut(&total)
@@ -138,25 +129,33 @@ impl Decoder {
             .map(|(state, row)| state.begin(row.proposal.tokens().len()))
             .collect::<Result<Vec<_>, _>>()?;
         let mut selected = Vec::with_capacity(work.len());
+        let mut state_results = vec![Vec::new(); work.len()];
         StateAdvance::execute_batch(&mut advances, |transitions| {
-            packed.embedding.execute(
-                &HashMap::from([
-                    ("tokens".into(), packed.tokens.clone()),
-                    ("out".into(), packed.hidden.clone()),
-                ]),
+            let embedded = packed.embedding.execute(
+                &HashMap::from([("tokens".into(), packed.tokens.clone())]),
                 &HashMap::new(),
             )?;
-            for (index, feedforward) in packed.feedforwards.iter_mut().enumerate() {
-                for (member, transition) in members.iter().zip(transitions) {
+            packed.hidden = result_buffer(&embedded, &[1])?;
+            let mut packed_offset = 0;
+            for member in &mut members {
+                let bytes = member
+                    .geometry
+                    .0
+                    .checked_mul(width)
+                    .ok_or("member hidden extent overflow")?;
+                member.hidden = packed.hidden.view(packed_offset..packed_offset + bytes)?;
+                packed_offset += bytes;
+            }
+            for index in 0..block_count {
+                for (member_index, (member, transition)) in
+                    members.iter_mut().zip(transitions).enumerate()
+                {
                     let rows = self
                         .rows
                         .get_mut(&member.geometry)
                         .expect("member geometry prepared");
                     let block = &mut rows.blocks[index];
-                    let mut tensors = HashMap::from([
-                        ("hidden".into(), member.hidden.clone()),
-                        ("out".into(), member.hidden.clone()),
-                    ]);
+                    let mut tensors = HashMap::from([("hidden".into(), member.hidden.clone())]);
                     let i = block.state_index;
                     if block.attention {
                         rows.coordinates.write(
@@ -193,21 +192,25 @@ impl Decoder {
                         tensors.extend([
                             ("window".into(), transition.previous[i].clone()),
                             ("delta".into(), transition.previous[i + 1].clone()),
-                            ("next_window".into(), transition.following[i].clone()),
-                            ("next_delta".into(), transition.following[i + 1].clone()),
                         ]);
                     }
                     // Complete this member before reusing geometry-local scratch
                     // or control buffers for another request of the same shape.
-                    block.mixer.execute(&tensors, &HashMap::new())?;
+                    let mixed = block.mixer.execute(&tensors, &HashMap::new())?;
+                    member.hidden = if block.attention {
+                        result_buffer(&mixed, &[])?
+                    } else {
+                        state_results[member_index].push((i, result_buffer(&mixed, &[0])?));
+                        state_results[member_index].push((i + 1, result_buffer(&mixed, &[1])?));
+                        result_buffer(&mixed, &[2])?
+                    };
+                    let fed = block.feedforward.execute(
+                        &HashMap::from([("residual".into(), member.hidden.clone())]),
+                        &HashMap::new(),
+                    )?;
+                    member.hidden =
+                        result_buffer(&fed, &[6]).or_else(|_| result_buffer(&fed, &[14]))?;
                 }
-                feedforward.execute(
-                    &HashMap::from([
-                        ("residual".into(), packed.hidden.clone()),
-                        ("out".into(), packed.hidden.clone()),
-                    ]),
-                    &HashMap::new(),
-                )?;
             }
             for (row, member) in work.iter().zip(&members) {
                 if !row.proposal.needs_sample() {
@@ -218,13 +221,11 @@ impl Decoder {
                     .rows
                     .get_mut(&member.geometry)
                     .expect("member geometry prepared");
-                rows.readout.execute(
-                    &HashMap::from([
-                        ("hidden".into(), member.hidden.clone()),
-                        ("logits".into(), rows.logits.clone()),
-                    ]),
+                let logits = rows.readout.execute(
+                    &HashMap::from([("hidden".into(), member.hidden.clone())]),
                     &HashMap::new(),
                 )?;
+                rows.logits = result_buffer(&logits, &[1])?;
                 let selection = self.sampler.as_mut().expect("sampler prepared").sample(
                     &rows.logits,
                     row.mask,
@@ -240,6 +241,11 @@ impl Decoder {
             }
             Ok(())
         })?;
+        for (advance, replacements) in advances.iter_mut().zip(state_results) {
+            for (index, buffer) in replacements {
+                advance.replace_following(index, buffer)?;
+            }
+        }
         for advance in advances {
             advance.commit()?;
         }

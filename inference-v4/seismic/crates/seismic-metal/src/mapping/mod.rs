@@ -13,13 +13,13 @@ pub use estimate::{EstimateModel, Group, Totals, IDENTITY};
 use crate::execution::{Execution, SUBGROUP};
 use accounting::MetalAccounting;
 use seismic_compiler::selection::mapping::{self, CostScope, Costs, Legality, ScopeCost};
-use seismic_compiler::selection::quantity::Quantity;
+use seismic_compiler::selection::quantity::{self, Quantity};
 use seismic_compiler::selection::structure::Account;
-use seismic_compiler::selection::{Backend, Constraint, Factor, Interval, SelectionError};
+use seismic_compiler::selection::{Backend, Constraint, Factor, Interval, ResourceConstraint, ResourceTerm, SelectionError};
 use seismic_lang::exec::lowered_ir::LoweredIr;
-use seismic_lang::family::{CandidateRef, Family, OccurrenceId, SiteId, Witness};
-use seismic_lang::sir::{Program, VarKind};
-use seismic_lang::syntax::ast::RegionMode;
+use seismic_lang::family::{CandidateRef, Family, SiteId, Witness};
+use seismic_lang::sir::{IntrinsicUse, Program, VarKind};
+use seismic_lang::sir::RegionMode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -30,26 +30,28 @@ pub const TARGET: &str = "metal";
 pub const MAX_GROUPS: u64 = 65_535;
 pub use seismic_compiler::selection::mapping::{DOMAIN_VALUES, MAX_PARTS};
 
-/// Queried device limits.
+/// Resource bounds used by mapping; each field retains queried or assumed provenance in the
+/// originating target profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub max_threads_per_threadgroup: u64,
     pub max_threadgroup_bytes: u64,
-    /// Declared thread-address-space array bytes of one kernel. Metal does not document or
-    /// expose the per-thread stack; pipeline creation fails with "Compute function exceeds
-    /// available stack space" beyond it. See `PRIVATE_BYTES`.
+    /// Compiler budget for declared thread-address-space array bytes of one kernel. Metal does
+    /// not document or expose the per-thread stack, so this is never a queried device limit.
     pub max_private_bytes: u64,
 }
 
 /// Measured on Apple M4 Max (macOS 15): a kernel whose only private storage is one array
 /// links up to 258,032 declared bytes and fails above, i.e. a 256 KiB thread stack less
-/// the kernel's own frame. Half of it is left to compiler temporaries and register spills.
-pub const PRIVATE_BYTES: u64 = 128 * 1024;
+/// the kernel's own frame. Half of it is left to compiler temporaries and register spills. This
+/// conservative assumption is attached to the device profile with explicit provenance; it must
+/// not be reported as hardware capability.
+pub const CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES: u64 = 128 * 1024;
 
 impl Limits {
     #[cfg(target_os = "macos")]
     pub fn from_device(device: &crate::runtime::DeviceInfo) -> Self {
-        Limits { max_threads_per_threadgroup: device.max_threads_per_threadgroup, max_threadgroup_bytes: device.max_threadgroup_bytes, max_private_bytes: PRIVATE_BYTES }
+        Limits { max_threads_per_threadgroup: device.max_threads_per_threadgroup, max_threadgroup_bytes: device.max_threadgroup_bytes, max_private_bytes: device.profile.private_storage_budget_bytes.value }
     }
 
     /// Pieces share a threadgroup only when one grid cannot hold them all.
@@ -74,6 +76,7 @@ impl Limits {
 pub struct Metal {
     limits: Limits,
     estimate: EstimateModel,
+    target_profile: crate::target::TargetProfile,
     numerical_environment: String,
 }
 
@@ -92,22 +95,33 @@ impl Metal {
             limits.max_threadgroup_bytes,
             limits.max_private_bytes
         );
-        Ok(Metal { limits, estimate, numerical_environment })
+        let target_profile = crate::target::TargetProfile::synthetic(
+            limits.max_threads_per_threadgroup,
+            limits.max_threadgroup_bytes,
+            u64::MAX,
+            limits.max_private_bytes,
+        );
+        Ok(Metal { limits, estimate, target_profile, numerical_environment })
     }
 
     #[cfg(target_os = "macos")]
     pub fn from_device(device: &crate::runtime::DeviceInfo) -> Result<Self, SelectionError> {
         let mut backend = Metal::new(Limits::from_device(device), EstimateModel::from_device(device))?;
-        backend.numerical_environment = format!(
-            "seismic-metal-v1:name={}:unified={}:threads={}:threadgroup={}:private={}",
-            device.name,
-            device.unified_memory,
-            backend.limits.max_threads_per_threadgroup,
-            backend.limits.max_threadgroup_bytes,
-            backend.limits.max_private_bytes
+        backend.numerical_environment = format!("seismic-metal-v2:{}", device.target_fingerprint());
+        backend.target_profile = crate::target::TargetProfile::from_evidence(
+            &device.capability_fingerprint(),
+            &device.profile.scalar_dtypes.value,
+            &device.profile.matrix_dtypes.value,
+            &device.profile.matrix_combinations.value,
+            device.max_threads_per_threadgroup,
+            device.max_threadgroup_bytes,
+            device.max_buffer_bytes,
+            device.profile.private_storage_budget_bytes.value,
         );
         Ok(backend)
     }
+
+    pub fn target_profile(&self) -> &crate::target::TargetProfile { &self.target_profile }
 }
 
 /// A hard device limit over derived quantities.
@@ -225,62 +239,81 @@ impl Metal {
                 }
             }
         }
-        // One kernel declares the threadgroup tiles of every candidate inlined into its launch
-        // (allocation never reuses a slot), so candidates of different occurrences that share a
-        // launch are limited jointly: one constraint per co-selectable combination of two or
-        // more such candidates, guarded by all of their chains.
-        let mut launches: BTreeMap<(CandidateRef, usize), BTreeMap<OccurrenceId, Vec<(CandidateRef, Quantity, Quantity)>>> = BTreeMap::new();
+        Ok(out)
+    }
+
+    /// Polynomial resource model: one guarded additive term per candidate contribution, plus
+    /// one upper bound per physical launch. This represents sibling co-selection directly and
+    /// never enumerates candidate subsets or Cartesian products.
+    fn launch_resources(&self, analysis: &Analysis<'_>) -> Vec<ResourceConstraint> {
+        type LaunchKey = (Option<(CandidateRef, usize)>, CandidateRef);
+        type SharedContribution = (Vec<CandidateRef>, Quantity, Quantity);
+        let mut shared: BTreeMap<LaunchKey, Vec<SharedContribution>> = BTreeMap::new();
+        let mut private: BTreeMap<LaunchKey, Vec<(Vec<CandidateRef>, Quantity)>> = BTreeMap::new();
         for (&candidate, account) in &analysis.accounts {
-            let mut own: BTreeMap<(CandidateRef, usize), (Vec<Quantity>, Quantity)> = BTreeMap::new();
-            for root in account.ledger.placed() {
-                if let Some((tile, bits)) = account.ledger.tiles.get(&root).zip(account.ledger.placed_bits(root)) {
-                    if let Some(launch) = tile.launch {
-                        own.entry(launch).or_insert_with(|| (Vec::new(), tile.pieces.clone())).0.push(bits);
-                    }
+            let mut launches = account.ledger.tiles.values().map(|tile| tile.launch).collect::<Vec<_>>();
+            launches.sort_unstable();
+            launches.dedup();
+            launches.retain(|launch| launch.is_some() || account.context.scope.invocation);
+            for launch in launches {
+                let owner = launch.map_or(candidate, |(owner, _)| owner);
+                let shared_bits = account.ledger.shared_bits_for(launch);
+                if !shared_bits.is_empty() {
+                    let pieces = account.ledger.tiles.values().find(|tile| tile.launch == launch)
+                        .map(|tile| tile.pieces.clone()).unwrap_or_else(Quantity::one);
+                    shared.entry((launch, owner)).or_default().push((
+                        account.context.guards.clone(), Quantity::Sum(shared_bits), pieces,
+                    ));
                 }
-            }
-            for (launch, (bits, pieces)) in own {
-                launches.entry(launch).or_default().entry(candidate.occurrence).or_default().push((candidate, Quantity::Sum(bits), pieces));
+                let private_bits = account.ledger.private_bits(launch);
+                if !private_bits.is_empty() {
+                    private.entry((launch, owner)).or_default().push((
+                        account.context.guards.clone(), Quantity::Sum(private_bits),
+                    ));
+                }
             }
         }
-        for occurrences in launches.values().filter(|o| o.len() >= 2) {
-            let groups: Vec<&Vec<(CandidateRef, Quantity, Quantity)>> = occurrences.values().collect();
-            let mut chosen: Vec<&(CandidateRef, Quantity, Quantity)> = Vec::new();
-            fn combine<'c>(
-                groups: &[&'c Vec<(CandidateRef, Quantity, Quantity)>],
-                chosen: &mut Vec<&'c (CandidateRef, Quantity, Quantity)>,
-                emit: &mut dyn FnMut(&[&'c (CandidateRef, Quantity, Quantity)]),
-            ) {
-                let Some((first, rest)) = groups.split_first() else {
-                    if chosen.len() >= 2 {
-                        emit(chosen);
-                    }
-                    return;
-                };
-                combine(rest, chosen, emit);
-                for entry in first.iter() {
-                    chosen.push(entry);
-                    combine(rest, chosen, emit);
-                    chosen.pop();
+
+        let mut resources = Vec::with_capacity(shared.len() + private.len());
+        for ((launch, _), contributions) in shared {
+            let terms = contributions.into_iter().map(|(guard, bits, pieces)| {
+                let scope = quantity::scope([&bits, &pieces]);
+                let table = scope.clone();
+                let limits = self.limits.clone();
+                ResourceTerm {
+                    guard,
+                    scope,
+                    amount: Box::new(move |values| {
+                        let site = quantity::lookup(&table, values);
+                        bits.eval(&site)?.div_ceil(8)
+                            .checked_mul(limits.items_per_group(pieces.eval(&site)?))
+                            .ok_or_else(|| "Metal threadgroup bytes overflow u64".into())
+                    }),
                 }
-            }
-            combine(&groups, &mut chosen, &mut |combination| {
-                let mut guard: Vec<CandidateRef> = Vec::new();
-                for (candidate, _, _) in combination {
-                    for g in &analysis.accounts[candidate].context.guards {
-                        if !guard.contains(g) {
-                            guard.push(*g);
-                        }
-                    }
-                }
-                // Two candidates of one occurrence are never selected together.
-                let consistent = guard.iter().all(|a| guard.iter().all(|b| a.occurrence != b.occurrence || a == b));
-                if consistent {
-                    out.push(Limit::Threadgroup { bits: Quantity::Sum(combination.iter().map(|(_, bits, _)| bits.clone()).collect()), pieces: combination[0].2.clone() }.legality(&self.limits, guard, format!("threadgroup-placed tiles of {} candidates sharing one launch fit {} bytes", combination.len(), self.limits.max_threadgroup_bytes)));
-                }
+            }).collect();
+            resources.push(ResourceConstraint {
+                terms,
+                capacity: self.limits.max_threadgroup_bytes,
+                reason: format!("Metal launch {launch:?} co-selected threadgroup arrays fit {} bytes", self.limits.max_threadgroup_bytes),
             });
         }
-        Ok(out)
+        for ((launch, _), contributions) in private {
+            let terms = contributions.into_iter().map(|(guard, bits)| {
+                let scope = quantity::scope([&bits]);
+                let table = scope.clone();
+                ResourceTerm {
+                    guard,
+                    scope,
+                    amount: Box::new(move |values| bits.eval(&quantity::lookup(&table, values)).map(|bits| bits.div_ceil(8))),
+                }
+            }).collect();
+            resources.push(ResourceConstraint {
+                terms,
+                capacity: self.limits.max_private_bytes,
+                reason: format!("Metal launch {launch:?} co-selected private arrays fit {} bytes", self.limits.max_private_bytes),
+            });
+        }
+        resources
     }
 
 }
@@ -356,6 +389,14 @@ impl Backend for Metal {
         TARGET
     }
 
+    fn capability_fingerprint(&self) -> String {
+        self.target_profile.fingerprint().into()
+    }
+
+    fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
+        self.target_profile.supports_intrinsic(intrinsic)
+    }
+
     fn estimate_model(&self) -> String {
         IDENTITY.into()
     }
@@ -372,6 +413,10 @@ impl Backend for Metal {
     fn constraints(&self, program: &Program, family: &Family) -> Result<Vec<Constraint>, SelectionError> {
         let analysis = self.analysis(program, family)?;
         mapping::constraints(family, self.legalities(&analysis)?)
+    }
+
+    fn resources(&self, program: &Program, family: &Family) -> Result<Vec<ResourceConstraint>, SelectionError> {
+        Ok(self.launch_resources(&self.analysis(program, family)?))
     }
 
     fn intervals(&self, program: &Program, family: &Family) -> Result<Vec<Interval>, SelectionError> {
@@ -408,7 +453,8 @@ impl Backend for Metal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::family::{Requirement, Site, SiteKind};
+    use seismic_lang::family::{OccurrenceId, Requirement, Site, SiteKind};
+    use seismic_lang::sir::CallId;
     use seismic_lang::types::{RegionId, SliceId};
 
     #[test]
@@ -428,6 +474,28 @@ mod tests {
         let totals = Totals { lane_ops: 1 << 20, visits: 16, device_bits: 1 << 23, ..Totals::default() };
         let costs: Vec<u64> = (0..4).map(|launches| model.scope_ns(launches, &totals, 64, 0, Group::default()).unwrap()).collect();
         assert!(costs.windows(2).all(|w| w[0] < w[1]), "{costs:?}");
+    }
+
+    #[test]
+    fn complete_call_operand_is_rejected_at_the_1081504_byte_stack_regression() {
+        let owner = CandidateRef { occurrence: OccurrenceId(0), candidate: 0 };
+        let launch = Some((owner, 0));
+        let mut ledger = accounting::Ledger::default();
+        ledger.tiles.insert(0, accounting::Tile {
+            bits: Quantity::Constant(1_081_504 * 8),
+            // Ordinary lane distribution looked legal; a complete call operand instead needs
+            // the full replicated declaration in every lane's private address space.
+            private_bits: Quantity::Constant(33_800 * 8),
+            replicated_bits: Quantity::Constant(1_081_504 * 8),
+            snapshot: false,
+            launch,
+            pieces: Quantity::one(),
+            owner: seismic_compiler::selection::structure::TileOwner::Piece,
+        });
+        ledger.call_arguments.push((CallId(0), 0, 0));
+        let requirement = Quantity::Sum(ledger.private_bits(launch));
+        assert_eq!(requirement.eval(&|_| None).unwrap().div_ceil(8), 1_081_504);
+        assert!(requirement.eval(&|_| None).unwrap().div_ceil(8) > 131_072);
     }
 
     #[test]
@@ -455,7 +523,11 @@ mod tests {
             ownership: Default::default(),
             alias_requirements: Vec::new(),
             params: vec![("y".into(), tensor.clone())],
+            source_param_count: 1,
+            result: Ty::Void,
+            result_bindings: Vec::new(),
             index_params: Vec::new(),
+            range_params: Vec::new(),
             vars: vec![
                 Var { name: "y".into(), ty: tensor, span, kind: IrVarKind::Param(0) },
                 Var { name: "i".into(), ty: Ty::Scalar(DType::I32), span, kind: IrVarKind::Index(atom) },
@@ -463,7 +535,7 @@ mod tests {
             body: vec![Stmt { id: None, span, kind: StmtKind::Parallel { vars: vec![1], extents: vec![Sym::constant(4)], body: vec![assign] } }],
             shapes: Default::default(),
         };
-        let limits = Limits { max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768, max_private_bytes: PRIVATE_BYTES };
+        let limits = Limits { max_threads_per_threadgroup: 1024, max_threadgroup_bytes: 32768, max_private_bytes: CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES };
         let execution = realize::realize(&limits, &lowered, false).unwrap();
         assert!(crate::msl::emit_execution(&execution).unwrap().source.contains("kernel void"));
     }
