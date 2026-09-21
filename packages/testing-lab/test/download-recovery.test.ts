@@ -17,7 +17,7 @@ const strict = <A extends object>(value: Partial<A>): A => new Proxy(value, { ge
 } }) as A
 const owner = Schema.decodeUnknownSync(ApplicationIdentity)({ applicationPid: 10, servicePid: 11, serviceInstance: "original" })
 const address = NetworkProbeAddress.make({ address: "192.0.2.1", family: 4, port: 443 })
-const isolation = Schema.decodeUnknownSync(NetworkIsolation)({ uid: 1000, controlPlane: [], resolvers: [], rule: `magnitude_lab_${"a".repeat(32)}` })
+const isolation = Schema.decodeUnknownSync(NetworkIsolation)({ _tag: "linux", uid: 1000, controlPlane: [], resolvers: [], rule: `magnitude_lab_${"a".repeat(32)}` })
 const files = Schema.decodeUnknownSync(ModelFileReceipt)({ files: [{ repository: "owner/model", revision: "a".repeat(40), path: "model.gguf", bytes: 100, sha256: "b".repeat(64) }] })
 const generation = Schema.decodeUnknownSync(GenerationExecution)({ generation: { requestId: "completion", model: "fixture", text: "HELLO", chunks: 1 },
   native: { traceId: "a".repeat(32), model: "fixture", workerPid: 42, workerGeneration: "2", requestId: "7", allocations: [{ kind: "host", model_bytes: 1024 }] } })

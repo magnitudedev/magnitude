@@ -20,7 +20,7 @@ import { verifyServiceOwnership } from "./suites/service"
 import { verifyWorkerRecovery, WorkerRecoveryEvidence } from "./suites/worker-recovery"
 import { admittedModelFiles, verifyModelFiles } from "./model-files"
 import { verifyDownloadRecovery, DownloadRecoveryEvidence } from "./suites/download-recovery"
-import { linuxNetworkFault } from "./network-fault"
+import { nativeNetworkFault } from "./network-fault"
 import { verifyOfflineRecovery, OfflineRecoveryEvidence } from "./suites/offline-recovery"
 import { nativeWorkerFault } from "./worker-fault"
 import { InstallationOwnership, verifyInstallationOwnership } from "./suites/installation-ownership"
@@ -436,7 +436,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             generation => attestRuntimeModules(generation.native, modules).pipe(Effect.zipRight(attestGeneration(target, host, config.model, generation.native))),
             value => evidence(`R2-${value._tag}.json`, DownloadRecoveryEvidence, value).pipe(Effect.tap(item => Effect.sync(() => { downloadEvidence.push(item) })), Effect.asVoid),
             detail => { cleanupErrors.push(`Download interruption restoration: ${detail}`) }).pipe(
-              Effect.provideService(DesktopDriver, yield* desktop), Effect.provideService(CliTests, yield* cli), Effect.provide(linuxNetworkFault))
+              Effect.provideService(DesktopDriver, yield* desktop), Effect.provideService(CliTests, yield* cli), Effect.provide(nativeNetworkFault))
           return CaseObservation.make({ detail: "Interrupted an active UI model download, retried through the UI, verified all admitted file digests and attested generation", evidence: [yield* inputEvidence, hostEvidence] })
         }
         case "R3": {
@@ -447,7 +447,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           yield* verifyOfflineRecovery(observe, generation => attestRuntimeModules(generation.native, expected).pipe(
             Effect.zipRight(attestGeneration(target, host, config.model, generation.native))), value => evidence(`R3-${value._tag}.json`, OfflineRecoveryEvidence, value).pipe(
               Effect.tap(item => Effect.sync(() => { offlineEvidence.push(item) })), Effect.asVoid), detail => { cleanupErrors.push(`Offline network restoration: ${detail}`) }).pipe(
-            Effect.provideService(DesktopDriver, yield* desktop), Effect.provideService(CliTests, yield* cli), Effect.provide(linuxNetworkFault))
+            Effect.provideService(DesktopDriver, yield* desktop), Effect.provideService(CliTests, yield* cli), Effect.provide(nativeNetworkFault))
           return CaseObservation.make({ detail: "Reloaded the cached model and attested generation with external traffic blocked, then restored connectivity", evidence: [yield* inputEvidence, hostEvidence] })
         }
         case "R4": {

@@ -1,6 +1,7 @@
 import { playwrightDownloads, type DesktopDownloads } from "./download-controls"
 import { playwrightUpdates, type DesktopUpdates } from "./update-controls"
-import { ApplicationIdentity, ReadyApplicationSnapshot } from "./application-identity"
+import { ApplicationIdentity, LabProcessId, ReadyApplicationSnapshot } from "./application-identity"
+import { verifyLaunchedDesktop } from "./desktop-process"
 import { desktopAutomation as automation } from "../../../desktop/src/automation"
 import { FileSystem } from "@effect/platform"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
@@ -10,6 +11,7 @@ import { join } from "node:path"
 import { desktopEnvironment, DesktopEnvironment } from "./desktop-environment"
 import { AssertionFailure, InfrastructureFailure } from "./domain"
 import { MacLoginRegistration } from "./login-registration"
+import { ProcessExecutorLive } from "./process"
 
 export const DesktopLaunch = Schema.Struct({ ...DesktopEnvironment.fields, executable: Schema.String, evidence: Schema.String })
 export type DesktopLaunch = typeof DesktopLaunch.Type
@@ -118,6 +120,11 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
   nativeProcess = app.process()
   nativeProcess.stdout?.on("data", collect)
   nativeProcess.stderr?.on("data", collect)
+  const observedPid = yield* action("Observe Electron main process", () => app.evaluate(() => process.pid)).pipe(
+    Effect.flatMap(Schema.decodeUnknown(LabProcessId)), Effect.mapError(() => new AssertionFailure({ message: "Electron did not report a valid main process identity" })))
+  const applicationPid = yield* verifyLaunchedDesktop({ applicationPid: observedPid,
+    launcherPid: yield* Schema.decodeUnknown(LabProcessId)(nativeProcess.pid).pipe(Effect.mapError(() => new AssertionFailure({ message: "Desktop launcher has no native process identity" }))),
+    executable: config.executable }).pipe(Effect.provide(ProcessExecutorLive))
   const page = yield* action("Wait for packaged application window", () => app.firstWindow({ timeout: 60_000 }))
   page.setDefaultTimeout(30_000)
   if (preparePage) yield* action("Prepare UI resilience challenge", () => preparePage(page))
@@ -167,7 +174,8 @@ export const playwrightDesktop = (config: DesktopLaunch, preparePage?: (page: Pa
         if (finished) unsubscribe()
       })))
       const snapshot = yield* Schema.decodeUnknown(ReadyApplicationSnapshot)(wire).pipe(Effect.mapError(() => new AssertionFailure({ message: "Native service observation is not ready or lacks identity" })))
-      if (snapshot.pid !== nativeProcess!.pid || snapshot.service.health.pid === snapshot.pid || snapshot.endpoint !== `http://127.0.0.1:${config.port}`) return yield* new AssertionFailure({ message: "Native service identity does not belong to the isolated application" })
+      if (snapshot.pid !== applicationPid || snapshot.service.health.pid === snapshot.pid || snapshot.endpoint !== `http://127.0.0.1:${config.port}`) return yield* new AssertionFailure({
+        message: `Native service identity differs from the launched application: app=${snapshot.pid}, expected=${applicationPid}, service=${snapshot.service.health.pid}, endpoint=${snapshot.endpoint}` })
       return ApplicationIdentity.make({ applicationPid: snapshot.pid, servicePid: snapshot.service.health.pid, serviceInstance: snapshot.service.health.id })
     }),
     host: () => action("Verify packaged native host bridge", () => page.evaluate(async () => {

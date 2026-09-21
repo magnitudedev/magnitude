@@ -84,8 +84,12 @@ No execution may touch a developer's normal application data. Local execution
 requires an isolated profile, and privileged install/uninstall is restricted to disposable hosts.
 Desktop launches explicitly distinguish an isolated profile from an installed OS-user context.
 The driver must not silently rewrite profile or endpoint settings: isolated launch configuration
-must agree with the environment shared by the bundled CLI. Installed-user mode requires a
-separately supplied qualified disposable-user capability, uses normal product data and endpoint
+must agree with the environment shared by the bundled CLI.
+Native identity binds the observed Electron main process to the launch. On Windows the launcher
+is a shell: native inspection must match the Electron child's parent, executable, current-user
+ownership and creation ordering, with stable creation identities across inspection. The shell PID
+cannot substitute for the application's PID in service, recovery or removal assertions.
+Installed-user mode requires a separately supplied qualified disposable-user capability, uses normal product data and endpoint
 policy, and rejects development profile or control-directory overrides. A HOME substitution is
 not proof of disposable OS-user authority. Existing isolated probes cannot qualify native login
 registration; provider/user qualification and installed-mode orchestration are required separately.
@@ -252,6 +256,14 @@ recipe; reconciliation verifies that receipt and the live desktop without reinst
 Incomplete preparation requires a fresh worker. Provider credentials stay on the coordinator;
 only a bounded read capability for the pinned runtime enters the guest and is removed after use.
 Native dependency failures retain diagnostic evidence before ordinary lease cleanup.
+Namespace's Apple Paravirtual Metal device can execute required SIMD-group operations while
+reporting conservative family flags. Preparation compiles and signs the pinned compatibility
+shim, then enables it only when an executable stock-device probe identifies that exact device,
+proves Apple family 7 is unadvertised, and produces the expected SIMD result. A second executable
+probe must pass with Apple family 7 exposed and the device's existing 32 KiB threadgroup-memory
+limit unchanged. The worker exports a receipt-bound lab capability; only candidate application,
+CLI and harness processes translate it into loader variables. Physical Macs and non-Namespace
+workers receive no override. The profile does not change product Metal selection policy.
 Windows client allocation requires an operator-verified licensing basis in administrator
 configuration. Multitenant hosting emits Azure's Windows client license declaration; Visual Studio
 dev/test eligibility does not imply that declaration. Credits, image visibility and Server diagnostic

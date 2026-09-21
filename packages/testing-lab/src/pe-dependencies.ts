@@ -81,17 +81,26 @@ while ($queue.Count) {
   if (-not $file.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Native root escapes the owned directory' }
   $pe = [Dependencies.BinaryCache]::LoadPe($file)
   if (-not $pe -or -not $pe.LoadSuccessful) { throw 'Owned dependency is not a valid PE' }
-  $imports = @($pe.GetImports())
+  # Convert C++/CLI value types into an explicit wire contract. Passing them directly
+  # through ConvertTo-Json produced version-dependent shapes on Server 2022/2025.
+  $imports = @($pe.GetImports() | ForEach-Object {
+    $symbols = @($_.ImportList | ForEach-Object {
+      $symbolName = if ($null -eq $_.Name) { $null } else { [string]$_.Name }
+      @{Name=$symbolName;ModuleName=[string]$_.ModuleName;
+        ImportByOrdinal=[bool]$_.ImportByOrdinal;Ordinal=[int]$_.Ordinal;DelayImport=[bool]$_.DelayImport}
+    })
+    @{Name=[string]$_.Name;NumberOfEntries=[int64]$_.NumberOfEntries;ImportList=$symbols}
+  })
   $dependencies = [Collections.Generic.List[object]]::new()
   foreach ($item in $imports) {
     $resolved = [Dependencies.BinaryCache]::ResolveModule($root, $item.Name, $sxs, $search, $env:LAB_PE_WORKING_DIRECTORY)
     $path = if ($resolved.Item2) { $resolved.Item2.Filepath } else { $null }
-    $dependencies.Add(@{ModuleName=$item.Name;Filepath=$path;SearchStrategy=[int]$resolved.Item1})
+    $dependencies.Add(@{ModuleName=[string]$item.Name;Filepath=$path;SearchStrategy=[int]$resolved.Item1})
     if ($path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $queue.Enqueue($path) }
   }
-  $modules.Add(@{Filepath=$pe.Filepath;Imports=$imports;Dependencies=@($dependencies.ToArray())})
+  $modules.Add(@{Filepath=[string]$pe.Filepath;Imports=$imports;Dependencies=@($dependencies.ToArray())})
 }
-@{schemaVersion=1;Root=$root.Filepath;Modules=@($modules.ToArray())} | ConvertTo-Json -Depth 8 -Compress
+@{schemaVersion=1;Root=[string]$root.Filepath;Modules=@($modules.ToArray())} | ConvertTo-Json -Depth 8 -Compress
 `
 
 export const inspectPeGraph = (tool: string, file: string, root: string, workingDirectory: string, systemRoot: string, ownedSearchPaths: readonly string[]) =>

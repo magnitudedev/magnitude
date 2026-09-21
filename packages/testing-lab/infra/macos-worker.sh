@@ -97,6 +97,27 @@ for key in ['runtime','node','rustup','tirith']:
 subprocess.run(['tar','-xzf',str(root/'download-node'),'--strip-components=1','-C',str(root/'node-bin')],check=True)
 subprocess.run(['tar','-xzf',str(root/'download-runtime'),'-C',str(root)],check=True)
 workspace=root/'runtime'
+metal_source=workspace/'packages/testing-lab/infra/namespace-metal-compatibility/LumeMetalCapabilities.m'
+metal_probe=workspace/'packages/testing-lab/infra/namespace-metal-compatibility/probe.swift'
+if not metal_source.is_file() or not metal_probe.is_file():raise SystemExit('Namespace Metal compatibility sources are missing')
+metal_root=root/'metal-compatibility';metal_root.mkdir()
+metal_shim=metal_root/'LumeMetalCapabilities-arm64.dylib'
+metal_probe_binary=metal_root/'probe-arm64'
+subprocess.run(['xcrun','clang','-dynamiclib','-fobjc-arc','-arch','arm64','-framework','Foundation','-framework','Metal',str(metal_source),'-o',str(metal_shim)],check=True)
+subprocess.run(['codesign','--force','--sign','-',str(metal_shim)],check=True)
+subprocess.run(['xcrun','swiftc','-O','-target','arm64-apple-macosx13.0',str(metal_probe),'-o',str(metal_probe_binary)],check=True)
+stock_metal=json.loads(output(str(metal_probe_binary)))
+if stock_metal.get('device')=='Apple Paravirtual device' and not stock_metal.get('apple7') and stock_metal.get('simdReductionExecuted') and stock_metal.get('simdReductionResult')==528:
+ metal_environment={**os.environ,'DYLD_INSERT_LIBRARIES':str(metal_shim),'LUME_METAL_APPLE_FAMILY_MAX':'1007',
+  'LUME_METAL_MAX_THREADGROUP_MEMORY':str(stock_metal['maxThreadgroupMemory'])}
+ profiled_metal=json.loads(subprocess.check_output([str(metal_probe_binary)],env=metal_environment,text=True))
+ if not profiled_metal.get('apple7') or not profiled_metal.get('simdReductionExecuted'):raise SystemExit('Namespace Metal compatibility profile did not establish its qualified capability')
+ metal_compatibility={'enabled':True,'stock':stock_metal,'profiled':profiled_metal,'shimSha256':hashlib.sha256(metal_shim.read_bytes()).hexdigest(),
+  'probeSha256':hashlib.sha256(metal_probe_binary.read_bytes()).hexdigest()}
+elif stock_metal.get('apple7') and stock_metal.get('simdReductionExecuted'):
+ metal_compatibility={'enabled':False,'stock':stock_metal,'probeSha256':hashlib.sha256(metal_probe_binary.read_bytes()).hexdigest()}
+else:raise SystemExit('Namespace Metal device did not satisfy the executable compatibility probe')
+(metal_root/'receipt.json').write_text(json.dumps(metal_compatibility,sort_keys=True))
 hermes=json.loads((workspace/'packages/testing-lab/tools/hermes.json').read_text())
 if hermes['repository']!='https://github.com/NousResearch/hermes-agent.git' or not re.fullmatch('[a-f0-9]{40}',hermes['commit']):raise SystemExit('Invalid Hermes source pin')
 rust=tomllib.loads((workspace/'inference/rust-toolchain.toml').read_text())['toolchain']['channel']
@@ -146,11 +167,15 @@ launcher='\n'.join(['#!/bin/bash','set -euo pipefail','umask 022',
  'export LAB_PI_EXECUTABLE='+shlex.quote(str(home/'.local/bin/pi')),
  'export LAB_OPENCODE_EXECUTABLE='+shlex.quote(str(home/'.local/bin/opencode')),
  'export LAB_HERMES_EXECUTABLE='+shlex.quote(str(home/'.local/bin/hermes')),
+ *(['export LAB_NAMESPACE_METAL_SHIM='+shlex.quote(str(metal_shim)),
+   'export LAB_NAMESPACE_METAL_FAMILY_MAX=1007',
+   'export LAB_NAMESPACE_METAL_MAX_THREADGROUP_MEMORY='+shlex.quote(str(stock_metal['maxThreadgroupMemory']))] if metal_compatibility['enabled'] else []),
  'cd '+shlex.quote(str(workspace)), 'exec bun packages/testing-lab/src/worker-entry.ts "$@"',''])
 (root/'worker').write_text(launcher);(root/'worker').chmod(0o755)
 local_receipt=root/'receipt.json'
 local_receipt.write_text(json.dumps({'identity':config['identity'],'runtimeSha256':config['runtime']['sha256'],
- 'uid':account.pw_uid,'productVersion':config['productVersion'],'buildVersion':config['buildVersion'],'rustVersion':rust}))
+ 'uid':account.pw_uid,'productVersion':config['productVersion'],'buildVersion':config['buildVersion'],'rustVersion':rust,
+ 'metalCompatibility':metal_compatibility}))
 subprocess.run(['sudo','-n','install','-d','-o','root','-g','wheel','-m','755',str(state)],check=True)
 subprocess.run(['sudo','-n','install','-o','root','-g','wheel','-m','644',str(local_receipt),str(receipt)],check=True)
 local_receipt.unlink()

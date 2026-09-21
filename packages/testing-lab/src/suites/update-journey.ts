@@ -2,7 +2,6 @@ import { isWindows } from "../domain"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
 import { nativeHostLayer, NativeHost } from "../../../daemon-management/src/desktop-native"
 import { updateControlEndpoint } from "../update-control"
 import { requestApplication } from "../../../daemon-management/src/desktop-native/application-control"
@@ -44,7 +43,14 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   if (Option.isNone(original)) return yield* fail("Updater journey requires an owned candidate installation")
   const { fixture, pair } = yield* prepareUpdateConsumer(config.acceptance, config.target, join(config.root, "inputs"))
   yield* record("pair", UpdatePair, pair)
-  const state = yield* fs.makeTempDirectoryScoped({ directory: isWindows(config.target.os) ? tmpdir() : "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
+  // The Windows owner must create the state directory itself with its protected
+  // current-user ACL. A generic temporary directory has inherited ACL entries and
+  // is correctly rejected by the native ownership lock.
+  const state = isWindows(config.target.os) ? join(config.root, "application-state")
+    : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
+  if (isWindows(config.target.os) && (yield* fs.exists(state))) return yield* new InfrastructureFailure({
+    operation: "update-journey", message: "Update application state must begin absent so the native owner can create its private directory",
+  })
   const profile = join(config.root, "profile")
   // Load a lease-owned copy: Windows locks loaded DLLs until worker exit.
   // Keep it outside scoped state cleanup; allocation cleanup runs after the worker exits.

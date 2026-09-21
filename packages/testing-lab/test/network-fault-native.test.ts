@@ -22,6 +22,8 @@ for (const injectFailure of [false, true]) test.skipIf(!enabled)(`native offline
   const local = NetworkProbeAddress.make({ address: "127.0.0.1", family: 4, port: (server.address() as AddressInfo).port })
   const result = yield* Effect.scoped(Effect.gen(function* () {
     const receipt = yield* network.isolate(message => { cleanup.push(message) })
+    expect(receipt._tag).toBe("linux")
+    if (receipt._tag !== "linux") throw new Error("Expected Linux isolation")
     expect(receipt.uid).toBe(userInfo().uid)
     expect(yield* network.reachable(address)).toBe(false)
     expect(yield* network.reachable(local)).toBe(true)

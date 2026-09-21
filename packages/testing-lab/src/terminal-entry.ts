@@ -1,12 +1,17 @@
-import { NodeRuntime, NodeStream } from "@effect/platform-node"
+import { NodeRuntime } from "@effect/platform-node"
 import { Deferred, Effect, Option, Queue, Runtime, Schema, Sink, Stream } from "effect"
 import { createRequire } from "node:module"
+import { createInterface } from "node:readline"
 import { TerminalCommand, TerminalEvent, TerminalStart, TerminalExit, TerminalBridgeFailure } from "./terminal-protocol.ts"
 
 const error = () => new TerminalBridgeFailure({ message: "Native terminal bridge failed" })
 const program = Effect.scoped(Effect.gen(function* () {
   if (process.versions.bun || Number(process.versions.node.split(".")[0]) < 24) return yield* new TerminalBridgeFailure({ message: "The native terminal bridge requires Node.js 24 or newer" })
-  const input = NodeStream.fromReadable(() => process.stdin, error).pipe(Stream.decodeText(), Stream.splitLines,
+  // readline explicitly resumes Windows named-pipe stdin. NodeStream remained paused on
+  // Server 2022/2025, leaving the bridge alive without ever consuming its Start frame.
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
+  yield* Effect.addFinalizer(() => Effect.sync(() => lines.close()))
+  const input = Stream.fromAsyncIterable(lines, error).pipe(
     Stream.mapEffect(line => line.length <= 256 * 1024 ? Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(line).pipe(Effect.mapError(error)) : Effect.fail(error())))
   const [head, rest] = yield* Stream.peel(input, Sink.head())
   const first = yield* Option.match(head, { onNone: () => Effect.fail(error()), onSome: Schema.decodeUnknown(TerminalStart) })
