@@ -7,8 +7,8 @@ Red Hat's Azure image leaves its home logical volume at 1 GiB; preparation verif
 XFS/LVM layout and expands that volume to 64 GiB before installing dependencies.
 Windows preparation installs pinned tools and runtime dependencies, creates the admitted user's
 interactive desktop, removes one-shot login credentials, and verifies live readiness. It is
-integrated with allocation and natively proven on a disposable Windows Server diagnostic;
-Windows 10/11 still require eligible client licensing and their own application qualification.
+integrated with allocation. Windows Server 2022 and 2025 are the agreed baseline targets;
+Windows 10/11 client coverage is deferred and is not implied by Server results.
 GPU driver preparation is implemented but native GPU qualification awaits quota. CUDA source producers have a separate pinned
 SDK preparation phase; its native qualification status is recorded in the coverage ledger.
 Windows delivery now supports an already prepared interactive desktop user: its configured
@@ -16,7 +16,7 @@ runtime must be a native `.exe` with absolute local paths. The bootstrap creates
 Interactive scheduled task, verifies the actual user and nonzero session, observes its exit,
 and removes the system-owned launcher and scoped credential. It does not create a login
 session or install build dependencies. The launcher has native Windows Server validation;
-Windows 10/11 app coverage is not established by that diagnostic. RHEL 10
+Windows client app coverage is not established by that diagnostic. RHEL 10
 uses a private headless GNOME Wayland session because [Red Hat removed the X.Org server](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.0_release_notes/removed-features);
 the worker waits for a logical monitor before starting. Its compositor and sockets are removed on
 exit. Bounded compositor logs accompany failed execution. Electron inherits `XDG_SESSION_TYPE=wayland`;
@@ -228,7 +228,7 @@ the disposable worker and disappears with it. The matching variables are documen
 Configure a Windows image with a `kind: "windows"` initialization recipe. Pin each of
 `toolsSetup`, `runtimeSetup` and `desktopSetup` by file path and SHA-256; the coordinator image
 contains these scripts under `/opt/lab/`. Include the decoded native download pins from
-`tools/windows-downloads.json`, the exact client distribution (`windows` version `10` or `11`),
+`tools/windows-downloads.json`, the exact Server distribution (`windows-server` version `2022` or `2025`),
 `architecture: "x64"`, the allocation's administrator username, and the same content-addressed
 runtime blob descriptor used by Linux. The recipe must match the target before allocation.
 
@@ -239,7 +239,7 @@ to resume without reinstalling or rebooting a ready desktop. Only readiness is r
 success. Failed stages retain execution diagnostics in the run's evidence and leave the owned
 lease discoverable for cleanup. Windows initialization does not use Linux cloud-init.
 
-Server 2025 diagnostic preparation is a separate mechanism test, not Windows 10/11 qualification.
+Server preparation and app qualification cannot establish Windows 10/11 client coverage.
 Do not configure a client image until its licensing eligibility is established. The implementation
 requires `windowsLicense` on a client image: `visual-studio-dev-test` for verified Visual Studio
 and subscription eligibility, or `multitenant` for verified Windows hosting rights. Only the latter
@@ -291,6 +291,6 @@ This compiler installation does not install a GPU driver or require GPU quota. A
 6000 consumer drivers have separate pinned preparation in `tools/nvidia-drivers.json`. Configure
 that model's OS-specific entry as `gpu` in the initialization recipe. The allocator checks hardware,
 VM family and supported guest OS before provisioning; current recipes permit Ubuntu 24.04 and
-Windows 11, plus Windows Server diagnostics. Driver installation and real CUDA generation remain
-unverified at zero GPU quota. Other catalog OS/GPU combinations require a supported driver recipe. Linux x64 SDK compilation/linking has
-native Azure CPU evidence; Windows and Linux ARM SDK execution remain unverified.
+Windows Server 2022/2025. Driver installation and real CUDA generation remain
+unverified at zero GPU quota. Other catalog OS/GPU combinations require a supported driver recipe. Linux x64, Linux ARM64 and Windows x64 SDK compilation/linking have native Azure CPU evidence;
+this does not establish GPU execution.

@@ -448,8 +448,13 @@ Native helper state uses canonical paths, including macOS's `/tmp` to `/private/
 
 Private update fixtures own a loopback HTTPS listener, temporary TLS material and an ephemeral
 publisher. Their public configuration is compiled into acceptance packages before execution;
-ordinary production packages cannot be relabelled as accepting that trust. Certificate trust is
-limited to the launched test process, never installed in the host trust store. Publication copies
+ordinary production packages cannot be relabelled as accepting that trust. TLS certificate trust is
+limited to the launched test process, never installed in the host trust store. Windows Authenticode
+acceptance uses a separate ephemeral code-signing certificate: the private key remains in the
+producer account, while only its public certificate enters the disposable VM’s machine root store.
+Native unattended import requires this administrative store; no shared or persistent Windows host
+is eligible. Trust is removed at scope exit, and VM deletion bounds cleanup after worker failure.
+Existing certificate entries are never claimed or removed. Publication copies
 and verifies the exact candidate bytes before atomically offering a signed target/version. Failed
 publication preserves the preceding offer. Signed request admission validates target metadata,
 timestamp and bounded nonce replay state. Artifact capability routes expose only the owned copy,

@@ -31,12 +31,12 @@ $ErrorActionPreference = 'Stop'
 $certificate = $null
 try {
   $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Magnitude Update Acceptance, O=Magnitude Update Acceptance' -CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(2)
-  $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root','CurrentUser')
-  try { $store.Open('ReadWrite'); $store.Add($certificate) } finally { $store.Close() }
+  $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root','LocalMachine')
+  try { $store.Open('ReadWrite'); $store.Add([Security.Cryptography.X509Certificates.X509Certificate2]::new($certificate.RawData)) } finally { $store.Close() }
   @{ thumbprint = $certificate.Thumbprint; certificate = [Convert]::ToBase64String($certificate.RawData) } | ConvertTo-Json -Compress
 } catch {
   if ($certificate) {
-    Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "Cert:\LocalMachine\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue
   }
   throw
@@ -48,23 +48,23 @@ try {
 const removePublisher = (thumbprint: string, privateKey: boolean) => run(String.raw`
 $ErrorActionPreference = 'Stop'
 foreach ($storeName in ($env:LAB_PUBLISHER_STORES -split ',')) {
-  $path = "Cert:\CurrentUser\$storeName\$env:LAB_PUBLISHER_THUMBPRINT"
+  $path = "Cert:\$storeName\$env:LAB_PUBLISHER_THUMBPRINT"
   if (Test-Path -LiteralPath $path) {
-    if ($storeName -eq 'My') { Remove-Item -LiteralPath $path -Force -DeleteKey } else { Remove-Item -LiteralPath $path -Force }
+    if ($storeName -eq 'CurrentUser\My') { Remove-Item -LiteralPath $path -Force -DeleteKey } else { Remove-Item -LiteralPath $path -Force }
   }
 }
-`, { LAB_PUBLISHER_THUMBPRINT: thumbprint, LAB_PUBLISHER_STORES: privateKey ? "Root,My" : "Root" })
+`, { LAB_PUBLISHER_THUMBPRINT: thumbprint, LAB_PUBLISHER_STORES: privateKey ? "LocalMachine\\Root,CurrentUser\\My" : "LocalMachine\\Root" })
 
-/** Trust is scoped to the disposable test account and removed after the update journey. */
+/** Authenticode trust is scoped to the disposable Windows VM and removed after the update journey. */
 export const trustWindowsUpdatePublisher = (publisher: typeof WindowsUpdatePublisher.Type) => Effect.gen(function* () {
   yield* validateWindowsUpdatePublisher(publisher)
   yield* Effect.acquireRelease(run(String.raw`
 $ErrorActionPreference = 'Stop'
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($env:LAB_PUBLISHER_CERTIFICATE))
 if ($certificate.Thumbprint -ne $env:LAB_PUBLISHER_THUMBPRINT -or $certificate.HasPrivateKey) { throw 'Publisher certificate mismatch' }
-if (Test-Path -LiteralPath "Cert:\CurrentUser\Root\$($certificate.Thumbprint)") { throw 'Publisher trust already exists; refusing to claim ownership' }
-$store = [Security.Cryptography.X509Certificates.X509Store]::new('Root','CurrentUser')
-try { $store.Open('ReadWrite'); $store.Add($certificate) } finally { $store.Close() }
+if (Test-Path -LiteralPath "Cert:\LocalMachine\Root\$($certificate.Thumbprint)") { throw 'Publisher trust already exists; refusing to claim ownership' }
+$store = [Security.Cryptography.X509Certificates.X509Store]::new('Root','LocalMachine')
+  try { $store.Open('ReadWrite'); $store.Add([Security.Cryptography.X509Certificates.X509Certificate2]::new($certificate.RawData)) } finally { $store.Close() }
 `, { LAB_PUBLISHER_CERTIFICATE: publisher.certificate, LAB_PUBLISHER_THUMBPRINT: publisher.thumbprint }),
     () => removePublisher(publisher.thumbprint, false).pipe(Effect.orDie))
 })

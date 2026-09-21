@@ -25,9 +25,9 @@ test("Windows publisher transfers only its public certificate and scopes creatio
       ? yield* Schema.encode(Schema.parseJson(WindowsUpdatePublisher))(publisher) : "" }
   }).pipe(Effect.orDie) })
   yield* Effect.scoped(createWindowsUpdatePublisher).pipe(Effect.provideService(ProcessExecutor, executor))
-  expect(calls[1]?.stores).toBe("Root,My")
+  expect(calls[1]?.stores).toBe("LocalMachine\\Root,CurrentUser\\My")
   expect(calls[1]?.script).toContain("-DeleteKey")
   yield* Effect.scoped(trustWindowsUpdatePublisher(publisher)).pipe(Effect.provideService(ProcessExecutor, executor))
   expect(calls[2]?.script).toContain("HasPrivateKey")
-  expect(calls[3]?.stores).toBe("Root")
+  expect(calls[3]?.stores).toBe("LocalMachine\\Root")
 })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))

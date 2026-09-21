@@ -6,7 +6,7 @@ import { Clock, Deferred, Effect, Option, Ref, Runtime, Schema, Stream } from "e
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from "node:crypto"
 import { join } from "node:path"
 import { AssertionFailure, Digest, InfrastructureFailure } from "./domain"
-import { checkedCommand } from "./process"
+import { createFixtureTls } from "./fixture-tls"
 
 export const UpdateFixtureArtifact = Schema.Struct({
   path: Schema.NonEmptyString, version: Schema.NonEmptyString, target: ReleaseTarget,
@@ -35,7 +35,6 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
   yield* fs.chmod(directory, 0o700)
   const caPath = join(directory, "certificate.pem"), keyPath = join(directory, "tls-key.pem")
   if (restored) yield* Schema.validate(UpdateFixtureAuthority)(restored).pipe(Effect.mapError(() => fail("Malformed private update authority")))
-  const opensslConfig = join(directory, "openssl.cnf")
   if (restored) {
     yield* Effect.try({ try: () => {
       const certificate = new X509Certificate(restored.certificate)
@@ -46,10 +45,7 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
     yield* fs.writeFileString(caPath, restored.certificate, { mode: 0o600 })
     yield* fs.writeFileString(keyPath, restored.tlsPrivateKey, { mode: 0o600 })
   } else {
-    yield* fs.writeFileString(opensslConfig, `[req]\nprompt = no\ndistinguished_name = subject\nx509_extensions = extensions\n[subject]\nCN = Magnitude isolated update fixture\n[extensions]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage = serverAuth\nsubjectAltName = IP:127.0.0.1,DNS:localhost\n`, { mode: 0o600 })
-    yield* checkedCommand("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", opensslConfig,
-      "-keyout", keyPath, "-out", caPath], { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
-    yield* fs.chmod(keyPath, 0o600)
+    yield* createFixtureTls(directory)
   }
   const publisher = yield* Effect.try({ try: () => {
     const privateKey = restored ? createPrivateKey(restored.publisherPrivateKey) : generateKeyPairSync("ed25519").privateKey

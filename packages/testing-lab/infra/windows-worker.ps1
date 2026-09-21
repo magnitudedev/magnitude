@@ -15,5 +15,7 @@ $env:LAB_OPENCODE_EXECUTABLE = $launch.opencode
 $env:LAB_HERMES_EXECUTABLE = $launch.hermes
 $env:LAB_DEPENDENCIES_EXECUTABLE = $launch.dependencies
 Set-Location $launch.workspace
+& $launch.bun (Join-Path $launch.workspace 'packages\testing-lab\scripts\verify-update-prerequisites.ts')
+if ($LASTEXITCODE -ne 0) { throw 'Native update prerequisites failed before candidate execution' }
 & $launch.bun (Join-Path $launch.workspace 'packages\testing-lab\src\outward-worker.ts')
 exit $LASTEXITCODE
