@@ -17,7 +17,7 @@ import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
-import { makeAppearancePreferences, makeModelStoragePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeModelStoragePreferences, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
@@ -112,6 +112,10 @@ const program = Effect.scoped(Effect.gen(function* () {
   // The service reads the same setting when it spawns the engine; this is what the running service uses.
   const activeModelStorage = yield* modelStorage.read.pipe(Effect.map(settings => settings.path), Effect.catchAll(error =>
     Effect.logWarning(error.message).pipe(Effect.as(modelStorage.defaultPath))))
+  const networkPreferences = yield* makeNetworkPreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  // The service resolves the same setting when it binds; this is what the running service listens on.
+  const activeNetwork = yield* networkPreferences.read.pipe(Effect.map(settings => settings.resolved), Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as(LOOPBACK_ONLY))))
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -317,6 +321,18 @@ const program = Effect.scoped(Effect.gen(function* () {
       catch: () => new HostError({ message: "The folder chooser could not be opened." }),
     }).pipe(Effect.map(result => ({ path: result.canceled ? null : result.filePaths[0] ?? null }))),
     Relaunch: () => Queue.offer(quit, "Relaunch").pipe(Effect.as({})),
+    GetNetworkAccess: () => networkPreferences.read.pipe(Effect.mapError(connectionError), Effect.map(({ saved, resolved }) => ({
+      enabled: resolved.enabled,
+      bind: Option.isSome(saved) && saved.value.bind !== undefined ? saved.value.bind : null,
+      requireApiKey: Option.isSome(saved) ? saved.value.requireApiKey : true,
+      apiKey: Option.isSome(saved) ? saved.value.apiKey ?? null : null,
+      interfaces: listNetworkInterfaces(),
+      port,
+      pending: !networkAccessEquals(resolved, activeNetwork),
+      warning: Option.getOrNull(resolved.warning),
+    }))),
+    SetNetworkAccess: change => preferenceWrites.withPermits(1)(networkPreferences.update(change)).pipe(Effect.mapError(connectionError), Effect.as({})),
+    RegenerateNetworkApiKey: () => preferenceWrites.withPermits(1)(networkPreferences.regenerateApiKey).pipe(Effect.mapError(connectionError), Effect.as({})),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
     SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
     Connections: () => Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(connectionChanges), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(Stream.mapEffect(() => connections.pipe(Effect.flatMap(service => service.inspect), Effect.map(connections => ({ _tag: "Ready" as const, connections })), Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))))),

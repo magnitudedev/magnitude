@@ -61,6 +61,17 @@ may supply another explicit port. Health is available during startup. RPC dispat
 at Ready and fenced by the selected instance ID. Inference paths remain unchanged. The inherited
 control channel carries startup health and shutdown; there is no discoverable coordination listener.
 
+Network access is off by default and read once from `network` in `config.json` when ACN starts.
+When enabled, ACN also listens on all interfaces, or on one configured address beside loopback, so
+local clients are never displaced. Reachability from another address never widens what a remote
+caller may do: `/rpc` is refused by socket peer address, never by header, so application control
+stays on this machine; `/health` reports only readiness to remote callers; inference routes require
+the generated API key as a Bearer token or `x-api-key` from remote callers unless the key
+requirement is switched off, and never from loopback callers. The Host header is accepted only for
+local names, and with network access on also for IP literals, `host.docker.internal`, `.ts.net`
+names, and names listed under `network.allowedHosts`; no wildcard is ever accepted. CORS stays
+loopback-only. Harness connections keep writing the loopback origin.
+
 RPCs, subscriptions, sessions, requests, and observation do not determine process presence. Closing
 an ordinary client cannot stop the service. Closing the desktop window hides it; full application
 Quit is the owner shutdown command. ICN remains the private mandatory child.

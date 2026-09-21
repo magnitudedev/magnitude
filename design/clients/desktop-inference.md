@@ -193,6 +193,15 @@ differs, a persistent toast in the window's bottom-right corner on every page st
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new
 folder. Magnitude never moves model files itself.
+
+Network access is a General row with a switch, off by default, persisted as `network` in the same
+`config.json` that the service reads when it binds. Turning it on generates an API key once and
+reveals three rows: Address (all interfaces or one detected IPv4 address, with Tailscale's range
+labelled), API key (the key with the copy control, Regenerate, and a Require key switch that is on
+by default), and Connection URLs (the OpenAI-compatible base URL for each address). Main records the
+resolved settings in effect at launch; when the saved settings resolve differently the same restart
+toast appears, naming network settings. Connections ends with an "Other apps and remote agents"
+card showing the loopback base URL, the placeholder key, and the network URLs when enabled.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

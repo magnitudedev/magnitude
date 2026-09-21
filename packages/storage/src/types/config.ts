@@ -17,12 +17,22 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
 const SerializableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(schema, { as: 'Option', exact: true } as const)
 
+export const NetworkAccessConfigSchema = Schema.Struct({
+  enabled: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  bind: Schema.optional(Schema.NonEmptyTrimmedString),
+  apiKey: Schema.optional(Schema.NonEmptyTrimmedString),
+  requireApiKey: Schema.optionalWith(Schema.Boolean, { default: () => true }),
+  allowedHosts: Schema.optionalWith(Schema.Array(Schema.NonEmptyTrimmedString), { default: () => [] }),
+})
+export type NetworkAccessConfig = Schema.Schema.Type<typeof NetworkAccessConfigSchema>
+
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
   autoDownloadUpdates: SerializableOptional(Schema.Boolean),
   appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
   modelsDirectory: SerializableOptional(Schema.NonEmptyTrimmedString.pipe(Schema.maxLength(4_096))),
+  network: SerializableOptional(NetworkAccessConfigSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

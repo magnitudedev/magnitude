@@ -41,7 +41,7 @@ import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefres
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
-import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
@@ -80,6 +80,11 @@ const chooseModelStorage = Atom.fn((_: void) => hostCommand(() => host.chooseMod
   Effect.flatMap(path => path === null ? Effect.void : hostCommand(() => host.setModelStorage(path)))))
 const resetModelStorage = Atom.fn((_: void) => hostCommand(() => host.setModelStorage(null)))
 const relaunchApplication = Atom.fn((_: void) => hostCommand(() => host.relaunch()))
+const networkAccessSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getNetworkAccess())))
+const updateNetworkAccess = Atom.fn((change: NetworkAccessChange) => hostCommand(() => host.setNetworkAccess(change)))
+const regenerateNetworkApiKey = Atom.fn((_: void) => hostCommand(() => host.regenerateNetworkApiKey()))
+const ALL_INTERFACES = "all"
+const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
 /** The exact command that moves an existing store; the root holds only hub/, locks/ and one JSON file. */
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
@@ -372,6 +377,7 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
       : rows.value._tag === "Unavailable" ? <p role="alert" className="mt-5">Could not check connections. {rows.value.message}</p>
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={host.platform}
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
+    <RemoteAccessCard platform={host.platform} />
   </>
 }
 function ModelStatus() {
@@ -500,11 +506,11 @@ function ModelStorageRow() {
         {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
         <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
       </>} />
-    <ModelStorageRefresh refresh={refresh} results={[choosing, resetting]} />
+    <RefreshAfter refresh={refresh} results={[choosing, resetting]} />
   </>
 }
-// Re-reads config.json when Settings opens and after each host write; the toast shares the atom.
-function ModelStorageRefresh({ refresh, results }: { refresh: () => void; results: ReadonlyArray<Result.Result<unknown, unknown>> }) {
+// Re-reads config.json when Settings opens and after each host write; the toast shares the atoms.
+function RefreshAfter({ refresh, results }: { refresh: () => void; results: ReadonlyArray<Result.Result<unknown, unknown>> }) {
   const key = results.map(result => Result.isSuccess(result) && !result.waiting ? "done" : Result.isFailure(result) ? "failed" : "idle").join(",")
   const previous = useRef(key)
   useEffect(() => { refresh() }, [refresh])
@@ -512,20 +518,77 @@ function ModelStorageRefresh({ refresh, results }: { refresh: () => void; result
   return null
 }
 function RestartRequiredToast() {
-  const settings = useAtomValue(modelStorageSettings)
+  const storage = useAtomValue(modelStorageSettings)
+  const network = useAtomValue(networkAccessSettings)
   const relaunch = useAtomSet(relaunchApplication)
   const relaunching = useAtomValue(relaunchApplication)
-  const current = Result.isSuccess(settings) ? settings.value : null
-  if (!current || current.path === current.active) return null
+  const storageValue = Result.isSuccess(storage) ? storage.value : null
+  const storagePending = storageValue !== null && storageValue.path !== storageValue.active
+  const networkPending = Result.isSuccess(network) && network.value.pending
+  if (!storagePending && !networkPending) return null
+  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
+    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
   return <div role="status" className="fixed bottom-4 right-4 z-50 w-[30rem] max-w-[calc(100vw-2rem)] rounded-lg border border-slate-300 bg-white p-4 text-sm text-slate-900 shadow-md dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100">
     <div className="flex items-center justify-between gap-4">
-      <div><p className="font-medium">Restart required</p><p className="mt-0.5 text-slate-600 dark:text-slate-400">Magnitude is still using the previous model folder.</p>
+      <div><p className="font-medium">Restart required</p><p className="mt-0.5 text-slate-600 dark:text-slate-400">{reason}</p>
         {Result.isFailure(relaunching) && <p role="alert" className="mt-1">{hostFailureMessage(relaunching.cause)}</p>}</div>
       <Button size="sm" disabled={relaunching.waiting} onClick={() => { relaunch(); }}>Restart Magnitude</Button>
     </div>
-    <p className="mt-3 text-xs text-slate-600 dark:text-slate-400">Downloaded models stay in the previous folder. To move them too, quit Magnitude, run this, then open it again.</p>
-    <div className="mt-1.5"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, current.active, current.path)} label="Copy move command" /></div>
+    {storagePending && storageValue && <>
+      <p className="mt-3 text-xs text-slate-600 dark:text-slate-400">Downloaded models stay in the previous folder. To move them too, quit Magnitude, run this, then open it again.</p>
+      <div className="mt-1.5"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, storageValue.active, storageValue.path)} label="Copy move command" /></div>
+    </>}
   </div>
+}
+function NetworkAccessRows() {
+  const settings = useAtomValue(networkAccessSettings)
+  const refresh = useAtomRefresh(networkAccessSettings)
+  const update = useAtomSet(updateNetworkAccess)
+  const updating = useAtomValue(updateNetworkAccess)
+  const regenerate = useAtomSet(regenerateNetworkApiKey)
+  const regenerating = useAtomValue(regenerateNetworkApiKey)
+  const busy = updating.waiting || regenerating.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const failure = firstFailure([settings, updating, regenerating])
+  const addresses = current ? (current.bind === null ? current.interfaces.map(entry => entry.address) : [current.bind]) : []
+  return <>
+    <SettingsRow label="Network access" hint={current ? "Let other devices on your network use Magnitude for inference. Apps on this computer are unaffected." : <SkeletonLine className="h-4 text-xs" width="240px" />}
+      alert={current?.warning ?? (failure ? hostFailureMessage(failure.cause) : undefined)}
+      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
+    {current?.enabled && <>
+      <SettingsRow label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
+        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.tailscale ? "Tailscale" : entry.name})` }))]}
+          value={current.bind ?? ALL_INTERFACES} onValueChange={value => update({ bind: value === ALL_INTERFACES || value === null ? null : value })}>
+          <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.tailscale ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+        </Select>} />
+      <SettingsRow label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token. Apps on this computer never need it." : "Other devices can connect without a key. Only do this on a network you trust."}
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => { regenerate(); }}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: checked })} /></>}>
+        {current.apiKey && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey} label="Copy API key" /></div>}
+      </SettingsRow>
+      <SettingsRow label="Connection URLs" hint={addresses.length === 0 ? "No addresses are available." : `OpenAI-compatible base URL${addresses.length === 1 ? "" : "s"}. Anthropic-compatible clients use /inference/anthropic on the same address.`}>
+        <div className="mt-2 space-y-2">{addresses.map(address => <CopyCommand key={address} command={inferenceUrl(address, current.port)} label={`Copy ${address} URL`} />)}</div>
+      </SettingsRow>
+    </>}
+    <RefreshAfter refresh={refresh} results={[updating, regenerating]} />
+  </>
+}
+function RemoteAccessCard({ platform }: { platform: string }) {
+  const settings = useAtomValue(networkAccessSettings)
+  const state = useAtomValue(hostState)
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const port = current?.port ?? (Result.isSuccess(state) ? Number(new URL(state.value.endpoint).port) : 10100)
+  const addresses = current?.enabled ? (current.bind === null ? current.interfaces.map(entry => entry.address) : [current.bind]) : []
+  return <article className={`${pageLayout.harnessCard} mt-5`}>
+    <h2 className="font-heading text-lg">Other apps and remote agents</h2>
+    <p className="mt-2 text-sm text-slate-500">Any OpenAI-compatible app on this computer can use Magnitude with this base URL and any API key value, such as <span className="text-slate-700 dark:text-slate-300">magnitude-local</span>. Anthropic-compatible apps use <span className="text-slate-700 dark:text-slate-300">/inference/anthropic</span> instead.</p>
+    <div className="mt-3"><CopyCommand command={inferenceUrl("127.0.0.1", port)} label="Copy local base URL" /></div>
+    {addresses.length > 0 && current ? <>
+      <p className="mt-4 text-sm text-slate-500">Other devices, WSL, and containers use {addresses.length === 1 ? "this URL" : "one of these URLs"}{current.requireApiKey ? " with the API key from Settings" : ""}.</p>
+      <div className="mt-2 space-y-2">{addresses.map(address => <CopyCommand key={address} command={inferenceUrl(address, port)} label={`Copy ${address} URL`} />)}</div>
+    </> : <p className="mt-4 text-sm text-slate-500">To reach Magnitude from other devices, WSL, or containers, turn on Network access in Settings.</p>}
+    {platform === "win32" && <p className="mt-3 text-xs text-slate-500">On Windows, agents inside WSL reach this computer through its network address unless WSL uses mirrored networking.</p>}
+  </article>
 }
 function AutomaticUpdatesRow() {
   const service = useUpdateSnapshot()
@@ -588,7 +651,7 @@ function AboutRowView({ service, version }: { service: DesktopSession; version: 
 }
 function SettingsPage() {
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
   </>
 }
