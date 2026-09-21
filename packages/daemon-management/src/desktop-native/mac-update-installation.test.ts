@@ -1,6 +1,6 @@
 import { Deferred, Effect, Fiber, Ref } from "effect"
 import { describe, expect, it } from "vitest"
-import { MacApplicationInstallation, MacInstallationObservationFailed, macUpdateJobIsActive, waitForMacApplicationInstallation } from "./mac-update-installation"
+import { MacApplicationInstallation, MacInstallationObservationFailed, macNativeInspectionEnvironment, macUpdateJobIsActive, waitForMacApplicationInstallation } from "./mac-update-installation"
 
 const executable = "/Applications/Magnitude.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt"
 describe("Mac native update launch barrier", () => {
@@ -15,6 +15,12 @@ describe("Mac native update launch barrier", () => {
   it("does not reinterpret malformed native evidence as installation absence", async () => {
     const result = await Effect.runPromise(macUpdateJobIsActive("unexpected output", executable).pipe(Effect.either))
     expect(result._tag).toBe("Left")
+  })
+  it("keeps native update inspection outside candidate loader injection", () => {
+    expect(macNativeInspectionEnvironment({ PATH: "/usr/bin", DYLD_INSERT_LIBRARIES: "/lab/shim.dylib",
+      LUME_METAL_PROCESS_NAME: "magnitude-inference", HOME: "/Users/runner" })).toEqual({
+      PATH: "/usr/bin", HOME: "/Users/runner",
+    })
   })
   it("waits through active installation without mutating or supervising its job", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

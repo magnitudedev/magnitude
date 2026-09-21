@@ -11,8 +11,12 @@ export interface MacApplicationInstallation {
 }
 export const MacApplicationInstallation = Context.GenericTag<MacApplicationInstallation>("desktop/MacApplicationInstallation")
 const Result = Schema.Struct({ code: Schema.Int, stdout: Schema.String })
+/** Native update inspection must execute the OS tools themselves, outside application loader injection. */
+export const macNativeInspectionEnvironment = (environment: NodeJS.ProcessEnv = process.env) =>
+  Object.fromEntries(Object.entries(environment).filter(([key]) => key !== "DYLD_INSERT_LIBRARIES" && !key.startsWith("LUME_METAL_")))
 const command = (executable: string, args: readonly string[]) => Effect.async<typeof Result.Type, MacInstallationObservationFailed>(resume => {
-  const child = execFile(executable, [...args], { encoding: "utf8", timeout: 5000, maxBuffer: 128 * 1024 }, (error, stdout) => {
+  const child = execFile(executable, [...args], { encoding: "utf8", timeout: 5000, maxBuffer: 128 * 1024,
+    env: macNativeInspectionEnvironment() }, (error, stdout) => {
     if (error !== null && typeof error.code !== "number") return resume(new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude updater. Retry the command." }))
     resume(Effect.succeed({ code: typeof error?.code === "number" ? error.code : 0, stdout }))
   })
