@@ -58,6 +58,13 @@ implementation candidate. The portable function remains the complete type, owner
 shape, and reference-semantic contract. Generated callers select this distinct path with
 `native_for_device`; its `NativeKernel` can be called directly but cannot enter a workflow.
 
+Direct Metal source receives a generated ABI prefix after element parameters are bound. The
+prefix derives representation descriptors exclusively from the semantic registry for every bound
+element parameter and tensor parameter/result: canonical identity, dense/packed/external kind,
+decoded dtype, packet geometry, and packed-plane layout and encoding. These are compile-time Metal
+macros, while dimensions, extents, strides, and scalars remain invocation words. Native assets do
+not infer representations from byte lengths or reproduce registry layout tables.
+
 At each static call occurrence, compilation considers every applicable portable body and every
 applicable lowering for the selected backend. Portable bodies are not fallback implementations and
 backend lowerings receive no implicit priority. A candidate is available only when its complete

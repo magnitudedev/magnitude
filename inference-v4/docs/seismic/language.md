@@ -145,6 +145,11 @@ the ordinary `for_device(device, precision)` and the explicit
 native handle permits only direct synchronous calls. Its launch expressions are closed integer
 arithmetic over the attached function's shape dimensions.
 
+The embedded source receives generated `SEISMIC_*` Metal macros. In addition to buffers, shapes,
+strides, and scalar words, polymorphic element bindings and tensor ABI leaves receive canonical
+registry-derived representation descriptors. Native source uses these macros rather than inferring
+storage from logical extents or duplicating representation layout tables.
+
 ## Capabilities
 
 The initial source-visible backend capability namespaces are:

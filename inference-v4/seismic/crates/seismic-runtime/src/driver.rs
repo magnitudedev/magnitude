@@ -680,7 +680,7 @@ pub(crate) fn prepare_native_metal(
             ResultKind::Range { .. } => NativeResult::Range,
         })
         .collect();
-    let source = render_native_source(logical.schema(), definition.source);
+    let source = render_native_source(logical.schema(), &bindings, definition.source);
     let pipeline =
         seismic_metal::DirectPipeline::compile(&opened.service, &source, definition.entry)
             .map_err(|error| {
@@ -1000,9 +1000,15 @@ fn read_native_word(bytes: &[u8], word: usize) -> u64 {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn render_native_source(schema: &CallSchema, source: &str) -> String {
+fn render_native_source(schema: &CallSchema, bindings: &ElementBindings, source: &str) -> String {
     let mut prefix = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    for (name, representation) in bindings.iter() {
+        render_native_representation(
+            &mut prefix,
+            &format!("SEISMIC_ELEMENT_{}", native_macro(name)),
+            representation,
+        );
+    }
     let mut buffer = 0usize;
     let mut word = 0usize;
     for dimension in schema.dimensions() {
@@ -1022,13 +1028,29 @@ fn render_native_source(schema: &CallSchema, source: &str) -> String {
             .count()
             == 1;
         match &parameter.kind {
-            ParameterKind::Tensor { axes, .. } => {
+            ParameterKind::Tensor {
+                axes,
+                representation,
+                ..
+            } => {
                 if named {
                     prefix.push_str(&format!("#define SEISMIC_BUFFER_{name} {buffer}\n"));
                 }
                 prefix.push_str(&format!(
                     "#define SEISMIC_PARAM_{ordinal}_BUFFER {buffer}\n"
                 ));
+                render_native_representation(
+                    &mut prefix,
+                    &format!("SEISMIC_PARAM_{ordinal}"),
+                    *representation,
+                );
+                if named {
+                    render_native_representation(
+                        &mut prefix,
+                        &format!("SEISMIC_{name}"),
+                        *representation,
+                    );
+                }
                 buffer += 1;
                 for axis in 0..axes.len() {
                     prefix.push_str(&format!(
@@ -1077,10 +1099,19 @@ fn render_native_source(schema: &CallSchema, source: &str) -> String {
     }
     let mut scalar_word = 0usize;
     for (ordinal, result) in schema.results().iter().enumerate() {
-        if let ResultKind::Tensor { axes, .. } = &result.kind {
+        if let ResultKind::Tensor {
+            axes,
+            representation,
+        } = &result.kind
+        {
             prefix.push_str(&format!(
                 "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}\n"
             ));
+            render_native_representation(
+                &mut prefix,
+                &format!("SEISMIC_RESULT_{ordinal}"),
+                *representation,
+            );
             buffer += 1;
             for axis in 0..axes.len() {
                 prefix.push_str(&format!(
@@ -1113,7 +1144,6 @@ fn render_native_source(schema: &CallSchema, source: &str) -> String {
     prefix
 }
 
-#[cfg(target_os = "macos")]
 fn native_macro(name: &str) -> String {
     name.chars()
         .map(|character| {
@@ -1124,6 +1154,185 @@ fn native_macro(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn render_native_representation(out: &mut String, prefix: &str, representation: RepresentationId) {
+    let info = registry::representation_info(representation);
+    out.push_str(&format!(
+        "#define {prefix}_REPRESENTATION_{} 1\n",
+        native_macro(info.name)
+    ));
+    out.push_str(&format!(
+        "#define {prefix}_DECODED_{} 1\n",
+        native_macro(info.decoded.name())
+    ));
+    match &info.kind {
+        registry::RepresentationKind::Dense(dtype) => {
+            out.push_str(&format!("#define {prefix}_KIND_DENSE 1\n"));
+            out.push_str(&format!(
+                "#define {prefix}_PACKET_SIZE {}\n#define {prefix}_PACKET_ALIGNMENT {}\n#define {prefix}_LOGICAL_GROUP 1\n#define {prefix}_PLANE_COUNT 0\n",
+                dtype.bytes(),
+                dtype.bytes()
+            ));
+        }
+        registry::RepresentationKind::Packed(layout) => {
+            out.push_str(&format!("#define {prefix}_KIND_PACKED 1\n"));
+            out.push_str(&format!(
+                "#define {prefix}_PACKET_SIZE {}\n#define {prefix}_PACKET_ALIGNMENT {}\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_PLANE_COUNT {}\n",
+                layout.packet_size,
+                layout.packet_alignment,
+                layout.group,
+                layout.planes.len()
+            ));
+            for (ordinal, plane) in layout.planes.iter().enumerate() {
+                let plane_prefix = format!("{prefix}_PLANE_{ordinal}");
+                out.push_str(&format!(
+                    "#define {plane_prefix}_NAME_{} 1\n#define {plane_prefix}_OFFSET {}\n#define {plane_prefix}_BYTES_PER_GROUP {}\n#define {plane_prefix}_ALIGNMENT {}\n#define {plane_prefix}_GROUP {}\n#define {plane_prefix}_FIELDS {}\n#define {plane_prefix}_ENTRY_BITS {}\n#define {plane_prefix}_STORAGE_{} 1\n",
+                    native_macro(plane.name),
+                    plane.offset,
+                    plane.bytes_per_group,
+                    plane.alignment,
+                    plane.group,
+                    plane.fields,
+                    plane.entry_bits,
+                    native_macro(plane.storage_dtype.name())
+                ));
+                render_native_plane_encoding(out, &plane_prefix, &plane.encoding);
+            }
+        }
+        registry::RepresentationKind::External(layout) => {
+            out.push_str(&format!("#define {prefix}_KIND_EXTERNAL 1\n"));
+            out.push_str(&format!(
+                "#define {prefix}_PACKET_SIZE {}\n#define {prefix}_PACKET_ALIGNMENT {}\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_PLANE_COUNT 0\n",
+                layout.packet_size, layout.packet_alignment, layout.logical_group
+            ));
+        }
+    }
+}
+
+fn render_native_plane_encoding(
+    out: &mut String,
+    prefix: &str,
+    encoding: &registry::PlaneEncoding,
+) {
+    match encoding {
+        registry::PlaneEncoding::Dense(dtype) => {
+            out.push_str(&format!(
+                "#define {prefix}_ENCODING_DENSE 1\n#define {prefix}_ENCODING_DTYPE_{} 1\n",
+                native_macro(dtype.name())
+            ));
+        }
+        registry::PlaneEncoding::Packed {
+            bits,
+            interpretation,
+        } => {
+            out.push_str(&format!(
+                "#define {prefix}_ENCODING_PACKED 1\n#define {prefix}_ENCODING_BITS {bits}\n"
+            ));
+            render_native_code_interpretation(out, prefix, interpretation);
+        }
+        registry::PlaneEncoding::FloatCode { format } => {
+            let name = match format {
+                registry::FloatCodeFormat::E2M1 => "E2M1",
+                registry::FloatCodeFormat::E4M3 => "E4M3",
+                registry::FloatCodeFormat::UE4M3 => "UE4M3",
+            };
+            out.push_str(&format!(
+                "#define {prefix}_ENCODING_FLOAT_CODE 1\n#define {prefix}_ENCODING_FLOAT_CODE_{name} 1\n#define {prefix}_ENCODING_BITS {}\n",
+                format.bits()
+            ));
+        }
+    }
+}
+
+fn render_native_code_interpretation(
+    out: &mut String,
+    prefix: &str,
+    interpretation: &registry::CodeInterpretation,
+) {
+    match interpretation {
+        registry::CodeInterpretation::Unsigned => {
+            out.push_str(&format!("#define {prefix}_CODE_UNSIGNED 1\n"));
+        }
+        registry::CodeInterpretation::TwosComplement => {
+            out.push_str(&format!("#define {prefix}_CODE_TWOS_COMPLEMENT 1\n"));
+        }
+        registry::CodeInterpretation::Offset(offset) => {
+            out.push_str(&format!(
+                "#define {prefix}_CODE_OFFSET 1\n#define {prefix}_CODE_OFFSET_VALUE {offset}\n"
+            ));
+        }
+        registry::CodeInterpretation::Table(values) => {
+            out.push_str(&format!(
+                "#define {prefix}_CODE_TABLE 1\n#define {prefix}_CODE_TABLE_COUNT {}\n",
+                values.len()
+            ));
+            for (ordinal, value) in values.iter().enumerate() {
+                out.push_str(&format!("#define {prefix}_CODE_TABLE_{ordinal} {value}\n"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_abi_tests {
+    use super::*;
+    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+
+    fn render_for(representation: &str) -> String {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "probe.seismic".to_owned(),
+            text: "fn probe[N](x: &tensor[N] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0])\n    return output\n"
+                .to_owned(),
+        }]))
+        .expect("probe source checks");
+        let binding = registry::representation(representation).expect("registered representation");
+        let bindings = ElementBindings::new().bind("E", binding);
+        let logical = module
+            .entry(module.entries()[0].id, &bindings)
+            .expect("probe entry monomorphizes");
+        render_native_source(logical.schema(), &bindings, "\nkernel void probe() {}\n")
+    }
+
+    #[test]
+    fn native_prefix_describes_dense_element_parameter_and_tensor_abi() {
+        let source = render_for("f16");
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_F16 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_DENSE 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_DECODED_F16 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PACKET_SIZE 2\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_LOGICAL_GROUP 1\n"));
+        assert!(source.contains("#define SEISMIC_X_REPRESENTATION_F16 1\n"));
+        assert!(source.contains("#define SEISMIC_RESULT_0_REPRESENTATION_F32 1\n"));
+    }
+
+    #[test]
+    fn native_prefix_describes_packed_planes_and_encoding() {
+        let source = render_for("q8g32");
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_Q8G32 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_PACKED 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PACKET_SIZE 36\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_LOGICAL_GROUP 32\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_COUNT 2\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_NAME_WORDS 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_BYTES_PER_GROUP 32\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_ENCODING_PACKED 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_CODE_UNSIGNED 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_NAME_SCALE 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_OFFSET 32\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_STORAGE_F32 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_ENCODING_DENSE 1\n"));
+    }
+
+    #[test]
+    fn native_prefix_describes_external_packets() {
+        let source = render_for("gguf_q4_k");
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_K 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_EXTERNAL 1\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PACKET_SIZE 144\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_LOGICAL_GROUP 256\n"));
+        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_COUNT 0\n"));
+    }
 }
 
 pub(crate) struct PreparedHandle<B: Backend> {

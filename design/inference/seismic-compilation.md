@@ -282,6 +282,11 @@ Consumers import only `seismic` and `seismic-build`, provide tensors and
 ordinary parameters, prepare with `for_device`, and `call`. Only genuinely
 polymorphic element representations are compile-time bindings.
 
+For the explicit direct-native route, runtime renders the canonical registry descriptors of those
+compile-time bindings and of every tensor ABI leaf into the Metal source prefix before compiling
+the pipeline. The rendered source therefore changes with representation bindings without adding a
+second layout authority or runtime representation branch.
+
 ## Failure taxonomy
 
 Source, bundle, target, preparation (`NoApplicableImplementation`,

@@ -28,5 +28,12 @@ The `NativeKernel` handle supports direct `.call(...)` only. It cannot be
 enqueued into a Seismic workflow and never enters lowering, tuning, solving,
 schedule construction, or portfolio selection.
 
+For polymorphic entries, the generated Metal prefix describes each bound
+element and tensor representation with `SEISMIC_ELEMENT_*`,
+`SEISMIC_PARAM_*`, named-parameter, and `SEISMIC_RESULT_*` macros. These
+include the canonical representation, dense/packed/external kind, decoded
+dtype, packet geometry, and packed-plane layout/encoding. `read_first` shows
+one native source compiled under both dense F16 and packed Q8G32 bindings.
+
 `runner` is an executable end-to-end example. On macOS, run it with
 `cargo run --manifest-path seismic/examples/native/runner/Cargo.toml`.

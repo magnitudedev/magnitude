@@ -11,6 +11,12 @@ as the ordinary kernel. It performs no tuning, solving, implementation selection
 modeling, workflow construction, or fallback. Opening and using this path also avoids Metal's lazy
 device-profile probe suite.
 
+Before direct compilation, the runtime prefixes the asset with ABI macros for buffers, invocation
+words, and canonical representation descriptors. Bound element parameters and tensor
+parameters/results expose their registry identity, representation kind, decoded dtype, packet
+geometry, and packed-plane layout/encoding. Representation facts are compile-time macros;
+dimensions, tensor extents/strides, and scalar values remain invocation words.
+
 Device kinds are Metal (`Device::metal()`, macOS only), the host CPU (`Device::cpu()`: one
 worker thread per unit of host parallelism, buffers in host memory) and CUDA
 (`Device::cuda()`: device zero through a private thread-affine driver context; the driver
