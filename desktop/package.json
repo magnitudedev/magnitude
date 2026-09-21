@@ -22,6 +22,7 @@
     "@magnitudedev/web": "workspace:*",
     "effect": "^3.21.2",
     "@magnitudedev/utils": "workspace:*",
+    "@magnitudedev/version": "workspace:*",
     "@phosphor-icons/react": "^2.1.10"
   },
   "devDependencies": {

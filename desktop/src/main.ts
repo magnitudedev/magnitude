@@ -50,6 +50,7 @@ import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/
 import { HostError, ApplicationAction, InferenceHostRpcs, type Page } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -284,7 +285,8 @@ const program = Effect.scoped(Effect.gen(function* () {
   const handlers = InferenceHostRpcs.toLayer({
     MachineIdentity: () => machineIdentity,
     Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
-    ApplicationInfo: () => Effect.sync(() => ({ version: app.getVersion() })),
+    // Unpackaged runs report Electron's own version; the generated Magnitude version is the truth there.
+    ApplicationInfo: () => Effect.sync(() => ({ version: app.isPackaged ? app.getVersion() : MAGNITUDE_VERSION })),
     Updates: () => updates.changes,
     SetAutoDownload: ({ enabled }) => preferenceWrites.withPermits(1)(updates.setAutoDownload(enabled)).pipe(Effect.mapError(connectionError), Effect.as({})),
     CheckUpdate: () => updateSchedule.check.pipe(Effect.mapError(connectionError), Effect.as({})),

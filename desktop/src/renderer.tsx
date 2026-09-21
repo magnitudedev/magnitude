@@ -1,10 +1,11 @@
-import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, type AppearancePreference } from "../../web/src/stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
+import { Switch } from "../../web/src/components/ui/switch"
 import { Input } from "../../web/src/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 import { Progress } from "../../web/src/components/ui/progress"
@@ -74,9 +75,7 @@ const saveAppearance = Atom.fn((preference: AppearancePreference, context) => ho
   Effect.tap(() => Effect.sync(() => { context.set(appearanceReadError, null); setAppearancePreference(preference) })),
 ))
 
-// The host owns the setting in config.json. Not kept alive: each visit to Settings re-reads it, so
-// hand edits of config.json show up, and it is refreshed after every host write.
-const modelStorageSettings = Atom.make(hostCommand(() => host.getModelStorage()))
+const modelStorageSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getModelStorage())))
 const chooseModelStorage = Atom.fn((_: void) => hostCommand(() => host.chooseModelStorageDirectory()).pipe(
   Effect.flatMap(path => path === null ? Effect.void : hostCommand(() => host.setModelStorage(path)))))
 const resetModelStorage = Atom.fn((_: void) => hostCommand(() => host.setModelStorage(null)))
@@ -429,143 +428,169 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
     <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
   </div>
 }
-function ApplicationSettings() {
+type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]
+const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result))
+function useUpdateSnapshot() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  const info = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.applicationInfo))), [session]))
-  return <section className={pageLayout.settingsCard}>
-    <h2 className="font-heading text-lg">About Magnitude</h2>
-    <p className="mt-2 text-sm text-slate-500">{Result.isSuccess(info) ? `Version ${info.value.version}` : Result.isFailure(info) ? "Version unavailable" : <SkeletonLine className="h-5 text-sm" width="96px" />}</p>
-    {Result.isSuccess(service) ? <UpdateSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert">Update settings unavailable.</p> : <UpdatesSkeleton />}
+  return Result.isSuccess(service) ? service.value : null
+}
+function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
+  return <section aria-label={label} className="mt-7">
+    <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</h2>
+    <div className="divide-y divide-slate-200 rounded-lg border border-slate-300 bg-white dark:divide-slate-800 dark:border-slate-750 dark:bg-slate-850">{children}</div>
   </section>
 }
-function UpdateSettingsView({ service }: { service: DesktopSession }) {
-  const observation = useAtomValue(service.updates)
-  const check = useAtomSet(service.checkUpdate)
-  const discard = useAtomSet(service.discardUpdate)
-  const discarding = useAtomValue(service.discardUpdate)
-  const download = useAtomSet(service.downloadUpdate)
-  const restart = useAtomSet(service.restartUpdate)
-  const setAutoDownload = useAtomSet(service.setAutoDownload)
-  const checking = useAtomValue(service.checkUpdate)
-  const downloading = useAtomValue(service.downloadUpdate)
-  const restarting = useAtomValue(service.restartUpdate)
-  const saving = useAtomValue(service.setAutoDownload)
-  const snapshot = Result.isSuccess(observation) ? observation.value : null
-  const current = snapshot?.transfer
-  const pending = downloading.waiting || restarting.waiting || discarding.waiting
-  const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
-    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Magnitude checks for updates automatically."
-    : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
-    : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
-    : current._tag === "Cancelling" ? "Stopping automatic download…"
-    : current._tag === "Staging" ? `Preparing version ${current.version}…`
-    : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
-    : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
-  if (Result.isInitial(observation)) return <UpdatesSkeleton />
-  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
-    <h3 className="font-medium">Application updates</h3>
-    {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
-      <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
-      Auto-download updates
-    </label>}
-    {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
-      <p role="alert" className="text-sm">{snapshot.preference.message}</p>
-      <div className="mt-2 flex gap-2"><Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(true)}>Enable automatic downloads</Button>
-        <Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(false)}>Use manual downloads</Button></div>
-    </div>}
-    <p className="mt-3 text-sm text-slate-500" role="status">{message}</p>
-    {snapshot?.check._tag === "Failed" && <p className="mt-2 text-sm" role="alert">{snapshot.check.message}</p>}
-    <div className="mt-3 flex flex-wrap gap-2">
-      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
-      {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+function SettingsRow({ label, hint, alert, control, children }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode }) {
+  return <div className="px-4 py-3">
+    <div className="flex items-center justify-between gap-6">
+      <div className="min-w-0"><p className="text-sm font-medium">{label}</p>
+        {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
+        {alert && <p role="alert" className="mt-0.5 text-xs">{alert}</p>}
+      </div>
+      {control && <div className="flex shrink-0 items-center gap-2">{control}</div>}
     </div>
-    {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
-    {[checking, downloading, restarting, discarding, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
+    {children}
   </div>
 }
-function AppearanceSettings() {
+function ThemeRow() {
   const appearance = useAppearancePreference()
   const save = useAtomSet(saveAppearance)
   const saving = useAtomValue(saveAppearance)
   const readError = useAtomValue(appearanceReadError)
-  return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
-    <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
-    <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
-    </div>
-    {readError && <p role="alert" className="px-5 pb-5 text-sm">{readError}</p>}
-    {Result.isFailure(saving) && <p role="alert" className="px-5 pb-5 text-sm">{hostFailureMessage(saving.cause)}</p>}
-  </section>
+  return <SettingsRow label="Theme" alert={readError ?? (Result.isFailure(saving) ? hostFailureMessage(saving.cause) : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+      {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+    </div>} />
 }
-function ModelStorageSettings() {
+function LaunchAtLoginRow() {
+  const service = useUpdateSnapshot()
+  if (!service) return <SettingsRow label="Launch at login" hint={<SkeletonLine className="h-4 text-xs" width="160px" />} />
+  return <LaunchAtLoginRowView service={service} />
+}
+function LaunchAtLoginRowView({ service }: { service: DesktopSession }) {
+  const state = useAtomValue(service.loginStartup)
+  const set = useAtomSet(service.setLoginStartup)
+  const change = useAtomValue(service.setLoginStartup)
+  const current = Result.isSuccess(state) ? state.value : null
+  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
+  const hint = current?._tag === "Unavailable" ? current.message
+    : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
+    : "Starts in the background with its tray icon."
+  const alert = Result.isFailure(state) ? `Could not read login startup. ${hostFailureMessage(state.cause)}` : Result.isFailure(change) ? hostFailureMessage(change.cause) : undefined
+  return <SettingsRow label="Launch at login" hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
+    control={<Switch aria-label="Launch at login" checked={enabled} disabled={!current || current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
+}
+function ModelStorageRow() {
   const settings = useAtomValue(modelStorageSettings)
   const refresh = useAtomRefresh(modelStorageSettings)
   const choose = useAtomSet(chooseModelStorage)
   const choosing = useAtomValue(chooseModelStorage)
   const reset = useAtomSet(resetModelStorage)
   const resetting = useAtomValue(resetModelStorage)
-  const relaunch = useAtomSet(relaunchApplication)
-  const relaunching = useAtomValue(relaunchApplication)
-  const busy = choosing.waiting || resetting.waiting || relaunching.waiting
+  const busy = choosing.waiting || resetting.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
-  const pending = current !== null && current.path !== current.active
-  return <section aria-labelledby="model-storage-heading" className={pageLayout.settingsCard}>
-    <div className="flex flex-wrap items-center justify-between gap-6">
-      <div className="min-w-0"><h2 id="model-storage-heading" className="font-heading text-lg">Model storage</h2>
-        <p className="mt-2 text-sm text-slate-500">Downloaded models are kept in this folder.</p>
-        {current ? <p className="mt-2 break-all font-mono text-[13px]" data-testid="model-storage-path">{current.path}{current.source === "Default" && <span className="ml-2 font-sans text-xs text-slate-500">Default</span>}</p>
-          : Result.isFailure(settings) ? <p role="alert" className="mt-2 text-sm">{hostFailureMessage(settings.cause)}</p> : <SkeletonLine className="mt-2 h-5 text-sm" width="60%" />}
-        {current?.warning && <p role="alert" className="mt-2 text-sm">{current.warning}</p>}
-      </div>
-      <div className="flex shrink-0 gap-2">
-        <Button variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
-        {current?.source === "Configured" && <Button variant="outline" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
-      </div>
-    </div>
-    {pending && current && <div className="mt-5 border-t border-slate-200 pt-4 text-sm dark:border-slate-750">
-      <div className="flex items-center justify-between gap-4" role="status">
-        <p><span className="font-medium">Restart required.</span> <span className="text-slate-500">Magnitude is still using the previous folder.</span></p>
-        <Button variant="secondary" size="sm" disabled={busy} onClick={() => { relaunch(); }}>Restart Magnitude</Button>
-      </div>
-      <p className="mt-4 text-slate-500">To move your downloaded models as well, quit Magnitude and run this first:</p>
-      <div className="mt-2"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, current.active, current.path)} label="Copy move command" /></div>
-    </div>}
-    {[choosing, resetting, relaunching].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-3 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
+  const failure = firstFailure([settings, choosing, resetting])
+  return <>
+    <SettingsRow label="Model storage" alert={current?.warning ?? (failure ? hostFailureMessage(failure.cause) : undefined)}
+      hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span> : <SkeletonLine className="h-4 text-xs" width="220px" />}
+      control={<>
+        {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
+      </>} />
     <ModelStorageRefresh refresh={refresh} results={[choosing, resetting]} />
-  </section>
+  </>
 }
-/** Re-reads the setting after a host write completes. */
+// Re-reads config.json when Settings opens and after each host write; the toast shares the atom.
 function ModelStorageRefresh({ refresh, results }: { refresh: () => void; results: ReadonlyArray<Result.Result<unknown, unknown>> }) {
   const key = results.map(result => Result.isSuccess(result) && !result.waiting ? "done" : Result.isFailure(result) ? "failed" : "idle").join(",")
   const previous = useRef(key)
+  useEffect(() => { refresh() }, [refresh])
   useEffect(() => { if (previous.current !== key) { previous.current = key; refresh() } }, [key, refresh])
   return null
 }
-function LoginSettings() {
+function RestartRequiredToast() {
+  const settings = useAtomValue(modelStorageSettings)
+  const relaunch = useAtomSet(relaunchApplication)
+  const relaunching = useAtomValue(relaunchApplication)
+  const current = Result.isSuccess(settings) ? settings.value : null
+  if (!current || current.path === current.active) return null
+  return <div role="status" className="fixed bottom-4 right-4 z-50 w-[30rem] max-w-[calc(100vw-2rem)] rounded-lg border border-slate-300 bg-white p-4 text-sm text-slate-900 shadow-md dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100">
+    <div className="flex items-center justify-between gap-4">
+      <div><p className="font-medium">Restart required</p><p className="mt-0.5 text-slate-600 dark:text-slate-400">Magnitude is still using the previous model folder.</p>
+        {Result.isFailure(relaunching) && <p role="alert" className="mt-1">{hostFailureMessage(relaunching.cause)}</p>}</div>
+      <Button size="sm" disabled={relaunching.waiting} onClick={() => { relaunch(); }}>Restart Magnitude</Button>
+    </div>
+    <p className="mt-3 text-xs text-slate-600 dark:text-slate-400">Downloaded models stay in the previous folder. To move them too, quit Magnitude, run this, then open it again.</p>
+    <div className="mt-1.5"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, current.active, current.path)} label="Copy move command" /></div>
+  </div>
+}
+function AutomaticUpdatesRow() {
+  const service = useUpdateSnapshot()
+  if (!service) return <SettingsRow label="Automatic updates" hint={<SkeletonLine className="h-4 text-xs" width="200px" />} />
+  return <AutomaticUpdatesRowView service={service} />
+}
+function AutomaticUpdatesRowView({ service }: { service: DesktopSession }) {
+  const observation = useAtomValue(service.updates)
+  const setAutoDownload = useAtomSet(service.setAutoDownload)
+  const saving = useAtomValue(service.setAutoDownload)
+  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const preference = snapshot?.preference
+  const closed = snapshot?.transfer._tag === "Closed"
+  return <SettingsRow label="Automatic updates"
+    hint={!snapshot ? (Result.isFailure(observation) ? "Update status unavailable." : <SkeletonLine className="h-4 text-xs" width="200px" />) : preference?._tag === "Unavailable" ? preference.message : "Download updates in the background when they are available."}
+    alert={Result.isFailure(saving) ? hostFailureMessage(saving.cause) : undefined}
+    control={<Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+}
+function AboutRow() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <LoginSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert" className="mt-6">Login settings unavailable.</p> : <LoginSkeleton />
+  const info = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.applicationInfo))), [session]))
+  const version = Result.isSuccess(info) ? `Magnitude ${info.value.version}` : Result.isFailure(info) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
+  if (!Result.isSuccess(service)) return <SettingsRow label={version} hint={Result.isFailure(service) ? "Update status unavailable." : <SkeletonLine className="h-4 text-xs" width="160px" />} />
+  return <AboutRowView service={service.value} version={version} />
 }
-function LoginSettingsView({ service }: { service: DesktopSession }) {
-  const state = useAtomValue(service.loginStartup)
-  const set = useAtomSet(service.setLoginStartup)
-  const change = useAtomValue(service.setLoginStartup)
-  const current = Result.isSuccess(state) ? state.value : null
-  if (Result.isInitial(state)) return <LoginSkeleton />
-  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  return <section className={pageLayout.settingsCard}>
-    <div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div>
-    <Button variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
-    {current?._tag === "Unavailable" && <p className="mt-3 text-sm text-slate-500">{current.message}</p>}
-    {current?._tag === "RequiresApproval" && <p className="mt-3 text-sm">Allow Magnitude in your system login settings to finish enabling startup.</p>}
-    {Result.isFailure(state) && <p role="alert" className="mt-3 text-sm">Could not read login startup. {hostFailureMessage(state.cause)}</p>}
-    {Result.isFailure(change) && <p role="alert" className="mt-3 text-sm">{hostFailureMessage(change.cause)}</p>}
-  </section>
+function AboutRowView({ service, version }: { service: DesktopSession; version: ReactNode }) {
+  const observation = useAtomValue(service.updates)
+  const check = useAtomSet(service.checkUpdate)
+  const discard = useAtomSet(service.discardUpdate)
+  const discarding = useAtomValue(service.discardUpdate)
+  const download = useAtomSet(service.downloadUpdate)
+  const restart = useAtomSet(service.restartUpdate)
+  const checking = useAtomValue(service.checkUpdate)
+  const downloading = useAtomValue(service.downloadUpdate)
+  const restarting = useAtomValue(service.restartUpdate)
+  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const current: UpdateTransfer | undefined = snapshot?.transfer
+  const pending = downloading.waiting || restarting.waiting || discarding.waiting
+  const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
+    : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
+    : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
+    : current._tag === "Cancelling" ? "Stopping automatic download…"
+    : current._tag === "Staging" ? `Preparing version ${current.version}…`
+    : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
+    : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
+  const failure = snapshot?.check._tag === "Failed" ? snapshot.check.message : firstFailure([checking, downloading, restarting, discarding])
+  const installable = current?._tag === "Ready" || current?._tag === "InstallationFailed"
+  return <SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+    alert={typeof failure === "string" ? failure : failure ? hostFailureMessage(failure.cause) : undefined}
+    control={<>
+      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>
+        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
+        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>
+        : null}
+    </>} />
+}
+function SettingsPage() {
+  return <>
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
+  </>
 }
 function App() {
   const state = useAtomValue(hostState)
@@ -576,15 +601,15 @@ function App() {
   const pageResult = useAtomValue(pageAtom)
   const page = Result.isSuccess(pageResult) ? pageResult.value : "discover"
   const service = Result.isSuccess(state) ? state.value.service : null
-  return <DesktopShell page={page} navigate={navigate}>
+  return <><RestartRequiredToast /><DesktopShell page={page} navigate={navigate}>
       {page === "status" ? Result.isFailure(state) ? <p role="alert" className="mt-7">{hostFailureMessage(state.cause)}</p> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "usage" ? <ServingUsage />
-      : page === "settings" ? <><AppearanceSettings /><ModelStorageSettings /><LoginSettings /><ApplicationSettings /></>
+      : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-8">The service needs attention. Open Status for details.</p></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
-  </DesktopShell>
+  </DesktopShell></>
 }
 function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
   const platform = window.__magnitudeDesktop.platform
