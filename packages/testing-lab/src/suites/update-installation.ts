@@ -23,6 +23,15 @@ export const observeUpdatedInstallation = (previous: InstalledApplication, candi
   } else if (format === "dmg") {
     version = (yield* run("/usr/bin/plutil", ["-extract", "CFBundleShortVersionString", "raw", "-o", "-", join(previous.root, "Contents/Info.plist")])).stdout.trim()
     if (version !== candidate.version) return yield* fail("Updated bundle version differs from its candidate")
+  } else if (format === "exe") {
+    const observation = yield* checkedCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", String.raw`
+$ErrorActionPreference = 'Stop'
+$registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MagnitudeDesktop'
+if (![String]::Equals([IO.Path]::GetFullPath($registration.InstallLocation), [IO.Path]::GetFullPath($env:LAB_UPDATED_ROOT), [StringComparison]::OrdinalIgnoreCase)) { throw 'Updated registration points outside the owned installation' }
+[Console]::Write([string]$registration.DisplayVersion)
+`], { env: { ...environment, LAB_UPDATED_ROOT: previous.root }, inheritEnv: false, timeoutMs: 30_000 })
+    version = observation.stdout.trim()
+    if (version !== candidate.version) return yield* fail("Updated Windows registration still contains a different version")
   }
   const cli = yield* run(previous.cli, ["--version"])
   if (cli.stdout.trim() !== candidate.version) return yield* fail("Updated bundled CLI version differs from its candidate")

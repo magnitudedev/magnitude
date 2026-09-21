@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { FileSystem } from "@effect/platform"
 import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { join } from "node:path"
@@ -144,7 +145,7 @@ export const azureAllocator = (config: AzureConfig) => Layer.effect(MachineAlloc
       if (!/^ml-[a-f0-9]{12}$/.test(lease.resourceName)) return yield* fail("Azure machine names must be ml- followed by twelve hexadecimal digits")
       const image = config.images.find(i => i.targetId === target.id)
       if (!image) return yield* fail(`No qualified Azure image for ${target.id}`)
-      if ((target.os === "windows") !== (image.os === "Windows")) return yield* fail("Image OS does not match target")
+      if (isWindows(target.os) !== (image.os === "Windows")) return yield* fail("Image OS does not match target")
       if (target.os === "windows" && Option.isNone(image.windowsLicense)) return yield* fail("Windows client allocation requires an operator-verified licensing basis")
       if (target.os !== "windows" && Option.isSome(image.windowsLicense)) return yield* fail("Windows client licensing cannot be applied to another OS")
       const gpu = Option.flatMap(image.initialization, setup => "kind" in setup ? setup.gpu : Option.none())

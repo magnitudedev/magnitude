@@ -12,11 +12,13 @@ test("Linux identity preserves distro versions and DGX OTA identity without exec
   }
 })
 
-test("Windows client identity distinguishes client versions and rejects Server despite matching build numbers", async () => {
+test("Windows identity distinguishes clients and supported Server editions despite shared build numbers", async () => {
   const report = { productType: 1, version: "10.0.26100", build: "26100", architecture: 9, cpuVendor: "GenuineIntel", cpuName: "Xeon", machineModel: "Virtual Machine", memoryBytes: 16 * 1024 ** 3 }
   expect(await Effect.runPromise(windowsIdentity(report))).toMatchObject({ os: "windows", version: "11", arch: "x64" })
   expect(await Effect.runPromise(windowsIdentity({ ...report, build: "19045", architecture: 12 }))).toMatchObject({ version: "10", arch: "arm64" })
-  for (const invalid of [{ ...report, productType: 3 }, { ...report, productType: 2 }, { ...report, architecture: 0 }, { ...report, version: "6.3" }]) {
+  expect(await Effect.runPromise(windowsIdentity({ ...report, productType: 3 }))).toMatchObject({ os: "windows-server", version: "2025" })
+  expect(await Effect.runPromise(windowsIdentity({ ...report, productType: 3, build: "20348" }))).toMatchObject({ os: "windows-server", version: "2022" })
+  for (const invalid of [{ ...report, productType: 3, build: "19045" }, { ...report, productType: 2 }, { ...report, architecture: 0 }, { ...report, version: "6.3" }]) {
     expect((await Effect.runPromise(windowsIdentity(invalid).pipe(Effect.either)))._tag).toBe("Left")
   }
 })

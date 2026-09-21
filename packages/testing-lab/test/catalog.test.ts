@@ -19,11 +19,11 @@ describe("coverage policy", () => {
     expect((await Effect.runPromise(planRun(base))).targets[0]!.cases.filter(test => test.suite === "update")).toHaveLength(6)
   })
   test("expands every agreed combination without excluded platforms", () => {
-    expect(targets).toHaveLength(44)
-    expect(new Set(targets.map(t => t.id)).size).toBe(44)
+    expect(targets).toHaveLength(46)
+    expect(new Set(targets.map(t => t.id)).size).toBe(46)
     expect(new Set(cases.map(c => c.id)).size).toBe(52)
     expect(new Set(cases.map(c => c.suite)).size).toBe(9)
-    expect(targets.filter(t => t.backend === "cuda")).toHaveLength(12)
+    expect(targets.filter(t => t.backend === "cuda")).toHaveLength(13)
     expect(targets.every(t => t.os !== "macos" || t.arch === "arm64")).toBe(true)
   })
   test("PR keeps all 12 representatives and blocks office access instead of omitting it", async () => {
@@ -35,7 +35,7 @@ describe("coverage policy", () => {
   })
   test("full retains all desired targets even before qualification", async () => {
     const plan = await Effect.runPromise(planRun(request({ kind: "profile", profile: "full" })))
-    expect(plan.targets).toHaveLength(44)
+    expect(plan.targets).toHaveLength(46)
     expect(plan.targets.every(t => t.cases.filter(c => c.id === "H7").length === 3)).toBe(true)
   })
   test("custom harness selection expands real setup dependencies and device attestation", async () => {

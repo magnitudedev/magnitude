@@ -12,7 +12,7 @@ $build = [int]$os.BuildNumber
 $client = $os.ProductType -eq 1
 $matches = if ($config.distribution.os -eq 'windows') {
   $client -and (($config.distribution.version -eq '10' -and $build -ge 19041 -and $build -lt 22000) -or ($config.distribution.version -eq '11' -and $build -ge 22000))
-} else { $config.distribution.os -eq 'windows-server' -and $config.distribution.version -eq '2025' -and -not $client -and $build -eq 26100 }
+} else { $config.distribution.os -eq 'windows-server' -and $os.ProductType -eq 3 -and (($config.distribution.version -eq '2022' -and $build -eq 20348) -or ($config.distribution.version -eq '2025' -and $build -eq 26100)) }
 if (-not $matches -or $config.architecture -ne 'x64' -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Runtime image does not match its admitted distribution and architecture' }
 if ($config.adminUsername -notmatch '^[a-z][a-z0-9]{1,19}$') { throw 'Invalid worker account' }
 $account = Get-LocalUser -Name $config.adminUsername

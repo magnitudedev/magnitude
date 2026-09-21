@@ -3,12 +3,30 @@ import { BunContext } from "@effect/platform-bun"
 import { Effect, Layer, Option, Redacted, Schema } from "effect"
 import { parse } from "yaml"
 import { expect, test } from "vitest"
-import { prepareAzureInitialization, LinuxAzureInitialization } from "../src/providers/azure-initialization"
+import { prepareAzureInitialization, LinuxAzureInitialization, WindowsAzureInitialization } from "../src/providers/azure-initialization"
+import { WindowsToolDownloads, windowsToolDownloads } from "../src/providers/windows-tools"
 import { azureInitializationWait, azureInitializationDiagnosticsScript } from "../src/providers/azure-readiness"
 import { LinuxInitialization } from "../src/providers/linux-initialization"
 import { checkedCommand, ProcessExecutor, ProcessExecutorLive } from "../src/process"
 import driverPins from "../tools/nvidia-drivers.json"
 import { sha256 } from "../src/snapshot"
+
+for (const version of ["2022", "2025"] as const) for (const gpu of ["windows-a10", "windows-rtx-pro-6000"] as const) {
+  test(`pinned Windows GPU recipe accepts Server ${version} with ${gpu} and rejects ARM64`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-server-gpu-" })
+    const script = "Write-Output 'prepared'", file = `${root}/prepare.ps1`, digest = "a".repeat(64)
+    yield* fs.writeFileString(file, script)
+    const pin = { file, sha256: sha256(script) }
+    const recipe = yield* Schema.decodeUnknown(WindowsAzureInitialization)({ kind: "windows", toolsSetup: pin, runtimeSetup: pin, desktopSetup: pin,
+      downloads: yield* Schema.encode(WindowsToolDownloads)(yield* windowsToolDownloads),
+      distribution: { os: "windows-server", version }, architecture: "x64", adminUsername: "labworker", gpu: driverPins[gpu],
+      runtime: { account: "labaccount", container: "artifacts", blob: `worker-runtime/${digest}.tar.gz`, sha256: digest, bytes: 100 } })
+    const scope = { executable: "az", subscription: "5304c4b3-d605-4193-b0cb-766c065acfa6", adminUsername: "labworker", architecture: "x64" as const, os: "windows-server", version }
+    expect((yield* prepareAzureInitialization(recipe, scope)).kind).toBe("windows")
+    expect((yield* prepareAzureInitialization(recipe, { ...scope, architecture: "arm64" }).pipe(Effect.either))._tag).toBe("Left")
+  })).pipe(Effect.provide([BunContext.layer, ProcessExecutorLive]))))
+}
 
 for (const mode of ["gpu", "unsupported-gpu", "renew", "wrong-blob", "write-permission", "expired", "foreign-account", "changed-script", "signing-failure", "wrong-distribution"] as const) {
   test(`runtime capability preparation: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {

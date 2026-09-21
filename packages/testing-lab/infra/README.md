@@ -143,7 +143,8 @@ never a shell argument or Git file. PostgreSQL backup retention is seven days.
 
 Bundle `src/server.ts` with the repository-pinned Bun using `bun build --target=bun`. Place the
 result as `coordinator.js` beside `Dockerfile`, `entrypoint.sh`, `linux-worker.sh`,
-`macos-worker.sh`, `windows-tools.ps1`, `windows-runtime.ps1` and `windows-desktop.ps1` in a private build context.
+`macos-worker.sh`, `windows-tools.ps1`, `windows-runtime.ps1`, `windows-desktop.ps1`,
+`tailscale-start.sh`, `spark-docker.sh` and `spark-ssh.sh` in a private build context.
 Build that context using `az acr build --registry magnitudelab5304 --platform linux/amd64`.
 Only this generated context is uploaded; do not send the entire working directory or secrets.
 Resolve the resulting image digest, then deploy `coordinator.bicep` using that immutable reference.
@@ -157,6 +158,34 @@ logs in with the coordinator managed identity. Run credentials are still deliver
 through the protected Azure worker bootstrap. The coordinator has one always-running replica,
 2 vCPUs and 4 GiB memory, with database/object state outside the replica. Entra developer
 credentials remain supported by the ordinary server configuration.
+
+For trusted Spark runs, set the Spark allocator executable to `/opt/lab/spark-docker.sh`,
+host to `ssh://tom@sparky`, and image to an immutable digest already available to that
+Docker daemon. Supply `tailscaleAuthKey` through the secure deployment parameter file.
+Use a reusable key with ephemeral devices so coordinator replacements enroll automatically
+and offline replicas disappear. This is a separate coordinator credential, never a worker
+environment variable. It must be rotated before its enrollment expiry; an expired key cannot
+start a replacement coordinator. The existing tailnet policy must authorize that identity to
+SSH to Sparky as `tom`. Enrollment does not narrow the organization's existing network policy.
+Do not copy a developer's personal SSH private key into the service.
+
+The coordinator runs Tailscale in userspace with no inbound listener, subnet route or privileged
+container. Tailscale's SSH wrapper resolves MagicDNS and authenticates the remote host key;
+only the Spark Docker client uses this route. Enrollment material is written to a private
+temporary file, removed after enrollment and unset before the application starts. Tailscale
+startup failures prevent that revision from becoming ready; other healthy revisions must not
+be removed before the new revision is ready.
+
+Build `Spark.Dockerfile` with the pinned worker archive as `runtime.tar.gz` and
+`spark-prepare.sh` and `spark-update.rules` under their original names in the context. Use a native ARM64 Azure builder: the qualified
+Bun version crashed under the registry builder's ARM emulation. Image construction, dependency
+installation and candidate source compilation do not run on the office Spark. Its configured
+runtime launches `/bin/bash /opt/lab/runtime/packages/testing-lab/infra/spark-worker.sh`, with
+`/lab` as the workspace and an explicit small model. Native generation remains a separate
+qualification from successfully building or pulling the image.
+The container owns a private network namespace with `NET_ADMIN` for scoped network fault tests,
+plus its own system D-Bus and Polkit service for the packaged updater. It has no host network,
+host filesystem mounts or privileged-container mode; these services never run on Sparky's host.
 
 The managed identity can allocate resources within magnitude-ci, pull the private image and
 access artifact blobs. Worker VMs do not receive that identity. Foundation resources are durable

@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
@@ -66,7 +67,7 @@ export const verifyWindowsSignature = (path: string, policy: typeof WindowsTrust
 
 export const inspectWindowsPackageTrust = (app: InstalledApplication, release: typeof ReleaseManifestSchema.Type,
   policy: typeof WindowsTrustPolicy.Type, environment: Readonly<Record<string, string>>) => Effect.scoped(Effect.gen(function* () {
-  if (app.candidate.target.os !== "windows") return yield* invalid("Requires a Windows package")
+  if (!isWindows(app.candidate.target.os)) return yield* invalid("Requires a Windows package")
   const signatures = [{ ...(yield* verifyWindowsSignature(app.candidate.path, policy, environment)), path: "installer" }]
   const unqualifiedVendors: string[] = []
   const runtime = yield* admittedRuntimeComposition(release, app.candidate.target)

@@ -9,8 +9,8 @@ test("keeps source paths literal and enables Spark only by explicit flag", async
 })
 
 test("custom selections preserve explicit targets, suites and harnesses", async () => {
-  const selected = await Effect.runPromise(selectionFromOptions(new Map([["target", "ubuntu-24.04-x64-cpu-intel,windows-11-x64-cuda-a10"], ["suite", "harness, cli"], ["harness", "pi,hermes"]])))
-  expect(selected).toMatchObject({ kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel", "windows-11-x64-cuda-a10"], suites: ["harness", "cli"], harnesses: ["pi", "hermes"] })
+  const selected = await Effect.runPromise(selectionFromOptions(new Map([["target", "ubuntu-24.04-x64-cpu-intel,windows-server-2025-x64-cuda-a10"], ["suite", "harness, cli"], ["harness", "pi,hermes"]])))
+  expect(selected).toMatchObject({ kind: "custom", targets: ["ubuntu-24.04-x64-cpu-intel", "windows-server-2025-x64-cuda-a10"], suites: ["harness", "cli"], harnesses: ["pi", "hermes"] })
 })
 test("quick accepts a harness override without becoming a custom suite selection", async () => {
   const selected = await Effect.runPromise(selectionFromOptions(new Map([["profile", "quick"], ["harness", "opencode,hermes"]])))

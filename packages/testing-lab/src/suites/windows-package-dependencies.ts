@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 import { FileSystem } from "@effect/platform"
@@ -15,7 +16,7 @@ export const WindowsPackageDependencies = Schema.Struct({ application: PeDepende
 export const inspectWindowsPackageDependencies = (app: InstalledApplication, release: typeof ReleaseManifestSchema.Type,
   environment: Readonly<Record<string, string>>) => Effect.scoped(Effect.gen(function* () {
   const target = app.candidate.target
-  if (target.os !== "windows") return yield* new AssertionFailure({ message: "PE package inspection requires a Windows target" })
+  if (!isWindows(target.os)) return yield* new AssertionFailure({ message: "PE package inspection requires a Windows target" })
   const inspector = environment.LAB_DEPENDENCIES_EXECUTABLE, systemRoot = environment.SystemRoot ?? environment.SYSTEMROOT
   if (!inspector || !win32.isAbsolute(inspector) || !systemRoot || !win32.isAbsolute(systemRoot)) {
     return yield* new InfrastructureFailure({ operation: "pe-dependencies", message: "Pinned Windows dependency inspector or SystemRoot is unavailable" })

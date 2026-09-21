@@ -9,10 +9,13 @@ import { InstalledApplication } from "../src/installer"
 import { CliTests } from "../src/suites/cli"
 import { verifyInstallationOwnership } from "../src/suites/installation-ownership"
 
-for (const mode of ["owned", "symlink", "foreign-entrypoint", "escaped-bundle", "changed-owner"] as const) test(`installation ownership rejects substitution: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+for (const targetId of ["ubuntu-24.04-x64-cpu-intel", "windows-server-2022-x64-cpu-intel", "windows-server-2025-x64-cpu-intel"]) {
+for (const mode of ["owned", "symlink", "foreign-entrypoint", "escaped-bundle", "changed-owner"] as const) test(`installation ownership rejects substitution: ${targetId}/${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const temporary = yield* fs.makeTempDirectoryScoped({ prefix: "lab-install-ownership-" })
-  const root = join(temporary, "app"), bundled = join(root, "resources", "magnitude"), outside = join(temporary, "other-cli")
+  const target = targets.find(target => target.id === targetId)!
+  const windows = target.os === "windows-server", filename = windows ? "app.exe" : "app.deb"
+  const root = join(temporary, "app"), bundled = join(root, "resources", windows ? "magnitude.exe" : "magnitude"), outside = join(temporary, "other-cli")
   yield* fs.makeDirectory(join(root, "resources"), { recursive: true })
   yield* fs.writeFileString(outside, "another CLI")
   if (mode === "escaped-bundle") yield* fs.symlink(outside, bundled)
@@ -20,8 +23,8 @@ for (const mode of ["owned", "symlink", "foreign-entrypoint", "escaped-bundle", 
   const cli = mode === "symlink" ? join(temporary, "launcher") : mode === "foreign-entrypoint" ? outside : bundled
   if (mode === "symlink") yield* fs.symlink(bundled, cli)
   const app = yield* Schema.decodeUnknown(InstalledApplication)({ root, executable: join(root, "magnitude"), cli, packageVersion: "0.1.3",
-    candidate: { version: "0.1.3", target: targets.find(target => target.id === "ubuntu-24.04-x64-cpu-intel"), path: join(temporary, "app.deb"),
-      artifact: { id: "desktop", kind: "desktop", host: "linux-x64-gnu", filename: "app.deb", bytes: 1, sha256: "a".repeat(64) } } })
+    candidate: { version: "0.1.3", target, path: join(temporary, filename),
+      artifact: { id: "desktop", kind: "desktop", host: target.artifactHost, filename, bytes: 1, sha256: "a".repeat(64) } } })
   const owner = yield* Schema.decodeUnknown(ApplicationIdentity)({ applicationPid: 101, servicePid: 102, serviceInstance: "first" })
   let observed = 0, invoked = 0
   const result = yield* verifyInstallationOwnership(app, { ready: () => Effect.void, identity: () => Effect.sync(() => {
@@ -35,3 +38,4 @@ for (const mode of ["owned", "symlink", "foreign-entrypoint", "escaped-bundle", 
   expect(invoked).toBe(mode === "foreign-entrypoint" || mode === "escaped-bundle" ? 0 : 2)
   if (result._tag === "Right") expect(result.right.before).toEqual(result.right.after)
 })).pipe(Effect.provide(BunContext.layer))))
+}

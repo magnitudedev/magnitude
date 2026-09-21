@@ -169,7 +169,7 @@ test("PostgreSQL fences stale workers, rolls back transactions and serializes Sp
       const client = yield* LabClient
       expect(Buffer.concat(Array.from(yield* client.evidence(assignment.claim.runId, evidenceDigest).pipe(Stream.runCollect))).toString()).toBe("private test trace")
       expect((yield* client.identity()).owner).toBe("developer")
-      expect((yield* client.targets()).length).toBe(44)
+      expect((yield* client.targets()).length).toBe(46)
       expect((yield* client.plan(request)).targets.length).toBe(1)
       expect((yield* client.get(runId)).state._tag).toBe("Finished")
       expect(Option.getOrThrow(yield* client.result(runId)).cases.every(c => c.outcome.status === "cancelled")).toBe(true)

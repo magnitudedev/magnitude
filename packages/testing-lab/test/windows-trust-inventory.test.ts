@@ -37,7 +37,7 @@ for (const mode of ["owned", "missing-service", "non-native-service", "misplaced
       { id: "base", kind: "icn-base", host: "windows-x64-msvc", backend: "cpu", nativeBuild: "fixture", backendModuleAbi: "fixture", filename: "base.tar.gz", bytes: bytes.length, sha256: sha256(bytes) },
     ] })
   const app = yield* Schema.decodeUnknown(InstalledApplication)({ root: appRoot, executable: join(appRoot, "Magnitude.exe"), cli: join(appRoot, "resources/magnitude.exe"), packageVersion: "0.1.3",
-    candidate: { version: "0.1.3", path: join(temporary, "installer.exe"), target: targets.find(target => target.id === "windows-11-x64-cpu-intel"),
+    candidate: { version: "0.1.3", path: join(temporary, "installer.exe"), target: targets.find(target => target.id === "windows-server-2025-x64-cpu-intel"),
       artifact: { id: "desktop", kind: "desktop", host: "windows-x64-msvc", filename: "installer.exe", bytes: 256, sha256: sha256(header) } } })
   yield* write(app.candidate.path)
   const signatures = Layer.succeed(ProcessExecutor, { run: spec => Effect.succeed({ exitCode: 0, stderr: "", stdout: spec.executable === "signtool.exe" ? "" : JSON.stringify({ status: "Valid", signatureType: "Authenticode", timestamped: true,

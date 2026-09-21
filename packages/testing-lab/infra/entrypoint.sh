@@ -17,5 +17,9 @@ if [ -n "${LAB_NAMESPACE_CREDENTIAL_BASE64:-}" ]; then
   export NSC_TOKEN_FILE=/opt/lab/namespace-auth/token.json
 fi
 export LAB_COORDINATOR_CONFIG=/opt/lab/config.json
+if [ -n "${LAB_TAILSCALE_AUTH_KEY:-}" ]; then
+  /bin/sh /opt/lab/tailscale-start.sh
+  unset LAB_TAILSCALE_AUTH_KEY
+fi
 az login --identity --client-id "$LAB_AZURE_CLIENT_ID" --output none
 exec bun /opt/lab/coordinator.js

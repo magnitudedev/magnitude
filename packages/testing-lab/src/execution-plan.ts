@@ -14,7 +14,7 @@ export const ExecutionPlan = Schema.Array(WorkSpec)
 const buildCases = new Set(["P1", "P2"])
 const producerTargets: Readonly<Record<Target["artifactHost"], string>> = {
   "darwin-arm64": "macos-15-arm64-cpu-apple-silicon",
-  "windows-x64-msvc": "windows-10-x64-cpu-intel",
+  "windows-x64-msvc": "windows-server-2022-x64-cpu-intel",
   "linux-x64-gnu": "ubuntu-24.04-x64-cpu-intel",
   "linux-arm64-gnu": "ubuntu-24.04-arm64-cpu-arm",
 }

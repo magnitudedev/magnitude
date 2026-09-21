@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { assignmentInputs } from "./work-store"
 import { Context, DateTime, Effect, Layer, Option, Redacted, Schema } from "effect"
 import { posix, win32 } from "node:path"
@@ -48,7 +49,7 @@ export const outwardWorkerRunner = (config: typeof OutwardRunnerConfig.Type) => 
       if (assignment.plan.request.trust === "untrusted-ci" && (!runtime.disposable || machine.provider === "local" || machine.provider === "spark")) return yield* fail("Untrusted work requires disposable cloud execution")
       const deadline = Math.min(DateTime.toEpochMillis(machine.tags.expiresAt), DateTime.toEpochMillis(assignment.deadline))
       if (deadline <= Date.now()) return yield* fail("Worker allocation has expired")
-      const path = assignment.target.target.os === "windows" ? win32 : posix
+      const path = isWindows(assignment.target.target.os) ? win32 : posix
       const base = machine.provider === "local" ? machine.root : runtime.root
       if (!path.isAbsolute(base)) return yield* fail("Guest root must be absolute")
       const root = path.join(base, machine.tags.leaseId, `attempt-${assignment.claim.fence}`)

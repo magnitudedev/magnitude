@@ -27,7 +27,7 @@ export const Trust = Schema.Literal("developer", "trusted-ci", "untrusted-ci")
 export const Principal = Schema.Struct({ owner: OwnerId, trust: Trust })
 export type Principal = typeof Principal.Type
 export const Target = Schema.Struct({
-  id: TargetId, os: Schema.Literal("macos", "windows", "ubuntu", "debian", "fedora", "redhat", "dgx-os"),
+  id: TargetId, os: Schema.Literal("macos", "windows", "windows-server", "ubuntu", "debian", "fedora", "redhat", "dgx-os"),
   version: Schema.NonEmptyString, arch: Architecture, backend: Backend, hardware: Hardware,
   provider: Provider, artifactHost: Schema.Literal("darwin-arm64", "windows-x64-msvc", "linux-x64-gnu", "linux-arm64-gnu"),
   packageFormat: Schema.Literal("dmg", "exe", "deb", "rpm"),
@@ -112,3 +112,6 @@ export const resultExitCode = (result: RunResult): 0 | 1 | 2 | 3 => {
   if (keys.some(key => !selected.has(key))) return 2
   return 0
 }
+
+/** Windows client and Server share package mechanics, but never host identity. */
+export const isWindows = (os: Target["os"]): boolean => os === "windows" || os === "windows-server"

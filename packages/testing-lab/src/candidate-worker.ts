@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { DebianPackageTrust, inspectDebianPackageTrust } from "./suites/debian-package-trust"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
@@ -250,7 +251,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             Effect.void,
             () => Effect.scoped(Effect.gen(function* () {
               const app = yield* ownership.replace(pair.previous)
-              const updateState = target.os === "windows" ? join(config.root, "update-profile", "state")
+              const updateState = isWindows(target.os) ? join(config.root, "update-profile", "state")
                 : yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
               const baselineEnvironment = yield* runtimeEnvironment(pair.previousRelease, target.artifactHost, environment)
               const updateEnvironment = { ...baselineEnvironment, ...(Option.isSome(restored) ? { NODE_EXTRA_CA_CERTS: restored.value.fixture.caPath } : {}), MAGNITUDE_DEV_DATA_DIR: join(config.root, "update-profile"), MAGNITUDE_DEV_PORT: String(application.port), MAGNITUDE_DESKTOP_STATE_DIR: updateState }
@@ -298,7 +299,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           if (!release.artifacts.some(artifact => artifact.kind === "icn-base" && Option.contains(artifact.host, target.artifactHost))) {
             return yield* unavailable("Dependency closure requires the admitted native runtime archives")
           }
-          if (target.os === "windows") {
+          if (isWindows(target.os)) {
             const report = yield* inspectWindowsPackageDependencies(yield* installed, release, environment).pipe(Effect.provide(NodeArchiveExtractor))
             return CaseObservation.make({ detail: "Verified packaged PE import closure in native loader contexts, including delay imports, API-set mappings and signed OS boundaries",
               evidence: [yield* inputEvidence, yield* evidence("package-dependencies.json", WindowsPackageDependencies, report)] })
@@ -328,8 +329,8 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             return CaseObservation.make({ detail: "Verified installed RPM payload, native package integrity and admitted runtime archives; no production publisher trust claimed",
               evidence: [yield* inputEvidence, yield* evidence("P5-rpm-package-trust.json", RpmPackageTrust, receipt)] })
           }
-          if (target.os !== "macos" && target.os !== "windows") return yield* unavailable("Native package trust verification is not yet qualified for this platform")
-          if (target.os === "windows") {
+          if (target.os !== "macos" && !isWindows(target.os)) return yield* unavailable("Native package trust verification is not yet qualified for this platform")
+          if (isWindows(target.os)) {
             const policy = yield* windowsTrustPolicy(production, config.environment)
             const receipt = yield* inspectWindowsPackageTrust(yield* installed, release, policy, config.environment).pipe(Effect.provide(NodeArchiveExtractor))
             return CaseObservation.make({ detail: receipt.productionTrusted ? "Verified timestamped Authenticode signatures and expected publishers on installer, application and admitted runtime"
@@ -496,7 +497,7 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
             environment: { ...prepared, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), HERMES_HOME: join(home, ".hermes"),
               XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
               XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
-              PATH: `${dirname(runtime)}${target.os === "windows" ? ";" : ":"}${prepared.PATH ?? ""}` },
+              PATH: `${dirname(runtime)}${isWindows(target.os) ? ";" : ":"}${prepared.PATH ?? ""}` },
             // The completed marker must be absent from echoed input. Familiar words avoid
             // turning terminal qualification into an arbitrary numeric-copying test.
             interrupt: { prompt: "First concatenate SUN and FLOWER without a space and print that uppercase word. Then count from 1 to 10000, one number per line. Do not use tools.", expected: "SUNFLOWER" },

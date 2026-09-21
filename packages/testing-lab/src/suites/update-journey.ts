@@ -1,6 +1,10 @@
+import { isWindows } from "../domain"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { join } from "node:path"
+import { tmpdir } from "node:os"
+import { nativeHostLayer, NativeHost } from "../../../daemon-management/src/desktop-native"
+import { updateControlEndpoint } from "../update-control"
 import { requestApplication } from "../../../daemon-management/src/desktop-native/application-control"
 import { ApplicationSnapshot } from "../../../sdk/src/desktop-host"
 import { ApplicationIdentity, assertServiceExited, LabProcessId } from "../application-identity"
@@ -19,6 +23,7 @@ import { inspectPackageIdentity, PackageIdentity } from "./package"
 import { observeUpdatedInstallation } from "./update-installation"
 import { PackagePayload, verifyDebPayload } from "./package-payload"
 import { verifyRpmPayload } from "./rpm-package-trust"
+import { InstalledPayload, installedPayload, verifyInstalledPayload } from "./installed-payload"
 import { UpdateBaseline, verifyUpdateBaseline } from "./update"
 
 const fail = (message: string) => new AssertionFailure({ message })
@@ -34,13 +39,23 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   readonly evidence: string; readonly environment: Readonly<Record<string, string>>; readonly port: number; readonly model: string },
   ownership: Ownership, record: RecordEvidence, onCleanupError: (detail: string) => void) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
-  if (config.target.os === "windows") return yield* new InfrastructureFailure({ operation: "update-journey", message: "Windows updater control endpoint qualification is not connected yet" })
+  if (isWindows(config.target.os) && config.target.arch !== "x64") return yield* new InfrastructureFailure({ operation: "update-journey", message: "Windows update packages require x64" })
   const original = yield* ownership.current
   if (Option.isNone(original)) return yield* fail("Updater journey requires an owned candidate installation")
   const { fixture, pair } = yield* prepareUpdateConsumer(config.acceptance, config.target, join(config.root, "inputs"))
   yield* record("pair", UpdatePair, pair)
-  const state = yield* fs.makeTempDirectoryScoped({ directory: "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
-  const profile = join(config.root, "profile"), endpoint = join(state, "application.sock")
+  const state = yield* fs.makeTempDirectoryScoped({ directory: isWindows(config.target.os) ? tmpdir() : "/tmp", prefix: "ml-up-state-" }).pipe(Effect.flatMap(fs.realPath))
+  const profile = join(config.root, "profile")
+  // Load a lease-owned copy: Windows locks loaded DLLs until worker exit.
+  // Keep it outside scoped state cleanup; allocation cleanup runs after the worker exits.
+  const native = isWindows(config.target.os) ? yield* Effect.gen(function* () {
+    const addon = join(config.root, "update-observer.node")
+    yield* fs.copyFile(join(original.value.root, "resources", "desktop-host.node"), addon)
+    return yield* NativeHost.pipe(Effect.provide(nativeHostLayer(addon)))
+  }) : undefined
+  const endpoint = updateControlEndpoint(state, isWindows(config.target.os))
+  const control = (intent: "Observe" | "Quit") => (native ? endpoint.pipe(Effect.provideService(NativeHost, native))
+    : Effect.succeed(join(state, "application.sock"))).pipe(Effect.flatMap(path => requestApplication(path, intent)))
   const environment = yield* runtimeEnvironment(pair.previousRelease, config.target.artifactHost, { ...config.environment,
     MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: String(config.port), MAGNITUDE_DESKTOP_STATE_DIR: state,
     NODE_EXTRA_CA_CERTS: fixture.caPath }, [config.acceptance.candidate])
@@ -52,14 +67,18 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
     if (observed._tag === "Right") yield* ownership.adoptReplacement(observed.right)
     yield* ownership.replace(original.value.candidate)
   }).pipe(Effect.catchAllCause(() => Effect.sync(() => { onCleanupError("Could not restore the primary installation after updater testing") }))))
+  const expectedPayload = config.target.packageFormat === "exe" || config.target.packageFormat === "dmg"
+    ? Option.some(yield* installedPayload(yield* ownership.replace(pair.candidate))) : Option.none()
+  if (Option.isSome(expectedPayload)) yield* record("clean-candidate-payload", InstalledPayload, expectedPayload.value)
   let app = yield* ownership.replace(pair.previous)
-  yield* Effect.addFinalizer(() => requestApplication(endpoint, "Quit").pipe(Effect.flatMap(owner => owner.service._tag === "Ready"
+  yield* Effect.addFinalizer(() => control("Quit").pipe(Effect.flatMap(owner => owner.service._tag === "Ready"
     ? assertServiceExited(LabProcessId.make(owner.service.health.pid)).pipe(Effect.retry(Schedule.spaced("200 millis").pipe(Schedule.intersect(Schedule.recurs(50))))) : Effect.void),
     Effect.catchTag("ApplicationControlUnavailable", () => Effect.void), Effect.catchAllCause(() => Effect.sync(() => { onCleanupError("Could not stop the automatic update owner") }))))
   const session = yield* desktopSession({ mode: "isolated", executable: app.executable, profile, port: config.port, environment,
     evidence: config.evidence }, onCleanupError)
   const artifact: typeof UpdateFixtureArtifact.Type = { path: pair.update.path, version: pair.candidate.version, bytes: pair.update.artifact.bytes,
     sha256: Digest.make(pair.update.artifact.sha256), target: config.target.os === "macos" ? { os: "darwin", arch: config.target.arch, package: "mac-zip" }
+      : isWindows(config.target.os) ? { os: "windows", arch: "x64", package: "windows-exe" }
       : { os: "linux", arch: config.target.arch, package: config.target.packageFormat === "rpm" ? "rpm" : "deb" } }
   const scope = yield* Scope.Scope
   const endpointContext = yield* Layer.buildWithScope(endpointTests(`http://127.0.0.1:${config.port}`, config.model).pipe(Layer.provide(FetchHttpClient.layer)), scope)
@@ -103,7 +122,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
     yield* driver.restartForUpdate()
     yield* session.stop
     // This only observes. Launching the replacement manually cannot make the case pass.
-    const after = yield* requestApplication(endpoint, "Observe").pipe(Effect.flatMap(owner => Effect.gen(function* () {
+    const after = yield* control("Observe").pipe(Effect.flatMap(owner => Effect.gen(function* () {
       if (owner.pid === before.applicationPid || owner.service._tag !== "Ready") return yield* new InfrastructureFailure({ operation: "update-handoff", message: "Waiting for the automatic replacement owner" })
       handoffSettled = true
       if (owner.service.health.version !== pair.candidate.version) return yield* fail("Updater relaunched the old version; inspect installation failure evidence")
@@ -112,7 +131,7 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
     app = yield* observeUpdatedInstallation(app, pair.candidate, environment)
     yield* ownership.adoptReplacement(app)
     yield* record("replacement", UpdateReplacement, { before, after, version: pair.candidate.version })
-    yield* requestApplication(endpoint, "Quit")
+    yield* control("Quit")
     yield* Effect.all([assertServiceExited(LabProcessId.make(after.pid)),
       ...(after.service._tag === "Ready" ? [assertServiceExited(LabProcessId.make(after.service.health.pid))] : [])]).pipe(
       Effect.retry(Schedule.spaced("200 millis").pipe(Schedule.intersect(Schedule.recurs(50)))))
@@ -120,7 +139,8 @@ export const updateJourney = (config: { readonly acceptance: UpdateAcceptance; r
   const payload = Effect.gen(function* () {
     const driver = yield* session.driver
     yield* record("updated-package", PackageIdentity, yield* inspectPackageIdentity(app, yield* driver.host(), environment))
-    yield* record("updated-payload", PackagePayload, yield* (config.target.packageFormat === "rpm" ? verifyRpmPayload(app) : verifyDebPayload(app)))
+    yield* record("updated-payload", PackagePayload, yield* (Option.isSome(expectedPayload) ? verifyInstalledPayload(app, expectedPayload.value)
+      : config.target.packageFormat === "rpm" ? verifyRpmPayload(app) : verifyDebPayload(app)))
   })
   const continuation = Effect.gen(function* () {
     const driver = yield* session.driver

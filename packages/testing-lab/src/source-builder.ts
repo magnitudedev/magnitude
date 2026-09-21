@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { join } from "node:path"
@@ -31,7 +32,7 @@ export const nativeSourceBuilder = (config: typeof SourceBuildConfig.Type) => La
   const executor = yield* ProcessExecutor
   return {
     prepare: (source, digest, target, backend, updates = false) => Effect.gen(function* () {
-      const platform = target.os === "macos" ? "darwin" : target.os === "windows" ? "win32" : "linux"
+      const platform = target.os === "macos" ? "darwin" : isWindows(target.os) ? "win32" : "linux"
       if (platform !== process.platform || target.arch !== process.arch) return yield* failure("Build must execute on the selected native OS and architecture")
       if (yield* fs.exists(config.root)) return yield* failure("Source build requires a fresh workspace")
       yield* fs.makeDirectory(config.root, { recursive: true, mode: 0o700 })

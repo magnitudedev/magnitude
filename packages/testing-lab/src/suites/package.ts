@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { Effect, Schema } from "effect"
 import { join } from "node:path"
 import { ACN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
@@ -12,15 +13,15 @@ export const inspectPackageIdentity = (app: InstalledApplication, observedDeskto
   const target = app.candidate.target, expected = app.candidate.version
   if (observedDesktopVersion !== expected) return yield* new AssertionFailure({ message: "Running desktop version differs from admitted package" })
   const resources = join(app.root, target.os === "macos" ? "Contents/Resources" : "resources")
-  const suffix = target.os === "windows" ? ".exe" : ""
+  const suffix = isWindows(target.os) ? ".exe" : ""
   const paths = [
-    { name: "desktop", path: target.os === "macos" || target.os === "windows" ? app.executable : join(app.root, "magnitude") },
+    { name: "desktop", path: target.os === "macos" || isWindows(target.os) ? app.executable : join(app.root, "magnitude") },
     { name: "service", path: join(resources, `${ACN_EXECUTABLE_NAME}${suffix}`) },
     { name: "cli", path: join(resources, `magnitude${suffix}`) },
     { name: "native-host", path: join(resources, "desktop-host.node") },
-    ...(target.os === "windows" ? [] : [{ name: "command-helper", path: join(resources, "magnitude-command") }]),
+    ...(isWindows(target.os) ? [] : [{ name: "command-helper", path: join(resources, "magnitude-command") }]),
   ]
-  const format = target.os === "macos" ? "mach-o" : target.os === "windows" ? "pe" : "elf"
+  const format = target.os === "macos" ? "mach-o" : isWindows(target.os) ? "pe" : "elf"
   const binaries = yield* Effect.forEach(paths, file => Effect.gen(function* () {
     const image = yield* inspectNativeImage(file.path)
     if (image.format !== format || !image.architectures.includes(target.arch)) return yield* new AssertionFailure({ message: `${file.name} does not contain the requested native OS/CPU architecture` })

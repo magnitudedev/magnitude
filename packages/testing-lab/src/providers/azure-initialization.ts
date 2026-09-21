@@ -41,7 +41,7 @@ export const prepareAzureInitialization = (initialization: AzureInitialization, 
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if ("kind" in initialization && Option.isSome(initialization.gpu)) {
-    if (scope.architecture !== "x64" || !(scope.os === "ubuntu" && scope.version === "24.04" || scope.os === "windows" && scope.version === "11" || scope.os === "windows-server" && scope.version === "2025"))
+    if (scope.architecture !== "x64" || !(scope.os === "ubuntu" && scope.version === "24.04" || scope.os === "windows" && scope.version === "11" || scope.os === "windows-server" && ["2022", "2025"].includes(scope.version)))
       return yield* fail("No supported Azure NVIDIA driver recipe for this OS/version and architecture")
   }
   if ("kind" in initialization && initialization.kind === "windows") {

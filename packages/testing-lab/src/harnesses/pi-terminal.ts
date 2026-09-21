@@ -3,7 +3,7 @@ import { Effect, Option, Schedule, Schema } from "effect"
 import { join } from "node:path"
 import { AssertionFailure } from "../domain"
 import { command } from "../process"
-import { containsTerminalMarker, HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
+import { containsTerminalMarker, screenContainsTerminalMarker, HarnessTerminalReceipt, TerminalInput, TerminalTurn } from "./terminal"
 import { TerminalConfig, TerminalDriver, TerminalScreen, waitForTerminal } from "../terminal"
 
 export const PiTerminalConfig = Schema.Struct({ ...TerminalConfig.omit("args", "columns", "rows").fields,
@@ -20,7 +20,7 @@ export const piTerminal = (config: typeof PiTerminalConfig.Type, onCleanupError:
   yield* Schema.decodeUnknown(PiTerminalConfig)(config)
   const fs = yield* FileSystem.FileSystem
   for (const turn of [config.interrupt, config.recovery]) {
-    if (containsTerminalMarker(turn.prompt, turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
+    if (screenContainsTerminalMarker(turn.prompt.split(/\r?\n/), turn.expected)) return yield* fail("Terminal response marker must not appear in echoed input")
   }
   const version = yield* command(config.executable, ["--version"], { env: config.environment, inheritEnv: false, timeoutMs: 30_000 })
   if (version.exitCode !== 0 || version.stdout.trim() !== "0.85.1") return yield* fail("Pi terminal qualification requires version 0.85.1")
@@ -52,14 +52,14 @@ export const piTerminal = (config: typeof PiTerminalConfig.Type, onCleanupError:
     until: screen => screen.lines.some(line => line.includes(`Model: ${config.model}`)), schedule: Schedule.spaced("100 millis"),
   }), Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => fail("Pi did not confirm keyboard model selection") }))
   yield* terminal.write(`${config.interrupt.prompt}\r`)
-  yield* saveScreen("streaming", yield* waitForTerminal(terminal, screen => screen.lines.some(line => containsTerminalMarker(line, config.interrupt.expected)), "render streamed assistant output", 300_000))
+  yield* saveScreen("streaming", yield* waitForTerminal(terminal, screen => screenContainsTerminalMarker(screen.lines, config.interrupt.expected), "render streamed assistant output", 300_000))
   yield* terminal.write("\u001b")
   const aborted = yield* waitForMessages(1)
   if (aborted.headers.length !== 1 || aborted.messages.length !== 1 || aborted.messages[0]!.message.stopReason !== "aborted") {
     return yield* fail("Pi did not persist exactly one interrupted assistant turn")
   }
   yield* terminal.write(`${config.recovery.prompt}\r`)
-  yield* saveScreen("recovered", yield* waitForTerminal(terminal, screen => screen.lines.some(line => containsTerminalMarker(line, config.recovery.expected)), "render the follow-up answer", 300_000))
+  yield* saveScreen("recovered", yield* waitForTerminal(terminal, screen => screenContainsTerminalMarker(screen.lines, config.recovery.expected), "render the follow-up answer", 300_000))
   const completed = yield* waitForMessages(2)
   if (completed.headers.length !== 1 || completed.headers[0]!.id !== aborted.headers[0]!.id || completed.messages.length !== 2 ||
     completed.messages[0]!.id !== aborted.messages[0]!.id || completed.messages[1]!.id === aborted.messages[0]!.id ||

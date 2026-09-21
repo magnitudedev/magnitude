@@ -1,0 +1,8 @@
+polkit.addRule(function(action, subject) {
+  var program = '/usr/lib/magnitude-desktop/resources/magnitude';
+  if (action.id === 'org.freedesktop.policykit.exec' && subject.user === 'labworker'
+      && action.lookup('program') === program
+      && action.lookup('command_line').indexOf(program + ' _install-application-update ') === 0) {
+    return polkit.Result.YES;
+  }
+});

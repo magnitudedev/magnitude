@@ -1,8 +1,9 @@
+import { trustWindowsUpdatePublisher } from "./windows-update-publisher"
 import { FileSystem } from "@effect/platform"
 import { UpdateConfiguration } from "@magnitudedev/release/hosted-update"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import { ArtifactStore } from "./artifact-store"
-import { AssertionFailure, Target } from "./domain"
+import { AssertionFailure, Target, isWindows } from "./domain"
 import { sha256 } from "./snapshot"
 import { UpdateAcceptance } from "./update-acceptance"
 import { updateFixture, UpdateFixtureAuthority } from "./update-fixture"
@@ -23,6 +24,10 @@ export const prepareUpdateConsumer = (acceptance: UpdateAcceptance, target: Targ
   }
   const authority = yield* Schema.decodeUnknown(Schema.parseJson(UpdateFixtureAuthority))(bytes.toString("utf8")).pipe(
     Effect.mapError(() => new AssertionFailure({ message: "Invalid private update authority" })))
+  if (isWindows(target.os)) {
+    if (Option.isNone(authority.windowsPublisher)) return yield* new AssertionFailure({ message: "Windows update fixture has no admitted signing certificate" })
+    yield* trustWindowsUpdatePublisher(authority.windowsPublisher.value)
+  }
   yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 })
   const fixture = yield* updateFixture(directory, authority)
   if (!Schema.equivalence(UpdateConfiguration)(fixture.configuration, acceptance.configuration)) {

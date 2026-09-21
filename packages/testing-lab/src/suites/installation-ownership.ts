@@ -3,7 +3,7 @@ import { Effect, Schema } from "effect"
 import { join, relative, isAbsolute } from "node:path"
 import { ApplicationIdentity } from "../application-identity"
 import type { DesktopDriver } from "../desktop-driver"
-import { AssertionFailure } from "../domain"
+import { AssertionFailure, isWindows } from "../domain"
 import { InstalledApplication } from "../installer"
 import { CliTests } from "./cli"
 
@@ -15,7 +15,7 @@ export const verifyInstalledCliPath = (app: InstalledApplication) => Effect.gen(
   const fs = yield* FileSystem.FileSystem
   const os = app.candidate.target.os
   const root = yield* fs.realPath(app.root)
-  const bundledCli = yield* fs.realPath(join(app.root, os === "macos" ? "Contents/Resources" : "resources", os === "windows" ? "magnitude.exe" : "magnitude"))
+  const bundledCli = yield* fs.realPath(join(app.root, os === "macos" ? "Contents/Resources" : "resources", isWindows(os) ? "magnitude.exe" : "magnitude"))
   const within = relative(root, bundledCli)
   if (!within || within === ".." || within.startsWith("../") || within.startsWith("..\\") || isAbsolute(within)
     || (yield* fs.stat(bundledCli)).type !== "File" || (yield* fs.realPath(app.cli)) !== bundledCli) {

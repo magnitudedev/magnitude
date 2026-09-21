@@ -16,8 +16,8 @@ test("the complete source matrix shares native builds while preserving every con
   expect(yield* Schema.decodeUnknown(Schema.parseJson(ExecutionPlan))(encoded)).toEqual(work)
   const builds = work.filter(item => item.kind === "build"), tests = work.filter(item => item.kind === "test")
   expect(builds).toHaveLength(8)
-  expect(tests).toHaveLength(44)
-  expect(new Set(work.map(item => item.id)).size).toBe(52)
+  expect(tests).toHaveLength(targets.length)
+  expect(new Set(work.map(item => item.id)).size).toBe(builds.length + targets.length)
   expect(builds.every(item => item.target.target.backend === "cpu" && item.target.target.provider !== "spark")).toBe(true)
   for (const consumer of tests) {
     const producer = builds.find(item => item.id === Option.getOrThrow(consumer.producer))!
@@ -38,7 +38,7 @@ test("the complete source matrix shares native builds while preserving every con
 test("artifact-only runs preserve packaging verification and create no producer", () => Effect.runPromise(Effect.gen(function* () {
   const plan = yield* planRun(request("artifacts"))
   const work = yield* planExecution(plan.request, plan.targets, targets)
-  expect(work).toHaveLength(44)
+  expect(work).toHaveLength(targets.length)
   for (const item of work) {
     expect(item.kind).toBe("test")
     if (item.kind === "test") expect(Option.isNone(item.producer)).toBe(true)

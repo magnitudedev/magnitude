@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { planExecution } from "./execution-plan"
 import { Effect, Option, Schema } from "effect"
 import { CaseId, Harness, InvalidInput, PlannedCase, RunPlan, RunRequest, Selection, Suite, Target, TargetId } from "./domain"
@@ -5,31 +6,31 @@ import { CaseId, Harness, InvalidInput, PlannedCase, RunPlan, RunRequest, Select
 const target = (os: Target["os"], version: string, arch: Target["arch"], backend: Target["backend"], hardware: Target["hardware"]): Target =>
   Schema.decodeUnknownSync(Target)({ id: `${os}-${version}-${arch}-${backend}-${hardware}`,
     os, version, arch, backend, hardware,
-    provider: os === "macos" ? "namespace" : os === "dgx-os" ? "spark" : "azure",
-    artifactHost: os === "macos" ? "darwin-arm64" : os === "windows" ? "windows-x64-msvc" : `linux-${arch}-gnu`,
-    packageFormat: os === "macos" ? "dmg" : os === "windows" ? "exe" : os === "fedora" || os === "redhat" ? "rpm" : "deb",
+    provider: os === "macos" ? "namespace" : hardware === "dgx-spark" ? "spark" : "azure",
+    artifactHost: os === "macos" ? "darwin-arm64" : isWindows(os) ? "windows-x64-msvc" : `linux-${arch}-gnu`,
+    packageFormat: os === "macos" ? "dmg" : isWindows(os) ? "exe" : os === "fedora" || os === "redhat" ? "rpm" : "deb",
   })
 
 export const targets: readonly Target[] = [
   ...["15", "26"].flatMap(v => [target("macos", v, "arm64", "cpu", "apple-silicon"), target("macos", v, "arm64", "metal", "apple-silicon")]),
-  ...["10", "11"].flatMap(v => [
-    target("windows", v, "x64", "cpu", "intel"), target("windows", v, "x64", "cpu", "amd"),
-    target("windows", v, "x64", "cpu", "a10"), target("windows", v, "x64", "cuda", "a10"),
+  ...["2022", "2025"].flatMap(v => [
+    target("windows-server", v, "x64", "cpu", "intel"), target("windows-server", v, "x64", "cpu", "amd"),
+    target("windows-server", v, "x64", "cpu", "a10"), target("windows-server", v, "x64", "cuda", "a10"),
+    target("windows-server", v, "x64", "cpu", "rtx-pro-6000"), target("windows-server", v, "x64", "cuda", "rtx-pro-6000"),
   ]),
-  target("windows", "11", "x64", "cpu", "rtx-pro-6000"), target("windows", "11", "x64", "cuda", "rtx-pro-6000"),
   ...([["ubuntu", "24.04"], ["debian", "13"], ["fedora", "44"], ["redhat", "10"]] as const).flatMap(([os, v]) => [
     target(os, v, "x64", "cpu", "intel"), target(os, v, "x64", "cpu", "amd"), target(os, v, "arm64", "cpu", "arm"),
     ...(["a10", "rtx-pro-6000"] as const).flatMap(hw => [target(os, v, "x64", "cpu", hw), target(os, v, "x64", "cuda", hw)]),
   ]),
-  target("dgx-os", "7", "arm64", "cpu", "dgx-spark"), target("dgx-os", "7", "arm64", "cuda", "dgx-spark"),
+  target("ubuntu", "24.04", "arm64", "cpu", "dgx-spark"), target("ubuntu", "24.04", "arm64", "cuda", "dgx-spark"),
 ]
 
 export const prTargetIds = [
   "macos-15-arm64-cpu-apple-silicon", "macos-26-arm64-metal-apple-silicon",
-  "windows-10-x64-cpu-intel", "windows-11-x64-cpu-amd", "windows-10-x64-cuda-a10",
-  "windows-11-x64-cuda-a10", "windows-11-x64-cuda-rtx-pro-6000",
+  "windows-server-2022-x64-cpu-intel", "windows-server-2025-x64-cpu-amd", "windows-server-2022-x64-cuda-a10",
+  "windows-server-2025-x64-cuda-a10", "windows-server-2025-x64-cuda-rtx-pro-6000",
   "ubuntu-24.04-x64-cpu-intel", "ubuntu-24.04-arm64-cpu-arm", "ubuntu-24.04-x64-cuda-a10",
-  "ubuntu-24.04-x64-cuda-rtx-pro-6000", "dgx-os-7-arm64-cuda-dgx-spark",
+  "ubuntu-24.04-x64-cuda-rtx-pro-6000", "ubuntu-24.04-arm64-cuda-dgx-spark",
 ].map(id => TargetId.make(id))
 
 /** Case identity is stable; titles describe an assertion rather than an implementation hook. */
@@ -62,7 +63,7 @@ export const cases: readonly PlannedCase[] = Object.entries(suiteCases).flatMap(
   harness: Option.none<Harness>(), prerequisites: (prerequisites[`${prefixes[suite as Suite]}${index + 1}`] ?? []).map(id => CaseId.make(id)),
 })))
 const quickIds = new Set(["P1", "P2", "P3", "P4", "P5", "I1", "I2", "I3", "I4", "A1", "A2", "A3", "A5", "E1", "E3", "E6", "H1", "H2", "H3", "H5", "C1", "C2"])
-const updateRepresentatives = new Set(["macos-26-arm64-metal-apple-silicon", "windows-11-x64-cuda-a10", "ubuntu-24.04-x64-cuda-a10"])
+const updateRepresentatives = new Set(["macos-26-arm64-metal-apple-silicon", "windows-server-2025-x64-cuda-a10", "ubuntu-24.04-x64-cuda-a10"])
 
 export const findTarget = (id: TargetId) => Effect.fromNullable(targets.find(t => t.id === id)).pipe(
   Effect.mapError(() => new InvalidInput({ message: `Unknown target: ${id}` })),

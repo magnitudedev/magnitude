@@ -6,6 +6,8 @@ test("only disposable cloud allocations with the actual non-root account can gra
   const identity = { home: "/home/labworker", username: "labworker", uid: 1000 }, environment = { HOME: "/home/labworker" }
   for (const provider of ["azure", "namespace"] as const) expect(Option.isSome(yield* admitGuestUser(provider, true, identity, environment, "linux"))).toBe(true)
   for (const provider of ["local", "spark"] as const) expect((yield* admitGuestUser(provider, true, identity, environment, "linux").pipe(Effect.either))._tag).toBe("Left")
+  expect(Option.isSome(yield* admitGuestUser("spark", true, identity, environment, "linux", true))).toBe(true)
+  expect((yield* admitGuestUser("spark", true, identity, environment, "darwin", true).pipe(Effect.either))._tag).toBe("Left")
   expect(Option.isNone(yield* admitGuestUser("local", false, identity, environment, "linux"))).toBe(true)
   for (const user of [{ ...identity, uid: 0 }, { ...identity, home: "relative" }]) expect((yield* admitGuestUser("azure", true, user, environment, "linux").pipe(Effect.either))._tag).toBe("Left")
   expect((yield* admitGuestUser("azure", true, identity, { HOME: "/somewhere-else" }, "linux").pipe(Effect.either))._tag).toBe("Left")

@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { workerObjectLimits } from "./worker-evidence"
 import { outputObjects } from "./build-output"
 import { assignmentInputs } from "./work-store"
@@ -34,12 +35,12 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
       const transport = transports.transports.get(machine.provider)
       if (selected.length !== 1 || !transport) return yield* fail("Exactly one qualified guest runtime and transport must match the worker")
       const runtime = selected[0]!
-      if (runtime.disposable && (machine.provider === "local" || machine.provider === "spark")) return yield* fail("Shared hosts cannot grant a disposable OS-user context")
+      if (runtime.disposable && machine.provider === "local") return yield* fail("Shared hosts cannot grant a disposable OS-user context")
       if (machine.tags.runId !== assignment.claim.runId || assignment.claim.targetId !== assignment.target.target.id) return yield* fail("Worker ownership does not match its assignment")
       if (assignment.plan.request.trust === "untrusted-ci" && (!runtime.disposable || machine.provider === "local" || machine.provider === "spark")) return yield* fail("Untrusted work requires a disposable cloud worker")
       const deadline = Math.min(DateTime.toEpochMillis(machine.tags.expiresAt), DateTime.toEpochMillis(assignment.deadline))
       if (deadline <= Date.now()) return yield* fail("Worker assignment has expired")
-      const remotePath = assignment.target.target.os === "windows" ? win32 : posix
+      const remotePath = isWindows(assignment.target.target.os) ? win32 : posix
       const base = machine.provider === "local" ? machine.root : runtime.root
       if (!remotePath.isAbsolute(base)) return yield* fail("Guest runtime root must be absolute")
       const directory = remotePath.join(base, machine.tags.leaseId, `attempt-${assignment.claim.fence}`)
@@ -87,7 +88,7 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
           { timeoutMs: Math.max(1, deadline - Date.now()), env: { COPYFILE_DISABLE: "1" } }).pipe(Effect.provideService(ProcessExecutor, processes))
         const remoteArchive = remotePath.join(directory, "input.tar.gz")
         yield* transport.upload(machine, archive, remoteArchive)
-        const unpacked = yield* transport.execute(machine, assignment.target.target.os === "windows" ? "C:\\Windows\\System32\\tar.exe" : "/usr/bin/tar",
+        const unpacked = yield* transport.execute(machine, isWindows(assignment.target.target.os) ? "C:\\Windows\\System32\\tar.exe" : "/usr/bin/tar",
           ["-xzf", remoteArchive, "-C", directory], Math.max(1, deadline - Date.now()))
         if (unpacked.exitCode !== 0) return yield* nativeFailure(`Worker input bundle extraction exited ${unpacked.exitCode}`, unpacked)
         const response = yield* transport.execute(machine, runtime.executable, [...runtime.args, remoteJob], Math.max(1, deadline - Date.now()))

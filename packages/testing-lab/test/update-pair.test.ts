@@ -10,7 +10,7 @@ import { targets } from "../src/catalog"
 import { sha256 } from "../src/snapshot"
 import { prepareUpdatePair } from "../src/update-pair"
 
-for (const id of ["macos-15-arm64-metal-apple-silicon", "windows-11-x64-cpu-intel", "ubuntu-24.04-x64-cpu-intel", "fedora-44-x64-cpu-intel"]) {
+for (const id of ["macos-15-arm64-metal-apple-silicon", "windows-server-2025-x64-cpu-intel", "ubuntu-24.04-x64-cpu-intel", "fedora-44-x64-cpu-intel"]) {
   test(`prepares exact old/new installer and update bytes for ${id}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const target = targets.find(target => target.id === id)
     if (!target) return yield* Effect.dieMessage(`Missing test target ${id}`)

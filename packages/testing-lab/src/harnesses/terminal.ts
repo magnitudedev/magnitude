@@ -10,3 +10,7 @@ export const HarnessTerminalReceipt = Schema.Struct({ sessionId: Schema.NonEmpty
  * Use the same comparison for echo exclusion, display and persisted output. */
 export const containsTerminalMarker = (text: string, marker: string): boolean =>
   marker.length > 0 && text.toLowerCase().includes(marker.toLowerCase())
+
+/** TUI renderers can wrap inside a word independently of terminal column width. */
+export const screenContainsTerminalMarker = (lines: readonly string[], marker: string): boolean =>
+  containsTerminalMarker(lines.map(line => line.trim()).join(""), marker)

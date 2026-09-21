@@ -12,6 +12,29 @@ import { observeUpdatedInstallation } from "../src/suites/update-installation"
 import { verifyDebPayload } from "../src/suites/package-payload"
 
 const target = targets.find(value => value.id === "ubuntu-24.04-x64-cpu-intel")!
+for (const mode of ["updated", "old-registration", "old-cli"] as const) test(`Windows update observation verifies registration and bundled CLI: ${mode}`, () => Effect.runPromise(Effect.gen(function* () {
+  const windows = targets.find(value => value.id === "windows-server-2025-x64-cpu-intel")!
+  const candidate = yield* Schema.decodeUnknown(Candidate)({ target: windows, version: "1.2.4", path: "C:\\candidate.exe", artifact: {
+    id: "desktop-windows-x64", kind: "desktop", host: "windows-x64-msvc", filename: "Magnitude.exe", bytes: 1, sha256: "a".repeat(64) } })
+  const previous = InstalledApplication.make({ candidate: { ...candidate, version: "1.2.3" }, root: "C:\\owned\\Magnitude",
+    executable: "C:\\owned\\Magnitude\\Magnitude.exe", cli: "C:\\owned\\Magnitude\\resources\\magnitude.exe", packageVersion: "1.2.3" })
+  const commands: string[] = []
+  const result = yield* observeUpdatedInstallation(previous, candidate, {}).pipe(Effect.provideService(ProcessExecutor, {
+    run: spec => Effect.sync(() => {
+      commands.push(spec.executable)
+      if (spec.executable === "powershell.exe") {
+        expect(spec.env.LAB_UPDATED_ROOT).toBe(previous.root)
+        expect(spec.args.at(-1)).toContain("InstallLocation")
+        return { exitCode: 0, stderr: "", stdout: mode === "old-registration" ? "1.2.3" : "1.2.4" }
+      }
+      expect(spec.executable).toBe(previous.cli)
+      return { exitCode: 0, stderr: "", stdout: mode === "old-cli" ? "1.2.3" : "1.2.4" }
+    }),
+  }), Effect.either)
+  expect(result._tag).toBe(mode === "updated" ? "Right" : "Left")
+  expect(commands).toEqual(mode === "old-registration" ? ["powershell.exe"] : ["powershell.exe", previous.cli])
+})))
+
 for (const mode of ["exact", "changed-file", "changed-link", "file-became-link", "directory-became-link", "changed-package"] as const) test(`updated payload comparison rejects divergence: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "lab-update-payload-" }).pipe(Effect.flatMap(fs.realPath))

@@ -1,3 +1,4 @@
+import { WindowsUpdatePublisher } from "./windows-update-publisher"
 import { FileSystem } from "@effect/platform"
 import { acceptsUpdateRelease, decodeUpdateRequest, ReleaseTarget, signUpdateRelease, UpdateConfiguration, UpdateRelease, verifyUpdateRequest } from "@magnitudedev/release/hosted-update"
 import { defineFSM } from "@magnitudedev/utils/fsm"
@@ -14,6 +15,7 @@ export const UpdateFixtureArtifact = Schema.Struct({
 /** Private run material, stored as an authorized object, never as result evidence. */
 export const UpdateFixtureAuthority = Schema.Struct({ schemaVersion: Schema.Literal(1),
   origin: Schema.String.pipe(Schema.pattern(/^https:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}$/)),
+  windowsPublisher: Schema.optionalWith(WindowsUpdatePublisher, { as: "Option", exact: true }),
   certificate: Schema.NonEmptyString, tlsPrivateKey: Schema.NonEmptyString, publisherPrivateKey: Schema.NonEmptyString,
 })
 export type UpdateFixtureAuthority = typeof UpdateFixtureAuthority.Type
@@ -32,7 +34,7 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
   const directory = yield* fs.makeTempDirectoryScoped({ directory: parent, prefix: "update-fixture-" })
   yield* fs.chmod(directory, 0o700)
   const caPath = join(directory, "certificate.pem"), keyPath = join(directory, "tls-key.pem")
-  if (restored) yield* Schema.decodeUnknown(UpdateFixtureAuthority)(restored).pipe(Effect.mapError(() => fail("Malformed private update authority")))
+  if (restored) yield* Schema.validate(UpdateFixtureAuthority)(restored).pipe(Effect.mapError(() => fail("Malformed private update authority")))
   const opensslConfig = join(directory, "openssl.cnf")
   if (restored) {
     yield* Effect.try({ try: () => {
@@ -187,7 +189,7 @@ export const updateFixture = (parent: string, restored?: UpdateFixtureAuthority)
     }), () => cut.pipe(Effect.zipRight(Effect.sync(() => { if (activeFault === fault) activeFault = undefined }))))
     return { started: Deferred.await(started).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => fail("App did not start an update archive transfer") })), cut }
   })
-  const authority = UpdateFixtureAuthority.make({ schemaVersion: 1, origin, certificate: cert, tlsPrivateKey: key,
+  const authority = UpdateFixtureAuthority.make({ schemaVersion: 1, origin, windowsPublisher: restored?.windowsPublisher ?? Option.none(), certificate: cert, tlsPrivateKey: key,
     publisherPrivateKey: publisher.privateKey.export({ type: "pkcs8", format: "pem" }).toString() })
   return { origin, caPath, configPath, configuration, publish, withdraw, authority, interruptDownload }
 })

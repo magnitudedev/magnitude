@@ -256,8 +256,8 @@ success cannot establish client entitlement. Non-Windows targets reject client l
 Windows preparation separates pinned tooling, trusted runtime dependencies, and the admitted
 user's desktop. Runtime readiness binds the runtime digest, native distribution/architecture and
 user SID. One-shot login credentials are removed at logon before a desktop receipt is published;
-that receipt also requires a live interactive session. A separate server diagnostic distribution
-can exercise preparation mechanisms but cannot qualify a Windows client target. Azure records
+that receipt also requires a live interactive session. Windows Server 2022 and 2025 are explicit baseline targets with license-included Azure
+pricing and native Server identity checks. They cannot qualify Windows 10/11 client behavior. Azure records
 recipe-bound preparation stages and observes ambiguous command submissions without repeating
 installers. Restart intent is persisted before reboot so reconciliation cannot reboot an already
 prepared desktop. Readiness is refreshed against the live session; an older command receipt cannot
@@ -281,7 +281,20 @@ Run and provider credentials must not appear in command arguments, script text o
 temporary delivery files are private and scoped. Guest launch uses the intended application
 user and a qualified display environment. Service-session execution cannot qualify an
 interactive desktop test, and accepting a launch request alone never establishes a test pass.
-Spark is opt-in for trusted source, exclusive within the lab and subject to a busy-device check.
+Spark is opt-in for trusted source and exclusive within the lab. Its disposable Ubuntu ARM64
+container uses the GB10 through NVIDIA CDI; reports identify the container distribution and
+physical GPU separately. Source compilation stays on the Azure ARM64 producer. Docker over
+SSH uses a pinned image, bounded CPU/memory/process limits and a lease lifetime. Transfers
+and cleanup verify lease metadata plus the immutable container ID; cleanup never removes a
+new container that happens to reuse the fixed lab name. The container grants native package
+installation context only to its actual non-root user. It isolates and cleans up only
+lab-owned files, processes and ports; it does not inspect or manage unrelated office workloads.
+Network faults affect only the container's private network namespace. Update authorization uses
+the real native policy service inside that container and only the packaged updater command.
+Cloud access uses a coordinator-only Tailscale identity and authenticated SSH host discovery.
+Enrollment credentials and network access never enter candidate containers. The connection
+does not expose a public SSH port or require a privileged coordinator container. Enrollment
+expiry is an operator-managed deployment prerequisite, independent of run credentials.
 
 Installed-package ownership follows explicit present/absent transitions. Removal updates
 ownership only after the native uninstaller succeeds; reinstall acquires new ownership.

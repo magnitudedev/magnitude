@@ -3,10 +3,10 @@ import { Effect, Schema } from "effect"
 import { fileURLToPath } from "node:url"
 import { InitializationDownload } from "./linux-initialization"
 
-// Server preparation permits native mechanism diagnostics, never Windows client qualification.
+// Preparation verifies the exact client or Server distribution before candidate delivery.
 export const WindowsPreparationDistribution = Schema.Union(
   Schema.Struct({ os: Schema.Literal("windows"), version: Schema.Literal("10", "11") }),
-  Schema.Struct({ os: Schema.Literal("windows-server"), version: Schema.Literal("2025") }),
+  Schema.Struct({ os: Schema.Literal("windows-server"), version: Schema.Literal("2022", "2025") }),
 )
 export const WindowsRuntimePreparation = Schema.Struct({
   distribution: WindowsPreparationDistribution,

@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { FileSystem } from "@effect/platform"
 import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
@@ -22,8 +23,8 @@ export const localAllocator = (directory: string) => Layer.effect(MachineAllocat
     ensure: (lease, target) => Effect.gen(function* () {
       if (lease.provider !== "local" || !safeName(lease.resourceName)) return yield* failed("Invalid local allocation identity")
       if ((target.arch === "arm64" ? "arm64" : "x64") !== process.arch) return yield* failed("Local worker architecture differs from target")
-      if ((target.os === "macos" && process.platform !== "darwin") || (target.os === "windows" && process.platform !== "win32") ||
-        (!["macos", "windows"].includes(target.os) && process.platform !== "linux")) return yield* failed("Local worker OS family differs from target")
+      if ((target.os === "macos" && process.platform !== "darwin") || (isWindows(target.os) && process.platform !== "win32") ||
+        (target.os !== "macos" && !isWindows(target.os) && process.platform !== "linux")) return yield* failed("Local worker OS family differs from target")
       if (DateTime.toEpochMillis(lease.expiresAt) <= Date.now()) return yield* failed("Local lease already expired")
       const tags = MachineTags.make({ schemaVersion: 1, leaseId: lease.leaseId, runId: lease.runId, expiresAt: lease.expiresAt })
       const root = join(base, lease.resourceName)

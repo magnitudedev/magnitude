@@ -45,11 +45,14 @@ export const nvidiaDevices = (wire: string) => Effect.forEach(wire.trim() ? wire
 const WindowsReport = Schema.Struct({ productType: Schema.Int, version: Schema.String, build: Schema.String, architecture: Schema.Int,
   cpuVendor: Schema.NonEmptyString, cpuName: Schema.NonEmptyString, machineModel: Schema.NonEmptyString, memoryBytes: Schema.Number })
 export const windowsIdentity = (report: typeof WindowsReport.Type) => Effect.gen(function* () {
-  if (report.productType !== 1 || !report.version.startsWith("10.") || !/^\d+$/.test(report.build) || Number(report.build) < 10240) {
-    return yield* fail("Worker must run Windows 10 or 11 client, not Windows Server")
+  if (![1, 3].includes(report.productType) || !report.version.startsWith("10.") || !/^\d+$/.test(report.build) || Number(report.build) < 10240) {
+    return yield* fail("Unsupported Windows edition or build")
   }
+  const serverVersion = report.build === "20348" ? "2022" : report.build === "26100" ? "2025" : null
+  if (report.productType === 3 && serverVersion === null) return yield* fail("Unsupported Windows Server build")
   const arch = yield* decode(Architecture, report.architecture === 9 ? "x64" : report.architecture === 12 ? "arm64" : "unsupported")
-  return { os: "windows" as const, version: Number(report.build) >= 22000 ? "11" : "10", build: report.build, arch,
+  return { os: report.productType === 3 ? "windows-server" as const : "windows" as const,
+    version: report.productType === 3 ? serverVersion! : Number(report.build) >= 22000 ? "11" : "10", build: report.build, arch,
     cpuVendor: report.cpuVendor, cpuName: report.cpuName, machineModel: report.machineModel, memoryBytes: report.memoryBytes }
 })
 const windowsQuery = `$ErrorActionPreference = 'Stop'

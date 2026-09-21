@@ -12,7 +12,7 @@ import { ProcessExecutor, type CommandSpec } from "../src/process"
 import { MachineAllocator, MachineTags } from "../src/machines"
 import { Allocating } from "../src/lease"
 import { targets } from "../src/catalog"
-import { LeaseId, RunId } from "../src/domain"
+import { LeaseId, RunId, TargetId } from "../src/domain"
 import { ArtifactStore } from "../src/artifact-store"
 import { WorkerDiagnostic } from "../src/worker-diagnostics"
 const target = targets.find(t => t.os === "ubuntu" && t.hardware === "intel")!
@@ -161,10 +161,12 @@ for (const mode of ["ready", "failed", "missing-exit", "changed-file", "oversize
   })
 }
 
-for (const windowsLicense of ["visual-studio-dev-test", "multitenant"] as const) for (const failRuntime of [false, true]) {
+for (const windowsLicense of ["visual-studio-dev-test", "multitenant", "server-2022", "server-2025"] as const) for (const failRuntime of [false, true]) {
   test(`Windows allocator routes native preparation and retains failures: ${windowsLicense}/${failRuntime}`, async () => {
     const { WindowsAzureInitialization } = await import("../src/providers/azure-initialization")
-    const windows = targets.find(t => t.os === "windows" && t.version === "11" && t.hardware === "intel")!
+    const server = targets.find(t => t.os === "windows-server" && t.version === (windowsLicense === "server-2022" ? "2022" : "2025") && t.hardware === "intel")!
+    const client = windowsLicense === "visual-studio-dev-test" || windowsLicense === "multitenant"
+    const windows = client ? { ...server, id: TargetId.make("windows-11-x64-cpu-intel"), os: "windows" as const, version: "11" } : server
     const directory = mkdtempSync(join(tmpdir(), "lab-windows-init-"))
     try {
       const file = join(directory, "setup.ps1"), script = "Write-Output 'native preparation'"
@@ -172,9 +174,9 @@ for (const windowsLicense of ["visual-studio-dev-test", "multitenant"] as const)
       const digest = "a".repeat(64), pin = { file, sha256: sha256(script) }
       const downloads = JSON.parse(readFileSync(new URL("../tools/windows-downloads.json", import.meta.url), "utf8"))
       const initialization = Schema.decodeUnknownSync(WindowsAzureInitialization)({ kind: "windows", toolsSetup: pin, runtimeSetup: pin, desktopSetup: pin, downloads,
-        distribution: { os: "windows", version: "11" }, architecture: "x64", adminUsername: "labworker",
+        distribution: { os: windows.os, version: windows.version }, architecture: "x64", adminUsername: "labworker",
         runtime: { account: "labaccount", container: "artifacts", blob: `worker-runtime/${digest}.tar.gz`, sha256: digest, bytes: 100 } })
-      const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: windows.id, os: "Windows", windowsLicense: Option.some(windowsLicense), initialization: Option.some(initialization) }] }
+      const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: windows.id, os: "Windows", windowsLicense: client ? Option.some(windowsLicense as "visual-studio-dev-test" | "multitenant") : Option.none(), initialization: Option.some(initialization) }] }
       const l = new Allocating({ ...lease(), targetId: windows.id, workId: WorkId.make(`test:${windows.id}`) })
       const rows: ReturnType<typeof resource>[] = [], commands = new Map<string, { tags: Record<string, string> }>()
       const artifacts = new Map<string, Uint8Array>()
@@ -224,7 +226,7 @@ for (const windowsLicense of ["visual-studio-dev-test", "multitenant"] as const)
 }
 
 for (const mode of ["missing", "linux"] as const) test(`rejects invalid Windows licensing configuration before allocating: ${mode}`, async () => {
-  const windows = targets.find(t => t.os === "windows" && t.hardware === "intel")!
+  const windows = { ...targets.find(t => t.os === "windows-server" && t.hardware === "intel")!, id: TargetId.make("windows-11-x64-cpu-intel"), os: "windows" as const, version: "11" }
   const requested = mode === "missing" ? windows : target
   const settings: AzureConfig = { ...config, images: [{ ...config.images[0]!, targetId: requested.id,
     os: mode === "missing" ? "Windows" : "Linux", windowsLicense: mode === "missing" ? Option.none() : Option.some("multitenant") }] }

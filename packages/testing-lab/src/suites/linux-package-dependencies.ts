@@ -1,3 +1,4 @@
+import { isWindows } from "../domain"
 import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 import { FileSystem } from "@effect/platform"
@@ -27,7 +28,7 @@ export const LinuxPackageDependencies = Schema.Struct({ application: ElfDependen
 
 export const inspectLinuxPackageDependencies = (app: InstalledApplication, release: typeof ReleaseManifestSchema.Type) => Effect.scoped(Effect.gen(function* () {
   const target = app.candidate.target
-  if (target.os === "macos" || target.os === "windows") return yield* new AssertionFailure({ message: "ELF package inspection requires a Linux target" })
+  if (target.os === "macos" || isWindows(target.os)) return yield* new AssertionFailure({ message: "ELF package inspection requires a Linux target" })
   const composed = yield* admittedRuntimeComposition(release, target)
   const fs = yield* FileSystem.FileSystem
   const interpreters: (typeof LinuxPackageDependencies.Type)["interpreters"][number][] = []

@@ -1,3 +1,4 @@
+import { isWindows } from "./domain"
 import { FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { join, resolve } from "node:path"
@@ -45,7 +46,7 @@ export const nativeInstaller = (config: typeof InstallerConfig.Type) => Layer.ef
   const host = (candidate: Candidate) => Effect.gen(function* () {
     if (candidate.artifact.kind !== "desktop" || !Option.contains(candidate.artifact.host, candidate.target.artifactHost)
       || !candidate.artifact.filename.endsWith(`.${candidate.target.packageFormat}`)) return yield* fail("Installer metadata differs from requested target")
-    const platform = candidate.target.os === "macos" ? "darwin" : candidate.target.os === "windows" ? "win32" : "linux"
+    const platform = candidate.target.os === "macos" ? "darwin" : isWindows(candidate.target.os) ? "win32" : "linux"
     if (process.platform !== platform || process.arch !== candidate.target.arch) return yield* infra("Native installer host differs from requested target")
     if (platform !== "darwin" && !config.disposable) return yield* infra("System installation requires a disposable lab worker/user")
   })

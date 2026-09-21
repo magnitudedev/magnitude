@@ -1,3 +1,4 @@
+import { SparkConfig, sparkAllocator, sparkTransport } from "./providers/spark"
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { BunContext, BunHttpServer, BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Context, Effect, Layer, Option, Redacted, Schema } from "effect"
@@ -29,6 +30,7 @@ export const ServerConfig = Schema.Struct({ coordinator: CoordinatorConfig,
   storage: Schema.Union(Schema.Struct({ kind: Schema.Literal("file"), directory: Schema.NonEmptyString }), Schema.Struct({ kind: Schema.Literal("azure"), config: AzureArtifactConfig })),
   namespace: Schema.optionalWith(Schema.Struct({ executable: Schema.NonEmptyString, images: Schema.NonEmptyArray(NamespaceImage), preparation: NamespacePreparation }), { as: "Option", exact: true }),
   azure: Schema.optionalWith(Schema.Struct({ allocation: AzureConfig, workerOrigin: Schema.NonEmptyString }), { as: "Option", exact: true }),
+  spark: Schema.optionalWith(SparkConfig, { as: "Option", exact: true }),
   entra: Schema.optionalWith(EntraAuthConfig, { as: "Option", exact: true }),
   github: Schema.optionalWith(GitHubAuthConfig, { as: "Option", exact: true }),
   runtimes: Schema.Array(GuestRuntime),
@@ -38,8 +40,8 @@ export const configuredCoordinator = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const config = yield* fs.readFileString(yield* Config.string("LAB_COORDINATOR_CONFIG")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(ServerConfig))))
   if (config.runtimes.some(runtime => runtime.provider === "namespace" ? Option.isNone(config.namespace)
-    : runtime.provider === "azure" ? Option.isNone(config.azure) || !(runtime.artifactHost.startsWith("linux-") || runtime.artifactHost === "windows-x64-msvc") : true)) return yield* new InvalidInput({ message: "A runtime requires its configured provider; this entry point supports Namespace and Azure Linux/Windows execution" })
-  for (const provider of ["namespace", "azure"] as const) if (Option.isSome<unknown>(config[provider]) && !config.runtimes.some(runtime => runtime.provider === provider)) return yield* new InvalidInput({ message: `${provider} allocation requires a configured guest runtime` })
+    : runtime.provider === "azure" ? Option.isNone(config.azure) || !(runtime.artifactHost.startsWith("linux-") || runtime.artifactHost === "windows-x64-msvc") : runtime.provider === "spark" ? Option.isNone(config.spark) || runtime.artifactHost !== "linux-arm64-gnu" || !runtime.disposable || runtime.root !== "/lab" : true)) return yield* new InvalidInput({ message: "A runtime requires a matching configured provider and isolated guest" })
+  for (const provider of ["namespace", "azure", "spark"] as const) if (Option.isSome<unknown>(config[provider]) && !config.runtimes.some(runtime => runtime.provider === provider)) return yield* new InvalidInput({ message: `${provider} allocation requires a configured guest runtime` })
   if (new Set(config.runtimes.map(runtime => `${runtime.provider}/${runtime.artifactHost}`)).size !== config.runtimes.length) return yield* new InvalidInput({ message: "Guest runtime identities must be unique" })
   if (config.credentials.length === 0 && Option.isNone(config.github) && Option.isNone(config.entra)) return yield* new InvalidInput({ message: "Configure at least one authentication method" })
   const credentials = yield* Effect.forEach(config.credentials, entry => Effect.gen(function* () {
@@ -66,9 +68,15 @@ export const configuredCoordinator = Effect.gen(function* () {
     transports.set("namespace", Context.get(yield* Layer.build(namespaceTransport(namespace.executable)), WorkerTransport))
   }
   if (Option.isSome(config.azure)) allocators.set("azure", Context.get(yield* Layer.build(azureAllocator(config.azure.value.allocation).pipe(Layer.provide(storage))), MachineAllocator))
+  if (Option.isSome(config.spark)) {
+    allocators.set("spark", Context.get(yield* Layer.build(sparkAllocator(config.spark.value)), MachineAllocator))
+    transports.set("spark", Context.get(yield* Layer.build(sparkTransport(config.spark.value)), WorkerTransport))
+  }
   const runner = Layer.scoped(WorkerRunner, Effect.gen(function* () {
     const byProvider = new Map<typeof Provider.Type, WorkerRunner>()
     if (Option.isSome(config.namespace)) byProvider.set("namespace", Context.get(yield* Layer.build(transportWorkerRunner(config.runtimes.filter(runtime => runtime.provider === "namespace")).pipe(
+      Layer.provide(Layer.succeed(WorkerTransports, { transports })))), WorkerRunner))
+    if (Option.isSome(config.spark)) byProvider.set("spark", Context.get(yield* Layer.build(transportWorkerRunner(config.runtimes.filter(runtime => runtime.provider === "spark")).pipe(
       Layer.provide(Layer.succeed(WorkerTransports, { transports })))), WorkerRunner))
     if (Option.isSome(config.azure)) {
       const bootstrap = yield* azureBootstrap(config.azure.value.allocation)
