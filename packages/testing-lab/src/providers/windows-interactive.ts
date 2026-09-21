@@ -89,34 +89,43 @@ try {
   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $configuration.timeoutSeconds) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
   $registered = $true
+  # Task Scheduler timestamps can lag the freshly booted guest's wall clock.
+  # This task is newly registered and single-use: observe its own initial value changing.
+  $initialRun = (Get-ScheduledTaskInfo -TaskName $taskName).LastRunTime
   $started = Get-Date
   $deadline = $started.AddSeconds($configuration.timeoutSeconds)
   Start-ScheduledTask -TaskName $taskName
   for (;;) {
     $task = Get-ScheduledTask -TaskName $taskName
     $info = Get-ScheduledTaskInfo -TaskName $taskName
-    $ran = $info.LastRunTime -ge $started.AddSeconds(-2)
+    $ran = $info.LastRunTime -ne $initialRun
     if ($ran -and $task.State -ne 'Running' -and $task.State -ne 'Queued') {
       if ($info.LastTaskResult -eq 0) { $exitCode = 0 }
       else { Write-Output ('Interactive worker exit: ' + $info.LastTaskResult) }
       break
     }
     if ((Get-Date) -ge $deadline) { throw 'Interactive worker exceeded its deadline' }
-    if (-not $ran -and (Get-Date) -ge $started.AddMinutes(2)) { throw 'No interactive desktop session accepted the worker task' }
-    Start-Sleep -Seconds 2
-  }
-  foreach ($name in @('bootstrap.stdout.log', 'bootstrap.stderr.log', 'bootstrap.launch-error.log')) {
-    $log = Join-Path $configuration.root $name
-    if (Test-Path -LiteralPath $log) {
-      $text = (Get-Content -LiteralPath $log -Tail 80 | Out-String).Replace($LAB_WORKER_TOKEN, '[REDACTED]')
-      Write-Output $text.Substring([Math]::Max(0, $text.Length - 12000))
+    if (-not $ran -and (Get-Date) -ge $started.AddMinutes(2)) {
+      throw ('No interactive desktop session accepted the worker task; state={0}; result={1}; lastRun={2:o}; submitted={3:o}' -f $task.State, $info.LastTaskResult, $info.LastRunTime, $started)
     }
+    Start-Sleep -Seconds 2
   }
 } catch {
   $detail = $_.Exception.Message.Replace($LAB_WORKER_TOKEN, '[REDACTED]')
   Write-Error -ErrorAction Continue ('Windows desktop worker delivery failed: ' + $detail.Substring(0, [Math]::Min(1800, $detail.Length)))
 }
 finally {
+  try {
+    foreach ($name in @('bootstrap.stdout.log', 'bootstrap.stderr.log', 'bootstrap.launch-error.log')) {
+      $log = Join-Path $configuration.root $name
+      if (Test-Path -LiteralPath $log) {
+        $text = (Get-Content -LiteralPath $log -Tail 80 | Out-String).Replace($LAB_WORKER_TOKEN, '[REDACTED]')
+        Write-Output $text.Substring([Math]::Max(0, $text.Length - 12000))
+      }
+    }
+  } catch {
+    Write-Output 'Could not read worker bootstrap diagnostics'
+  }
   if ($registered) {
     try {
       Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue

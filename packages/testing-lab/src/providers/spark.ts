@@ -1,8 +1,12 @@
 import { DateTime, Effect, Layer, Schema } from "effect"
+import { FileSystem } from "@effect/platform"
 import { InfrastructureFailure } from "../domain"
 import { Machine, MachineAllocator, MachineTags, SshMachine, WorkerTransport } from "../machines"
 import { posix } from "node:path"
 import { command, ProcessExecutor } from "../process"
+// Playwright v1.62.1's Docker allowlist permits Chromium's nested sandbox namespaces.
+// https://github.com/microsoft/playwright/blob/v1.62.1/utils/docker/seccomp_profile.json
+import browserSeccomp from "./spark-seccomp.json"
 
 export const SparkConfig = Schema.Struct({
   executable: Schema.NonEmptyString,
@@ -35,9 +39,10 @@ const sparkAccess = (config: typeof SparkConfig.Type) => Effect.gen(function* ()
 
 export const sparkAllocator = (config: typeof SparkConfig.Type) => Layer.effect(MachineAllocator, Effect.gen(function* () {
   const { run, inspect } = yield* sparkAccess(config)
+  const fs = yield* FileSystem.FileSystem
   return MachineAllocator.of({
     inventory: inspect,
-    ensure: (lease, target) => Effect.gen(function* () {
+    ensure: (lease, target) => Effect.scoped(Effect.gen(function* () {
       if (lease.provider !== "spark" || target.provider !== "spark" || target.arch !== "arm64" || target.hardware !== "dgx-spark") {
         return yield* failed("Spark requires its explicit ARM64 hardware target")
       }
@@ -50,15 +55,18 @@ export const sparkAllocator = (config: typeof SparkConfig.Type) => Layer.effect(
         return current[0]!
       }
       const encoded = Buffer.from(yield* Schema.encode(Schema.parseJson(MachineTags))(tags)).toString("base64")
+      const seccomp = yield* fs.makeTempFileScoped({ prefix: "lab-spark-seccomp-", suffix: ".json" })
+      yield* fs.writeFileString(seccomp, yield* Schema.encode(Schema.parseJson(Schema.Unknown))(browserSeccomp), { mode: 0o600 })
       const result = yield* run(["run", "--detach", "--name", name, "--label", `${label}=${encoded}`,
         "--cpus", "2", "--memory", "8g", "--pids-limit", "512", "--device", "nvidia.com/gpu=0",
+        "--security-opt", `seccomp=${seccomp}`,
         "--cap-add", "NET_ADMIN",
         "--init", config.image, "sleep", String(Math.max(1, Math.ceil((DateTime.toEpochMillis(lease.expiresAt) - Date.now()) / 1000)))])
       if (result.exitCode !== 0) return yield* failed("Could not create the isolated Spark lease")
       const created = yield* inspect()
       if (created.length !== 1 || !Schema.equivalence(MachineTags)(created[0]!.tags, tags)) return yield* failed("Spark allocation ownership mismatch")
       return created[0]!
-    }).pipe(Effect.mapError(error => error instanceof InfrastructureFailure ? error : failed("Spark allocation failed"))),
+    })).pipe(Effect.mapError(error => error instanceof InfrastructureFailure ? error : failed("Spark allocation failed"))),
     release: machine => Effect.gen(function* () {
       if (machine.provider !== "spark" || machine.host !== config.host) return yield* failed("Wrong Spark allocation endpoint")
       const current = yield* inspect()

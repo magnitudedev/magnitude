@@ -221,6 +221,9 @@ and current allocation states. The CLI emits stage changes while waiting; progre
 result and cannot establish acceptance. Reconnecting to wait on an existing run never resubmits
 its input or acquires another allocation; reports retain the original run identity.
 Provider bootstraps verify the resource's exact lease identity before delivering authority.
+Azure's transient Creating/Updating state after guest preparation is awaited for at most two
+minutes and never beyond the allocation deadline. Each observation revalidates ownership;
+failed or unknown provisioning states and changed ownership cannot receive credentials.
 Windows delivery runs the worker in the admitted local user's interactive desktop session.
 A system-session process cannot qualify GUI behavior. A temporary, system-owned launcher
 delivers only attempt-scoped authority through a protected input, validates the actual user and
@@ -281,6 +284,8 @@ Run and provider credentials must not appear in command arguments, script text o
 temporary delivery files are private and scoped. Guest launch uses the intended application
 user and a qualified display environment. Service-session execution cannot qualify an
 interactive desktop test, and accepting a launch request alone never establishes a test pass.
+Windows task admission observes the new task's own execution transition; disagreement between
+the guest clock and Task Scheduler's timestamp cannot turn a completed worker into a launch timeout.
 Spark is opt-in for trusted source and exclusive within the lab. Its disposable Ubuntu ARM64
 container uses the GB10 through NVIDIA CDI; reports identify the container distribution and
 physical GPU separately. Source compilation stays on the Azure ARM64 producer. Docker over
@@ -291,6 +296,8 @@ installation context only to its actual non-root user. It isolates and cleans up
 lab-owned files, processes and ports; it does not inspect or manage unrelated office workloads.
 Network faults affect only the container's private network namespace. Update authorization uses
 the real native policy service inside that container and only the packaged updater command.
+Electron retains its Chromium sandbox. A pinned browser-compatible seccomp allowlist permits
+nested user namespaces; it does not disable seccomp or grant host namespaces or privileged mode.
 Cloud access uses a coordinator-only Tailscale identity and authenticated SSH host discovery.
 Enrollment credentials and network access never enter candidate containers. The connection
 does not expose a public SSH port or require a privileged coordinator container. Enrollment

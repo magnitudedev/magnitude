@@ -1,4 +1,6 @@
 import { DateTime, Effect, Layer, Schema } from "effect"
+import { BunContext } from "@effect/platform-bun"
+import { readFileSync, existsSync } from "node:fs"
 import { expect, test } from "vitest"
 import { targets } from "../src/catalog"
 import { LeaseId, RunId } from "../src/domain"
@@ -15,6 +17,7 @@ test("Spark leases are exclusive, bounded, idempotent and remove only their exac
     targetId: target.id, resourceName: "ml-123456789abc", expiresAt: DateTime.unsafeMake(Date.now() + 60_000) })
   let labels: Record<string, string> | undefined
   const recorded: string[][] = []
+  let seccomp = ""
   const executor = Layer.succeed(ProcessExecutor, ProcessExecutor.of({ run: spec => Effect.sync(() => {
     expect(spec.args.slice(0, 2)).toEqual(["--host", "ssh://tom@sparky"])
     const args = spec.args.slice(2); recorded.push([...args])
@@ -26,6 +29,11 @@ test("Spark leases are exclusive, bounded, idempotent and remove only their exac
       expect(args).not.toContain("--privileged"); expect(args).not.toContain("--volume")
       expect(args[args.indexOf("--cap-add") + 1]).toBe("NET_ADMIN")
       expect(args).not.toContain("--network=host")
+      seccomp = args[args.indexOf("--security-opt") + 1]!.slice("seccomp=".length)
+      const policy = Schema.decodeUnknownSync(Schema.parseJson(Schema.Struct({ defaultAction: Schema.String,
+        syscalls: Schema.Array(Schema.Struct({ names: Schema.Array(Schema.String), action: Schema.String })) })))(readFileSync(seccomp, "utf8"))
+      expect(policy.defaultAction).toBe("SCMP_ACT_ERRNO")
+      expect(policy.syscalls.some(rule => rule.action === "SCMP_ACT_ALLOW" && ["clone", "setns", "unshare"].every(name => rule.names.includes(name)))).toBe(true)
       const value = args[args.indexOf("--label") + 1]!, split = value.indexOf("=")
       labels = { [value.slice(0, split)]: value.slice(split + 1) }
       return { exitCode: 0, stdout: "a".repeat(64), stderr: "" }
@@ -44,7 +52,8 @@ test("Spark leases are exclusive, bounded, idempotent and remove only their exac
     expect(build._tag).toBe("Left")
     yield* allocator.release(machine)
     yield* allocator.release(machine)
-  }).pipe(Effect.provide(sparkAllocator({ executable: "docker", host: "ssh://tom@sparky", image: `ubuntu@sha256:${"b".repeat(64)}` }).pipe(Layer.provide(executor)))))
+  }).pipe(Effect.provide(sparkAllocator({ executable: "docker", host: "ssh://tom@sparky", image: `ubuntu@sha256:${"b".repeat(64)}` }).pipe(Layer.provide([executor, BunContext.layer])))))
+  expect(existsSync(seccomp)).toBe(false)
   expect(recorded.filter(args => args[0] === "run")).toHaveLength(1)
   expect(recorded.filter(args => args[0] === "rm")).toHaveLength(1)
 })

@@ -4,6 +4,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     sudo curl ca-certificates python3 python3-venv git xz-utils tar build-essential \
     binutils lsof openssl xvfb xauth dbus-x11 openbox libgtk-3-0t64 libnss3 \
     libasound2t64 libgbm1 libxss1 libxtst6 libffi-dev python3-dev \
+    libnotify4 xdg-utils libsecret-1-0 libglib2.0-bin \
     && rm -rf /var/lib/apt/lists/* \
     && userdel ubuntu && useradd --create-home --uid 1000 --shell /bin/bash labworker \
     && printf 'labworker ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/labworker \

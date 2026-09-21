@@ -1,5 +1,5 @@
 import { FileSystem } from "@effect/platform"
-import { DateTime, Effect, Option, Redacted, Schedule, Schema } from "effect"
+import { Clock, DateTime, Effect, Option, Redacted, Schedule, Schema } from "effect"
 import { join, posix } from "node:path"
 import { InfrastructureFailure } from "../domain"
 import { type Machine, MachineTags } from "../machines"
@@ -67,33 +67,44 @@ export const azureBootstrap = (config: typeof AzureBootstrapConfig.Type) => Effe
       return Option.none()
     }),
     start: (machine, launch) => Effect.gen(function* () {
-      machine = yield* verifyScope(machine)
-      const deadline = Math.min(DateTime.toEpochMillis(launch.deadline), DateTime.toEpochMillis(machine.tags.expiresAt))
-      if (deadline <= Date.now()) return yield* fail("Cannot start an expired worker")
-      const vm = yield* request("GET", machine.id).pipe(Effect.flatMap(result => Schema.decodeUnknown(Schema.parseJson(Observation))(result.stdout)),
-        Effect.mapError(() => fail("Cannot verify Azure worker identity")))
-      const tags = yield* Schema.decodeUnknown(Schema.parseJson(MachineTags))(vm.tags["lab-lease"]).pipe(Effect.mapError(() => fail("Worker has invalid lease metadata")))
-      if (vm.id.toLowerCase() !== machine.id.toLowerCase() || vm.name !== machine.name ||
-        vm.tags["lab-owner"] !== "magnitude-testing-lab-v1" || vm.tags["lab-machine"] !== machine.name ||
-        !Schema.equivalence(MachineTags)(tags, machine.tags)) return yield* fail("Worker ownership changed before credential delivery")
-      if (vm.properties.provisioningState !== "Succeeded") return yield* fail("Worker bootstrap requires a provisioned VM")
+      const owned = yield* verifyScope(machine)
+      const deadline = Math.min(DateTime.toEpochMillis(launch.deadline), DateTime.toEpochMillis(owned.tags.expiresAt))
+      const now = yield* Clock.currentTimeMillis
+      if (deadline <= now) return yield* fail("Cannot start an expired worker")
+      // VM tags and desktop preparation can leave Azure briefly Updating after
+      // guest readiness. Revalidate ownership on every read before issuing authority.
+      const vm = yield* Effect.gen(function* () {
+        for (;;) {
+          const observed = yield* request("GET", owned.id).pipe(Effect.flatMap(result => Schema.decodeUnknown(Schema.parseJson(Observation))(result.stdout)),
+            Effect.mapError(() => fail("Cannot verify Azure worker identity")))
+          const tags = yield* Schema.decodeUnknown(Schema.parseJson(MachineTags))(observed.tags["lab-lease"]).pipe(Effect.mapError(() => fail("Worker has invalid lease metadata")))
+          if (observed.id.toLowerCase() !== owned.id.toLowerCase() || observed.name !== owned.name ||
+            observed.tags["lab-owner"] !== "magnitude-testing-lab-v1" || observed.tags["lab-machine"] !== owned.name ||
+            !Schema.equivalence(MachineTags)(tags, owned.tags)) return yield* fail("Worker ownership changed before credential delivery")
+          const state = observed.properties.provisioningState
+          if (state === "Succeeded") return observed
+          if (state !== "Updating" && state !== "Creating") return yield* fail(`Worker cannot start from Azure provisioning state ${state}`)
+          yield* Effect.sleep("1 second")
+        }
+      }).pipe(Effect.timeoutFail({ duration: Math.min(120_000, deadline - now),
+        onTimeout: () => fail("Worker provisioning did not settle before its bootstrap deadline") }))
       const windows = vm.properties.storageProfile.osDisk.osType === "Windows"
       if (!windows && (!posix.isAbsolute(launch.executable) || !posix.isAbsolute(launch.root) ||
         [launch.executable, launch.root, launch.origin, ...launch.args].some(value => value.includes("\0")))) return yield* fail("Linux worker paths must be absolute and launch arguments must not contain NUL")
-      if (deadline <= Date.now()) return yield* fail("Worker expired while verifying its identity")
+      if (deadline <= (yield* Clock.currentTimeMillis)) return yield* fail("Worker expired while verifying its identity")
       // Azure's runAsUser uses sudo without preserving named protected parameters.
       // Receive them as root, then retain only the lab variables through an explicit user switch.
       // The credential remains an environment value, never a command argument or script literal.
       // Package builders require normal directory permissions. Invocation credentials and
       // workspaces use explicit 0600/0700 modes instead of imposing 077 on their children.
       const script = windows ? yield* windowsInteractiveScript({ user: config.adminUsername, executable: launch.executable, args: launch.args,
-        root: launch.root, origin: launch.origin, timeoutSeconds: Math.max(1, Math.ceil((deadline - Date.now()) / 1000)) }) : ["#!/bin/sh", "set -eu", "umask 022", ': "${LAB_WORKER_TOKEN:?Missing worker credential}"',
+        root: launch.root, origin: launch.origin, timeoutSeconds: Math.max(1, Math.ceil((deadline - (yield* Clock.currentTimeMillis)) / 1000)) }) : ["#!/bin/sh", "set -eu", "umask 022", ': "${LAB_WORKER_TOKEN:?Missing worker credential}"',
         `export LAB_WORKER_ROOT=${quote(launch.root)}`, `export LAB_URL=${quote(launch.origin)}`,
         "cd /",
         `exec /usr/bin/sudo -n -H --preserve-env=LAB_WORKER_TOKEN,LAB_WORKER_ROOT,LAB_URL -u ${quote(config.adminUsername)} -- ${[launch.executable, ...launch.args].map(quote).join(" ")}`].join("\n")
-      yield* request("PUT", `${machine.id}/runCommands/lab-worker`, { location: vm.location, properties: {
+      yield* request("PUT", `${owned.id}/runCommands/lab-worker`, { location: vm.location, properties: {
         source: { script }, asyncExecution: true,
-        timeoutInSeconds: Math.max(1, Math.ceil((deadline - Date.now()) / 1000)),
+        timeoutInSeconds: Math.max(1, Math.ceil((deadline - (yield* Clock.currentTimeMillis)) / 1000)),
         protectedParameters: [{ name: "LAB_WORKER_TOKEN", value: Redacted.value(launch.token) }],
       } })
     }),
