@@ -3,7 +3,7 @@ import { ReleaseArtifactSchema, ReleaseManifestSchema, validateReleaseManifest }
 import { Digest } from "../src/domain"
 import { FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Option, Schema } from "effect"
+import { Config, Effect, Option, Schedule, Schema } from "effect"
 import { join, resolve } from "node:path"
 import { buildAcnBinary } from "../../release/scripts/build/acn"
 import { buildCliBinary } from "../../release/scripts/build/cli"
@@ -52,7 +52,10 @@ const run = Effect.gen(function* () {
     yield* execute(["packages/version/scripts/generate-version.ts"])
     const identity = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ cliVersion: Schema.String, revision: Schema.Int, rpc: ReleaseManifestSchema.fields.rpc })))(
       yield* fs.readFileString(join(root, "packages/release/release-plan.json")))
-    yield* execute(["run", "icn:catalog:build-bundle"])
+    // The catalog is pinned, but each clean builder must fetch upstream metadata.
+    // Retry only transport failures; a malformed lock or unsupported model remains a build failure.
+    yield* execute(["run", "icn:catalog:build-bundle"]).pipe(Effect.retry({ times: 2,
+      schedule: Schedule.spaced("2 seconds"), while: error => /upstream model service failed: error decoding response body/.test(error.message) }))
     const nativeBase = yield* compileIcnBase(host)
     const nativePacks: (typeof ReleaseArtifactSchema.Type)[] = []
     for (const pack of packs) {
