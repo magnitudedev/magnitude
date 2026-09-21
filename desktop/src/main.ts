@@ -17,7 +17,7 @@ import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
-import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeModelStoragePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
@@ -107,6 +107,10 @@ const program = Effect.scoped(Effect.gen(function* () {
   const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>
     Effect.logWarning(error.message).pipe(Effect.as("system" as const))))
   nativeTheme.themeSource = initialAppearance
+  const modelStorage = yield* makeModelStoragePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  // The service reads the same setting when it spawns the engine; this is what the running service uses.
+  const activeModelStorage = yield* modelStorage.read.pipe(Effect.map(settings => settings.path), Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as(modelStorage.defaultPath))))
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -118,7 +122,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   yield* initializeLoginStartup(loginStartup, stateDir, isolatedProfile).pipe(Effect.provide(NodeContext.layer), Effect.catchAll(error => Effect.logWarning(error.message)))
   const rendererRecovery = yield* makeRendererRecovery
   const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
-  const quit = yield* Queue.sliding<"Quit" | "RestartUpdate">(1)
+  const quit = yield* Queue.sliding<"Quit" | "RestartUpdate" | "Relaunch">(1)
   const state = yield* Ref.make<OwnedServiceState | null>(null)
   const model = yield* Ref.make({ label: "Model status unavailable", canStop: false })
   const runtime = yield* Effect.runtime<never>()
@@ -301,6 +305,16 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.sync(() => { nativeTheme.themeSource = preference }))),
     SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.mapError(connectionError),
       Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
+    GetModelStorage: () => modelStorage.read.pipe(Effect.mapError(connectionError), Effect.map(settings =>
+      ({ active: activeModelStorage, path: settings.path, source: settings.source, defaultPath: settings.defaultPath, warning: Option.getOrNull(settings.warning) }))),
+    SetModelStorage: ({ path }) => preferenceWrites.withPermits(1)(modelStorage.write(Option.fromNullable(path))).pipe(Effect.mapError(connectionError), Effect.as({})),
+    ChooseModelStorageDirectory: () => Effect.tryPromise({
+      try: () => window && !window.isDestroyed()
+        ? dialog.showOpenDialog(window, { title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] })
+        : dialog.showOpenDialog({ title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] }),
+      catch: () => new HostError({ message: "The folder chooser could not be opened." }),
+    }).pipe(Effect.map(result => ({ path: result.canceled ? null : result.filePaths[0] ?? null }))),
+    Relaunch: () => Queue.offer(quit, "Relaunch").pipe(Effect.as({})),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
     SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
     Connections: () => Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(connectionChanges), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(Stream.mapEffect(() => connections.pipe(Effect.flatMap(service => service.inspect), Effect.map(connections => ({ _tag: "Ready" as const, connections })), Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))))),
@@ -394,7 +408,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const stopped = yield* service.shutdown.pipe(Effect.either)
     if (stopped._tag === "Right") {
       if (systemShutdownRequested || intent === "Quit") return "Quit" as const
-      if (!restartPreparedUpdate) return "Relaunch" as const
+      if (intent === "Relaunch" || !restartPreparedUpdate) return "Relaunch" as const
       const installation = yield* restartPreparedUpdate({ showWindow: reopenAfterUpdate, allowAuthorizationPrompt: true }).pipe(Effect.either)
       if (installation._tag === "Left") yield* Effect.logError(installation.left.message)
       return installation._tag === "Right" && installation.right === "Started" ? "RestartUpdate" as const : "Relaunch" as const
@@ -412,7 +426,8 @@ const program = Effect.scoped(Effect.gen(function* () {
 Effect.runPromiseExit(program).then(Exit.match({
   onSuccess: intent => {
     exiting = true
-    if (intent === "Relaunch") app.relaunch({ args: reopenAfterUpdate ? [] : ["--background"] })
+    // `args` replaces the argument list, so keep the original ones (the app directory in development).
+    if (intent === "Relaunch") app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
     // Native staging happens only during installation. Squirrel applies on ordinary exit;
     // the admitted helper preserves profile and window intent when relaunching afterward.
     app.quit()

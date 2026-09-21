@@ -22,6 +22,8 @@ export const MagnitudeConfigSchema = Schema.Struct({
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
   autoDownloadUpdates: SerializableOptional(Schema.Boolean),
   appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
+  /** Absolute path of the model store root; absent means `<dataDir>/models`. */
+  modelsDirectory: SerializableOptional(Schema.NonEmptyTrimmedString.pipe(Schema.maxLength(4_096))),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

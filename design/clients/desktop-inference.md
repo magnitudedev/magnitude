@@ -178,6 +178,16 @@ System and reports the unavailable preference. Browser storage is not a desktop 
 and no old browser preference is imported. Renderer reloads reread the host preference independently
 of ACN readiness. The browser client retains its own persistence adapter around shared appearance
 rendering.
+
+Settings also owns the model storage location, persisted as `modelsDirectory` in the canonical
+`config.json` that the service reads when it spawns the engine. The section shows the folder the next
+service start will use, marks the default, offers a native folder chooser and a return to the
+default, and rejects relative paths. Main records the folder in effect at launch; when the saved
+folder differs, the section states that the change applies after a restart, that downloaded models
+stay in the previous folder, shows a copyable platform-specific command that moves the previous
+store into the new folder, and offers Restart Magnitude, which stops the model and service and
+relaunches the application through the ordinary quit path. Magnitude never moves model files
+itself.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

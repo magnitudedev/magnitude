@@ -31,10 +31,12 @@ import {
   MonitorIcon,
   SunIcon,
   MoonIcon,
+  FolderOpenIcon,
 } from "@phosphor-icons/react"
+import { CopyCommand } from "./copy-command"
 import { createRoot } from "react-dom/client"
-import { useId, useMemo, useState, type ReactNode } from "react"
-import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react"
+import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefresh } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
@@ -56,7 +58,7 @@ import "@web-styles/tailwind.css"
 document.documentElement.dataset.desktopPlatform = window.__magnitudeDesktop.platform
 const host = window.__magnitudeDesktop
 class DesktopHostFailed extends Schema.TaggedError<DesktopHostFailed>()("DesktopHostFailed", { message: Schema.String }) {}
-const hostCommand = (action: () => Promise<void>) => Effect.tryPromise({ try: action, catch: error => {
+const hostCommand = <A,>(action: () => Promise<A>) => Effect.tryPromise({ try: action, catch: error => {
   const decoded = Schema.decodeUnknownEither(Schema.Struct({ message: Schema.String }))(error)
   return new DesktopHostFailed({ message: decoded._tag === "Right" ? decoded.right.message : "Magnitude could not complete this action. Try again or check Status." })
 } })
@@ -71,6 +73,18 @@ const appearanceReadError = Atom.keepAlive(Atom.make<string | null>(null))
 const saveAppearance = Atom.fn((preference: AppearancePreference, context) => hostCommand(() => host.setAppearance(preference)).pipe(
   Effect.tap(() => Effect.sync(() => { context.set(appearanceReadError, null); setAppearancePreference(preference) })),
 ))
+
+// The host owns the setting in config.json. Not kept alive: each visit to Settings re-reads it, so
+// hand edits of config.json show up, and it is refreshed after every host write.
+const modelStorageSettings = Atom.make(hostCommand(() => host.getModelStorage()))
+const chooseModelStorage = Atom.fn((_: void) => hostCommand(() => host.chooseModelStorageDirectory()).pipe(
+  Effect.flatMap(path => path === null ? Effect.void : hostCommand(() => host.setModelStorage(path)))))
+const resetModelStorage = Atom.fn((_: void) => hostCommand(() => host.setModelStorage(null)))
+const relaunchApplication = Atom.fn((_: void) => hostCommand(() => host.relaunch()))
+/** The exact command that moves an existing store; the root holds only hub/, locks/ and one JSON file. */
+const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
+  ? `robocopy "${from}" "${to}" /E /MOVE`
+  : `mv "${from}/"* "${to}/"`
 
 const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHostFailed>(emit => Effect.acquireRelease(
   Effect.sync(() => host.observe(encoded => {
@@ -487,6 +501,50 @@ function AppearanceSettings() {
     {Result.isFailure(saving) && <p role="alert" className="px-5 pb-5 text-sm">{hostFailureMessage(saving.cause)}</p>}
   </section>
 }
+function ModelStorageSettings() {
+  const settings = useAtomValue(modelStorageSettings)
+  const refresh = useAtomRefresh(modelStorageSettings)
+  const choose = useAtomSet(chooseModelStorage)
+  const choosing = useAtomValue(chooseModelStorage)
+  const reset = useAtomSet(resetModelStorage)
+  const resetting = useAtomValue(resetModelStorage)
+  const relaunch = useAtomSet(relaunchApplication)
+  const relaunching = useAtomValue(relaunchApplication)
+  const busy = choosing.waiting || resetting.waiting || relaunching.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const pending = current !== null && current.path !== current.active
+  return <section aria-labelledby="model-storage-heading" className={pageLayout.settingsCard}>
+    <div className="flex flex-wrap items-center justify-between gap-6">
+      <div className="min-w-0"><h2 id="model-storage-heading" className="font-heading text-lg">Model storage</h2>
+        <p className="mt-2 text-sm text-slate-500">Downloaded models are kept in this folder.</p>
+        {current ? <p className="mt-2 break-all font-mono text-[13px]" data-testid="model-storage-path">{current.path}{current.source === "Default" && <span className="ml-2 font-sans text-xs text-slate-500">Default</span>}</p>
+          : Result.isFailure(settings) ? <p role="alert" className="mt-2 text-sm">{hostFailureMessage(settings.cause)}</p> : <SkeletonLine className="mt-2 h-5 text-sm" width="60%" />}
+        {current?.warning && <p role="alert" className="mt-2 text-sm">{current.warning}</p>}
+      </div>
+      <div className="flex shrink-0 gap-2">
+        <Button variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
+        {current?.source === "Configured" && <Button variant="outline" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
+      </div>
+    </div>
+    {pending && current && <div className="mt-5 border-t border-slate-200 pt-4 text-sm dark:border-slate-750">
+      <div className="flex items-center justify-between gap-4" role="status">
+        <p><span className="font-medium">Restart required.</span> <span className="text-slate-500">Magnitude is still using the previous folder.</span></p>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => { relaunch(); }}>Restart Magnitude</Button>
+      </div>
+      <p className="mt-4 text-slate-500">To move your downloaded models as well, quit Magnitude and run this first:</p>
+      <div className="mt-2"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, current.active, current.path)} label="Copy move command" /></div>
+    </div>}
+    {[choosing, resetting, relaunching].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-3 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
+    <ModelStorageRefresh refresh={refresh} results={[choosing, resetting]} />
+  </section>
+}
+/** Re-reads the setting after a host write completes. */
+function ModelStorageRefresh({ refresh, results }: { refresh: () => void; results: ReadonlyArray<Result.Result<unknown, unknown>> }) {
+  const key = results.map(result => Result.isSuccess(result) && !result.waiting ? "done" : Result.isFailure(result) ? "failed" : "idle").join(",")
+  const previous = useRef(key)
+  useEffect(() => { if (previous.current !== key) { previous.current = key; refresh() } }, [key, refresh])
+  return null
+}
 function LoginSettings() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
@@ -521,7 +579,7 @@ function App() {
   return <DesktopShell page={page} navigate={navigate}>
       {page === "status" ? Result.isFailure(state) ? <p role="alert" className="mt-7">{hostFailureMessage(state.cause)}</p> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "usage" ? <ServingUsage />
-      : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
+      : page === "settings" ? <><AppearanceSettings /><ModelStorageSettings /><LoginSettings /><ApplicationSettings /></>
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-8">The service needs attention. Open Status for details.</p></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />

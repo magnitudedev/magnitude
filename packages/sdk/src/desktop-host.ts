@@ -6,6 +6,19 @@ export { DesktopUpdateState } from "./desktop-update"
 export const AppearancePreference = Schema.Literal("system", "light", "dark")
 export type AppearancePreference = typeof AppearancePreference.Type
 
+/** Where downloaded models are stored. The engine reads the folder once at service start. */
+export const ModelStorageSettings = Schema.Struct({
+  /** Folder in use by the running service, read when the application launched. */
+  active: Schema.String,
+  /** Folder the next service start will use. */
+  path: Schema.String,
+  source: Schema.Literal("Default", "Configured"),
+  defaultPath: Schema.String,
+  /** Why a saved value is not being used, when the default applies instead. */
+  warning: Schema.NullOr(Schema.String),
+})
+export type ModelStorageSettings = typeof ModelStorageSettings.Type
+
 export const ApplicationUpdateAction = Schema.Literal("status", "check", "download", "install", "discard")
 export type ApplicationUpdateAction = typeof ApplicationUpdateAction.Type
 export class ApplicationUpdateControlFailed extends Schema.TaggedError<ApplicationUpdateControlFailed>()("ApplicationUpdateControlFailed", { message: Schema.String }) {}
