@@ -1259,16 +1259,162 @@ pub(crate) fn check_closed(
     if let Some(diagnostics) = Diagnostics::new(entry_diagnostics) {
         return Err(SourceError::Type(diagnostics));
     }
+    let mut native_implementations = Vec::new();
+    let mut native_diagnostics = Vec::new();
+    for (file, parsed_file) in &parsed {
+        for declaration in &parsed_file.decls {
+            let crate::syntax::ast::Decl::Native(native) = declaration else {
+                continue;
+            };
+            let Some(backend) = crate::registry::BackendName::parse(&native.target.name) else {
+                native_diagnostics.push(SourceDiagnostic {
+                    path: sources.files()[*file].path.clone(),
+                    span: native.target.span,
+                    message: format!("unknown native backend `{}`", native.target.name),
+                });
+                continue;
+            };
+            if backend != crate::registry::BackendName::Metal {
+                native_diagnostics.push(SourceDiagnostic {
+                    path: sources.files()[*file].path.clone(),
+                    span: native.target.span,
+                    message: "top-level native implementations currently support only `metal`"
+                        .to_owned(),
+                });
+                continue;
+            }
+            let matching = entries
+                .iter()
+                .filter(|entry| entry.name == native.function.name)
+                .collect::<Vec<_>>();
+            let entry = match matching.as_slice() {
+                [entry] => *entry,
+                [] => {
+                    native_diagnostics.push(SourceDiagnostic {
+                        path: sources.files()[*file].path.clone(),
+                        span: native.function.span,
+                        message: format!(
+                            "native implementation refers to unknown portable function `{}`",
+                            native.function.name
+                        ),
+                    });
+                    continue;
+                }
+                _ => {
+                    native_diagnostics.push(SourceDiagnostic {
+                        path: sources.files()[*file].path.clone(),
+                        span: native.function.span,
+                        message: format!(
+                            "native implementation of overloaded function `{}` is ambiguous",
+                            native.function.name
+                        ),
+                    });
+                    continue;
+                }
+            };
+            if native_implementations.iter().any(
+                |implementation: &crate::checked::NativeImplementation| {
+                    implementation.entry == entry.id && implementation.backend == backend
+                },
+            ) {
+                native_diagnostics.push(SourceDiagnostic {
+                    path: sources.files()[*file].path.clone(),
+                    span: native.span,
+                    message: format!(
+                        "function `{}` already has a native implementation for `{}`",
+                        native.function.name,
+                        backend.as_str()
+                    ),
+                });
+                continue;
+            }
+            let mut convert = |expression: &crate::syntax::ast::Expr| {
+                native_nat_expr(expression, &entry.dimensions).map_err(|message| {
+                    native_diagnostics.push(SourceDiagnostic {
+                        path: sources.files()[*file].path.clone(),
+                        span: expression.span,
+                        message,
+                    });
+                })
+            };
+            let threadgroups = native.threadgroups.each_ref().map(&mut convert);
+            let threads = native.threads_per_threadgroup.each_ref().map(&mut convert);
+            let [Ok(x), Ok(y), Ok(z)] = threadgroups else {
+                continue;
+            };
+            let [Ok(tx), Ok(ty), Ok(tz)] = threads else {
+                continue;
+            };
+            native_implementations.push(crate::checked::NativeImplementation {
+                entry: entry.id,
+                backend,
+                declared_in: sources.files()[*file].path.clone(),
+                source: native.source.clone(),
+                threadgroups: [x, y, z],
+                threads_per_threadgroup: [tx, ty, tz],
+            });
+        }
+    }
+    if let Some(diagnostics) = Diagnostics::new(native_diagnostics) {
+        return Err(SourceError::Type(diagnostics));
+    }
     Ok(crate::checked::internals::Module {
         id: module_id,
         template_program: program,
         semantic_hash,
         sources,
         entries,
+        native_implementations,
         entry_families,
         definitions,
         families,
     })
+}
+
+fn native_nat_expr(
+    expression: &crate::syntax::ast::Expr,
+    dimensions: &[String],
+) -> Result<crate::checked::NativeNatExpr, String> {
+    use crate::checked::NativeNatExpr as N;
+    use crate::syntax::ast::{BinaryOp, ExprKind};
+    let binary = |left: &crate::syntax::ast::Expr,
+                  right: &crate::syntax::ast::Expr,
+                  make: fn(Box<N>, Box<N>) -> N| {
+        Ok(make(
+            Box::new(native_nat_expr(left, dimensions)?),
+            Box::new(native_nat_expr(right, dimensions)?),
+        ))
+    };
+    match &expression.kind {
+        ExprKind::Int(value) => Ok(N::Constant(*value)),
+        ExprKind::Name(name) if dimensions.contains(&name.name) => {
+            Ok(N::Dimension(name.name.clone()))
+        }
+        ExprKind::Name(name) => Err(format!(
+            "native launch expression references unknown dimension `{}`",
+            name.name
+        )),
+        ExprKind::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Add => binary(lhs, rhs, N::Add),
+            BinaryOp::Sub => binary(lhs, rhs, N::Sub),
+            BinaryOp::Mul => binary(lhs, rhs, N::Mul),
+            BinaryOp::Div => binary(lhs, rhs, N::Div),
+            BinaryOp::Rem => binary(lhs, rhs, N::Rem),
+            _ => Err("native launch expressions use only `+`, `-`, `*`, `/`, and `%`".to_owned()),
+        },
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if bindings.is_empty()
+            && matches!(&callee.kind, ExprKind::Name(name) if name.name == "ceil_div")
+            && args.len() == 2
+            && args.iter().all(|arg| arg.name.is_none()) =>
+        {
+            binary(&args[0].value, &args[1].value, N::CeilDiv)
+        }
+        _ => Err("unsupported native launch expression".to_owned()),
+    }
 }
 
 fn element_summary(element: &Elem) -> crate::checked::ElementSummary {
@@ -1386,6 +1532,11 @@ fn entry_info(
         id,
         stable,
         name: definition.name.clone(),
+        dimensions: definition
+            .dimensions
+            .iter()
+            .map(|dimension| dimension.name.clone())
+            .collect(),
         element_parameters: definition.elem_params.clone(),
         parameters,
         results,

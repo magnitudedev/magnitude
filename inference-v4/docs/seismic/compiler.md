@@ -1,6 +1,6 @@
 # Seismic compiler
 
-Seismic has one production artifact progression:
+The ordinary Seismic compiler has one production artifact progression:
 
 ```text
 CheckedModule -> LogicalEntry -> ImplementationDraft<B>
@@ -13,6 +13,18 @@ CheckedModule -> LogicalEntry -> ImplementationDraft<B>
 Each artifact removes freedom from the preceding one. There is no separate realization layer,
 independently sealed strategy/dataflow/placement pipeline, native plan mirror, retry compiler, or
 runtime fallback.
+
+An explicitly selected top-level native implementation takes a separate direct route:
+
+```text
+CheckedModule -> LogicalEntry -> InvocationContract
+             + embedded Metal source + authored launch -> NativeKernel<Entry> -> Completion
+```
+
+It reuses source checking, the generated call contract, tensor allocation, invocation validation,
+and access exclusion. It does not construct compiler implementations, kernel IR, a plan space,
+solver input, frozen plans, executable variants, tuning data, or workflows. Callers opt into this
+route through generated `native_for_device`; there is no implicit selection or fallback.
 
 ## Artifact ownership
 
@@ -68,10 +80,10 @@ Invocation selection is deterministic by
 
 ## Target, native, workflow, and runtime boundaries
 
-Device discovery only enumerates inexpensive descriptors. Opening a device creates the production
-service and queues, queries authoritative facts, runs the fixed primitive probe suite, and binds a
-complete `DeviceContract` and `ExecutionProfile` to that service before exposing a usable device. Preparation never pairs
-an independently acquired profile with a later-opened service.
+Device discovery only enumerates inexpensive descriptors. Opening a Metal device creates the
+production service and queue. Ordinary preparation or capability introspection lazily acquires and
+caches the authoritative `DeviceContract` and fixed primitive `ExecutionProfile` on that exact
+service. Direct native preparation does not trigger that profiling path.
 
 Native formation consumes closed kernel templates before `PlanSpace`, creates an unusable
 candidate, and reconciles authoritative reflection into `NativeKernel`. Frozen-plan translation

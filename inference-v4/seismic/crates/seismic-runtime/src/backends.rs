@@ -8,7 +8,7 @@
 use crate::api::{
     device::DeviceInner,
     kernel::{
-        DecodedResults, EncodedArgs, EncodedWorkflowArgs, PendingWorkflowResults,
+        DecodedResults, EncodedArgs, EncodedWorkflowArgs, NativeDefinition, PendingWorkflowResults,
         WorkflowCompletionAny, WorkflowResultRef,
     },
     CallError, DeviceId, DeviceInfo, WorkflowError,
@@ -50,6 +50,24 @@ pub(crate) enum PreparedKind {
     #[cfg(target_os = "macos")]
     Metal(Arc<PreparedHandle<seismic_metal::Metal>>),
     Cuda(Arc<PreparedHandle<seismic_cuda::Cuda>>),
+}
+
+pub(crate) enum NativePreparedKind {
+    #[cfg(target_os = "macos")]
+    Metal(Arc<driver::NativePreparedMetal>),
+    #[cfg(not(target_os = "macos"))]
+    Unsupported,
+}
+
+impl NativePreparedKind {
+    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.call(args),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
 }
 
 impl PreparedKind {
@@ -186,13 +204,11 @@ pub(crate) fn open(infos: &[DeviceInfo], id: DeviceId) -> Result<Arc<DeviceInner
         #[cfg(target_os = "macos")]
         Descriptor::Metal { handle } => {
             let service = seismic_metal::MetalDevice::open(handle.clone())?;
-            let (contract, execution) = seismic_metal::profile::open(&service)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
-            DeviceKind::Metal(Arc::new(Opened::new(
+            DeviceKind::Metal(Arc::new(Opened::new_lazy(
                 service,
                 executor,
-                Arc::new(contract),
-                Arc::new(execution),
+                seismic_metal::profile::open,
             )))
         }
         Descriptor::Cuda { ordinal } => {
@@ -205,10 +221,9 @@ pub(crate) fn open(infos: &[DeviceInfo], id: DeviceId) -> Result<Arc<DeviceInner
             )))
         }
     };
-    let capabilities = kind.capabilities();
     Ok(Arc::new(DeviceInner {
         info,
-        capabilities,
+        capabilities: std::sync::OnceLock::new(),
         kind,
     }))
 }
@@ -235,12 +250,12 @@ impl DeviceKind {
             )),
         }
     }
-    fn capabilities(&self) -> Vec<String> {
+    pub(crate) fn capabilities(&self) -> Vec<String> {
         match self {
-            Self::Cpu(device) => driver::capability_summaries(device.contract()),
+            Self::Cpu(device) => driver::opened_capability_summaries(device),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => driver::capability_summaries(device.contract()),
-            Self::Cuda(device) => driver::capability_summaries(device.contract()),
+            Self::Metal(device) => driver::opened_capability_summaries(device),
+            Self::Cuda(device) => driver::opened_capability_summaries(device),
         }
     }
 
@@ -282,11 +297,14 @@ impl DeviceKind {
                 .representations
                 .contains(&representation),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device
-                .contract()
-                .dtypes()
-                .representations
-                .contains(&representation),
+            // Direct Metal owns raw shared buffers; representation-specific
+            // interpretation remains in the authored kernel. A normal
+            // compiler preparation profiles and validates its narrower
+            // representation support before planning.
+            Self::Metal(_) => {
+                let _ = seismic_lang::registry::representation_info(representation);
+                true
+            }
             Self::Cuda(device) => device
                 .contract()
                 .dtypes()
@@ -328,6 +346,39 @@ impl DeviceKind {
                 prepare(device, module, entry, bindings, public_device, precision)
                     .map(PreparedKind::Cuda)
             }
+        }
+    }
+
+    pub(crate) fn prepare_native(
+        &self,
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        public_device: &Arc<DeviceInner>,
+        definition: NativeDefinition,
+    ) -> Result<NativePreparedKind, crate::api::kernel::PrepareError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => driver::prepare_native_metal(
+                device,
+                module,
+                entry,
+                bindings,
+                public_device,
+                definition,
+            )
+            .map(NativePreparedKind::Metal),
+            Self::Cpu(_) | Self::Cuda(_) => Err(crate::api::kernel::PrepareError::Preparation(
+                seismic_compiler::errors::PreparationError::NoApplicableImplementation(
+                    seismic_compiler::errors::NoApplicableReport {
+                        entry: definition.entry.to_owned(),
+                        declined: vec![(
+                            "native.metal".to_owned(),
+                            "the selected device is not a Metal device".to_owned(),
+                        )],
+                    },
+                ),
+            )),
         }
     }
 }

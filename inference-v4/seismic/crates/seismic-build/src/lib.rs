@@ -38,6 +38,8 @@
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // monomorphic
 //!     pub fn for_device_with(device: &seismic::Device, precision: seismic::PrecisionPolicy, elements: Elements)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // polymorphic
+//!     pub fn native_for_device(device: &seismic::Device)
+//!         -> Result<seismic::NativeKernel<Entry>, seismic::LoadError>;           // when declared
 //! }
 //! ```
 //!
@@ -46,8 +48,8 @@
 
 use seismic_lang::checked::SourceError;
 use seismic_lang::checked::{
-    check_source, EntryInfo, ParameterSummary, ParameterSummaryKind, ResultSummaryKind, SourceFile,
-    SourceSet, TensorAccess,
+    check_source, EntryInfo, NativeImplementation, NativeNatExpr, ParameterSummary,
+    ParameterSummaryKind, ResultSummaryKind, SourceFile, SourceSet, TensorAccess,
 };
 use seismic_lang::types::DType;
 use sha2::{Digest, Sha256};
@@ -141,6 +143,12 @@ mod internals {
     use std::ffi::OsStr;
     use std::fs;
 
+    struct NativeAsset<'a> {
+        definition: &'a NativeImplementation,
+        path: PathBuf,
+        source: Vec<u8>,
+    }
+
     pub(super) fn run(build: Build) -> Result<Artifacts, BuildError> {
         validate_identifier(build.module())?;
         let output = match build.output_directory() {
@@ -179,22 +187,79 @@ mod internals {
 
         let checked = check_source(sources).map_err(BuildError::Source)?;
         let encoded = seismic_lang::bundle::encode_checked_bundle(&checked);
+        let native_assets = resolve_native_assets(&checked, &paths)?;
         // The checked bundle contains the canonical sources, bundle format,
         // checker semantic version, registry revision, and semantic hash.
         // Addressing the emitted bundle therefore cannot accidentally reuse
         // generated bindings across a change in any of those inputs.
-        let bundle_digest: [u8; 32] = Sha256::digest(&encoded).into();
+        let mut identity_hasher = Sha256::new();
+        identity_hasher.update(&encoded);
+        for asset in &native_assets {
+            identity_hasher.update(asset.definition.backend.as_str().as_bytes());
+            identity_hasher.update(asset.definition.source.as_bytes());
+            identity_hasher.update((asset.source.len() as u64).to_le_bytes());
+            identity_hasher.update(&asset.source);
+        }
+        let bundle_digest: [u8; 32] = identity_hasher.finalize().into();
         let identity = hex(&bundle_digest);
         let bundle = output.join(format!("{}.seismicbundle", build.module()));
         let bindings = output.join(format!("{}.rs", build.module()));
         fs::write(&bundle, encoded).map_err(BuildError::Io)?;
-        fs::write(&bindings, render(&checked, build.module(), &identity))
-            .map_err(BuildError::Io)?;
+        fs::write(
+            &bindings,
+            render(&checked, build.module(), &identity, &native_assets),
+        )
+        .map_err(BuildError::Io)?;
         Ok(Artifacts {
             bundle,
             bindings,
             identity,
         })
+    }
+
+    fn resolve_native_assets<'a>(
+        module: &'a seismic_lang::checked::CheckedModule,
+        source_paths: &[PathBuf],
+    ) -> Result<Vec<NativeAsset<'a>>, BuildError> {
+        let source_by_label = source_paths
+            .iter()
+            .map(|path| (source_label(path), path))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut assets = Vec::new();
+        for entry in module.entries() {
+            let Some(definition) =
+                module.native_implementation(entry.id, seismic_lang::registry::BackendName::Metal)
+            else {
+                continue;
+            };
+            let declaring = source_by_label
+                .get(&definition.declared_in)
+                .ok_or_else(|| {
+                    BuildError::Environment(format!(
+                        "native declaration source `{}` is not a filesystem build input",
+                        definition.declared_in
+                    ))
+                })?;
+            let base = declaring
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let path = base.join(&definition.source);
+            let path = path.canonicalize().map_err(BuildError::Io)?;
+            println!("cargo:rerun-if-changed={}", path.display());
+            let source = fs::read(&path).map_err(BuildError::Io)?;
+            std::str::from_utf8(&source).map_err(|_| {
+                BuildError::Environment(format!(
+                    "native Metal source `{}` is not UTF-8",
+                    path.display()
+                ))
+            })?;
+            assets.push(NativeAsset {
+                definition,
+                path,
+                source,
+            });
+        }
+        Ok(assets)
     }
 
     fn source_label(path: &std::path::Path) -> String {
@@ -243,7 +308,12 @@ mod internals {
         Ok(())
     }
 
-    fn render(module: &seismic_lang::checked::CheckedModule, name: &str, identity: &str) -> String {
+    fn render(
+        module: &seismic_lang::checked::CheckedModule,
+        name: &str,
+        identity: &str,
+        native_assets: &[NativeAsset<'_>],
+    ) -> String {
         let mut out = String::new();
         out.push_str("// @generated by seismic-build; do not edit.\n");
         out.push_str(&format!(
@@ -254,12 +324,15 @@ mod internals {
         out.push_str("fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
         for entry in module.entries() {
-            render_entry(&mut out, entry);
+            let native = native_assets
+                .iter()
+                .find(|asset| asset.definition.entry == entry.id);
+            render_entry(&mut out, entry, native);
         }
         out
     }
 
-    fn render_entry(out: &mut String, entry: &EntryInfo) {
+    fn render_entry(out: &mut String, entry: &EntryInfo, native: Option<&NativeAsset<'_>>) {
         let module_name = ident(&entry.name);
         out.push_str(&format!("pub mod {module_name} {{\n"));
         out.push_str("  use super::*;\n");
@@ -487,7 +560,69 @@ mod internals {
             }
             out.push_str("    ])\n  }\n");
         }
+        if let Some(native) = native {
+            let path = native.path.to_string_lossy();
+            out.push_str("  fn native_definition() -> seismic::generated::NativeDefinition {\n");
+            out.push_str(&format!(
+                "    seismic::generated::NativeDefinition {{ source: include_str!({path:?}), entry: {:?}, threadgroups: [\n",
+                entry.name
+            ));
+            for expression in &native.definition.threadgroups {
+                out.push_str("      ");
+                render_native_expr(out, expression);
+                out.push_str(",\n");
+            }
+            out.push_str("    ], threads_per_threadgroup: [\n");
+            for expression in &native.definition.threads_per_threadgroup {
+                out.push_str("      ");
+                render_native_expr(out, expression);
+                out.push_str(",\n");
+            }
+            out.push_str("    ] }\n  }\n");
+            if entry.element_parameters.is_empty() {
+                out.push_str("  pub fn native_for_device(device: &seismic::Device) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> { seismic::generated::prepare_native::<Entry>(device, native_definition(), &[]) }\n");
+            } else {
+                out.push_str("  pub fn native_for_device_with(device: &seismic::Device, elements: Elements) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {\n");
+                out.push_str("    seismic::generated::prepare_native::<Entry>(device, native_definition(), &[\n");
+                for parameter in &entry.element_parameters {
+                    out.push_str(&format!(
+                        "      ({:?}, elements.{}),\n",
+                        parameter,
+                        ident(parameter)
+                    ));
+                }
+                out.push_str("    ])\n  }\n");
+            }
+        }
         out.push_str("}\n");
+    }
+
+    fn render_native_expr(out: &mut String, expression: &NativeNatExpr) {
+        let (name, left, right) = match expression {
+            NativeNatExpr::Constant(value) => {
+                out.push_str(&format!(
+                    "seismic::generated::NativeExpr::constant({value})"
+                ));
+                return;
+            }
+            NativeNatExpr::Dimension(name) => {
+                out.push_str(&format!(
+                    "seismic::generated::NativeExpr::dimension({name:?})"
+                ));
+                return;
+            }
+            NativeNatExpr::Add(left, right) => ("add", left, right),
+            NativeNatExpr::Sub(left, right) => ("sub", left, right),
+            NativeNatExpr::Mul(left, right) => ("mul", left, right),
+            NativeNatExpr::Div(left, right) => ("div", left, right),
+            NativeNatExpr::Rem(left, right) => ("rem", left, right),
+            NativeNatExpr::CeilDiv(left, right) => ("ceil_div", left, right),
+        };
+        out.push_str(&format!("seismic::generated::NativeExpr::{name}("));
+        render_native_expr(out, left);
+        out.push_str(", ");
+        render_native_expr(out, right);
+        out.push(')');
     }
 
     fn parameter_type(kind: &ParameterSummaryKind) -> String {
@@ -739,5 +874,55 @@ mod internals {
             output.push(DIGITS[(byte & 0xf) as usize] as char);
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn native_asset_generates_explicit_direct_loader_and_affects_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seismic-native-build-{}-{unique}",
+            std::process::id()
+        ));
+        let output = root.join("out");
+        fs::create_dir_all(root.join("native")).expect("fixture directories");
+        let source = root.join("ops.seismic");
+        let metal = root.join("native/scale.metal");
+        fs::write(
+            &source,
+            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+        )
+        .expect("Seismic fixture");
+        fs::write(&metal, "kernel void scale() {}\n").expect("Metal fixture");
+
+        let first = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(&output)
+            .run()
+            .expect("first build");
+        let generated = fs::read_to_string(&first.bindings).expect("generated bindings");
+        assert!(generated.contains("pub fn native_for_device"));
+        assert!(generated.contains("NativeExpr::ceil_div"));
+        assert!(generated.contains("NativeKernel<Entry>"));
+
+        fs::write(&metal, "kernel void scale() { /* changed */ }\n").expect("changed Metal");
+        let second = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(&output)
+            .run()
+            .expect("second build");
+        assert_ne!(first.identity, second.identity);
+        fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 }

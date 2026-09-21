@@ -4,6 +4,13 @@
 binding, invocation validation, submission, and completion.** It applies the
 compiler's result. It has no tuning policy and cannot reinterpret a witness.
 
+The explicit top-level native path is the narrow exception to “applies the compiler's result.” A
+generated `native_for_device(device)` returns `NativeKernel<Entry>`, compiles the attached Metal
+asset directly, and exposes only synchronous `call` with the same generated arguments and results
+as the ordinary kernel. It performs no tuning, solving, implementation selection, duration
+modeling, workflow construction, or fallback. Opening and using this path also avoids Metal's lazy
+device-profile probe suite.
+
 Device kinds are Metal (`Device::metal()`, macOS only), the host CPU (`Device::cpu()`: one
 worker thread per unit of host parallelism, buffers in host memory) and CUDA
 (`Device::cuda()`: device zero through a private thread-affine driver context; the driver

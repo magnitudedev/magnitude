@@ -5,6 +5,7 @@ use crate::span::Span;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Name(String),
+    String(String),
     Int(u64),
     Float(f64),
     Kw(Kw),
@@ -23,6 +24,7 @@ pub enum Tok {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kw {
     Fn,
+    Native,
     Lower,
     Requires,
     Where,
@@ -51,8 +53,9 @@ pub enum Kw {
 }
 
 impl Kw {
-    pub const ALL: [Kw; 26] = [
+    pub const ALL: [Kw; 27] = [
         Kw::Fn,
+        Kw::Native,
         Kw::Lower,
         Kw::Requires,
         Kw::Where,
@@ -87,6 +90,7 @@ impl Kw {
     pub fn text(self) -> &'static str {
         match self {
             Kw::Fn => "fn",
+            Kw::Native => "native",
             Kw::Lower => "lower",
             Kw::Requires => "requires",
             Kw::Where => "where",
@@ -199,6 +203,7 @@ impl Tok {
     pub fn describe(&self) -> String {
         match self {
             Tok::Name(n) => format!("name `{n}`"),
+            Tok::String(_) => "string literal".into(),
             Tok::Int(v) => format!("integer `{v}`"),
             Tok::Float(v) => format!("number `{v}`"),
             Tok::Kw(k) => format!("`{}`", k.text()),

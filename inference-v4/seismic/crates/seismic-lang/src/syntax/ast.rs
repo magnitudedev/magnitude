@@ -125,6 +125,7 @@ pub struct File {
 pub enum Decl {
     Fn(FnDecl),
     Lower(LowerDecl),
+    Native(NativeDecl),
 }
 
 impl Decl {
@@ -132,6 +133,7 @@ impl Decl {
         match self {
             Decl::Fn(f) => &f.name,
             Decl::Lower(l) => &l.name,
+            Decl::Native(n) => &n.function,
         }
     }
 
@@ -139,8 +141,20 @@ impl Decl {
         match self {
             Decl::Fn(f) => f.span,
             Decl::Lower(l) => l.span,
+            Decl::Native(n) => n.span,
         }
     }
+}
+
+/// A direct top-level backend implementation of an existing portable function.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeDecl {
+    pub function: Ident,
+    pub target: Ident,
+    pub source: String,
+    pub threadgroups: [Expr; 3],
+    pub threads_per_threadgroup: [Expr; 3],
+    pub span: Span,
 }
 
 /// `fn name[shape](params) [-> result] [for target] [requires capability] [where pred]: body`

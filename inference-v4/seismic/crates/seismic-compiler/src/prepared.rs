@@ -160,6 +160,38 @@ enum ParameterContract {
 }
 
 impl InvocationContract {
+    /// Compiles the public invocation contract of an entry without creating a
+    /// plan space. Direct native entry points use this path: they still get
+    /// the ordinary Seismic call-boundary validation, but perform no
+    /// implementation search, solving, scheduling, or portfolio construction.
+    #[doc(hidden)]
+    pub fn compile_entry(entry: &seismic_lang::entry::LogicalEntry) -> Self {
+        let fixed = PartialAssignment::new();
+        let arena = entry.arena();
+        let schema = entry.schema();
+        let parameters = schema
+            .parameters()
+            .iter()
+            .map(|parameter| match &parameter.kind {
+                ParameterKind::Tensor { axes, .. } => ParameterContract::Tensor {
+                    axes: axes.iter().map(|axis| arena.compile_nat(*axis)).collect(),
+                },
+                ParameterKind::Scalar { .. } => ParameterContract::Scalar,
+                ParameterKind::Index { bound, .. } => ParameterContract::Index {
+                    bound: arena.compile_nat(*bound),
+                },
+                ParameterKind::Range { bound, .. } => ParameterContract::Range {
+                    bound: arena.compile_nat(*bound),
+                },
+            })
+            .collect();
+        Self {
+            dimension_inference: schema.compile_dimension_inference(arena, &fixed),
+            target_domain: arena.compile_bool(entry.domain().predicate().node()),
+            parameters,
+        }
+    }
+
     pub(crate) fn compile(
         arena: &ExprArena,
         schema: &CallSchema,

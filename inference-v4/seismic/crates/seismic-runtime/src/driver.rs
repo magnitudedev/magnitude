@@ -4,7 +4,8 @@
 
 use crate::api::kernel::{
     DecodedResults, DecodedValue, EncodedArgs, EncodedWorkflowArgs, EncodedWorkflowArgument,
-    PendingWorkflowResults, PrepareError, WorkflowCompletionAny, WorkflowTensorArgument,
+    NativeDefinition, NativeExpr, PendingWorkflowResults, PrepareError, WorkflowCompletionAny,
+    WorkflowTensorArgument,
 };
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
@@ -22,13 +23,15 @@ use seismic_compiler::numerics::{EvidenceCatalog, PolicyIdentity};
 use seismic_compiler::plan_space::plan_space;
 use seismic_compiler::portfolio::prepare_kernel;
 use seismic_compiler::prepared::{
-    validate_invocation, ArgumentValue, DeviceIdentity, PreparedKernel,
+    validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract, PreparedKernel,
 };
 use seismic_compiler::target::{Backend, DeviceContract, ExecutionProfile};
 use seismic_compiler::PreparationBudget;
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{CallSchema, ElementBindings, ParameterKind, TensorAccess};
-use seismic_lang::expr::compiled::InvocationValues;
+use seismic_lang::entry::{
+    CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
+};
+use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
 use seismic_lang::precision::PrecisionPolicy;
@@ -57,10 +60,22 @@ pub(crate) struct Opened<B: Backend> {
     identity: DeviceIdentity,
     service: Arc<Service<B>>,
     executor: B::Executor,
-    contract: Arc<DeviceContract<B>>,
-    execution: Arc<ExecutionProfile<B>>,
+    profile: std::sync::OnceLock<Result<OpenedProfile<B>, seismic_compiler::errors::TargetError>>,
+    profile_loader: Option<
+        fn(
+            &Service<B>,
+        ) -> Result<
+            (DeviceContract<B>, ExecutionProfile<B>),
+            seismic_compiler::errors::TargetError,
+        >,
+    >,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<B>>>>,
     memory: Arc<MemoryDomain>,
+}
+
+struct OpenedProfile<B: Backend> {
+    contract: Arc<DeviceContract<B>>,
+    execution: Arc<ExecutionProfile<B>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,20 +232,57 @@ impl<B: Backend> Opened<B> {
             identity: DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)),
             service: Arc::new(service),
             executor,
-            contract,
-            execution,
+            profile: std::sync::OnceLock::from(Ok(OpenedProfile {
+                contract,
+                execution,
+            })),
+            profile_loader: None,
             cache: Mutex::new(HashMap::new()),
             memory: MemoryDomain::new(),
         }
+    }
+    pub(crate) fn new_lazy(
+        service: Service<B>,
+        executor: B::Executor,
+        profile_loader: fn(
+            &Service<B>,
+        ) -> Result<
+            (DeviceContract<B>, ExecutionProfile<B>),
+            seismic_compiler::errors::TargetError,
+        >,
+    ) -> Self {
+        Self {
+            identity: DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)),
+            service: Arc::new(service),
+            executor,
+            profile: std::sync::OnceLock::new(),
+            profile_loader: Some(profile_loader),
+            cache: Mutex::new(HashMap::new()),
+            memory: MemoryDomain::new(),
+        }
+    }
+    fn profile(&self) -> Result<&OpenedProfile<B>, seismic_compiler::errors::TargetError> {
+        self.profile
+            .get_or_init(|| {
+                let loader = self
+                    .profile_loader
+                    .expect("an unopened device profile has no loader");
+                loader(&self.service).map(|(contract, execution)| OpenedProfile {
+                    contract: Arc::new(contract),
+                    execution: Arc::new(execution),
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
     pub(crate) fn identity(&self) -> DeviceIdentity {
         self.identity
     }
     pub(crate) fn contract(&self) -> &DeviceContract<B> {
-        &self.contract
-    }
-    pub(crate) fn execution_profile(&self) -> &ExecutionProfile<B> {
-        &self.execution
+        &self
+            .profile()
+            .expect("device profile acquisition failed after opening")
+            .contract
     }
     fn executor(&self) -> &B::Executor {
         &self.executor
@@ -288,6 +340,13 @@ pub(crate) fn capability_summaries<B: Backend>(contract: &DeviceContract<B>) -> 
         .filter(|capability| contract.supports_capability(capability.id))
         .map(|capability| format!("{}.{}", B::NAME.as_str(), capability.name))
         .collect()
+}
+
+pub(crate) fn opened_capability_summaries<B: Backend>(opened: &Opened<B>) -> Vec<String> {
+    opened
+        .profile()
+        .map(|profile| capability_summaries(&profile.contract))
+        .unwrap_or_default()
 }
 
 pub(crate) trait Storage: Send + Sync {
@@ -502,6 +561,15 @@ pub(crate) fn prepare<B: Backend>(
     bindings: ElementBindings,
     precision: PrecisionPolicy,
 ) -> Result<Arc<Prepared<B>>, PrepareError> {
+    let profile = opened.profile().map_err(|error| {
+        PrepareError::Preparation(
+            seismic_compiler::errors::PreparationError::NativeCompilation(
+                seismic_compiler::errors::NativeCompilationError::ToolchainFailure(
+                    error.to_string(),
+                ),
+            ),
+        )
+    })?;
     let logical = module
         .entry(entry, &bindings)
         .map_err(PrepareError::Source)?;
@@ -523,17 +591,17 @@ pub(crate) fn prepare<B: Backend>(
         key_str("seismic.backend", B::NAME.as_str()),
         key_str(
             "seismic.target.hardware",
-            opened.contract.compatibility_identity().hardware.clone(),
+            profile.contract.compatibility_identity().hardware.clone(),
         ),
         key_str(
             "seismic.target.fingerprint",
-            hex(&opened.contract.identity().fingerprint),
+            hex(&profile.contract.identity().fingerprint),
         ),
         key_str("seismic.policy", hex(&key.policy.0)),
     ];
     let mut span = Timed::start("seismic.prepare", attributes.clone());
     let budget = PreparationBudget::default();
-    let machine = opened.contract.planning_with(&opened.execution);
+    let machine = profile.contract.planning_with(&profile.execution);
     let space = plan_space(
         logical,
         machine,
@@ -553,6 +621,509 @@ pub(crate) fn prepare<B: Backend>(
     });
     opened.cache().insert(key, Arc::downgrade(&prepared));
     Ok(prepared)
+}
+
+#[cfg(target_os = "macos")]
+enum NativeResult {
+    Tensor {
+        representation: RepresentationId,
+        axes: Vec<CompiledNat>,
+    },
+    Scalar(seismic_lang::types::DType),
+    Index,
+    Range,
+}
+
+/// A direct Metal entry point. It deliberately has no `PreparedKernel`,
+/// plan space, precision policy, portfolio, or workflow representation.
+#[cfg(target_os = "macos")]
+pub(crate) struct NativePreparedMetal {
+    opened: Arc<Opened<seismic_metal::Metal>>,
+    public_device: Arc<crate::api::device::DeviceInner>,
+    logical: LogicalEntry,
+    invocation: InvocationContract,
+    pipeline: seismic_metal::DirectPipeline,
+    definition: NativeDefinition,
+    results: Vec<NativeResult>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_native_metal(
+    opened: &Arc<Opened<seismic_metal::Metal>>,
+    module: &CheckedModule,
+    entry: EntryId,
+    bindings: ElementBindings,
+    public_device: &Arc<crate::api::device::DeviceInner>,
+    definition: NativeDefinition,
+) -> Result<Arc<NativePreparedMetal>, PrepareError> {
+    let logical = module
+        .entry(entry, &bindings)
+        .map_err(PrepareError::Source)?;
+    let invocation = InvocationContract::compile_entry(&logical);
+    let results = logical
+        .schema()
+        .results()
+        .iter()
+        .map(|result| match &result.kind {
+            ResultKind::Tensor {
+                representation,
+                axes,
+            } => NativeResult::Tensor {
+                representation: *representation,
+                axes: axes
+                    .iter()
+                    .map(|axis| logical.arena().compile_nat(*axis))
+                    .collect(),
+            },
+            ResultKind::Scalar(dtype) => NativeResult::Scalar(*dtype),
+            ResultKind::Index { .. } => NativeResult::Index,
+            ResultKind::Range { .. } => NativeResult::Range,
+        })
+        .collect();
+    let source = render_native_source(logical.schema(), definition.source);
+    let pipeline =
+        seismic_metal::DirectPipeline::compile(&opened.service, &source, definition.entry)
+            .map_err(|error| {
+                PrepareError::Preparation(
+                    seismic_compiler::errors::PreparationError::NativeCompilation(error),
+                )
+            })?;
+    Ok(Arc::new(NativePreparedMetal {
+        opened: opened.clone(),
+        public_device: public_device.clone(),
+        logical,
+        invocation,
+        pipeline,
+        definition,
+        results,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+impl NativePreparedMetal {
+    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        let schema = self.logical.schema();
+        let arguments = args.values();
+        let values =
+            validate_invocation(schema, &self.invocation, self.opened.identity(), &arguments)
+                .map_err(CallError::Invocation)?;
+
+        let mut tensor_results = Vec::new();
+        for result in &self.results {
+            match result {
+                NativeResult::Tensor {
+                    representation,
+                    axes,
+                } => {
+                    let extents = axes
+                        .iter()
+                        .map(|axis| native_eval_compiled(axis, &values))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let tensor = Arc::new(
+                        TensorInner::zeros(&self.public_device, *representation, &extents)
+                            .map_err(native_tensor_error)?,
+                    );
+                    tensor_results.push(tensor);
+                }
+                NativeResult::Scalar(_) | NativeResult::Index | NativeResult::Range => {
+                    // Filled from the scalar-result buffer after dispatch.
+                }
+            }
+        }
+
+        let words = native_words(schema, &args, &tensor_results, &values)?;
+        let word_bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let word_allocation = self
+            .opened
+            .allocate_storage(word_bytes.len().max(1) as u64, 8)
+            .map_err(CallError::Execution)?;
+        word_allocation
+            .storage()
+            .write(0, &word_bytes)
+            .map_err(CallError::Execution)?;
+        let scalar_words = self
+            .results
+            .iter()
+            .map(|result| match result {
+                NativeResult::Range => 2usize,
+                NativeResult::Scalar(_) | NativeResult::Index => 1,
+                NativeResult::Tensor { .. } => 0,
+            })
+            .sum::<usize>();
+        let scalar_allocation = self
+            .opened
+            .allocate_storage((scalar_words * 8).max(1) as u64, 8)
+            .map_err(CallError::Execution)?;
+        write_zeros(
+            scalar_allocation.storage(),
+            (scalar_words * 8).max(1) as u64,
+        )
+        .map_err(CallError::Execution)?;
+
+        let mut access = collect_access(schema, &args);
+        access.extend(
+            tensor_results
+                .iter()
+                .map(|tensor| (tensor.allocation().clone(), true)),
+        );
+        let _permits = acquire_access(&access);
+
+        let mut buffers = Vec::new();
+        for (ordinal, parameter) in schema.parameters().iter().enumerate() {
+            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
+                let tensor = args
+                    .tensor(ordinal)
+                    .expect("validated tensor argument disappeared");
+                buffers.push((
+                    typed_buffer::<seismic_metal::Metal>(tensor.allocation()),
+                    tensor.byte_offset(),
+                ));
+            }
+        }
+        for tensor in &tensor_results {
+            buffers.push((
+                typed_buffer::<seismic_metal::Metal>(tensor.allocation()),
+                tensor.byte_offset(),
+            ));
+        }
+        buffers.push((typed_buffer::<seismic_metal::Metal>(&word_allocation), 0));
+        buffers.push((typed_buffer::<seismic_metal::Metal>(&scalar_allocation), 0));
+        let borrowed = buffers
+            .iter()
+            .map(|(buffer, offset)| (buffer, *offset))
+            .collect::<Vec<_>>();
+        let threadgroups = self
+            .definition
+            .threadgroups
+            .each_ref()
+            .map(|expression| native_eval_launch(expression, schema, &values));
+        let threads = self
+            .definition
+            .threads_per_threadgroup
+            .each_ref()
+            .map(|expression| native_eval_launch(expression, schema, &values));
+        let threadgroups = collect_native_geometry(threadgroups)?;
+        let threads = collect_native_geometry(threads)?;
+        self.pipeline
+            .dispatch(&self.opened.service, &borrowed, threadgroups, threads)
+            .map_err(CallError::Execution)?;
+
+        let mut scalar_bytes = vec![0u8; scalar_words * 8];
+        scalar_allocation
+            .storage()
+            .read(0, &mut scalar_bytes)
+            .map_err(CallError::Execution)?;
+        let mut scalar_offset = 0usize;
+        let mut tensors = tensor_results.into_iter();
+        let mut final_values = Vec::with_capacity(self.results.len());
+        for result in &self.results {
+            match result {
+                NativeResult::Tensor { .. } => final_values.push(DecodedValue::Tensor(
+                    tensors.next().expect("native result tensor count changed"),
+                )),
+                NativeResult::Scalar(dtype) => {
+                    let word = read_native_word(&scalar_bytes, scalar_offset);
+                    scalar_offset += 1;
+                    final_values.push(DecodedValue::Scalar(native_scalar(*dtype, word)));
+                }
+                NativeResult::Index => {
+                    let word = read_native_word(&scalar_bytes, scalar_offset);
+                    scalar_offset += 1;
+                    final_values.push(DecodedValue::Scalar(ArgumentValue::Index(word)));
+                }
+                NativeResult::Range => {
+                    let start = read_native_word(&scalar_bytes, scalar_offset);
+                    let end = read_native_word(&scalar_bytes, scalar_offset + 1);
+                    scalar_offset += 2;
+                    final_values.push(DecodedValue::Scalar(ArgumentValue::Range { start, end }));
+                }
+            }
+        }
+        Ok(DecodedResults::new(final_values))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_tensor_error(error: crate::api::TensorError) -> CallError {
+    match error {
+        crate::api::TensorError::Execution(error) => CallError::Execution(error),
+        other => CallError::Execution(ExecutionError::AllocationFailed(other.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_eval_compiled(
+    expression: &CompiledNat,
+    values: &InvocationValues,
+) -> Result<u64, CallError> {
+    expression.evaluate(values).map_err(|error| {
+        CallError::Execution(ExecutionError::SubmissionFailed(format!(
+            "native ABI expression failed after invocation validation: {error:?}"
+        )))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn native_eval_launch(
+    expression: &NativeExpr,
+    schema: &CallSchema,
+    values: &InvocationValues,
+) -> Result<u64, CallError> {
+    let binary = |left: &NativeExpr, right: &NativeExpr, operation: fn(u64, u64) -> Option<u64>| {
+        let left = native_eval_launch(left, schema, values)?;
+        let right = native_eval_launch(right, schema, values)?;
+        operation(left, right).ok_or_else(|| {
+            CallError::Execution(ExecutionError::SubmissionFailed(
+                "native launch expression overflowed or divided by zero".to_owned(),
+            ))
+        })
+    };
+    match expression {
+        NativeExpr::Constant(value) => Ok(*value),
+        NativeExpr::Dimension(name) => {
+            let dimension = schema
+                .dimensions()
+                .iter()
+                .find(|dimension| dimension.name == *name)
+                .expect("checked native launch expression names an absent dimension");
+            match values.get(dimension.symbol) {
+                Some(SymbolValue::Nat(value)) => Ok(value),
+                _ => panic!("validated invocation omitted a native launch dimension"),
+            }
+        }
+        NativeExpr::Add(left, right) => binary(left, right, u64::checked_add),
+        NativeExpr::Sub(left, right) => binary(left, right, u64::checked_sub),
+        NativeExpr::Mul(left, right) => binary(left, right, u64::checked_mul),
+        NativeExpr::Div(left, right) => binary(left, right, u64::checked_div),
+        NativeExpr::Rem(left, right) => binary(left, right, u64::checked_rem),
+        NativeExpr::CeilDiv(left, right) => {
+            let left = native_eval_launch(left, schema, values)?;
+            let right = native_eval_launch(right, schema, values)?;
+            left.checked_add(right.saturating_sub(1))
+                .and_then(|value| value.checked_div(right))
+                .ok_or_else(|| {
+                    CallError::Execution(ExecutionError::SubmissionFailed(
+                        "native ceil_div launch expression overflowed or divided by zero"
+                            .to_owned(),
+                    ))
+                })
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_native_geometry(values: [Result<u64, CallError>; 3]) -> Result<[u64; 3], CallError> {
+    let [x, y, z] = values;
+    Ok([x?, y?, z?])
+}
+
+#[cfg(target_os = "macos")]
+fn native_words(
+    schema: &CallSchema,
+    args: &EncodedArgs,
+    results: &[Arc<TensorInner>],
+    values: &InvocationValues,
+) -> Result<Vec<u64>, CallError> {
+    let mut words = Vec::new();
+    for dimension in schema.dimensions() {
+        match values.get(dimension.symbol) {
+            Some(SymbolValue::Nat(value)) => words.push(value),
+            _ => panic!("validated invocation omitted a native ABI dimension"),
+        }
+    }
+    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
+        match &parameter.kind {
+            ParameterKind::Tensor { .. } => {
+                let tensor = args.tensor(ordinal).expect("validated tensor disappeared");
+                words.extend_from_slice(tensor.extents());
+                words.extend_from_slice(tensor.strides());
+            }
+            ParameterKind::Scalar { symbol, .. } | ParameterKind::Index { symbol, .. } => {
+                words.push(native_symbol(
+                    values.get(*symbol).expect("validated scalar disappeared"),
+                ));
+            }
+            ParameterKind::Range { start, end, .. } => {
+                words.push(native_symbol(
+                    values
+                        .get(*start)
+                        .expect("validated range start disappeared"),
+                ));
+                words.push(native_symbol(
+                    values.get(*end).expect("validated range end disappeared"),
+                ));
+            }
+        }
+    }
+    for tensor in results {
+        words.extend_from_slice(tensor.extents());
+        words.extend_from_slice(tensor.strides());
+    }
+    Ok(words)
+}
+
+#[cfg(target_os = "macos")]
+fn native_symbol(value: SymbolValue) -> u64 {
+    match value {
+        SymbolValue::Nat(value) => value,
+        SymbolValue::Int(value) => value as u64,
+        SymbolValue::F32(value) => u64::from(value.to_bits()),
+        SymbolValue::F16(value) | SymbolValue::BF16(value) => u64::from(value),
+        SymbolValue::I32(value) => u64::from(value as u32),
+        SymbolValue::U32(value) => u64::from(value),
+        SymbolValue::Bool(value) => u64::from(value),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_scalar(dtype: seismic_lang::types::DType, value: u64) -> ArgumentValue {
+    match dtype {
+        seismic_lang::types::DType::F32 => ArgumentValue::F32(f32::from_bits(value as u32)),
+        seismic_lang::types::DType::F16 => ArgumentValue::F16(value as u16),
+        seismic_lang::types::DType::BF16 => ArgumentValue::BF16(value as u16),
+        seismic_lang::types::DType::I32 => ArgumentValue::I32(value as u32 as i32),
+        seismic_lang::types::DType::U32 => ArgumentValue::U32(value as u32),
+        seismic_lang::types::DType::Bool => ArgumentValue::Bool(value != 0),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_word(bytes: &[u8], word: usize) -> u64 {
+    let start = word * 8;
+    u64::from_le_bytes(
+        bytes[start..start + 8]
+            .try_into()
+            .expect("native scalar word"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn render_native_source(schema: &CallSchema, source: &str) -> String {
+    let mut prefix = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    let mut buffer = 0usize;
+    let mut word = 0usize;
+    for dimension in schema.dimensions() {
+        prefix.push_str(&format!(
+            "#define SEISMIC_DIM_{} (seismic_words[{}])\n",
+            native_macro(&dimension.name),
+            word
+        ));
+        word += 1;
+    }
+    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
+        let name = native_macro(&parameter.name);
+        let named = schema
+            .parameters()
+            .iter()
+            .filter(|candidate| candidate.name == parameter.name)
+            .count()
+            == 1;
+        match &parameter.kind {
+            ParameterKind::Tensor { axes, .. } => {
+                if named {
+                    prefix.push_str(&format!("#define SEISMIC_BUFFER_{name} {buffer}\n"));
+                }
+                prefix.push_str(&format!(
+                    "#define SEISMIC_PARAM_{ordinal}_BUFFER {buffer}\n"
+                ));
+                buffer += 1;
+                for axis in 0..axes.len() {
+                    prefix.push_str(&format!(
+                        "#define SEISMIC_PARAM_{ordinal}_EXTENT_{axis} (seismic_words[{}])\n",
+                        word + axis
+                    ));
+                    prefix.push_str(&format!(
+                        "#define SEISMIC_PARAM_{ordinal}_STRIDE_{axis} (seismic_words[{}])\n",
+                        word + axes.len() + axis
+                    ));
+                    if named {
+                        prefix.push_str(&format!(
+                            "#define SEISMIC_{name}_EXTENT_{axis} SEISMIC_PARAM_{ordinal}_EXTENT_{axis}\n#define SEISMIC_{name}_STRIDE_{axis} SEISMIC_PARAM_{ordinal}_STRIDE_{axis}\n"
+                        ));
+                    }
+                }
+                word += axes.len() * 2;
+            }
+            ParameterKind::Scalar { .. } | ParameterKind::Index { .. } => {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_PARAM_{ordinal} (seismic_words[{word}])\n"
+                ));
+                if named {
+                    prefix.push_str(&format!(
+                        "#define SEISMIC_PARAM_{name} SEISMIC_PARAM_{ordinal}\n"
+                    ));
+                }
+                word += 1;
+            }
+            ParameterKind::Range { .. } => {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_PARAM_{ordinal}_START (seismic_words[{word}])\n"
+                ));
+                prefix.push_str(&format!(
+                    "#define SEISMIC_PARAM_{ordinal}_END (seismic_words[{}])\n",
+                    word + 1
+                ));
+                if named {
+                    prefix.push_str(&format!(
+                        "#define SEISMIC_PARAM_{name}_START SEISMIC_PARAM_{ordinal}_START\n#define SEISMIC_PARAM_{name}_END SEISMIC_PARAM_{ordinal}_END\n"
+                    ));
+                }
+                word += 2;
+            }
+        }
+    }
+    let mut scalar_word = 0usize;
+    for (ordinal, result) in schema.results().iter().enumerate() {
+        if let ResultKind::Tensor { axes, .. } = &result.kind {
+            prefix.push_str(&format!(
+                "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}\n"
+            ));
+            buffer += 1;
+            for axis in 0..axes.len() {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_RESULT_{ordinal}_EXTENT_{axis} (seismic_words[{}])\n",
+                    word + axis
+                ));
+                prefix.push_str(&format!(
+                    "#define SEISMIC_RESULT_{ordinal}_STRIDE_{axis} (seismic_words[{}])\n",
+                    word + axes.len() + axis
+                ));
+            }
+            word += axes.len() * 2;
+        } else {
+            prefix.push_str(&format!(
+                "#define SEISMIC_RESULT_{ordinal}_WORD {scalar_word}\n"
+            ));
+            scalar_word += if matches!(result.kind, ResultKind::Range { .. }) {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    prefix.push_str(&format!("#define SEISMIC_BUFFER_WORDS {buffer}\n"));
+    prefix.push_str(&format!(
+        "#define SEISMIC_BUFFER_SCALAR_RESULTS {}\n",
+        buffer + 1
+    ));
+    prefix.push_str(source);
+    prefix
+}
+
+#[cfg(target_os = "macos")]
+fn native_macro(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub(crate) struct PreparedHandle<B: Backend> {

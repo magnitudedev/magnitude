@@ -11,6 +11,13 @@ applies_to:
 Numerical precision is an observable compilation contract and a hard selection constraint. It is
 not a source-level permission, a backend-wide fast-math mode, or a performance penalty.
 
+An explicitly selected top-level native implementation is outside compiler selection. Its
+generated `native_for_device` API therefore accepts no precision policy and carries no inferred or
+qualified numerical assessment. Selecting it asserts that the authored native asset implements
+the attached portable function contract. This is an implementation conformance obligation, not a
+caller precondition, an `unsafe` call, or permission for silent fallback. The direct Metal compiler
+still disables fast math by default.
+
 ## Authority
 
 The first applicable portable function body defines reference operation order, casts,
@@ -113,3 +120,4 @@ qualification. It never invents a bound to obtain a faster result.
 - A threshold change may change the selected witness, but cannot widen evidence implicitly.
 - Unknown analysis and special-value changes cannot disappear into a performance objective.
 - Source syntax has no `admit` escape hatch; partial-value checking is numerical-policy agnostic.
+- Direct native selection is explicit and cannot be mistaken for policy-checked compiler selection.

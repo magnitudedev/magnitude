@@ -515,6 +515,14 @@ pub struct Kernel<E: Entry> {
     marker: std::marker::PhantomData<E>,
 }
 
+/// An explicitly selected, top-level native implementation of one entry.
+/// It has the same typed call contract as [`Kernel`], but intentionally
+/// cannot be enqueued into a workflow or passed through compiler planning.
+pub struct NativeKernel<E: Entry> {
+    inner: Arc<seismic_runtime::api::kernel::NativePreparedAny>,
+    marker: std::marker::PhantomData<E>,
+}
+
 /// A workflow draft is the only public object that accepts prepared call
 /// nodes. Enqueue returns symbolic results that cannot be used by the
 /// synchronous kernel API. `run` consumes the draft, admits all nodes, submits
@@ -598,6 +606,59 @@ impl<E: Entry> Kernel<E> {
     }
 }
 
+impl<E: Entry> NativeKernel<E> {
+    fn prepare(
+        device: &Device,
+        definition: generated::NativeDefinition,
+        bindings: seismic_lang::entry::ElementBindings,
+    ) -> Result<Self, LoadError> {
+        let module = E::module().map_err(LoadError::Bundle)?;
+        let entry = E::resolve(module).map_err(LoadError::Bundle)?;
+        seismic_runtime::api::kernel::prepare_native(
+            module.checked(),
+            entry.id(),
+            bindings,
+            device.inner(),
+            definition,
+        )
+        .map(|inner| Self {
+            inner: Arc::new(inner),
+            marker: std::marker::PhantomData,
+        })
+        .map_err(|error| match error {
+            seismic_runtime::api::kernel::PrepareError::Source(error) => {
+                LoadError::Source(SourceLoadError::from_internal(error))
+            }
+            seismic_runtime::api::kernel::PrepareError::Preparation(error) => {
+                LoadError::Preparation(error)
+            }
+        })
+    }
+
+    pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
+        let encoded = E::encode(args);
+        let decoded = seismic_runtime::api::kernel::call_native(&self.inner, encoded)?;
+        Ok(E::decode(decoded))
+    }
+}
+
+impl<E: Entry> Clone for NativeKernel<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<E: Entry> fmt::Debug for NativeKernel<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeKernel")
+            .field("entry", &E::NAME)
+            .finish()
+    }
+}
+
 impl<E: Entry> Clone for Kernel<E> {
     fn clone(&self) -> Self {
         Self {
@@ -624,6 +685,7 @@ pub mod generated {
     pub use seismic_runtime::api::kernel::{
         DecodedResults, EncodedArgs, EncodedWorkflowArgs, PendingWorkflowResults, WorkflowResultRef,
     };
+    pub use seismic_runtime::api::kernel::{NativeDefinition, NativeExpr};
 
     /// Opaque checked module token used only by generated bindings. Consumers
     /// can name the type because Rust trait implementations must, but cannot
@@ -805,6 +867,18 @@ pub mod generated {
             |bindings, (name, element)| bindings.bind(name, element.id()),
         );
         Kernel::prepare(device, precision, bindings)
+    }
+
+    pub fn prepare_native<E: Entry>(
+        device: &Device,
+        definition: NativeDefinition,
+        elements: &[(&str, Element)],
+    ) -> Result<NativeKernel<E>, LoadError> {
+        let bindings = elements.iter().fold(
+            seismic_lang::entry::ElementBindings::new(),
+            |bindings, (name, element)| bindings.bind(name, element.id()),
+        );
+        NativeKernel::prepare(device, definition, bindings)
     }
 
     fn tensor_result(inner: Arc<seismic_runtime::api::tensor::TensorInner>) -> Tensor {

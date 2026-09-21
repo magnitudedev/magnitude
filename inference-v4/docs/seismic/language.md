@@ -22,6 +22,10 @@ lower name[SHAPES](parameters) -> result for metal
     requires metal.matrix
     where predicates:
     body
+
+native name for metal from "native/name.metal":
+    threadgroups (ceil_div(N, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
 ```
 
 Canonical header order is `for`, `requires`, `where`.
@@ -29,12 +33,15 @@ Canonical header order is `for`, `requires`, `where`.
 - A `fn` without `for` is portable.
 - A `fn for B` is a helper callable only by definitions for backend `B`.
 - A `lower ... for B` is an alternative backend implementation of a portable function family.
+- A `native name for B from "asset"` attaches one explicitly selected, top-level native
+  implementation to an existing portable function. Its signature, effects, shapes, and ABI are
+  derived from that function rather than repeated.
 - Portable bodies and applicable lowerings remain equal candidates at each static call.
 - A backend definition declares every capability namespace it uses. Requirements propagate through
   backend-helper calls, and unused requirements are errors.
 - Source files end in `.seismic`; file names do not establish a backend or namespace.
 
-There are no bodyless declarations, target-neutral lowerings, export markers, lowering promises,
+There are no bodyless function declarations, target-neutral lowerings, export markers, lowering promises,
 or `= portable` aliases.
 
 ## Values and ownership
@@ -131,6 +138,12 @@ candidates.
 
 Shape predicates use `where`. A lowering may specialize shape relationships or element types only
 while preserving the function contract.
+
+A native implementation is never considered at a static call occurrence. Generated Rust exposes
+the ordinary `for_device(device, precision)` and the explicit
+`native_for_device(device)` in parallel. Both use the same generated `Args` and `Results`, but the
+native handle permits only direct synchronous calls. Its launch expressions are closed integer
+arithmetic over the attached function's shape dimensions.
 
 ## Capabilities
 

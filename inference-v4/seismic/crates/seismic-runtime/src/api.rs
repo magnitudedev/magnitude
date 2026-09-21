@@ -215,7 +215,7 @@ pub mod device {
 
     pub struct DeviceInner {
         pub(crate) info: DeviceInfo,
-        pub(crate) capabilities: Vec<String>,
+        pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: DeviceKind,
     }
     impl DeviceInner {
@@ -223,7 +223,9 @@ pub mod device {
             &self.info
         }
         pub fn capabilities(&self) -> &[String] {
-            &self.capabilities
+            self.capabilities
+                .get_or_init(|| self.kind.capabilities())
+                .as_slice()
         }
         pub(crate) fn allocate(
             self: &Arc<Self>,
@@ -626,6 +628,59 @@ pub mod kernel {
     pub enum PrepareError {
         Source(SourceError),
         Preparation(PreparationError),
+    }
+
+    /// Closed launch-expression vocabulary emitted by `seismic-build` for a
+    /// top-level native implementation.
+    #[derive(Clone, Debug)]
+    pub enum NativeExpr {
+        Constant(u64),
+        Dimension(&'static str),
+        Add(Box<Self>, Box<Self>),
+        Sub(Box<Self>, Box<Self>),
+        Mul(Box<Self>, Box<Self>),
+        Div(Box<Self>, Box<Self>),
+        Rem(Box<Self>, Box<Self>),
+        CeilDiv(Box<Self>, Box<Self>),
+    }
+
+    impl NativeExpr {
+        pub fn constant(value: u64) -> Self {
+            Self::Constant(value)
+        }
+        pub fn dimension(name: &'static str) -> Self {
+            Self::Dimension(name)
+        }
+        pub fn add(left: Self, right: Self) -> Self {
+            Self::Add(Box::new(left), Box::new(right))
+        }
+        pub fn sub(left: Self, right: Self) -> Self {
+            Self::Sub(Box::new(left), Box::new(right))
+        }
+        pub fn mul(left: Self, right: Self) -> Self {
+            Self::Mul(Box::new(left), Box::new(right))
+        }
+        pub fn div(left: Self, right: Self) -> Self {
+            Self::Div(Box::new(left), Box::new(right))
+        }
+        pub fn rem(left: Self, right: Self) -> Self {
+            Self::Rem(Box::new(left), Box::new(right))
+        }
+        pub fn ceil_div(left: Self, right: Self) -> Self {
+            Self::CeilDiv(Box::new(left), Box::new(right))
+        }
+    }
+
+    /// Source and launch contract for a generated native entry point.
+    pub struct NativeDefinition {
+        pub source: &'static str,
+        pub entry: &'static str,
+        pub threadgroups: [NativeExpr; 3],
+        pub threads_per_threadgroup: [NativeExpr; 3],
+    }
+
+    pub struct NativePreparedAny {
+        pub(crate) inner: crate::backends::NativePreparedKind,
     }
 
     enum EncodedArgument {
@@ -1035,6 +1090,26 @@ pub mod kernel {
             .map(|inner| PreparedAny { inner })
     }
     pub fn call(kernel: &Arc<PreparedAny>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        kernel.inner.call(args)
+    }
+
+    pub fn prepare_native(
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        device: &Arc<DeviceInner>,
+        definition: NativeDefinition,
+    ) -> Result<NativePreparedAny, PrepareError> {
+        device
+            .kind
+            .prepare_native(module, entry, bindings, device, definition)
+            .map(|inner| NativePreparedAny { inner })
+    }
+
+    pub fn call_native(
+        kernel: &Arc<NativePreparedAny>,
+        args: EncodedArgs,
+    ) -> Result<DecodedResults, CallError> {
         kernel.inner.call(args)
     }
 

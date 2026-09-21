@@ -86,6 +86,24 @@ impl Printer {
                 self.out.push_str(":\n");
                 self.block(&l.body);
             }
+            Decl::Native(n) => {
+                let escaped = n.source.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(
+                    self.out,
+                    "native {} for {} from \"{}\":\n",
+                    n.function.name, n.target.name, escaped
+                );
+                self.level += 1;
+                self.indent();
+                self.out.push_str("threadgroups (");
+                self.list(&n.threadgroups, |p, expr| p.expr(expr, 0));
+                self.out.push_str(")\n");
+                self.indent();
+                self.out.push_str("threads_per_threadgroup (");
+                self.list(&n.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
+                self.out.push_str(")\n");
+                self.level -= 1;
+            }
         }
     }
 

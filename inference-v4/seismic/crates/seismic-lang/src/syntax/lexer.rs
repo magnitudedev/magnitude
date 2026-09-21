@@ -55,6 +55,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'0'..=b'9' => self.number()?,
+                b'"' => self.string()?,
                 b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.name(),
                 _ => self.operator()?,
             }
@@ -274,6 +275,63 @@ impl<'a> Lexer<'a> {
             tok,
             span: Span::new(start, self.pos),
         });
+    }
+
+    fn string(&mut self) -> Result<(), Diagnostic> {
+        let start = self.pos;
+        self.pos += 1;
+        let mut value = String::new();
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'"' => {
+                    self.pos += 1;
+                    self.tokens.push(Token {
+                        tok: Tok::String(value),
+                        span: Span::new(start, self.pos),
+                    });
+                    return Ok(());
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    if self.pos >= self.bytes.len() {
+                        break;
+                    }
+                    let escaped = match self.bytes[self.pos] {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        other => {
+                            return Err(Diagnostic::new(
+                                Span::new(self.pos - 1, self.pos + 1),
+                                format!("unsupported string escape `\\{}`", other as char),
+                            ));
+                        }
+                    };
+                    value.push(escaped);
+                    self.pos += 1;
+                }
+                b'\n' | b'\r' => {
+                    return Err(Diagnostic::new(
+                        Span::new(start, self.pos),
+                        "string literals cannot contain a newline",
+                    ));
+                }
+                _ => {
+                    let ch = self.text[self.pos..]
+                        .chars()
+                        .next()
+                        .expect("lexer position is within the source");
+                    value.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+        Err(Diagnostic::new(
+            Span::new(start, self.pos),
+            "unterminated string literal",
+        ))
     }
 
     fn operator(&mut self) -> Result<(), Diagnostic> {

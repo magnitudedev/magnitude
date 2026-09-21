@@ -14,7 +14,7 @@ applies_to:
 
 # Seismic compilation
 
-The sole artifact progression is:
+The ordinary compiler artifact progression is:
 
 ```text
 CheckedModule -> LogicalEntry -> ImplementationDraft<B>
@@ -32,6 +32,20 @@ fallback, retry compiler, compatibility route, greedy selector, or backup
 implementation. Private algorithms may normalize, infer, schedule, or emit,
 but they never introduce a public or cross-crate artifact that restates the
 program.
+
+An explicitly selected top-level native implementation is a separate terminal route, not another
+compiler progression:
+
+```text
+CheckedModule -> LogicalEntry -> InvocationContract
+             + embedded native source + authored launch
+             -> NativeKernel<Entry> -> direct synchronous Metal completion
+```
+
+This route reuses the checked entry contract and public tensor runtime but constructs none of
+`ImplementationDraft`, compiler kernel IR, `PlanSpace`, `FrozenPlan`, `ExecutableVariant`,
+`PreparedKernel`, or workflow artifacts. It has no tuning, solving, duration model, candidate
+selection, retry, or fallback. The distinct public handle makes direct-only use structural.
 
 ## Principles
 
@@ -59,7 +73,7 @@ program.
 
 | Artifact | Owns | Must not own |
 |---|---|---|
-| `CheckedModule` | source semantics, types, effects, canonical bodies, lowering declarations, capability requirements, stable identities | target decisions, schedules, allocations, native code |
+| `CheckedModule` | source semantics, types, effects, canonical bodies, lowering declarations, top-level native asset references and launch expressions, capability requirements, stable identities | target decisions, schedules, allocations, native code bytes |
 | `LogicalEntry` | monomorphized entry semantics, `CallSchema`, `EntryDomain`, canonical operation graph, provenance, the entry's expression arena | placement, algorithm selection, native limits |
 | `DeviceContract<B>` | device-wide compatibility, capabilities, hard limits, memory rules, toolchain modes, and numerical environment | kernel-specific limits, measured rates, selected plan |
 | `NativeKernel<B>` | one concrete kernel handle, exact ABI, launch domain, reflected resources, numerical mode, and service footprint | unresolved codegen choices, performance observations |
@@ -103,11 +117,12 @@ constraint.
 
 ## Machine contracts and capabilities
 
-Catalog discovery only enumerates unopened physical devices. Opening a device
-creates the production service/queue, queries a device contract, runs the fixed
-primitive probe suite, assembles the execution profile, and returns a usable public device
-only after all of those steps succeed. A profile is never constructed during
-catalog discovery or independently paired with a later-opened service.
+Catalog discovery only enumerates unopened physical devices. Opening a Metal device creates the
+production service/queue immediately. Its device contract and fixed primitive execution profile
+are acquired together and cached on first use by ordinary compiler preparation or capability
+introspection. This preserves exact pairing with the opened service while allowing explicitly
+selected direct native calls to avoid profiling entirely. Other backends may still acquire their
+complete profile while opening.
 
 The device contract is assembled once from backend revision, hardware identity
 and device-wide limits, driver and toolchain versions, dtype support, the

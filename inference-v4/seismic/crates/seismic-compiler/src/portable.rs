@@ -409,6 +409,128 @@ enum SegmentCapture {
     Unit,
 }
 
+#[derive(Clone, Debug)]
+struct StreamTensorPlan {
+    axes: Vec<NatExpr>,
+    value: StreamTensorPlanValue,
+}
+
+#[derive(Clone, Debug)]
+enum StreamTensorPlanValue {
+    Physical(AnyBufferView),
+    Elementwise {
+        primitive: PrimitiveId,
+        inputs: Vec<StreamBoundPlan>,
+        input_axes: Vec<Option<Vec<NatExpr>>>,
+        output: SemanticType,
+    },
+    View {
+        base: Box<StreamTensorPlan>,
+        transform: StreamViewPlan,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum StreamBoundPlan {
+    Tensor(StreamTensorPlan),
+    Scalar(PreparedArg),
+}
+
+#[derive(Clone, Debug)]
+enum StreamViewPlan {
+    Slice(Vec<StreamSliceAxisPlan>),
+    Transpose(Vec<u32>),
+    Reshape,
+}
+
+#[derive(Clone, Debug)]
+enum StreamSliceAxisPlan {
+    Full,
+    Point(PreparedArg),
+    Range { start: PreparedArg },
+}
+
+fn instantiate_stream_tensor<B: Backend>(
+    kernel: &mut PortableBuilder<'_, B>,
+    plan: &StreamTensorPlan,
+) -> SegmentTensor {
+    let axes = plan
+        .axes
+        .iter()
+        .map(|axis| kernel.nat_arg(*axis))
+        .collect::<Vec<_>>();
+    let value = match &plan.value {
+        StreamTensorPlanValue::Physical(view) => {
+            let place = kernel.arg_view(*view, false);
+            SegmentTensorValue::Physical(kernel.tensor(place))
+        }
+        StreamTensorPlanValue::Elementwise {
+            primitive,
+            inputs,
+            input_axes,
+            output,
+        } => SegmentTensorValue::Elementwise {
+            primitive: primitive.clone(),
+            inputs: inputs
+                .iter()
+                .map(|input| match input {
+                    StreamBoundPlan::Tensor(tensor) => {
+                        SegmentBound::Tensor(instantiate_stream_tensor(kernel, tensor))
+                    }
+                    StreamBoundPlan::Scalar(value) => {
+                        SegmentBound::Scalar(prepared_kernel_arg(kernel, *value))
+                    }
+                })
+                .collect(),
+            input_axes: input_axes
+                .iter()
+                .map(|axes| {
+                    axes.as_ref().map(|axes| {
+                        axes.iter()
+                            .map(|axis| kernel.nat_arg(*axis))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect(),
+            output: output.clone(),
+        },
+        StreamTensorPlanValue::View { base, transform } => {
+            let base = Box::new(instantiate_stream_tensor(kernel, base));
+            let transform = match transform {
+                StreamViewPlan::Transpose(permutation) => {
+                    SegmentViewTransform::Transpose(permutation.clone())
+                }
+                StreamViewPlan::Reshape => SegmentViewTransform::Reshape,
+                StreamViewPlan::Slice(axes) => SegmentViewTransform::Slice(
+                    axes.iter()
+                        .map(|axis| match axis {
+                            StreamSliceAxisPlan::Full => SegmentSliceAxis::Full,
+                            StreamSliceAxisPlan::Point(value) => {
+                                SegmentSliceAxis::Point(prepared_kernel_arg(kernel, *value))
+                            }
+                            StreamSliceAxisPlan::Range { start } => SegmentSliceAxis::Range {
+                                start: prepared_kernel_arg(kernel, *start),
+                            },
+                        })
+                        .collect(),
+                ),
+            };
+            SegmentTensorValue::View { base, transform }
+        }
+    };
+    SegmentTensor { axes, value }
+}
+
+fn prepared_kernel_arg<B: Backend>(
+    kernel: &mut PortableBuilder<'_, B>,
+    argument: PreparedArg,
+) -> PortableValue {
+    match argument {
+        PreparedArg::Index(value) => kernel.nat_arg(value),
+        PreparedArg::Scalar(symbol, dtype) => kernel.scalar_arg(symbol, dtype),
+    }
+}
+
 /// Total construction environment for one checked function. Owner and
 /// ordinal checks are concentrated here; lowering sites never join raw IDs
 /// against an unqualified map.
@@ -489,6 +611,7 @@ struct Lowerer<'f, 'b, B: Backend> {
     builder: &'b mut ImplementationBuilder<'f, B>,
     values: SemanticBindings,
     mode: SemanticMode,
+    streamed_values: BTreeSet<SemanticValueId>,
 }
 
 impl<'f, 'b, B: Backend> Lowerer<'f, 'b, B> {
@@ -542,6 +665,10 @@ impl<'f, 'b, B: Backend> Lowerer<'f, 'b, B> {
             builder,
             values,
             mode,
+            // Stream fusion is an optional portable optimization. Keep the
+            // ordinary materialized path as the construction default; sites
+            // that prove a closed streamed subgraph can populate this set.
+            streamed_values: BTreeSet::new(),
         }
     }
 
@@ -4645,7 +4772,7 @@ pub(crate) fn realize_tensor<B: Backend>(
             } else {
                 SemanticMode::Portable
             };
-            let mut lowerer = Lowerer::new(function, builder, mode, false);
+            let mut lowerer = Lowerer::new(function, builder, mode);
             lowerer.realize_pure_value(value, &mut BTreeSet::new());
             let realized = lowerer.values.get(value);
             assert!(

@@ -207,6 +207,7 @@ impl Parser {
                 Tok::Eof => break,
                 Tok::Kw(Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Kw(Kw::Lower) => decls.push(Decl::Lower(self.lower_decl()?)),
+                Tok::Kw(Kw::Native) => decls.push(Decl::Native(self.native_decl()?)),
                 Tok::Indent => {
                     return Err(self.error(
                         "unexpected indentation; declarations start at the left margin".into(),
@@ -214,7 +215,7 @@ impl Parser {
                 }
                 other => {
                     return Err(self.error(format!(
-                        "expected `fn` or `lower`, found {}",
+                        "expected `fn`, `lower`, or `native`, found {}",
                         other.describe()
                     )));
                 }
@@ -277,6 +278,77 @@ impl Parser {
             body,
             span: start.to(self.prev_span()),
         })
+    }
+
+    fn native_decl(&mut self) -> PResult<NativeDecl> {
+        let start = self.expect_kw(Kw::Native)?;
+        let function = self.expect_name()?;
+        self.expect_kw(Kw::For)?;
+        let target = self.expect_name()?;
+        if !self.at_word("from") {
+            return Err(self.error(format!(
+                "expected `from <source>`, found {}",
+                self.peek().describe()
+            )));
+        }
+        self.bump();
+        let source = match self.peek().clone() {
+            Tok::String(value) => {
+                self.bump();
+                value
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a native source string, found {}",
+                    other.describe()
+                )));
+            }
+        };
+        self.expect_op(Op::Colon)?;
+        self.expect_newline()?;
+        if !matches!(self.peek(), Tok::Indent) {
+            return Err(self.error("expected an indented native declaration body".into()));
+        }
+        self.bump();
+        let threadgroups = self.native_launch_property("threadgroups")?;
+        self.expect_newline()?;
+        let threads_per_threadgroup = self.native_launch_property("threads_per_threadgroup")?;
+        self.expect_newline()?;
+        if !matches!(self.peek(), Tok::Dedent | Tok::Eof) {
+            return Err(self.error(
+                "a native declaration contains exactly `threadgroups` and `threads_per_threadgroup`"
+                    .into(),
+            ));
+        }
+        if matches!(self.peek(), Tok::Dedent) {
+            self.bump();
+        }
+        Ok(NativeDecl {
+            function,
+            target,
+            source,
+            threadgroups,
+            threads_per_threadgroup,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    fn native_launch_property(&mut self, expected: &str) -> PResult<[Expr; 3]> {
+        if !self.at_word(expected) {
+            return Err(self.error(format!(
+                "expected `{expected} (x, y, z)`, found {}",
+                self.peek().describe()
+            )));
+        }
+        self.bump();
+        self.expect_op(Op::LParen)?;
+        let x = self.expr()?;
+        self.expect_op(Op::Comma)?;
+        let y = self.expr()?;
+        self.expect_op(Op::Comma)?;
+        let z = self.expr()?;
+        self.expect_op(Op::RParen)?;
+        Ok([x, y, z])
     }
 
     /// A header may continue on one deeper-indented line (and further lines at that
@@ -1014,6 +1086,19 @@ mod tests {
             StmtKind::For { parallel: true, .. }
         ));
         assert!(matches!(file.decls[1], Decl::Lower(_)));
+    }
+
+    #[test]
+    fn native_declarations_round_trip_without_repeating_the_signature() {
+        let file = round_trip(
+            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Fn(_), Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one portable function and one native implementation")
+        };
+        assert_eq!(native.function.name, "scale");
+        assert_eq!(native.target.name, "metal");
+        assert_eq!(native.source, "native/scale.metal");
     }
 
     #[test]

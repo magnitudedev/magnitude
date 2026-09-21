@@ -11,6 +11,7 @@
 
 use crate::entry::{ElementBindings, LogicalEntry};
 use crate::ids::{EntryId, ModuleHash, StableEntryId};
+use crate::registry::BackendName;
 use crate::span::Span;
 use crate::types::DType;
 
@@ -195,6 +196,19 @@ impl CheckedModule {
             .map(|e| e.id)
     }
 
+    /// The explicitly authored top-level native implementation for an entry
+    /// and backend, when one exists.
+    pub fn native_implementation(
+        &self,
+        entry: EntryId,
+        backend: BackendName,
+    ) -> Option<&NativeImplementation> {
+        self.inner
+            .native_implementations
+            .iter()
+            .find(|native| native.entry == entry && native.backend == backend)
+    }
+
     /// Builds the monomorphized semantics of one entry under one set of
     /// compile-time element bindings. This is the only constructor of
     /// `LogicalEntry` (§3.4). An entry with no element parameters takes
@@ -233,10 +247,37 @@ pub struct EntryInfo {
     pub id: EntryId,
     pub stable: StableEntryId,
     pub name: String,
+    /// Runtime-inferred shape dimensions, in contract order.
+    pub dimensions: Vec<String>,
     /// Compile-time element parameters (`T`, `U`) an entry is polymorphic in.
     pub element_parameters: Vec<String>,
     pub parameters: Vec<ParameterSummary>,
     pub results: Vec<ResultSummary>,
+}
+
+/// One direct top-level native implementation attached to a checked entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeImplementation {
+    pub entry: EntryId,
+    pub backend: BackendName,
+    /// Canonical module source label containing the declaration.
+    pub declared_in: String,
+    pub source: String,
+    pub threadgroups: [NativeNatExpr; 3],
+    pub threads_per_threadgroup: [NativeNatExpr; 3],
+}
+
+/// Closed integer language used by native launch geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeNatExpr {
+    Constant(u64),
+    Dimension(String),
+    Add(Box<Self>, Box<Self>),
+    Sub(Box<Self>, Box<Self>),
+    Mul(Box<Self>, Box<Self>),
+    Div(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
+    CeilDiv(Box<Self>, Box<Self>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,7 +338,7 @@ pub(crate) mod internals {
     //! constructor reachable from outside `seismic-lang` other than
     //! `check` and the bundle decoder.
 
-    use super::{Diagnostics, EntryInfo, SourceError, SourceSet};
+    use super::{Diagnostics, EntryInfo, NativeImplementation, SourceError, SourceSet};
     use crate::entry::{ElementBindings, LogicalEntry};
     use crate::ids::{EntryId, ModuleHash, ModuleId, ProgramId};
 
@@ -308,6 +349,7 @@ pub(crate) mod internals {
         pub(crate) semantic_hash: ModuleHash,
         pub(crate) sources: SourceSet,
         pub(crate) entries: Vec<EntryInfo>,
+        pub(crate) native_implementations: Vec<NativeImplementation>,
         pub(crate) entry_families: Vec<usize>,
         pub(crate) definitions: Vec<crate::check::ir::Definition>,
         pub(crate) families: Vec<crate::check::ir::Family>,
@@ -345,6 +387,77 @@ pub(crate) mod internals {
         }
         pub(crate) fn sources(&self) -> &SourceSet {
             &self.sources
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    fn source(native: &str) -> SourceSet {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: format!(
+                "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\n{native}"
+            ),
+        });
+        sources
+    }
+
+    #[test]
+    fn native_implementation_attaches_to_the_portable_entry() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+        ))
+        .expect("native declaration should check");
+        let entry = &module.entries()[0];
+        let native = module
+            .native_implementation(entry.id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(entry.dimensions, ["N"]);
+        assert_eq!(native.source, "scale.metal");
+        assert!(matches!(
+            native.threadgroups[0],
+            NativeNatExpr::CeilDiv(_, _)
+        ));
+    }
+
+    #[test]
+    fn duplicate_native_implementations_are_rejected() {
+        let declaration = "native scale for metal from \"scale.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n";
+        let error = check_source(source(&format!("{declaration}\n{declaration}")))
+            .expect_err("duplicate implementation must fail");
+        assert!(error
+            .to_string()
+            .contains("already has a native implementation"));
+    }
+
+    #[test]
+    fn native_implementation_rejects_unknown_contract_facts() {
+        let cases = [
+            (
+                "native missing for metal from \"scale.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n",
+                "unknown portable function `missing`",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    threadgroups (ceil_div(M, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+                "unknown dimension `M`",
+            ),
+            (
+                "native scale for cpu from \"scale.c\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n",
+                "currently support only `metal`",
+            ),
+        ];
+
+        for (declaration, expected) in cases {
+            let error = check_source(source(declaration))
+                .expect_err("invalid native declaration must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "expected diagnostic containing {expected:?}, got {error}"
+            );
         }
     }
 }
