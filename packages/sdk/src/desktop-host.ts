@@ -8,13 +8,10 @@ export type AppearancePreference = typeof AppearancePreference.Type
 
 /** Where downloaded models are stored. The engine reads the folder once at service start. */
 export const ModelStorageSettings = Schema.Struct({
-  /** Folder in use by the running service, read when the application launched. */
   active: Schema.String,
-  /** Folder the next service start will use. */
   path: Schema.String,
   source: Schema.Literal("Default", "Configured"),
   defaultPath: Schema.String,
-  /** Why a saved value is not being used, when the default applies instead. */
   warning: Schema.NullOr(Schema.String),
 })
 export type ModelStorageSettings = typeof ModelStorageSettings.Type

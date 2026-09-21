@@ -8,15 +8,12 @@ export const defaultModelStoreRoot = (dataDir: string): string => join(dataDir, 
 export type ModelStoreSource = 'Default' | 'Configured'
 
 export interface ModelStoreSelection {
-  /** The configured or default path, exactly as the user would see it. */
   readonly path: string
   readonly source: ModelStoreSource
-  /** Why a configured value was not used. */
   readonly warning: Option.Option<string>
 }
 
 export interface ModelStoreLocation extends ModelStoreSelection {
-  /** The absolute path handed to the inference engine, with a symlinked root resolved. */
   readonly root: string
 }
 

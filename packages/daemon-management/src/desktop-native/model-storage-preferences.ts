@@ -9,9 +9,7 @@ export class ModelStoragePreferencesFailed extends Schema.TaggedError<ModelStora
 
 export interface ModelStoragePreferences {
   readonly defaultPath: string
-  /** What the next service start will use, resolved exactly as the service resolves it. */
   readonly read: Effect.Effect<ModelStoreLocation & { readonly defaultPath: string }, ModelStoragePreferencesFailed>
-  /** `None` removes the setting so the default applies again. */
   readonly write: (path: Option.Option<string>) => Effect.Effect<void, ModelStoragePreferencesFailed>
 }
 export const ModelStoragePreferences = Context.GenericTag<ModelStoragePreferences>("desktop/ModelStoragePreferences")
