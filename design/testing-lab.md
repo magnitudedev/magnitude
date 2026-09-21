@@ -261,10 +261,10 @@ reporting conservative family flags. Preparation compiles and signs the pinned c
 shim, then enables it only when an executable stock-device probe identifies that exact device,
 proves Apple family 7 is unadvertised, and produces the expected SIMD result. A second executable
 probe must pass with Apple family 7 exposed and the device's existing 32 KiB threadgroup-memory
-limit unchanged. The worker exports a receipt-bound lab capability; only candidate application,
-CLI and harness launches translate it into loader variables so the managed inference child can
-inherit them. The shim checks the executable name before installing any Metal hook and activates
-only inside `magnitude-inference`; Electron, the service host, CLIs and harnesses retain stock Metal
+limit unchanged. The worker exports a receipt-bound lab capability in the candidate environment
+without loader variables. The native inference launch alone translates it into loader variables.
+The shim also checks the executable name before installing any Metal hook and activates only
+inside `magnitude-inference`; Electron, the service host, CLIs, harnesses and macOS system tools retain stock Metal
 behavior. Physical Macs and non-Namespace workers receive no override. The profile does not change
 product Metal selection policy.
 Windows client allocation requires an operator-verified licensing basis in administrator
@@ -289,7 +289,9 @@ not repeat installation or reboot an already prepared desktop. Linux requires he
 running kernel. Native GPU model and driver version must match before candidate execution;
 installer success alone cannot establish readiness or CUDA generation qualification.
 Azure provisioning success alone is not runtime readiness. Initialization receives no run or
-provider credential; downloaded tooling has explicit length and digest checks. Candidate source
+provider credential; downloaded tooling has explicit length and digest checks. Windows tooling
+may retry a transient transport error twice after removing a partial file; an integrity or
+redirect validation failure terminates preparation immediately. Candidate source
 is delivered only after preparation. Preparation failures retain normal lease cleanup ownership. Before releasing a failed guest,
 the coordinator stores bounded setup or terminal execution diagnostics in the artifact store, redacting credentials
 and URL capabilities. Completed blocked cases reference those objects, so the run owner can
@@ -516,10 +518,12 @@ replacement-owner evidence. Repeated service starts
 retain the native application PID, service PID and service instance identity. After a
 restart the previous owning service must have exited and the replacement must have
 a new identity; tests never terminate a leftover process to manufacture acceptance.
-CLI interruption acceptance first observes a connection to the deliberately stalled owned
-service, then interrupts the CLI and requires the expected interruption exit. Early process
-exit cannot satisfy this case. The service is resumed on every exit path, and afterward the
-same application and service identities must remain usable. Unsupported native interruption
+CLI interruption acceptance first observes a connection to a deliberately stalled endpoint,
+then interrupts the CLI and requires the expected interruption exit. POSIX pauses the owned
+service and resumes it on every exit path. Windows binds a disposable local endpoint for this
+one CLI invocation and delivers Ctrl+C through its native ConPTY; the installed application
+continues at its real endpoint. Early process exit cannot satisfy this case, and afterward
+the same application and service identities must remain usable. Unsupported native interruption
 mechanisms block qualification rather than substituting forced termination.
 Harness terminal paths use a real native PTY or ConPTY with an explicitly selected runtime
 and isolated environment. Terminal interpretation preserves cursor movement, alternate screens,

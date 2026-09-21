@@ -1,20 +1,29 @@
 import { NodeRuntime } from "@effect/platform-node"
-import { Deferred, Effect, Option, Queue, Runtime, Schema, Sink, Stream } from "effect"
+import { Deferred, Effect, Option, Queue, Runtime, Schema, Stream } from "effect"
 import { createRequire } from "node:module"
 import { createInterface } from "node:readline"
 import { TerminalCommand, TerminalEvent, TerminalStart, TerminalExit, TerminalBridgeFailure } from "./terminal-protocol.ts"
 
 const error = () => new TerminalBridgeFailure({ message: "Native terminal bridge failed" })
+process.stderr.write("Terminal bridge loaded\n")
 const program = Effect.scoped(Effect.gen(function* () {
   if (process.versions.bun || Number(process.versions.node.split(".")[0]) < 24) return yield* new TerminalBridgeFailure({ message: "The native terminal bridge requires Node.js 24 or newer" })
-  // readline explicitly resumes Windows named-pipe stdin. NodeStream remained paused on
-  // Server 2022/2025, leaving the bridge alive without ever consuming its Start frame.
+  // Use readline's line event directly for the Windows named pipe. The async iterator
+  // can leave that pipe paused while Stream.peel waits for its first frame.
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
-  yield* Effect.addFinalizer(() => Effect.sync(() => lines.close()))
-  const input = Stream.fromAsyncIterable(lines, error).pipe(
-    Stream.mapEffect(line => line.length <= 256 * 1024 ? Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(line).pipe(Effect.mapError(error)) : Effect.fail(error())))
-  const [head, rest] = yield* Stream.peel(input, Sink.head())
-  const first = yield* Option.match(head, { onNone: () => Effect.fail(error()), onSome: Schema.decodeUnknown(TerminalStart) })
+  const frames = yield* Queue.unbounded<string>()
+  const onLine = (line: string) => { Runtime.runSync(Runtime.defaultRuntime)(Queue.offer(frames, line)) }
+  const onClose = () => { Runtime.runSync(Runtime.defaultRuntime)(Queue.shutdown(frames)) }
+  lines.on("line", onLine)
+  lines.on("close", onClose)
+  yield* Effect.addFinalizer(() => Effect.sync(() => { lines.off("line", onLine); lines.off("close", onClose); lines.close() }))
+  process.stdin.resume()
+  const decode = (line: string) => line.length <= 256 * 1024
+    ? Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(line).pipe(Effect.mapError(error))
+    : Effect.fail(error())
+  const first = yield* Queue.take(frames).pipe(Effect.mapError(error), Effect.flatMap(decode), Effect.flatMap(Schema.decodeUnknown(TerminalStart)))
+  process.stderr.write("Terminal bridge received launch\n")
+  const rest = Stream.fromQueue(frames).pipe(Stream.mapEffect(decode))
   const events = yield* Queue.unbounded<typeof TerminalEvent.Type>()
   const sentExit = yield* Deferred.make<void>()
   yield* Queue.take(events).pipe(Effect.flatMap(event => Effect.gen(function* () {
@@ -25,6 +34,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const runtime = yield* Effect.runtime<never>()
   const emit = (event: typeof TerminalEvent.Type) => Runtime.runSync(runtime)(Queue.offer(events, event))
   const pty: typeof import("node-pty") = yield* Effect.try({ try: () => createRequire(import.meta.url)("node-pty"), catch: error })
+  process.stderr.write("Terminal bridge loaded native PTY\n")
   const config = first.launch
   const nativeExit = yield* Deferred.make<void>()
   let ended = false

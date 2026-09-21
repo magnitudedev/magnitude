@@ -1181,9 +1181,34 @@ impl InstalledModelPackages for ManagedModelStore {
             let mut removed = false;
             let mut freed_bytes = 0_u64;
             for inventory_entry_id in managed_occurrences {
-                let deleted = <Self as ModelInventory>::delete(self, &inventory_entry_id).await?;
-                removed |= deleted.deleted;
-                freed_bytes = freed_bytes.saturating_add(deleted.freed_bytes);
+                match <Self as ModelInventory>::delete(self, &inventory_entry_id).await {
+                    Ok(deleted) => {
+                        removed |= deleted.deleted;
+                        freed_bytes = freed_bytes.saturating_add(deleted.freed_bytes);
+                    }
+                    // A previous deletion can remove another occurrence in the same
+                    // package. The final reconciliation below must prove all are gone.
+                    Err(InventoryError::NotFound(_)) if removed => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.ensure_installed_model_inventory().await?;
+            if self
+                .installed_packages
+                .read()
+                .map_err(|_| {
+                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+                })?
+                .records
+                .values()
+                .any(|record| {
+                    record.installed.package.id == package_id
+                        && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                })
+            {
+                return Err(InventoryError::Internal(
+                    "managed package remained after removal".to_owned(),
+                ));
             }
             Ok(RemoveInstalledModelPackageResponse {
                 package_id,

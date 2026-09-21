@@ -273,7 +273,9 @@ Externally owned or shared dependencies are retained while a removable target an
 owned material are removed; removal is retained as a whole only when a target itself is external or
 shared, because deleting it would either violate ownership or break another catalog model. Removing
 an eligible package removes every Magnitude-owned inventory occurrence of that package and preserves
-every external Hugging Face cache occurrence.
+every external Hugging Face cache occurrence. A deletion may remove another occurrence from the
+same package; a missing later entry is acceptable only after a prior deletion and a fresh inventory
+check proving that no managed occurrence of the package remains.
 
 Deleting artifacts does not delete slot selection, favorites, or recency. Those are user intent and
 may remain unresolved until the exact catalog configuration and required files are available again.

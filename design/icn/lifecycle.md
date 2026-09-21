@@ -206,6 +206,11 @@ binding, model-store and cache roots, optional read-only import/source roots, st
 deadlines, output bounds, authentication/instance identity, and compatible API/build identity.
 It must be validated before spawning.
 
+The Namespace testing lab may pass a qualified macOS Metal capability receipt through the desktop
+and service environments. Only the ICN child launch translates that exact receipt into loader
+controls for `magnitude-inference`; generic desktop and macOS system process launches do not load
+the compatibility shim. This does not alter backend selection on physical Macs.
+
 The model store and disposable cache are separate roots. In the managed product layout, authoritative
 model artifacts live under `.magnitude/models` and every Magnitude-owned disposable cache namespace
 lives under `.magnitude/cache`; cache implementations must not create private cache roots beneath

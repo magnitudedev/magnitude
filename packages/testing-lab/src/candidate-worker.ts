@@ -56,7 +56,7 @@ import { HarnessTerminalReceipt } from "./harnesses/terminal"
 import { TerminalDriver } from "./terminal"
 import { EndpointTests, endpointTests, Generation } from "./suites/endpoint"
 import { bundledCliTests, CliTests } from "./suites/cli"
-import { CliInterruption, verifyCliInterruption } from "./suites/cli-interruption"
+import { CliInterruption, verifyCliInterruption, verifyWindowsCliInterruption } from "./suites/cli-interruption"
 import { WorkAssignment, TargetResult } from "./work-store"
 import { prepareUpdateConsumer } from "./update-consumer"
 import { prepareUpdatePair, UpdatePair } from "./update-pair"
@@ -526,8 +526,17 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
           const before = yield* driver.identity()
           const tests = yield* cli
           yield* tests.invalid
-          const interruption = yield* verifyCliInterruption({ executable: (yield* installed).cli, port: application.port, environment: yield* candidateEnvironment }, before).pipe(
-            Effect.provideService(ProcessExecutor, processes))
+          const configuration = { executable: (yield* installed).cli, port: application.port, environment: yield* candidateEnvironment }
+          const interruption = isWindows(target.os)
+            ? yield* Effect.gen(function* () {
+                const runtime = configuration.environment.LAB_TERMINAL_NODE_EXECUTABLE
+                const terminal = yield* Effect.serviceOption(TerminalDriver)
+                if (!runtime || !isAbsolute(runtime) || Option.isNone(terminal)) return yield* unavailable("Windows CLI interruption requires the qualified native terminal driver")
+                return yield* verifyWindowsCliInterruption({ ...configuration, runtime,
+                  evidence: join(evidenceDirectory, "cli-interruption") }, message => { cleanupErrors.push(`CLI interruption: ${message}`) }).pipe(
+                    Effect.provideService(TerminalDriver, terminal.value))
+              })
+            : yield* verifyCliInterruption(configuration, before).pipe(Effect.provideService(ProcessExecutor, processes))
           yield* tests.inspect
           if (!Schema.equivalence(ApplicationIdentity)(before, yield* driver.identity())) return yield* new AssertionFailure({ message: "CLI interruption changed the owning application or service" })
           return CaseObservation.make({ detail: test.title, evidence: [yield* inputEvidence,
@@ -659,6 +668,10 @@ export const runCandidateWorker = (assignment: WorkAssignment, config: typeof Ca
     const names = (yield* fs.readDirectory(cliEvidence)).filter(name => /^\d+-[a-z0-9-]+\.json$/.test(name)).sort()
     if (names.length > 100) cleanupErrors.push("CLI evidence exceeded its file-count limit")
     else if (cliCase) for (const name of names) yield* exportFile(`cli/${name}`, cliCase.caseId, 32 * 1024 * 1024, Option.getOrUndefined(cliCase.harness))
+  }
+  for (const file of ["terminal-output.txt", "terminal-screen.json", "failure-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {
+    const relative = `cli-interruption/${file}`
+    if (yield* fs.exists(join(evidenceDirectory, relative))) yield* exportFile(relative, "C5", 32 * 1024 * 1024)
   }
   for (const harness of Harness.literals) {
     for (const file of ["session.jsonl", "lifecycle.jsonl", "selected-model.json", "aborted.session.json", "recovered.session.json", "streaming.json", "recovered.json", "terminal-output.txt", "terminal-screen.json", "failure-screen.json", "terminal-events.jsonl", "terminal-bridge.stderr.log"]) {

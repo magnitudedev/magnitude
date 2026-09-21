@@ -6,7 +6,7 @@ const keys = ["LAB_NAMESPACE_METAL_SHIM", "LAB_NAMESPACE_METAL_FAMILY_MAX", "LAB
 const fail = (message: string) => new InfrastructureFailure({ operation: "namespace-metal-compatibility", message })
 const Memory = Schema.NumberFromString.pipe(Schema.int(), Schema.positive())
 
-/** Translate a trusted Namespace preparation receipt into candidate-only loader controls. */
+/** Pass a trusted Namespace preparation receipt to the candidate, without loading the shim into Electron or system tools. */
 export const namespaceMetalEnvironment = (inherited: Readonly<Record<string, string>>, platform: NodeJS.Platform = process.platform) => Effect.gen(function* () {
   const configured = keys.filter(key => inherited[key] !== undefined)
   if (configured.length === 0) return { ...inherited }
@@ -23,7 +23,6 @@ export const namespaceMetalEnvironment = (inherited: Readonly<Record<string, str
   if (["DYLD_INSERT_LIBRARIES", "LUME_METAL_PROCESS_NAME", "LUME_METAL_APPLE_FAMILY_MAX", "LUME_METAL_MAX_THREADGROUP_MEMORY"].some(key => key in inherited)) {
     return yield* fail("Namespace Metal compatibility conflicts with an existing loader configuration")
   }
-  const environment = Object.fromEntries(Object.entries(inherited).filter(([key]) => !keys.includes(key as typeof keys[number])))
-  return { ...environment, DYLD_INSERT_LIBRARIES: shim, LUME_METAL_PROCESS_NAME: "magnitude-inference",
-    LUME_METAL_APPLE_FAMILY_MAX: "1007", LUME_METAL_MAX_THREADGROUP_MEMORY: "32768" }
+  return { ...inherited, LAB_NAMESPACE_METAL_SHIM: shim, LAB_NAMESPACE_METAL_FAMILY_MAX: "1007",
+    LAB_NAMESPACE_METAL_MAX_THREADGROUP_MEMORY: "32768" }
 })

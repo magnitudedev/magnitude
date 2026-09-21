@@ -29,6 +29,7 @@ import {
   SubscriptionRef,
 } from "effect";
 import { installationLoaderEnvironment, installationNativePath } from "./installation-environment.js";
+import { namespaceMetalInferenceEnvironment } from "./namespace-metal-environment.js";
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables";
 import {
   IcnApiIncompatible,
@@ -392,7 +393,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         const process = yield* children.spawn(new IcnChildLaunch({
           executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
-          environment: { ...binary.environment, MAGNITUDE_ICN_AUTH_TOKEN: authorization, HF_HUB_DISABLE_IMPLICIT_TOKEN: "1" },
+          environment: { ...binary.environment, ...namespaceMetalInferenceEnvironment(), MAGNITUDE_ICN_AUTH_TOKEN: authorization, HF_HUB_DISABLE_IMPLICIT_TOKEN: "1" },
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,
           forceShutdownTimeout: config.forceShutdownTimeout,
         }));

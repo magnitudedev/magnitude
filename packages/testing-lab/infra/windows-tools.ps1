@@ -25,38 +25,49 @@ function Get-PinnedTool([string]$Name) {
   $destination = Join-Path $downloads $Name
   $url = [Uri]$item.url
   if ($url.Scheme -ne 'https' -or $url.UserInfo -or $url.Fragment -or $item.sha256 -notmatch '^[a-f0-9]{64}$' -or $item.bytes -lt 1 -or $item.bytes -gt 1GB) { throw "Invalid $Name pin" }
-  try {
-    for ($redirect = 0; $redirect -le 6; $redirect++) {
-      $request = [Net.HttpWebRequest]::Create($url)
-      $request.AllowAutoRedirect = $false
-      $request.Timeout = 120000
-      $request.ReadWriteTimeout = 120000
-      $response = $request.GetResponse()
-      try {
-        $status = [int]$response.StatusCode
-        if ($status -ge 300 -and $status -lt 400) {
-          $url = [Uri]::new($url, $response.Headers['Location'])
-          if ($url.Scheme -ne 'https' -or $url.UserInfo -or $url.Fragment) { throw 'Invalid redirect' }
-          continue
-        }
-        if ($status -ne 200) { throw 'Unexpected status' }
-        $stream = $response.GetResponseStream()
-        $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew)
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $url = [Uri]$item.url
+    try {
+      for ($redirect = 0; $redirect -le 6; $redirect++) {
+        $request = [Net.HttpWebRequest]::Create($url)
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 120000
+        $request.ReadWriteTimeout = 120000
+        $response = $request.GetResponse()
         try {
-          $buffer = New-Object byte[] 1048576
-          [long]$total = 0
-          while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $total += $count
-            if ($total -gt $item.bytes) { throw 'Oversized download' }
-            $output.Write($buffer, 0, $count)
+          $status = [int]$response.StatusCode
+          if ($status -ge 300 -and $status -lt 400) {
+            $url = [Uri]::new($url, $response.Headers['Location'])
+            if ($url.Scheme -ne 'https' -or $url.UserInfo -or $url.Fragment) { throw 'Invalid redirect' }
+            continue
           }
-        } finally { $output.Dispose(); $stream.Dispose() }
-        if ($total -ne $item.bytes -or (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $item.sha256) { throw 'Integrity mismatch' }
-        return $destination
-      } finally { $response.Dispose() }
+          if ($status -ne 200) { throw 'Unexpected status' }
+          $stream = $response.GetResponseStream()
+          $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew)
+          try {
+            $buffer = New-Object byte[] 1048576
+            [long]$total = 0
+            while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+              $total += $count
+              if ($total -gt $item.bytes) { throw 'Oversized download' }
+              $output.Write($buffer, 0, $count)
+            }
+          } finally { $output.Dispose(); $stream.Dispose() }
+          if ($total -ne $item.bytes -or (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $item.sha256) { throw 'Integrity mismatch' }
+          return $destination
+        } finally { $response.Dispose() }
+      }
+      throw 'Redirect limit'
+    } catch {
+      $reason = $_.Exception.Message
+      Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+      if ($reason -in @('Integrity mismatch','Oversized download','Invalid redirect','Unexpected status','Redirect limit')) {
+        throw "Pinned $Name download failed integrity or redirect validation"
+      }
+      if ($attempt -eq 3) { throw "Pinned $Name download failed transport validation after three attempts ($($_.Exception.GetType().Name))" }
+      Start-Sleep -Seconds (2 * $attempt)
     }
-    throw 'Redirect limit'
-  } catch { throw "Pinned $Name download failed integrity or transport validation" }
+  }
 }
 function Expand-Tool([string]$Name) {
   $archive = Get-PinnedTool $Name

@@ -9,14 +9,8 @@ const configured = {
   LAB_NAMESPACE_METAL_MAX_THREADGROUP_MEMORY: "32768",
 }
 
-test("qualified Namespace Metal configuration becomes candidate-only loader controls", async () => {
-  expect(await Effect.runPromise(namespaceMetalEnvironment(configured, "darwin"))).toEqual({
-    PATH: "/usr/bin",
-    DYLD_INSERT_LIBRARIES: configured.LAB_NAMESPACE_METAL_SHIM,
-    LUME_METAL_PROCESS_NAME: "magnitude-inference",
-    LUME_METAL_APPLE_FAMILY_MAX: "1007",
-    LUME_METAL_MAX_THREADGROUP_MEMORY: "32768",
-  })
+test("qualified Namespace Metal configuration stays inert in the candidate environment", async () => {
+  expect(await Effect.runPromise(namespaceMetalEnvironment(configured, "darwin"))).toEqual(configured)
 })
 
 test("ordinary environments remain unchanged", async () => {

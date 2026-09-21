@@ -39,7 +39,7 @@ export const verifyPeImports = (table: typeof ImportReport.Type["Imports"]) => E
 /** Preserve the root executable's search context; do not resolve a child under a new root. */
 export const decodePeGraph = (json: string, executable: string) => Effect.gen(function* () {
   const report = yield* Schema.decodeUnknown(Schema.parseJson(GraphReport))(json).pipe(
-    Effect.mapError(() => fail("malformed loader report")))
+    Effect.mapError(error => fail(`malformed loader report: ${String(error).slice(0, 600)}`)))
   if (pePathKey(report.Root) !== pePathKey(executable)) return yield* fail("loader report has a different root")
   const modules = new Map<string, PeModule>()
   if (!report.Modules.length || report.Modules.length > 16_384) return yield* fail("invalid owned graph size")

@@ -1,7 +1,10 @@
-import { Effect, Schema, Stream } from "effect"
+import { Deferred, Effect, Option, Runtime, Schema, Stream } from "effect"
+import { createServer, type Socket } from "node:net"
+import { dirname } from "node:path"
 import { ApplicationIdentity } from "../application-identity"
 import { AssertionFailure, InfrastructureFailure } from "../domain"
 import { command } from "../process"
+import { TerminalDriver } from "../terminal"
 
 export const CliInterruption = Schema.Struct({ exitCode: Schema.Int, interrupted: Schema.Literal(true), stdout: Schema.String, stderr: Schema.String })
 export const CliInterruptionConfig = Schema.Struct({ executable: Schema.NonEmptyString,
@@ -48,3 +51,47 @@ export const verifyCliInterruption = (config: typeof CliInterruptionConfig.Type,
   const [exitCode, stdout, stderr] = yield* Effect.all([interrupt, collect(child.stdout), collect(child.stderr)], { concurrency: "unbounded" })
   return CliInterruption.make({ exitCode, interrupted: true, stdout, stderr })
 }))
+
+/** A disposable silent endpoint stalls the installed CLI without suspending the Windows app owner. */
+export const verifyWindowsCliInterruption = (config: typeof CliInterruptionConfig.Type & { readonly runtime: string; readonly evidence: string },
+  onCleanupError: (message: string) => void) =>
+  Effect.scoped(Effect.gen(function* () {
+    const connected = yield* Deferred.make<void>()
+    const runtime = yield* Effect.runtime<never>()
+    const sockets = new Set<Socket>()
+    const server = yield* Effect.acquireRelease(Effect.tryPromise({
+      try: () => new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
+        const listener = createServer(socket => {
+          sockets.add(socket)
+          socket.on("close", () => sockets.delete(socket))
+          Runtime.runSync(runtime)(Deferred.succeed(connected, undefined))
+        })
+        listener.once("error", reject)
+        listener.listen(0, "127.0.0.1", () => { listener.off("error", reject); resolve(listener) })
+      }),
+      catch: () => infrastructure("Could not bind the isolated CLI interruption endpoint"),
+    }), listener => Effect.tryPromise({
+      try: () => new Promise<void>((resolve, reject) => {
+        for (const socket of sockets) socket.destroy()
+        listener.close(failure => failure ? reject(failure) : resolve())
+      }),
+      catch: () => infrastructure("Could not release the isolated CLI interruption endpoint"),
+    }).pipe(Effect.catchAll(failure => Effect.sync(() => onCleanupError(failure.message)))))
+    const address = server.address()
+    if (!address || typeof address === "string") return yield* infrastructure("Isolated CLI endpoint has no TCP port")
+    const terminal = yield* TerminalDriver
+    const session = yield* terminal.start({ executable: config.executable, args: ["service", "status"],
+      runtime: config.runtime, cwd: dirname(config.executable), evidence: config.evidence,
+      environment: { ...config.environment, MAGNITUDE_DEV_PORT: String(address.port) }, columns: 80, rows: 24 },
+    onCleanupError).pipe(Effect.mapError(() => infrastructure("Could not start the bundled CLI in its native console")))
+    yield* Deferred.await(connected).pipe(Effect.timeoutFail({ duration: "15 seconds",
+      onTimeout: () => fail("CLI did not connect to the isolated stalled endpoint") }))
+    yield* session.write("\u0003")
+    const result = yield* session.exited.pipe(Effect.timeoutFail({ duration: "10 seconds",
+      onTimeout: () => fail("CLI ignored terminal interruption while waiting for the endpoint") }))
+    if (![130, -1073741510, 3221225786].includes(result.code) && !Option.contains(result.signal, "SIGINT")) {
+      return yield* fail(`CLI returned unexpected Windows interruption exit code ${result.code}`)
+    }
+    const screen = yield* session.screen
+    return CliInterruption.make({ exitCode: result.code, interrupted: true, stdout: screen.lines.join("\n"), stderr: "" })
+  }))

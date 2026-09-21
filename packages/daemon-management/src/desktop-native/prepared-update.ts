@@ -113,15 +113,17 @@ export const makePreparedUpdateStore = (options: {
     prepare: (archive, release) => Effect.gen(function* () {
       yield* verifyUpdateRelease(release, options.target, options.trustedPublishers)
       if (Option.isSome(yield* read)) return yield* failed("An update is already prepared.")
-      yield* permissions.prepareDirectory(directory)
+      yield* permissions.prepareDirectory(directory).pipe(Effect.mapError(() => failed("The private update directory could not be prepared.")))
       const temporary = join(directory, `installer-${randomUUID()}.tmp`)
-      yield* Effect.acquireUseRelease(permissions.createFile(temporary), () => Effect.gen(function* () {
-        yield* fs.stream(archive, { bytesToRead: release.bytes + 1 }).pipe(Stream.run(fs.sink(temporary, { flag: "r+" })))
+      yield* Effect.acquireUseRelease(permissions.createFile(temporary).pipe(Effect.mapError(() => failed("The private update file could not be created."))), () => Effect.gen(function* () {
+        yield* fs.stream(archive, { bytesToRead: release.bytes + 1 }).pipe(Stream.run(fs.sink(temporary, { flag: "r+" })),
+          Effect.mapError(() => failed("The downloaded installer could not be copied to private storage.")))
         yield* verifyFile(temporary, release)
-        yield* Effect.scoped(fs.open(temporary, { flag: "r+" }).pipe(Effect.flatMap(file => file.sync)))
+        yield* Effect.scoped(fs.open(temporary, { flag: "r+" }).pipe(Effect.flatMap(file => file.sync),
+          Effect.mapError(() => failed("The downloaded installer could not be synced."))))
         yield* Effect.gen(function* () {
-          yield* fs.rename(temporary, installer)
-          yield* syncDirectory
+          yield* fs.rename(temporary, installer).pipe(Effect.mapError(() => failed("The downloaded installer could not be published.")))
+          yield* syncDirectory.pipe(Effect.mapError(() => failed("The update directory could not be synced.")))
           yield* write({ release, installation: { _tag: "Unattempted" } })
         }).pipe(Effect.uninterruptible)
       }), () => fs.remove(temporary, { force: true }).pipe(Effect.ignore))
