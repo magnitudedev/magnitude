@@ -30,22 +30,26 @@ export const networkAccessEquals = (a: NetworkAccess, b: NetworkAccess): boolean
   && Option.getOrNull(a.apiKey) === Option.getOrNull(b.apiKey)
   && a.allowedHosts.length === b.allowedHosts.length && a.allowedHosts.every((host, index) => host === b.allowedHosts[index])
 
+export type NetworkInterfaceKind = "lan" | "tailscale" | "virtual"
 export interface NetworkInterfaceAddress {
   readonly name: string
   readonly address: string
-  readonly tailscale: boolean
+  readonly kind: NetworkInterfaceKind
 }
 
 const isTailscaleAddress = (address: string) => {
   const [first, second] = address.split(".").map(Number)
   return first === 100 && second !== undefined && second >= 64 && second <= 127
 }
+const VIRTUAL_INTERFACE = /^(bridge|vmnet|vboxnet|docker|veth|br-|virbr|utun|tun|tap|wg|ppp|llw|awdl|anpi|ap\d|vEthernet|VirtualBox|VMware)/i
+const KIND_ORDER: Record<NetworkInterfaceKind, number> = { lan: 0, tailscale: 1, virtual: 2 }
 
-/** IPv4 addresses other devices could use, with Tailscale's CGNAT range labelled. */
+/** IPv4 addresses other devices could use: physical networks first, then Tailscale, then virtual adapters. */
 export const listNetworkInterfaces = (interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): ReadonlyArray<NetworkInterfaceAddress> =>
   Object.entries(interfaces).flatMap(([name, entries]) => (entries ?? [])
     .filter(entry => entry.family === "IPv4" && !entry.internal && !entry.address.startsWith("169.254."))
-    .map(entry => ({ name, address: entry.address, tailscale: isTailscaleAddress(entry.address) })))
+    .map(entry => ({ name, address: entry.address, kind: isTailscaleAddress(entry.address) ? "tailscale" as const : VIRTUAL_INTERFACE.test(name) ? "virtual" as const : "lan" as const })))
+    .sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind])
 
 export const makeNetworkPreferences = (clientDataDirectory: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem

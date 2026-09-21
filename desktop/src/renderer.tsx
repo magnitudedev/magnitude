@@ -377,7 +377,6 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
       : rows.value._tag === "Unavailable" ? <p role="alert" className="mt-5">Could not check connections. {rows.value.message}</p>
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={host.platform}
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
-    <RemoteAccessCard platform={host.platform} />
   </>
 }
 function ModelStatus() {
@@ -448,10 +447,10 @@ function SettingsGroup({ label, children }: { label: string; children: ReactNode
     <div className="divide-y divide-slate-200 rounded-lg border border-slate-300 bg-white dark:divide-slate-800 dark:border-slate-750 dark:bg-slate-850">{children}</div>
   </section>
 }
-function SettingsRow({ label, hint, alert, control, children }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode }) {
-  return <div className="px-4 py-3">
+function SettingsRow({ label, hint, alert, control, children, nested = false }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode; nested?: boolean }) {
+  return <div className={nested ? "bg-slate-50 py-2.5 pl-10 pr-4 dark:bg-slate-900/40" : "px-4 py-3"}>
     <div className="flex items-center justify-between gap-6">
-      <div className="min-w-0"><p className="text-sm font-medium">{label}</p>
+      <div className="min-w-0"><p className={nested ? "text-[13px] font-medium" : "text-sm font-medium"}>{label}</p>
         {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
         {alert && <p role="alert" className="mt-0.5 text-xs">{alert}</p>}
       </div>
@@ -550,45 +549,28 @@ function NetworkAccessRows() {
   const busy = updating.waiting || regenerating.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
   const failure = firstFailure([settings, updating, regenerating])
-  const addresses = current ? (current.bind === null ? current.interfaces.map(entry => entry.address) : [current.bind]) : []
+  const reachable = current?.enabled ? (current.bind ?? current.interfaces[0]?.address) : undefined
   return <>
-    <SettingsRow label="Network access" hint={current ? "Let other devices on your network use Magnitude for inference. Apps on this computer are unaffected." : <SkeletonLine className="h-4 text-xs" width="240px" />}
+    <SettingsRow label="Network access" hint={current ? "Let other devices on your network use Magnitude for inference." : <SkeletonLine className="h-4 text-xs" width="240px" />}
       alert={current?.warning ?? (failure ? hostFailureMessage(failure.cause) : undefined)}
       control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
     {current?.enabled && <>
-      <SettingsRow label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
-        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.tailscale ? "Tailscale" : entry.name})` }))]}
+      <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
+        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
           value={current.bind ?? ALL_INTERFACES} onValueChange={value => update({ bind: value === ALL_INTERFACES || value === null ? null : value })}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
-          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.tailscale ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
-      <SettingsRow label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token. Apps on this computer never need it." : "Other devices can connect without a key. Only do this on a network you trust."}
+      <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
         control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => { regenerate(); }}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: checked })} /></>}>
         {current.apiKey && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey} label="Copy API key" /></div>}
       </SettingsRow>
-      <SettingsRow label="Connection URLs" hint={addresses.length === 0 ? "No addresses are available." : `OpenAI-compatible base URL${addresses.length === 1 ? "" : "s"}. Anthropic-compatible clients use /inference/anthropic on the same address.`}>
-        <div className="mt-2 space-y-2">{addresses.map(address => <CopyCommand key={address} command={inferenceUrl(address, current.port)} label={`Copy ${address} URL`} />)}</div>
-      </SettingsRow>
+      {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
+        <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label="Copy base URL" /></div>
+      </SettingsRow>}
     </>}
     <RefreshAfter refresh={refresh} results={[updating, regenerating]} />
   </>
-}
-function RemoteAccessCard({ platform }: { platform: string }) {
-  const settings = useAtomValue(networkAccessSettings)
-  const state = useAtomValue(hostState)
-  const current = Result.isSuccess(settings) ? settings.value : null
-  const port = current?.port ?? (Result.isSuccess(state) ? Number(new URL(state.value.endpoint).port) : 10100)
-  const addresses = current?.enabled ? (current.bind === null ? current.interfaces.map(entry => entry.address) : [current.bind]) : []
-  return <article className={`${pageLayout.harnessCard} mt-5`}>
-    <h2 className="font-heading text-lg">Other apps and remote agents</h2>
-    <p className="mt-2 text-sm text-slate-500">Any OpenAI-compatible app on this computer can use Magnitude with this base URL and any API key value, such as <span className="text-slate-700 dark:text-slate-300">magnitude-local</span>. Anthropic-compatible apps use <span className="text-slate-700 dark:text-slate-300">/inference/anthropic</span> instead.</p>
-    <div className="mt-3"><CopyCommand command={inferenceUrl("127.0.0.1", port)} label="Copy local base URL" /></div>
-    {addresses.length > 0 && current ? <>
-      <p className="mt-4 text-sm text-slate-500">Other devices, WSL, and containers use {addresses.length === 1 ? "this URL" : "one of these URLs"}{current.requireApiKey ? " with the API key from Settings" : ""}.</p>
-      <div className="mt-2 space-y-2">{addresses.map(address => <CopyCommand key={address} command={inferenceUrl(address, port)} label={`Copy ${address} URL`} />)}</div>
-    </> : <p className="mt-4 text-sm text-slate-500">To reach Magnitude from other devices, WSL, or containers, turn on Network access in Settings.</p>}
-    {platform === "win32" && <p className="mt-3 text-xs text-slate-500">On Windows, agents inside WSL reach this computer through its network address unless WSL uses mirrored networking.</p>}
-  </article>
 }
 function AutomaticUpdatesRow() {
   const service = useUpdateSnapshot()

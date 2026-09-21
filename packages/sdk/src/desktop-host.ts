@@ -16,7 +16,7 @@ export const ModelStorageSettings = Schema.Struct({
 })
 export type ModelStorageSettings = typeof ModelStorageSettings.Type
 
-export const NetworkInterfaceAddress = Schema.Struct({ name: Schema.String, address: Schema.String, tailscale: Schema.Boolean })
+export const NetworkInterfaceAddress = Schema.Struct({ name: Schema.String, address: Schema.String, kind: Schema.Literal("lan", "tailscale", "virtual") })
 export const NetworkAccessSettings = Schema.Struct({
   enabled: Schema.Boolean,
   bind: Schema.NullOr(Schema.String),

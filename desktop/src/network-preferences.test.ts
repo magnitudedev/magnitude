@@ -45,18 +45,20 @@ it("compares what the service enforces", () => {
   expect(networkAccessEquals({ ...LOOPBACK_ONLY, apiKey: Option.some("a") }, { ...LOOPBACK_ONLY, apiKey: Option.some("b") })).toBe(false)
 })
 
-it("lists external IPv4 addresses and labels Tailscale's range", () => {
+it("lists external IPv4 addresses, physical first, with Tailscale and virtual adapters labelled", () => {
   const listed = listNetworkInterfaces({
     lo0: [{ address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", mac: "00:00:00:00:00:00", internal: true, cidr: "127.0.0.1/8" }],
     en0: [
       { address: "192.168.1.67", netmask: "255.255.255.0", family: "IPv4", mac: "00:00:00:00:00:01", internal: false, cidr: "192.168.1.67/24" },
       { address: "fe80::1", netmask: "ffff:ffff:ffff:ffff::", family: "IPv6", mac: "00:00:00:00:00:01", internal: false, cidr: "fe80::1/64", scopeid: 1 },
     ],
+    bridge100: [{ address: "10.211.55.2", netmask: "255.255.255.0", family: "IPv4", mac: "00:00:00:00:00:04", internal: false, cidr: "10.211.55.2/24" }],
     utun4: [{ address: "100.124.15.114", netmask: "255.255.255.255", family: "IPv4", mac: "00:00:00:00:00:02", internal: false, cidr: "100.124.15.114/32" }],
     awdl0: [{ address: "169.254.10.2", netmask: "255.255.0.0", family: "IPv4", mac: "00:00:00:00:00:03", internal: false, cidr: "169.254.10.2/16" }],
   })
   expect(listed).toEqual([
-    { name: "en0", address: "192.168.1.67", tailscale: false },
-    { name: "utun4", address: "100.124.15.114", tailscale: true },
+    { name: "en0", address: "192.168.1.67", kind: "lan" },
+    { name: "utun4", address: "100.124.15.114", kind: "tailscale" },
+    { name: "bridge100", address: "10.211.55.2", kind: "virtual" },
   ])
 })
