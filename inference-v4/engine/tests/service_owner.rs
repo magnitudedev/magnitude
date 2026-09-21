@@ -1,4 +1,4 @@
-use seismic_engine::{
+use magnitude_engine::{
     generation::{FinishReason, Generation, Options, Sampling},
     inputs::{InputLayout, TokenId},
     models::sequence::Advance,
@@ -38,7 +38,7 @@ struct Control {
 }
 struct Batch(Rc<Control>);
 impl Completion for Batch {
-    fn notify(&mut self, wake: seismic_engine::service::worker::CompletionWake) {
+    fn notify(&mut self, wake: magnitude_engine::service::worker::CompletionWake) {
         assert!(
             self.is_complete(),
             "direct owner fixture has no asynchronous notifier"
@@ -111,7 +111,7 @@ impl Executor for Model {
     fn checkpoint(
         &self,
         _: RequestId,
-    ) -> Result<seismic_engine::service::owner::NumericalCheckpoint<()>, String> {
+    ) -> Result<magnitude_engine::service::owner::NumericalCheckpoint<()>, String> {
         Err("fixture does not implement numerical checkpoints".into())
     }
     fn open_checkpoint(&mut self, _: RequestId, _: &()) -> Result<(), String> {
@@ -565,7 +565,7 @@ fn successful_idle_reclamation_retries_the_original_batch_before_shrinking() {
 }
 #[test]
 fn indivisible_work_does_not_retry_the_same_shape_and_lonely_infeasibility_fails() {
-    use seismic_engine::inputs::{BoundaryRule, InputSpan};
+    use magnitude_engine::inputs::{BoundaryRule, InputSpan};
     let control = Rc::new(Control::default());
     control.capacity.set(true);
     let mut owner = owner(control.clone());

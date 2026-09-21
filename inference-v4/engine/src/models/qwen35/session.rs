@@ -1,14 +1,12 @@
 //! One long-context session through the unified runtime pipeline: a prose payload
 //! prefilled in fixed chunks, then greedy decode. Mirrors the V3 session-bench prose
 //! workload (`benchmark_fixtures/prose.py`, serving `--prefill-tokens`). Every forward
-//! records whether it compiled anything; only forwards that compiled nothing are warm.
-use super::{
-    baseline::{selections, EntrySelection},
-    decoder::Decoder,
-    loading::Model,
-};
+//! selects prepared capacity classes; the compilation count is fixed at load.
+use super::{decoder::Decoder, loading::Model};
+use crate::preparation::Settings;
+use crate::Error;
 use crate::inputs::{ByteBpeTokenizer, SpecialTokens, TokenId};
-use seismic_runtime::{plan::Settings, Device};
+use seismic_runtime::Device;
 use serde::Serialize;
 use std::{path::Path, rc::Rc, time::Instant};
 
@@ -48,8 +46,7 @@ pub struct Forward {
     /// Context position of the first row.
     pub position: usize,
     pub seconds: f64,
-    pub device_seconds: Option<f64>,
-    /// Kernels planned and compiled inside this forward; nonzero means cold.
+    /// Kernels compiled inside this forward; nonzero is impossible after load.
     pub new_kernels: usize,
 }
 #[derive(Serialize)]
@@ -76,9 +73,9 @@ pub struct Report {
     pub prefill_chunk: usize,
     pub decode_steps: usize,
     pub load_seconds: f64,
-    /// Payload start to the first generated token, compilation included.
+    /// Payload start to the first generated token, load-time preparation included.
     pub cold_seconds_to_first_token: f64,
-    /// All chunks (compilation included) and the chunks that compiled nothing.
+    /// All chunks and the chunks that compiled nothing.
     pub prefill_cold: Rate,
     pub prefill_warm: Rate,
     /// Decode steps that compiled nothing; attention cost grows with history.
@@ -86,9 +83,6 @@ pub struct Report {
     pub decode_latency: Latency,
     pub decode_first_32: Latency,
     pub decode_last_32: Latency,
-    pub compile_seconds_total: f64,
-    /// One record per compiled `(entry, shapes, elements)` specialization.
-    pub selections: Vec<EntrySelection>,
     pub prefill: Vec<Forward>,
     pub decode: Vec<Forward>,
     /// The first token follows the payload; each decode step appends one.
@@ -141,12 +135,13 @@ fn argmax(logits: &[f32]) -> Result<u32, String> {
     if logits.iter().any(|v| !v.is_finite()) {
         return Err("non-finite logits".into());
     }
-    logits
+    let index = logits
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i as u32)
-        .ok_or_else(|| "empty logits".into())
+        .map(|(i, _)| i)
+        .ok_or_else(|| "empty logits".to_string())?;
+    u32::try_from(index).map_err(|_| "logit index exceeds token domain".to_string())
 }
 
 impl Session {
@@ -155,7 +150,7 @@ impl Session {
         device: Rc<Device>,
         settings: Settings,
         context_capacity: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let start = Instant::now();
         let backend = device.backend().to_string();
         let model = Model::open(path)?;
@@ -179,7 +174,7 @@ impl Session {
         fixture: &[u8],
         chunk: usize,
         decode: usize,
-    ) -> Result<Report, String> {
+    ) -> Result<Report, Error> {
         use sha2::{Digest, Sha256};
         let text = normalize(fixture)?;
         let fixture_text_sha256 = Sha256::digest(text.as_bytes())
@@ -207,7 +202,8 @@ impl Session {
             return Err(format!(
                 "fixture yields {} tokens, fewer than the {budget}-token payload",
                 payload.len()
-            ));
+            )
+            .into());
         }
 
         let mut state = self.decoder.state_store().create()?;
@@ -220,7 +216,7 @@ impl Session {
                 state.position(),
                 Instant::now(),
             );
-            let (advance, observation) = self
+            let (advance, _) = self
                 .decoder
                 .prefill_batched(&mut state, rows)
                 .map_err(|e| format!("prefill at {position}: {e}"))?;
@@ -230,7 +226,6 @@ impl Session {
                 rows: rows.len(),
                 position,
                 seconds: start.elapsed().as_secs_f64(),
-                device_seconds: observation.device_seconds,
                 new_kernels: self.decoder.compiled_kernel_count() - before,
             });
             eprintln!(
@@ -249,7 +244,7 @@ impl Session {
                 Instant::now(),
             );
             let token = *tokens.last().ok_or("no token to continue from")?;
-            let (advance, observation) = self
+            let (advance, _) = self
                 .decoder
                 .propose_batched(&mut state, token)
                 .map_err(|e| format!("decode at {position}: {e}"))?;
@@ -259,7 +254,6 @@ impl Session {
                 rows: 1,
                 position,
                 seconds: start.elapsed().as_secs_f64(),
-                device_seconds: observation.device_seconds,
                 new_kernels: self.decoder.compiled_kernel_count() - before,
             });
             tokens.push(next);
@@ -282,7 +276,6 @@ impl Session {
             decoded.push_str(&detokenizer.push(TokenId(*token))?);
         }
         decoded.push_str(&detokenizer.finish()?);
-        let selections = selections(&self.decoder)?;
         Ok(Report {
             artifact: self.artifact.clone(),
             backend: self.backend.clone(),
@@ -299,8 +292,6 @@ impl Session {
             decode_latency: latency(&warm_steps),
             decode_first_32: latency(&warm_steps[..window]),
             decode_last_32: latency(&warm_steps[warm_steps.len() - window..]),
-            compile_seconds_total: selections.iter().map(|s| s.compile_seconds).sum(),
-            selections,
             prefill,
             decode: steps,
             tokens,

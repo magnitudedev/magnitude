@@ -21,14 +21,19 @@ impl Domain {
         }
     }
     pub fn set_limit(&self, limit: Option<usize>) -> Result<(), Error> {
-        if limit.is_some_and(|limit| limit < self.charged.get()) {
-            return Err("allocation limit cannot be below retained charges".into());
+        if let Some(limit) = limit {
+            if limit < self.charged.get() {
+                return Err(Error::LimitBelowCharges {
+                    limit,
+                    charged: self.charged.get(),
+                });
+            }
         }
         self.limit.set(limit);
         Ok(())
     }
     pub fn charge(self: &Rc<Self>, bytes: usize) -> Result<Charge, Error> {
-        let available = self.limit.get().unwrap_or(usize::MAX) - self.charged.get();
+        let available = self.limit.get().map_or(usize::MAX, |limit| limit) - self.charged.get();
         if bytes > available {
             return Err(Error::Capacity {
                 required: bytes,

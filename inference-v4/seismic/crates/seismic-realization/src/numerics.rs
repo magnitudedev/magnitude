@@ -1,24 +1,29 @@
 //! Numerical transfer taxonomy and composition, hosted here so every crate
 //! below the compiler shares the one definition. The registry-level form
 //! (`seismic_lang::intrinsics::NumericalTransfer`) describes authored
-//! capability effects and is converted here.
+//! capability effects and is converted here. The evidence-qualification
+//! predicate and the canonical workload/assignment fingerprints are also
+//! hosted here: one qualification authority, one fingerprint definition.
 
+use crate::ids::{OccurrenceId, StrategyId};
 use seismic_lang::{
     intrinsics::{ErrorBound, IntrinsicId, PrimitiveId, ReduceOp},
-    logical::{EffectiveTargetIdentity, LogicalIdentity},
+    logical::{specialization::SpecializationDomain, EffectiveTargetIdentity, LogicalIdentity},
     precision::{EvidenceRequirement, NumericalAssessment, PrecisionPolicy, Tolerance},
     types::{DType, ExtentExpr, RuntimeExtentId, ValueType},
 };
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
-// Reduction topology (identical shape to the compiler crate's
-// `terminal::reduction::ReductionTopology`; this is the single hosted
-// definition the compiler crate re-exports)
+// Reduction topology (the single hosted definition; it supersedes the
+// compiler crate's `terminal::reduction::ReductionTopology`, which X1
+// deletes, and extends it with the atomic-combine topology M1 derives for
+// concurrent atomic accumulation)
 // ---------------------------------------------------------------------------
 
 /// Exact reduction topology: what the strategy's data flow looks like. The
 /// `inner` of a wrapping topology is the per-participant fold.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReductionTopology {
     /// A serial fold over one axis, ascending coordinates.
     SerialAxis { axis: usize, length: ExtentExpr },
@@ -61,6 +66,12 @@ pub enum ReductionTopology {
         passes: u32,
         inner: Box<ReductionTopology>,
     },
+    /// Participants combine single-rounding updates through a device atomic
+    /// in arbitrary interleaving (the concurrent atomic float-add loop).
+    /// Each participant's own visits are serial; the combine order across
+    /// participants, and within a participant's claims, is unspecified.
+    /// Contention is unmodelled.
+    AtomicCombine,
 }
 
 impl ReductionTopology {
@@ -76,12 +87,18 @@ impl ReductionTopology {
     /// Whether the reduced axis is folded in the reference ascending order:
     /// a serial axis, or parallel outer coordinates each folding serially.
     /// Reassociating topologies (tree/subgroup/workgroup/matrix/split/
-    /// multi-launch) do not preserve the reference order.
+    /// multi-launch/atomic-combine) do not preserve the reference order.
     pub fn is_reference_order(&self) -> bool {
         match self {
             ReductionTopology::SerialAxis { .. } => true,
             ReductionTopology::ParallelOuter { inner, .. } => inner.is_reference_order(),
-            _ => false,
+            ReductionTopology::Tree { .. }
+            | ReductionTopology::Subgroup { .. }
+            | ReductionTopology::Workgroup { .. }
+            | ReductionTopology::Matrix { .. }
+            | ReductionTopology::Split { .. }
+            | ReductionTopology::MultiLaunch { .. }
+            | ReductionTopology::AtomicCombine => false,
         }
     }
 }
@@ -513,6 +530,33 @@ pub fn compose_all(transfers: &[NumericalTransfer]) -> NumericalTransfer {
         .fold(NumericalTransfer::Exact, |acc, next| compose(next, &acc))
 }
 
+/// A conservative additive error envelope for a transfer. `None` means the
+/// transfer is data-dependent or otherwise requires whole-assignment
+/// qualification. Additive envelopes compose safely across selected
+/// strategies by summing their relative and absolute components.
+pub fn analytical_bound(
+    transfer: &NumericalTransfer,
+    runtime: &dyn Fn(RuntimeExtentId) -> Option<u64>,
+) -> Option<ErrorBound> {
+    match transfer {
+        NumericalTransfer::Exact => Some(ErrorBound {
+            relative: 0.0,
+            absolute: 0.0,
+        }),
+        NumericalTransfer::Round { dtype, count } => Some(ErrorBound {
+            relative: unit_roundoff(*dtype) * count.eval(runtime)? as f64,
+            absolute: 0.0,
+        }),
+        NumericalTransfer::Approximate { bound, .. } => Some(*bound),
+        NumericalTransfer::Capability {
+            bound: Some(bound), ..
+        } => Some(*bound),
+        NumericalTransfer::Reassociate { .. }
+        | NumericalTransfer::Capability { bound: None, .. }
+        | NumericalTransfer::Unknown { .. } => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Policy
 // ---------------------------------------------------------------------------
@@ -695,19 +739,107 @@ impl EvidenceKey {
 }
 
 /// One accepted numerical evidence record: a qualification measured under
-/// exactly its key.
+/// exactly its key — the complete workload/target/toolchain identity, the
+/// witnessed strategy selection per occurrence, and the witnessed values of
+/// every consequence-expression atom the measurement depended on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NumericalEvidence {
     pub key: EvidenceKey,
     pub assessment: NumericalAssessment,
+    /// The witnessed strategy selection: one entry per occurrence, `None`
+    /// for an inactivated occurrence. It must hash to `key.assignment`
+    /// under [`assignment_fingerprint`]; a record whose retained fingerprint
+    /// disagrees with its own selection qualifies nothing.
+    pub selections: BTreeMap<OccurrenceId, Option<StrategyId>>,
+    /// The witnessed values of the consequence-expression atoms the
+    /// measurement depended on: tuning-parameter names (qualified by the
+    /// plan-space model so strategy-local declarations never collide) and
+    /// the reserved `@runtime<N>`/`@leaf<L>` atom families of the M1
+    /// resource-expression vocabulary.
+    pub symbols: BTreeMap<String, u64>,
 }
 
-impl NumericalEvidence {
-    /// Whether this record qualifies a candidate with exactly this identity
-    /// under a policy at least as strict as the one it was validated against.
-    pub fn qualifies(&self, key: &EvidenceKey) -> bool {
-        &self.key == key && self.assessment.satisfies(&key.precision)
+/// The canonical 32-byte hash shared by both fingerprint types: four
+/// independent FNV-1a/64 lanes over the same byte stream, each seeded with
+/// the FNV offset basis and domain-separated by its index times the FNV
+/// prime inside every mix step, lanes emitted little-endian in index order.
+fn four_lane_fnv1a(bytes: &[u8]) -> [u8; 32] {
+    let mut lanes = [0xcbf29ce484222325u64; 4];
+    for byte in bytes {
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            *lane ^= u64::from(*byte) + (index as u64) * 0x100000001b3;
+            *lane = lane.wrapping_mul(0x100000001b3);
+        }
     }
+    let mut out = [0u8; 32];
+    for (index, lane) in lanes.iter().enumerate() {
+        out[index * 8..index * 8 + 8].copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
+/// The canonical assignment fingerprint: the four-lane FNV-1a hash over the
+/// canonical selection serialization — every `(occurrence, strategy)` pair
+/// in occurrence order, each id as four little-endian bytes, an inactivated
+/// occurrence serialized as `u32::MAX`. The compiler and every evidence
+/// producer use exactly this definition; no other serialization of a
+/// selection is authoritative.
+pub fn assignment_fingerprint(
+    selections: &BTreeMap<OccurrenceId, Option<StrategyId>>,
+) -> AssignmentFingerprint {
+    let mut bytes = Vec::new();
+    for (occurrence, strategy) in selections {
+        bytes.extend_from_slice(&occurrence.0.to_le_bytes());
+        let selected = strategy.map(|strategy| strategy.0).unwrap_or(u32::MAX);
+        bytes.extend_from_slice(&selected.to_le_bytes());
+    }
+    AssignmentFingerprint(four_lane_fnv1a(&bytes))
+}
+
+/// The canonical workload fingerprint: the four-lane FNV-1a hash over the
+/// specialization domain's identity bytes.
+pub fn workload_fingerprint(domain: &SpecializationDomain) -> WorkloadFingerprint {
+    WorkloadFingerprint(four_lane_fnv1a(&domain.identity_bytes()))
+}
+
+/// Whether one evidence record qualifies a candidate complete assignment
+/// under `policy`. The sole qualification authority: no other function
+/// decides that a transfer requiring evidence is admitted.
+///
+/// The record qualifies iff all of the following hold:
+///
+/// - its retained assignment fingerprint is the canonical fingerprint of
+///   its own witnessed selection (a malformed record qualifies nothing);
+/// - the witnessed selection equals the candidate selection for every
+///   occurrence — the same occurrences, the same strategy or `None` each;
+/// - every witnessed symbol is bound by the candidate to its witnessed
+///   value (`values` answers `Some` with that exact value); symbols the
+///   record does not witness do not affect qualification, because the
+///   measurement depended only on the witnessed atoms;
+/// - the assessment satisfies `policy` — evidence class and
+///   validated-policy permissiveness per `NumericalAssessment::satisfies`.
+///
+/// The remaining `EvidenceKey` identity fields (logical program, workload,
+/// target, toolchain) select which records are presented to this predicate;
+/// the caller compares them, they are never re-derived here.
+pub fn evidence_qualifies(
+    evidence: &NumericalEvidence,
+    policy: &PrecisionPolicy,
+    selections: &BTreeMap<OccurrenceId, Option<StrategyId>>,
+    values: &dyn Fn(&str) -> Option<u64>,
+) -> bool {
+    if evidence.key.assignment != assignment_fingerprint(&evidence.selections) {
+        return false;
+    }
+    if &evidence.selections != selections {
+        return false;
+    }
+    for (name, witnessed) in &evidence.symbols {
+        if values(name) != Some(*witnessed) {
+            return false;
+        }
+    }
+    evidence.assessment.satisfies(policy)
 }
 
 /// Whether a bounded policy is willing to trust qualification records at all.

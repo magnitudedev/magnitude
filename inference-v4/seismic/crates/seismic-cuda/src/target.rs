@@ -1,26 +1,23 @@
-//! CUDA target observation and PTX target selection.
+//! CUDA target observation, PTX target selection, and the effective CUDA
+//! target profile.
 //!
-//! Source programs never reason about CUDA versions. This module turns the facts reported by
-//! the installed CUDA driver into the most conservative PTX target that implements the selected
-//! backend operation. The scalar backend currently implements one such operation set: the PTX
-//! 7.1, SM 8.0 baseline. Newer family- and architecture-specific targets are represented here but
-//! are not claimed until their instruction sets and driver requirements are implemented.
-
-use std::fmt;
+//! Source programs never reason about CUDA versions. This module turns the
+//! facts reported by the installed CUDA driver into the most conservative
+//! PTX target that implements the selected backend operation (the PTX 7.1,
+//! SM 8.0 baseline) and fills the effective target profile: exact
+//! `cuda.subgroup` signatures, fully populated hard limits, and the
+//! cooperative-grid facility when the device and driver support cooperative
+//! launch (`None` otherwise — a grid-cooperative proposal is then never
+//! made, never a fallback).
 
 use seismic_lang::sir::IntrinsicUse;
 use seismic_lang::types::{DType, ValueType};
+use seismic_realization::target::{CooperativeGrid, EffectiveTargetProfile, TargetLimits};
+use std::collections::BTreeSet;
+use std::fmt;
 
 /// Revision of the CUDA realization contract, independent of the source intrinsic registry.
-pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-cuda-realization-v2";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TargetLimits {
-    pub max_threads_per_block: u32,
-    pub max_grid_x: u32,
-    pub warp_size: u32,
-    pub max_scratch_bytes: u64,
-}
+pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-cuda-realization-v3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SupportedIntrinsic {
@@ -51,17 +48,20 @@ impl SupportedIntrinsic {
         // intrinsic identity plus concrete argument and result types.
         match self {
             Self::LaneIndexI32 => {
-                use_.id.path() == "cuda.subgroup.lane_index"
+                use_.id.name == "lane_index"
+                    && use_.id.capability.name == "subgroup"
                     && use_.arguments.is_empty()
                     && use_.result == i32
             }
             Self::ShuffleF32I32ToF32 => {
-                use_.id.path() == "cuda.subgroup.shuffle"
+                use_.id.name == "shuffle"
+                    && use_.id.capability.name == "subgroup"
                     && use_.arguments == [f32.clone(), i32]
                     && use_.result == f32
             }
             Self::SimdSumF32 => {
-                use_.id.path() == "cuda.subgroup.simd_sum"
+                use_.id.name == "simd_sum"
+                    && use_.id.capability.name == "subgroup"
                     && use_.arguments == [f32.clone()]
                     && use_.result == f32
             }
@@ -212,6 +212,16 @@ impl TargetTier {
     }
 }
 
+impl fmt::Display for TargetTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Baseline => "baseline",
+            Self::Family => "family",
+            Self::Architecture => "architecture",
+        })
+    }
+}
+
 /// A complete PTX virtual-ISA target retained by terminal code, native images, and caches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PtxTarget {
@@ -256,7 +266,10 @@ pub enum TargetRequirement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetProfile {
     observation: TargetObservation,
-    limits: TargetLimits,
+    limits: crate::mapping::Limits,
+    /// The cooperative-grid facility, when the observed device and driver
+    /// support cooperative launch.
+    cooperative: Option<CooperativeGrid>,
     scalar_target: PtxTarget,
     supported_intrinsics: Vec<SupportedIntrinsic>,
     fingerprint: String,
@@ -269,7 +282,8 @@ impl TargetProfile {
 
     pub fn from_observation(
         observation: TargetObservation,
-        limits: TargetLimits,
+        limits: crate::mapping::Limits,
+        cooperative: Option<CooperativeGrid>,
     ) -> Result<Self, TargetError> {
         if observation.compute_capability < ComputeCapability::SM80 {
             return Err(TargetError::UnsupportedHardware {
@@ -294,9 +308,19 @@ impl TargetProfile {
                 reason: "CUDA target limits must be positive".into(),
             });
         }
+        if let Some(cooperative) = &cooperative {
+            if cooperative.max_resident_participants == 0 {
+                return Err(TargetError::InvalidObservation {
+                    reason: "a cooperative CUDA target must admit at least one resident \
+                             participant"
+                        .into(),
+                });
+            }
+        }
         Ok(Self::build(
             observation,
             limits,
+            cooperative,
             SupportedIntrinsic::CURRENT.to_vec(),
             seismic_lang::intrinsics::REGISTRY_REVISION,
             BACKEND_IMPLEMENTATION_REVISION,
@@ -305,7 +329,8 @@ impl TargetProfile {
 
     fn build(
         observation: TargetObservation,
-        limits: TargetLimits,
+        limits: crate::mapping::Limits,
+        cooperative: Option<CooperativeGrid>,
         mut supported_intrinsics: Vec<SupportedIntrinsic>,
         registry_revision: &str,
         backend_revision: &str,
@@ -318,8 +343,12 @@ impl TargetProfile {
             .map(|signature| signature.identity())
             .collect::<Vec<_>>()
             .join(",");
+        let cooperative_text = match cooperative.as_ref() {
+            Some(grid) => format!(":coop-resident={}", grid.max_resident_participants),
+            None => String::new(),
+        };
         let fingerprint = format!(
-            "seismic-cuda-target-v2:registry={registry_revision}:backend={backend_revision}:cc={}:driver-api={}:codegen=ptx{}-{}-{:?}:limits=threads{},grid{},warp{},scratch{}:intrinsics=[{signatures}]",
+            "seismic-cuda-target-v3:registry={registry_revision}:backend={backend_revision}:cc={}:driver-api={}:codegen=ptx{}-{}-{}:limits=threads{},grid{},warp{},scratch{}{cooperative_text}:intrinsics=[{signatures}]",
             observation.compute_capability,
             observation.driver_api.0,
             scalar_target.isa,
@@ -333,19 +362,32 @@ impl TargetProfile {
         Self {
             observation,
             limits,
+            cooperative,
             scalar_target,
             supported_intrinsics,
             fingerprint,
         }
     }
 
-    pub fn synthetic_baseline(limits: TargetLimits) -> Self {
-        Self::from_observation(
-            TargetObservation::synthetic((8, 0), 11_010)
-                .expect("the built-in CUDA baseline observation is valid"),
+    pub fn synthetic_baseline(
+        limits: crate::mapping::Limits,
+        cooperative: Option<CooperativeGrid>,
+    ) -> Self {
+        // The built-in baseline observation and limit set are the
+        // constants `from_observation` validates; constructing directly
+        // keeps the profile total over them.
+        Self::build(
+            TargetObservation {
+                compute_capability: ComputeCapability { major: 8, minor: 0 },
+                driver_api: DriverApiVersion(11_010),
+                source: FactSource::Synthetic,
+            },
             limits,
+            cooperative,
+            SupportedIntrinsic::CURRENT.to_vec(),
+            seismic_lang::intrinsics::REGISTRY_REVISION,
+            BACKEND_IMPLEMENTATION_REVISION,
         )
-        .expect("the built-in CUDA baseline profile is supported")
     }
 
     pub fn observation(&self) -> &TargetObservation {
@@ -356,8 +398,12 @@ impl TargetProfile {
         &self.fingerprint
     }
 
-    pub fn limits(&self) -> TargetLimits {
-        self.limits
+    pub fn limits(&self) -> &crate::mapping::Limits {
+        &self.limits
+    }
+
+    pub fn cooperative(&self) -> Option<&CooperativeGrid> {
+        self.cooperative.as_ref()
     }
 
     pub fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
@@ -372,7 +418,8 @@ impl TargetProfile {
         // legalization, resources, numerics and emission are complete.
         if intrinsic.id.capability.name == "matrix" {
             return Err(format!(
-                "BackendNotImplemented: logical CUDA matrix intrinsic `{}` has a preserved owned result ABI, but no CUDA realization and numerical contract",
+                "BackendNotImplemented: logical CUDA matrix intrinsic `{}` has a preserved \
+                 owned result ABI, but no CUDA realization and numerical contract",
                 intrinsic.id.path()
             ));
         }
@@ -383,8 +430,11 @@ impl TargetProfile {
             .then_some(())
             .ok_or_else(|| {
                 format!(
-                    "the CUDA target profile has no implemented realization for exact intrinsic use `{}` with arguments {:?} and result {}",
-                    intrinsic.id.path(), intrinsic.arguments, intrinsic.result
+                    "the CUDA target profile has no implemented realization for exact intrinsic \
+                     use `{}` with arguments {:?} and result {}",
+                    intrinsic.id.path(),
+                    intrinsic.arguments,
+                    intrinsic.result
                 )
             })
     }
@@ -408,22 +458,62 @@ impl TargetProfile {
         if target == self.scalar_target {
             return Ok(());
         }
-        match target.tier {
-            TargetTier::Baseline => Err(TargetError::BackendNotImplemented {
-                tier: TargetTier::Baseline,
-                observed: self.observation.compute_capability,
-            }),
-            TargetTier::Family | TargetTier::Architecture => {
-                Err(TargetError::BackendNotImplemented {
-                    tier: target.tier,
-                    observed: self.observation.compute_capability,
-                })
-            }
-        }
+        Err(TargetError::BackendNotImplemented {
+            tier: target.tier,
+            observed: self.observation.compute_capability,
+        })
     }
 
     pub fn observed_architecture(&self) -> Result<u16, TargetError> {
         self.observation.compute_capability.ptx_architecture()
+    }
+
+    /// The effective CUDA target profile: exact `cuda.subgroup` signatures
+    /// and fully populated hard limits, with the cooperative-grid facility
+    /// when the target has one.
+    pub fn effective_profile(&self) -> EffectiveTargetProfile {
+        let limits = self.effective_limits();
+        EffectiveTargetProfile {
+            backend: crate::mapping::TARGET.into(),
+            capability_fingerprint: self.capability_fingerprint(),
+            toolchain_fingerprint: self.fingerprint().to_string(),
+            effective_signatures: crate::intrinsics::subgroup_families(),
+            limits,
+        }
+    }
+
+    /// The fully populated hard-limit set of the effective profile.
+    pub fn effective_limits(&self) -> TargetLimits {
+        TargetLimits {
+            // One native workgroup is one CUDA block.
+            max_participants: u64::from(self.limits.max_threads_per_block),
+            max_workgroups_axis: [u64::from(self.limits.max_grid_x), 65_535, 65_535],
+            max_workgroup_bytes: 48 * 1024,
+            max_explicit_private_bytes: self.limits.max_scratch_bytes,
+            max_direct_bindings: (crate::encode::MAX_KERNEL_PARAMETER_BYTES / 8) as u32,
+            max_device_bytes: self.limits.max_scratch_bytes,
+            cooperative_grid: self.cooperative.clone(),
+        }
+    }
+
+    /// Fingerprint of every availability and identity input of the physical
+    /// target (limits and cooperative facility included).
+    pub fn capability_fingerprint(&self) -> String {
+        format!("seismic-cuda-physical-v4:{}", self.fingerprint())
+    }
+
+    /// The intrinsics this profile reports as supported (diagnostics and
+    /// selection tests; the effective signatures are the authority).
+    pub fn supported_intrinsic_identities(&self) -> Vec<&'static str> {
+        self.supported_intrinsics
+            .iter()
+            .map(|signature| signature.identity())
+            .collect()
+    }
+
+    /// The effective signature set as a `BTreeSet` for profile comparison.
+    pub fn effective_signature_set(&self) -> BTreeSet<seismic_lang::intrinsics::IntrinsicId> {
+        crate::intrinsics::subgroup_families()
     }
 }
 
@@ -458,7 +548,8 @@ impl fmt::Display for TargetError {
                 operation_set,
             } => write!(
                 f,
-                "{operation_set} requires compute capability {required} or newer; device reports {observed}"
+                "{operation_set} requires compute capability {required} or newer; device \
+                 reports {observed}"
             ),
             Self::UnsupportedDriver {
                 observed,
@@ -466,11 +557,13 @@ impl fmt::Display for TargetError {
                 ptx,
             } => write!(
                 f,
-                "PTX {ptx} requires CUDA driver API {required} or newer; installed driver reports {observed}"
+                "PTX {ptx} requires CUDA driver API {required} or newer; installed driver \
+                 reports {observed}"
             ),
             Self::BackendNotImplemented { tier, observed } => write!(
                 f,
-                "Seismic CUDA does not yet implement {tier:?} PTX emission for compute capability {observed}"
+                "Seismic CUDA does not yet implement {tier} PTX emission for compute \
+                 capability {observed}"
             ),
         }
     }
@@ -482,20 +575,30 @@ impl std::error::Error for TargetError {}
 mod tests {
     use super::*;
 
-    const LIMITS: TargetLimits = TargetLimits {
-        max_threads_per_block: 1024,
-        max_grid_x: i32::MAX as u32,
-        warp_size: 32,
-        max_scratch_bytes: 1 << 30,
-    };
+    fn limits() -> crate::mapping::Limits {
+        crate::mapping::Limits {
+            max_threads_per_block: 1024,
+            max_grid_x: i32::MAX as u32,
+            warp_size: 32,
+            max_scratch_bytes: 1 << 30,
+        }
+    }
 
-    fn profile(cc: (i32, i32), driver: i32) -> Result<TargetProfile, TargetError> {
-        TargetProfile::from_observation(TargetObservation::synthetic(cc, driver)?, LIMITS)
+    fn profile(
+        cc: (i32, i32),
+        driver: i32,
+        cooperative: Option<CooperativeGrid>,
+    ) -> Result<TargetProfile, TargetError> {
+        TargetProfile::from_observation(
+            TargetObservation::synthetic(cc, driver)?,
+            limits(),
+            cooperative,
+        )
     }
 
     #[test]
     fn scalar_baseline_is_selected_from_oldest_supported_matrix() {
-        let profile = profile((8, 0), 11_010).unwrap();
+        let profile = profile((8, 0), 11_010, None).unwrap();
         assert_eq!(
             profile.plan(TargetRequirement::ScalarBaseline),
             Ok(PtxTarget::SCALAR_BASELINE)
@@ -508,7 +611,7 @@ mod tests {
 
     #[test]
     fn newer_hardware_retains_the_implemented_forward_compatible_baseline() {
-        let profile = profile((12, 1), 13_000).unwrap();
+        let profile = profile((12, 1), 13_000, None).unwrap();
         assert_eq!(profile.observed_architecture(), Ok(121));
         assert_eq!(
             profile.plan(TargetRequirement::ScalarBaseline),
@@ -527,7 +630,7 @@ mod tests {
             ((10, 0), 12_080),
             ((12, 1), 13_000),
         ] {
-            let profile = profile(cc, driver).unwrap();
+            let profile = profile(cc, driver, None).unwrap();
             assert_eq!(
                 profile.plan(TargetRequirement::ScalarBaseline),
                 Ok(PtxTarget::SCALAR_BASELINE),
@@ -541,7 +644,7 @@ mod tests {
     #[test]
     fn hardware_below_the_emitted_baseline_is_rejected() {
         assert!(matches!(
-            profile((7, 5), 12_000),
+            profile((7, 5), 12_000, None),
             Err(TargetError::UnsupportedHardware { .. })
         ));
     }
@@ -549,7 +652,7 @@ mod tests {
     #[test]
     fn driver_too_old_for_the_emitted_ptx_is_rejected() {
         assert!(matches!(
-            profile((8, 0), 10_020),
+            profile((8, 0), 10_020, None),
             Err(TargetError::UnsupportedDriver { .. })
         ));
     }
@@ -567,8 +670,60 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_resident_cooperative_facility_is_rejected() {
+        assert!(matches!(
+            profile(
+                (8, 0),
+                11_010,
+                Some(CooperativeGrid {
+                    max_resident_participants: 0
+                })
+            ),
+            Err(TargetError::InvalidObservation { .. })
+        ));
+    }
+
+    #[test]
+    fn the_effective_profile_fills_every_limit_and_the_cooperative_facility() {
+        let plain = profile((8, 0), 11_010, None).unwrap().effective_limits();
+        assert_eq!(plain.max_participants, 1024);
+        assert_eq!(
+            plain.max_workgroups_axis,
+            [u64::from(i32::MAX as u32), 65_535, 65_535]
+        );
+        assert_eq!(plain.max_workgroup_bytes, 48 * 1024);
+        assert_eq!(plain.max_direct_bindings, (32_764 / 8) as u32);
+        assert!(plain.cooperative_grid.is_none());
+
+        let cooperative = profile(
+            (9, 0),
+            12_000,
+            Some(CooperativeGrid {
+                max_resident_participants: 32 * 128,
+            }),
+        )
+        .unwrap()
+        .effective_limits();
+        assert_eq!(
+            cooperative.cooperative_grid,
+            Some(CooperativeGrid {
+                max_resident_participants: 32 * 128
+            })
+        );
+        let with_coop = profile(
+            (9, 0),
+            12_000,
+            Some(CooperativeGrid {
+                max_resident_participants: 32 * 128,
+            }),
+        )
+        .unwrap();
+        assert!(with_coop.fingerprint().contains("coop-resident=4096"));
+    }
+
+    #[test]
     fn specialized_tiers_are_explicitly_unimplemented() {
-        let profile = profile((12, 1), 13_000).unwrap();
+        let profile = profile((12, 1), 13_000, None).unwrap();
         assert!(matches!(
             profile.plan(TargetRequirement::FamilySpecific),
             Err(TargetError::BackendNotImplemented {
@@ -590,7 +745,8 @@ mod tests {
         let observation = TargetObservation::synthetic((8, 0), 11_010).unwrap();
         let baseline = TargetProfile::build(
             observation.clone(),
-            LIMITS,
+            limits(),
+            None,
             SupportedIntrinsic::CURRENT.to_vec(),
             "registry-a",
             "backend-a",
@@ -598,38 +754,53 @@ mod tests {
         let variants = [
             TargetProfile::build(
                 TargetObservation::synthetic((8, 9), 12_000).unwrap(),
-                LIMITS,
+                limits(),
+                None,
                 SupportedIntrinsic::CURRENT.to_vec(),
                 "registry-a",
                 "backend-a",
             ),
             TargetProfile::build(
                 observation.clone(),
-                TargetLimits {
-                    max_scratch_bytes: LIMITS.max_scratch_bytes - 1,
-                    ..LIMITS
+                crate::mapping::Limits {
+                    max_scratch_bytes: (1 << 30) - 1,
+                    ..limits()
                 },
+                None,
                 SupportedIntrinsic::CURRENT.to_vec(),
                 "registry-a",
                 "backend-a",
             ),
             TargetProfile::build(
                 observation.clone(),
-                LIMITS,
+                limits(),
+                Some(CooperativeGrid {
+                    max_resident_participants: 4096,
+                }),
+                SupportedIntrinsic::CURRENT.to_vec(),
+                "registry-a",
+                "backend-a",
+            ),
+            TargetProfile::build(
+                observation.clone(),
+                limits(),
+                None,
                 vec![SupportedIntrinsic::LaneIndexI32],
                 "registry-a",
                 "backend-a",
             ),
             TargetProfile::build(
                 observation.clone(),
-                LIMITS,
+                limits(),
+                None,
                 SupportedIntrinsic::CURRENT.to_vec(),
                 "registry-b",
                 "backend-a",
             ),
             TargetProfile::build(
                 observation,
-                LIMITS,
+                limits(),
+                None,
                 SupportedIntrinsic::CURRENT.to_vec(),
                 "registry-a",
                 "backend-b",

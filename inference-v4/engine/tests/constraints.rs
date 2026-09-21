@@ -1,4 +1,4 @@
-use seismic_engine::{
+use magnitude_engine::{
     chat::ConstraintPlan,
     generation::{
         constraints::{CacheLimits, Vocabulary},
@@ -240,7 +240,7 @@ fn native_qwen_grammars_enforce_required_tool_names_and_argument_schemas() {
 
 #[test]
 fn real_constraint_is_installed_only_after_numerical_commit() {
-    use seismic_engine::{
+    use magnitude_engine::{
         generation::{Generation, Options, Readiness, Sampling},
         inputs::InputLayout,
         models::sequence::Advance,
@@ -320,7 +320,7 @@ fn real_constraint_is_installed_only_after_numerical_commit() {
 
 #[test]
 fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
-    use seismic_engine::{
+    use magnitude_engine::{
         chat::{ChatRequest, PreparedChat, TemplateBundle, TemplateSelection, TemplateVariant},
         generation::{Options, Sampling},
     };
@@ -374,7 +374,7 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
 #[test]
 #[ignore = "requires a Metal device"]
 fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_together() {
-    use seismic_engine::{
+    use magnitude_engine::{
         generation::{FinishReason, Generation, Options, Readiness, Sampling},
         inputs::InputLayout,
         models::sequence::OwnedSequence,

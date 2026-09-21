@@ -1,4 +1,4 @@
-use seismic_engine::inputs::{
+use magnitude_engine::inputs::{
     BoundaryRule, BpeConfig, ByteBpeTokenizer, InputLayout, InputSpan, PieceKind, SpecialTokens,
     TokenId,
 };
@@ -121,7 +121,7 @@ fn input_spans_bound_advances_without_using_physical_page_geometry() {
 
 #[test]
 fn artifact_metadata_uses_file_precedence_and_preserves_token_ids() {
-    use seismic_engine::{chat::TemplateSelection, inputs::artifacts};
+    use magnitude_engine::{chat::TemplateSelection, inputs::artifacts};
     use serde_json::json;
     let path = std::env::temp_dir().join(format!("seismic-input-artifacts-{}", std::process::id()));
     std::fs::create_dir_all(path.join("chat_templates")).unwrap();
@@ -186,7 +186,7 @@ fn artifact_metadata_uses_file_precedence_and_preserves_token_ids() {
 
 #[test]
 fn prepared_chat_uses_the_same_prompt_for_counting_and_model_input() {
-    use seismic_engine::chat::{
+    use magnitude_engine::chat::{
         ChatRequest, PreparedChat, TemplateBundle, TemplateSelection, TemplateVariant,
     };
     let tokenizer = ByteBpeTokenizer::new(byte_config()).unwrap();
@@ -216,7 +216,7 @@ fn prepared_chat_uses_the_same_prompt_for_counting_and_model_input() {
 
 #[test]
 fn accepted_tokens_decode_stop_and_finish_through_one_native_stream() {
-    use seismic_engine::{
+    use magnitude_engine::{
         chat::{
             ChatRequest, Event, PreparedChat, TemplateBundle, TemplateSelection, TemplateVariant,
             TerminalCause, TokenChatStream,

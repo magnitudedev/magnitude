@@ -1,21 +1,25 @@
-//! Metal backend: sealed `MetalOp` dialect, strategies over the common family
-//! builder, mechanical MSL emission, and the macOS runtime.
+//! Metal backend: the sealed `MetalIntrinsic` dialect, the declarative
+//! mapping catalog (streaming, blocked, subgroup, matrix — nothing else),
+//! the exhaustive mechanical MSL encoder, the native assembler, and the
+//! macOS executor over prepared invocations.
 //!
-//! The backend owns exactly: the `MetalDialect` legalization/consequence
-//! contract, the universal and capability strategies that consume logical
-//! alternatives through `PlanFamilyBuilder`/`AlternativeBuilder`, the MSL
-//! printer that exhaustively accepts `MetalOp`, and runtime glue over the
-//! retained structured `ResolvedStep` tree. Boundaries name caller storage;
-//! there is no assembly alias union. Threadgroup/private storage and argument
-//! tables come only from the resolved plan.
+//! The backend owns exactly: the effective target profile and its filled
+//! `TargetLimits` (no cooperative grid on Metal), the intrinsic catalog
+//! total over effective signatures, the optional mapping rules expressed
+//! declaratively over occurrence facts, the probe-calibrated cost model,
+//! the total MSL emission over `KernelOp<MetalIntrinsic>`, native
+//! assembly with reflection folded into direct handles, and runtime
+//! execution over `PreparedInvocation` with only `ExecutionFailure`
+//! outcomes. Boundaries name caller storage; storage, geometry, and
+//! guards come only from the sealed launch; there is no fallback, retry,
+//! or alternate path.
 
-#[path = "msl_new.rs"]
-pub mod msl;
-pub mod physical;
+pub mod catalog;
+pub mod encode;
+pub mod estimate;
+pub mod intrinsics;
+#[cfg(target_os = "macos")]
+pub mod native;
 pub mod target;
-
-#[path = "mapping_new.rs"]
-pub mod mapping;
-
 #[cfg(target_os = "macos")]
 pub mod runtime;

@@ -105,7 +105,7 @@ pub fn bindings(args: &[String]) -> Result<(), String> {
                         .fold(Sym::constant(1), |a, (_, d)| a.mul(d))
                 };
                 let elem = match &s.elem {
-                    Elem::Param(p) => o.workload.elems.get(p).ok_or_else(|| {
+                    Elem::Param(p) => o.elems.get(p).ok_or_else(|| {
                         format!(
                             "parameter `{pname}` has generic element `{p}`; bind it with --element"
                         )

@@ -1,12 +1,15 @@
 use seismic_lang::{
+    logical::specialization::{ShapeBinding, SpecializationDomain},
     program::{compile, SourceFile},
     types::Elem,
 };
 use seismic_runtime::{
+    invocation::Bindings,
     plan::{PlanCompiler, Settings},
-    Device,
+    submission::Submission,
+    Buffer, Device,
 };
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[test]
 fn cpu_allocates_and_returns_hidden_tuple_destinations() {
@@ -25,10 +28,20 @@ fn cpu_allocates_and_returns_hidden_tuple_destinations() {
         )
     });
     let device = Device::cpu().unwrap();
-    let shapes = HashMap::from([("N".into(), 4)]);
-    let elements = HashMap::<String, Elem>::new();
+    let shapes = BTreeMap::from([("N".to_string(), 4_i64)]);
+    let elements = BTreeMap::<String, Elem>::new();
+    let domain = SpecializationDomain::new(
+        &program,
+        "pair",
+        shapes
+            .iter()
+            .map(|(n, v)| (n.clone(), ShapeBinding::Exact(*v as u64)))
+            .collect(),
+        elements,
+    )
+    .unwrap();
     let mut compiler = PlanCompiler::new(&device, &program, Settings::default());
-    let mut plan = compiler.compile_entry("pair", &shapes, &elements).unwrap();
+    let plan = compiler.compile_entry(&domain).unwrap();
     assert_eq!(
         compiler.kernel_count(),
         1,
@@ -46,22 +59,46 @@ fn cpu_allocates_and_returns_hidden_tuple_destinations() {
         })
         .collect::<Vec<_>>();
 
-    let results = plan.execute_buffers_with_results(&inputs, &[]).unwrap();
+    struct Inputs<'a> {
+        buffers: &'a [Buffer],
+        shapes: &'a BTreeMap<String, i64>,
+    }
+    impl Bindings for Inputs<'_> {
+        fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
+            match (root, plane) {
+                ("x", "") => self.buffers.first(),
+                ("y", "") => self.buffers.get(1),
+                _ => None,
+            }
+        }
+        fn scalar(&self, _name: &str) -> Option<f64> {
+            None
+        }
+        fn shape(&self, name: &str) -> Option<u64> {
+            self.shapes.get(name).and_then(|v| u64::try_from(*v).ok())
+        }
+    }
 
-    assert_eq!(
-        results
-            .iter()
-            .map(|result| result.path.clone())
-            .collect::<Vec<_>>(),
-        [vec![0], vec![1]]
-    );
-    for (result, expected) in results.iter().zip(values) {
+    let bound = Inputs {
+        buffers: &inputs,
+        shapes: &shapes,
+    };
+    let invocation = plan.prepare(&bound).unwrap();
+    let results = Submission::single(invocation).execute().unwrap().remove(0);
+
+    let paths = results
+        .planes
+        .iter()
+        .map(|plane| plane.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, [vec![0], vec![1]]);
+    for (plane, expected) in results.planes.iter().zip(values.iter()) {
         let mut actual = vec![0_u8; expected.len() * size_of::<f32>()];
-        result.buffer.read(&mut actual).unwrap();
+        plane.buffer.read(&mut actual).unwrap();
         let actual = actual
             .chunks_exact(size_of::<f32>())
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+        assert_eq!(&actual, expected);
     }
 }

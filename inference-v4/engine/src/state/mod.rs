@@ -2,11 +2,13 @@
 //! Native calls are synchronous today: an advance becomes committable only after
 //! its execution closure returns successful physical completion.
 use seismic_lang::types::DType;
-use seismic_runtime::{Buffer, Device, Error};
+use seismic_runtime::{Buffer, Device};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
 };
+
+use crate::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentSpec {
@@ -126,25 +128,28 @@ impl StateStore {
     }
     /// Recurrent component storage freed by closing the selected states. Shared
     /// checkpoints, unselected descendants, and execution pins prevent reclaim.
-    pub fn reclaimable(self: &Rc<Self>, states: &[&SequenceState]) -> Result<usize, String> {
+    pub fn reclaimable(self: &Rc<Self>, states: &[&SequenceState]) -> Result<usize, Error> {
         if states.iter().any(|state| !Rc::ptr_eq(self, &state.store)) {
-            return Err("reclamation requires states from this store".into());
+            return Err(Error::Request(
+                "reclamation requires states from this store".into(),
+            ));
         }
         Buffer::reclaimable_bytes(states.iter().flat_map(|state| state.values.iter()))
+            .map_err(Error::from)
     }
     pub fn idle(&self) -> bool {
         self.owners.get() == 0
     }
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
-    pub fn release_idle(&self) -> Result<usize, String> {
+    pub fn release_idle(&self) -> Result<usize, Error> {
         if !self.idle() {
             return Ok(0);
         }
         self.history
             .borrow_mut()
             .take()
-            .map_or(Ok(0), |v| Buffer::reclaimable_bytes(v.iter()))
+            .map_or(Ok(0), |v| Buffer::reclaimable_bytes(v.iter()).map_err(Error::from))
     }
     fn allocate_values(&self, zero: bool) -> Result<Vec<Buffer>, Error> {
         self.component_specs

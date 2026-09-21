@@ -1,4 +1,4 @@
-//! Unified logical -> family -> solve -> resolve -> native compilation
+//! Unified semantic -> logical -> plan-space -> physical-plan -> native compilation
 //! inspection commands.
 
 use crate::{load_program, options, Options};
@@ -6,17 +6,17 @@ use seismic_compiler::{
     pipeline::{self, Backend, Compiled},
     planning::Budget,
 };
-use seismic_cpu::mapping::Cpu;
-use seismic_cuda::mapping::Cuda;
+use seismic_cpu::Cpu;
+use seismic_cuda::{CudaCompiler, Device as CudaDevice};
 use seismic_lang::sir::Program;
-use seismic_metal::mapping::{Limits, Metal};
-use seismic_realization::executable::{ExecutableDialect, ResolvedSchedule, ResolvedStep};
+use seismic_realization::ids::{DenseIndex, LaunchIx};
+use seismic_realization::kernel::ExecutableDialect;
+use seismic_realization::physical::PhysicalStep;
 
 const FLAGS: &[&str] = &[
     "--fn",
     "--shape",
     "--element",
-    "--extent",
     "--precision",
     "--atol",
     "--rtol",
@@ -28,33 +28,6 @@ const FLAGS: &[&str] = &[
     "--allow-special-changes",
     "--target",
 ];
-
-const DEFAULT_MAX_THREADS_PER_THREADGROUP: u64 = 1024;
-const DEFAULT_MAX_THREADGROUP_BYTES: u64 = 32 * 1024;
-
-fn metal() -> Result<(Metal, String), String> {
-    #[cfg(target_os = "macos")]
-    if let Ok(device) = seismic_metal::runtime::Device::open() {
-        let info = device.info();
-        let origin = format!(
-            "device `{}` (max_threads_per_threadgroup={}, max_threadgroup_bytes={})",
-            info.name, info.max_threads_per_threadgroup, info.max_threadgroup_bytes
-        );
-        return Ok((
-            Metal::from_device(&info).map_err(|error| error.to_string())?,
-            origin,
-        ));
-    }
-    let limits = Limits {
-        max_threads_per_threadgroup: DEFAULT_MAX_THREADS_PER_THREADGROUP,
-        max_threadgroup_bytes: DEFAULT_MAX_THREADGROUP_BYTES,
-        max_private_bytes: seismic_metal::mapping::CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
-    };
-    Ok((
-        Metal::new(limits).map_err(|error| error.to_string())?,
-        "documented Metal baseline (no live device facts available)".into(),
-    ))
-}
 
 fn cpu() -> Result<(Cpu, String), String> {
     let workers = std::thread::available_parallelism()
@@ -69,28 +42,29 @@ fn cpu() -> Result<(Cpu, String), String> {
     Ok((backend, origin))
 }
 
-fn cuda() -> Result<(Cuda, String), String> {
-    if let Ok(device) = seismic_cuda::Device::open(0) {
-        let origin = format!(
-            "device `{}` (max_threads_per_block={}, max_grid_x={}, warp_size={})",
-            device.info.name,
-            device.info.max_threads_per_block,
-            device.info.max_grid_x,
-            device.info.warp_size
-        );
-        return Ok((
-            Cuda::from_device(&device.info).map_err(|error| error.to_string())?,
-            origin,
-        ));
-    }
-    Ok((
-        Cuda::new(
-            seismic_cuda::mapping::Limits::gb10(),
-            seismic_cuda::mapping::EstimateModel::default(),
-        )
-        .map_err(|error| error.to_string())?,
-        "documented GB10 baseline (no live device facts available)".into(),
-    ))
+fn cuda() -> Result<(CudaDevice, String), String> {
+    let device = CudaDevice::open(0)
+        .map_err(|error| format!("CUDA target needs a CUDA device: {error}"))?;
+    let origin = format!(
+        "device `{}` (max_threads_per_block={}, max_grid_x={}, warp_size={})",
+        device.info.name,
+        device.info.max_threads_per_block,
+        device.info.max_grid_x,
+        device.info.warp_size
+    );
+    Ok((device, origin))
+}
+
+#[cfg(target_os = "macos")]
+fn metal() -> Result<(seismic_metal::runtime::Device, String), String> {
+    let device = seismic_metal::runtime::Device::open()
+        .map_err(|error| format!("Metal target needs a Metal device: {error}"))?;
+    let info = device.info();
+    let origin = format!(
+        "device `{}` (max_threads_per_threadgroup={}, max_threadgroup_bytes={})",
+        info.name, info.max_threads_per_threadgroup, info.max_threadgroup_bytes
+    );
+    Ok((device, origin))
 }
 
 fn compile<B: Backend>(
@@ -98,38 +72,16 @@ fn compile<B: Backend>(
     program: &Program,
     backend: &B,
 ) -> Result<Compiled<B::Dialect, B::NativeArtifact>, String> {
+    let domain = options.domain(program)?;
     pipeline::compile(
         program,
-        options.entry()?,
-        &options.workload,
+        &domain,
+        &options.precision,
         backend,
         &[],
         Budget::default(),
     )
     .map_err(|error| error.to_string())
-}
-
-/// Launches of the retained structured schedule, in retained order.
-fn launches<D: ExecutableDialect>(schedule: &ResolvedSchedule<D>) -> Vec<&ResolvedStep<D>> {
-    let mut out = Vec::new();
-    fn walk<'a, D: ExecutableDialect>(
-        schedule: &'a ResolvedSchedule<D>,
-        out: &mut Vec<&'a ResolvedStep<D>>,
-    ) {
-        for step in schedule.steps.iter() {
-            match step {
-                ResolvedStep::Launch(_) => out.push(step),
-                ResolvedStep::Call(call) => walk(&call.body.schedule, out),
-                ResolvedStep::If(if_step) => {
-                    walk(&if_step.then_schedule, out);
-                    walk(&if_step.else_schedule, out);
-                }
-                ResolvedStep::Repeat(repeat) => walk(&repeat.body, out),
-            }
-        }
-    }
-    walk(schedule, &mut out);
-    out
 }
 
 fn report<D: ExecutableDialect, A>(
@@ -138,55 +90,56 @@ fn report<D: ExecutableDialect, A>(
     capacities: &str,
 ) -> String {
     let physical = &compiled.physical;
+    let identity = physical.identity();
     let mut text = format!(
         "entry: {}\ntarget: {target}\ntarget facts: {capacities}\ncapability fingerprint: {}\nestimated cost: {}\noptimal: {}\nnumerical assessment: {:?}\n",
-        compiled.logical.entry,
-        compiled.logical.target.capability_fingerprint,
-        physical.estimated_cost,
-        physical.optimal,
-        physical.numerical,
+        compiled.logical.entry(),
+        identity.target.capability_fingerprint,
+        physical.estimated_cost(),
+        physical.optimal(),
+        physical.numerical(),
     );
     text.push_str("assignment:\n");
-    for (choice, selected) in &physical.identity.selections {
+    for (occurrence, selected) in &identity.selections {
+        let selected = selected
+            .map(|strategy| format!("physical#{}", strategy.0))
+            .unwrap_or_else(|| "none".to_string());
         text.push_str(&format!(
-            "  choice#{} = logical#{} / physical#{}\n",
-            choice.0, selected.0, selected.1
+            "  occurrence#{} = {}\n",
+            occurrence.0, selected
         ));
     }
     text.push_str("resources:\n");
-    let device_bytes = physical.internal_arena.bytes;
-    for step in launches(&physical.entry.schedule) {
-        if let ResolvedStep::Launch(launch) = step {
-            text.push_str(&format!(
-                "  launch#{}: device={device_bytes} B, workgroup={} B, private/participant={} B, bindings={}\n",
-                launch.id.0,
-                launch.kernel.resources.workgroup_bytes,
-                launch.kernel.resources.private_bytes_per_participant,
-                launch.bindings.len()
-            ));
-        }
+    let device_bytes = physical.resources().arena_bytes;
+    for launch in physical.launches() {
+        text.push_str(&format!(
+            "  launch#{}: device={device_bytes} B, workgroup={} B, private/participant={} B, bindings={}\n",
+            launch.id.index(),
+            launch.resources.workgroup_bytes,
+            launch.resources.private_bytes_per_participant,
+            launch.bindings.len(),
+        ));
     }
     let nested = {
-        fn calls<D: ExecutableDialect>(schedule: &ResolvedSchedule<D>) -> usize {
-            schedule
-                .steps
+        fn calls<D: ExecutableDialect>(steps: &[PhysicalStep<D>]) -> usize {
+            steps
                 .iter()
                 .map(|step| match step {
-                    ResolvedStep::Call(call) => 1 + calls(&call.body.schedule),
-                    ResolvedStep::If(if_step) => {
-                        calls(&if_step.then_schedule) + calls(&if_step.else_schedule)
+                    PhysicalStep::Call(call) => 1 + calls(&call.body.steps),
+                    PhysicalStep::If(branch) => {
+                        calls(&branch.then_schedule.steps) + calls(&branch.else_schedule.steps)
                     }
-                    ResolvedStep::Repeat(repeat) => calls(&repeat.body),
-                    ResolvedStep::Launch(_) => 0,
+                    PhysicalStep::Repeat(repeat) => calls(&repeat.body.steps),
+                    _ => 0,
                 })
                 .sum()
         }
-        calls(&physical.entry.schedule)
+        calls(&physical.schedule().steps)
     };
     text.push_str(&format!(
         "executable plan: {} launches, {} nested calls\n",
-        launches(&physical.entry.schedule).len(),
-        nested
+        physical.launches().len(),
+        nested,
     ));
     text
 }
@@ -200,13 +153,18 @@ pub fn select(args: &[String]) -> Result<(), String> {
             report(&compile(&options, &program, &backend)?, "cpu", &facts)
         }
         "cuda" => {
-            let (backend, facts) = cuda()?;
+            let (device, facts) = cuda()?;
+            let backend = CudaCompiler::new(&device).map_err(|error| error.to_string())?;
             report(&compile(&options, &program, &backend)?, "cuda", &facts)
         }
+        #[cfg(target_os = "macos")]
         "metal" => {
-            let (backend, facts) = metal()?;
+            let (device, facts) = metal()?;
+            let backend = seismic_metal::catalog::MetalCompiler::from_device(&device);
             report(&compile(&options, &program, &backend)?, "metal", &facts)
         }
+        #[cfg(not(target_os = "macos"))]
+        "metal" => return Err("Metal target requires macOS".to_string()),
         target => return Err(format!("unknown target `{target}`")),
     };
     print!("{text}");
@@ -223,21 +181,38 @@ pub fn emit(args: &[String]) -> Result<(), String> {
             let mut text = report(&compiled, "cpu", &facts);
             text.push_str(&format!(
                 "\nnative CPU artifact: {} launches\n",
-                compiled.native.kernel.launch_count()
+                compiled.native.launch_count()
             ));
             text
         }
         "cuda" => {
-            let (backend, _) = cuda()?;
-            compile(&options, &program, &backend)?
+            let (device, _) = cuda()?;
+            let backend = CudaCompiler::new(&device).map_err(|error| error.to_string())?;
+            let compiled = compile(&options, &program, &backend)?;
+            compiled
                 .native
-                .launches
+                .launches()
                 .iter()
                 .enumerate()
-                .map(|(index, launch)| format!("// launch {index}\n{}\n", launch.ptx))
+                .map(|(index, launch)| {
+                    format!("// launch {index}\n{}\n", launch.launch.ptx)
+                })
                 .collect()
         }
-        "metal" => compile(&options, &program, &metal()?.0)?.native.source,
+        #[cfg(target_os = "macos")]
+        "metal" => {
+            let (device, _) = metal()?;
+            let backend = seismic_metal::catalog::MetalCompiler::from_device(&device);
+            let compiled = compile(&options, &program, &backend)?;
+            (0..compiled.native.launch_count())
+                .map(|index| {
+                    let launch = compiled.native.launch(LaunchIx::from_index(index));
+                    format!("// launch {index}\n{}\n", launch.kernel())
+                })
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        "metal" => return Err("Metal target requires macOS".to_string()),
         target => return Err(format!("unknown target `{target}`")),
     };
     print!("{text}");
@@ -253,13 +228,18 @@ pub fn analyze_search(args: &[String]) -> Result<(), String> {
             search_report(&compile(&options, &program, &backend)?, "cpu", &facts)
         }
         "cuda" => {
-            let (backend, facts) = cuda()?;
+            let (device, facts) = cuda()?;
+            let backend = CudaCompiler::new(&device).map_err(|error| error.to_string())?;
             search_report(&compile(&options, &program, &backend)?, "cuda", &facts)
         }
+        #[cfg(target_os = "macos")]
         "metal" => {
-            let (backend, facts) = metal()?;
+            let (device, facts) = metal()?;
+            let backend = seismic_metal::catalog::MetalCompiler::from_device(&device);
             search_report(&compile(&options, &program, &backend)?, "metal", &facts)
         }
+        #[cfg(not(target_os = "macos"))]
+        "metal" => return Err("Metal target requires macOS".to_string()),
         target => return Err(format!("unknown target `{target}`")),
     };
     print!("{text}");
@@ -274,9 +254,9 @@ fn search_report<D: ExecutableDialect, A>(
     let physical = &compiled.physical;
     format!(
         "executable search of `{}` on {target}\n  target facts       {capacities}\n  selected choices   {}\n  selected cost      {}\n  optimum proven     {}\n",
-        compiled.logical.entry,
-        physical.identity.selections.len(),
-        physical.estimated_cost,
-        physical.optimal,
+        compiled.logical.entry(),
+        physical.identity().selections.len(),
+        physical.estimated_cost(),
+        physical.optimal(),
     )
 }

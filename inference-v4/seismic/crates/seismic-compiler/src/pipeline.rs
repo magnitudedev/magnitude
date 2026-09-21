@@ -1,41 +1,36 @@
-//! Sole production compilation seam.
+//! Sole production compilation seam (frozen by C0; package P1 owns the
+//! planning call it makes).
 //!
-//! Backends construct complete plan families, encode one resolved launch at
-//! a time, and assemble the hierarchy already encoded by the compiler core.
-//! The pipeline consumes the one structured schedule authority: encoded
-//! items mirror `ResolvedStep::{Launch, Call, If, Repeat}`, never a flattened
-//! phase list. Failure is one closed taxonomy; there is no retry, fallback,
-//! or repair path.
+//! The compiler calls core `form_plan_space` exactly once, passes the sealed
+//! space to the solver, resolves exactly one complete assignment, then
+//! performs exhaustive encoding and native assembly. Backends supply a
+//! profile, a mapping catalog, an exhaustive mechanical encoder over sealed
+//! launches, and a native assembler. There is no `Backend::elaborate`, no
+//! retry, fallback, repair, or alternate selector.
 
 use crate::planning::{self, Budget};
 use seismic_lang::{
-    logical::{self, ApplicabilityReport, EffectiveTargetIdentity, LogicalProgram},
+    logical::{
+        self, specialization::SpecializationDomain, ApplicabilityReport, EffectiveTargetIdentity,
+        LogicalProgram,
+    },
     precision::PrecisionPolicy,
     sir::{IntrinsicUse, Program},
-    types::Elem,
 };
-use seismic_realization::executable::{
-    EffectiveTargetProfile, ExecutableDialect, InvariantReport, PlanFamily, ResolvedLaunch,
-    ResolvedPlan, ResolvedScheduleIf, ResolvedScheduleRepeat, ResolvedStep,
+use seismic_realization::{
+    failure::CompilerDefect,
+    ids::{BranchIx, CallIx, GuardIx, LaunchIx, RepeatIx, StorageIx},
+    kernel::ExecutableDialect,
+    numerics::NumericalEvidence,
+    physical::{PhysicalPlan, PhysicalStep, SealedGuard, SealedLaunch},
+    plan_space::NumericalContext,
+    strategy::MappingCatalog,
+    target::EffectiveTargetProfile,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
-/// Concrete specialization of the entry: shape and element parameters plus
-/// the caller's whole-program precision policy, and the expected runtime
-/// value of `index` parameters that bound runtime domains.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Workload {
-    pub shapes: BTreeMap<String, i64>,
-    pub elems: BTreeMap<String, Elem>,
-    pub precision: PrecisionPolicy,
-    /// Expected runtime value of each `index` parameter used as a loop bound,
-    /// keyed by entry parameter name. Prices runtime domains for planning;
-    /// an unstated parameter leaves its domains priced at capacity. Never
-    /// affects semantics, geometry, or resources.
-    pub extents: BTreeMap<String, i64>,
-}
-
-/// Semantic diagnostics of a program that cannot yield a valid specialization.
+/// Semantic diagnostics of a program that cannot yield a valid
+/// specialization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostics(pub Vec<String>);
 
@@ -47,14 +42,36 @@ pub struct ToolchainReport(pub String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemReport(pub String);
 
+/// A backend's closed native-assembly failure taxonomy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssemblyFailure {
+    CompilerInvariant(CompilerDefect),
+    Toolchain(ToolchainReport),
+    SystemPreparation(SystemReport),
+}
+
+impl std::fmt::Display for AssemblyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CompilerInvariant(defect) => write!(f, "{defect} during assembly"),
+            Self::Toolchain(report) => write!(f, "native toolchain failure: {}", report.0),
+            Self::SystemPreparation(report) => {
+                write!(f, "native system preparation failed: {}", report.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for AssemblyFailure {}
+
 /// The closed production failure taxonomy. Exactly one of these (or a
-/// `ResolvedPlan`) is the result of compiling a checked program.
+/// compiled artifact) is the result of compiling a checked program.
 #[derive(Debug)]
 pub enum CompileFailure {
     InvalidSemanticProgram(Diagnostics),
     NoApplicableImplementation(ApplicabilityReport),
     PlanningInfeasible,
-    CompilerBug(InvariantReport),
+    CompilerBug(CompilerDefect),
     ToolchainFailure(ToolchainReport),
     SystemFailure(SystemReport),
 }
@@ -66,18 +83,14 @@ impl std::fmt::Display for CompileFailure {
                 write!(f, "invalid semantic program: {}", diagnostics.0.join("; "))
             }
             Self::NoApplicableImplementation(report) => {
-                write!(
-                    f,
-                    "no applicable implementation for entry `{}`",
-                    report.entry
-                )?;
+                write!(f, "no applicable implementation for entry `{}`", report.entry)?;
                 for rejection in &report.occurrences {
-                    write!(f, "; {:?}", rejection)?;
+                    write!(f, "; {rejection:?}")?;
                 }
                 Ok(())
             }
             Self::PlanningInfeasible => write!(f, "planning is infeasible"),
-            Self::CompilerBug(report) => write!(f, "compiler bug: {}", report.0),
+            Self::CompilerBug(defect) => write!(f, "{defect}"),
             Self::ToolchainFailure(report) => write!(f, "toolchain failure: {}", report.0),
             Self::SystemFailure(report) => write!(f, "system failure: {}", report.0),
         }
@@ -86,175 +99,222 @@ impl std::fmt::Display for CompileFailure {
 
 impl std::error::Error for CompileFailure {}
 
+/// The compiler backend seam. Formation and encoding are total because their
+/// inputs are sealed; catalog construction validates that every declared
+/// intrinsic family has an encoder.
 pub trait Backend {
     type Dialect: ExecutableDialect;
+    type Catalog: MappingCatalog<Self::Dialect>;
     type EncodedLaunch;
     type NativeArtifact;
 
-    fn target(&self) -> &'static str;
-    fn capability_fingerprint(&self) -> String;
+    fn profile(&self) -> &EffectiveTargetProfile;
+    fn catalog(&self) -> &Self::Catalog;
+    /// Applicability of one exact typed capability use on this target.
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String>;
-    fn target_profile(&self) -> &EffectiveTargetProfile;
-    /// Construct the complete plan family for one logical program: every
-    /// applicable portable alternative must receive a universal physical
-    /// alternative.
-    fn elaborate(&self, logical: &LogicalProgram) -> Result<PlanFamily<Self::Dialect>, String>;
-    fn encode_launch(
-        &self,
-        launch: &ResolvedLaunch<Self::Dialect>,
-    ) -> Result<Self::EncodedLaunch, String>;
+    /// Exhaustive mechanical encoding of one sealed launch. Total.
+    fn encode(&self, launch: &SealedLaunch<Self::Dialect>) -> Self::EncodedLaunch;
+    /// Compile every encoded launch, reflect native facts, validate them
+    /// against the selected contract, and seal one structured native tree.
     fn assemble(
         &self,
-        encoded: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
-    ) -> Result<Self::NativeArtifact, String>;
+        plan: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
+    ) -> Result<Self::NativeArtifact, AssemblyFailure>;
 }
 
-/// Encoded mirror of the resolved structured schedule.
+/// Encoded mirror of the sealed physical schedule: every `PhysicalStep`
+/// exactly once, launches paired with their encoded form. Construction is
+/// private to `encode_plan`, which builds the tree from the plan it pairs;
+/// the mirroring invariant is asserted at that one construction site.
 pub struct EncodedPlan<D: ExecutableDialect, L> {
-    pub resolved: Arc<ResolvedPlan<D>>,
-    pub steps: Vec<EncodedStep<D, L>>,
+    physical: Arc<PhysicalPlan<D>>,
+    steps: Vec<EncodedStep<L>>,
 }
 
-pub enum EncodedStep<D: ExecutableDialect, L> {
-    Launch {
-        resolved: ResolvedLaunch<D>,
-        encoded: L,
-    },
-    Call {
-        call: seismic_realization::executable::ResolvedCall<D>,
-        encoded: Box<EncodedPlanBody<D, L>>,
-    },
-    If {
-        resolved: ResolvedScheduleIf<D>,
-        then_steps: Vec<EncodedStep<D, L>>,
-        else_steps: Vec<EncodedStep<D, L>>,
-    },
-    Repeat {
-        resolved: ResolvedScheduleRepeat<D>,
-        body: Vec<EncodedStep<D, L>>,
-    },
+impl<D: ExecutableDialect, L> EncodedPlan<D, L> {
+    /// The sealed physical plan this encoded tree mirrors.
+    pub fn physical(&self) -> &Arc<PhysicalPlan<D>> {
+        &self.physical
+    }
+
+    /// The encoded tree, mirroring `physical().schedule()` exactly.
+    pub fn steps(&self) -> &[EncodedStep<L>] {
+        &self.steps
+    }
+
+    /// The only constructor: pairs an encoded tree with the plan it was
+    /// encoded from, asserting that the tree mirrors the plan's schedule
+    /// step for step.
+    pub(crate) fn seal(
+        physical: Arc<PhysicalPlan<D>>,
+        steps: Vec<EncodedStep<L>>,
+    ) -> EncodedPlan<D, L> {
+        debug_assert!(mirrors(&steps, &physical.schedule().steps));
+        EncodedPlan { physical, steps }
+    }
 }
 
-/// One encoded nested body (no second ABI or arena).
-pub struct EncodedPlanBody<D: ExecutableDialect, L> {
-    pub steps: Vec<EncodedStep<D, L>>,
+/// Whether an encoded tree pairs with the physical schedule it claims to
+/// mirror: identical step structure, identical dense ids, launches encoded
+/// in tree order.
+fn mirrors<D: ExecutableDialect, L>(
+    encoded: &[EncodedStep<L>],
+    physical: &[PhysicalStep<D>],
+) -> bool {
+    if encoded.len() != physical.len() {
+        return false;
+    }
+    for (encoded, physical) in encoded.iter().zip(physical) {
+        let paired = match (encoded, physical) {
+            (
+                EncodedStep::Launch { launch, .. },
+                PhysicalStep::Launch(sealed),
+            ) => *launch == sealed.id,
+            (EncodedStep::Guard { guard }, PhysicalStep::Guard(sealed)) => *guard == sealed.id,
+            (
+                EncodedStep::Call { call, body },
+                PhysicalStep::Call(sealed),
+            ) => *call == sealed.id && mirrors(body, &sealed.body.steps),
+            (
+                EncodedStep::If {
+                    branch,
+                    then_steps,
+                    else_steps,
+                },
+                PhysicalStep::If(sealed),
+            ) => {
+                *branch == sealed.id
+                    && mirrors(then_steps, &sealed.then_schedule.steps)
+                    && mirrors(else_steps, &sealed.else_schedule.steps)
+            }
+            (
+                EncodedStep::Repeat { repeat, body },
+                PhysicalStep::Repeat(sealed),
+            ) => *repeat == sealed.id && mirrors(body, &sealed.body.steps),
+            (EncodedStep::Fill { storage }, PhysicalStep::Fill(sealed)) => {
+                *storage == sealed.storage
+            }
+            _ => false,
+        };
+        if !paired {
+            return false;
+        }
+    }
+    true
 }
 
+pub enum EncodedStep<L> {
+    Launch { launch: LaunchIx, encoded: L },
+    Guard { guard: GuardIx },
+    Call { call: CallIx, body: Vec<EncodedStep<L>> },
+    If { branch: BranchIx, then_steps: Vec<EncodedStep<L>>, else_steps: Vec<EncodedStep<L>> },
+    Repeat { repeat: RepeatIx, body: Vec<EncodedStep<L>> },
+    /// A host-side fill (the pull-counter reset): present in the encoded
+    /// tree so it mirrors the physical schedule exactly once, but never
+    /// backend-encoded — the host zeroes the storage before the launch.
+    Fill { storage: StorageIx },
+}
+
+/// The compiled artifact: logical program, sealed physical plan, and native
+/// artifact. `CompiledPlan` (runtime, package R1) wraps it with its
+/// invocation contract.
 pub struct Compiled<D: ExecutableDialect, A> {
     pub logical: Arc<LogicalProgram>,
-    pub physical: Arc<ResolvedPlan<D>>,
+    pub physical: Arc<PhysicalPlan<D>>,
     pub native: A,
 }
 
+/// Compile one entry under one complete specialization domain and precision
+/// policy for one backend.
 pub fn compile<B: Backend>(
     program: &Program,
-    entry: &str,
-    workload: &Workload,
+    domain: &SpecializationDomain,
+    precision: &PrecisionPolicy,
     backend: &B,
-    numerical_evidence: &[planning::NumericalEvidence],
+    numerical_evidence: &[NumericalEvidence],
     budget: Budget,
 ) -> Result<Compiled<B::Dialect, B::NativeArtifact>, CompileFailure> {
-    let bug = |reason: String| CompileFailure::CompilerBug(InvariantReport(reason));
+    let profile = backend.profile();
     let target = EffectiveTargetIdentity {
-        backend: backend.target().to_string(),
-        capability_fingerprint: backend.capability_fingerprint(),
+        backend: profile.backend.clone(),
+        capability_fingerprint: profile.capability_fingerprint.clone(),
     };
     let supports = |intrinsic: &IntrinsicUse| backend.supports_intrinsic(intrinsic);
-    let mut logical = logical::construct(
-        program,
-        entry,
-        &target,
-        &supports,
-        workload.shapes.clone(),
-        workload.elems.clone(),
-    )
-    .map_err(|error| match error {
-        logical::LogicalConstructionError::NoApplicableImplementation(report) => {
-            CompileFailure::NoApplicableImplementation(report)
-        }
-        logical::LogicalConstructionError::InvalidProgram(reason) => {
-            CompileFailure::InvalidSemanticProgram(Diagnostics(vec![reason]))
+    let logical = logical::construct(program, &target, &supports, domain).map_err(|error| {
+        match error {
+            logical::LogicalConstructionError::NoApplicableImplementation(report) => {
+                CompileFailure::NoApplicableImplementation(report)
+            }
+            logical::LogicalConstructionError::InvalidProgram(reason) => {
+                CompileFailure::InvalidSemanticProgram(Diagnostics(vec![reason]))
+            }
         }
     })?;
-    logical
-        .verify()
-        .map_err(|reasons| bug(reasons.join("; ")))?;
-    logical.install_expected_extents(&workload.extents);
-    if logical.target != target {
-        return Err(bug(
-            "the logical target identity changed during specialization".into(),
-        ));
-    }
-    let family = backend.elaborate(&logical).map_err(bug)?;
-    let resolved = planning::plan(
-        &logical,
-        &family,
-        &planning::Context {
-            target: backend.target_profile(),
-            precision: &workload.precision,
-            numerical_evidence,
-        },
-        budget,
-    )
-    .map_err(|error| match error {
+    let logical = Arc::new(logical);
+    let space = seismic_realization::form_plan_space(&logical, profile, backend.catalog())
+        .map_err(CompileFailure::CompilerBug)?;
+    let numerics = NumericalContext {
+        precision,
+        evidence: numerical_evidence,
+    };
+    let assignment = planning::plan(&space, &numerics, budget).map_err(|error| match error {
         planning::PlanningFailure::Infeasible => CompileFailure::PlanningInfeasible,
-        planning::PlanningFailure::CompilerBug(reason) => {
-            CompileFailure::CompilerBug(InvariantReport(reason))
-        }
+        planning::PlanningFailure::CompilerBug(defect) => CompileFailure::CompilerBug(defect),
         planning::PlanningFailure::Solver(reason) => {
             CompileFailure::SystemFailure(SystemReport(reason))
         }
     })?;
-    let physical = Arc::new(resolved);
-    let encoded = encode_plan(physical.clone(), backend).map_err(bug)?;
-    let native = backend
-        .assemble(encoded)
-        .map_err(|reason| CompileFailure::ToolchainFailure(ToolchainReport(reason)))?;
+    let physical = Arc::new(space.resolve(assignment));
+    let encoded = encode_plan(Arc::clone(&physical), backend);
+    let native = backend.assemble(encoded).map_err(|failure| match failure {
+        AssemblyFailure::CompilerInvariant(defect) => CompileFailure::CompilerBug(defect),
+        AssemblyFailure::Toolchain(report) => CompileFailure::ToolchainFailure(report),
+        AssemblyFailure::SystemPreparation(report) => CompileFailure::SystemFailure(report),
+    })?;
     Ok(Compiled {
-        logical: Arc::new(logical),
+        logical,
         physical,
         native,
     })
 }
 
+/// Encode every launch once, mirroring the sealed schedule exactly. Total.
 fn encode_plan<B: Backend>(
-    resolved: Arc<ResolvedPlan<B::Dialect>>,
+    physical: Arc<PhysicalPlan<B::Dialect>>,
     backend: &B,
-) -> Result<EncodedPlan<B::Dialect, B::EncodedLaunch>, String> {
-    let steps = encode_steps(&resolved.entry.schedule, backend)?;
-    Ok(EncodedPlan { resolved, steps })
+) -> EncodedPlan<B::Dialect, B::EncodedLaunch> {
+    let steps = encode_steps(&physical.schedule().steps, backend);
+    EncodedPlan::seal(physical, steps)
 }
 
 fn encode_steps<B: Backend>(
-    schedule: &seismic_realization::executable::ResolvedSchedule<B::Dialect>,
+    steps: &[PhysicalStep<B::Dialect>],
     backend: &B,
-) -> Result<Vec<EncodedStep<B::Dialect, B::EncodedLaunch>>, String> {
-    let mut steps = Vec::new();
-    for step in schedule.steps.iter() {
-        steps.push(match step {
-            ResolvedStep::Launch(launch) => EncodedStep::Launch {
-                encoded: backend.encode_launch(launch)?,
-                resolved: launch.clone(),
+) -> Vec<EncodedStep<B::EncodedLaunch>> {
+    steps
+        .iter()
+        .map(|step| match step {
+            PhysicalStep::Launch(launch) => EncodedStep::Launch {
+                launch: launch.id,
+                encoded: backend.encode(launch),
             },
-            ResolvedStep::Call(call) => {
-                let encoded = Box::new(EncodedPlanBody {
-                    steps: encode_steps(&call.body.schedule, backend)?,
-                });
-                EncodedStep::Call {
-                    call: call.clone(),
-                    encoded,
-                }
-            }
-            ResolvedStep::If(if_step) => EncodedStep::If {
-                resolved: if_step.clone(),
-                then_steps: encode_steps(&if_step.then_schedule, backend)?,
-                else_steps: encode_steps(&if_step.else_schedule, backend)?,
+            PhysicalStep::Guard(SealedGuard { id, .. }) => EncodedStep::Guard { guard: *id },
+            PhysicalStep::Call(call) => EncodedStep::Call {
+                call: call.id,
+                body: encode_steps(&call.body.steps, backend),
             },
-            ResolvedStep::Repeat(repeat) => EncodedStep::Repeat {
-                resolved: repeat.clone(),
-                body: encode_steps(&repeat.body, backend)?,
+            PhysicalStep::If(branch) => EncodedStep::If {
+                branch: branch.id,
+                then_steps: encode_steps(&branch.then_schedule.steps, backend),
+                else_steps: encode_steps(&branch.else_schedule.steps, backend),
             },
-        });
-    }
-    Ok(steps)
+            PhysicalStep::Repeat(repeat) => EncodedStep::Repeat {
+                repeat: repeat.id,
+                body: encode_steps(&repeat.body.steps, backend),
+            },
+            PhysicalStep::Fill(fill) => EncodedStep::Fill {
+                storage: fill.storage,
+            },
+        })
+        .collect()
 }

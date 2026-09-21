@@ -9,6 +9,15 @@
 //! loops inside each independent point. Zero work is a retained launch
 //! condition skipped by the runtime; zero native grids are never submitted.
 //! Authored tile authority is deleted; only this mapping exists.
+//!
+//! Package D1 builds `ClosedKernelInterface.iteration` from a closed block's
+//! `ParticipantMap` with exactly one call, `LinearIterationMap::from_axes`:
+//! the extents are `independent_axes[..].extent` in ordinal order, the
+//! mapping is `AxisMapping::Serialized` for `ParticipantPolicy::Serial` and
+//! `AxisMapping::GridStride { participants }` (the participant tuning
+//! parameter as a planning symbol) for `Linear`/`Cooperative`, and runtime
+//! extents are looked up through `OccurrenceFacts::runtime_extent`. A block
+//! without independent axes maps to the single-visit serial domain.
 
 use seismic_lang::{
     logical::{RuntimeExtent, RuntimeScalarExpr},
@@ -16,6 +25,27 @@ use seismic_lang::{
     types::{ExtentExpr, RuntimeExtentId},
 };
 use std::collections::BTreeMap;
+
+/// How the participants of one block cover its independent axes (the
+/// participant map's policy, reduced to the geometries this map knows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AxisMapping {
+    /// One participant traverses every coordinate in ascending order
+    /// (`ParticipantPolicy::Serial`, the universal witness and the
+    /// atomic-join serialization).
+    Serialized,
+    /// `participants` cover the domain by grid stride with a tail mask
+    /// (`ParticipantPolicy::Linear`/`Cooperative`/`GridCooperative`); the
+    /// count is a planning expression over tuning parameters.
+    GridStride { participants: Sym },
+    /// `participants` claim coordinates from the device pull counter
+    /// residence `counter` (`ParticipantPolicy::DynamicPull`); D1 creates
+    /// the counter residence and passes its id here.
+    DynamicPull {
+        participants: Sym,
+        counter: crate::ids::ResidenceId,
+    },
+}
 
 /// How participants traverse the linear domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,10 +56,16 @@ pub enum Traversal {
     /// A fixed participant count covers the domain by grid stride; the tail
     /// mask skips participants beyond the total.
     GridStride,
+    /// Participants claim one linear coordinate per pull from the 4-byte
+    /// device counter residence `counter` (zeroed by the schedule's
+    /// `PullCounterReset` step before the launch). Encoders emit exactly
+    /// `while ((lin = atomic_fetch_add(counter, 1)) < total) { body(lin) }`:
+    /// no tail mask, every coordinate claimed exactly once.
+    DynamicPull { counter: crate::ids::ResidenceId },
 }
 
 /// The overflow-checked row-major total of the retained extents.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinearTotal {
     /// Every axis extent is static: the exact total.
     Static(u64),
@@ -115,7 +151,7 @@ impl std::fmt::Display for LinearMapError {
 impl std::error::Error for LinearMapError {}
 
 /// The universal arbitrary-rank iteration map.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearIterationMap {
     /// Retained logical axis extents, outermost first (last axis fastest).
     pub extents: Vec<ExtentExpr>,
@@ -142,6 +178,52 @@ impl LinearIterationMap {
         extents: &[ExtentExpr],
         runtime_extents: &BTreeMap<RuntimeExtentId, RuntimeExtent>,
     ) -> Result<LinearIterationMap, LinearMapError> {
+        Self::build(extents, &|id| {
+            runtime_extents
+                .get(&id)
+                .map(|runtime| (runtime.capacity, runtime.expected))
+        })
+    }
+
+    /// The map D1 builds for one closed block from its `ParticipantMap`:
+    /// `extents` are the block's independent axes (outermost first, the
+    /// axis-binding order), `mapping` is the participant policy's geometry,
+    /// and `runtime_extent` is `OccurrenceFacts::runtime_extent` (total over
+    /// the sealed program). Empty `extents` give the single-visit serial
+    /// domain under either mapping.
+    pub fn from_axes<'r>(
+        extents: &[ExtentExpr],
+        mapping: AxisMapping,
+        runtime_extent: &dyn Fn(RuntimeExtentId) -> &'r RuntimeExtent,
+    ) -> Result<LinearIterationMap, LinearMapError> {
+        let map = Self::build(extents, &|id| {
+            let runtime = runtime_extent(id);
+            Some((runtime.capacity, runtime.expected))
+        })?;
+        Ok(match mapping {
+            AxisMapping::Serialized => Self::serialized(&map),
+            AxisMapping::GridStride { participants } => map.with_participants(participants),
+            AxisMapping::DynamicPull {
+                participants,
+                counter,
+            } => LinearIterationMap {
+                extents: map.extents,
+                total: map.total,
+                traversal: Traversal::DynamicPull { counter },
+                tail_mask: false,
+                serialized: false,
+                participants,
+            },
+        })
+    }
+
+    /// The shared construction: the overflow-checked row-major total over
+    /// `extents`, with runtime capacities and expectations supplied by
+    /// `runtime` (`None` for an extent the caller cannot resolve).
+    fn build(
+        extents: &[ExtentExpr],
+        runtime: &dyn Fn(RuntimeExtentId) -> Option<(u64, Option<u64>)>,
+    ) -> Result<LinearIterationMap, LinearMapError> {
         let mut product: Option<RuntimeScalarExpr> = None;
         let mut capacity = 1u64;
         let mut expected: Option<u64> = Some(1);
@@ -153,13 +235,12 @@ impl LinearIterationMap {
                     (RuntimeScalarExpr::Const(n as i64), n, Some(n), true)
                 }
                 ExtentExpr::Runtime(id) => {
-                    let runtime = runtime_extents
-                        .get(id)
-                        .ok_or(LinearMapError::UnresolvedSymbol)?;
+                    let (runtime_capacity, runtime_expected) =
+                        runtime(*id).ok_or(LinearMapError::UnresolvedSymbol)?;
                     (
                         RuntimeScalarExpr::Extent(*id),
-                        runtime.capacity,
-                        runtime.expected,
+                        runtime_capacity,
+                        runtime_expected,
                         false,
                     )
                 }
@@ -347,6 +428,61 @@ mod tests {
         sorted.sort();
         ascending.sort();
         assert_eq!(sorted, ascending);
+    }
+
+    #[test]
+    fn from_axes_follows_the_participant_policy() {
+        let id = RuntimeExtentId(3);
+        let runtime = RuntimeExtent {
+            id,
+            value: RuntimeScalarExpr::Extent(id),
+            capacity: 64,
+            expected: Some(16),
+        };
+        let lookup = |_: RuntimeExtentId| &runtime;
+        let extents = [ExtentExpr::Runtime(id), ExtentExpr::Static(4)];
+        let serial = LinearIterationMap::from_axes(&extents, AxisMapping::Serialized, &lookup)
+            .expect("the map builds");
+        assert!(serial.serialized);
+        assert_eq!(serial.traversal, Traversal::OnePass);
+        assert_eq!(serial.participants, Sym::constant(1));
+        assert_eq!(serial.total_symbol().as_constant(), Some(256));
+        let strided = LinearIterationMap::from_axes(
+            &extents,
+            AxisMapping::GridStride {
+                participants: Sym::param("participants.launch0"),
+            },
+            &lookup,
+        )
+        .expect("the map builds");
+        assert!(!strided.serialized);
+        assert_eq!(strided.traversal, Traversal::GridStride);
+        assert!(strided.tail_mask);
+        assert_eq!(strided.participants, Sym::param("participants.launch0"));
+        assert_eq!(strided.total, serial.total);
+        // No axes: the single-visit serial domain.
+        let point = LinearIterationMap::from_axes(&[], AxisMapping::Serialized, &lookup)
+            .expect("the map builds");
+        assert_eq!(point.total, LinearTotal::Static(1));
+        // Dynamic pull: no tail mask, one coordinate per claim, the counter
+        // residence retained for the encoder.
+        let counter = crate::ids::ResidenceId(7);
+        let pulled = LinearIterationMap::from_axes(
+            &extents,
+            AxisMapping::DynamicPull {
+                participants: Sym::param("participants.launch0"),
+                counter,
+            },
+            &lookup,
+        )
+        .expect("the map builds");
+        assert_eq!(pulled.traversal, Traversal::DynamicPull { counter });
+        assert!(!pulled.tail_mask);
+        assert!(!pulled.serialized);
+        assert_eq!(pulled.total, serial.total);
+        // Geometry prices at the bound, cost at the expected total.
+        assert_eq!(pulled.total_symbol().as_constant(), Some(256));
+        assert_eq!(pulled.cost_symbol().as_constant(), Some(64));
     }
 
     #[test]

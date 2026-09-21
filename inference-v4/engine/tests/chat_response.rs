@@ -1,4 +1,4 @@
-use seismic_engine::chat::{ChatPublication, Event, SseResponse, TerminalCause, Usage};
+use magnitude_engine::chat::{ChatPublication, Event, SseResponse, TerminalCause, Usage};
 use serde_json::{json, Value};
 fn response(usage: bool) -> SseResponse {
     SseResponse::new("chatcmpl-fixture".into(), "model".into(), 123, usage, 8192).unwrap()
@@ -121,7 +121,7 @@ fn limits_invalid_event_order_and_missing_usage_fail_closed() {
 
 #[test]
 fn nonstream_assembly_preserves_chunked_reasoning_tools_and_terminal_usage() {
-    use seismic_engine::chat::CompleteResponse;
+    use magnitude_engine::chat::CompleteResponse;
     let mut complete =
         CompleteResponse::new("chatcmpl-fixture".into(), "model".into(), 123, 8192).unwrap();
     let mut stream = response(true);
@@ -200,7 +200,7 @@ fn nonstream_assembly_preserves_chunked_reasoning_tools_and_terminal_usage() {
 
 #[test]
 fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
-    use seismic_engine::chat::CompleteResponse;
+    use magnitude_engine::chat::CompleteResponse;
     let create = |limit| {
         CompleteResponse::new("chatcmpl-fixture".into(), "model".into(), 123, limit).unwrap()
     };

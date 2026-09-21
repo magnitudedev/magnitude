@@ -1,18 +1,22 @@
 //! Import stored tensor bytes into retained native allocations. Conversion and
-//! numerical transforms execute only through checked Seismic programs.
+//! numerical transforms execute only through checked Seismic programs. Import
+//! kernels are compiled eagerly at first use inside model loading — before the
+//! importing weight becomes resident — and are reused for every later import
+//! of the same geometry; loading is the preparation phase of the model.
 use super::{
     descriptor::{Stored, StoredTensor, Transform, WeightDescriptor},
     Error,
 };
+use crate::{
+    execution,
+    preparation::{PreparationSession, Program, Settings},
+};
 use seismic_lang::{
+    logical::specialization::ShapeBinding,
     program::{compile, SourceFile},
-    sir::Program,
     types::{DType, Elem},
 };
-use seismic_runtime::{
-    plan::{CompiledPlan, PlanCompiler, Settings},
-    Buffer, Device,
-};
+use seismic_runtime::{invocation::Bindings, plan::CompiledPlan, Buffer, Device};
 use std::{
     collections::{BTreeMap, HashMap},
     rc::Rc,
@@ -97,6 +101,28 @@ impl Importer {
         stored: &Stored,
         target: DType,
     ) -> Result<ResidentWeight, Error> {
+        let started = std::time::Instant::now();
+        let elements = element_count(&descriptor.shape).unwrap_or(0) as u64;
+        let result = self.import_inner(descriptor, stored, target);
+        crate::telemetry::span_import(
+            &descriptor.name,
+            &match stored {
+                Stored::GgmlBlocks { encoding, .. } => format!("{encoding:?}").to_lowercase(),
+                Stored::Dense(_) => "dense".into(),
+                Stored::AffinePlanes { .. } => "affine".into(),
+            },
+            elements,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    fn import_inner(
+        &mut self,
+        descriptor: &WeightDescriptor,
+        stored: &Stored,
+        target: DType,
+    ) -> Result<ResidentWeight, Error> {
         if !target.is_float() {
             return Err(invalid("weight target must be a floating dtype"));
         }
@@ -149,40 +175,41 @@ impl Importer {
                     / 4
                     * 4;
                 bytes.resize(padded, 0);
-                let input = self.device.buffer_from(&bytes).map_err(invalid)?;
+                let input = self.device.buffer_from(&bytes).map_err(|e| invalid(e.to_string()))?;
                 let key = (*encoding, blocks);
                 if !self.block_kernels.contains_key(&key) {
-                    let plan =
-                        PlanCompiler::new(&self.device, &self.program, self.settings.clone())
-                            .compile_entry(
-                                entry,
-                                &HashMap::from([(
-                                    "B".into(),
-                                    i64::try_from(blocks)
-                                        .map_err(|_| invalid("block count exceeds index range"))?,
-                                )]),
-                                &HashMap::new(),
-                            )
-                            .map_err(invalid)?;
+                    let plan = self
+                        .compile_kernel(
+                            entry,
+                            BTreeMap::from([("B".into(), ShapeBinding::Exact(blocks as u64))]),
+                            BTreeMap::new(),
+                        )
+                        .map_err(|e| invalid(e.to_string()))?;
                     self.block_kernels.insert(key, plan);
                 }
-                let mut buffers = vec![input.clone(), input];
-                let mut planes = BTreeMap::new();
+                let mut targets = BTreeMap::new();
                 for plane in repr.planes() {
                     let size = plane
                         .bytes(count as u64)
                         .and_then(|n| usize::try_from(n).ok())
                         .ok_or_else(|| invalid("packed plane byte size overflow"))?;
-                    let buffer = self.device.buffer(size).map_err(invalid)?;
-                    buffers.push(buffer.clone());
-                    planes.insert(plane.name.into(), buffer);
+                    let buffer = self.device.buffer(size).map_err(|e| invalid(e.to_string()))?;
+                    targets.insert(plane.name.to_string(), buffer);
                 }
-                self.block_kernels
-                    .get_mut(&key)
-                    .unwrap()
-                    .execute_buffers(&buffers, &[])
-                    .map_err(invalid)?;
-                (Elem::Repr(representation.into()), planes)
+                let bindings = BlockImport {
+                    input: &input,
+                    planes: &targets,
+                };
+                let observed = execution::invoke_plan(
+                    self.block_kernels.get(&key).expect("kernel prepared"),
+                    &bindings,
+                )
+                .and_then(execution::run_observed)
+                .map_err(|e| invalid(e.to_string()))?;
+                for launch in &observed.1.launches {
+                    crate::telemetry::span_launch(launch);
+                }
+                (Elem::Repr(representation.into()), targets)
             }
             Stored::Dense(tensor) => {
                 validate_dense(tensor)?;
@@ -191,7 +218,7 @@ impl Importer {
                         "stored dense weight does not match its logical descriptor",
                     ));
                 }
-                let input = self.device.buffer_from(&tensor.read()?).map_err(invalid)?;
+                let input = self.device.buffer_from(&tensor.read()?).map_err(|e| invalid(e.to_string()))?;
                 let output = if tensor.dtype == target
                     && descriptor.transform == Transform::Identity
                 {
@@ -205,32 +232,35 @@ impl Importer {
                         } else {
                             "import_weight"
                         };
-                        let plan =
-                            PlanCompiler::new(&self.device, &self.program, self.settings.clone())
-                                .compile_entry(
-                                    entry,
-                                    &HashMap::from([(
-                                        "N".into(),
-                                        i64::try_from(count)
-                                            .map_err(|_| invalid("weight exceeds index domain"))?,
-                                    )]),
-                                    &HashMap::from([
-                                        ("T".into(), Elem::Dtype(tensor.dtype)),
-                                        ("U".into(), Elem::Dtype(target)),
-                                    ]),
-                                )
-                                .map_err(invalid)?;
+                        let plan = self
+                            .compile_kernel(
+                                entry,
+                                BTreeMap::from([("N".into(), ShapeBinding::Exact(count as u64))]),
+                                BTreeMap::from([
+                                    ("T".into(), Elem::Dtype(tensor.dtype)),
+                                    ("U".into(), Elem::Dtype(target)),
+                                ]),
+                            )
+                            .map_err(|e| invalid(e.to_string()))?;
                         self.kernels.insert(key, plan);
                     }
                     let bytes = count
                         .checked_mul(target.bytes() as usize)
                         .ok_or_else(|| invalid("resident weight size overflow"))?;
-                    let output = self.device.buffer(bytes).map_err(invalid)?;
-                    self.kernels
-                        .get_mut(&key)
-                        .unwrap()
-                        .execute_buffers(&[input, output.clone()], &[])
-                        .map_err(invalid)?;
+                    let output = self.device.buffer(bytes).map_err(|e| invalid(e.to_string()))?;
+                    let bindings = DenseImport {
+                        source: &input,
+                        result: &output,
+                    };
+                    let observed = execution::invoke_plan(
+                        self.kernels.get(&key).expect("kernel prepared"),
+                        &bindings,
+                    )
+                    .and_then(execution::run_observed)
+                    .map_err(|e| invalid(e.to_string()))?;
+                    for launch in &observed.1.launches {
+                        crate::telemetry::span_launch(launch);
+                    }
                     output
                 };
                 (Elem::Dtype(target), BTreeMap::from([("".into(), output)]))
@@ -274,7 +304,7 @@ impl Importer {
                 for (name, tensor) in [("words", codes), ("scale", scales), ("bias", biases)] {
                     planes.insert(
                         name.into(),
-                        self.device.buffer_from(&tensor.read()?).map_err(invalid)?,
+                        self.device.buffer_from(&tensor.read()?).map_err(|e| invalid(e.to_string()))?,
                     );
                 }
                 (Elem::Repr("q4g64".into()), planes)
@@ -285,6 +315,59 @@ impl Importer {
             element,
             planes,
         })
+    }
+    fn compile_kernel(
+        &self,
+        entry: &str,
+        shapes: BTreeMap<String, ShapeBinding>,
+        elements: BTreeMap<String, Elem>,
+    ) -> Result<CompiledPlan, crate::Error> {
+        PreparationSession::new(&self.device, &self.program, self.settings.clone()).compile_entry(
+            entry, shapes, elements,
+        )
+    }
+}
+struct BlockImport<'a> {
+    input: &'a Buffer,
+    planes: &'a BTreeMap<String, Buffer>,
+}
+impl Bindings for BlockImport<'_> {
+    fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
+        if !plane.is_empty() {
+            return None;
+        }
+        match root {
+            "data" | "halves" => Some(self.input),
+            other => self.planes.get(other),
+        }
+    }
+    fn scalar(&self, _name: &str) -> Option<f64> {
+        None
+    }
+    fn shape(&self, _name: &str) -> Option<u64> {
+        None
+    }
+}
+struct DenseImport<'a> {
+    source: &'a Buffer,
+    result: &'a Buffer,
+}
+impl Bindings for DenseImport<'_> {
+    fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
+        if !plane.is_empty() {
+            return None;
+        }
+        match root {
+            "source" => Some(self.source),
+            "result" => Some(self.result),
+            _ => None,
+        }
+    }
+    fn scalar(&self, _name: &str) -> Option<f64> {
+        None
+    }
+    fn shape(&self, _name: &str) -> Option<u64> {
+        None
     }
 }
 fn element_count(shape: &[u64]) -> Result<usize, Error> {

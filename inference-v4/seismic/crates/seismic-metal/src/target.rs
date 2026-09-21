@@ -1,28 +1,43 @@
 //! Effective Metal target profile: the exact intersection of observed
 //! device/compiler support with the source intrinsic registry and the
-//! signatures this backend can actually emit.
+//! signatures this backend can actually emit, plus the fully filled
+//! `TargetLimits` of the realization layer.
 //!
 //! A signature is registered only when typing, reference meaning, detection,
 //! legalization, resources, numerics, and emission are complete:
-//! `metal.subgroup.{lane_index,shuffle,simd_sum,simd_max,simd_min}` are
-//! registered. `metal.matrix` is observed by the device probes but is NOT
-//! registered until fragment emission is complete; authored uses of an
-//! unregistered signature are removed before planning with reasons, and the
-//! portable bodies remain.
+//! `metal.subgroup.{lane_index,shuffle,simd_sum,simd_max,simd_min}` and the
+//! logical `metal.matrix.{matmul,matmul_add}` entries whose dtypes survived
+//! the native compile probes are registered.
+//!
+//! Metal has no cooperative-grid facility: `cooperative_grid` is `None`, so
+//! a grid-cooperative proposal is never made on this target — never a
+//! fallback.
 
 use seismic_lang::{
     intrinsics::{self, CapabilitySignature, IntrinsicId},
     sir::IntrinsicUse,
     types::{DType, Elem, ValueType},
 };
+use seismic_realization::target::{CooperativeGrid, EffectiveTargetProfile, TargetLimits};
 use std::collections::BTreeSet;
 
-pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-metal-realizations-v3";
+pub const BACKEND_IMPLEMENTATION_REVISION: &str = "seismic-metal-realizations-v4";
 pub const COMPILER_PROBE_REVISION: &str = "seismic-metal-compile-probes-v1";
 /// Identity of this backend's cost model: the probe-calibrated estimate
 /// model, carried with its provenance. Uncalibrated costs affect ranking
 /// only, never legality.
-pub const COST_MODEL_IDENTITY: &str = crate::mapping::estimate::IDENTITY;
+pub const COST_MODEL_IDENTITY: &str = crate::estimate::IDENTITY;
+
+pub const TARGET: &str = "metal";
+/// Metal's per-axis workgroup-count limit (a driver constant below the
+/// documented 2^32-1 so geometry arithmetic stays comfortable in u32).
+pub const MAX_GROUPS: u64 = 65_535;
+/// The fixed lane topology of every subgroup collective this backend emits.
+pub const SUBGROUP: u32 = crate::intrinsics::SUBGROUP_WIDTH;
+/// The argument-table limit of one Metal compute pipeline (31 buffers).
+pub const MAX_KERNEL_BUFFERS: u32 = 31;
+/// Metal exposes no private-stack limit; a conservative compiler budget.
+pub const CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES: u64 = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MatrixCombination {
@@ -31,14 +46,44 @@ pub struct MatrixCombination {
     pub right: DType,
 }
 
+/// Hard limits the Metal target offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_threads_per_threadgroup: u64,
+    pub max_threadgroup_bytes: u64,
+    pub max_private_bytes: u64,
+    pub max_device_bytes: u64,
+}
+
+impl Limits {
+    #[cfg(target_os = "macos")]
+    pub fn from_device(device: &crate::runtime::DeviceInfo) -> Self {
+        Self {
+            max_threads_per_threadgroup: device.max_threads_per_threadgroup,
+            max_threadgroup_bytes: device.max_threadgroup_bytes,
+            max_private_bytes: device.profile.private_storage_budget_bytes.value,
+            max_device_bytes: device.max_buffer_bytes,
+        }
+    }
+
+    pub fn synthetic() -> Self {
+        Self {
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_bytes: 32 * 1024,
+            max_private_bytes: CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES,
+            max_device_bytes: u64::MAX,
+        }
+    }
+}
+
 /// The exact effective signature set of one observed device: registry
-/// signatures this backend registers (subgroup collective dtypes admitted by
-/// native compile probes). Matrix signatures stay absent until fragment
-/// emission is complete.
+/// signatures this backend registers (collective and matrix dtypes admitted
+/// by native compile probes).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TargetProfile {
     signatures: Vec<CapabilitySignature>,
     fingerprint: String,
+    limits: Limits,
 }
 
 impl TargetProfile {
@@ -55,7 +100,7 @@ impl TargetProfile {
     ) -> Self {
         // Registered signatures: the registry's metal.subgroup entries whose
         // dtype survived the native compile probe, and the logical
-        // metal.matrix matmul entries whose dtypes survived it.
+        // metal.matrix entries whose dtypes survived it.
         let mut signatures = Vec::new();
         for entry in intrinsics::capabilities() {
             if entry.id.capability.backend != "metal" {
@@ -114,7 +159,7 @@ impl TargetProfile {
             .collect::<Vec<_>>()
             .join("|");
         let fingerprint = format!(
-            "seismic-metal-target-v3;observation={observation};probe={COMPILER_PROBE_REVISION};\
+            "seismic-metal-target-v4;observation={observation};probe={COMPILER_PROBE_REVISION};\
              registry={};backend={BACKEND_IMPLEMENTATION_REVISION};cost={COST_MODEL_IDENTITY};\
              threads={max_threads};threadgroup={max_threadgroup_bytes};buffer={max_buffer_bytes};\
              private={private_budget_bytes};signatures={identity}",
@@ -123,24 +168,25 @@ impl TargetProfile {
         Self {
             signatures,
             fingerprint,
+            limits: Limits {
+                max_threads_per_threadgroup: max_threads,
+                max_threadgroup_bytes,
+                max_private_bytes: private_budget_bytes,
+                max_device_bytes: max_buffer_bytes,
+            },
         }
     }
 
-    pub fn synthetic(
-        max_threads: u64,
-        max_threadgroup_bytes: u64,
-        max_buffer_bytes: u64,
-        private_budget_bytes: u64,
-    ) -> Self {
+    pub fn synthetic(limits: Limits) -> Self {
         Self::from_evidence(
             "synthetic-metal-baseline",
             &[DType::F16, DType::F32],
             &[DType::F16, DType::F32],
             &[],
-            max_threads,
-            max_threadgroup_bytes,
-            max_buffer_bytes,
-            private_budget_bytes,
+            limits.max_threads_per_threadgroup,
+            limits.max_threadgroup_bytes,
+            limits.max_device_bytes,
+            limits.max_private_bytes,
         )
     }
 
@@ -148,13 +194,17 @@ impl TargetProfile {
         &self.fingerprint
     }
 
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
     /// The exact effective signature ids (planning capability coverage).
     pub fn effective_signatures(&self) -> BTreeSet<IntrinsicId> {
         self.signatures.iter().map(|s| s.id.clone()).collect()
     }
 
-    /// Exact intrinsic admission: the use must match a registered signature's
-    /// id and concrete argument/result types.
+    /// Exact intrinsic admission: the use must match a registered
+    /// signature's id and concrete argument/result types.
     pub fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         if intrinsic.id.capability.backend != "metal" {
             return Err(format!(
@@ -192,6 +242,39 @@ impl TargetProfile {
             ))
         }
     }
+
+    /// The fully filled effective target profile of the realization layer.
+    /// `cooperative_grid` is `None`: Metal has no grid-wide barrier
+    /// facility, so no grid-cooperative proposal is ever made.
+    pub fn effective_profile(&self) -> EffectiveTargetProfile {
+        let limits = self.limits;
+        if limits.max_threads_per_threadgroup < u64::from(SUBGROUP) {
+            panic!(
+                "compiler defect ({:?}): Metal needs at least {SUBGROUP} threads per \
+                 threadgroup; the target offers {}",
+                seismic_realization::failure::Package::B1Metal,
+                limits.max_threads_per_threadgroup
+            );
+        }
+        EffectiveTargetProfile {
+            backend: TARGET.into(),
+            capability_fingerprint: self.fingerprint.clone(),
+            toolchain_fingerprint: format!(
+                "{};{}",
+                BACKEND_IMPLEMENTATION_REVISION, COMPILER_PROBE_REVISION
+            ),
+            effective_signatures: self.effective_signatures(),
+            limits: TargetLimits {
+                max_participants: limits.max_threads_per_threadgroup,
+                max_workgroups_axis: [MAX_GROUPS; 3],
+                max_workgroup_bytes: limits.max_threadgroup_bytes,
+                max_explicit_private_bytes: limits.max_private_bytes,
+                max_direct_bindings: MAX_KERNEL_BUFFERS,
+                max_device_bytes: limits.max_device_bytes,
+                cooperative_grid: None::<CooperativeGrid>,
+            },
+        }
+    }
 }
 
 fn argument_type_name(ty: &ValueType) -> String {
@@ -200,7 +283,7 @@ fn argument_type_name(ty: &ValueType) -> String {
         ValueType::Index { .. } => "i32".into(),
         ValueType::Range { .. } => "range".into(),
         ValueType::Tensor(s) => match &s.elem {
-            seismic_lang::types::Elem::Dtype(d) => format!("tensor2<{}>", d.name()),
+            Elem::Dtype(d) => format!("tensor2<{}>", d.name()),
             _ => "tensor2<repr>".into(),
         },
         ValueType::Tuple(_) => "tuple".into(),
@@ -217,9 +300,9 @@ fn concrete_matches(pattern: &ValueType, concrete: &ValueType) -> bool {
         (ValueType::Tensor(pattern_tensor), ValueType::Tensor(concrete_tensor)) => {
             pattern_tensor.rank() == concrete_tensor.rank()
                 && pattern_tensor.elem == concrete_tensor.elem
-                || (matches!(pattern_tensor.elem, seismic_lang::types::Elem::Param(_))
+                || (matches!(pattern_tensor.elem, Elem::Param(_))
                     && pattern_tensor.rank() == concrete_tensor.rank()
-                    && matches!(concrete_tensor.elem, seismic_lang::types::Elem::Dtype(_)))
+                    && matches!(concrete_tensor.elem, Elem::Dtype(_)))
         }
         _ => false,
     }
@@ -360,8 +443,8 @@ mod tests {
                 elem,
             ))
         };
-        let f16 = seismic_lang::types::Elem::Dtype(DType::F16);
-        let f32 = seismic_lang::types::Elem::Dtype(DType::F32);
+        let f16 = Elem::Dtype(DType::F16);
+        let f32 = Elem::Dtype(DType::F32);
         assert!(profile
             .supports_intrinsic(&intrinsic(
                 "matrix",
@@ -376,12 +459,29 @@ mod tests {
                 "matrix",
                 "matmul",
                 vec![
-                    inner(seismic_lang::types::Elem::Dtype(DType::BF16)),
-                    columns(seismic_lang::types::Elem::Dtype(DType::BF16))
+                    inner(Elem::Dtype(DType::BF16)),
+                    columns(Elem::Dtype(DType::BF16))
                 ],
                 matrix(f32.clone()),
             ))
             .unwrap_err()
             .contains("does not support exact intrinsic signature"));
+    }
+
+    #[test]
+    fn the_effective_profile_fills_every_limit_and_has_no_cooperative_grid() {
+        let profile = TargetProfile::synthetic(Limits::synthetic());
+        let effective = profile.effective_profile();
+        assert_eq!(effective.backend, "metal");
+        assert_eq!(effective.limits.max_participants, 1024);
+        assert_eq!(effective.limits.max_workgroups_axis, [MAX_GROUPS; 3]);
+        assert_eq!(effective.limits.max_workgroup_bytes, 32 * 1024);
+        assert_eq!(
+            effective.limits.max_explicit_private_bytes,
+            CONSERVATIVE_PRIVATE_STORAGE_BUDGET_BYTES
+        );
+        assert_eq!(effective.limits.max_direct_bindings, MAX_KERNEL_BUFFERS);
+        assert_eq!(effective.limits.max_device_bytes, u64::MAX);
+        assert!(effective.limits.cooperative_grid.is_none());
     }
 }

@@ -1,14 +1,16 @@
-//! Retained execution resources for the dense feedforward suffix of a Qwen block.
-use crate::weights::residency::ResidentWeight;
-use seismic_lang::{
-    sir::Program,
-    types::{DType, Elem},
+//! Prepared dense feedforward suffix of a Qwen block. `DenseSuffix::compile`
+//! is model preparation: it compiles and seals the whole (exact) workload
+//! envelope before returning; execution invokes the sealed plan only.
+use crate::{
+    execution,
+    preparation::{
+        CompositionSpec, EnvelopeShape, PreparationSession, Program, Settings, WorkloadEnvelope,
+    },
+    weights::residency::ResidentWeight,
 };
-use seismic_runtime::{
-    plan::{Bindings, CompiledPlan, PlanCompiler, Settings},
-    Buffer, Device,
-};
-use std::collections::HashMap;
+use seismic_lang::types::{DType, Elem};
+use seismic_runtime::{Buffer, Device};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct DenseWeights {
@@ -23,11 +25,13 @@ pub struct DenseInvocation {
     pub activation: DType,
     pub epsilon: f32,
 }
-/// Owns native code and weights. The compiler/runtime own all result destinations.
+/// Owns the sealed prepared composition and weights. The compiler/runtime own
+/// all result destinations.
 pub struct DenseSuffix {
-    plan: CompiledPlan,
+    composition: crate::preparation::PreparedComposition,
     weights: DenseWeights,
     epsilon: f32,
+    rows: usize,
 }
 impl DenseSuffix {
     pub fn compile(
@@ -65,74 +69,63 @@ impl DenseSuffix {
                 "dense suffix weights disagree on hidden and intermediate dimensions".into(),
             );
         }
-        let shape = |n: u64| {
-            i64::try_from(n).map_err(|_| "dense suffix dimension exceeds index range".to_string())
-        };
-        let shapes = HashMap::from([
-            (
-                "M".into(),
-                i64::try_from(rows).map_err(|_| "row count exceeds index range")?,
-            ),
-            ("H".into(), shape(*hidden)?),
-            ("F".into(), shape(*intermediate)?),
-        ]);
-        let elements = HashMap::from([
-            ("A".into(), Elem::Dtype(activation)),
-            ("NW".into(), weights.norm.element().clone()),
-            ("GW".into(), weights.gate.element().clone()),
-            ("UW".into(), weights.up.element().clone()),
-            ("DW".into(), weights.down.element().clone()),
-        ]);
-        let plan = PlanCompiler::new(device, program, settings).compile_entry(
-            "qwen_dense_suffix",
-            &shapes,
-            &elements,
-        )?;
+        let mut session = PreparationSession::new(device, program, settings);
+        let envelope = WorkloadEnvelope::new(
+            BTreeMap::from([
+                ("M".into(), EnvelopeShape::Exact(rows as u64)),
+                ("H".into(), EnvelopeShape::Exact(*hidden)),
+                ("F".into(), EnvelopeShape::Exact(*intermediate)),
+            ]),
+            BTreeMap::from([
+                ("A".into(), Elem::Dtype(activation)),
+                ("NW".into(), weights.norm.element().clone()),
+                ("GW".into(), weights.gate.element().clone()),
+                ("UW".into(), weights.up.element().clone()),
+                ("DW".into(), weights.down.element().clone()),
+            ]),
+            Vec::new(),
+        )
+        .map_err(|e| e.to_string())?;
+        let composition = session.prepare(CompositionSpec {
+            entry: "qwen_dense_suffix".into(),
+            envelope,
+            weights: HashMap::from([
+                ("norm".into(), weights.norm.clone()),
+                ("gate_weight".into(), weights.gate.clone()),
+                ("up_weight".into(), weights.up.clone()),
+                ("down_weight".into(), weights.down.clone()),
+            ]),
+            external: HashSet::from(["residual".into()]),
+            intermediates: HashSet::new(),
+            scalars: HashMap::new(),
+        })
+        .map_err(|e| e.to_string())?;
         Ok(Self {
-            plan,
+            composition,
             weights,
             epsilon,
+            rows,
         })
     }
-    pub fn execute(&mut self, residual: &Buffer) -> Result<Buffer, String> {
-        let results = self.plan.execute_with_results(&Invocation {
-            weights: &self.weights,
-            epsilon: self.epsilon,
-            residual,
-        })?;
+    pub fn kernel_count(&self) -> usize {
+        self.composition.kernel_count()
+    }
+    pub fn execute(&self, residual: &Buffer) -> Result<Buffer, String> {
+        let results = execution::execute(
+            &self.composition,
+            &BTreeMap::from([("M".into(), self.rows as u64)]),
+            &HashMap::from([("residual".into(), residual.clone())]),
+            &HashMap::from([("eps".into(), f64::from(self.epsilon))]),
+        )
+        .map_err(|e| e.to_string())?;
         results
+            .planes
             .into_iter()
             .find(|result| result.path == [6] && result.plane.is_empty())
             .map(|result| result.buffer)
             .ok_or_else(|| "dense suffix returned no F32 residual result".into())
     }
-}
-struct Invocation<'a> {
-    weights: &'a DenseWeights,
-    epsilon: f32,
-    residual: &'a Buffer,
-}
-impl Bindings for Invocation<'_> {
-    fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
-        let weight = match root {
-            "norm" => Some(&self.weights.norm),
-            "gate_weight" => Some(&self.weights.gate),
-            "up_weight" => Some(&self.weights.up),
-            "down_weight" => Some(&self.weights.down),
-            _ => None,
-        };
-        if let Some(weight) = weight {
-            return weight.plane(plane);
-        }
-        if !plane.is_empty() {
-            return None;
-        }
-        match root {
-            "residual" => Some(self.residual),
-            _ => None,
-        }
-    }
-    fn scalar(&self, name: &str) -> Option<f64> {
-        (name == "eps").then_some(f64::from(self.epsilon))
+    pub fn weights(&self) -> &DenseWeights {
+        &self.weights
     }
 }

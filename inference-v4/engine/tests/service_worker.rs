@@ -1,4 +1,4 @@
-use seismic_engine::{
+use magnitude_engine::{
     generation::{Generation, Options, Sampling},
     inputs::{InputLayout, TokenId},
     models::sequence::Advance,
@@ -39,7 +39,7 @@ impl Drop for HostInput {
         *self.dropped_on.lock().unwrap() = Some(std::thread::current().id());
     }
 }
-impl seismic_engine::service::owner::InputExecutor<HostInput> for Model {
+impl magnitude_engine::service::owner::InputExecutor<HostInput> for Model {
     fn input_layout(&self, source: &HostInput, tokens: &[TokenId]) -> Result<InputLayout, String> {
         if source.tokens != tokens {
             return Err("source prompt differs".into());
@@ -156,7 +156,7 @@ impl Executor for Model {
     fn checkpoint(
         &self,
         request: RequestId,
-    ) -> Result<seismic_engine::service::owner::NumericalCheckpoint<Snapshot>, String> {
+    ) -> Result<magnitude_engine::service::owner::NumericalCheckpoint<Snapshot>, String> {
         let position = *self
             .shared
             .positions
@@ -165,7 +165,7 @@ impl Executor for Model {
             .get(&request)
             .ok_or("unknown numerical request")?;
         self.shared.snapshots.fetch_add(1, Ordering::Relaxed);
-        Ok(seismic_engine::service::owner::NumericalCheckpoint {
+        Ok(magnitude_engine::service::owner::NumericalCheckpoint {
             position,
             state: Snapshot {
                 position,
@@ -548,14 +548,14 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 fn runtime_service() -> (
-    seismic_engine::service::runtime::Service<Model>,
-    seismic_engine::chat::PreparedInput,
+    magnitude_engine::service::runtime::Service<Model>,
+    magnitude_engine::chat::PreparedInput,
     Options,
     Receiver<Arc<Gate>>,
     Arc<Shared>,
-    Arc<seismic_engine::inputs::ByteBpeTokenizer>,
+    Arc<magnitude_engine::inputs::ByteBpeTokenizer>,
 ) {
-    use seismic_engine::{
+    use magnitude_engine::{
         generation::constraints::{CacheLimits, Vocabulary},
         inputs::{BpeConfig, ByteBpeTokenizer, PieceKind},
         service::runtime::{Runtime, Service},
@@ -588,7 +588,7 @@ fn runtime_service() -> (
         })
         .unwrap(),
     );
-    let input = seismic_engine::chat::PreparedInput {
+    let input = magnitude_engine::chat::PreparedInput {
         artifact_identity: tokenizer.artifact_identity().into(),
         tokenizer_identity: tokenizer.identity().into(),
         tokens: vec![TokenId(1), TokenId(2)],
@@ -641,7 +641,7 @@ fn runtime_service() -> (
 }
 #[test]
 fn prepared_admission_and_notified_publication_preserve_terminal_output() {
-    use seismic_engine::generation::FinishReason;
+    use magnitude_engine::generation::FinishReason;
     let (mut service, input, mut options, submissions, shared, _) = runtime_service();
     options.output_capacity = 3;
     options.max_tokens = 3;
@@ -713,7 +713,7 @@ fn service_shutdown_wakes_a_waiting_publication_receiver() {
     let closer = std::thread::spawn(move || service.close());
     assert_eq!(
         block_on(request.receive(1)).unwrap().finish,
-        Some(seismic_engine::generation::FinishReason::Cancelled)
+        Some(magnitude_engine::generation::FinishReason::Cancelled)
     );
     gate.complete();
     closer.join().unwrap();
@@ -723,7 +723,7 @@ fn service_shutdown_wakes_a_waiting_publication_receiver() {
 
 #[test]
 fn fatal_owner_failure_retains_accepted_output_after_thread_teardown() {
-    use seismic_engine::generation::FinishReason;
+    use magnitude_engine::generation::FinishReason;
     let (mut service, input, options, submissions, shared, _) = runtime_service();
     let client = service.client();
     let mut first = block_on(client.admit(input.clone(), options.clone())).unwrap();
@@ -748,7 +748,7 @@ fn fatal_owner_failure_retains_accepted_output_after_thread_teardown() {
 
 #[test]
 fn native_chat_session_composes_scheduled_tokens_and_releases_on_string_stop() {
-    use seismic_engine::chat::{
+    use magnitude_engine::chat::{
         ChatRequest, Event, PreparedChat, Session, TemplateBundle, TemplateSelection,
         TemplateVariant, TerminalCause,
     };
@@ -801,7 +801,7 @@ fn native_chat_session_composes_scheduled_tokens_and_releases_on_string_stop() {
 
 #[test]
 fn failed_chat_session_drains_multiple_publications_before_reporting_error() {
-    use seismic_engine::chat::{
+    use magnitude_engine::chat::{
         ChatRequest, Event, PreparedChat, Session, TemplateBundle, TemplateSelection,
         TemplateVariant, TerminalCause,
     };
@@ -865,7 +865,7 @@ fn failed_chat_session_drains_multiple_publications_before_reporting_error() {
 
 #[test]
 fn stop_acknowledges_stable_usage_while_native_work_is_still_outstanding() {
-    use seismic_engine::generation::{FinishReason, Usage};
+    use magnitude_engine::generation::{FinishReason, Usage};
     let (mut service, input, mut options, submissions, shared, _) = runtime_service();
     options.output_capacity = 2;
     options.max_tokens = 3;
@@ -893,7 +893,7 @@ fn stop_acknowledges_stable_usage_while_native_work_is_still_outstanding() {
 
 #[test]
 fn session_sse_uses_acknowledged_counts_including_suppressed_stop_tokens() {
-    use seismic_engine::chat::{
+    use magnitude_engine::chat::{
         ChatRequest, PreparedChat, Session, SseResponse, TemplateBundle, TemplateSelection,
         TemplateVariant,
     };
@@ -970,7 +970,7 @@ fn session_sse_uses_acknowledged_counts_including_suppressed_stop_tokens() {
 
 #[test]
 fn nonstream_session_collects_the_same_parser_and_generation_usage() {
-    use seismic_engine::chat::{
+    use magnitude_engine::chat::{
         ChatRequest, CompleteResponse, PreparedChat, Session, TemplateBundle, TemplateSelection,
         TemplateVariant,
     };
@@ -1029,10 +1029,10 @@ fn nonstream_session_collects_the_same_parser_and_generation_usage() {
 }
 
 fn http_server(
-    service: seismic_engine::service::runtime::Service<Model>,
-    tokenizer: Arc<seismic_engine::inputs::ByteBpeTokenizer>,
-) -> seismic_engine::serving::Server<Model> {
-    use seismic_engine::{
+    service: magnitude_engine::service::runtime::Service<Model>,
+    tokenizer: Arc<magnitude_engine::inputs::ByteBpeTokenizer>,
+) -> magnitude_engine::serving::Server<Model> {
+    use magnitude_engine::{
         chat::{TemplateBundle, TemplateVariant},
         serving::{Config, Server},
     };
@@ -1334,7 +1334,7 @@ fn service_checkpoints_are_bounded_releasable_and_invalid_after_shutdown() {
 
 #[test]
 fn typed_source_admission_preserves_layout_and_releases_only_on_owner_after_completion() {
-    use seismic_engine::inputs::{BoundaryRule, InputSpan};
+    use magnitude_engine::inputs::{BoundaryRule, InputSpan};
     let (mut service, input, options, submissions, shared, _) = runtime_service();
     let caller = std::thread::current().id();
     let dropped_on = Arc::new(Mutex::new(None));

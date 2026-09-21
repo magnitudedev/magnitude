@@ -1,250 +1,300 @@
-//! Reusable compiled entries with retained, checked runtime bindings.
+//! Explicit compiled-plan preparation (package R1).
 //!
-//! One entry compiles once per `(entry, shapes, elements, precision, evidence
-//! catalog)`. Buffer contents and scalar values are never part of that
-//! identity, so changing control inputs or decode positions reuse the
-//! compiled kernel.
-use crate::{Buffer, Device, ExecutionObservation, Kernel};
-use seismic_compiler::planning::{Budget, NumericalEvidence};
-use seismic_lang::types::Elem;
-use seismic_lang::{precision::PrecisionPolicy, sir::Program};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
-pub trait Bindings {
-    fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer>;
-    fn scalar(&self, name: &str) -> Option<f64>;
-}
-#[derive(Clone, Debug)]
-pub struct StepObservation {
-    pub entry: String,
-    pub execution: ExecutionObservation,
-    /// Native per-dispatch stage intervals of this step, in launch order.
-    pub dispatches: Vec<crate::DispatchProfile>,
-}
-pub struct CompiledPlan {
-    enclosing: Rc<Enclosing>,
-}
-impl CompiledPlan {
-    pub fn shares_compilation(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.enclosing, &other.enclosing)
-    }
-    pub fn step_count(&self) -> usize {
-        1
-    }
-    /// Kernels planned and natively compiled for this plan.
-    pub fn kernel_count(&self) -> usize {
-        usize::from(self.enclosing.kernel.borrow().is_some())
-    }
-    pub fn execute(&mut self, bindings: &dyn Bindings) -> Result<(), String> {
-        self.execute_with_results(bindings).map(|_| ())
-    }
-    /// Execute with source bindings and return compiler-allocated owned result planes.
-    pub fn execute_with_results(
-        &mut self,
-        bindings: &dyn Bindings,
-    ) -> Result<InvocationResults, String> {
-        let mut submission = self.prepare(bindings)?;
-        submission.execute_sequential()?;
-        Ok(submission.results_for(0)?.clone())
-    }
-    pub fn execute_observed(
-        &mut self,
-        bindings: &dyn Bindings,
-    ) -> Result<Vec<StepObservation>, String> {
-        self.prepare(bindings)?.execute_steps_observed()
-    }
-    pub fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
-        self.enclosing.prepare(bindings)
-    }
-    /// The resolved, natively compiled kernel.
-    pub fn kernel(&self) -> Result<Rc<RefCell<Kernel>>, String> {
-        self.enclosing.kernel()
-    }
-    /// Bind the entry's ABI positionally, in the order of `Kernel::buffers`/`scalars`.
-    pub fn execute_buffers(&mut self, buffers: &[Buffer], scalars: &[f64]) -> Result<(), String> {
-        self.execute_buffers_with_results(buffers, scalars)
-            .map(|_| ())
-    }
-    /// Bind only source parameters. Owned result storage is allocated by the runtime and
-    /// returned after synchronous completion.
-    pub fn execute_buffers_with_results(
-        &mut self,
-        buffers: &[Buffer],
-        scalars: &[f64],
-    ) -> Result<InvocationResults, String> {
-        let (submission, results) = self.prepare_positional(buffers, scalars)?;
-        let mut submission = submission;
-        submission.execute_sequential()?;
-        let _ = results;
-        Ok(submission.results_for(0)?.clone())
-    }
-    /// Bind positionally, allocating owned result storage up front.
-    fn prepare_positional(
-        &self,
-        buffers: &[Buffer],
-        scalars: &[f64],
-    ) -> Result<(Submission, InvocationResults), String> {
-        let kernel = self.enclosing.kernel()?;
-        let mut supplied = buffers.iter();
-        let mut bound = Vec::new();
-        let mut results = Vec::new();
-        {
-            let abi = kernel
-                .try_borrow()
-                .map_err(|_| "shared kernel is already executing")?;
-            for spec in abi.buffers() {
-                let buffer = match &spec.role {
-                    crate::BindingRole::Parameter => supplied
-                        .next()
-                        .ok_or("the invocation supplies every ABI parameter")?
-                        .view(0..spec.bytes)?,
-                    crate::BindingRole::Result { path } => {
-                        let buffer = self
-                            .enclosing
-                            .device
-                            .buffer(spec.bytes)
-                            .map_err(|error| error.to_string())?;
-                        results.push(ResultPlane {
-                            path: path.clone(),
-                            plane: spec.plane.clone(),
-                            buffer: buffer.clone(),
-                        });
-                        buffer
-                    }
-                };
-                bound.push(buffer);
-            }
-        }
-        Ok((
-            Submission {
-                invocations: vec![BoundInvocation {
-                    entry: self.enclosing.entry.clone(),
-                    kernel,
-                    buffers: bound,
-                    scalars: scalars.to_vec(),
-                    results,
-                }],
-            },
-            Vec::new(),
-        ))
-    }
+//! One entry compiles once per `(entry, specialization domain, precision,
+//! evidence catalog)`. `compile_entry` runs the whole semantic -> logical ->
+//! plan-space -> physical-plan -> native-artifact pipeline eagerly and stores
+//! a non-optional sealed artifact; there is no first-invocation compile path
+//! and no optional kernel cache. Compilation identity is the specialization
+//! domain's identity bytes, so repeated requests for the same domain share
+//! one sealed artifact — dispatch among valid compiled artifacts, never
+//! recompilation.
+
+use crate::invocation::{self, Bindings, PreparedInvocation};
+use crate::{Device, DeviceHandle};
+use seismic_compiler::pipeline::{self, CompileFailure, SystemReport};
+use seismic_compiler::planning::Budget;
+use seismic_lang::abi::RangeEndpoint;
+use seismic_lang::logical::LogicalProgram;
+use seismic_lang::logical::specialization::SpecializationDomain;
+use seismic_lang::precision::PrecisionPolicy;
+use seismic_lang::sir::Program;
+use seismic_lang::types::{DType, ValuePath};
+use seismic_realization::failure::ExecutionFailure;
+use seismic_realization::ids::NativeFactIx;
+use seismic_realization::invocation::InvocationContract;
+use seismic_realization::numerics::NumericalEvidence;
+use seismic_realization::physical::PhysicalPlan;
+use seismic_cpu::CpuDialect;
+use std::rc::Rc;
+use std::sync::Arc;
+
+/// One compiler-owned scalar result. Range endpoints share a semantic path
+/// and remain explicitly distinguished by `endpoint`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalarResult {
+    pub path: ValuePath,
+    pub endpoint: Option<RangeEndpoint>,
+    pub dtype: DType,
+    pub value: f64,
 }
 
-struct BoundInvocation {
-    entry: String,
-    kernel: Rc<RefCell<Kernel>>,
-    buffers: Vec<Buffer>,
-    scalars: Vec<f64>,
-    results: InvocationResults,
-}
+/// One owned result plane of an invocation, in ABI result order: the buffer
+/// preparation allocated and the kernels wrote through the executor's
+/// binding path.
 #[derive(Clone)]
 pub struct ResultPlane {
     pub path: Vec<u32>,
     pub plane: String,
-    pub buffer: Buffer,
+    pub buffer: crate::Buffer,
 }
-pub type InvocationResults = Vec<ResultPlane>;
-/// Bound code and allocation pins. Preparation does not execute numerical work.
-/// Appending preserves source order and extends resource lifetime through completion.
-#[derive(Default)]
-pub struct Submission {
-    invocations: Vec<BoundInvocation>,
+
+/// The outputs of one executed invocation.
+#[derive(Clone, Default)]
+pub struct InvocationResults {
+    pub planes: Vec<ResultPlane>,
+    pub scalars: Vec<ScalarResult>,
 }
-impl Submission {
-    pub fn append(&mut self, mut other: Self) {
-        self.invocations.append(&mut other.invocations);
+
+/// The sealed compiled artifact. Fields are private and construction happens
+/// at exactly one point — `PlanCompiler::compile_entry` wrapping the compiler
+/// pipeline's `Compiled{logical, physical, native}` result — so the physical
+/// plan and native artifact of every arm are the one-to-one pairing the
+/// pipeline produced, and no caller can assemble mismatched halves. The CUDA
+/// native artifact is thread-affine, so no arm requires `Send` or `Sync`.
+pub struct CompiledArtifact {
+    backend: BackendArtifact,
+}
+
+/// The per-backend payload of a sealed artifact: the device the pipeline ran
+/// on (where execution owns state: the CPU worker pool, the CUDA driver
+/// context) and the paired plan/native halves. Private to this module.
+enum BackendArtifact {
+    Cpu {
+        device: Rc<crate::CpuDevice>,
+        physical: Arc<PhysicalPlan<CpuDialect>>,
+        native: seismic_cpu::NativeArtifact,
+    },
+    #[cfg(target_os = "macos")]
+    Metal {
+        physical: Arc<PhysicalPlan<seismic_metal::intrinsics::MetalDialect>>,
+        native: Arc<seismic_metal::native::NativeArtifact>,
+    },
+    Cuda {
+        device: Rc<seismic_cuda::runtime::Device>,
+        physical: Arc<PhysicalPlan<seismic_cuda::Dialect>>,
+        native: Arc<seismic_cuda::native::NativeArtifact>,
+    },
+}
+
+/// Everything one backend's executor needs, retrieved as one paired bundle
+/// from the sealed artifact: the device handle, the physical plan, and the
+/// native artifact of the same compilation. Total — one arm per backend, no
+/// mismatchable halves.
+pub(crate) enum SealedBackend<'a> {
+    Cpu {
+        device: &'a Rc<crate::CpuDevice>,
+        physical: &'a Arc<PhysicalPlan<CpuDialect>>,
+        native: &'a seismic_cpu::NativeArtifact,
+    },
+    #[cfg(target_os = "macos")]
+    Metal {
+        native: &'a Arc<seismic_metal::native::NativeArtifact>,
+    },
+    Cuda {
+        device: &'a Rc<seismic_cuda::runtime::Device>,
+        physical: &'a Arc<PhysicalPlan<seismic_cuda::Dialect>>,
+        native: &'a Arc<seismic_cuda::native::NativeArtifact>,
+    },
+}
+
+impl CompiledArtifact {
+    /// The only constructor, private to this module and called only where
+    /// `compile_entry` wraps the pipeline result: the pairing of device,
+    /// physical plan, and native artifact is established here and nowhere
+    /// else.
+    fn seal(backend: BackendArtifact) -> CompiledArtifact {
+        CompiledArtifact { backend }
     }
-    pub fn len(&self) -> usize {
-        self.invocations.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.invocations.is_empty()
-    }
-    pub fn results_for(&self, invocation: usize) -> Result<&InvocationResults, String> {
-        self.invocations
-            .get(invocation)
-            .map(|bound| &bound.results)
-            .ok_or_else(|| format!("submission has no invocation {invocation}"))
-    }
-    pub fn execute_sequential(&mut self) -> Result<(), String> {
-        for invocation in &self.invocations {
-            invocation
-                .kernel
-                .try_borrow_mut()
-                .map_err(|_| "shared kernel is already executing")?
-                .execute(&invocation.buffers, &invocation.scalars)
-                .map_err(|e| format!("{}: {e}", invocation.entry))?;
+
+    /// The invocation contract of the sealed physical plan.
+    pub fn contract(&self) -> &InvocationContract {
+        match &self.backend {
+            BackendArtifact::Cpu { physical, .. } => physical.contract(),
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { physical, .. } => physical.contract(),
+            BackendArtifact::Cuda { physical, .. } => physical.contract(),
         }
-        Ok(())
     }
-    pub fn execute_steps_observed(&mut self) -> Result<Vec<StepObservation>, String> {
-        self.invocations
-            .iter()
-            .map(|invocation| {
-                let execution = invocation
-                    .kernel
-                    .try_borrow_mut()
-                    .map_err(|_| "shared kernel is already executing")?
-                    .execute_observed(&invocation.buffers, &invocation.scalars)
-                    .map_err(|e| format!("{}: {e}", invocation.entry))?;
-                Ok(StepObservation {
-                    entry: invocation.entry.clone(),
-                    execution,
-                    dispatches: Vec::new(),
-                })
-            })
-            .collect()
+
+    /// Launches in the sealed plan; constant for a sealed artifact.
+    pub fn kernel_count(&self) -> usize {
+        match &self.backend {
+            BackendArtifact::Cpu { physical, .. } => physical.launches().len(),
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { physical, .. } => physical.launches().len(),
+            BackendArtifact::Cuda { physical, .. } => physical.launches().len(),
+        }
     }
-    /// Invocations run in source order, each through its own synchronous
-    /// submission. No cross-invocation native batching exists; the whole
-    /// batch validates before any of it executes, and no asynchronous work
-    /// escapes this method, including on failure.
-    pub fn execute_batched(&mut self) -> Result<ExecutionObservation, String> {
-        let start = std::time::Instant::now();
-        let kernels = self
-            .invocations
-            .iter()
-            .map(|i| {
-                i.kernel
-                    .try_borrow()
-                    .map_err(|_| "shared kernel is already executing".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (kernel, bound) in kernels.iter().zip(&self.invocations) {
-            kernel
-                .validate_invocation(&bound.buffers, &bound.scalars)
-                .map_err(|e| format!("{}: {e}", bound.entry))?;
+
+    /// One reflected native fact, folded and validated at assembly; dense and
+    /// in-bounds by construction. This is the `native` closure source of
+    /// `InvocationContract::evaluate`.
+    pub fn native_fact(&self, index: NativeFactIx) -> u64 {
+        match &self.backend {
+            BackendArtifact::Cpu { native, .. } => native.native_fact(index),
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { native, .. } => native.native_fact(index),
+            BackendArtifact::Cuda { native, .. } => native.native_fact(index),
         }
-        let (mut seconds, mut scope) = (0.0, None);
-        for bound in &self.invocations {
-            let observed = bound
-                .kernel
-                .try_borrow_mut()
-                .map_err(|_| "shared kernel is already executing")?
-                .execute_observed(&bound.buffers, &bound.scalars)
-                .map_err(|e| format!("{}: {e}", bound.entry))?;
-            if let Some(device_seconds) = observed.device_seconds {
-                seconds += device_seconds;
-                scope = observed.device_scope;
-            }
+    }
+
+    /// The sealed physical plan when this artifact compiled for the CPU.
+    pub fn physical_cpu(&self) -> Option<&Arc<PhysicalPlan<CpuDialect>>> {
+        match &self.backend {
+            BackendArtifact::Cpu { physical, .. } => Some(physical),
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { .. } => None,
+            BackendArtifact::Cuda { .. } => None,
         }
-        Ok(ExecutionObservation {
-            host_seconds: start.elapsed().as_secs_f64(),
-            device_seconds: (seconds > 0.0).then_some(seconds),
-            device_scope: scope,
-        })
+    }
+
+    /// The sealed physical plan when this artifact compiled for Metal.
+    #[cfg(target_os = "macos")]
+    pub fn physical_metal(
+        &self,
+    ) -> Option<&Arc<PhysicalPlan<seismic_metal::intrinsics::MetalDialect>>> {
+        match &self.backend {
+            BackendArtifact::Metal { physical, .. } => Some(physical),
+            BackendArtifact::Cpu { .. } | BackendArtifact::Cuda { .. } => None,
+        }
+    }
+
+    /// The sealed physical plan when this artifact compiled for CUDA.
+    pub fn physical_cuda(&self) -> Option<&Arc<PhysicalPlan<seismic_cuda::Dialect>>> {
+        match &self.backend {
+            BackendArtifact::Cuda { physical, .. } => Some(physical),
+            BackendArtifact::Cpu { .. } => None,
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { .. } => None,
+        }
+    }
+
+    /// The paired executor bundle of this artifact's backend. The only
+    /// execution-side retrieval; every arm carries its own device, physical
+    /// plan, and native artifact together.
+    pub(crate) fn backend(&self) -> SealedBackend<'_> {
+        match &self.backend {
+            BackendArtifact::Cpu {
+                device,
+                physical,
+                native,
+            } => SealedBackend::Cpu {
+                device,
+                physical,
+                native,
+            },
+            #[cfg(target_os = "macos")]
+            BackendArtifact::Metal { native, .. } => SealedBackend::Metal { native },
+            BackendArtifact::Cuda {
+                device,
+                physical,
+                native,
+            } => SealedBackend::Cuda {
+                device,
+                physical,
+                native,
+            },
+        }
     }
 }
 
-/// Explicit search budget. Implementation choices are compiler-owned; the backend and its
-/// capacities come from the device the plan compiles for.
+/// One eagerly compiled entry: the sealed artifact, the interface parameter
+/// names its ABI buffer ordinals resolve to, and the device it compiled for.
+/// Clones share one sealed compilation.
+#[derive(Clone)]
+pub struct CompiledPlan {
+    artifact: Arc<CompiledArtifact>,
+    /// Interface parameter names in ABI parameter-ordinal order (the root
+    /// names `Bindings::buffer` receives).
+    parameters: Rc<Vec<String>>,
+    device: Device,
+}
+
+impl CompiledPlan {
+    /// Validate one invocation against the sealed contract and allocate its
+    /// result planes. The only public constructor of `PreparedInvocation`.
+    pub fn prepare(
+        &self,
+        bindings: &dyn Bindings,
+    ) -> Result<PreparedInvocation, ExecutionFailure> {
+        invocation::prepare(
+            &self.device,
+            Arc::clone(&self.artifact),
+            &self.parameters,
+            bindings,
+        )
+    }
+
+    pub fn contract(&self) -> &InvocationContract {
+        self.artifact.contract()
+    }
+
+    /// Launches in the sealed plan; constant for this compiled plan.
+    pub fn kernel_count(&self) -> usize {
+        self.artifact.kernel_count()
+    }
+
+    /// The solver's estimated cost of the selected assignment.
+    pub fn estimated_cost(&self) -> u64 {
+        match self.artifact.backend() {
+            SealedBackend::Cpu { physical, .. } => physical.estimated_cost(),
+            #[cfg(target_os = "macos")]
+            SealedBackend::Metal { native, .. } => native.estimated_cost(),
+            SealedBackend::Cuda { physical, .. } => physical.estimated_cost(),
+        }
+    }
+
+    /// Whether the solver proved the selected assignment optimal within its
+    /// budget.
+    pub fn optimal(&self) -> bool {
+        match self.artifact.backend() {
+            SealedBackend::Cpu { physical, .. } => physical.optimal(),
+            #[cfg(target_os = "macos")]
+            SealedBackend::Metal { native, .. } => native.optimal(),
+            SealedBackend::Cuda { physical, .. } => physical.optimal(),
+        }
+    }
+
+    pub fn shares_compilation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.artifact, &other.artifact)
+    }
+
+    pub fn artifact(&self) -> &CompiledArtifact {
+        &self.artifact
+    }
+
+    pub fn parameters(&self) -> &[String] {
+        &self.parameters
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// Explicit search budget. Implementation choices are compiler-owned; the
+/// backend and its capacities come from the device the plan compiles for.
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub budget: Budget,
-    /// Observable numerical contract; part of every compiled entry's workload identity.
+    /// Observable numerical contract; part of every compiled entry's workload
+    /// identity.
     pub precision: PrecisionPolicy,
-    /// Whole-program numerical evidence keyed to complete physical assignments.
+    /// Whole-program numerical evidence keyed to complete physical
+    /// assignments.
     pub numerical_evidence: Vec<NumericalEvidence>,
 }
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -254,92 +304,24 @@ impl Default for Settings {
         }
     }
 }
-struct Enclosing {
-    device: Device,
-    program: Rc<Program>,
-    entry: String,
-    workload: crate::Workload,
-    settings: Settings,
-    kernel: RefCell<Option<Rc<RefCell<Kernel>>>>,
-}
-impl Enclosing {
-    /// Run the sole logical -> physical -> native pipeline. A failure retains
-    /// nothing and no alternate compilation path substitutes.
-    fn kernel(&self) -> Result<Rc<RefCell<Kernel>>, String> {
-        if let Some(kernel) = self.kernel.borrow().as_ref() {
-            return Ok(kernel.clone());
-        }
-        let kernel = Rc::new(RefCell::new(
-            self.device
-                .compile_with_evidence(
-                    &self.program,
-                    &self.entry,
-                    &self.workload,
-                    self.settings.budget,
-                    &self.settings.numerical_evidence,
-                )
-                .map_err(|e| format!("{}: {e}", self.entry))?,
-        ));
-        *self.kernel.borrow_mut() = Some(kernel.clone());
-        Ok(kernel)
-    }
-    fn prepare(&self, bindings: &dyn Bindings) -> Result<Submission, String> {
-        let kernel = self.kernel()?;
-        let mut buffers = Vec::new();
-        let mut results = Vec::new();
-        let scalars = {
-            let abi = kernel
-                .try_borrow()
-                .map_err(|_| "shared kernel is already executing")?;
-            for spec in abi.buffers() {
-                let buffer = match &spec.role {
-                    crate::BindingRole::Parameter => bindings
-                        .buffer(&spec.parameter, &spec.plane)
-                        .ok_or_else(|| format!("unbound tensor {}.{}", spec.parameter, spec.plane))?
-                        .view(0..spec.bytes)?,
-                    crate::BindingRole::Result { path } => {
-                        let buffer = self
-                            .device
-                            .buffer(spec.bytes)
-                            .map_err(|error| error.to_string())?;
-                        results.push(ResultPlane {
-                            path: path.clone(),
-                            plane: spec.plane.clone(),
-                            buffer: buffer.clone(),
-                        });
-                        buffer
-                    }
-                };
-                buffers.push(buffer);
-            }
-            abi.scalars()
-                .iter()
-                .map(|s| {
-                    bindings
-                        .scalar(&s.name)
-                        .ok_or_else(|| format!("unbound scalar {}", s.name))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        };
-        Ok(Submission {
-            invocations: vec![BoundInvocation {
-                entry: self.entry.clone(),
-                kernel,
-                buffers,
-                scalars,
-                results,
-            }],
-        })
-    }
+
+/// One eagerly compiled entry of one compiler.
+struct CompiledEntry {
+    identity: Vec<u8>,
+    artifact: Arc<CompiledArtifact>,
+    parameters: Rc<Vec<String>>,
 }
 
-/// Compiles linked entries through the unified pipeline only.
+/// Compiles linked entries through the unified pipeline only. One compiler
+/// owns an immutable settings snapshot, so cached entries cannot observe a
+/// catalog change.
 pub struct PlanCompiler<'a> {
     device: &'a Device,
     program: Rc<Program>,
     settings: Settings,
-    entries: Vec<Rc<Enclosing>>,
+    entries: Vec<CompiledEntry>,
 }
+
 impl<'a> PlanCompiler<'a> {
     pub fn new(device: &'a Device, program: &'a Program, settings: Settings) -> Self {
         Self {
@@ -349,62 +331,140 @@ impl<'a> PlanCompiler<'a> {
             entries: Vec::new(),
         }
     }
+
     pub fn settings(&self) -> Settings {
         self.settings.clone()
     }
-    /// Compilation identity is `(entry, shapes, elements, precision, evidence catalog)`;
-    /// one compiler owns an immutable settings snapshot, so cached entries cannot observe a
-    /// catalog change.
-    pub fn compile_entry(
-        &mut self,
-        entry: &str,
-        shapes: &HashMap<String, i64>,
-        elements: &HashMap<String, Elem>,
-    ) -> Result<CompiledPlan, String> {
-        let workload = crate::Workload {
-            shapes: shapes.iter().map(|(n, v)| (n.clone(), *v)).collect(),
-            elems: elements
-                .iter()
-                .map(|(n, e)| (n.clone(), e.clone()))
-                .collect(),
-            precision: self.settings.precision.clone(),
-            extents: Default::default(),
-        };
-        if let Some(enclosing) = self
-            .entries
-            .iter()
-            .find(|e| e.entry == entry && e.workload == workload)
-        {
-            return Ok(CompiledPlan {
-                enclosing: enclosing.clone(),
-            });
-        }
-        self.program.resolve_family(entry)?;
-        let enclosing = Rc::new(Enclosing {
-            device: self.device.clone(),
-            program: self.program.clone(),
-            entry: entry.into(),
-            workload,
-            settings: self.settings.clone(),
-            kernel: RefCell::new(None),
-        });
-        // Specialization, physical planning, and native compilation are part of plan construction.
-        // Binding and execution must not be the first point at which an invalid artifact is
-        // discovered.
-        enclosing.kernel()?;
-        self.entries.push(enclosing.clone());
-        Ok(CompiledPlan { enclosing })
-    }
+
     pub fn program(&self) -> &Program {
         &self.program
     }
+
     pub fn device(&self) -> &Device {
         self.device
     }
+
+    /// Entries compiled so far (each eagerly sealed at its first request).
     pub fn kernel_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.kernel.borrow().is_some())
-            .count()
+        self.entries.len()
     }
+
+    /// Compile one entry under one complete specialization domain, eagerly:
+    /// specialization, physical planning, and native compilation complete
+    /// before the plan is returned. A repeated domain returns the same sealed
+    /// artifact.
+    pub fn compile_entry(
+        &mut self,
+        domain: &SpecializationDomain,
+    ) -> Result<CompiledPlan, CompileFailure> {
+        let identity = domain.identity_bytes();
+        if let Some(entry) = self.entries.iter().find(|entry| entry.identity == identity) {
+            return Ok(CompiledPlan {
+                artifact: Arc::clone(&entry.artifact),
+                parameters: Rc::clone(&entry.parameters),
+                device: self.device.clone(),
+            });
+        }
+        let (artifact, parameters) =
+            compile_artifact(self.device, &self.program, domain, &self.settings)?;
+        let plan = CompiledPlan {
+            artifact: Arc::clone(&artifact),
+            parameters: Rc::clone(&parameters),
+            device: self.device.clone(),
+        };
+        self.entries.push(CompiledEntry {
+            identity,
+            artifact,
+            parameters,
+        });
+        Ok(plan)
+    }
+}
+
+/// Run the sole logical -> plan-space -> physical-plan -> native pipeline for
+/// this device's backend and seal the result. The one construction point of
+/// `CompiledArtifact`: each arm is assembled from the single `Compiled`
+/// result of the pipeline run on this device, so the plan/native pairing (and
+/// the device that will execute it) is established here and nowhere else. No
+/// selected or partially lowered artifact is exposed at the runtime boundary.
+fn compile_artifact(
+    device: &Device,
+    program: &Program,
+    domain: &SpecializationDomain,
+    settings: &Settings,
+) -> Result<(Arc<CompiledArtifact>, Rc<Vec<String>>), CompileFailure> {
+    let system =
+        |reason: String| CompileFailure::SystemFailure(SystemReport(reason));
+    match device.backend_handle() {
+        crate::DeviceHandle::Cpu(cpu) => {
+            let workers = cpu.workers.borrow().count() as u64;
+            let backend = seismic_cpu::Cpu::host(workers).map_err(system)?;
+            let compiled = pipeline::compile(
+                program,
+                domain,
+                &settings.precision,
+                &backend,
+                &settings.numerical_evidence,
+                settings.budget,
+            )?;
+            let parameters = parameter_names(&compiled.logical);
+            let artifact = CompiledArtifact::seal(BackendArtifact::Cpu {
+                device: Rc::clone(cpu),
+                physical: compiled.physical,
+                native: compiled.native,
+            });
+            Ok((Arc::new(artifact), parameters))
+        }
+        #[cfg(target_os = "macos")]
+        crate::DeviceHandle::Metal(metal) => {
+            let backend = seismic_metal::catalog::MetalCompiler::from_device(metal);
+            let compiled = pipeline::compile(
+                program,
+                domain,
+                &settings.precision,
+                &backend,
+                &settings.numerical_evidence,
+                settings.budget,
+            )?;
+            let parameters = parameter_names(&compiled.logical);
+            let artifact = CompiledArtifact::seal(BackendArtifact::Metal {
+                physical: compiled.physical,
+                native: Arc::new(compiled.native),
+            });
+            Ok((Arc::new(artifact), parameters))
+        }
+        crate::DeviceHandle::Cuda(cuda) => {
+            let backend = seismic_cuda::CudaCompiler::new(cuda)
+                .map_err(|error| system(error.to_string()))?;
+            let compiled = pipeline::compile(
+                program,
+                domain,
+                &settings.precision,
+                &backend,
+                &settings.numerical_evidence,
+                settings.budget,
+            )?;
+            let parameters = parameter_names(&compiled.logical);
+            let artifact = CompiledArtifact::seal(BackendArtifact::Cuda {
+                device: Rc::clone(cuda),
+                physical: compiled.physical,
+                native: Arc::new(compiled.native),
+            });
+            Ok((Arc::new(artifact), parameters))
+        }
+    }
+}
+
+/// Interface parameter names in interface order; ABI parameter ordinals are
+/// interface param ordinals.
+fn parameter_names(logical: &LogicalProgram) -> Rc<Vec<String>> {
+    Rc::new(
+        logical
+            .choice(logical.entry_choice)
+            .interface
+            .params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect(),
+    )
 }

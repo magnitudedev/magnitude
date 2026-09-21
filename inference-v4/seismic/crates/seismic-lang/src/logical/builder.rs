@@ -1,10 +1,13 @@
-//! The type-state graph builder: validity by construction.
+//! The private graph builder: validity by construction.
 //!
-//! All graph, node, value, state, loop and call assembly inside this crate
-//! goes through `GraphBuilder`; raw constructors do not exist. Constructors
-//! create outputs and dependencies immediately, and every locally decidable
-//! invariant is checked at that moment:
+//! All graph, node, value, state, loop and call assembly goes through
+//! `GraphBuilder`; raw constructors do not exist outside this module.
+//! Constructors create outputs and dependencies immediately, and every locally
+//! decidable invariant is checked at that moment:
 //!
+//! - every value has one exhaustive kind; a view value names a view of this
+//!   graph whose shape is the value's type; void creates no value;
+//! - every state token names one storage of this graph from allocation;
 //! - every input is a value in scope, so its origin dominates the use;
 //! - every consumed state is the current token of its storage;
 //! - moved storage has no later use;
@@ -14,29 +17,33 @@
 //! - branch regions share parameter schemas and produce one result per join;
 //! - carried slots have identical initial/body-parameter/body-result types;
 //! - independent loops admit only `DisjointWrite`/`Atomic` joins and no
-//!   carries.
+//!   carries;
+//! - a call instantiates its callee contract with current caller states, and
+//!   every exclusively borrowed leaf has exactly one final state.
 //!
-//! `seal` is available only when every region is closed and the root region
-//! produced its results; `finish` is available only on the sealed builder.
+//! The consuming `seal` is the only constructor of a `TaskGraph`. It admits a
+//! graph only when every region is closed, every value and state token of the
+//! graph has exactly one origin, and the boundary names root-scope values and
+//! states with the structure its ownership modes require.
+//!
+//! Every `Err` of this module is a construction defect of the normalizer
+//! (the `CompilerDefect` class); it never classifies source semantics.
 
 use super::{
-    Access, BoundaryInput, BoundaryInputKind, BoundaryResult, BoundaryResultKind, CallNode,
-    CarriedSlot, ChoiceId, Coverage, GraphRegion, GraphValue, GraphValueId, IdVec, IfCapture,
-    IfNode, Initialization, JoinSlot, LogicalNode, LogicalNodeKind, LogicalRange, LogicalStorage,
-    LogicalStorageId, LogicalView, LogicalViewId, LoopKind, LoopNode, NodeId, PrimitiveApplication,
-    PrimitiveOp, ReductionNode, ReductionOrder, RegionInput, RegionParameter, RegionResult,
-    SafetyObligation, StateJoin, StateToken, StateTokenId, StorageOrigin, TaskGraph, ViewTransform,
+    Access, BoundaryLeaf, CallBoundary, CallInput, CallNode, CarriedSlot, ChoiceId, Coverage,
+    GraphRegion, GraphValue, GraphValueId, GraphValueKind, IdVec, IfCapture, IfNode,
+    Initialization, JoinSlot, LogicalBoundary, LogicalBoundaryInput, LogicalBoundaryResult,
+    LogicalNode, LogicalNodeKind, LogicalRange, LogicalStorage, LogicalStorageId,
+    LogicalStorageOwner, LogicalView, LogicalViewId, LoopKind, LoopNode, NodeId,
+    PrimitiveApplication, PrimitiveOp, ReductionNode, ReductionOrder, RegionInput,
+    RegionParameter, RegionResult, SafetyObligation, StateJoin, StateToken, StateTokenId,
+    TaskGraph, TensorSource, ViewBase, ViewTransform,
 };
 use crate::intrinsics::ReduceOp;
+use crate::sir::ParamOwnership;
 use crate::span::Span;
 use crate::types::{DType, TensorType, ValueType};
 use std::collections::{BTreeMap, BTreeSet};
-use std::marker::PhantomData;
-
-/// Construction phase marker: regions may still be open.
-pub struct Building;
-/// Construction phase marker: everything is consumed; only `finish` remains.
-pub struct Complete;
 
 /// Global id allocator shared by every graph of one logical program. Ids are
 /// unique across the whole program, so retained runtime expressions and
@@ -52,25 +59,25 @@ pub struct Ids {
 }
 
 impl Ids {
-    pub fn value(&mut self) -> GraphValueId {
+    fn value(&mut self) -> GraphValueId {
         let id = GraphValueId(self.next_value);
         self.next_value += 1;
         id
     }
 
-    pub fn state(&mut self) -> StateTokenId {
+    fn state(&mut self) -> StateTokenId {
         let id = StateTokenId(self.next_state);
         self.next_state += 1;
         id
     }
 
-    pub fn storage(&mut self) -> LogicalStorageId {
+    fn storage(&mut self) -> LogicalStorageId {
         let id = LogicalStorageId(self.next_storage);
         self.next_storage += 1;
         id
     }
 
-    pub fn view(&mut self) -> LogicalViewId {
+    fn view(&mut self) -> LogicalViewId {
         let id = LogicalViewId(self.next_view);
         self.next_view += 1;
         id
@@ -83,8 +90,9 @@ pub struct PrimitiveSpec {
     pub inputs: Vec<GraphValueId>,
     /// Storages read through operand views; resolved to their current tokens.
     pub reads: Vec<LogicalStorageId>,
-    /// An optional state transition: consumes the current token of `storage`
-    /// and produces the next, merging `coverage` structurally.
+    /// The state transition of a writing primitive: consumes the current
+    /// token of `storage` and produces the next, merging `coverage`
+    /// structurally. A pure primitive has none.
     pub write: Option<WriteEffect>,
     pub outputs: Vec<Output>,
     pub safety: Vec<SafetyObligation>,
@@ -104,9 +112,10 @@ pub struct WriteEffect {
     pub initializing: bool,
 }
 
-/// One output of a primitive: a plain typed value or a declared view.
+/// One output of a primitive: a produced value (a non-tensor value, or a
+/// computed tensor without storage) or a declared view of storage.
 pub enum Output {
-    Value(ValueType),
+    Computed(ValueType),
     View(LogicalViewId),
 }
 
@@ -136,62 +145,81 @@ pub struct LoopOutcome {
     pub exit_values: Vec<GraphValueId>,
 }
 
+/// The exhaustive kind of a produced (non-view) value of type `ty`: tensors
+/// are computed, `Void` creates no value, tuples are nonempty.
+pub fn computed_kind(ty: ValueType) -> Result<GraphValueKind, String> {
+    Ok(match ty {
+        ValueType::Void => return Err("void creates no graph value".into()),
+        ValueType::Scalar(dtype) => GraphValueKind::Scalar(dtype),
+        ValueType::Index { bound } => GraphValueKind::Index { bound },
+        ValueType::Range { bound } => GraphValueKind::Range { bound },
+        ValueType::Tensor(ty) => GraphValueKind::Tensor {
+            ty,
+            source: TensorSource::Computed,
+        },
+        ValueType::Tuple(items) => GraphValueKind::Tuple(items),
+        ValueType::CapabilityValue(ty) => GraphValueKind::Capability(ty),
+    })
+}
+
 struct RegionFrame {
     parameters: Vec<RegionParameter>,
     nodes: Vec<LogicalNode>,
     /// Values visible in this region (ancestor scopes included).
-    scope: BTreeMap<GraphValueId, ValueType>,
+    scope: BTreeSet<GraphValueId>,
     /// State tokens visible in this region (ancestor scopes included).
-    state_scope: BTreeMap<StateTokenId, LogicalStorageId>,
+    state_scope: BTreeSet<StateTokenId>,
 }
 
 struct GraphCore {
     choice: ChoiceId,
     alternative: u32,
     ids: Ids,
-    parameters: Vec<RegionParameter>,
-    storages: BTreeMap<u32, LogicalStorage>,
-    views: BTreeMap<u32, LogicalView>,
-    /// Type of every value allocated in this graph.
-    value_types: BTreeMap<GraphValueId, ValueType>,
-    /// The view backing each tensor value.
-    value_views: BTreeMap<GraphValueId, LogicalViewId>,
+    /// Every value allocated in this graph, with its exhaustive kind.
+    values: BTreeMap<GraphValueId, GraphValue>,
+    storages: BTreeMap<LogicalStorageId, LogicalStorage>,
+    views: BTreeMap<LogicalViewId, LogicalView>,
+    /// The storage every allocated state token versions.
+    states: BTreeMap<StateTokenId, LogicalStorageId>,
     /// Current state token per storage.
     current: BTreeMap<LogicalStorageId, StateTokenId>,
     /// Storages moved into a call (no later use).
-    moved: BTreeMap<LogicalStorageId, ()>,
+    moved: BTreeSet<LogicalStorageId>,
     frames: Vec<RegionFrame>,
-    root: Option<GraphRegion>,
-    results: Vec<RegionResult>,
+    /// The closed root region with the value/state scope it ended with;
+    /// present once the root frame closed.
+    root: Option<ClosedRoot>,
+}
+
+struct ClosedRoot {
+    region: GraphRegion,
+    scope: BTreeSet<GraphValueId>,
+    state_scope: BTreeSet<StateTokenId>,
 }
 
 /// Builder of one task graph (one alternative of one occurrence).
-pub struct GraphBuilder<P = Building> {
+pub struct GraphBuilder {
     core: GraphCore,
-    phase: PhantomData<P>,
 }
 
-impl GraphBuilder<Building> {
+impl GraphBuilder {
     /// Begin the graph of `alternative` of `choice`, continuing id allocation
     /// from `ids`.
-    pub fn new(choice: ChoiceId, alternative: u32, ids: Ids) -> GraphBuilder<Building> {
+    pub fn new(choice: ChoiceId, alternative: u32, ids: Ids) -> GraphBuilder {
         GraphBuilder {
             core: GraphCore {
                 choice,
                 alternative,
                 ids,
-                parameters: Vec::new(),
+                values: BTreeMap::new(),
                 storages: BTreeMap::new(),
                 views: BTreeMap::new(),
-                value_types: BTreeMap::new(),
-                value_views: BTreeMap::new(),
+                states: BTreeMap::new(),
                 current: BTreeMap::new(),
-                moved: BTreeMap::new(),
+                moved: BTreeSet::new(),
                 frames: Vec::new(),
                 root: None,
-                results: Vec::new(),
             },
-            phase: PhantomData,
         }
     }
 
@@ -200,9 +228,7 @@ impl GraphBuilder<Building> {
         if !self.core.frames.is_empty() || self.core.root.is_some() {
             return Err("the root region is already open".into());
         }
-        self.core.parameters = parameters.clone();
-        self.open_frame(parameters);
-        Ok(())
+        self.open_frame(parameters)
     }
 
     /// Open a nested region. `State` parameters become the current tokens of
@@ -214,28 +240,38 @@ impl GraphBuilder<Building> {
         if self.core.frames.is_empty() {
             return Err("a nested region must be opened inside the root region".into());
         }
-        self.open_frame(parameters);
-        Ok(())
+        self.open_frame(parameters)
     }
 
-    fn open_frame(&mut self, parameters: Vec<RegionParameter>) {
-        let mut scope = BTreeMap::new();
-        let mut state_scope = BTreeMap::new();
+    fn open_frame(&mut self, parameters: Vec<RegionParameter>) -> Result<(), String> {
+        let mut scope = BTreeSet::new();
+        let mut state_scope = BTreeSet::new();
         for frame in &self.core.frames {
-            for (id, ty) in &frame.scope {
-                scope.insert(*id, ty.clone());
-            }
-            for (token, storage) in &frame.state_scope {
-                state_scope.insert(*token, *storage);
-            }
+            scope.extend(frame.scope.iter().copied());
+            state_scope.extend(frame.state_scope.iter().copied());
         }
         for parameter in &parameters {
             match parameter {
                 RegionParameter::Value { id, ty } => {
-                    scope.insert(*id, ty.clone());
+                    let value = self.value(*id)?;
+                    if value.ty() != *ty {
+                        return Err(format!(
+                            "region parameter {} is declared as {ty} but the value is {}",
+                            id.0,
+                            value.ty()
+                        ));
+                    }
+                    scope.insert(*id);
                 }
                 RegionParameter::State { id, storage } => {
-                    state_scope.insert(*id, *storage);
+                    let bound = self.storage_of_token(*id)?;
+                    if bound != *storage {
+                        return Err(format!(
+                            "region state parameter {} versions storage {} but is declared on storage {}",
+                            id.0, bound.0, storage.0
+                        ));
+                    }
+                    state_scope.insert(*id);
                     self.core.current.insert(*storage, *id);
                 }
             }
@@ -246,28 +282,50 @@ impl GraphBuilder<Building> {
             scope,
             state_scope,
         });
+        Ok(())
     }
 
     /// Close the current region, validating that every result is in scope and
-    /// fully initialized where it is a storage leaf.
+    /// fully initialized where it is a view of storage. The root region takes
+    /// no results: the graph boundary is stated at `seal`.
     pub fn end_region(&mut self, results: Vec<RegionResult>) -> Result<GraphRegion, String> {
         let Some(frame) = self.core.frames.pop() else {
             return Err("no region is open".into());
         };
+        if self.core.frames.is_empty() && !results.is_empty() {
+            return Err("the root region has no positional results; state the boundary at seal".into());
+        }
         for result in &results {
             match result {
-                RegionResult::Value { id, .. } => {
-                    if !frame.scope.contains_key(id) && !self.in_ancestor_scope(*id) {
+                RegionResult::Value { id, ty } => {
+                    if !frame.scope.contains(id) {
                         return Err(format!("region result value {} is not in scope", id.0));
                     }
-                    if let Some(view) = self.core.value_views.get(id) {
-                        let storage = self.core.views[&view.0].storage;
-                        self.check_result_storage(storage)?;
+                    let value = self.value(*id)?;
+                    if value.ty() != *ty {
+                        return Err(format!(
+                            "region result value {} is declared as {ty} but the value is {}",
+                            id.0,
+                            value.ty()
+                        ));
+                    }
+                    if let Some(TensorSource::View(view)) = value.tensor_source() {
+                        // A view result names storage only when its base is
+                        // storage; a view of a computed value is a value.
+                        if let ViewBase::Storage(storage) = self.view(view).base {
+                            self.check_result_storage(storage)?;
+                        }
                     }
                 }
-                RegionResult::State { id, .. } => {
-                    if !frame.state_scope.contains_key(id) && !self.in_ancestor_states(*id) {
+                RegionResult::State { id, storage, .. } => {
+                    if !frame.state_scope.contains(id) {
                         return Err(format!("region result state {} is not in scope", id.0));
+                    }
+                    if self.storage_of_token(*id)? != *storage {
+                        return Err(format!(
+                            "region result state {} does not version storage {}",
+                            id.0, storage.0
+                        ));
                     }
                 }
             }
@@ -278,34 +336,23 @@ impl GraphBuilder<Building> {
             results,
         };
         if self.core.frames.is_empty() {
-            self.core.results = region.results.clone();
-            self.core.root = Some(region.clone());
+            self.core.root = Some(ClosedRoot {
+                region: region.clone(),
+                scope: frame.scope,
+                state_scope: frame.state_scope,
+            });
         }
         Ok(region)
     }
 
-    fn in_ancestor_scope(&self, id: GraphValueId) -> bool {
-        self.core
-            .frames
-            .iter()
-            .any(|frame| frame.scope.contains_key(&id))
-    }
-
-    fn in_ancestor_states(&self, id: StateTokenId) -> bool {
-        self.core
-            .frames
-            .iter()
-            .any(|frame| frame.state_scope.contains_key(&id))
-    }
-
     fn check_result_storage(&self, storage: LogicalStorageId) -> Result<(), String> {
-        if self.core.moved.contains_key(&storage) {
+        if self.core.moved.contains(&storage) {
             return Err(format!(
                 "a result leaf uses storage {} after it was moved",
                 storage.0
             ));
         }
-        let initialization = &self.core.storages[&storage.0].initialization;
+        let initialization = &self.storage(storage).initialization;
         if !matches!(initialization, Initialization::FullyInitialized) {
             return Err(format!(
                 "a result leaf on storage {} is not fully initialized",
@@ -319,76 +366,160 @@ impl GraphBuilder<Building> {
     pub fn declare_storage(
         &mut self,
         shape: TensorType,
-        origin: StorageOrigin,
+        owner: LogicalStorageOwner,
         initialization: Initialization,
     ) -> LogicalStorageId {
         let id = self.core.ids.storage();
         self.core.storages.insert(
-            id.0,
+            id,
             LogicalStorage {
                 shape,
-                origin,
+                owner,
                 initialization,
             },
         );
         id
     }
 
-    /// Declare one semantic view of a storage.
+    /// Declare one semantic view over one base: a storage of this graph, or a
+    /// computed tensor value of this graph (a view of a computed value is
+    /// read-only and flattens view chains to the bottom computed value).
     pub fn declare_view(
         &mut self,
-        storage: LogicalStorageId,
+        base: ViewBase,
         shape: TensorType,
         access: Access,
         transform: ViewTransform,
-    ) -> LogicalViewId {
+    ) -> Result<LogicalViewId, String> {
+        match base {
+            ViewBase::Storage(storage) => {
+                if !self.core.storages.contains_key(&storage) {
+                    return Err(format!(
+                        "a view names storage {} which this graph does not declare",
+                        storage.0
+                    ));
+                }
+            }
+            ViewBase::Value(value) => {
+                if access != Access::Shared {
+                    return Err("a view of a computed value is read-only".into());
+                }
+                match self.value(value)?.kind() {
+                    GraphValueKind::Tensor {
+                        source: TensorSource::Computed,
+                        ..
+                    } => {}
+                    GraphValueKind::Tensor {
+                        source: TensorSource::View(_),
+                        ..
+                    } => {
+                        return Err(format!(
+                            "a view's value base {} is itself a view; views flatten to the bottom computed value",
+                            value.0
+                        ))
+                    }
+                    kind => {
+                        return Err(format!(
+                            "a view's value base {} is not a computed tensor ({:?})",
+                            value.0, kind
+                        ))
+                    }
+                }
+            }
+        }
         let id = self.core.ids.view();
         self.core.views.insert(
-            id.0,
+            id,
             LogicalView {
-                storage,
+                base,
                 shape,
                 access,
                 transform,
             },
         );
-        id
+        Ok(id)
     }
 
-    /// Allocate a graph value; `view` backs tensor values.
-    pub fn fresh_value(
-        &mut self,
-        ty: ValueType,
-        view: Option<LogicalViewId>,
-    ) -> Result<GraphValueId, String> {
-        if let Some(view) = view {
-            let shape = self.core.views[&view.0].shape.clone();
-            if ValueType::Tensor(shape) != ty {
-                return Err(format!("a declared view cannot back a value of type {ty}"));
+    /// The storage a view of storage names; a named error for a view whose
+    /// base is a computed value.
+    pub fn storage_base(&self, view: LogicalViewId) -> Result<LogicalStorageId, String> {
+        match self.view(view).base {
+            ViewBase::Storage(storage) => Ok(storage),
+            ViewBase::Value(_) => Err(format!(
+                "view {} reads a computed value, not storage",
+                view.0
+            )),
+        }
+    }
+
+    /// The kind of a value backed by `view`: a tensor of the view's shape.
+    pub fn view_kind(&self, view: LogicalViewId) -> Result<GraphValueKind, String> {
+        let declared = self
+            .core
+            .views
+            .get(&view)
+            .ok_or_else(|| format!("view {} is not declared by this graph", view.0))?;
+        Ok(GraphValueKind::Tensor {
+            ty: declared.shape.clone(),
+            source: TensorSource::View(view),
+        })
+    }
+
+    /// Allocate a graph value of one exhaustive kind. A view-backed tensor
+    /// must name a view of this graph with exactly the value's shape. The
+    /// value enters the open region's scope (or becomes a region parameter
+    /// of the region opened next).
+    pub fn fresh_value(&mut self, kind: GraphValueKind) -> Result<GraphValueId, String> {
+        match &kind {
+            GraphValueKind::Tensor {
+                ty,
+                source: TensorSource::View(view),
+            } => {
+                let declared = self
+                    .core
+                    .views
+                    .get(view)
+                    .ok_or_else(|| format!("view {} is not declared by this graph", view.0))?;
+                if declared.shape != *ty {
+                    return Err(format!(
+                        "view {} has shape {} but backs a value of type {}",
+                        view.0,
+                        ValueType::Tensor(declared.shape.clone()),
+                        ValueType::Tensor(ty.clone())
+                    ));
+                }
             }
+            GraphValueKind::Void => return Err("void creates no graph value".into()),
+            GraphValueKind::Tensor {
+                source: TensorSource::Computed,
+                ..
+            }
+            | GraphValueKind::Tuple(_)
+            | GraphValueKind::Scalar(_)
+            | GraphValueKind::Index { .. }
+            | GraphValueKind::Range { .. }
+            | GraphValueKind::Capability(_) => {}
         }
         let id = self.core.ids.value();
-        self.core.value_types.insert(id, ty);
-        if let Some(view) = view {
-            self.core.value_views.insert(id, view);
-        }
+        self.core.values.insert(id, GraphValue::new(id, kind));
         if let Some(frame) = self.core.frames.last_mut() {
-            frame.scope.insert(id, self.core.value_types[&id].clone());
+            frame.scope.insert(id);
         }
         Ok(id)
     }
 
-    /// Allocate a state token id (the `StateToken` record is assembled by the
-    /// construct that owns the transition; `bind_state` records its storage).
-    pub fn fresh_state(&mut self) -> StateTokenId {
-        self.core.ids.state()
-    }
-
-    /// Record which storage a freshly allocated token versions.
-    pub fn bind_state(&mut self, token: StateTokenId, storage: LogicalStorageId) {
-        if let Some(frame) = self.core.frames.last_mut() {
-            frame.state_scope.insert(token, storage);
+    /// Allocate a state token versioning `storage`. The token enters scope
+    /// when the region parameter or node that originates it is added.
+    pub fn fresh_state(&mut self, storage: LogicalStorageId) -> Result<StateTokenId, String> {
+        if !self.core.storages.contains_key(&storage) {
+            return Err(format!(
+                "a state token names storage {} which this graph does not declare",
+                storage.0
+            ));
         }
+        let id = self.core.ids.state();
+        self.core.states.insert(id, storage);
+        Ok(id)
     }
 
     /// The current state token of one storage.
@@ -402,38 +533,92 @@ impl GraphBuilder<Building> {
 
     /// Install a specific token as the current state of a storage (used after
     /// region parameters, joins, calls and loop exits).
-    pub fn set_current_state(&mut self, storage: LogicalStorageId, token: StateTokenId) {
+    pub fn set_current_state(
+        &mut self,
+        storage: LogicalStorageId,
+        token: StateTokenId,
+    ) -> Result<(), String> {
+        if self.storage_of_token(token)? != storage {
+            return Err(format!(
+                "token {} does not version storage {}",
+                token.0, storage.0
+            ));
+        }
         self.core.current.insert(storage, token);
+        Ok(())
     }
 
     pub fn initialization(&self, storage: LogicalStorageId) -> &Initialization {
-        &self.core.storages[&storage.0].initialization
+        &self.storage(storage).initialization
     }
 
     pub fn view(&self, id: LogicalViewId) -> &LogicalView {
-        &self.core.views[&id.0]
+        &self.core.views[&id]
     }
 
     pub fn storage(&self, id: LogicalStorageId) -> &LogicalStorage {
-        &self.core.storages[&id.0]
+        &self.core.storages[&id]
+    }
+
+    /// The value with this id; an error names a value this graph did not
+    /// allocate (a normalizer defect).
+    pub fn value(&self, id: GraphValueId) -> Result<&GraphValue, String> {
+        self.core
+            .values
+            .get(&id)
+            .ok_or_else(|| format!("value {} is not defined by this graph", id.0))
     }
 
     pub fn value_type(&self, id: GraphValueId) -> Result<ValueType, String> {
-        self.core
-            .value_types
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| format!("value {} has no recorded type", id.0))
+        Ok(self.value(id)?.ty())
     }
 
-    /// The view backing a tensor value.
-    pub fn view_of_value(&self, id: GraphValueId) -> Option<LogicalViewId> {
-        self.core.value_views.get(&id).copied()
+    /// The tensor source of a tensor value; an error names a non-tensor.
+    pub fn tensor_source(&self, id: GraphValueId) -> Result<TensorSource, String> {
+        let value = self.value(id)?;
+        value
+            .tensor_source()
+            .ok_or_else(|| format!("value {} is not a tensor ({})", id.0, value.ty()))
     }
 
-    /// The storage a tensor value reads.
-    pub fn storage_of_value(&self, id: GraphValueId) -> Option<LogicalStorageId> {
-        self.view_of_value(id).map(|view| self.view(view).storage)
+    /// The storage a value reads through its view: `Some` exactly for a view
+    /// of logical storage. A computed tensor, a view of one, and a non-tensor
+    /// value read no storage (an exhaustive statement about the kind, not a
+    /// missing fact).
+    pub fn read_storage(&self, id: GraphValueId) -> Result<Option<LogicalStorageId>, String> {
+        Ok(match self.value(id)?.kind() {
+            GraphValueKind::Tensor {
+                source: TensorSource::View(view),
+                ..
+            } => match self.view(*view).base {
+                ViewBase::Storage(storage) => Some(storage),
+                ViewBase::Value(_) => None,
+            },
+            GraphValueKind::Tensor {
+                source: TensorSource::Computed,
+                ..
+            }
+            | GraphValueKind::Void
+            | GraphValueKind::Scalar(_)
+            | GraphValueKind::Index { .. }
+            | GraphValueKind::Range { .. }
+            | GraphValueKind::Tuple(_)
+            | GraphValueKind::Capability(_) => None,
+        })
+    }
+
+    /// The distinct storages the given values read through views, in first
+    /// occurrence order.
+    pub fn reads_of(&self, values: &[GraphValueId]) -> Result<Vec<LogicalStorageId>, String> {
+        let mut reads = Vec::new();
+        for value in values {
+            if let Some(storage) = self.read_storage(*value)? {
+                if !reads.contains(&storage) {
+                    reads.push(storage);
+                }
+            }
+        }
+        Ok(reads)
     }
 
     /// Mark one storage fully initialized. Used for storages handed to a
@@ -443,7 +628,7 @@ impl GraphBuilder<Building> {
     pub fn mark_fully_initialized(&mut self, storage: LogicalStorageId) {
         self.core
             .storages
-            .get_mut(&storage.0)
+            .get_mut(&storage)
             .expect("the storage exists")
             .initialization = Initialization::FullyInitialized;
     }
@@ -464,9 +649,15 @@ impl GraphBuilder<Building> {
         let mut state_inputs = Vec::new();
         let initializing = write.as_ref().map(|w| w.initializing).unwrap_or(false);
         for storage in reads.iter().copied().chain(write_storage) {
+            if !self.core.storages.contains_key(&storage) {
+                return Err(format!(
+                    "a primitive names storage {} which this graph does not declare",
+                    storage.0
+                ));
+            }
             // A write to fresh storage consumes no prior state: the node is
             // the origin of the storage's first version.
-            if let Some(token) = self.current_state(storage).ok() {
+            if let Ok(token) = self.current_state(storage) {
                 if !state_inputs.contains(&token) {
                     state_inputs.push(token);
                 }
@@ -478,25 +669,21 @@ impl GraphBuilder<Building> {
             } else if write_storage != Some(storage) || !initializing {
                 return Err(format!("storage {} has no current state", storage.0));
             }
-            if self.core.moved.contains_key(&storage) {
+            if self.core.moved.contains(&storage) {
                 return Err(format!("storage {} is used after it was moved", storage.0));
             }
         }
         let mut out_ids = Vec::new();
         for output in outputs {
-            let id = match output {
-                Output::Value(ty) => self.fresh_value(ty, None)?,
-                Output::View(view) => {
-                    let shape = self.core.views[&view.0].shape.clone();
-                    self.fresh_value(ValueType::Tensor(shape), Some(view))?
-                }
+            let kind = match output {
+                Output::Computed(ty) => computed_kind(ty)?,
+                Output::View(view) => self.view_kind(view)?,
             };
-            out_ids.push(id);
+            out_ids.push(self.fresh_value(kind)?);
         }
         let mut state_outputs = Vec::new();
         if let Some(write) = &write {
-            let token = self.fresh_state();
-            self.bind_state(token, write.storage);
+            let token = self.fresh_state(write.storage)?;
             state_outputs.push(StateToken {
                 id: token,
                 storage: write.storage,
@@ -523,7 +710,8 @@ impl GraphBuilder<Building> {
         })
     }
 
-    /// Add one reduction node (never a scalar primitive payload).
+    /// Add one reduction node (never a scalar primitive payload). A computed
+    /// operand is reduced directly; a view operand reads its storage.
     #[allow(clippy::too_many_arguments)]
     pub fn add_reduction(
         &mut self,
@@ -536,13 +724,43 @@ impl GraphBuilder<Building> {
         span: Span,
     ) -> Result<GraphValueId, String> {
         self.check_inputs(&[operand])?;
-        if let Some(storage) = self.storage_of_value(operand) {
-            self.check_read(storage)?;
+        let value = self.value(operand)?;
+        let (tensor, source) = match value.kind() {
+            GraphValueKind::Tensor { ty, source } => (ty.clone(), *source),
+            GraphValueKind::Void
+            | GraphValueKind::Scalar(_)
+            | GraphValueKind::Index { .. }
+            | GraphValueKind::Range { .. }
+            | GraphValueKind::Tuple(_)
+            | GraphValueKind::Capability(_) => {
+                return Err(format!(
+                    "reduction operand must be a tensor, found {}",
+                    value.ty()
+                ))
+            }
+        };
+        let reduced_extent = tensor.axes.get(axis).cloned().ok_or_else(|| {
+            format!(
+                "reduction axis {axis} is outside rank {}",
+                tensor.axes.len()
+            )
+        })?;
+        let mut state_inputs = Vec::new();
+        match source {
+            TensorSource::View(view) => match self.view(view).base {
+                ViewBase::Storage(storage) => {
+                    self.check_read(storage)?;
+                    state_inputs.push(self.current_state(storage)?);
+                }
+                // A view of a computed value reads the value; no storage.
+                ViewBase::Value(_) => {}
+            },
+            TensorSource::Computed => {}
         }
-        let out = self.fresh_value(result.clone(), None)?;
+        let out = self.fresh_value(computed_kind(result.clone())?)?;
         let node = LogicalNode {
             inputs: vec![operand],
-            state_inputs: Vec::new(),
+            state_inputs,
             kind: LogicalNodeKind::Reduction(ReductionNode {
                 operand,
                 axis,
@@ -553,101 +771,223 @@ impl GraphBuilder<Building> {
             }),
             outputs: self.values_of(&[out])?,
             state_outputs: Vec::new(),
-            safety: Vec::new(),
+            safety: if matches!(op, ReduceOp::Max | ReduceOp::Min | ReduceOp::Argmax) {
+                vec![SafetyObligation::ExtentPositive {
+                    extent: reduced_extent,
+                }]
+            } else {
+                Vec::new()
+            },
             span,
         };
         self.append_node(node);
         Ok(out)
     }
 
-    /// Add one call node. Inputs must be in scope; borrowed and moved storages
-    /// must be at their current token; a move marks the caller storage moved.
-    /// `result_values` are the call's data-result values (scalar leaves and
-    /// the view-backed values of result storages): the node produces them.
-    /// Result storages and `inout` result states become current.
+    /// Add one call node: the callee contract instantiated with the caller's
+    /// identities. Input values must be in scope; a storage-backed tensor
+    /// input's state must be the current token of its storage (a moved
+    /// storage has no later use); a computed tensor input carries the value
+    /// itself, admitted for shared reads and owned moves; every exclusively
+    /// borrowed leaf has exactly one final state versioning the same storage,
+    /// which becomes current; result values are produced by the node.
     pub fn add_call(
         &mut self,
         choice: ChoiceId,
-        boundary_inputs: Vec<BoundaryInput>,
-        boundary_results: Vec<BoundaryResult>,
-        result_values: Vec<GraphValueId>,
+        boundary: CallBoundary,
         span: Span,
     ) -> Result<(), String> {
         let mut inputs = Vec::new();
         let mut state_inputs = Vec::new();
-        for input in &boundary_inputs {
-            match &input.kind {
-                BoundaryInputKind::Value(id) => inputs.push(*id),
-                BoundaryInputKind::Shared { value, state }
-                | BoundaryInputKind::Exclusive { value, state }
-                | BoundaryInputKind::Move { value, state } => {
+        for input in boundary.inputs.values() {
+            match input {
+                CallInput::Value(id) => inputs.push(*id),
+                CallInput::Computed { value, .. } => inputs.push(*value),
+                CallInput::Tensor { value, state, .. } => {
                     inputs.push(*value);
                     state_inputs.push(*state);
                 }
             }
         }
         self.check_inputs(&inputs)?;
-        for input in &boundary_inputs {
-            match &input.kind {
-                BoundaryInputKind::Shared { state, .. } => {
-                    self.check_borrowed(*state)?;
+        for (leaf, input) in &boundary.inputs {
+            let BoundaryLeaf::Input { .. } = leaf else {
+                return Err("a call input leaf is keyed as a result".into());
+            };
+            match input {
+                CallInput::Value(id) => {
+                    if self.value(*id)?.tensor_source().is_some() {
+                        return Err(format!(
+                            "call input value {} is a tensor passed as a plain value",
+                            id.0
+                        ));
+                    }
                 }
-                BoundaryInputKind::Exclusive { state, .. }
-                | BoundaryInputKind::Move { state, .. } => {
-                    self.check_borrowed(*state)?;
+                CallInput::Computed { value, ownership } => match ownership {
+                    // An exclusive borrow mutates through caller storage; a
+                    // computed value has none to version.
+                    ParamOwnership::Exclusive => {
+                        return Err(format!(
+                            "exclusively borrowed call input {} is a computed value; an exclusive borrow requires a tensor place with storage",
+                            value.0
+                        ))
+                    }
+                    ParamOwnership::Value => {
+                        return Err(format!(
+                            "call tensor input {} carries value ownership",
+                            value.0
+                        ))
+                    }
+                    ParamOwnership::Shared | ParamOwnership::Owned => {
+                        if boundary.final_states.contains_key(leaf) {
+                            return Err("a computed call input has no final state".into());
+                        }
+                        match self.value(*value)?.tensor_source() {
+                            Some(TensorSource::Computed) => {}
+                            Some(TensorSource::View(view)) => match self.view(view).base {
+                                // A storage-backed tensor goes through its
+                                // state so the call can borrow or move the
+                                // storage.
+                                ViewBase::Storage(_) => {
+                                    return Err(format!(
+                                        "call tensor input {} views storage but is passed as a computed value",
+                                        value.0
+                                    ))
+                                }
+                                ViewBase::Value(_) => {}
+                            },
+                            None => {
+                                return Err(format!(
+                                    "call tensor input {} is not a tensor",
+                                    value.0
+                                ))
+                            }
+                        }
+                    }
+                },
+                CallInput::Tensor {
+                    value,
+                    state,
+                    ownership,
+                } => {
                     let storage = self.storage_of_current(*state)?;
-                    if self.core.moved.contains_key(&storage) {
+                    let Some(TensorSource::View(view)) = self.value(*value)?.tensor_source()
+                    else {
+                        return Err(format!(
+                            "call tensor input {} is not a view of storage",
+                            value.0
+                        ));
+                    };
+                    if self.storage_base(view)? != storage {
+                        return Err(format!(
+                            "call tensor input {} views storage {} but consumes a state of storage {}",
+                            value.0,
+                            self.storage_base(view)?.0,
+                            storage.0
+                        ));
+                    }
+                    if self.core.moved.contains(&storage) {
                         return Err(format!(
                             "storage {} is used by this call after it was moved",
                             storage.0
                         ));
                     }
-                    if matches!(input.kind, BoundaryInputKind::Move { .. }) {
-                        self.core.moved.insert(storage, ());
+                    match ownership {
+                        ParamOwnership::Value => {
+                            return Err(format!(
+                                "call tensor input {} carries value ownership",
+                                value.0
+                            ));
+                        }
+                        ParamOwnership::Shared => {
+                            if boundary.final_states.contains_key(leaf) {
+                                return Err("a shared borrow has no final state".into());
+                            }
+                        }
+                        ParamOwnership::Owned => {
+                            if boundary.final_states.contains_key(leaf) {
+                                return Err("a moved tensor has no final state".into());
+                            }
+                        }
+                        ParamOwnership::Exclusive => {
+                            let final_state = boundary.final_states.get(leaf).ok_or_else(|| {
+                                format!(
+                                    "exclusively borrowed call input {} has no final state",
+                                    value.0
+                                )
+                            })?;
+                            if self.storage_of_token(*final_state)? != storage {
+                                return Err(format!(
+                                    "final state {} does not version storage {}",
+                                    final_state.0, storage.0
+                                ));
+                            }
+                        }
                     }
                 }
-                BoundaryInputKind::Value(_) => {}
             }
         }
-        let outputs = self.values_of(&result_values)?;
-        let mut state_outputs = Vec::new();
-        for result in &boundary_results {
-            match &result.kind {
-                BoundaryResultKind::Value(_) => {}
-                BoundaryResultKind::Storage { storage, token, .. } => {
-                    self.bind_state(*token, *storage);
-                    state_outputs.push(StateToken {
-                        id: *token,
-                        storage: *storage,
-                        join: None,
-                    });
-                    self.core.current.insert(*storage, *token);
-                }
-                BoundaryResultKind::State(token) => {
-                    let storage = self.storage_of_bound(*token)?;
-                    state_outputs.push(StateToken {
-                        id: *token,
-                        storage,
-                        join: None,
-                    });
-                    self.core.current.insert(storage, *token);
+        for leaf in boundary.final_states.keys() {
+            match boundary.inputs.get(leaf) {
+                Some(CallInput::Tensor {
+                    ownership: ParamOwnership::Exclusive,
+                    ..
+                }) => {}
+                Some(_) | None => {
+                    return Err("a final state names a leaf that is not an exclusive tensor input".into());
                 }
             }
+        }
+        for (leaf, value) in &boundary.results {
+            let BoundaryLeaf::Result { .. } = leaf else {
+                return Err("a call result leaf is keyed as an input".into());
+            };
+            match self.value(*value)?.tensor_source() {
+                Some(TensorSource::View(_)) => {
+                    return Err(format!(
+                        "call result {} is a view; a call result is a produced value",
+                        value.0
+                    ));
+                }
+                Some(TensorSource::Computed) | None => {}
+            }
+        }
+        // Moves happen after every check so a failing call leaves no trace.
+        for input in boundary.inputs.values() {
+            if let CallInput::Tensor {
+                state,
+                ownership: ParamOwnership::Owned,
+                ..
+            } = input
+            {
+                let storage = self.storage_of_token(*state)?;
+                self.core.moved.insert(storage);
+            }
+        }
+        let result_ids: Vec<GraphValueId> = boundary.results.values().copied().collect();
+        let outputs = self.values_of(&result_ids)?;
+        let mut state_outputs = Vec::new();
+        for token in boundary.final_states.values() {
+            let storage = self.storage_of_token(*token)?;
+            state_outputs.push(StateToken {
+                id: *token,
+                storage,
+                join: None,
+            });
         }
         let node = LogicalNode {
             inputs,
             state_inputs,
-            kind: LogicalNodeKind::Call(CallNode {
-                choice,
-                boundary_inputs,
-                boundary_results,
-            }),
+            kind: LogicalNodeKind::Call(CallNode { choice, boundary }),
             outputs,
-            state_outputs,
+            state_outputs: state_outputs.clone(),
             safety: Vec::new(),
             span,
         };
         self.append_node(node);
+        for token in &state_outputs {
+            self.core.current.insert(token.storage, token.id);
+        }
         Ok(())
     }
 
@@ -706,17 +1046,25 @@ impl GraphBuilder<Building> {
         for join in &joins {
             match join {
                 JoinSlot::Value { joined, ty, .. } => {
-                    let view = self.core.value_views.get(joined).copied();
-                    outputs.push(GraphValue {
-                        id: *joined,
-                        ty: ty.clone(),
-                        view,
-                    });
+                    let value = self.value(*joined)?;
+                    if value.ty() != *ty {
+                        return Err(format!(
+                            "join value {} is declared as {ty} but the value is {}",
+                            joined.0,
+                            value.ty()
+                        ));
+                    }
+                    outputs.push(value.clone());
                 }
                 JoinSlot::State {
                     joined, storage, ..
                 } => {
-                    self.bind_state(*joined, *storage);
+                    if self.storage_of_token(*joined)? != *storage {
+                        return Err(format!(
+                            "join state {} does not version storage {}",
+                            joined.0, storage.0
+                        ));
+                    }
                     state_outputs.push(StateToken {
                         id: *joined,
                         storage: *storage,
@@ -755,7 +1103,8 @@ impl GraphBuilder<Building> {
     /// Add one loop node. Carried slots must have identical types across
     /// initial value, body parameter and body result; independent loops admit
     /// only `DisjointWrite`/`Atomic` joins and no carries. Returns the loop's
-    /// exit values (one fresh id per value carry, in carried order).
+    /// exit values (one fresh produced value per value carry, in carried
+    /// order).
     pub fn add_loop(&mut self, spec: LoopSpec) -> Result<LoopOutcome, String> {
         let LoopSpec {
             kind,
@@ -770,85 +1119,84 @@ impl GraphBuilder<Building> {
         self.check_inputs(&[range.start, range.end])?;
         self.check_inputs(&invariant_values)?;
         for slot in &carried {
-            let initial_kind = matches!(slot.initial, RegionInput::Value(_));
-            let parameter_kind = matches!(
-                body.parameters.get(slot.body_parameter.index()),
-                Some(RegionParameter::Value { .. })
-            );
-            let result_kind = matches!(
-                body.results.get(slot.body_result.index()),
-                Some(RegionResult::Value { .. })
-            );
-            if initial_kind != parameter_kind || initial_kind != result_kind {
-                return Err(format!(
-                    "carried slot {} mixes value and state shapes",
-                    slot.body_parameter.0
-                ));
-            }
-            if initial_kind {
-                let initial_ty = match slot.initial {
-                    RegionInput::Value(id) => self.value_type(id)?,
-                    RegionInput::State(_) => unreachable!(),
-                };
-                let Some(RegionParameter::Value { ty, .. }) =
-                    body.parameters.get(slot.body_parameter.index())
-                else {
-                    unreachable!()
-                };
-                if initial_ty != *ty {
-                    return Err(format!(
-                        "carried slot {} has initial type {initial_ty} but body parameter type {ty}",
-                        slot.body_parameter.0
-                    ));
+            match slot.initial {
+                RegionInput::Value(initial) => {
+                    let Some(RegionParameter::Value { ty, .. }) =
+                        body.parameters.get(slot.body_parameter.index())
+                    else {
+                        return Err(format!(
+                            "carried value slot {} has no value body parameter",
+                            slot.body_parameter.0
+                        ));
+                    };
+                    let Some(RegionResult::Value { ty: result_ty, .. }) =
+                        body.results.get(slot.body_result.index())
+                    else {
+                        return Err(format!(
+                            "carried value slot {} has no value body result",
+                            slot.body_result.0
+                        ));
+                    };
+                    let initial_ty = self.value_type(initial)?;
+                    if initial_ty != *ty {
+                        return Err(format!(
+                            "carried slot {} has initial type {initial_ty} but body parameter type {ty}",
+                            slot.body_parameter.0
+                        ));
+                    }
+                    if initial_ty != *result_ty {
+                        return Err(format!(
+                            "carried slot {} has initial type {initial_ty} but body result type {result_ty}",
+                            slot.body_result.0
+                        ));
+                    }
                 }
-                let Some(RegionResult::Value { ty: result_ty, .. }) =
-                    body.results.get(slot.body_result.index())
-                else {
-                    unreachable!()
-                };
-                if initial_ty != *result_ty {
-                    return Err(format!(
-                        "carried slot {} has initial type {initial_ty} but body result type {result_ty}",
-                        slot.body_result.0
-                    ));
-                }
-            } else {
-                let initial_storage = match slot.initial {
-                    RegionInput::State(token) => self.storage_of_current(token)?,
-                    RegionInput::Value(_) => unreachable!(),
-                };
-                let Some(RegionParameter::State { storage, .. }) =
-                    body.parameters.get(slot.body_parameter.index())
-                else {
-                    unreachable!()
-                };
-                if initial_storage != *storage {
-                    return Err(format!(
-                        "carried state slot {} changes storage",
-                        slot.body_parameter.0
-                    ));
-                }
-                let Some(RegionResult::State {
-                    storage: result_storage,
-                    ..
-                }) = body.results.get(slot.body_result.index())
-                else {
-                    unreachable!()
-                };
-                if initial_storage != *result_storage {
-                    return Err(format!(
-                        "carried state slot {} changes storage",
-                        slot.body_result.0
-                    ));
+                RegionInput::State(token) => {
+                    let initial_storage = self.storage_of_current(token)?;
+                    let Some(RegionParameter::State { storage, .. }) =
+                        body.parameters.get(slot.body_parameter.index())
+                    else {
+                        return Err(format!(
+                            "carried state slot {} has no state body parameter",
+                            slot.body_parameter.0
+                        ));
+                    };
+                    if initial_storage != *storage {
+                        return Err(format!(
+                            "carried state slot {} changes storage",
+                            slot.body_parameter.0
+                        ));
+                    }
+                    let Some(RegionResult::State {
+                        storage: result_storage,
+                        ..
+                    }) = body.results.get(slot.body_result.index())
+                    else {
+                        return Err(format!(
+                            "carried state slot {} has no state body result",
+                            slot.body_result.0
+                        ));
+                    };
+                    if initial_storage != *result_storage {
+                        return Err(format!(
+                            "carried state slot {} changes storage",
+                            slot.body_result.0
+                        ));
+                    }
                 }
             }
         }
-        if kind == LoopKind::Independent {
-            if !carried.is_empty() {
-                return Err("an independent loop has no data carries".into());
+        match kind {
+            LoopKind::Independent => {
+                if !carried.is_empty() {
+                    return Err("an independent loop has no data carries".into());
+                }
             }
-        } else if !joins.is_empty() {
-            return Err("an ordered loop joins carried states, not visit states".into());
+            LoopKind::Ordered => {
+                if !joins.is_empty() {
+                    return Err("an ordered loop joins carried states, not visit states".into());
+                }
+            }
         }
         let mut initial_values = Vec::new();
         let mut initial_states = Vec::new();
@@ -862,44 +1210,37 @@ impl GraphBuilder<Building> {
             initial_states.push(self.current_state(*storage)?);
         }
         let mut state_outputs = Vec::new();
-        if kind == LoopKind::Ordered {
-            for slot in &carried {
-                if let RegionInput::State(token) = slot.initial {
-                    let storage = self.storage_of_current(token)?;
-                    let next = self.fresh_state();
-                    self.bind_state(next, storage);
+        match kind {
+            LoopKind::Ordered => {
+                for slot in &carried {
+                    if let RegionInput::State(token) = slot.initial {
+                        let storage = self.storage_of_current(token)?;
+                        let next = self.fresh_state(storage)?;
+                        state_outputs.push(StateToken {
+                            id: next,
+                            storage,
+                            join: None,
+                        });
+                    }
+                }
+            }
+            LoopKind::Independent => {
+                for (storage, join) in &joins {
+                    let next = self.fresh_state(*storage)?;
                     state_outputs.push(StateToken {
                         id: next,
-                        storage,
-                        join: None,
+                        storage: *storage,
+                        join: Some(join.clone()),
                     });
                 }
             }
-        } else {
-            for (storage, join) in &joins {
-                let next = self.fresh_state();
-                self.bind_state(next, *storage);
-                state_outputs.push(StateToken {
-                    id: next,
-                    storage: *storage,
-                    join: Some(join.clone()),
-                });
-            }
         }
-        let carried_value_ids = carried
-            .iter()
-            .filter(|slot| matches!(slot.initial, RegionInput::Value(_)))
-            .filter_map(|slot| match slot.initial {
-                RegionInput::Value(id) => Some(id),
-                RegionInput::State(_) => None,
-            })
-            .collect::<Vec<_>>();
-        // The loop's exit values are fresh ids (the value of the last visit),
-        // one per value carry, in carried order.
+        // The loop's exit values are fresh produced values (the value of the
+        // last visit), one per value carry, in carried order.
         let mut exit_values = Vec::new();
-        for id in &carried_value_ids {
+        for id in &initial_values {
             let ty = self.value_type(*id)?;
-            exit_values.push(self.fresh_value(ty, None)?);
+            exit_values.push(self.fresh_value(computed_kind(ty)?)?);
         }
         let node = LogicalNode {
             inputs: Vec::new(),
@@ -926,34 +1267,6 @@ impl GraphBuilder<Building> {
         Ok(LoopOutcome { exit_values })
     }
 
-    /// Whether construction is complete enough to seal (every region closed).
-    pub fn seal_check(&self) -> Result<(), String> {
-        if !self.core.frames.is_empty() {
-            return Err("a region is still open".into());
-        }
-        if self.core.root.is_none() {
-            return Err("the root region was never closed".into());
-        }
-        Ok(())
-    }
-
-    /// Close construction. Available only when every region is closed (for a
-    /// void function the result list is legitimately empty); afterwards only
-    /// `finish` remains. Call `seal_check` first to recover the builder on
-    /// failure.
-    pub fn seal(self) -> Result<GraphBuilder<Complete>, String> {
-        if !self.core.frames.is_empty() {
-            return Err("a region is still open".into());
-        }
-        if self.core.root.is_none() {
-            return Err("the root region was never closed".into());
-        }
-        Ok(GraphBuilder {
-            core: self.core,
-            phase: PhantomData,
-        })
-    }
-
     /// Take the id allocator out (a child graph is built with it while this
     /// graph's construction is suspended).
     pub fn take_ids(&mut self) -> Ids {
@@ -970,21 +1283,259 @@ impl GraphBuilder<Building> {
         self.core.ids
     }
 
+    /// Close construction: the only constructor of a `TaskGraph`. Requires
+    /// every region closed, and establishes by checking:
+    ///
+    /// - every value and state token of the graph has exactly one origin
+    ///   (region parameter or node output) and every origin is in the table;
+    /// - every view names a storage of the graph and every view value has
+    ///   the view's shape (by construction of `fresh_value`/`declare_view`);
+    /// - every boundary input is a root region parameter: a tensor input is a
+    ///   view of parameter-owned storage whose entry state is the root state
+    ///   parameter of that storage; a value input is a non-tensor;
+    /// - every exclusive input has exactly one final state, in root scope and
+    ///   versioning its storage; shared, owned and value inputs have none;
+    /// - every result value is in root scope; a view result is fully
+    ///   initialized and unmoved; a computed result needs no storage.
+    ///
+    /// Returns the sealed graph and the id allocator for the next graph.
+    pub fn seal(
+        self,
+        inputs: BTreeMap<BoundaryLeaf, LogicalBoundaryInput>,
+        results: BTreeMap<BoundaryLeaf, LogicalBoundaryResult>,
+        final_states: BTreeMap<BoundaryLeaf, StateTokenId>,
+    ) -> Result<(TaskGraph, Ids), String> {
+        if !self.core.frames.is_empty() {
+            return Err("a region is still open".into());
+        }
+        let Some(root) = &self.core.root else {
+            return Err("the root region was never closed".into());
+        };
+
+        // Origins: exactly one per value and per state token.
+        let mut value_origins: BTreeMap<GraphValueId, usize> = BTreeMap::new();
+        let mut state_origins: BTreeMap<StateTokenId, (usize, LogicalStorageId)> = BTreeMap::new();
+        collect_origins(&root.region, &mut value_origins, &mut state_origins);
+        for (id, count) in &value_origins {
+            if *count != 1 {
+                return Err(format!("value {} has {count} origins", id.0));
+            }
+            if !self.core.values.contains_key(id) {
+                return Err(format!("value {} originates but is not in the table", id.0));
+            }
+        }
+        for id in self.core.values.keys() {
+            if !value_origins.contains_key(id) {
+                return Err(format!("value {} is allocated but never originates", id.0));
+            }
+        }
+        for (id, (count, storage)) in &state_origins {
+            if *count != 1 {
+                return Err(format!("state token {} has {count} origins", id.0));
+            }
+            match self.core.states.get(id) {
+                Some(bound) if bound == storage => {}
+                Some(bound) => {
+                    return Err(format!(
+                        "state token {} originates on storage {} but versions storage {}",
+                        id.0, storage.0, bound.0
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "state token {} originates but is not in the table",
+                        id.0
+                    ))
+                }
+            }
+        }
+        for id in self.core.states.keys() {
+            if !state_origins.contains_key(id) {
+                return Err(format!(
+                    "state token {} is allocated but never originates",
+                    id.0
+                ));
+            }
+        }
+
+        // Boundary inputs.
+        let root_value_params: BTreeSet<GraphValueId> = root
+            .region
+            .parameters
+            .iter()
+            .filter_map(|parameter| match parameter {
+                RegionParameter::Value { id, .. } => Some(*id),
+                RegionParameter::State { .. } => None,
+            })
+            .collect();
+        let root_state_params: BTreeMap<StateTokenId, LogicalStorageId> = root
+            .region
+            .parameters
+            .iter()
+            .filter_map(|parameter| match parameter {
+                RegionParameter::State { id, storage } => Some((*id, *storage)),
+                RegionParameter::Value { .. } => None,
+            })
+            .collect();
+        for (leaf, input) in &inputs {
+            let BoundaryLeaf::Input { .. } = leaf else {
+                return Err("a boundary input leaf is keyed as a result".into());
+            };
+            match input {
+                LogicalBoundaryInput::Value(id) => {
+                    if !root_value_params.contains(id) {
+                        return Err(format!(
+                            "boundary input value {} is not a root parameter",
+                            id.0
+                        ));
+                    }
+                    if self.value(*id)?.tensor_source().is_some() {
+                        return Err(format!(
+                            "boundary input value {} is a tensor without a state",
+                            id.0
+                        ));
+                    }
+                    if final_states.contains_key(leaf) {
+                        return Err("a value input has no final state".into());
+                    }
+                }
+                LogicalBoundaryInput::Tensor {
+                    value,
+                    state,
+                    ownership,
+                } => {
+                    if !root_value_params.contains(value) {
+                        return Err(format!(
+                            "boundary tensor input {} is not a root parameter",
+                            value.0
+                        ));
+                    }
+                    let Some(TensorSource::View(view)) = self.value(*value)?.tensor_source()
+                    else {
+                        return Err(format!(
+                            "boundary tensor input {} is not a view of parameter storage",
+                            value.0
+                        ));
+                    };
+                    let storage = match self.view(view).base {
+                        ViewBase::Storage(storage) => storage,
+                        ViewBase::Value(_) => {
+                            return Err(format!(
+                                "boundary tensor input {} is not a view of parameter storage",
+                                value.0
+                            ))
+                        }
+                    };
+                    if self.storage(storage).owner != LogicalStorageOwner::Parameter(leaf.clone())
+                    {
+                        return Err(format!(
+                            "boundary tensor input {} views storage {} which is not owned by its leaf",
+                            value.0, storage.0
+                        ));
+                    }
+                    match root_state_params.get(state) {
+                        Some(bound) if *bound == storage => {}
+                        Some(_) | None => {
+                            return Err(format!(
+                                "boundary tensor input {} names entry state {} which is not the root state of storage {}",
+                                value.0, state.0, storage.0
+                            ))
+                        }
+                    }
+                    match ownership {
+                        ParamOwnership::Value => {
+                            return Err(format!(
+                                "boundary tensor input {} carries value ownership",
+                                value.0
+                            ))
+                        }
+                        ParamOwnership::Shared | ParamOwnership::Owned => {
+                            if final_states.contains_key(leaf) {
+                                return Err(format!(
+                                    "boundary input {} is not exclusive but has a final state",
+                                    value.0
+                                ));
+                            }
+                        }
+                        ParamOwnership::Exclusive => {
+                            let token = final_states.get(leaf).ok_or_else(|| {
+                                format!(
+                                    "exclusive boundary input {} has no final state",
+                                    value.0
+                                )
+                            })?;
+                            if !root.state_scope.contains(token) {
+                                return Err(format!(
+                                    "final state {} is not in root scope",
+                                    token.0
+                                ));
+                            }
+                            if self.storage_of_token(*token)? != storage {
+                                return Err(format!(
+                                    "final state {} does not version storage {}",
+                                    token.0, storage.0
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for leaf in final_states.keys() {
+            if !inputs.contains_key(leaf) {
+                return Err("a final state names a leaf that is not a boundary input".into());
+            }
+        }
+
+        // Boundary results.
+        for (leaf, result) in &results {
+            let BoundaryLeaf::Result { .. } = leaf else {
+                return Err("a boundary result leaf is keyed as an input".into());
+            };
+            if !root.scope.contains(&result.value) {
+                return Err(format!(
+                    "boundary result {} is not in root scope",
+                    result.value.0
+                ));
+            }
+            if let Some(TensorSource::View(view)) = self.value(result.value)?.tensor_source() {
+                // A returned view of a computed value is a legitimate value
+                // result; only a view of storage names storage to check.
+                if let ViewBase::Storage(storage) = self.view(view).base {
+                    self.check_result_storage(storage)?;
+                }
+            }
+        }
+
+        let core = self.core;
+        let root = core.root.expect("checked above");
+        let graph = TaskGraph {
+            choice: core.choice,
+            alternative: core.alternative,
+            boundary: LogicalBoundary::new(inputs, results, final_states),
+            root: root.region,
+            values: IdVec::from_iter(core.values),
+            storages: IdVec::from_iter(core.storages),
+            views: IdVec::from_iter(core.views),
+            states: IdVec::from_iter(core.states),
+        };
+        Ok((graph, core.ids))
+    }
+
     // -- internals ---------------------------------------------------------
 
-    fn check_inputs(&mut self, inputs: &[GraphValueId]) -> Result<(), String> {
+    fn check_inputs(&self, inputs: &[GraphValueId]) -> Result<(), String> {
         for id in inputs {
             let visible = self
                 .core
                 .frames
                 .iter()
-                .any(|frame| frame.scope.contains_key(id));
+                .any(|frame| frame.scope.contains(id));
             if !visible {
                 return Err(format!("input value {} does not dominate this use", id.0));
             }
-            if let Some(view) = self.core.value_views.get(id) {
-                let storage = self.core.views[&view.0].storage;
-                if self.core.moved.contains_key(&storage) {
+            if let Some(storage) = self.read_storage(*id)? {
+                if self.core.moved.contains(&storage) {
                     return Err(format!(
                         "value {} uses storage {} after it was moved",
                         id.0, storage.0
@@ -996,7 +1547,7 @@ impl GraphBuilder<Building> {
     }
 
     fn check_read(&self, storage: LogicalStorageId) -> Result<(), String> {
-        let initialization = &self.core.storages[&storage.0].initialization;
+        let initialization = &self.storage(storage).initialization;
         if matches!(initialization, Initialization::Uninitialized) {
             return Err(format!(
                 "storage {} is read before any element is written",
@@ -1006,45 +1557,29 @@ impl GraphBuilder<Building> {
         Ok(())
     }
 
-    fn check_borrowed(&self, token: StateTokenId) -> Result<(), String> {
-        if !self.core.current.values().any(|current| *current == token) {
+    /// The storage a token versions (recorded at allocation).
+    fn storage_of_token(&self, token: StateTokenId) -> Result<LogicalStorageId, String> {
+        self.core
+            .states
+            .get(&token)
+            .copied()
+            .ok_or_else(|| format!("token {} is not a state token of this graph", token.0))
+    }
+
+    /// The storage of a token that must be its storage's current state.
+    fn storage_of_current(&self, token: StateTokenId) -> Result<LogicalStorageId, String> {
+        let storage = self.storage_of_token(token)?;
+        if self.core.current.get(&storage) != Some(&token) {
             return Err(format!(
-                "token {} is not the current state of its storage",
-                token.0
+                "token {} is not the current state of storage {}",
+                token.0, storage.0
             ));
         }
-        Ok(())
-    }
-
-    fn storage_of_current(&self, token: StateTokenId) -> Result<LogicalStorageId, String> {
-        self.core
-            .current
-            .iter()
-            .find(|(_, current)| **current == token)
-            .map(|(storage, _)| *storage)
-            .ok_or_else(|| format!("token {} is not a current state", token.0))
-    }
-
-    /// The storage a bound token versions (recorded by `bind_state`).
-    fn storage_of_bound(&self, token: StateTokenId) -> Result<LogicalStorageId, String> {
-        for frame in self.core.frames.iter().rev() {
-            if let Some(storage) = frame.state_scope.get(&token) {
-                return Ok(*storage);
-            }
-        }
-        Err(format!("token {} is not bound to a storage", token.0))
+        Ok(storage)
     }
 
     fn values_of(&self, ids: &[GraphValueId]) -> Result<Vec<GraphValue>, String> {
-        let mut out = Vec::new();
-        for id in ids {
-            out.push(GraphValue {
-                id: *id,
-                ty: self.value_type(*id)?,
-                view: self.core.value_views.get(id).copied(),
-            });
-        }
-        Ok(out)
+        ids.iter().map(|id| self.value(*id).cloned()).collect()
     }
 
     fn apply_coverage(
@@ -1053,10 +1588,10 @@ impl GraphBuilder<Building> {
         coverage: &Coverage,
         initializing: bool,
     ) {
-        let initialization = self.core.storages[&storage.0].initialization.clone();
+        let initialization = self.storage(storage).initialization.clone();
         self.core
             .storages
-            .get_mut(&storage.0)
+            .get_mut(&storage)
             .expect("the storage exists")
             .initialization = match initialization {
             Initialization::Uninitialized => {
@@ -1083,39 +1618,47 @@ impl GraphBuilder<Building> {
     fn append_node(&mut self, node: LogicalNode) {
         let frame = self.core.frames.last_mut().expect("a region is open");
         for output in &node.outputs {
-            frame.scope.insert(output.id, output.ty.clone());
-            if let Some(view) = output.view {
-                self.core.value_views.insert(output.id, view);
-            }
+            frame.scope.insert(output.id());
         }
         for token in &node.state_outputs {
-            frame.state_scope.insert(token.id, token.storage);
+            frame.state_scope.insert(token.id);
         }
         frame.nodes.push(node);
     }
 }
 
-impl GraphBuilder<Complete> {
-    /// Finish the sealed graph, returning the id allocator for the next graph.
-    pub fn finish(self) -> (TaskGraph, Ids) {
-        let core = self.core;
-        let graph = TaskGraph {
-            choice: core.choice,
-            alternative: core.alternative,
-            parameters: core.parameters,
-            storages: IdVec::from_iter(
-                core.storages
-                    .into_iter()
-                    .map(|(id, storage)| (LogicalStorageId(id), storage)),
-            ),
-            views: IdVec::from_iter(
-                core.views
-                    .into_iter()
-                    .map(|(id, view)| (LogicalViewId(id), view)),
-            ),
-            root: core.root.expect("seal guarantees a root region"),
-            results: core.results,
-        };
-        (graph, core.ids)
+/// Count the origins of every value and state token in a region tree.
+fn collect_origins(
+    region: &GraphRegion,
+    values: &mut BTreeMap<GraphValueId, usize>,
+    states: &mut BTreeMap<StateTokenId, (usize, LogicalStorageId)>,
+) {
+    for parameter in &region.parameters {
+        match parameter {
+            RegionParameter::Value { id, .. } => *values.entry(*id).or_insert(0) += 1,
+            RegionParameter::State { id, storage } => {
+                let entry = states.entry(*id).or_insert((0, *storage));
+                entry.0 += 1;
+            }
+        }
+    }
+    for node in region.nodes.iter() {
+        for output in &node.outputs {
+            *values.entry(output.id()).or_insert(0) += 1;
+        }
+        for token in &node.state_outputs {
+            let entry = states.entry(token.id).or_insert((0, token.storage));
+            entry.0 += 1;
+        }
+        match &node.kind {
+            LogicalNodeKind::If(if_node) => {
+                collect_origins(&if_node.then_region, values, states);
+                collect_origins(&if_node.else_region, values, states);
+            }
+            LogicalNodeKind::Loop(loop_node) => collect_origins(&loop_node.body, values, states),
+            LogicalNodeKind::Primitive(_)
+            | LogicalNodeKind::Reduction(_)
+            | LogicalNodeKind::Call(_) => {}
+        }
     }
 }

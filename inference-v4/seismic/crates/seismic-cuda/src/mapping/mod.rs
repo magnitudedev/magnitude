@@ -1,16 +1,26 @@
-//! CUDA target configuration and the pipeline `Backend` implementation.
+//! The CUDA backend: target configuration, the mapping catalog, and the
+//! pipeline `Backend` implementation.
+//!
+//! `Cuda` is the device-independent planner (profile, catalog, cost model)
+//! used for selection; `CudaCompiler` binds one open device and implements
+//! `Backend`, whose `assemble` compiles every encoded launch through that
+//! device's driver context.
 
 mod estimate;
-pub use estimate::{EstimateModel, Totals, IDENTITY as COST_MODEL_IDENTITY};
+pub use estimate::{EstimateError, EstimateModel, IDENTITY as COST_MODEL_IDENTITY};
 
-use seismic_compiler::pipeline::{Backend, EncodedPlan};
+use crate::catalog::CudaCatalog;
+use crate::intrinsics::Dialect;
+use seismic_compiler::pipeline::{AssemblyFailure, Backend, EncodedPlan};
 use seismic_lang::sir::IntrinsicUse;
-use seismic_realization::executable::{self as realization, EffectiveTargetProfile, PlanFamily};
+use seismic_realization::physical::SealedLaunch;
+use seismic_realization::target::{CooperativeGrid, EffectiveTargetProfile, TargetLimits};
 
 pub const TARGET: &str = "cuda";
 pub const WARP: u32 = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The device facts the CUDA target is configured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub max_threads_per_block: u32,
     pub max_grid_x: u32,
@@ -36,31 +46,137 @@ impl Limits {
             max_scratch_bytes: device.global_memory_bytes / 4,
         }
     }
+}
 
-    pub(crate) fn target(&self) -> crate::target::TargetLimits {
-        crate::target::TargetLimits {
-            max_threads_per_block: self.max_threads_per_block,
-            max_grid_x: self.max_grid_x,
-            warp_size: self.warp_size,
-            max_scratch_bytes: self.max_scratch_bytes,
+/// The CUDA backend planner: the effective target profile, the mapping
+/// catalog, and the cost model. Device-bound assembly lives on
+/// `CudaCompiler`.
+pub struct Cuda {
+    limits: Limits,
+    cooperative: Option<CooperativeGrid>,
+    target_profile: crate::target::TargetProfile,
+    effective_profile: EffectiveTargetProfile,
+    catalog: CudaCatalog,
+}
+
+/// The target configuration is invalid for this backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// The device facts do not support a CUDA target.
+    Limits {
+        max_threads_per_block: u32,
+        max_grid_x: u32,
+        warp_size: u32,
+    },
+    /// The cost configuration is invalid.
+    Estimate(EstimateError),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limits {
+                max_threads_per_block,
+                max_grid_x,
+                warp_size,
+            } => write!(
+                f,
+                "CUDA needs positive block, grid and warp capacities; the device offers \
+                 {max_threads_per_block} threads per block, {max_grid_x} blocks, \
+                 {warp_size}-lane warps"
+            ),
+            Self::Estimate(error) => write!(f, "{error}"),
         }
     }
 }
 
-/// The CUDA backend and its effective target profile.
-pub struct Cuda {
-    limits: Limits,
-    target_profile: crate::target::TargetProfile,
-    physical_target_profile: EffectiveTargetProfile,
+impl std::error::Error for ConfigError {}
+
+impl Cuda {
+    /// Configure the backend from device facts without the cooperative
+    /// facility (selection tests and synthetic targets).
+    pub fn new(limits: Limits, estimate: EstimateModel) -> Result<Self, ConfigError> {
+        Self::with_cooperative(limits, estimate, None)
+    }
+
+    /// Configure the backend from device facts. `cooperative` is the
+    /// device's cooperative-grid facility (`None` when unsupported); a
+    /// grid-cooperative proposal is then never made, never a fallback.
+    pub fn with_cooperative(
+        limits: Limits,
+        estimate: EstimateModel,
+        cooperative: Option<CooperativeGrid>,
+    ) -> Result<Self, ConfigError> {
+        if limits.max_threads_per_block == 0
+            || limits.max_grid_x == 0
+            || limits.warp_size == 0
+            || i64::try_from(limits.max_scratch_bytes).is_err()
+        {
+            return Err(ConfigError::Limits {
+                max_threads_per_block: limits.max_threads_per_block,
+                max_grid_x: limits.max_grid_x,
+                warp_size: limits.warp_size,
+            });
+        }
+        estimate.validate().map_err(ConfigError::Estimate)?;
+        let target_profile =
+            crate::target::TargetProfile::synthetic_baseline(limits.clone(), cooperative.clone());
+        let effective_profile = target_profile.effective_profile();
+        let catalog = CudaCatalog::new(&limits, cooperative.clone(), &estimate);
+        Ok(Self {
+            limits,
+            cooperative,
+            target_profile,
+            effective_profile,
+            catalog,
+        })
+    }
+
+    /// Configure the backend from one observed device.
+    pub fn from_device(device: &crate::DeviceInfo) -> Result<Self, ConfigError> {
+        Self::with_cooperative(
+            Limits::from_device(device),
+            EstimateModel::default(),
+            device.cooperative_grid(),
+        )
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub fn cooperative(&self) -> Option<&CooperativeGrid> {
+        self.cooperative.as_ref()
+    }
+
+    pub fn target_profile(&self) -> &crate::target::TargetProfile {
+        &self.target_profile
+    }
+
+    /// The fully populated effective target profile.
+    pub fn effective_profile(&self) -> &EffectiveTargetProfile {
+        &self.effective_profile
+    }
+
+    /// The effective hard limits.
+    pub fn effective_limits(&self) -> &TargetLimits {
+        &self.effective_profile.limits
+    }
+
+    pub fn capability_fingerprint(&self) -> String {
+        self.effective_profile.capability_fingerprint.clone()
+    }
 }
 
+/// The device-bound CUDA backend: compilation and native assembly through
+/// one open device's driver context.
 pub struct CudaCompiler<'a> {
     planner: Cuda,
     device: &'a crate::Device,
 }
 
 impl<'a> CudaCompiler<'a> {
-    pub fn new(device: &'a crate::Device) -> Result<Self, String> {
+    pub fn new(device: &'a crate::Device) -> Result<Self, ConfigError> {
         Ok(Self {
             planner: Cuda::from_device(&device.info)?,
             device,
@@ -76,144 +192,37 @@ impl<'a> CudaCompiler<'a> {
     }
 }
 
-impl Cuda {
-    pub fn new(limits: Limits, estimate: EstimateModel) -> Result<Self, String> {
-        if limits.max_threads_per_block == 0
-            || limits.max_grid_x == 0
-            || limits.warp_size == 0
-            || i64::try_from(limits.max_scratch_bytes).is_err()
-        {
-            return Err(format!(
-                "CUDA needs positive block, grid and warp capacities; the device offers {} threads per block, {} blocks, {}-lane warps",
-                limits.max_threads_per_block, limits.max_grid_x, limits.warp_size
-            ));
-        }
-        estimate.validate()?;
-        let target_profile = crate::target::TargetProfile::synthetic_baseline(limits.target());
-        let physical_target_profile =
-            crate::physical::cuda_target_profile(&limits, &target_profile);
-        Ok(Self {
-            limits,
-            target_profile,
-            physical_target_profile,
-        })
-    }
-
-    pub fn from_device(device: &crate::DeviceInfo) -> Result<Self, String> {
-        let mut backend = Self::new(Limits::from_device(device), EstimateModel::default())?;
-        backend.target_profile = crate::target::TargetProfile::from_observation(
-            crate::target::TargetObservation::driver(
-                device.compute_capability,
-                device.driver_version,
-            )
-            .map_err(|error| error.to_string())?,
-            backend.limits.target(),
-        )
-        .map_err(|error| error.to_string())?;
-        backend.physical_target_profile =
-            crate::physical::cuda_target_profile(&backend.limits, &backend.target_profile);
-        Ok(backend)
-    }
-
-    pub fn limits(&self) -> &Limits {
-        &self.limits
-    }
-
-    pub fn target_profile(&self) -> &crate::target::TargetProfile {
-        &self.target_profile
-    }
-}
-
-impl Backend for Cuda {
-    type Dialect = crate::physical::CudaDialect;
-    type EncodedLaunch = crate::native::EncodedLaunch;
-    type NativeArtifact = crate::native::Emitted;
-
-    fn target(&self) -> &'static str {
-        TARGET
-    }
-
-    fn capability_fingerprint(&self) -> String {
-        self.physical_target_profile.capability_fingerprint.clone()
-    }
-
-    fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
-        self.target_profile.supports_intrinsic(intrinsic)
-    }
-
-    fn target_profile(&self) -> &EffectiveTargetProfile {
-        &self.physical_target_profile
-    }
-
-    fn elaborate(
-        &self,
-        logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<PlanFamily<Self::Dialect>, String> {
-        crate::physical::elaborate(logical, &self.physical_target_profile)
-            .map_err(|error| error.to_string())
-    }
-
-    fn encode_launch(
-        &self,
-        launch: &realization::ResolvedLaunch<Self::Dialect>,
-    ) -> Result<Self::EncodedLaunch, String> {
-        // The mechanical PTX emission happens once in `assemble`.
-        crate::native::encode_launch(launch)
-    }
-
-    fn assemble(
-        &self,
-        encoded: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
-    ) -> Result<Self::NativeArtifact, String> {
-        crate::native::assemble(encoded)
-    }
-}
-
 impl Backend for CudaCompiler<'_> {
-    type Dialect = crate::physical::CudaDialect;
-    type EncodedLaunch = crate::native::EncodedLaunch;
-    type NativeArtifact = crate::PhysicalSequence;
+    type Dialect = Dialect;
+    type Catalog = CudaCatalog;
+    type EncodedLaunch = crate::encode::CudaLaunch;
+    type NativeArtifact = crate::native::NativeArtifact;
 
-    fn target(&self) -> &'static str {
-        TARGET
+    fn profile(&self) -> &EffectiveTargetProfile {
+        self.planner.effective_profile()
     }
 
-    fn capability_fingerprint(&self) -> String {
-        self.planner
-            .physical_target_profile
-            .capability_fingerprint
-            .clone()
+    fn catalog(&self) -> &CudaCatalog {
+        &self.planner.catalog
     }
 
+    /// Applicability of one exact typed capability use on this target.
     fn supports_intrinsic(&self, intrinsic: &IntrinsicUse) -> Result<(), String> {
         self.planner.target_profile.supports_intrinsic(intrinsic)
     }
 
-    fn target_profile(&self) -> &EffectiveTargetProfile {
-        &self.planner.physical_target_profile
+    /// Exhaustive mechanical encoding of one sealed launch. Total.
+    fn encode(&self, launch: &SealedLaunch<Dialect>) -> crate::encode::CudaLaunch {
+        crate::encode::encode(launch)
     }
 
-    fn elaborate(
-        &self,
-        logical: &seismic_lang::logical::LogicalProgram,
-    ) -> Result<PlanFamily<Self::Dialect>, String> {
-        self.planner.elaborate(logical)
-    }
-
-    fn encode_launch(
-        &self,
-        launch: &realization::ResolvedLaunch<Self::Dialect>,
-    ) -> Result<Self::EncodedLaunch, String> {
-        crate::native::encode_launch(launch)
-    }
-
+    /// Compile every encoded launch through the device, reflect native
+    /// facts against the selected contract, and seal one native tree
+    /// mirroring the physical schedule exactly once.
     fn assemble(
         &self,
-        encoded: EncodedPlan<Self::Dialect, Self::EncodedLaunch>,
-    ) -> Result<Self::NativeArtifact, String> {
-        let emitted = self.planner.assemble(encoded)?;
-        self.device
-            .compile_emitted(emitted)
-            .map_err(|error| error.to_string())
+        plan: EncodedPlan<Dialect, crate::encode::CudaLaunch>,
+    ) -> Result<crate::native::NativeArtifact, AssemblyFailure> {
+        crate::native::assemble(self.device, plan)
     }
 }

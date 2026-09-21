@@ -4,19 +4,20 @@
 mod bindings;
 mod select;
 
-use seismic_compiler::pipeline::Workload;
+use seismic_lang::logical::specialization::{ShapeBinding, SpecializationDomain};
 use seismic_lang::precision::{EvidenceRequirement, InputRange, Limit, PrecisionPolicy, Tolerance};
 use seismic_lang::program::{collect_files, compile};
 use seismic_lang::sir::Program;
 use seismic_lang::syntax;
 use seismic_lang::types::{DType, Elem};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   seismic check <file|dir>...
   seismic print <file|dir>...
-  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--extent NAME=V,...] [--precision exact|bounded|unconstrained] [--atol V] [--rtol V] [--relative-floor V] [--ulps N] [--output-tolerance NAME=ATOL:RTOL:FLOOR:ULPS|-] [--input-range NAME=MIN..MAX] [--allow-special-changes nan,infinity,signed-zero,subnormal] [--evidence proven|qualified] [--target cpu|cuda|metal]
+  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--precision exact|bounded|unconstrained] [--atol V] [--rtol V] [--relative-floor V] [--ulps N] [--output-tolerance NAME=ATOL:RTOL:FLOOR:ULPS|-] [--input-range NAME=MIN..MAX] [--allow-special-changes nan,infinity,signed-zero,subnormal] [--evidence proven|qualified] [--target cpu|cuda|metal]
   seismic emit <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
   seismic analyze-search <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
   seismic bindings <file|dir>... --fn <name> [--element NAME=TYPE,...]
@@ -35,7 +36,9 @@ pub struct Options {
     /// The backend `select`, `emit` and `analyze-search` run on.
     pub target: String,
     pub function: Option<String>,
-    pub workload: Workload,
+    pub shapes: BTreeMap<String, i64>,
+    pub elems: BTreeMap<String, Elem>,
+    pub precision: PrecisionPolicy,
 }
 
 impl Options {
@@ -43,6 +46,25 @@ impl Options {
         self.function
             .as_deref()
             .ok_or_else(|| "--fn is required".to_string())
+    }
+
+    /// The complete specialization domain of one inspection request.
+    pub fn domain(&self, program: &Program) -> Result<SpecializationDomain, String> {
+        SpecializationDomain::new(
+            program,
+            self.entry()?,
+            self.shapes
+                .iter()
+                .map(|(name, value)| {
+                    (*value)
+                        .try_into()
+                        .map(|value| (name.clone(), ShapeBinding::Exact(value)))
+                        .map_err(|_| format!("shape `{name}` must be a valid extent"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?,
+            self.elems.clone(),
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -87,7 +109,9 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
         paths: Vec::new(),
         target: TARGET.into(),
         function: None,
-        workload: Workload::default(),
+        shapes: BTreeMap::new(),
+        elems: BTreeMap::new(),
+        precision: PrecisionPolicy::default(),
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -126,33 +150,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                     if extent < 0 {
                         return Err(format!("shape `{name}` must be nonnegative"));
                     }
-                    if o.workload
-                        .shapes
-                        .insert(name.trim().to_string(), extent)
-                        .is_some()
-                    {
+                    if o.shapes.insert(name.trim().to_string(), extent).is_some() {
                         return Err(format!("duplicate shape binding {name}"));
-                    }
-                }
-            }
-            "--extent" => {
-                for binding in value.split(',') {
-                    let (name, extent) = binding.split_once('=').ok_or_else(|| {
-                        format!("bad extent binding `{binding}`; expected NAME=V")
-                    })?;
-                    let extent: i64 = extent
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("bad extent value `{extent}`"))?;
-                    if extent < 0 {
-                        return Err(format!("extent `{name}` must be nonnegative"));
-                    }
-                    if o.workload
-                        .extents
-                        .insert(name.trim().to_string(), extent)
-                        .is_some()
-                    {
-                        return Err(format!("duplicate extent binding {name}"));
                     }
                 }
             }
@@ -169,22 +168,18 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                     } else {
                         return Err(format!("unknown concrete element type {element}"));
                     };
-                    if o.workload
-                        .elems
-                        .insert(name.trim().to_string(), element)
-                        .is_some()
-                    {
+                    if o.elems.insert(name.trim().to_string(), element).is_some() {
                         return Err(format!("duplicate element binding {name}"));
                     }
                 }
             }
             "--precision" => {
-                o.workload.precision = match value.as_str() {
+                o.precision = match value.as_str() {
                     "exact" => PrecisionPolicy::Exact,
                     "bounded"
-                        if matches!(o.workload.precision, PrecisionPolicy::Bounded { .. }) =>
+                        if matches!(o.precision, PrecisionPolicy::Bounded { .. }) =>
                     {
-                        o.workload.precision
+                        o.precision
                     }
                     "bounded" => PrecisionPolicy::bounded(Tolerance::EXACT),
                     "unconstrained" => PrecisionPolicy::Unconstrained,
@@ -200,7 +195,7 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                     .parse()
                     .map_err(|_| format!("bad numerical limit `{value}`"))?;
                 let limit = Limit::new(parsed)?;
-                let tolerance = bounded(&mut o.workload.precision);
+                let tolerance = bounded(&mut o.precision);
                 match arg.as_str() {
                     "--atol" => tolerance.absolute = limit,
                     "--rtol" => tolerance.relative = limit,
@@ -208,7 +203,7 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 }
             }
             "--ulps" => {
-                bounded(&mut o.workload.precision).ulps = Some(
+                bounded(&mut o.precision).ulps = Some(
                     value
                         .parse()
                         .map_err(|_| format!("bad ULP limit `{value}`"))?,
@@ -224,8 +219,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                         ))
                     }
                 };
-                bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { evidence, .. } = &mut o.workload.precision else {
+                bounded(&mut o.precision);
+                let PrecisionPolicy::Bounded { evidence, .. } = &mut o.precision else {
                     unreachable!()
                 };
                 *evidence = requirement;
@@ -260,8 +255,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                         )
                     },
                 };
-                bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { outputs, .. } = &mut o.workload.precision else {
+                bounded(&mut o.precision);
+                let PrecisionPolicy::Bounded { outputs, .. } = &mut o.precision else {
                     unreachable!()
                 };
                 if outputs.insert(name.trim().into(), tolerance).is_some() {
@@ -283,8 +278,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                         .parse()
                         .map_err(|_| format!("bad range maximum `{maximum}`"))?,
                 )?;
-                bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { inputs, .. } = &mut o.workload.precision else {
+                bounded(&mut o.precision);
+                let PrecisionPolicy::Bounded { inputs, .. } = &mut o.precision else {
                     unreachable!()
                 };
                 if inputs.insert(name.trim().into(), range).is_some() {
@@ -292,8 +287,8 @@ pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
                 }
             }
             "--allow-special-changes" => {
-                bounded(&mut o.workload.precision);
-                let PrecisionPolicy::Bounded { specials, .. } = &mut o.workload.precision else {
+                bounded(&mut o.precision);
+                let PrecisionPolicy::Bounded { specials, .. } = &mut o.precision else {
                     unreachable!()
                 };
                 for name in value.split(',') {

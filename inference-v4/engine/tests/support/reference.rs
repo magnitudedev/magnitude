@@ -1,18 +1,20 @@
 //! Numerical fixture harness. The structured interpreter is the semantic oracle and
-//! runs every fixture under two partitionings; Metal goes through joint selection and
-//! the ordinary runtime. Neither path accepts an implementation choice from a test.
+//! runs every fixture under two partitionings; Metal goes through the sealed
+//! compiler pipeline and submission. Neither path accepts an implementation
+//! choice from a test.
 #![allow(dead_code)]
 use seismic_lang::interp::value::Backing;
 pub use seismic_lang::interp::value::Value as InterpValue;
 pub use seismic_lang::interp::{Arg, Bindings as InterpBindings, Interpreter, TensorData};
 use seismic_lang::{
-    precision::PrecisionPolicy,
+    logical::specialization::{ShapeBinding, SpecializationDomain},
     sir::{Definition, Program},
     types::{DType, Elem, ExtentExpr, TensorType, ValueType},
 };
-pub use seismic_runtime::Workload;
 use seismic_runtime::{
-    plan::{Bindings, PlanCompiler},
+    invocation::Bindings,
+    plan::{InvocationResults, PlanCompiler},
+    submission::Submission,
     Buffer,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -76,25 +78,58 @@ fn elements<'t>(
     }
     elements
 }
-pub fn workload(shapes: &HashMap<String, i64>, elements: &HashMap<String, Elem>) -> Workload {
-    Workload {
-        shapes: shapes.iter().map(|(n, v)| (n.clone(), *v)).collect(),
-        elems: elements
-            .iter()
-            .map(|(n, e)| (n.clone(), e.clone()))
-            .collect(),
-        extents: BTreeMap::new(),
-        precision: PrecisionPolicy::default(),
+
+/// Interpreter shape/element bindings of one geometry.
+fn interp_bindings(
+    shapes: &HashMap<String, i64>,
+    elements: &HashMap<String, Elem>,
+) -> InterpBindings {
+    InterpBindings {
+        shapes: shapes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        elems: elements.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
 }
 
-/// Interpreter shape/element bindings of one workload.
-fn interp_bindings(workload: &Workload) -> InterpBindings {
-    InterpBindings {
-        shapes: workload.shapes.clone(),
-        elems: workload.elems.clone(),
-    }
+/// The complete specialization domain of one entry geometry: every shape
+/// bound exactly and every element parameter concretized by its tensor.
+fn domain(
+    program: &Program,
+    name: &str,
+    shapes: &HashMap<String, i64>,
+    elements: &HashMap<String, Elem>,
+) -> SpecializationDomain {
+    SpecializationDomain::new(
+        program,
+        name,
+        shapes
+            .iter()
+            .map(|(n, v)| {
+                let value = u64::try_from(*v)
+                    .unwrap_or_else(|_| panic!("shape {n}={v} is not a valid extent"));
+                (n.clone(), ShapeBinding::Exact(value))
+            })
+            .collect(),
+        elements
+            .iter()
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect(),
+    )
+    .unwrap_or_else(|error| panic!("{name}: {error}"))
 }
+
+/// The specialization domain of one entry over bound tensors: element
+/// parameters concretized by their tensors, every shape bound exactly.
+pub fn tensor_domain(
+    program: &Program,
+    name: &str,
+    shapes: &HashMap<String, i64>,
+    tensors: &HashMap<String, TensorData>,
+) -> SpecializationDomain {
+    let definition = entry(program, name);
+    let bound = elements(definition, |parameter, _| &tensors[parameter]);
+    domain(program, name, shapes, &bound)
+}
+
 /// Positional interpreter call; tensors may alias by naming one id twice.
 /// Returns the entry's result value.
 pub fn run(
@@ -116,18 +151,18 @@ pub fn run_with_elements(
     extra: &HashMap<String, Elem>,
 ) -> InterpValue {
     let tensors = &vm.tensors;
-    let mut elements = elements(entry(vm.program, name), |parameter, ordinal| {
+    let mut bound = elements(entry(vm.program, name), |parameter, ordinal| {
         match &args[ordinal] {
             Arg::Tensor(id) => &tensors[*id],
             Arg::Scalar(_) | Arg::Range(..) => panic!("{name}.{parameter} is a tensor"),
         }
     });
     for (name, element) in extra {
-        elements
+        bound
             .entry(name.clone())
             .or_insert_with(|| element.clone());
     }
-    vm.run(name, args, &interp_bindings(&workload(shapes, &elements)))
+    vm.run(name, args, &interp_bindings(shapes, &bound))
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 /// Zeroed dense storage for every tensor parameter; `dtype` resolves element parameters.
@@ -176,6 +211,7 @@ pub fn values(tensor: &TensorData) -> Vec<f32> {
 struct Bound<'a> {
     buffers: HashMap<String, HashMap<String, Buffer>>,
     scalars: &'a HashMap<String, f64>,
+    shapes: &'a HashMap<String, i64>,
 }
 impl Bindings for Bound<'_> {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
@@ -183,6 +219,9 @@ impl Bindings for Bound<'_> {
     }
     fn scalar(&self, name: &str) -> Option<f64> {
         self.scalars.get(name).copied()
+    }
+    fn shape(&self, name: &str) -> Option<u64> {
+        self.shapes.get(name).and_then(|v| u64::try_from(*v).ok())
     }
 }
 /// Tensor result leaves by canonical path.
@@ -248,14 +287,14 @@ fn publish_interpreted(value: &InterpValue, tensors: &mut HashMap<String, Tensor
 
 /// Publish compiler-allocated result planes under `result{leaf}` names.
 fn publish_compiled(
-    results: &seismic_runtime::plan::InvocationResults,
+    results: &InvocationResults,
     definition: &Definition,
     shapes: &HashMap<String, i64>,
     elements: &HashMap<String, Elem>,
     tensors: &mut HashMap<String, TensorData>,
 ) {
     let leaves = tensor_leaf_paths(&definition.result);
-    for plane in results {
+    for plane in &results.planes {
         if !plane.plane.is_empty() {
             continue;
         }
@@ -305,9 +344,9 @@ impl Backend<'_> {
         shapes: &HashMap<String, i64>,
         tensors: &mut HashMap<String, TensorData>,
         scalars: &HashMap<String, f64>,
-    ) -> Option<(seismic_runtime::Selection, Workload)> {
+    ) {
         let definition = entry(self.program(), name).clone();
-        let elements = elements(&definition, |parameter, _| &tensors[parameter]);
+        let bound_elements = elements(&definition, |parameter, _| &tensors[parameter]);
         match self {
             Backend::Interpreter(program, extra_elements) => {
                 let mut vm = interpreter(program);
@@ -324,25 +363,28 @@ impl Backend<'_> {
                         _ => Arg::Scalar(scalars[&param.name]),
                     })
                     .collect::<Vec<_>>();
-                let mut bound = elements.clone();
+                let mut elements = bound_elements.clone();
                 for (name, element) in extra_elements {
-                    bound.entry(name.clone()).or_insert_with(|| element.clone());
+                    elements.entry(name.clone()).or_insert_with(|| element.clone());
                 }
                 let value = vm
-                    .run(name, &args, &interp_bindings(&workload(shapes, &bound)))
+                    .run(name, &args, &interp_bindings(shapes, &elements))
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 for (parameter, id) in ids {
                     tensors.insert(parameter, vm.tensors[id].clone());
                 }
                 publish_interpreted(&value, tensors);
-                None
             }
             Backend::Metal(compiler) => {
-                let mut plan = compiler.compile_entry(name, shapes, &elements).unwrap();
+                let domain = domain(compiler.program(), name, shapes, &bound_elements);
+                let plan = compiler
+                    .compile_entry(&domain)
+                    .unwrap_or_else(|e| panic!("{name} compile: {e}"));
                 let device = compiler.device();
                 let mut bound = Bound {
                     buffers: HashMap::new(),
                     scalars,
+                    shapes,
                 };
                 for (parameter, tensor) in tensors.iter() {
                     let planes = match tensor {
@@ -360,9 +402,13 @@ impl Backend<'_> {
                         .collect();
                     bound.buffers.insert(parameter.clone(), buffers);
                 }
-                let results = plan
-                    .execute_with_results(&bound)
-                    .unwrap_or_else(|e| panic!("{name} on metal: {e}"));
+                let invocation = plan
+                    .prepare(&bound)
+                    .unwrap_or_else(|e| panic!("{name} prepare on metal: {e}"));
+                let results = Submission::single(invocation)
+                    .execute()
+                    .unwrap_or_else(|e| panic!("{name} execute on metal: {e}"))
+                    .remove(0);
                 for (parameter, tensor) in tensors.iter_mut() {
                     if matches!(tensor, TensorData::Dense { .. }) {
                         let buffer = &bound.buffers[parameter][""];
@@ -371,16 +417,7 @@ impl Backend<'_> {
                         tensor.load_device_bytes(&bytes);
                     }
                 }
-                publish_compiled(&results, &definition, shapes, &elements, tensors);
-                let kernel = plan.kernel().unwrap();
-                let selection = kernel.borrow().selection().clone();
-                Some((
-                    selection,
-                    Workload {
-                        precision: compiler.settings().precision,
-                        ..workload(shapes, &elements)
-                    },
-                ))
+                publish_compiled(&results, &definition, shapes, &bound_elements, tensors);
             }
         }
     }

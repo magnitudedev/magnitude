@@ -1,7 +1,7 @@
 #[path = "support/reference.rs"]
 mod reference;
 use reference::{Arg, TensorData};
-use seismic_engine::weights::{
+use magnitude_engine::weights::{
     descriptor::{Stored, Transform, WeightDescriptor},
     gguf::Encoding,
     residency::{block_import, Importer},
@@ -121,13 +121,18 @@ fn reference_gguf_import() {
 #[test]
 #[ignore = "requires a Metal device"]
 fn metal_gguf_residency() {
+    use seismic_lang::logical::specialization::{ShapeBinding, SpecializationDomain};
     use seismic_runtime::{
-        plan::{Bindings, PlanCompiler, Settings},
+        invocation::Bindings,
+        plan::{PlanCompiler, Settings},
+        submission::Submission,
         Buffer, Device,
     };
+    use std::collections::BTreeMap;
     struct Decode<'a> {
-        source: &'a seismic_engine::weights::residency::ResidentWeight,
+        source: &'a magnitude_engine::weights::residency::ResidentWeight,
         out: &'a Buffer,
+        count: usize,
     }
     impl Bindings for Decode<'_> {
         fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
@@ -139,6 +144,9 @@ fn metal_gguf_residency() {
         }
         fn scalar(&self, _: &str) -> Option<f64> {
             Some(0.)
+        }
+        fn shape(&self, name: &str) -> Option<u64> {
+            (name == "N").then_some(self.count as u64)
         }
     }
     let program = seismic_std::program().unwrap();
@@ -191,21 +199,29 @@ fn metal_gguf_residency() {
         // Representation storage is compact; the independent V3 fixture supplies the
         // decoded values, widened here through the ordinary selected runtime.
         let out = device.buffer(count * 4).unwrap();
-        compiler
-            .compile_entry(
-                "import_weight",
-                &HashMap::from([("N".into(), count as i64)]),
-                &HashMap::from([
-                    ("T".into(), resident.element().clone()),
-                    ("U".into(), Elem::Dtype(DType::F32)),
-                ]),
-            )
+        let domain = SpecializationDomain::new(
+            &program,
+            "import_weight",
+            BTreeMap::from([(
+                "N".to_string(),
+                ShapeBinding::Exact(count as u64),
+            )]),
+            BTreeMap::from([
+                ("T".to_string(), resident.element().clone()),
+                ("U".to_string(), Elem::Dtype(DType::F32)),
+            ]),
+        )
+        .unwrap();
+        let invocation = compiler
+            .compile_entry(&domain)
             .unwrap()
-            .execute(&Decode {
+            .prepare(&Decode {
                 source: &resident,
                 out: &out,
+                count,
             })
             .unwrap();
+        Submission::single(invocation).execute().unwrap();
         let mut actual = vec![0; count * 4];
         out.read(&mut actual).unwrap();
         check(

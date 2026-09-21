@@ -1,21 +1,40 @@
-//! Timing probe for one linked entry on Metal: selects, compiles, binds random tensors and
-//! reports the resolved physical assignment, its estimate, and measured time per invocation
-//! (best of several observed runs) and per invocation inside one sequential batch.
+//! Timing probe for one linked entry on Metal: compiles one specialization
+//! domain, binds random tensors, and reports the resolved physical
+//! assignment, its estimate, and measured time per invocation (best of
+//! several observed runs) and per invocation inside one sequential batch.
 //!
 //! usage: probe <source dir>... -- <entry> <K=V,...> <NAME=elem,...|-> [scalar=v,...|-] [name=v:v:...;...|-] [exact]
 use seismic_lang::interp::{Rng, TensorData};
+use seismic_lang::logical::specialization::{ShapeBinding, SpecializationDomain};
 use seismic_lang::program::{collect_files, compile};
 use seismic_lang::repr;
 use seismic_lang::sir::Mode;
 use seismic_lang::types::{DType, Elem};
 use seismic_lang::types::{ExtentExpr, ValueType};
-use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
+use seismic_runtime::invocation::Bindings;
+use seismic_runtime::plan::{CompiledArtifact, PlanCompiler, Settings};
+use seismic_runtime::submission::Submission;
 use seismic_runtime::{Buffer, Device};
-use std::collections::HashMap;
+use seismic_realization::kernel::ExecutableDialect;
+use seismic_realization::physical::PhysicalPlan;
+use std::collections::{BTreeMap, HashMap};
+
+fn report<D: ExecutableDialect>(physical: &PhysicalPlan<D>) {
+    println!(
+        "physical estimate {}, optimal={}, launches={}",
+        physical.estimated_cost(),
+        physical.optimal(),
+        physical.launches().len(),
+    );
+    println!("assignment {:?}", physical.identity().selections);
+    println!("resources {:?}", physical.resources());
+    println!("numerics {:?}", physical.numerical());
+}
 
 struct Bound {
     buffers: HashMap<(String, String), Buffer>,
     scalars: HashMap<String, f64>,
+    shapes: HashMap<String, i64>,
 }
 impl Bindings for Bound {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
@@ -23,6 +42,9 @@ impl Bindings for Bound {
     }
     fn scalar(&self, name: &str) -> Option<f64> {
         self.scalars.get(name).copied()
+    }
+    fn shape(&self, name: &str) -> Option<u64> {
+        self.shapes.get(name).and_then(|v| u64::try_from(*v).ok())
     }
 }
 
@@ -41,12 +63,12 @@ fn main() -> Result<(), String> {
         .position(|a| a == "--")
         .ok_or("usage: probe <dir>... -- <entry> <shapes> <elems> [scalars] [contents]")?;
     let (dirs, rest) = (&args[..split], &args[split + 1..]);
-    let entry = rest.first().ok_or("missing entry")?;
+    let entry = rest.first().ok_or("missing entry")?.clone();
     let shapes: HashMap<String, i64> = pairs(rest.get(1).ok_or("missing shapes")?)
         .into_iter()
         .map(|(k, v)| Ok((k, v.parse::<i64>().map_err(|e| e.to_string())?)))
         .collect::<Result<_, String>>()?;
-    let elems: HashMap<String, Elem> = pairs(rest.get(2).map_or("-", String::as_str))
+    let elems: BTreeMap<String, Elem> = pairs(rest.get(2).map_or("-", String::as_str))
         .into_iter()
         .map(|(k, v)| {
             let elem = match DType::from_name(&v) {
@@ -83,7 +105,7 @@ fn main() -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let family = program.resolve_family(entry)?;
+    let family = program.resolve_family(&entry)?;
     let definition = family
         .bodies
         .iter()
@@ -91,7 +113,7 @@ fn main() -> Result<(), String> {
         .map(|id| program.definition(*id))
         .next()
         .ok_or("entry has no implementation")?;
-    let device = Device::metal()?;
+    let device = Device::metal().map_err(|e| e.to_string())?;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut buffers = HashMap::new();
     for param in &definition.params {
@@ -115,7 +137,7 @@ fn main() -> Result<(), String> {
             .collect::<Result<Vec<_>, String>>()?;
         let elem = match &shaped.elem {
             Elem::Param(p) => elems
-                .get(p.as_str())
+                .get(p)
                 .ok_or_else(|| format!("unbound element {p}"))?,
             concrete => concrete,
         };
@@ -155,13 +177,31 @@ fn main() -> Result<(), String> {
             );
         }
     }
-    let bound = Bound { buffers, scalars };
     let precision = if rest.get(5).is_some_and(|mode| mode == "unconstrained") {
         seismic_lang::precision::PrecisionPolicy::Unconstrained
     } else {
         seismic_lang::precision::PrecisionPolicy::Exact
     };
-    let mut plan = PlanCompiler::new(
+    let domain = SpecializationDomain::new(
+        &program,
+        &entry,
+        shapes
+            .iter()
+            .map(|(n, v)| {
+                let value = u64::try_from(*v)
+                    .map_err(|_| format!("shape {n}={v} is not a valid extent"))?;
+                Ok((n.clone(), ShapeBinding::Exact(value)))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?,
+        elems,
+    )
+    .map_err(|e| e.to_string())?;
+    let bound = Bound {
+        buffers,
+        scalars,
+        shapes,
+    };
+    let plan = PlanCompiler::new(
         &device,
         &program,
         Settings {
@@ -169,78 +209,52 @@ fn main() -> Result<(), String> {
             ..Settings::default()
         },
     )
-    .compile_entry(entry, &shapes, &elems)?;
-    let kernel = plan.kernel().map_err(|e| format!("compile: {e}"))?;
-    {
-        let kernel = kernel.borrow();
-        let selection = kernel.selection();
-        println!(
-            "physical estimate {}, optimal={}, compile={:.3}s",
-            selection.estimated_cost,
-            selection.optimal,
-            selection.compile.as_secs_f64()
-        );
-        println!(
-            "assignment {:?}",
-            selection
-                .assignment
-                .selections()
-                .iter()
-                .map(|(choice, alternative)| {
-                    (
-                        *choice,
-                        (
-                            alternative.logical_alternative,
-                            alternative.physical_alternative,
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "resources {:?}",
-            selection
-                .resources
-                .iter()
-                .map(|resource| (
-                    resource.launch.0,
-                    resource.workgroups,
-                    resource.threads_per_group,
-                    resource.device_bytes,
-                    resource.workgroup_bytes,
-                    resource.private_bytes_per_participant,
-                ))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "numerics {:?} evidence {:?}",
-            selection.numerical_assessment.evidence, selection.numerical_evidence_identity
-        );
-    }
-    let mut best_host = f64::INFINITY;
-    let mut best_device = f64::INFINITY;
-    for _ in 0..12 {
-        let steps = plan.execute_observed(&bound)?;
-        for step in steps {
-            best_host = best_host.min(step.execution.host_seconds);
-            if let Some(seconds) = step.execution.device_seconds {
-                best_device = best_device.min(seconds);
+    .compile_entry(&domain)
+    .map_err(|e| e.to_string())?;
+    match plan.artifact() {
+        artifact => {
+            if let Some(physical) = artifact.physical_cpu() {
+                report(physical);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(physical) = artifact.physical_metal() {
+                report(physical);
+            }
+            if let Some(physical) = artifact.physical_cuda() {
+                report(physical);
             }
         }
     }
-    println!("best host {:.1} us", best_host * 1e6);
-    if best_device.is_finite() {
-        println!("best device {:.1} us", best_device * 1e6);
+    let mut best_host = f64::INFINITY;
+    for _ in 0..12 {
+        let observed = Submission::single(
+            plan.prepare(&bound).map_err(|e| e.to_string())?,
+        )
+        .execute_observed()
+        .map_err(|e| e.to_string())?;
+        for (_, observation) in observed {
+            best_host = best_host.min(observation.host_seconds);
+        }
     }
+    println!("best host {:.1} us", best_host * 1e6);
     let mut batched = f64::INFINITY;
     for _ in 0..8 {
-        let mut submission = plan.prepare(&bound)?;
+        let mut submission = Submission::single(
+            plan.prepare(&bound).map_err(|e| e.to_string())?,
+        );
         for _ in 1..200 {
-            submission.append(plan.prepare(&bound)?);
+            submission.append(Submission::single(
+                plan.prepare(&bound).map_err(|e| e.to_string())?,
+            ));
         }
-        if let Some(seconds) = submission.execute_batched()?.device_seconds {
-            batched = batched.min(seconds / 200.0);
-        }
+        let observed = submission
+            .execute_observed()
+            .map_err(|e| e.to_string())?;
+        let total: f64 = observed
+            .into_iter()
+            .map(|(_, observation)| observation.host_seconds)
+            .sum();
+        batched = batched.min(total / 200.0);
     }
     println!("batched x200: {:.1} us per invocation", batched * 1e6);
     Ok(())

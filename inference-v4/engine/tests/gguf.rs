@@ -1,5 +1,5 @@
 //! Cases mirror V3 tests/weights/test_gguf.py, including its source byte layout.
-use seismic_engine::weights::gguf::{self, ByteOrder, Encoding, Scalar, Value};
+use magnitude_engine::weights::gguf::{self, ByteOrder, Encoding, Scalar, Value};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 struct Bytes {
     value: Vec<u8>,
@@ -67,7 +67,7 @@ fn container(
 fn entry() -> Entry<'static> {
     ("weight", vec![256, 2], Encoding::Q4K as u32, 0)
 }
-fn read(bytes: Vec<u8>) -> Result<gguf::Directory, seismic_engine::weights::Error> {
+fn read(bytes: Vec<u8>) -> Result<gguf::Directory, magnitude_engine::weights::Error> {
     gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT)
 }
 #[test]
@@ -230,7 +230,7 @@ fn declaration_order_does_not_depend_on_physical_order() {
 
 #[test]
 fn artifact_pins_validated_source_and_codec_descriptions() {
-    use seismic_engine::weights::descriptor::{Stored, Transform, WeightDescriptor};
+    use magnitude_engine::weights::descriptor::{Stored, Transform, WeightDescriptor};
     let root = std::env::temp_dir().join(format!("seismic-gguf-artifact-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("model.gguf");

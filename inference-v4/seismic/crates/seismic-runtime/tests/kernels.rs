@@ -2,15 +2,18 @@
 //! Metal, agrees with the reference interpreter. The same case table runs on the CPU device
 //! under exact precision, where every output must be bit-identical to the interpreter.
 use seismic_lang::interp::{Arg, Bindings as InterpBindings, Interpreter, Rng, TensorData};
+use seismic_lang::logical::specialization::{ShapeBinding, SpecializationDomain};
 use seismic_lang::precision::{compare_dense, Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 use seismic_lang::repr;
 use seismic_lang::sir::Mode;
 use seismic_lang::sir::{Definition, Program};
 use seismic_lang::types::{DType, Elem, ExtentExpr, ValueType};
-use seismic_runtime::plan::{Bindings, PlanCompiler, Settings};
-use seismic_runtime::{Buffer, Device, Workload};
+use seismic_runtime::invocation::Bindings;
+use seismic_runtime::plan::{PlanCompiler, Settings};
+use seismic_runtime::submission::Submission;
+use seismic_runtime::{Buffer, Device};
 use seismic_std::sweep::{cases, packed_cases, Case};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn abi<'a>(program: &'a Program, entry: &str) -> Result<&'a Definition, String> {
     let family = program.resolve_family(entry)?;
@@ -31,16 +34,20 @@ fn element(name: &str) -> Result<Elem, String> {
     }
 }
 
-struct Bound {
+struct Bound<'a> {
     buffers: HashMap<(String, String), Buffer>,
     scalars: HashMap<String, f64>,
+    shapes: &'a BTreeMap<String, i64>,
 }
-impl Bindings for Bound {
+impl Bindings for Bound<'_> {
     fn buffer(&self, root: &str, plane: &str) -> Option<&Buffer> {
         self.buffers.get(&(root.to_string(), plane.to_string()))
     }
     fn scalar(&self, name: &str) -> Option<f64> {
         self.scalars.get(name).copied()
+    }
+    fn shape(&self, name: &str) -> Option<u64> {
+        self.shapes.get(name).and_then(|v| u64::try_from(*v).ok())
     }
 }
 
@@ -53,20 +60,16 @@ fn run(
     seed: u64,
 ) -> Result<f64, String> {
     let definition = abi(program, case.entry)?;
-    let workload = Workload {
-        shapes: case
-            .shapes
-            .iter()
-            .map(|(n, v)| (n.to_string(), *v))
-            .collect(),
-        elems: case
-            .elems
-            .iter()
-            .map(|(n, e)| Ok((n.to_string(), element(e)?)))
-            .collect::<Result<_, String>>()?,
-        precision: precision.clone(),
-        extents: Default::default(),
-    };
+    let shapes: BTreeMap<String, i64> = case
+        .shapes
+        .iter()
+        .map(|(n, v)| (n.to_string(), *v))
+        .collect();
+    let elems: BTreeMap<String, Elem> = case
+        .elems
+        .iter()
+        .map(|(n, e)| Ok((n.to_string(), element(e)?)))
+        .collect::<Result<_, String>>()?;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
     let mut tensors: Vec<(String, bool, TensorData)> = Vec::new();
     let mut args = Vec::new();
@@ -79,7 +82,7 @@ fn run(
                     .iter()
                     .map(|axis| match axis {
                         ExtentExpr::Sym(sym) => sym
-                            .eval(&|n| workload.shapes.get(n).copied())
+                            .eval(&|n| shapes.get(n).copied())
                             .and_then(|v| usize::try_from(v).ok())
                             .ok_or_else(|| format!("{}: unresolved extent {sym}", param.name)),
                         ExtentExpr::Static(value) => usize::try_from(*value)
@@ -90,8 +93,7 @@ fn run(
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let elem = match &shaped.elem {
-                    Elem::Param(p) => workload
-                        .elems
+                    Elem::Param(p) => elems
                         .get(p)
                         .ok_or_else(|| format!("unbound element {p}"))?,
                     concrete => concrete,
@@ -161,16 +163,29 @@ fn run(
     let mut interpreter = Interpreter::new(program);
     interpreter.tensors = tensors.iter().map(|(_, _, t)| t.clone()).collect();
     let interpreter_bindings = InterpBindings {
-        shapes: workload.shapes.clone(),
-        elems: workload.elems.clone(),
+        shapes: shapes.clone().into_iter().collect(),
+        elems: elems.clone().into_iter().collect(),
     };
     interpreter
         .run(case.entry, &args, &interpreter_bindings)
         .map_err(|e| format!("interpreter: {e}"))?;
 
-    let shapes: HashMap<String, i64> = workload.shapes.clone().into_iter().collect();
-    let elems: HashMap<String, Elem> = workload.elems.clone().into_iter().collect();
-    let mut plan = PlanCompiler::new(
+    let domain = SpecializationDomain::new(
+        program,
+        case.entry,
+        shapes
+            .iter()
+            .map(|(n, v)| {
+                let Ok(value) = u64::try_from(*v) else {
+                    return Err(format!("shape {n}={v} is not a valid extent"));
+                };
+                Ok((n.clone(), ShapeBinding::Exact(value)))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?,
+        elems.clone(),
+    )
+    .map_err(|e| format!("specialize: {e}"))?;
+    let plan = PlanCompiler::new(
         device,
         program,
         Settings {
@@ -178,8 +193,8 @@ fn run(
             ..Settings::default()
         },
     )
-    .compile_entry(case.entry, &shapes, &elems)?;
-    plan.kernel().map_err(|e| format!("compile: {e}"))?;
+    .compile_entry(&domain)
+    .map_err(|e| format!("compile: {e}"))?;
     let mut buffers = HashMap::new();
     for (name, _, tensor) in &tensors {
         let planes: Vec<String> = match tensor {
@@ -197,8 +212,17 @@ fn run(
             );
         }
     }
-    let bound = Bound { buffers, scalars };
-    plan.execute(&bound).map_err(|e| format!("execute: {e}"))?;
+    let bound = Bound {
+        buffers,
+        scalars,
+        shapes: &shapes,
+    };
+    let prepared = plan
+        .prepare(&bound)
+        .map_err(|e| format!("prepare: {e}"))?;
+    Submission::single(prepared)
+        .execute()
+        .map_err(|e| format!("execute: {e}"))?;
 
     let mut worst = 0.0f64;
     for (index, (name, written, tensor)) in tensors.iter().enumerate() {
@@ -209,7 +233,9 @@ fn run(
             return Err(format!("{name}: packed output"));
         };
         let mut bytes = vec![0u8; data.len() * dtype.bytes() as usize];
-        bound.buffers[&(name.clone(), String::new())].read(&mut bytes)?;
+        bound.buffers[&(name.clone(), String::new())]
+            .read(&mut bytes)
+            .map_err(|e| e.to_string())?;
         let mut actual = tensor.clone();
         actual.load_device_bytes(&bytes);
         let expected = &interpreter.tensors[index];

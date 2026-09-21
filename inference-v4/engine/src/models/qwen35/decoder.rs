@@ -1,39 +1,35 @@
 //! Qwen sequence forwards and multi-request generation. Sequence successors
 //! remain private until shared completion and independent request acceptance.
+//! Every numerical composition is prepared once, eagerly, under the decoder's
+//! declared workload envelope; a forward selects prepared capacity classes
+//! and never compiles.
+mod conditioning;
 mod packed;
 use super::{Description, FeedForwardWeights, Geometry, HeadMapping, MixerWeights};
 use crate::{
-    execution::{Composition, CompositionSpec, IntegerRange},
+    execution::{self, StageBatch},
     generation::{
         sampling::{Sampler, Selection},
         Proposal, Sampling,
     },
     models::sequence::{Advance, OwnedSequence, SequenceWork},
+    preparation::{
+        CompositionSpec, EnvelopeShape, IntegerRange, PreparedComposition, PreparationSession,
+        Settings, WorkloadEnvelope,
+    },
     state::{ComponentSpec, SequenceState, StateAdvance, StateStore},
     weights::{descriptor::WeightDescriptor, residency::ResidentWeight},
+    Error,
 };
-use packed::PackedRows;
+use conditioning::{Conditioning, PreparedOverlay};
 use seismic_lang::types::{DType, Elem};
-use seismic_runtime::{
-    plan::{InvocationResults, PlanCompiler, Settings, StepObservation, Submission},
-    Buffer, Device, Error, ExecutionObservation,
-};
+use seismic_runtime::{plan::InvocationResults, Buffer, Device, ExecutionObservation};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
 };
 fn names(xs: &[&str]) -> HashSet<String> {
     xs.iter().map(|s| (*s).into()).collect()
-}
-fn shape(xs: &[(&str, u64)]) -> Result<HashMap<String, i64>, String> {
-    xs.iter()
-        .map(|(s, n)| {
-            Ok((
-                (*s).into(),
-                i64::try_from(*n).map_err(|_| "dimension exceeds index range")?,
-            ))
-        })
-        .collect()
 }
 fn weights(xs: Vec<(&str, ResidentWeight)>) -> HashMap<String, ResidentWeight> {
     xs.into_iter().map(|(n, w)| (n.into(), w)).collect()
@@ -41,16 +37,34 @@ fn weights(xs: Vec<(&str, ResidentWeight)>) -> HashMap<String, ResidentWeight> {
 fn scalar(xs: &[(&str, f64)]) -> HashMap<String, f64> {
     xs.iter().map(|(n, v)| ((*n).into(), *v)).collect()
 }
+fn exact(value: u64) -> EnvelopeShape {
+    EnvelopeShape::Exact(value)
+}
+fn varying(capacity: u64) -> EnvelopeShape {
+    EnvelopeShape::Bounded {
+        min: 1,
+        max: capacity,
+        expected: 1,
+    }
+}
+/// The declared decoder workload envelope: what invocations the prepared
+/// decoder must admit. Context capacity bounds forward rows and rotary
+/// positions; `max_ranges` bounds attention visibility fragmentation;
+/// `readout_capacity` bounds selected-row readouts. Packed row capacity is
+/// `max_sequences * context_capacity`.
+pub struct DecoderWorkload {
+    pub context_capacity: usize,
+    pub max_sequences: usize,
+    pub max_ranges: usize,
+    pub readout_capacity: usize,
+}
 struct Block {
-    mixer: Composition,
-    feedforward: Composition,
+    mixer: PreparedComposition,
+    feedforward: PreparedComposition,
     state_index: usize,
     attention: bool,
 }
 struct Rows {
-    embedding: Composition,
-    blocks: Vec<Block>,
-    readout: Composition,
     hidden: Buffer,
     logits: Buffer,
     coordinates: Buffer,
@@ -59,7 +73,6 @@ struct Rows {
     destinations: Buffer,
 }
 struct SelectedRows {
-    readout: Composition,
     ids: Buffer,
     logits: Buffer,
 }
@@ -67,54 +80,131 @@ pub struct Decoder {
     geometry: Geometry,
     store: Rc<StateStore>,
     device: Rc<Device>,
-    program: seismic_lang::sir::Program,
-    settings: Settings,
+    conditioning: Conditioning,
     context_capacity: usize,
+    max_ranges: usize,
+    packed_rows: u64,
+    embedding: PreparedComposition,
+    blocks: Vec<Block>,
+    readout: PreparedComposition,
+    selected: PreparedComposition,
+    sampler: Sampler,
     rows: HashMap<(usize, usize), Rows>,
-    sampler: Option<Sampler>,
-    selected_template: Composition,
-    selected: HashMap<(usize, usize), SelectedRows>,
-    packed: HashMap<usize, PackedRows>,
+    selected_rows: HashMap<usize, SelectedRows>,
+    packed: HashMap<usize, packed::PackedBuffers>,
 }
 #[derive(Clone, Debug)]
 pub struct DecoderStepObservation {
     pub stage: String,
     pub block: Option<usize>,
-    pub step: StepObservation,
+    pub entry: String,
+    pub execution: ExecutionObservation,
+}
+struct ConditionedInput<'a> {
+    coordinates: &'a [[i32; 4]],
+    overlays: &'a [PreparedOverlay],
+}
+fn forward_shapes(count: usize) -> BTreeMap<String, u64> {
+    BTreeMap::from([("M".into(), count as u64)])
+}
+fn attention_shapes(count: usize, ranges: usize) -> BTreeMap<String, u64> {
+    BTreeMap::from([("M".into(), count as u64), ("R".into(), ranges as u64)])
+}
+fn selected_shapes(count: usize, ids: usize) -> BTreeMap<String, u64> {
+    BTreeMap::from([("M".into(), count as u64), ("S".into(), ids as u64)])
+}
+fn row_hidden_bytes(geometry: &Geometry) -> Result<usize, Error> {
+    usize::try_from(geometry.hidden)
+        .ok()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "residual allocation overflow".into())
+}
+fn logits_bytes(geometry: &Geometry) -> Result<usize, Error> {
+    usize::try_from(geometry.vocabulary)
+        .ok()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "logits allocation overflow".into())
+}
+fn rows_entry<'a>(
+    geometry: &Geometry,
+    device: &Rc<Device>,
+    rows: &'a mut HashMap<(usize, usize), Rows>,
+    count: usize,
+    ranges: usize,
+    context_capacity: usize,
+) -> Result<&'a mut Rows, Error> {
+    if count == 0 || ranges == 0 || count > context_capacity {
+        return Err("invalid forward row count".into());
+    }
+    if !rows.contains_key(&(count, ranges)) {
+        let bytes = |width: usize| count.checked_mul(width).ok_or("forward buffer overflow");
+        let visible_width = ranges
+            .checked_mul(8)
+            .ok_or("visibility buffer overflow")?;
+        let allocated = Rows {
+            hidden: device.buffer(bytes(row_hidden_bytes(geometry)?)?)?,
+            logits: device.buffer(logits_bytes(geometry)?)?,
+            coordinates: device.buffer(bytes(16)?)?,
+            visible: device.buffer(bytes(visible_width)?)?,
+            tokens: device.buffer(bytes(4)?)?,
+            destinations: device.buffer(bytes(4)?)?,
+        };
+        rows.insert((count, ranges), allocated);
+    }
+    Ok(rows.get_mut(&(count, ranges)).expect("row buffers prepared"))
+}
+fn selected_entry<'a>(
+    device: &Rc<Device>,
+    context_capacity: usize,
+    selected: &'a mut HashMap<usize, SelectedRows>,
+    ids: usize,
+) -> Result<&'a mut SelectedRows, Error> {
+    if ids == 0 || ids > context_capacity {
+        return Err("selected readout size exceeds the prepared envelope".into());
+    }
+    if !selected.contains_key(&ids) {
+        let bytes = ids
+            .checked_mul(4)
+            .ok_or("selected readout size overflow")?;
+        selected.insert(
+            ids,
+            SelectedRows {
+                ids: device.buffer(bytes)?,
+                logits: device.buffer(bytes)?,
+            },
+        );
+    }
+    Ok(selected.get_mut(&ids).expect("selection prepared"))
 }
 fn execute_stage(
-    composition: &mut Composition,
+    composition: &PreparedComposition,
+    shapes: &BTreeMap<String, u64>,
     tensors: &HashMap<String, Buffer>,
-    scalars: &HashMap<String, f64>,
     stage: &str,
     block: Option<usize>,
     observations: &mut Option<Vec<DecoderStepObservation>>,
-    submission: &mut Option<Submission>,
-) -> Result<InvocationResults, String> {
-    let mut prepared = composition.prepare(tensors, scalars)?;
-    let results = prepared.results_for(0)?.clone();
-    if let Some(submission) = submission {
-        submission.append(prepared);
+    batch: &mut Option<StageBatch>,
+) -> Result<InvocationResults, Error> {
+    let invocation = execution::invoke(composition, shapes, tensors, &HashMap::new())?;
+    let results = execution::result_planes(&invocation);
+    let entry = composition.entry().to_string();
+    if let Some(batch) = batch {
+        batch.add(invocation);
     } else if let Some(observations) = observations {
-        observations.extend(prepared.execute_steps_observed()?.into_iter().map(|step| {
-            DecoderStepObservation {
-                stage: stage.into(),
-                block,
-                step,
-            }
-        }));
+        let (_, observation) = execution::run_observed(invocation)?;
+        observations.push(DecoderStepObservation {
+            stage: stage.into(),
+            block,
+            entry,
+            execution: observation,
+        });
     } else {
-        prepared.execute_sequential()?;
+        execution::run(invocation)?;
     }
     Ok(results)
 }
-
-fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, String> {
-    results
-        .iter()
-        .find(|result| result.path == path && result.plane.is_empty())
-        .map(|result| result.buffer.clone())
-        .ok_or_else(|| format!("owned result path {path:?} has no dense buffer"))
+fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, Error> {
+    execution::result_buffer(results, path).map_err(Error::from)
 }
 /// Explicit numerical output; state-only execution omits the vocabulary projection.
 pub enum Readout<'a> {
@@ -162,7 +252,7 @@ impl ExecutedAdvance<'_> {
         self.advance.commit()
     }
     pub fn abort(self) {
-        self.advance.abort()
+        self.advance.abort();
     }
 }
 pub struct ConditionedAdvance<'a> {
@@ -206,7 +296,7 @@ impl DecodedAdvance<'_> {
         self.advance.commit()
     }
     pub fn abort(self) {
-        self.advance.abort()
+        self.advance.abort();
     }
 }
 /// Logical members of one numerical preparation; masks are request-local.
@@ -298,56 +388,77 @@ impl Decoder {
             Ok(selected)
         })
     }
-    /// Import callbacks resolve container storage and preserve each declared
-    /// target publication. Packed resident representations remain packed.
+    /// Prepare the whole decoder under one declared workload envelope. Every
+    /// capacity class of every composition is compiled and natively sealed
+    /// before the decoder is returned; a failure retains nothing.
     pub fn compile(
         device: Rc<Device>,
         description: &Description,
         mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, String>,
         settings: Settings,
-        context_capacity: usize,
-        max_sequences: usize,
+        workload: DecoderWorkload,
     ) -> Result<Self, Error> {
         let g = &description.geometry;
         g.validate().map_err(|e| e.to_string())?;
         if description.blocks.len() != g.layers.len() {
             return Err("decoder requires complete block descriptors".into());
         }
+        let DecoderWorkload {
+            context_capacity,
+            max_sequences,
+            max_ranges,
+            readout_capacity,
+        } = workload;
         if context_capacity == 0
             || context_capacity as u64 > g.context_limit
             || context_capacity > i32::MAX as usize
             || max_sequences == 0
+            || max_ranges == 0
+            || max_ranges > context_capacity
+            || readout_capacity == 0
+            || readout_capacity > context_capacity
         {
-            return Err("invalid decoder context or sequence capacity".into());
+            return Err("invalid decoder workload envelope".into());
         }
         let history_capacity = context_capacity
             .checked_mul(max_sequences)
             .filter(|n| *n <= i32::MAX as usize)
             .ok_or("history capacity overflow")?;
+        let packed_rows = u64::try_from(
+            max_sequences
+                .checked_mul(context_capacity)
+                .ok_or("packed capacity overflow")?,
+        )
+        .ok()
+        .filter(|&n| n <= i64::from(i32::MAX) as u64)
+        .ok_or("packed capacity exceeds index domain")?;
         let program = super::program::program()?;
-        let mut compiler = PlanCompiler::new(&device, &program, settings.clone());
+        let mut session = PreparationSession::new(&device, &program, settings.clone());
         let activation = g.activation_dtype;
-        let mut bound =
-            |entry: &str, shapes, weights, external: &[&str], intermediates: &[&str], scalars| {
-                Composition::compile(
-                    &mut compiler,
-                    CompositionSpec {
-                        entry: entry.into(),
-                        shapes,
-                        elements: HashMap::from([("A".into(), Elem::Dtype(activation))]),
-                        weights,
-                        external: names(external),
-                        intermediates: names(intermediates),
-                        scalars,
-                    },
-                )
-            };
+        let elements = BTreeMap::from([("A".into(), Elem::Dtype(activation))]);
+        let mut bound = |entry: &str,
+                         shapes: BTreeMap<String, EnvelopeShape>,
+                         bound_weights: HashMap<String, ResidentWeight>,
+                         external: &[&str],
+                         bound_scalars: HashMap<String, f64>| {
+            session.prepare(CompositionSpec {
+                entry: entry.into(),
+                envelope: WorkloadEnvelope::geometric(shapes, elements.clone())?,
+                weights: bound_weights,
+                external: names(external),
+                intermediates: HashSet::new(),
+                scalars: bound_scalars,
+            })
+        };
         let embedding = bound(
             "qwen_embedding_rows",
-            shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
+            BTreeMap::from([
+                ("M".into(), varying(packed_rows)),
+                ("V".into(), exact(g.vocabulary)),
+                ("D".into(), exact(g.hidden)),
+            ]),
             weights(vec![("table", import(&description.embedding, activation)?)]),
             &["tokens"],
-            &[],
             HashMap::new(),
         )?
         .control_domain(
@@ -357,6 +468,37 @@ impl Decoder {
                 max: i128::from(g.vocabulary) - 1,
             },
         )?;
+        let attention_envelope = BTreeMap::from([
+            ("M".into(), varying(context_capacity as u64)),
+            ("D".into(), exact(g.hidden)),
+            ("T".into(), exact(history_capacity as u64)),
+            ("R".into(), varying(max_ranges as u64)),
+            ("G".into(), exact(g.attention_heads / g.kv_heads)),
+            ("KV".into(), exact(g.kv_heads)),
+            ("P".into(), exact(g.rotary_width / 2)),
+            (
+                "S".into(),
+                exact(g.attention_width - g.rotary_width),
+            ),
+            ("SH".into(), exact(g.rotary_sections[1])),
+            ("SW".into(), exact(g.rotary_sections[2])),
+        ]);
+        let recurrent_envelope = BTreeMap::from([
+            ("M".into(), varying(context_capacity as u64)),
+            ("H".into(), exact(g.hidden)),
+            ("NK".into(), exact(g.recurrent_key_heads)),
+            (
+                "GV".into(),
+                exact(g.recurrent_value_heads / g.recurrent_key_heads),
+            ),
+            ("W".into(), exact(g.recurrent_width)),
+            ("C".into(), exact(g.convolution_width)),
+        ]);
+        let dense_envelope = BTreeMap::from([
+            ("M".into(), varying(context_capacity as u64)),
+            ("H".into(), exact(g.hidden)),
+            ("F".into(), exact(g.intermediate)),
+        ]);
         let mut blocks = Vec::new();
         let mut components = Vec::new();
         let mut history_rows = Vec::new();
@@ -375,18 +517,7 @@ impl Decoder {
                     history_rows.extend([row_bytes, row_bytes]);
                     let mixer = bound(
                         "qwen_attention_sequence",
-                        shape(&[
-                            ("M", 1),
-                            ("D", g.hidden),
-                            ("T", history_capacity as u64),
-                            ("R", 1),
-                            ("G", g.attention_heads / g.kv_heads),
-                            ("KV", g.kv_heads),
-                            ("P", g.rotary_width / 2),
-                            ("S", g.attention_width - g.rotary_width),
-                            ("SH", g.rotary_sections[1]),
-                            ("SW", g.rotary_sections[2]),
-                        ])?,
+                        attention_envelope.clone(),
                         weights(vec![
                             ("input_norm", input_norm),
                             ("query_gate_weight", import(&a.query_gate, activation)?),
@@ -404,29 +535,27 @@ impl Decoder {
                             "history_key",
                             "history_value",
                         ],
-                        &[],
                         scalar(&[
                             ("base", g.rotary_base),
                             ("epsilon", g.epsilon),
                             ("scale", 1.0 / (g.attention_width as f64).sqrt()),
                         ]),
+                    )?
+                    .control_inputs(&["visible"])?
+                    .control_domain(
+                        "coordinates",
+                        IntegerRange {
+                            min: 0,
+                            max: i128::from(i32::MAX),
+                        },
+                    )?
+                    .control_domain(
+                        "destinations",
+                        IntegerRange {
+                            min: 0,
+                            max: history_capacity as i128 - 1,
+                        },
                     )?;
-                    let mixer = mixer
-                        .control_inputs(&["visible"])?
-                        .control_domain(
-                            "coordinates",
-                            IntegerRange {
-                                min: 0,
-                                max: i128::from(i32::MAX),
-                            },
-                        )?
-                        .control_domain(
-                            "destinations",
-                            IntegerRange {
-                                min: 0,
-                                max: history_capacity as i128 - 1,
-                            },
-                        )?;
                     (mixer, state_index, true)
                 }
                 MixerWeights::Recurrent(r) => {
@@ -450,14 +579,7 @@ impl Decoder {
                     });
                     let mixer = bound(
                         "qwen_recurrent_sequence",
-                        shape(&[
-                            ("M", 1),
-                            ("H", g.hidden),
-                            ("NK", g.recurrent_key_heads),
-                            ("GV", g.recurrent_value_heads / g.recurrent_key_heads),
-                            ("W", g.recurrent_width),
-                            ("C", g.convolution_width),
-                        ])?,
+                        recurrent_envelope.clone(),
                         weights(vec![
                             ("input_norm", input_norm),
                             ("qkv_weight", import(&r.query_key_value, activation)?),
@@ -471,7 +593,6 @@ impl Decoder {
                             ("output_weight", import(&r.output, activation)?),
                         ]),
                         &["hidden", "window", "delta"],
-                        &[],
                         scalar(&[
                             ("epsilon", g.epsilon),
                             ("preparation_epsilon", g.epsilon * g.recurrent_width as f64),
@@ -494,7 +615,7 @@ impl Decoder {
                     }
                     bound(
                         "qwen_dense_suffix",
-                        shape(&[("M", 1), ("H", g.hidden), ("F", g.intermediate)])?,
+                        dense_envelope.clone(),
                         weights(vec![
                             ("norm", import(&block.feedforward_norm, activation)?),
                             ("gate_weight", import(&ff.gate, activation)?),
@@ -502,7 +623,6 @@ impl Decoder {
                             ("down_weight", import(&ff.down, activation)?),
                         ]),
                         &["residual"],
-                        &[],
                         scalar(&[("eps", g.epsilon)]),
                     )?
                 }
@@ -513,14 +633,14 @@ impl Decoder {
                         .ok_or("routed feedforward lacks expert geometry")?;
                     bound(
                         "qwen_routed_suffix",
-                        shape(&[
-                            ("M", 1),
-                            ("H", g.hidden),
-                            ("E", experts.count),
-                            ("K", experts.selected),
-                            ("F", experts.intermediate),
-                            ("S", experts.shared_intermediate),
-                        ])?,
+                        BTreeMap::from([
+                            ("M".into(), varying(context_capacity as u64)),
+                            ("H".into(), exact(g.hidden)),
+                            ("E".into(), exact(experts.count)),
+                            ("K".into(), exact(experts.selected)),
+                            ("F".into(), exact(experts.intermediate)),
+                            ("S".into(), exact(experts.shared_intermediate)),
+                        ]),
                         weights(vec![
                             ("norm", import(&block.feedforward_norm, activation)?),
                             ("router", import(&ff.router, activation)?),
@@ -533,7 +653,6 @@ impl Decoder {
                             ("shared_down", import(&ff.shared_down, activation)?),
                         ]),
                         &["residual"],
-                        &[],
                         scalar(&[
                             ("eps", g.epsilon),
                             ("normalize", f64::from(experts.normalize_selected)),
@@ -552,12 +671,16 @@ impl Decoder {
             ("norm", import(&description.output_norm, activation)?),
             ("weight", import(&description.output, activation)?),
         ]);
-        let selected_template = bound(
+        let selected = bound(
             "qwen_readout_selected",
-            shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden), ("S", 1)])?,
+            BTreeMap::from([
+                ("M".into(), varying(context_capacity as u64)),
+                ("V".into(), exact(g.vocabulary)),
+                ("D".into(), exact(g.hidden)),
+                ("S".into(), varying(readout_capacity as u64)),
+            ]),
             readout_weights.clone(),
             &["hidden", "selected"],
-            &[],
             scalar(&[("epsilon", g.epsilon)]),
         )?
         .control_domain(
@@ -569,24 +692,15 @@ impl Decoder {
         )?;
         let readout = bound(
             "qwen_readout_rows",
-            shape(&[("M", 1), ("V", g.vocabulary), ("D", g.hidden)])?,
+            BTreeMap::from([
+                ("M".into(), varying(context_capacity as u64)),
+                ("V".into(), exact(g.vocabulary)),
+                ("D".into(), exact(g.hidden)),
+            ]),
             readout_weights,
             &["hidden"],
-            &[],
             scalar(&[("epsilon", g.epsilon)]),
         )?;
-        let hidden_bytes = usize::try_from(g.hidden)
-            .ok()
-            .and_then(|n| n.checked_mul(4))
-            .ok_or("residual allocation overflow")?;
-        let logits_bytes = usize::try_from(g.vocabulary)
-            .ok()
-            .and_then(|n| n.checked_mul(4))
-            .ok_or("logits allocation overflow")?;
-        let hidden = device.buffer(hidden_bytes)?;
-        let logits = device.buffer(logits_bytes)?;
-        let coordinates = device.buffer(16)?;
-        let visible = device.buffer(8)?;
         let store = StateStore::new(
             device.clone(),
             context_capacity,
@@ -594,121 +708,39 @@ impl Decoder {
             history_rows,
             components,
         )?;
-        let tokens = device.buffer(4)?;
-        let destinations = device.buffer(4)?;
-        let rows = Rows {
-            embedding,
-            blocks,
-            readout,
-            hidden,
-            logits,
-            coordinates,
-            visible,
-            tokens,
-            destinations,
-        };
+        let vocabulary = usize::try_from(g.vocabulary)
+            .map_err(|_| "vocabulary exceeds the host index domain")?;
+        let sampler = Sampler::compile(&device, vocabulary, settings.clone())?;
+        let conditioning = Conditioning::new(device.clone(), program, settings, g.hidden);
+        let mut rows = HashMap::new();
+        rows_entry(g, &device, &mut rows, 1, 1, context_capacity)?;
         Ok(Self {
             geometry: g.clone(),
             store,
             device,
-            program,
-            settings,
+            conditioning,
             context_capacity,
-            rows: HashMap::from([((1, 1), rows)]),
-            sampler: None,
-            selected_template,
-            selected: HashMap::new(),
+            max_ranges,
+            packed_rows,
+            embedding,
+            blocks,
+            readout,
+            selected,
+            sampler,
+            rows,
+            selected_rows: HashMap::new(),
             packed: HashMap::new(),
         })
     }
-    fn ensure_selected(&mut self, rows: usize, ids: &[u32]) -> Result<(), Error> {
-        if ids
-            .iter()
-            .any(|&id| u64::from(id) >= self.geometry.vocabulary || id > i32::MAX as u32)
-        {
-            return Err("selected readout token is outside vocabulary".into());
-        }
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let key = (rows, ids.len());
-        if !self.selected.contains_key(&key) {
-            let mut compiler =
-                PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-            let readout = self
-                .selected_template
-                .with_dimensions(&mut compiler, &[("M", rows), ("S", ids.len())])?;
-            let bytes = ids
-                .len()
-                .checked_mul(4)
-                .ok_or("selected readout size overflow")?;
-            self.selected.insert(
-                key,
-                SelectedRows {
-                    readout,
-                    ids: self.device.buffer(bytes)?,
-                    logits: self.device.buffer(bytes)?,
-                },
-            );
-        }
-        self.selected
-            .get(&key)
-            .expect("selection prepared")
-            .ids
-            .write(
-                &ids.iter()
-                    .flat_map(|&id| (id as i32).to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )?;
-        Ok(())
-    }
-    fn ensure_rows(&mut self, count: usize, ranges: usize) -> Result<(), Error> {
-        if self.rows.contains_key(&(count, ranges)) {
-            return Ok(());
-        }
-        if count == 0 || ranges == 0 || count as u64 > self.geometry.context_limit {
-            return Err("invalid forward row count".into());
-        }
-        let template = self.rows.get(&(1, 1)).expect("decode geometry exists");
-        let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-        let blocks = template
-            .blocks
-            .iter()
-            .map(|b| {
-                let dimensions = [("M", count), ("R", ranges)];
-                Ok(Block {
-                    mixer: b.mixer.with_dimensions(
-                        &mut compiler,
-                        &dimensions[..if b.attention { 2 } else { 1 }],
-                    )?,
-                    feedforward: b
-                        .feedforward
-                        .with_dimensions(&mut compiler, &[("M", count)])?,
-                    state_index: b.state_index,
-                    attention: b.attention,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let bytes = |width: usize| count.checked_mul(width).ok_or("forward buffer overflow");
-        let rows = Rows {
-            embedding: template
-                .embedding
-                .with_dimensions(&mut compiler, &[("M", count)])?,
-            readout: template
-                .readout
-                .with_dimensions(&mut compiler, &[("M", count)])?,
-            blocks,
-            hidden: self.device.buffer(bytes(template.hidden.len())?)?,
-            logits: self.device.buffer(template.logits.len())?,
-            coordinates: self.device.buffer(bytes(16)?)?,
-            visible: self.device.buffer(bytes(
-                ranges.checked_mul(8).ok_or("visibility buffer overflow")?,
-            )?)?,
-            tokens: self.device.buffer(bytes(4)?)?,
-            destinations: self.device.buffer(bytes(4)?)?,
-        };
-        self.rows.insert((count, ranges), rows);
-        Ok(())
+    fn rows_for(&mut self, count: usize, ranges: usize) -> Result<&mut Rows, Error> {
+        let Decoder {
+            geometry,
+            device,
+            rows,
+            context_capacity,
+            ..
+        } = self;
+        rows_entry(geometry, device, rows, count, ranges, *context_capacity)
     }
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
@@ -719,13 +751,12 @@ impl Decoder {
     pub fn memory_usage(&self) -> seismic_runtime::memory::Usage {
         self.device.memory_usage()
     }
-    /// Drop idle row specializations and sampling storage. The single-row
-    /// composition remains the source for later row specialization.
-    pub fn reclaim_idle(&mut self) -> Result<usize, String> {
+    /// Drop idle row buffers and selection storage. Prepared compositions are
+    /// retained; preparation state never depends on execution.
+    pub fn reclaim_idle(&mut self) -> Result<usize, Error> {
         let before = self.device.memory_usage().charged;
         self.rows.retain(|geometry, _| *geometry == (1, 1));
-        self.sampler.take();
-        self.selected.clear();
+        self.selected_rows.clear();
         self.packed.clear();
         self.store.release_idle()?;
         Ok(before - self.device.memory_usage().charged)
@@ -733,54 +764,18 @@ impl Decoder {
     pub fn state_store(&self) -> &Rc<StateStore> {
         &self.store
     }
-    fn unique_compositions(&self) -> Vec<&Composition> {
-        let mut unique: Vec<&Composition> = Vec::new();
-        for rows in self.rows.values() {
-            for composition in std::iter::once(&rows.embedding)
-                .chain(rows.blocks.iter().flat_map(|b| [&b.mixer, &b.feedforward]))
-                .chain(std::iter::once(&rows.readout))
-            {
-                if !unique
-                    .iter()
-                    .any(|previous| previous.shares_compilation(composition))
-                {
-                    unique.push(composition);
-                }
-            }
-        }
-        for composition in self
-            .packed
-            .values()
-            .flat_map(PackedRows::compositions)
-            .chain(std::iter::once(&self.selected_template))
-            .chain(self.selected.values().map(|rows| &rows.readout))
-        {
-            if !unique
-                .iter()
-                .any(|previous| previous.shares_compilation(composition))
-            {
-                unique.push(composition);
-            }
-        }
-        unique
-    }
+    /// Kernels compiled for the prepared decoder. Constant after preparation:
+    /// a forward can never compile, so a nonzero difference is impossible.
     pub fn compiled_kernel_count(&self) -> usize {
-        self.unique_compositions()
-            .iter()
-            .map(|c| c.kernel_count())
-            .sum::<usize>()
-            + self.sampler.as_ref().map_or(0, Sampler::kernel_count)
-    }
-    /// Selection records of every decoder kernel compiled so far, one per compilation.
-    pub fn selections(&self) -> Result<Vec<seismic_runtime::Selection>, String> {
-        Ok(self
-            .unique_compositions()
-            .into_iter()
-            .map(Composition::selection)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect())
+        self.embedding.kernel_count()
+            + self
+                .blocks
+                .iter()
+                .map(|b| b.mixer.kernel_count() + b.feedforward.kernel_count())
+                .sum::<usize>()
+            + self.readout.kernel_count()
+            + self.selected.kernel_count()
+            + self.sampler.kernel_count()
     }
     pub fn propose<'a>(
         &mut self,
@@ -867,14 +862,27 @@ impl Decoder {
             return Err("conditioned input differs from decoder continuation or owner".into());
         }
         let assembled = input.assemble(tokens)?;
+        // Explicit conditioned-input preparation: every overlay composition is
+        // compiled here, in full, before any numerical inference submission is
+        // built by the forward below.
+        let overlays = self.conditioning.prepare(&assembled)?;
         let next = input.after(
             input
                 .position()
                 .checked_add(tokens.len())
                 .ok_or("input advance overflow")?,
         )?;
+        let coordinates = assembled
+            .coordinates
+            .iter()
+            .map(|&[t, h, w]| [t, h, w, 0])
+            .collect::<Vec<_>>();
+        let conditioned = ConditionedInput {
+            coordinates: &coordinates,
+            overlays: &overlays,
+        };
         let (advance, _, _) =
-            self.propose_impl(state, tokens, false, true, readout, Some(&assembled))?;
+            self.propose_impl(state, tokens, false, true, readout, Some(&conditioned))?;
         Ok(ConditionedAdvance {
             advance,
             input,
@@ -888,7 +896,7 @@ impl Decoder {
         observed: bool,
         batched: bool,
         readout: Readout<'_>,
-        conditioned: Option<&super::inputs::Assembled>,
+        conditioned: Option<&ConditionedInput<'_>>,
     ) -> Result<
         (
             ExecutedAdvance<'a>,
@@ -898,57 +906,75 @@ impl Decoder {
         Error,
     > {
         let mut observations = observed.then(Vec::new);
-        let mut submission = batched.then(Submission::default);
+        let mut batch = batched.then(StageBatch::default);
         let mut batch_observation = None;
-        if !state.belongs_to(&self.store) {
+        let Decoder {
+            geometry,
+            store,
+            device,
+            context_capacity,
+            max_ranges,
+            embedding,
+            blocks,
+            readout: readout_stage,
+            selected: selected_stage,
+            sampler,
+            rows,
+            selected_rows,
+            ..
+        } = self;
+        if !state.belongs_to(store) {
             return Err("sequence belongs to another decoder state store".into());
         }
         if tokens.is_empty()
             || tokens
                 .iter()
-                .any(|&t| u64::from(t) >= self.geometry.vocabulary || t > i32::MAX as u32)
+                .any(|&t| u64::from(t) >= geometry.vocabulary || t > i32::MAX as u32)
         {
             return Err("token is outside vocabulary".into());
         }
         let ranges = state.history_ranges();
-        if tokens.len() > self.context_capacity - state.position() {
+        if tokens.len() > *context_capacity - state.position() {
             return Err("forward exceeds context limit".into());
         }
-        if matches!(&readout, Readout::Sample { .. }) && self.sampler.is_none() {
-            self.sampler = Some(Sampler::compile(
-                &self.device,
-                self.geometry.vocabulary as usize,
-                self.settings.clone(),
-            )?);
+        if ranges.len() > *max_ranges {
+            return Err("forward visibility exceeds the prepared envelope".into());
         }
-        if let Readout::Selected(ids) = &readout {
-            self.ensure_selected(tokens.len(), ids)?;
-        }
-        self.ensure_rows(tokens.len(), ranges.len().max(1))?;
-        let mut selected = match &readout {
-            Readout::Selected(ids) if !ids.is_empty() => {
-                self.selected.get_mut(&(tokens.len(), ids.len()))
+        let selected_ids = match &readout {
+            Readout::Selected(ids) => {
+                if ids
+                    .iter()
+                    .any(|&id| u64::from(id) >= geometry.vocabulary || id > i32::MAX as u32)
+                {
+                    return Err("selected readout token is outside vocabulary".into());
+                }
+                Some(ids.len())
             }
             _ => None,
         };
-        let rows = self
-            .rows
-            .get_mut(&(tokens.len(), ranges.len().max(1)))
-            .expect("row geometry prepared");
+        let shape_ranges = ranges.len().max(1);
+        let mut selected = selected_ids
+            .filter(|&ids| ids > 0)
+            .map(|ids| selected_entry(device, *context_capacity, selected_rows, ids))
+            .transpose()?;
+        if let (Some(entry), Readout::Selected(ids)) = (selected.as_ref(), &readout) {
+            entry.ids.write(
+                &ids.iter()
+                    .flat_map(|&id| (id as i32).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        let rows =
+            rows_entry(geometry, device, rows, tokens.len(), shape_ranges, *context_capacity)?;
         let position =
             i32::try_from(state.position()).map_err(|_| "rotary position exceeds index domain")?;
-        let coordinates: Vec<[i32; 4]> = if let Some(input) = conditioned {
-            input
-                .coordinates
-                .iter()
-                .map(|&[t, h, w]| [t, h, w, 0])
-                .collect()
-        } else {
-            tokens
+        let coordinates: Vec<[i32; 4]> = match conditioned {
+            Some(input) => input.coordinates.to_vec(),
+            None => tokens
                 .iter()
                 .enumerate()
                 .map(|(i, _)| [position + i as i32; 4])
-                .collect()
+                .collect(),
         };
         rows.coordinates.write(
             &coordinates
@@ -957,41 +983,6 @@ impl Decoder {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         )?;
-        let mut overlays = Vec::new();
-        if let Some(input) = conditioned {
-            let mut compiler =
-                PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-            let row_bytes = usize::try_from(self.geometry.hidden)
-                .map_err(|_| "hidden width overflow")?
-                .checked_mul(4)
-                .ok_or("hidden row bytes overflow")?;
-            for feature in &input.features {
-                let offset = feature
-                    .destination
-                    .checked_mul(row_bytes)
-                    .ok_or("feature destination overflow")?;
-                let length = feature
-                    .count
-                    .checked_mul(row_bytes)
-                    .ok_or("feature destination overflow")?;
-                let composition = Composition::compile(
-                    &mut compiler,
-                    CompositionSpec {
-                        entry: "cast_rows".into(),
-                        shapes: shape(&[("M", feature.count as u64), ("K", self.geometry.hidden)])?,
-                        elements: HashMap::from([
-                            ("T".into(), Elem::Dtype(DType::F32)),
-                            ("U".into(), Elem::Dtype(DType::F32)),
-                        ]),
-                        weights: HashMap::new(),
-                        external: names(&["input", "out"]),
-                        intermediates: HashSet::new(),
-                        scalars: HashMap::new(),
-                    },
-                )?;
-                overlays.push((composition, feature.source.clone(), offset, length));
-            }
-        }
         let ranges = if ranges.is_empty() {
             vec![(0, 0)]
         } else {
@@ -1025,35 +1016,41 @@ impl Decoder {
                     .collect::<Vec<_>>(),
             )?;
             let embedding = execute_stage(
-                &mut rows.embedding,
+                embedding,
+                &forward_shapes(tokens.len()),
                 &HashMap::from([("tokens".into(), rows.tokens.clone())]),
-                &HashMap::new(),
                 "embedding",
                 None,
                 &mut observations,
-                &mut submission,
+                &mut batch,
             )?;
             let mut hidden = result_buffer(&embedding, &[1])?;
-            for (composition, source, offset, length) in &mut overlays {
-                let out = hidden.view(
-                    *offset
-                        ..offset
-                            .checked_add(*length)
-                            .ok_or("feature destination overflow")?,
-                )?;
-                execute_stage(
-                    composition,
-                    &HashMap::from([("input".into(), source.clone()), ("out".into(), out)]),
-                    &HashMap::new(),
-                    "conditioning",
-                    None,
-                    &mut observations,
-                    &mut submission,
-                )?;
+            if let Some(input) = conditioned {
+                for overlay in input.overlays {
+                    let out = hidden.view(
+                        overlay.offset
+                            ..overlay
+                                .offset
+                                .checked_add(overlay.length)
+                                .ok_or("feature destination overflow")?,
+                    )?;
+                    execute_stage(
+                        &overlay.composition,
+                        &forward_shapes(overlay.count),
+                        &HashMap::from([
+                            ("input".into(), overlay.source.clone()),
+                            ("out".into(), out),
+                        ]),
+                        "conditioning",
+                        None,
+                        &mut observations,
+                        &mut batch,
+                    )?;
+                }
             }
-            for (block_index, block) in rows.blocks.iter_mut().enumerate() {
+            for (block_index, block) in blocks.iter().enumerate() {
                 let mut tensors = HashMap::from([("hidden".into(), hidden.clone())]);
-                let parameters = if block.attention {
+                if block.attention {
                     let i = block.state_index;
                     tensors.extend([
                         ("destinations".into(), rows.destinations.clone()),
@@ -1062,23 +1059,26 @@ impl Decoder {
                         ("history_key".into(), transition.history[i].clone()),
                         ("history_value".into(), transition.history[i + 1].clone()),
                     ]);
-                    HashMap::new()
                 } else {
                     let i = block.state_index;
                     tensors.extend([
                         ("window".into(), transition.previous[i].clone()),
                         ("delta".into(), transition.previous[i + 1].clone()),
                     ]);
-                    HashMap::new()
+                }
+                let shapes = if block.attention {
+                    attention_shapes(tokens.len(), shape_ranges)
+                } else {
+                    forward_shapes(tokens.len())
                 };
                 let mixed = execute_stage(
-                    &mut block.mixer,
+                    &block.mixer,
+                    &shapes,
                     &tensors,
-                    &parameters,
                     "mixer",
                     Some(block_index),
                     &mut observations,
-                    &mut submission,
+                    &mut batch,
                 )?;
                 hidden = if block.attention {
                     result_buffer(&mixed, &[])?
@@ -1089,45 +1089,46 @@ impl Decoder {
                     result_buffer(&mixed, &[2])?
                 };
                 let feedforward = execute_stage(
-                    &mut block.feedforward,
+                    &block.feedforward,
+                    &forward_shapes(tokens.len()),
                     &HashMap::from([("residual".into(), hidden.clone())]),
-                    &HashMap::new(),
                     "feedforward",
                     Some(block_index),
                     &mut observations,
-                    &mut submission,
+                    &mut batch,
                 )?;
                 hidden = result_buffer(&feedforward, &[6])
                     .or_else(|_| result_buffer(&feedforward, &[14]))?;
             }
-            if let Some(selected) = selected.as_mut() {
+            if let (Some(selected), Some(ids)) = (selected.as_mut(), selected_ids) {
                 let results = execute_stage(
-                    &mut selected.readout,
+                    selected_stage,
+                    &selected_shapes(tokens.len(), ids),
                     &HashMap::from([
                         ("hidden".into(), hidden.clone()),
                         ("selected".into(), selected.ids.clone()),
                     ]),
-                    &HashMap::new(),
                     "readout_selected",
                     None,
                     &mut observations,
-                    &mut submission,
+                    &mut batch,
                 )?;
                 selected.logits = result_buffer(&results, &[1])?;
             } else if !matches!(&readout, Readout::StateOnly | Readout::Selected(_)) {
                 let results = execute_stage(
-                    &mut rows.readout,
+                    readout_stage,
+                    &forward_shapes(tokens.len()),
                     &HashMap::from([("hidden".into(), hidden.clone())]),
-                    &HashMap::new(),
                     "readout",
                     None,
                     &mut observations,
-                    &mut submission,
+                    &mut batch,
                 )?;
                 rows.logits = result_buffer(&results, &[1])?;
             }
-            if let Some(submission) = &mut submission {
-                batch_observation = Some(submission.execute_batched()?);
+            if let Some(batch) = batch.take() {
+                let observed = batch.execute_observed()?;
+                batch_observation = Some(execution::batch_observation(&observed));
             }
             Ok(())
         })?;
@@ -1163,13 +1164,9 @@ impl Decoder {
                 sampling,
                 seed,
                 position,
-            } => ReadoutOutput::Sample(self.sampler.as_mut().expect("sampler prepared").sample(
-                &rows.logits,
-                mask,
-                sampling,
-                seed,
-                position,
-            )?),
+            } => ReadoutOutput::Sample(
+                sampler.sample(&rows.logits, mask, sampling, seed, position)?,
+            ),
         };
         Ok((
             ExecutedAdvance { advance, output },

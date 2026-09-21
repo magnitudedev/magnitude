@@ -1,8 +1,9 @@
 //! Logical model execution boundaries consumed by generation and service policy.
 use crate::inputs::TokenId;
 use crate::state::{SequenceState, StateCheckpoint, StateStore};
-use seismic_runtime::Error;
 use std::{cell::RefCell, rc::Rc};
+
+use crate::Error;
 
 /// A prepared numerical advance owns its tentative claims and submitted uses.
 /// Dropping it aborts acceptance and must retain any still-running physical uses.
@@ -41,16 +42,20 @@ impl OwnedSequence {
     /// Exclusive recurrent allocation bytes freed by dropping this entire set
     /// of unique handles. Aliased owners and checkpoints keep their storage live.
     /// History remains charged to the store until its idle release.
-    pub fn reclaimable(store: &Rc<StateStore>, sequences: &[&Self]) -> Result<usize, String> {
+    pub fn reclaimable(store: &Rc<StateStore>, sequences: &[&Self]) -> Result<usize, Error> {
         let mut seen = std::collections::HashSet::new();
         let mut accepted = Vec::new();
         for sequence in sequences {
             if !seen.insert(Rc::as_ptr(&sequence.0)) {
-                return Err("reclamation set contains a duplicate sequence".into());
+                return Err(Error::Request(
+                    "reclamation set contains a duplicate sequence".into(),
+                ));
             }
             let state = sequence.0.borrow();
             if state.pending || !state.state.belongs_to(store) {
-                return Err("reclamation requires reconciled sequences from this store".into());
+                return Err(Error::Request(
+                    "reclamation requires reconciled sequences from this store".into(),
+                ));
             }
             if Rc::strong_count(&sequence.0) == 1 {
                 accepted.push(state);

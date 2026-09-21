@@ -1,12 +1,13 @@
 //! Artifact interpretation is device-free. Loading imports the interpreted weight
 //! roles through ordinary automatic selection on the caller's execution owner.
 use super::{decoder::Decoder, gguf, mlx, Description};
+use crate::preparation::Settings;
 use crate::weights::{
     gguf::GgufArtifact,
     mlx::MlxArtifact,
     residency::{Importer, ResidentWeight},
 };
-use seismic_runtime::{plan::Settings, Device};
+use seismic_runtime::Device;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -124,7 +125,13 @@ impl Model {
         let mut importer =
             Importer::new(device.clone(), settings.clone()).map_err(|e| e.to_string())?;
         let mut resident: HashMap<(String, String, String), ResidentWeight> = HashMap::new();
-        Decoder::compile(
+        let workload = super::decoder::DecoderWorkload {
+            context_capacity: context,
+            max_sequences: sequences,
+            max_ranges: context,
+            readout_capacity: context,
+        };
+        let result = Decoder::compile(
             device,
             &self.description,
             |descriptor, dtype| {
@@ -148,9 +155,9 @@ impl Model {
                 Ok(weight)
             },
             settings,
-            context,
-            sequences,
+            workload,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        result
     }
 }

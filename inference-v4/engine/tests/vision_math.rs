@@ -79,7 +79,7 @@ fn affine_bias_precedes_compact_publication() {
 #[test]
 fn vision_patch_order_and_position_add_preserve_compact_publications() {
     {
-        let program = seismic_engine::models::qwen35::program::program().unwrap();
+        let program = magnitude_engine::models::qwen35::program::program().unwrap();
         let mut vm = reference::interpreter(&program);
         let values = (0..24).map(|i| i as f64 + 0.03125).collect::<Vec<_>>();
         let pixels = vm.add_tensor(TensorData::dense(
@@ -167,7 +167,7 @@ fn vision_patch_order_and_position_add_preserve_compact_publications() {
 #[test]
 fn vision_rotary_preserves_heads_axes_and_unrotated_values() {
     {
-        let program = seismic_engine::models::qwen35::program::program().unwrap();
+        let program = magnitude_engine::models::qwen35::program::program().unwrap();
         let mut vm = reference::interpreter(&program);
         let (rows, heads, width) = (6usize, 3usize, 12usize);
         let positions = [[0i32, 0], [0, 1], [1, 0], [1, 1], [7, 19], [19, 7]];
@@ -247,7 +247,7 @@ fn vision_rotary_preserves_heads_axes_and_unrotated_values() {
 #[test]
 fn vision_attention_includes_future_rows_and_keeps_heads_independent() {
     {
-        let program = seismic_engine::models::qwen35::program::program().unwrap();
+        let program = magnitude_engine::models::qwen35::program::program().unwrap();
         for nonzero in [false, true] {
             let mut vm = reference::interpreter(&program);
             let (rows, heads, width) = (3usize, 2usize, 4usize);
@@ -385,7 +385,7 @@ fn check_vision_reference(entry: &str, fixture: &str) {
             .iter()
             .map(|(k, v)| (k.clone(), v.as_i64().unwrap()))
             .collect();
-        let program = seismic_engine::models::qwen35::program::program().unwrap();
+        let program = magnitude_engine::models::qwen35::program::program().unwrap();
         let mut vm = reference::interpreter(&program);
         let mut args = Vec::new();
         let mut output = None;
@@ -435,7 +435,7 @@ fn check_vision_reference(entry: &str, fixture: &str) {
 #[test]
 fn merger_normalizes_patches_before_grouping_and_publishes_before_projection() {
     {
-        let program = seismic_engine::models::qwen35::program::program().unwrap();
+        let program = magnitude_engine::models::qwen35::program::program().unwrap();
         for dtype in [DType::F32, DType::BF16] {
             let round = |x: f32| match dtype {
                 DType::BF16 => seismic_lang::numeric::bf16_round(x),

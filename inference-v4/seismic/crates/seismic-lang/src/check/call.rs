@@ -575,8 +575,8 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        // Storage realization is not part of reduction syntax. Logical
-        // normalization materializes a computed value when it has no view.
+        // Storage realization is not part of reduction syntax. A computed
+        // operand is a legitimate value without logical storage.
         let Some(dtype) = (match &s.elem {
             Elem::Dtype(d) => Some(*d),
             Elem::Param(_) => Some(DType::F32),
@@ -1217,7 +1217,7 @@ impl<'a> Checker<'a> {
                 })?,
                 other => other.clone(),
             };
-            Ok(TensorType::new(axes, elem))
+            s.specialize_elem(axes, elem)
         };
         Ok(match ty {
             ValueType::Tensor(s) => ValueType::Tensor(shaped(s)?),

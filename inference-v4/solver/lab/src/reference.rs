@@ -7,7 +7,10 @@ use crate::{
 use magnitude_solver::model::{
     Arithmetic, Constraint, Cost, Factor, FactorKind, LinearTerm, Model, VarId,
 };
-use magnitude_solver::scheduling::{Activity, Demand, Interval, Reservation, SchedulingConstraint};
+use magnitude_solver::scheduling::{
+    Activity, ArenaExpression, ArenaPacking, Demand, Interval, Reservation,
+    SchedulingConstraint,
+};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -260,6 +263,7 @@ fn schedule_value(schedule: &SchedulingConstraint, v: &[i64]) -> LabResult<bool>
             capacity,
             reservations,
         } => cumulative(*capacity, reservations, v)?,
+        SchedulingConstraint::ArenaPacking(packing) => arena_value(packing, v)?,
         SchedulingConstraint::ActivityCumulative {
             completion,
             capacity,
@@ -285,6 +289,135 @@ fn schedule_value(schedule: &SchedulingConstraint, v: &[i64]) -> LabResult<bool>
                     .collect::<Vec<_>>(),
                 v,
             )?
+        }
+    })
+}
+
+/// The arena-packing oracle: an item is active when any activation clause
+/// holds; an active item's bytes come from its expression (checked, exact
+/// Euclidean division/remainder); the constraint holds iff the active items
+/// admit an exact placement — aligned offsets, every extent inside the
+/// capacity, and no overlap along an interference edge.
+fn arena_value(packing: &ArenaPacking, v: &[i64]) -> LabResult<bool> {
+    let active: Vec<(u32, u64, u64)> = packing
+        .items
+        .iter()
+        .filter(|item| {
+            item.activation.iter().any(|clause| {
+                clause
+                    .iter()
+                    .all(|literal| v.get(literal.variable.0) == Some(&literal.value))
+            })
+        })
+        .map(|item| {
+            let bytes = u64::try_from(arena_expression(&item.bytes, v)?)
+                .map_err(|_| "reference arena item size is negative")?;
+            Ok((item.ordinal, bytes, item.alignment.max(1)))
+        })
+        .collect::<LabResult<_>>()?;
+    if active.iter().any(|&(_, bytes, _)| bytes > packing.capacity) {
+        return Ok(false);
+    }
+    let edges: Vec<(u32, u32)> = packing
+        .interference
+        .iter()
+        .map(|&(left, right)| (left.min(right), left.max(right)))
+        .collect();
+    let mut placed: Vec<(u32, u64, u64)> = Vec::new();
+    Ok(arena_place(&active, 0, &mut placed, &edges, packing.capacity))
+}
+
+/// Exhaustive placement search: every candidate offset for one item is the
+/// arena origin or the end of an already-placed interferer, aligned up.
+fn arena_place(
+    active: &[(u32, u64, u64)],
+    index: usize,
+    placed: &mut Vec<(u32, u64, u64)>,
+    edges: &[(u32, u32)],
+    capacity: u64,
+) -> bool {
+    if index == active.len() {
+        return true;
+    }
+    let (ordinal, bytes, alignment) = active[index];
+    let mut candidates = vec![0u64];
+    for &(other, other_offset, other_bytes) in placed.iter() {
+        if edges.contains(&(other.min(ordinal), other.max(ordinal))) {
+            if let Some(end) = other_offset.checked_add(other_bytes) {
+                candidates.push(end);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    for candidate in candidates {
+        let offset = match candidate.checked_add(alignment - 1) {
+            Some(padded) => padded / alignment * alignment,
+            None => continue,
+        };
+        let Some(end) = offset.checked_add(bytes) else {
+            continue;
+        };
+        if end > capacity {
+            continue;
+        }
+        let clear = placed.iter().all(|&(other, other_offset, other_bytes)| {
+            !edges.contains(&(other.min(ordinal), other.max(ordinal)))
+                || end <= other_offset
+                || other_offset + other_bytes <= offset
+        });
+        if clear {
+            placed.push((ordinal, offset, bytes));
+            if arena_place(active, index + 1, placed, edges, capacity) {
+                return true;
+            }
+            placed.pop();
+        }
+    }
+    false
+}
+
+fn arena_expression(expression: &ArenaExpression, v: &[i64]) -> LabResult<i64> {
+    Ok(match expression {
+        ArenaExpression::Constant(value) => *value,
+        ArenaExpression::Variable(variable) => *v
+            .get(variable.0)
+            .ok_or("reference arena expression names an absent variable")?,
+        ArenaExpression::Sum(terms) => {
+            let mut sum = 0_i64;
+            for (coefficient, term) in terms {
+                let value = arena_expression(term, v)?;
+                let product = coefficient
+                    .checked_mul(value)
+                    .ok_or("reference arena sum overflow")?;
+                sum = sum
+                    .checked_add(product)
+                    .ok_or("reference arena sum overflow")?;
+            }
+            sum
+        }
+        ArenaExpression::Product(factors) => {
+            let mut product = 1_i64;
+            for factor in factors {
+                product = product
+                    .checked_mul(arena_expression(factor, v)?)
+                    .ok_or("reference arena product overflow")?;
+            }
+            product
+        }
+        ArenaExpression::Quotient(numerator, denominator) => {
+            let denominator = arena_expression(denominator, v)?;
+            if denominator <= 0 {
+                return Err("reference arena expression has a nonpositive divisor".into());
+            }
+            arena_expression(numerator, v)?.div_euclid(denominator)
+        }
+        ArenaExpression::Remainder(numerator, denominator) => {
+            let denominator = arena_expression(denominator, v)?;
+            if denominator <= 0 {
+                return Err("reference arena expression has a nonpositive divisor".into());
+            }
+            arena_expression(numerator, v)?.rem_euclid(denominator)
         }
     })
 }

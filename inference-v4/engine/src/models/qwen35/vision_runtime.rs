@@ -1,26 +1,34 @@
 //! Owner-local image execution. Preparation owns every pending operand; only
 //! successful numerical completion publishes a shareable conditioning lease.
+//! `Encoder::prepare` is the explicit input-preparation phase: it compiles the
+//! stage compositions for the image's exact geometry, in full, before the
+//! pending image's single submission is built; completion executes prepared
+//! invocations only.
 use super::{
     preparation::{spatial_controls, ImagePatches},
     vision::{Description, Geometry},
 };
 use crate::{
-    execution::{Composition, CompositionSpec},
+    execution,
     inputs::media::DType as HostDType,
+    preparation::{
+        CompositionSpec, EnvelopeShape, PreparationSession, Program, Settings, WorkloadEnvelope,
+    },
     weights::{descriptor::WeightDescriptor, residency::ResidentWeight},
 };
-use seismic_lang::{
-    sir::Program,
-    types::{DType, Elem},
-};
+use seismic_lang::types::{DType, Elem};
 use seismic_runtime::{
-    plan::{InvocationResults, PlanCompiler, Settings, Submission},
-    Buffer, Device, Error,
+    invocation::PreparedInvocation,
+    plan::InvocationResults,
+    submission::Submission,
+    Buffer, Device,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
 };
+
+use crate::Error;
 
 #[derive(Clone)]
 pub struct Features {
@@ -68,58 +76,61 @@ pub struct PendingImage {
 }
 impl PendingImage {
     /// Consuming completion prevents publication after failure or cancellation.
-    pub fn complete(mut self) -> Result<Features, String> {
-        self.submission.execute_sequential()?;
-        Ok(self.features)
+    pub fn complete(self) -> Result<Features, String> {
+        let PendingImage {
+            submission,
+            features,
+        } = self;
+        submission.execute().map_err(|e| e.to_string())?;
+        Ok(features)
     }
+}
+/// One stage of the vision tower: its entry, static dimensions, imported
+/// weights, external tensors, and fixed scalars. The row dimension is bound
+/// exactly, per image, by the input-preparation phase.
+struct StageSpec {
+    entry: String,
+    dimensions: Vec<(String, u64)>,
+    weights: HashMap<String, ResidentWeight>,
+    external: HashSet<String>,
+    scalars: HashMap<String, f64>,
+    controls: Vec<String>,
 }
 pub struct Encoder {
     device: Rc<Device>,
     geometry: Geometry,
     program: Program,
     settings: Settings,
-    stem: CompositionSpec,
-    blocks: Vec<CompositionSpec>,
-    merger: CompositionSpec,
+    stem: StageSpec,
+    blocks: Vec<StageSpec>,
+    merger: StageSpec,
+    output: usize,
 }
-fn names(values: &[&str]) -> HashSet<String> {
-    values.iter().map(|s| s.to_string()).collect()
-}
-fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, String> {
-    results
-        .iter()
-        .find(|result| result.path == path && result.plane.is_empty())
-        .map(|result| result.buffer.clone())
-        .ok_or_else(|| format!("owned result path {path:?} has no dense buffer"))
+fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, Error> {
+    execution::result_buffer(results, path).map_err(Error::from)
 }
 fn spec(
     entry: &str,
-    shapes: &[(&str, usize)],
+    dimensions: &[(&str, u64)],
     weights: HashMap<String, ResidentWeight>,
     external: &[&str],
-    intermediates: &[&str],
+    controls: &[&str],
     norm: bool,
-) -> Result<CompositionSpec, String> {
-    Ok(CompositionSpec {
+) -> Result<StageSpec, String> {
+    Ok(StageSpec {
         entry: entry.into(),
-        shapes: shapes
+        dimensions: dimensions
             .iter()
-            .map(|(name, n)| {
-                Ok((
-                    name.to_string(),
-                    i64::try_from(*n).map_err(|_| "vision dimension overflow")?,
-                ))
-            })
-            .collect::<Result<_, String>>()?,
-        elements: HashMap::from([("A".into(), Elem::Dtype(DType::BF16))]),
+            .map(|(name, value)| ((*name).into(), *value))
+            .collect(),
         weights,
-        external: names(external),
-        intermediates: names(intermediates),
+        external: external.iter().map(|s| (*s).to_string()).collect(),
         scalars: if norm {
             HashMap::from([("epsilon".into(), 1e-6)])
         } else {
             HashMap::new()
         },
+        controls: controls.iter().map(|s| (*s).to_string()).collect(),
     })
 }
 impl Encoder {
@@ -177,12 +188,11 @@ impl Encoder {
         let stem = spec(
             "qwen_vision_stem",
             &[
-                ("M", 1),
-                ("C", g.image.channels),
-                ("T", g.image.temporal_patch),
-                ("P", g.image.patch),
-                ("H", g.hidden),
-                ("L", g.table_side * g.table_side),
+                ("C", g.image.channels as u64),
+                ("T", g.image.temporal_patch as u64),
+                ("P", g.image.patch as u64),
+                ("H", g.hidden as u64),
+                ("L", (g.table_side * g.table_side) as u64),
             ],
             bind(vec![
                 ("weight", &description.patch.weight),
@@ -190,7 +200,7 @@ impl Encoder {
                 ("table", &description.positions),
             ])?,
             &["pixels", "indices", "coefficients"],
-            &[],
+            &["indices"],
             false,
         )?;
         let mut blocks = Vec::new();
@@ -198,10 +208,9 @@ impl Encoder {
             blocks.push(spec(
                 "qwen_vision_block",
                 &[
-                    ("M", 1),
-                    ("H", g.heads),
-                    ("P", g.hidden / g.heads / 4),
-                    ("F", g.intermediate),
+                    ("H", g.heads as u64),
+                    ("P", (g.hidden / g.heads / 4) as u64),
+                    ("F", g.intermediate as u64),
                 ],
                 bind(vec![
                     ("norm1_weight", &b.norm1.weight),
@@ -218,13 +227,17 @@ impl Encoder {
                     ("down_bias", &b.down.bias),
                 ])?,
                 &["hidden", "coordinates"],
-                &[],
+                &["coordinates"],
                 true,
             )?);
         }
         let merger = spec(
             "qwen_vision_merger",
-            &[("M", 1), ("G", group), ("H", g.hidden), ("D", g.output)],
+            &[
+                ("G", group as u64),
+                ("H", g.hidden as u64),
+                ("D", g.output as u64),
+            ],
             bind(vec![
                 ("norm_weight", &description.merger_norm.weight),
                 ("norm_bias", &description.merger_norm.bias),
@@ -245,6 +258,7 @@ impl Encoder {
             stem,
             blocks,
             merger,
+            output: g.output,
         })
     }
     pub fn prepare(&self, image: &ImagePatches) -> Result<PendingImage, Error> {
@@ -289,25 +303,54 @@ impl Encoder {
                 })
                 .collect::<Vec<_>>(),
         )?;
-        let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-        let mut prepare =
-            |template: &CompositionSpec,
-             count: usize,
-             bindings: HashMap<String, Buffer>,
-             controls: &[&str]|
-             -> Result<(Submission, seismic_runtime::plan::InvocationResults), Error> {
-                let mut spec = template.clone();
-                spec.shapes.insert(
-                    "M".into(),
-                    i64::try_from(count).map_err(|_| "vision rows overflow")?,
-                );
-                let composition =
-                    Composition::compile(&mut compiler, spec)?.control_inputs(controls)?;
-                let submission = composition.prepare(&bindings, &HashMap::new())?;
-                let results = submission.results_for(0)?.clone();
-                Ok((submission, results))
-            };
-        let (mut submission, stem_results) = prepare(
+        let mut session = PreparationSession::new(&self.device, &self.program, self.settings.clone());
+        let conversion = spec(
+            "qwen_vision_feature_output",
+            &[("D", self.output as u64)],
+            HashMap::new(),
+            &["source"],
+            &[],
+            false,
+        )
+        .map_err(Error::from)?;
+        let mut prepare = |stage: &StageSpec,
+                           count: usize,
+                           bindings: HashMap<String, Buffer>|
+         -> Result<(PreparedInvocation, InvocationResults), Error> {
+            let mut dimensions: BTreeMap<String, u64> =
+                stage.dimensions.iter().cloned().collect();
+            dimensions.insert("M".into(), count as u64);
+            let shapes = dimensions
+                .iter()
+                .map(|(name, &value)| (name.clone(), EnvelopeShape::Exact(value)))
+                .collect::<BTreeMap<String, EnvelopeShape>>();
+            let envelope = WorkloadEnvelope::new(
+                shapes,
+                BTreeMap::from([("A".into(), Elem::Dtype(DType::BF16))]),
+                Vec::new(),
+            )?;
+            let mut composition = session.prepare(CompositionSpec {
+                entry: stage.entry.clone(),
+                envelope,
+                weights: stage.weights.clone(),
+                external: stage.external.clone(),
+                intermediates: HashSet::new(),
+                scalars: stage.scalars.clone(),
+            })?;
+            if !stage.controls.is_empty() {
+                let controls = stage
+                    .controls
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                composition = composition.control_inputs(&controls)?;
+            }
+            let invocation =
+                execution::invoke(&composition, &dimensions, &bindings, &HashMap::new())?;
+            let results = execution::result_planes(&invocation);
+            Ok((invocation, results))
+        };
+        let (invocation, stem_results) = prepare(
             &self.stem,
             rows,
             HashMap::from([
@@ -315,52 +358,41 @@ impl Encoder {
                 ("indices".into(), indices),
                 ("coefficients".into(), coefficients),
             ]),
-            &["indices"],
         )?;
+        let mut submission = Submission::single(invocation);
         let mut hidden = result_buffer(&stem_results, &[])?;
         for block in &self.blocks {
-            let (prepared, results) = prepare(
+            let (invocation, results) = prepare(
                 block,
                 rows,
                 HashMap::from([
                     ("hidden".into(), hidden),
                     ("coordinates".into(), coordinates.clone()),
                 ]),
-                &["coordinates"],
             )?;
-            submission.append(prepared);
+            submission.append(Submission::single(invocation));
             hidden = result_buffer(&results, &[])?;
         }
-        let (prepared, results) = prepare(
+        let (invocation, results) = prepare(
             &self.merger,
             output_rows,
             HashMap::from([("hidden".into(), hidden)]),
-            &[],
         )?;
-        submission.append(prepared);
+        submission.append(Submission::single(invocation));
         let compact = result_buffer(&results, &[])?;
-        let conversion = spec(
-            "qwen_vision_feature_output",
-            &[("M", output_rows), ("D", g.output)],
-            HashMap::new(),
-            &["source"],
-            &[],
-            false,
-        )?;
-        let (prepared, results) = prepare(
+        let (invocation, results) = prepare(
             &conversion,
             output_rows,
             HashMap::from([("source".into(), compact)]),
-            &[],
         )?;
-        submission.append(prepared);
+        submission.append(Submission::single(invocation));
         let buffer = result_buffer(&results, &[])?;
         Ok(PendingImage {
             submission,
             features: Features {
                 identity: image.identity.clone(),
                 rows: output_rows,
-                width: g.output,
+                width: self.output,
                 buffer,
             },
         })

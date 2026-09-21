@@ -7,8 +7,10 @@
 //! A finite horizon belongs to the supplied model; no guessed horizon is added.
 
 pub mod repetition;
+mod arena;
 mod resources;
 
+pub use arena::{arena_offsets, ArenaExpression, ArenaItem, ArenaLiteral, ArenaPacking};
 pub use resources::{Demand, Event, Interval, Lifetime, Reservation};
 
 use crate::model::{Assessment, Domain, Error, Propagation, Result, VarId};
@@ -82,6 +84,7 @@ pub enum SchedulingConstraint {
         capacity: u64,
         activities: Vec<ActivityReservation>,
     },
+    ArenaPacking(ArenaPacking),
 }
 
 impl SchedulingConstraint {
@@ -153,6 +156,7 @@ impl SchedulingConstraint {
                     })
                     .collect(),
             },
+            Self::ArenaPacking(packing) => Self::ArenaPacking(packing.remap(variables)),
         }
     }
 
@@ -199,6 +203,7 @@ impl SchedulingConstraint {
                     }
                 }
             }
+            Self::ArenaPacking(packing) => scope.extend(packing.scope()),
         }
         scope.sort_unstable();
         scope.dedup();
@@ -232,10 +237,14 @@ impl SchedulingConstraint {
                 }
                 Ok(())
             }
+            Self::ArenaPacking(packing) => packing.validate(domains),
         }
     }
 
     pub fn assess(&self, domains: &[Domain]) -> Result<Assessment> {
+        if let Self::ArenaPacking(packing) = self {
+            return packing.assess(domains);
+        }
         let mut narrowed = domains.to_vec();
         let outcome = self.propagate(&mut narrowed)?;
         // Private values of a definitely absent optional activity are not
@@ -359,6 +368,7 @@ impl SchedulingConstraint {
                     scope.push(*completion);
                 }
             }
+            Self::ArenaPacking(packing) => scope.extend(packing.scope()),
         }
         scope.sort_unstable();
         scope.dedup();
@@ -437,6 +447,11 @@ impl SchedulingConstraint {
                             &mut state,
                         )?;
                     }
+                }
+            }
+            Self::ArenaPacking(packing) => {
+                if packing.assess(state.domains)?.infeasible {
+                    state.infeasible = true;
                 }
             }
         }

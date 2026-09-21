@@ -1,17 +1,21 @@
-//! Device vocabulary selection. Only the selected token crosses back to the host.
+//! Device vocabulary selection. Only the selected token crosses back to the
+//! host. The sampler is prepared with the decoder; sampling never compiles.
 use super::Sampling;
 use crate::{
-    execution::{Composition, CompositionSpec},
+    execution,
     inputs::TokenId,
+    preparation::{
+        CompositionSpec, EnvelopeShape, PreparedComposition, PreparationSession, Settings,
+        WorkloadEnvelope,
+    },
 };
-use seismic_runtime::{
-    plan::{PlanCompiler, Settings},
-    Buffer, Device, Error,
-};
-use std::collections::{HashMap, HashSet};
+use seismic_runtime::{Buffer, Device};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use crate::Error;
 
 pub struct Sampler {
-    composition: Composition,
+    composition: PreparedComposition,
     vocabulary: usize,
     mask: Buffer,
     draw: Buffer,
@@ -34,22 +38,26 @@ impl Sampler {
             return Err("sampling vocabulary is outside the index domain".into());
         }
         let program = seismic_std::program()?;
-        let mut compiler = PlanCompiler::new(device, &program, settings);
-        let composition = Composition::compile(
-            &mut compiler,
-            CompositionSpec {
-                entry: "sample_rows".into(),
-                shapes: HashMap::from([("M".into(), 1), ("V".into(), vocabulary as i64)]),
-                elements: HashMap::new(),
-                weights: HashMap::new(),
-                external: ["logits", "mask", "draws", "out"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                intermediates: HashSet::new(),
-                scalars: HashMap::new(),
-            },
+        let mut session = PreparationSession::new(device, &program, settings);
+        let envelope = WorkloadEnvelope::new(
+            BTreeMap::from([
+                ("M".into(), EnvelopeShape::Exact(1)),
+                ("V".into(), EnvelopeShape::Exact(vocabulary as u64)),
+            ]),
+            BTreeMap::new(),
+            Vec::new(),
         )?;
+        let composition = session.prepare(CompositionSpec {
+            entry: "sample_rows".into(),
+            envelope,
+            weights: HashMap::new(),
+            external: ["logits", "mask", "draws", "out"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            intermediates: HashSet::new(),
+            scalars: HashMap::new(),
+        })?;
         Ok(Self {
             composition,
             vocabulary,
@@ -95,7 +103,9 @@ impl Sampler {
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )?;
-        self.composition.execute(
+        execution::execute(
+            &self.composition,
+            &BTreeMap::from([("M".into(), 1u64)]),
             &HashMap::from([
                 ("logits".into(), logits.clone()),
                 ("mask".into(), self.mask.clone()),
@@ -103,7 +113,8 @@ impl Sampler {
                 ("out".into(), self.output.clone()),
             ]),
             &HashMap::new(),
-        )?;
+        )
+        .map_err(Error::from)?;
         let mut bytes = [0; 8];
         self.output.read(&mut bytes)?;
         let selected = i32::from_le_bytes(bytes[..4].try_into().unwrap());
@@ -117,5 +128,68 @@ impl Sampler {
             return Err("invalid or empty sampling distribution".into());
         }
         Ok(Selection::Token(TokenId(selected as u32)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preparation::{CapacityClass, EnvelopeError};
+    use seismic_lang::logical::specialization::ShapeBinding;
+    use seismic_lang::types::{DType, Elem};
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn sampler_preparation_compiles_the_whole_envelope_eagerly() {
+        let device = Device::metal().unwrap();
+        let sampler = Sampler::compile(&device, 32, Settings::default()).unwrap();
+        assert!(sampler.kernel_count() > 0);
+    }
+    #[test]
+    fn geometric_envelopes_are_disjoint_and_covering() {
+        let shapes = BTreeMap::from([(
+            "M".to_string(),
+            EnvelopeShape::Bounded {
+                min: 1,
+                max: 10,
+                expected: 2,
+            },
+        )]);
+        let elements = BTreeMap::from([("A".to_string(), Elem::Dtype(DType::F32))]);
+        let envelope = WorkloadEnvelope::geometric(shapes.clone(), elements.clone()).unwrap();
+        assert!(envelope.select(&BTreeMap::from([("M".to_string(), 1u64)])).is_some());
+        assert!(envelope.select(&BTreeMap::from([("M".to_string(), 10u64)])).is_some());
+        assert!(envelope.select(&BTreeMap::from([("M".to_string(), 11u64)])).is_none());
+        let overlapping = WorkloadEnvelope::new(
+            shapes,
+            elements,
+            vec![
+                CapacityClass {
+                    name: "a".into(),
+                    shapes: BTreeMap::from([(
+                        "M".into(),
+                        ShapeBinding::Bounded {
+                            min: 1,
+                            max: 5,
+                            expected: 2,
+                        },
+                    )]),
+                },
+                CapacityClass {
+                    name: "b".into(),
+                    shapes: BTreeMap::from([(
+                        "M".into(),
+                        ShapeBinding::Bounded {
+                            min: 5,
+                            max: 10,
+                            expected: 6,
+                        },
+                    )]),
+                },
+            ],
+        );
+        assert!(matches!(
+            overlapping.unwrap_err(),
+            EnvelopeError::Overlapping { .. }
+        ));
     }
 }

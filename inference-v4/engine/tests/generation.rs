@@ -1,5 +1,5 @@
-use seismic_engine::models::sequence::Advance;
-use seismic_engine::{
+use magnitude_engine::models::sequence::Advance;
+use magnitude_engine::{
     generation::{
         Constraint, FinishReason, Generation, Options, Proposal, Readiness, Sampling, WaitReason,
         WorkKind,

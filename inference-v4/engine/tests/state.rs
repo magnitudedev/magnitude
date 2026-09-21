@@ -1,4 +1,4 @@
-use seismic_engine::state::{ComponentSpec, SequenceState, StateStore};
+use magnitude_engine::state::{ComponentSpec, SequenceState, StateStore};
 use seismic_lang::types::DType;
 use seismic_runtime::Device;
 use std::rc::Rc;
@@ -264,7 +264,7 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
 #[test]
 #[ignore = "requires a Metal device"]
 fn shared_execution_publishes_completion_for_all_rows_or_none() {
-    use seismic_engine::state::StateAdvance;
+    use magnitude_engine::state::StateAdvance;
     let store = store(true, true);
     let mut first = store.create().unwrap();
     let mut second = store.create().unwrap();

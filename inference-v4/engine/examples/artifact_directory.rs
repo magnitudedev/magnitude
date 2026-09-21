@@ -1,7 +1,7 @@
 //! Inspect metadata only; this does not establish full model execution support.
-use seismic_engine::models::qwen35;
-use seismic_engine::weights::descriptor::ArtifactIdentity;
-use seismic_engine::weights::{gguf, safetensors, source::FileSource};
+use magnitude_engine::models::qwen35;
+use magnitude_engine::weights::descriptor::ArtifactIdentity;
+use magnitude_engine::weights::{gguf, safetensors, source::FileSource};
 use serde_json::{json, Value};
 fn scalar(s: &gguf::Scalar) -> Value {
     match s {
@@ -15,7 +15,7 @@ fn scalar(s: &gguf::Scalar) -> Value {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     for path in std::env::args().skip(1) {
         if std::path::Path::new(&path).is_dir() {
-            let artifact = seismic_engine::weights::mlx::MlxArtifact::open(&path)?;
+            let artifact = magnitude_engine::weights::mlx::MlxArtifact::open(&path)?;
             let model = qwen35::mlx::describe(&artifact)?;
             println!(
                 "{}",

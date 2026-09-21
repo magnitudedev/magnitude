@@ -1,4 +1,4 @@
-use seismic_engine::{
+use magnitude_engine::{
     models::qwen35::{gguf::inspect, FeedForwardWeights, HeadMapping, MixerWeights},
     weights::{
         descriptor::ArtifactIdentity,
@@ -215,7 +215,7 @@ fn explicit_mixer_flags_and_speculative_blocks_keep_main_layer_order() {
 
 #[test]
 fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
-    use seismic_engine::{
+    use magnitude_engine::{
         chat::{ChatRequest, PreparedChat, TemplateSelection},
         inputs::ByteBpeTokenizer,
         models::qwen35::loading::Model,

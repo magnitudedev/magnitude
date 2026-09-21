@@ -14,7 +14,7 @@ fn tensor(vm: &mut Interpreter<'_>, dtype: DType, shape: Vec<usize>, values: Vec
 #[test]
 fn packed_embedding_publishes_bf16_before_residual_cast() {
     {
-        let p = seismic_engine::models::qwen35::program::program().unwrap();
+        let p = magnitude_engine::models::qwen35::program::program().unwrap();
         let mut vm = reference::interpreter(&p);
         // Three distinct rows, one affine group each. Values require BF16 rounding.
         let scales = [0x3d81u16, 0x3e03, 0x3e85];
@@ -139,7 +139,7 @@ fn check_logits(vm: &Interpreter<'_>, id: usize, step: &Value) {
 #[test]
 fn multirow_prefill_and_continuation_match_v3_equations() {
     {
-        let p = seismic_engine::models::qwen35::program::program().unwrap();
+        let p = magnitude_engine::models::qwen35::program::program().unwrap();
         let fixture: Value = serde_json::from_str(include_str!(
             "../../validation/results/fixtures/qwen-decoder-reference.json"
         ))
@@ -368,7 +368,7 @@ fn multirow_prefill_and_continuation_match_v3_equations() {
 #[test]
 fn selected_readout_matches_full_projection_with_order_duplicates_and_packed_weights() {
     {
-        let p = seismic_engine::models::qwen35::program::program().unwrap();
+        let p = magnitude_engine::models::qwen35::program::program().unwrap();
         for packed in [false, true] {
             let mut vm = reference::interpreter(&p);
             let hidden = tensor(

@@ -12,7 +12,7 @@ use crate::types::{DType, Elem, ExtentExpr, TensorType, ValueType};
 /// Revision of the registry contract. Capability fingerprints and every
 /// downstream identity retain this value so cached decisions cannot survive a
 /// semantic change.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v3";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v4";
 
 // ---------------------------------------------------------------------------
 // Identities
@@ -522,6 +522,86 @@ pub fn accumulator_dtype(op: ReduceOp, input: DType) -> DType {
     }
 }
 
+/// The element the fold starts from (registry semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReduceIdentity {
+    /// `sum`: the additive identity of the accumulator dtype.
+    Zero,
+    /// `max`/`min`: no identity; the fold starts from the first (ascending)
+    /// element, so the reduced axis must be nonempty.
+    FirstElement,
+    /// `argmax`: no identity, smaller-index ties, nonempty input required.
+    FirstElementNonEmpty,
+}
+
+/// How ties are resolved. The registry admits exactly one rule; strategies
+/// may not weaken it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TieRule {
+    /// The smaller coordinate index wins.
+    SmallerCoordinateIndex,
+}
+
+/// The algebraic combination law of a reduction operator over its
+/// accumulator: what reorderings of the fold are meaning-preserving in
+/// exact arithmetic. The numerical transfer of any reassociation under
+/// finite precision is realization numerics' authority, not the registry's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CombineLaw {
+    /// Regrouping preserves meaning; operand order does not.
+    Associative,
+    /// Regrouping and reordering both preserve meaning.
+    AssociativeCommutative,
+    /// Only the ascending reference fold defines the result.
+    OrderedOnly,
+}
+
+/// The complete reduction schema of one operator over one input dtype: the
+/// single owner of accumulator/result dtypes, identity, tie rule, and
+/// combination law consumed by kernel formation, strategy formation, and
+/// backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReduceSchema {
+    /// Dtype of the running combined value: the `accumulator_dtype` for
+    /// `sum`/`max`/`min`; the input dtype (the running extremum) for
+    /// `argmax`, whose running coordinate is an implicit `i32`.
+    pub accumulator: DType,
+    /// Dtype of the published result (`accumulator_dtype`).
+    pub result: DType,
+    pub identity: ReduceIdentity,
+    pub ties: TieRule,
+    pub combine: CombineLaw,
+}
+
+/// The reduction schema of `op` over inputs of dtype `input`. Exhaustive
+/// over `ReduceOp`.
+pub fn reduce_schema(op: ReduceOp, input: DType) -> ReduceSchema {
+    let result = accumulator_dtype(op, input);
+    match op {
+        ReduceOp::Sum => ReduceSchema {
+            accumulator: result,
+            result,
+            identity: ReduceIdentity::Zero,
+            ties: TieRule::SmallerCoordinateIndex,
+            combine: CombineLaw::AssociativeCommutative,
+        },
+        ReduceOp::Max | ReduceOp::Min => ReduceSchema {
+            accumulator: result,
+            result,
+            identity: ReduceIdentity::FirstElement,
+            ties: TieRule::SmallerCoordinateIndex,
+            combine: CombineLaw::AssociativeCommutative,
+        },
+        ReduceOp::Argmax => ReduceSchema {
+            accumulator: input,
+            result,
+            identity: ReduceIdentity::FirstElementNonEmpty,
+            ties: TieRule::SmallerCoordinateIndex,
+            combine: CombineLaw::OrderedOnly,
+        },
+    }
+}
+
 /// The result type of reducing `operand` along `axis` with `op`.
 pub fn reduction_result(operand: &ValueType, op: ReduceOp, axis: usize) -> Option<ValueType> {
     let shaped = operand.shaped()?;
@@ -683,6 +763,103 @@ pub enum ReferenceNumerics {
     },
 }
 
+/// The core kernel-operation family that lowers a primitive category. This
+/// is the registry's lowering schema: kernel formation matches it
+/// exhaustively and maps each family onto the closed core kernel algebra
+/// (`seismic-realization::kernel::CoreKernelOp`) or onto a structural
+/// consequence with no operation. Backends never see a primitive id; they
+/// see the core operation the family names.
+///
+/// The families cover the complete primitive category of the semantic
+/// coverage basis: typed constants and runtime extents (which are logical
+/// primitive operations without a `PrimitiveId`) and every registry
+/// primitive. `lowering(id)` maps every `PrimitiveId` onto exactly one
+/// family; `Constant` is the family of the typed-literal category only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoreLoweringFamily {
+    /// Scalar operator arithmetic: `Unary`, `Binary`, and `Compare` core ops
+    /// applied per element under the participant map.
+    ScalarArithmetic,
+    /// Registry math sequences: the `Math` core op applied per element.
+    ElementwiseMap,
+    /// Dtype conversion: the `Cast` core op applied per element.
+    Cast,
+    /// Conditional selection: the `Select` core op applied per element.
+    Select,
+    /// Tuple and range construction/projection: pure value structure, no
+    /// kernel operation.
+    Structural,
+    /// Owned uninitialized storage: a residence only, no kernel operation.
+    TensorAlloc,
+    /// Constant fill of fresh storage: a `Const` and a `Store` per element.
+    Fill,
+    /// Slice write of a shaped value into a place: a `Load` and a `Store`
+    /// per element of the written range.
+    CopyInto,
+    /// Whole-object copy into fresh owned storage (`to_owned`, `clone`,
+    /// `load`): a `Load` and a `Store` per storage element of every plane.
+    BulkCopy,
+    /// Dense decode of a packed element: the `PackedDecode` core op.
+    PackedDecode,
+    /// Raw plane field read of a packed element: the `PackedPlaneRead` core
+    /// op.
+    PackedPlaneRead,
+    /// View selection (`transpose`, `reshape`, slicing): a route only, no
+    /// kernel operation.
+    ViewTransform,
+    /// Point read of one element: the `Load` core op.
+    ElementRead,
+    /// Point write of one element: the `Store` core op.
+    ElementWrite,
+    /// The checked (capacity) extent of an axis: a `Const` for a static
+    /// extent, the retained `RuntimeExtent` for a runtime extent.
+    ExtentRead,
+    /// Atomic read-modify-write of one element: the `Atomic` core op.
+    Atomic,
+    /// Reduction along one axis: the `Fold` core op (universal form) or an
+    /// optimized strategy alternative preserving the `ReduceSchema`.
+    Reduce,
+    /// A typed literal constant: the `Const` core op. Not a registry
+    /// primitive; the family of `logical::PrimitiveOp::Constant`.
+    Constant,
+    /// The extent in effect at runtime (`valid`): the `RuntimeExtent` core
+    /// op. Also the family of `logical::PrimitiveOp::RuntimeExtent`.
+    RuntimeExtent,
+}
+
+/// The core lowering family of one primitive identity. Exhaustive: adding a
+/// `PrimitiveId` variant fails compilation here.
+pub fn lowering(id: &PrimitiveId) -> CoreLoweringFamily {
+    match id {
+        PrimitiveId::TuplePack
+        | PrimitiveId::TupleGet(_)
+        | PrimitiveId::RangeMake
+        | PrimitiveId::RangeStart
+        | PrimitiveId::RangeEnd => CoreLoweringFamily::Structural,
+        PrimitiveId::Unary(_) | PrimitiveId::Binary(_) => CoreLoweringFamily::ScalarArithmetic,
+        PrimitiveId::Cast(_) => CoreLoweringFamily::Cast,
+        PrimitiveId::Math(_) => CoreLoweringFamily::ElementwiseMap,
+        PrimitiveId::Select => CoreLoweringFamily::Select,
+        PrimitiveId::TensorAlloc { .. } => CoreLoweringFamily::TensorAlloc,
+        PrimitiveId::Fill { .. } => CoreLoweringFamily::Fill,
+        PrimitiveId::Materialize | PrimitiveId::Clone | PrimitiveId::Load => {
+            CoreLoweringFamily::BulkCopy
+        }
+        PrimitiveId::Decode => CoreLoweringFamily::PackedDecode,
+        PrimitiveId::PackedRead(_) => CoreLoweringFamily::PackedPlaneRead,
+        PrimitiveId::Transpose | PrimitiveId::Reshape | PrimitiveId::SliceView { .. } => {
+            CoreLoweringFamily::ViewTransform
+        }
+        PrimitiveId::ElementRead { .. } => CoreLoweringFamily::ElementRead,
+        PrimitiveId::ElementWrite { .. } => CoreLoweringFamily::ElementWrite,
+        PrimitiveId::CopyInto => CoreLoweringFamily::CopyInto,
+        PrimitiveId::Extent { .. } => CoreLoweringFamily::ExtentRead,
+        PrimitiveId::ValidExtent { .. } => CoreLoweringFamily::RuntimeExtent,
+        PrimitiveId::Atomic { .. } => CoreLoweringFamily::Atomic,
+        PrimitiveId::Reduce { .. } => CoreLoweringFamily::Reduce,
+    }
+}
+
 /// One primitive's complete signature.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrimitiveSignature {
@@ -693,6 +870,8 @@ pub struct PrimitiveSignature {
     pub safety: SafetyFunction,
     pub reference: ReferenceSemantics,
     pub numerical: ReferenceNumerics,
+    /// The core kernel-operation family that lowers this primitive.
+    pub lowering: CoreLoweringFamily,
 }
 
 impl PrimitiveSignature {
@@ -760,6 +939,68 @@ pub enum CapabilitySemantics {
     MatrixMatmulAdd,
 }
 
+/// The capability family of an intrinsic: which backend feature namespace
+/// realizes it. Derived from `CapabilitySemantics`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CapabilityFamily {
+    /// Participant-group (subgroup/warp/SIMD-group) operations.
+    Subgroup,
+    /// Cooperative matrix (simdgroup matrix / tensor core) operations.
+    Matrix,
+}
+
+/// The capability family of one reference meaning. Exhaustive.
+pub fn capability_family(semantics: CapabilitySemantics) -> CapabilityFamily {
+    match semantics {
+        CapabilitySemantics::ParticipantIndex
+        | CapabilitySemantics::Exchange
+        | CapabilitySemantics::SubgroupReduction(_) => CapabilityFamily::Subgroup,
+        CapabilitySemantics::MatrixMatmul | CapabilitySemantics::MatrixMatmulAdd => {
+            CapabilityFamily::Matrix
+        }
+    }
+}
+
+/// The typed lowering of one capability intrinsic: every operand role,
+/// result role, shape, and dtype a backend `IntrinsicCatalog::lower` needs,
+/// so that lowering is a mechanical table over this enum and never a
+/// reconstruction from names or operand inspection.
+///
+/// Operand ordinals are the positions in `CapabilitySignature::arguments`;
+/// the roles below state them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntrinsicLowering {
+    /// No operands; result `i32`: the index of the participant in its group.
+    ParticipantIndex,
+    /// Operand 0: the value (`dtype`); operand 1: the source participant
+    /// index (`i32`); result: the exchanged value (`dtype`).
+    Exchange { dtype: DType },
+    /// Operand 0: the participant's value (`dtype`); result: the reduction
+    /// of every participant's value (`dtype`).
+    SubgroupReduce { op: ReduceOp, dtype: DType },
+    /// Operand 0: left `[rows, inner]` of `elem`; operand 1: right
+    /// `[inner, columns]` of `elem`; result: `[rows, columns]` of
+    /// `accumulator`.
+    MatrixMatmul {
+        rows: ExtentExpr,
+        columns: ExtentExpr,
+        inner: ExtentExpr,
+        elem: DType,
+        accumulator: DType,
+    },
+    /// Operand 0: left `[rows, inner]` of `elem`; operand 1: right
+    /// `[inner, columns]` of `elem`; operand 2: accumulator
+    /// `[rows, columns]` of `accumulator`; result: `[rows, columns]` of
+    /// `accumulator`.
+    MatrixMatmulAdd {
+        rows: ExtentExpr,
+        columns: ExtentExpr,
+        inner: ExtentExpr,
+        elem: DType,
+        accumulator: DType,
+    },
+}
+
 /// One capability intrinsic's complete signature.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilitySignature {
@@ -768,6 +1009,124 @@ pub struct CapabilitySignature {
     pub result: ConcreteType,
     pub semantics: CapabilitySemantics,
     pub numerical: NumericalTransfer,
+    /// The backend feature namespace realizing the intrinsic.
+    pub family: CapabilityFamily,
+    /// The only legal target of this signature (`id.capability.backend`).
+    pub backend: String,
+    /// The typed operand/result roles a backend lowers mechanically.
+    pub lowering: IntrinsicLowering,
+}
+
+/// The concrete dtype of a rank-two matrix operand of a capability
+/// signature. A non-concrete or packed element is a defect: capability
+/// lowering happens on specialized programs, and the registry admits dense
+/// dtype elements only.
+fn matrix_operand(id: &IntrinsicId, role: &str, ty: &ValueType) -> (DType, [ExtentExpr; 2]) {
+    let ValueType::Tensor(tensor) = ty else {
+        panic!("`{id}` {role} operand must be a rank-two tensor, found `{ty}`");
+    };
+    let [first, second] = tensor.axes.as_slice() else {
+        panic!("`{id}` {role} operand must be rank two, found `{ty}`");
+    };
+    let Elem::Dtype(dtype) = &tensor.elem else {
+        panic!("`{id}` {role} operand element must be a concrete dtype, found `{ty}`");
+    };
+    (*dtype, [first.clone(), second.clone()])
+}
+
+/// The scalar dtype of a scalar operand of a capability signature.
+fn scalar_operand(id: &IntrinsicId, role: &str, ty: &ValueType) -> DType {
+    let ValueType::Scalar(dtype) = ty else {
+        panic!("`{id}` {role} operand must be a scalar, found `{ty}`");
+    };
+    *dtype
+}
+
+/// The typed lowering of one capability signature from its reference
+/// meaning and exact operand/result types. Total over registry entries and
+/// checked uses; a structural mismatch is a defect named by `id`.
+fn intrinsic_lowering(
+    id: &IntrinsicId,
+    semantics: CapabilitySemantics,
+    arguments: &[ValueType],
+    result: &ValueType,
+) -> IntrinsicLowering {
+    match semantics {
+        CapabilitySemantics::ParticipantIndex => {
+            if !arguments.is_empty() {
+                panic!("`{id}` takes no operands, found {}", arguments.len());
+            }
+            IntrinsicLowering::ParticipantIndex
+        }
+        CapabilitySemantics::Exchange => {
+            let [value, lane] = arguments else {
+                panic!("`{id}` takes a value and a participant index, found {}", arguments.len());
+            };
+            let dtype = scalar_operand(id, "value", value);
+            if scalar_operand(id, "participant index", lane) != DType::I32 {
+                panic!("`{id}` participant index must be `i32`, found `{lane}`");
+            }
+            if scalar_operand(id, "result", result) != dtype {
+                panic!("`{id}` result must be `{}`, found `{result}`", dtype.name());
+            }
+            IntrinsicLowering::Exchange { dtype }
+        }
+        CapabilitySemantics::SubgroupReduction(op) => {
+            let [value] = arguments else {
+                panic!("`{id}` takes one value operand, found {}", arguments.len());
+            };
+            let dtype = scalar_operand(id, "value", value);
+            if scalar_operand(id, "result", result) != dtype {
+                panic!("`{id}` result must be `{}`, found `{result}`", dtype.name());
+            }
+            IntrinsicLowering::SubgroupReduce { op, dtype }
+        }
+        // The checker proved the inner axes equal (by the prover, not
+        // structurally) and built the result axes from the operand axes; the
+        // lowering carries the left operand's `rows`/`inner`, the right
+        // operand's `columns`, and the result's element. Operand element
+        // equality is guaranteed by the registry entry (`entry`) or by
+        // `signature_admits` (a use).
+        CapabilitySemantics::MatrixMatmul => {
+            let [left, right] = arguments else {
+                panic!("`{id}` takes two matrix operands, found {}", arguments.len());
+            };
+            let (elem, [rows, inner]) = matrix_operand(id, "left", left);
+            let (_, [_, columns]) = matrix_operand(id, "right", right);
+            let (accumulator, _) = matrix_operand(id, "result", result);
+            IntrinsicLowering::MatrixMatmul {
+                rows,
+                columns,
+                inner,
+                elem,
+                accumulator,
+            }
+        }
+        CapabilitySemantics::MatrixMatmulAdd => {
+            let [left, right, addend] = arguments else {
+                panic!(
+                    "`{id}` takes two matrix operands and an accumulator, found {}",
+                    arguments.len()
+                );
+            };
+            let (elem, [rows, inner]) = matrix_operand(id, "left", left);
+            let (_, [_, columns]) = matrix_operand(id, "right", right);
+            let (addend_elem, _) = matrix_operand(id, "accumulator", addend);
+            let (accumulator, _) = matrix_operand(id, "result", result);
+            if addend_elem != accumulator {
+                panic!(
+                    "`{id}` accumulator `{addend}` and result `{result}` elements differ"
+                );
+            }
+            IntrinsicLowering::MatrixMatmulAdd {
+                rows,
+                columns,
+                inner,
+                elem,
+                accumulator,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +1175,17 @@ pub fn primitive(id: PrimitiveId) -> PrimitiveSignature {
         safety,
         reference,
         numerical,
+        lowering: lowering(&id),
+    };
+    let bulk_copy = |reference: ReferenceSemantics| {
+        sig(
+            vec![TypePattern::TensorOf(ElemClass::Any)],
+            TypeFunction::SameAs(0),
+            EffectFunction::Allocates,
+            SafetyFunction::None,
+            reference,
+            ReferenceNumerics::Exact,
+        )
     };
     let ew = |class| TypePattern::Elementwise(ElemClass::Dense(class));
     match &id {
@@ -998,18 +1368,9 @@ pub fn primitive(id: PrimitiveId) -> PrimitiveSignature {
             ReferenceSemantics::FillConstant,
             ReferenceNumerics::RoundsOnce { dtype: *dtype },
         ),
-        PrimitiveId::Materialize | PrimitiveId::Clone | PrimitiveId::Load => sig(
-            vec![TypePattern::TensorOf(ElemClass::Any)],
-            TypeFunction::SameAs(0),
-            EffectFunction::Allocates,
-            SafetyFunction::None,
-            match id {
-                PrimitiveId::Materialize => ReferenceSemantics::MaterializeSnapshot,
-                PrimitiveId::Clone => ReferenceSemantics::CloneOwned,
-                _ => ReferenceSemantics::LoadSnapshot,
-            },
-            ReferenceNumerics::Exact,
-        ),
+        PrimitiveId::Materialize => bulk_copy(ReferenceSemantics::MaterializeSnapshot),
+        PrimitiveId::Clone => bulk_copy(ReferenceSemantics::CloneOwned),
+        PrimitiveId::Load => bulk_copy(ReferenceSemantics::LoadSnapshot),
         PrimitiveId::Decode => sig(
             vec![TypePattern::TensorOf(ElemClass::Packed)],
             TypeFunction::Elementwise {
@@ -1247,15 +1608,90 @@ fn entry(
     semantics: CapabilitySemantics,
     numerical: NumericalTransfer,
 ) -> CapabilitySignature {
+    let id = IntrinsicId {
+        capability: CapabilityId::new(backend, capability),
+        name: name.into(),
+    };
+    let lowering = intrinsic_lowering(&id, semantics, &arguments, &result);
     CapabilitySignature {
-        id: IntrinsicId {
-            capability: CapabilityId::new(backend, capability),
-            name: name.into(),
-        },
+        id,
         arguments,
         result,
         semantics,
         numerical,
+        family: capability_family(semantics),
+        backend: backend.into(),
+        lowering,
+    }
+}
+
+/// Whether one registry signature admits a checked use: the same identity,
+/// the same arity, scalars exactly, tensors by rank and element. This is the
+/// checker's admission relation sharpened to the element (the registry
+/// declares one signature per matrix element dtype).
+fn signature_admits(signature: &CapabilitySignature, intrinsic: &crate::sir::IntrinsicUse) -> bool {
+    signature.id == intrinsic.id
+        && signature.arguments.len() == intrinsic.arguments.len()
+        && signature
+            .arguments
+            .iter()
+            .zip(&intrinsic.arguments)
+            .all(|(parameter, argument)| match (parameter, argument) {
+                (ValueType::Scalar(p), ValueType::Scalar(a)) => p == a,
+                (ValueType::Tensor(p), ValueType::Tensor(a)) => {
+                    p.rank() == a.rank() && p.elem == a.elem
+                }
+                (ValueType::Index { .. }, argument) => {
+                    argument.scalar_dtype() == Some(DType::I32)
+                }
+                (parameter, argument) => parameter == argument,
+            })
+}
+
+/// The complete signature of one checked capability use, instantiated at
+/// the use's exact operand and result types (the registry entry's symbolic
+/// matrix shapes become the use's shapes; the lowering carries them). Total
+/// over checked uses: checking admitted the use against exactly one
+/// registry signature, so no admitting signature or more than one is a
+/// defect, reported with the use.
+pub fn capability_signature(intrinsic: &crate::sir::IntrinsicUse) -> CapabilitySignature {
+    let admitting: Vec<CapabilitySignature> = capabilities()
+        .into_iter()
+        .filter(|signature| signature_admits(signature, intrinsic))
+        .collect();
+    let describe = || {
+        let arguments: Vec<String> = intrinsic.arguments.iter().map(|t| t.to_string()).collect();
+        format!(
+            "`{}`({}) -> {}",
+            intrinsic.id,
+            arguments.join(", "),
+            intrinsic.result
+        )
+    };
+    let signature = match admitting.as_slice() {
+        [signature] => signature,
+        [] => panic!("checked capability use {} has no registry signature", describe()),
+        [_, _, ..] => panic!(
+            "checked capability use {} is admitted by {} registry signatures",
+            describe(),
+            admitting.len()
+        ),
+    };
+    let lowering = intrinsic_lowering(
+        &intrinsic.id,
+        signature.semantics,
+        &intrinsic.arguments,
+        &intrinsic.result,
+    );
+    CapabilitySignature {
+        id: intrinsic.id.clone(),
+        arguments: intrinsic.arguments.clone(),
+        result: intrinsic.result.clone(),
+        semantics: signature.semantics,
+        numerical: signature.numerical.clone(),
+        family: signature.family,
+        backend: signature.backend.clone(),
+        lowering,
     }
 }
 
@@ -1411,6 +1847,182 @@ mod tests {
                 Elem::Dtype(DType::I32)
             ))
         );
+    }
+
+    #[test]
+    fn every_primitive_carries_its_lowering_family() {
+        for signature in primitives() {
+            assert_eq!(signature.lowering, lowering(&signature.id), "{}", signature.id);
+            let expected_by_reference = match &signature.reference {
+                ReferenceSemantics::TupleOp | ReferenceSemantics::RangeOp => {
+                    Some(CoreLoweringFamily::Structural)
+                }
+                ReferenceSemantics::AllocateUninitialized => Some(CoreLoweringFamily::TensorAlloc),
+                ReferenceSemantics::FillConstant => Some(CoreLoweringFamily::Fill),
+                ReferenceSemantics::MaterializeSnapshot
+                | ReferenceSemantics::CloneOwned
+                | ReferenceSemantics::LoadSnapshot => Some(CoreLoweringFamily::BulkCopy),
+                ReferenceSemantics::DecodePacked => Some(CoreLoweringFamily::PackedDecode),
+                ReferenceSemantics::ReadPackedPlane => Some(CoreLoweringFamily::PackedPlaneRead),
+                ReferenceSemantics::ViewTransform => Some(CoreLoweringFamily::ViewTransform),
+                ReferenceSemantics::ReadElement => Some(CoreLoweringFamily::ElementRead),
+                ReferenceSemantics::Atomic => Some(CoreLoweringFamily::Atomic),
+                ReferenceSemantics::Reduce { .. } => Some(CoreLoweringFamily::Reduce),
+                // Several families share these reference meanings; the id
+                // decides (checked below).
+                ReferenceSemantics::ScalarOp
+                | ReferenceSemantics::ElementwiseOp
+                | ReferenceSemantics::ReadExtent => None,
+            };
+            if let Some(expected) = expected_by_reference {
+                assert_eq!(signature.lowering, expected, "{}", signature.id);
+            }
+        }
+        assert_eq!(lowering(&PrimitiveId::Binary(BinaryOp::Lt)), CoreLoweringFamily::ScalarArithmetic);
+        assert_eq!(lowering(&PrimitiveId::Math(MathOp::Fma)), CoreLoweringFamily::ElementwiseMap);
+        assert_eq!(lowering(&PrimitiveId::Cast(DType::BF16)), CoreLoweringFamily::Cast);
+        assert_eq!(lowering(&PrimitiveId::Select), CoreLoweringFamily::Select);
+        assert_eq!(lowering(&PrimitiveId::CopyInto), CoreLoweringFamily::CopyInto);
+        assert_eq!(
+            lowering(&PrimitiveId::ElementWrite { arity: 2 }),
+            CoreLoweringFamily::ElementWrite
+        );
+        assert_eq!(lowering(&PrimitiveId::Extent { axis: 0 }), CoreLoweringFamily::ExtentRead);
+        assert_eq!(
+            lowering(&PrimitiveId::ValidExtent { axis: 0 }),
+            CoreLoweringFamily::RuntimeExtent
+        );
+    }
+
+    #[test]
+    fn capability_signatures_carry_family_backend_and_typed_lowering() {
+        for signature in capabilities() {
+            assert_eq!(signature.backend, signature.id.capability.backend);
+            assert_eq!(signature.family, capability_family(signature.semantics));
+            match (&signature.semantics, &signature.lowering) {
+                (CapabilitySemantics::ParticipantIndex, IntrinsicLowering::ParticipantIndex) => {}
+                (CapabilitySemantics::Exchange, IntrinsicLowering::Exchange { dtype }) => {
+                    assert_eq!(signature.result, ValueType::Scalar(*dtype));
+                }
+                (
+                    CapabilitySemantics::SubgroupReduction(op),
+                    IntrinsicLowering::SubgroupReduce { op: lowered, dtype },
+                ) => {
+                    assert_eq!(op, lowered);
+                    assert_eq!(signature.result, ValueType::Scalar(*dtype));
+                }
+                (
+                    CapabilitySemantics::MatrixMatmul,
+                    IntrinsicLowering::MatrixMatmul {
+                        rows,
+                        columns,
+                        inner,
+                        elem,
+                        accumulator,
+                    },
+                ) => {
+                    assert_eq!(*rows, ExtentExpr::Sym(Sym::param("rows")));
+                    assert_eq!(*columns, ExtentExpr::Sym(Sym::param("columns")));
+                    assert_eq!(*inner, ExtentExpr::Sym(Sym::param("inner")));
+                    assert_eq!(signature.arguments[0], inner2(Elem::Dtype(*elem)));
+                    assert_eq!(*accumulator, DType::F32);
+                }
+                (
+                    CapabilitySemantics::MatrixMatmulAdd,
+                    IntrinsicLowering::MatrixMatmulAdd {
+                        elem, accumulator, ..
+                    },
+                ) => {
+                    assert_eq!(elem, accumulator);
+                    assert_eq!(signature.arguments[2], rows2(Elem::Dtype(*accumulator)));
+                }
+                (semantics, lowering) => {
+                    panic!("`{}`: {semantics:?} lowered as {lowering:?}", signature.id)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capability_signature_of_a_checked_use_instantiates_the_use_types() {
+        let id = IntrinsicId {
+            capability: CapabilityId::new("metal", "matrix"),
+            name: "matmul".into(),
+        };
+        let matrix = |rows: u64, columns: u64, dtype: DType| {
+            ValueType::Tensor(TensorType::new(
+                vec![ExtentExpr::Static(rows), ExtentExpr::Static(columns)],
+                Elem::Dtype(dtype),
+            ))
+        };
+        let used = crate::sir::IntrinsicUse {
+            id: id.clone(),
+            arguments: vec![matrix(64, 32, DType::F16), matrix(32, 16, DType::F16)],
+            result: matrix(64, 16, DType::F32),
+        };
+        let signature = capability_signature(&used);
+        assert_eq!(signature.id, id);
+        assert_eq!(signature.backend, "metal");
+        assert_eq!(signature.family, CapabilityFamily::Matrix);
+        assert_eq!(signature.arguments, used.arguments);
+        assert_eq!(signature.result, used.result);
+        assert_eq!(
+            signature.lowering,
+            IntrinsicLowering::MatrixMatmul {
+                rows: ExtentExpr::Static(64),
+                columns: ExtentExpr::Static(16),
+                inner: ExtentExpr::Static(32),
+                elem: DType::F16,
+                accumulator: DType::F32,
+            }
+        );
+
+        let shuffle = crate::sir::IntrinsicUse {
+            id: IntrinsicId {
+                capability: CapabilityId::new("cuda", "subgroup"),
+                name: "shuffle".into(),
+            },
+            arguments: vec![ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::I32)],
+            result: ValueType::Scalar(DType::BF16),
+        };
+        assert_eq!(
+            capability_signature(&shuffle).lowering,
+            IntrinsicLowering::Exchange { dtype: DType::BF16 }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "has no registry signature")]
+    fn capability_signature_rejects_an_unregistered_use_as_a_defect() {
+        let unregistered = crate::sir::IntrinsicUse {
+            id: IntrinsicId {
+                capability: CapabilityId::new("metal", "subgroup"),
+                name: "shuffle".into(),
+            },
+            arguments: vec![ValueType::Scalar(DType::I32), ValueType::Scalar(DType::I32)],
+            result: ValueType::Scalar(DType::I32),
+        };
+        capability_signature(&unregistered);
+    }
+
+    #[test]
+    fn reduce_schema_agrees_with_accumulator_dtype_and_laws() {
+        for input in [DType::F16, DType::BF16, DType::F32, DType::I32, DType::U32, DType::Bool] {
+            for op in [ReduceOp::Sum, ReduceOp::Max, ReduceOp::Min] {
+                let schema = reduce_schema(op, input);
+                assert_eq!(schema.result, accumulator_dtype(op, input));
+                assert_eq!(schema.accumulator, schema.result);
+                assert_eq!(schema.combine, CombineLaw::AssociativeCommutative);
+                assert_eq!(schema.ties, TieRule::SmallerCoordinateIndex);
+            }
+            let argmax = reduce_schema(ReduceOp::Argmax, input);
+            assert_eq!(argmax.result, DType::I32);
+            assert_eq!(argmax.accumulator, input);
+            assert_eq!(argmax.identity, ReduceIdentity::FirstElementNonEmpty);
+            assert_eq!(argmax.combine, CombineLaw::OrderedOnly);
+        }
+        assert_eq!(reduce_schema(ReduceOp::Sum, DType::F16).identity, ReduceIdentity::Zero);
+        assert_eq!(reduce_schema(ReduceOp::Max, DType::U32).identity, ReduceIdentity::FirstElement);
     }
 
     #[test]

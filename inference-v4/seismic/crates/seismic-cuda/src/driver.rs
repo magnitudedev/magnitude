@@ -3,7 +3,7 @@
 //! required to build this crate or load hardware-independent tools.
 use libloading::Library;
 use std::{
-    ffi::{c_char, c_int, c_uint, c_void, CStr},
+    ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr},
     fmt,
     rc::Rc,
 };
@@ -50,7 +50,6 @@ driver! {
     free: unsafe extern "system" fn(u64)->ResultCode => "cuMemFree_v2",
     upload: unsafe extern "system" fn(u64,*const c_void,usize)->ResultCode => "cuMemcpyHtoD_v2",
     download: unsafe extern "system" fn(*mut c_void,u64,usize)->ResultCode => "cuMemcpyDtoH_v2",
-    memset: unsafe extern "system" fn(u64,u8,usize)->ResultCode => "cuMemsetD8_v2",
     module_load: unsafe extern "system" fn(*mut Handle,*const c_void,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuModuleLoadDataEx",
     link_create: unsafe extern "system" fn(c_uint,*mut c_int,*mut *mut c_void,*mut Handle)->ResultCode => "cuLinkCreate_v2",
     link_add_data: unsafe extern "system" fn(Handle,c_int,*mut c_void,usize,*const c_char,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuLinkAddData_v2",
@@ -60,10 +59,9 @@ driver! {
     module_function: unsafe extern "system" fn(*mut Handle,Handle,*const c_char)->ResultCode => "cuModuleGetFunction",
     function_attribute: unsafe extern "system" fn(*mut c_int,c_int,Handle)->ResultCode => "cuFuncGetAttribute",
     launch: unsafe extern "system" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->ResultCode => "cuLaunchKernel",
-    event_create: unsafe extern "system" fn(*mut Handle,c_uint)->ResultCode => "cuEventCreate",
-    event_destroy: unsafe extern "system" fn(Handle)->ResultCode => "cuEventDestroy_v2",
-    event_record: unsafe extern "system" fn(Handle,Handle)->ResultCode => "cuEventRecord",
-    event_elapsed: unsafe extern "system" fn(*mut f32,Handle,Handle)->ResultCode => "cuEventElapsedTime",
+    launch_cooperative: unsafe extern "system" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->ResultCode => "cuLaunchCooperativeKernel",
+    memcpy_device: unsafe extern "system" fn(u64,u64,usize)->ResultCode => "cuMemcpyDtoD_v2",
+    memset_d8: unsafe extern "system" fn(u64,c_uchar,usize)->ResultCode => "cuMemsetD8_v2",
     error_string: unsafe extern "system" fn(ResultCode,*mut *const c_char)->ResultCode => "cuGetErrorString",
 }
 impl Driver {
@@ -188,9 +186,6 @@ impl Allocation {
             context: context.clone(),
         })
     }
-    pub fn upload(&self, bytes: &[u8]) -> Result<(), String> {
-        self.upload_at(0, bytes)
-    }
     pub fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), String> {
         if offset
             .checked_add(bytes.len())
@@ -213,9 +208,6 @@ impl Allocation {
         }
         Ok(())
     }
-    pub fn download(&self, bytes: &mut [u8]) -> Result<(), String> {
-        self.download_at(0, bytes)
-    }
     pub fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), String> {
         if offset
             .checked_add(bytes.len())
@@ -233,18 +225,6 @@ impl Allocation {
                         bytes.len(),
                     ),
                     "download",
-                )?;
-            }
-        }
-        Ok(())
-    }
-    pub fn fill(&self, byte: u8) -> Result<(), String> {
-        let _current = self.context.enter()?;
-        if self.bytes > 0 {
-            unsafe {
-                self.context.driver.check(
-                    (self.context.driver.memset)(self.pointer, byte, self.bytes),
-                    "memory fill",
                 )?;
             }
         }
@@ -269,37 +249,6 @@ impl Drop for Module {
         if let Ok(_current) = self.context.enter() {
             unsafe {
                 (self.context.driver.module_unload)(self.raw);
-            }
-        }
-    }
-}
-
-/// Event ownership is tied to the private context. A recorded event is retired
-/// only after the synchronous launch boundary has drained submitted work.
-pub(crate) struct Event {
-    pub raw: Handle,
-    context: Rc<Context>,
-}
-impl Event {
-    pub fn new(context: &Rc<Context>) -> Result<Self, String> {
-        let _current = context.enter()?;
-        let mut raw = std::ptr::null_mut();
-        unsafe {
-            context
-                .driver
-                .check((context.driver.event_create)(&mut raw, 0), "event creation")?;
-        }
-        Ok(Self {
-            raw,
-            context: context.clone(),
-        })
-    }
-}
-impl Drop for Event {
-    fn drop(&mut self) {
-        if let Ok(_current) = self.context.enter() {
-            unsafe {
-                (self.context.driver.event_destroy)(self.raw);
             }
         }
     }

@@ -1,8 +1,6 @@
 //! Authored numerical compositions following V3's publication boundaries.
-use seismic_lang::{
-    program::{compile, SourceFile},
-    sir::Program,
-};
+use crate::preparation::Program;
+use seismic_lang::program::{compile, SourceFile};
 /// Contains no hardware policy. Candidate selection belongs to the compiler and
 /// accounting system; these equations describe the model's numerical stages.
 pub fn program() -> Result<Program, String> {

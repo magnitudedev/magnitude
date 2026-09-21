@@ -1,30 +1,43 @@
 //! Semantic-to-logical construction: a single forward pass over the checked
 //! body.
 //!
-//! One lexical environment maps each local to its current value/view/state.
-//! Constructors create outputs and dependencies immediately; nothing is
-//! collected by recursive scanning afterwards. Arguments are region
-//! parameters, never
-//! pseudo-values; entry results are compiler-owned logical storage; call
-//! results are occurrence-owned storage. Initialization follows
-//! `Uninitialized -> PartiallyInitialized(coverage proof) -> FullyInitialized`
-//! with structurally composing disjoint coverage.
+//! One lexical environment maps each local to its current value. Constructors
+//! create outputs and dependencies immediately; nothing is collected by
+//! recursive scanning afterwards. Arguments are region parameters, never
+//! pseudo-values; a computed tensor is a value without logical storage and is
+//! returned, reduced, read, viewed or passed into a call as such — a view of
+//! a computed tensor names the value as its base, and a computed call
+//! argument is shared or moved as a value. Storage exists only where the
+//! source names it: parameters, allocation-family primitives, and the mutable
+//! state of a `let mut` local written in place (the one materialization
+//! construction performs, because the write itself names state).
+//! Initialization follows `Uninitialized -> PartiallyInitialized(coverage
+//! proof) -> FullyInitialized` with structurally composing disjoint coverage.
+//!
+//! Domain specialization (package W1 behavior under W1's frozen types): exact entry
+//! shape bindings are static extents; bounded bindings are one retained
+//! invocation-sourced runtime extent each; every implementation predicate is
+//! decided over the whole domain; every shape expression of every occurrence
+//! is resolved in the entry's symbol space so equal expressions share one
+//! runtime extent program-wide.
 
-use super::builder::{GraphBuilder, Ids, LoopSpec, Output, PrimitiveSpec, WriteEffect};
+use super::builder::{computed_kind, GraphBuilder, Ids, LoopSpec, Output, PrimitiveSpec, WriteEffect};
+use super::specialization::{predicate_verdict, shape_interval, PredicateVerdict, ShapeBinding};
 use super::*;
 use crate::check::atom_var;
 use crate::family;
-use crate::intrinsics::{accumulator_dtype, PrimitiveId};
+use crate::intrinsics::{accumulator_dtype, IndexSlot, PrimitiveId};
 use crate::sir::{
     BlockTerminator, CheckedBlock, CheckedCall, CheckedExpr, CheckedExprKind, CheckedIndex,
     CheckedPlace, CheckedRange, CheckedStmt, DefId, Definition, IntrinsicUse, Literal, LocalId,
-    LoopKind, LoopMutationSummary, Mode, ParamOwnership, Pattern, Program,
+    LoopKind, LoopMutationSummary, ParamOwnership, Pattern, Predicate, Program,
 };
 use crate::span::Span;
 use crate::sym::{Atom, Sym};
 use crate::syntax::ast::{AssignOp, BinaryOp};
 use crate::types::{
-    DType, Elem, ExtentExpr, NonEmpty, RuntimeExtentId, TensorType, ValuePath, ValueType,
+    CapabilityValueType, DType, Elem, ExtentExpr, NonEmpty, RuntimeExtentId, TensorType,
+    ValuePath, ValueType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -66,59 +79,73 @@ pub(super) enum BuildError {
 // Boundary leaf decomposition
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
-enum BoundaryLeaf {
+/// One canonical leaf of a boundary type. This is `types::canonical_leaves`'
+/// path scheme extended with capability values: they never cross the public
+/// ABI or a portable boundary, but a same-backend call passes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LeafKind<'a> {
     Scalar(DType),
-    Index(ExtentExpr),
-    Range(ExtentExpr),
-    Tensor(TensorType),
-    /// An opaque capability value. Checking keeps these inside one backend's
-    /// alternatives; they never cross a portable boundary or the public ABI.
-    Capability,
+    Index(&'a ExtentExpr),
+    Range(&'a ExtentExpr),
+    Tensor(&'a TensorType),
+    Capability(&'a CapabilityValueType),
 }
 
-fn boundary_leaves(ty: &ValueType) -> Vec<(ValuePath, BoundaryLeaf)> {
-    let mut out = Vec::new();
-    fn walk(ty: &ValueType, path: &ValuePath, out: &mut Vec<(ValuePath, BoundaryLeaf)>) {
+impl LeafKind<'_> {
+    fn ty(&self) -> ValueType {
+        match self {
+            LeafKind::Scalar(dtype) => ValueType::Scalar(*dtype),
+            LeafKind::Index(bound) => ValueType::Index {
+                bound: (*bound).clone(),
+            },
+            LeafKind::Range(bound) => ValueType::Range {
+                bound: (*bound).clone(),
+            },
+            LeafKind::Tensor(ty) => ValueType::Tensor((*ty).clone()),
+            LeafKind::Capability(ty) => ValueType::CapabilityValue((*ty).clone()),
+        }
+    }
+
+    /// The kind of a value this leaf produces at a boundary where it is not a
+    /// view: a tensor leaf is computed.
+    fn produced_kind(&self) -> GraphValueKind {
+        match self {
+            LeafKind::Scalar(dtype) => GraphValueKind::Scalar(*dtype),
+            LeafKind::Index(bound) => GraphValueKind::Index {
+                bound: (*bound).clone(),
+            },
+            LeafKind::Range(bound) => GraphValueKind::Range {
+                bound: (*bound).clone(),
+            },
+            LeafKind::Tensor(ty) => GraphValueKind::Tensor {
+                ty: (*ty).clone(),
+                source: TensorSource::Computed,
+            },
+            LeafKind::Capability(ty) => GraphValueKind::Capability((*ty).clone()),
+        }
+    }
+}
+
+/// The canonical (path, leaf) list of one boundary type. `Void` has no leaves.
+pub(super) fn boundary_leaves(ty: &ValueType) -> Vec<(ValuePath, LeafKind<'_>)> {
+    fn walk<'a>(ty: &'a ValueType, path: &ValuePath, out: &mut Vec<(ValuePath, LeafKind<'a>)>) {
         match ty {
-            ValueType::Scalar(d) => out.push((path.clone(), BoundaryLeaf::Scalar(*d))),
-            ValueType::Index { bound } => {
-                out.push((path.clone(), BoundaryLeaf::Index(bound.clone())))
-            }
-            ValueType::Range { bound } => {
-                out.push((path.clone(), BoundaryLeaf::Range(bound.clone())))
-            }
-            ValueType::Tensor(s) => out.push((path.clone(), BoundaryLeaf::Tensor(s.clone()))),
+            ValueType::Scalar(d) => out.push((path.clone(), LeafKind::Scalar(*d))),
+            ValueType::Index { bound } => out.push((path.clone(), LeafKind::Index(bound))),
+            ValueType::Range { bound } => out.push((path.clone(), LeafKind::Range(bound))),
+            ValueType::Tensor(s) => out.push((path.clone(), LeafKind::Tensor(s))),
             ValueType::Tuple(items) => {
                 for (i, item) in items.iter().enumerate() {
                     walk(item, &path.extend(i as u32), out);
                 }
             }
-            ValueType::CapabilityValue(_) => out.push((path.clone(), BoundaryLeaf::Capability)),
+            ValueType::CapabilityValue(n) => out.push((path.clone(), LeafKind::Capability(n))),
             ValueType::Void => {}
         }
     }
+    let mut out = Vec::new();
     walk(ty, &ValuePath::default(), &mut out);
     out
-}
-
-fn leaf_value_type(leaf: &BoundaryLeaf) -> ValueType {
-    match leaf {
-        BoundaryLeaf::Scalar(d) => ValueType::Scalar(*d),
-        BoundaryLeaf::Index(bound) => ValueType::Index {
-            bound: bound.clone(),
-        },
-        BoundaryLeaf::Range(bound) => ValueType::Range {
-            bound: bound.clone(),
-        },
-        BoundaryLeaf::Tensor(s) => ValueType::Tensor(s.clone()),
-        BoundaryLeaf::Capability => ValueType::CapabilityValue(crate::types::CapabilityValueType {
-            target: String::new(),
-            name: String::new(),
-            shape: Vec::new(),
-            elem: None,
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,29 +310,34 @@ fn root_var(expr: &CheckedExpr) -> Option<LocalId> {
             id: PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
             operands,
         } => root_var(operands.first()?),
-        _ => None,
+        CheckedExprKind::Primitive { .. }
+        | CheckedExprKind::Capability { .. }
+        | CheckedExprKind::Call { .. }
+        | CheckedExprKind::Literal(_) => None,
     }
 }
 
-/// Locals whose storage this block may write: assignment places, atomic
-/// bases, and call arguments borrowed into callees. Over-approximated.
-fn written_roots(block: &CheckedBlock) -> BTreeSet<LocalId> {
+/// Locals whose storage this block writes in place: element and slice
+/// assignment places, atomic bases, and call arguments borrowed into callees.
+/// Over-approximated (a shared borrow is counted).
+fn storage_written_roots(block: &CheckedBlock) -> BTreeSet<LocalId> {
     let mut out = BTreeSet::new();
-    fn place_root(place: &CheckedPlace, out: &mut BTreeSet<LocalId>) {
-        match place {
-            CheckedPlace::Local { root } => {
-                out.insert(*root);
-            }
-            CheckedPlace::Element { root, .. } => {
-                out.insert(*root);
-            }
-            CheckedPlace::Tuple(places) => places.iter().for_each(|p| place_root(p, out)),
-        }
-    }
     fn walk(block: &CheckedBlock, out: &mut BTreeSet<LocalId>) {
         for stmt in &block.statements {
             match stmt {
-                CheckedStmt::Assign { place, .. } => place_root(place, out),
+                CheckedStmt::Assign { place, .. } => match place {
+                    CheckedPlace::Local { .. } => {}
+                    CheckedPlace::Element { root, .. } => {
+                        out.insert(*root);
+                    }
+                    CheckedPlace::Tuple(places) => {
+                        for place in places {
+                            if let CheckedPlace::Element { root, .. } = place {
+                                out.insert(*root);
+                            }
+                        }
+                    }
+                },
                 CheckedStmt::Loop { body, .. } => walk(body, out),
                 CheckedStmt::If {
                     then_body,
@@ -324,7 +356,7 @@ fn written_roots(block: &CheckedBlock) -> BTreeSet<LocalId> {
                 operands,
             } = &expr.kind
             {
-                if let Some(root) = root_var(operands.first().expect("atomic add has a base")) {
+                if let Some(root) = root_var(operands.first().expect("an atomic has a base")) {
                     out.insert(root);
                 }
             }
@@ -369,33 +401,125 @@ fn rebound_roots(block: &CheckedBlock) -> BTreeSet<LocalId> {
     out
 }
 
+/// Every local this block may write: in place or by rebinding.
+fn written_roots(block: &CheckedBlock) -> BTreeSet<LocalId> {
+    storage_written_roots(block)
+        .union(&rebound_roots(block))
+        .copied()
+        .collect()
+}
+
 fn returns_directly(block: &CheckedBlock) -> bool {
     matches!(block.terminator, BlockTerminator::Return(_))
+}
+
+// ---------------------------------------------------------------------------
+// Predicates over the specialization domain
+// ---------------------------------------------------------------------------
+
+fn predicate_display(predicate: &Predicate) -> String {
+    match predicate {
+        Predicate::NonNegative(expr) => format!("0 <= {expr}"),
+        Predicate::Zero(expr) => format!("{expr} == 0"),
+        Predicate::NonZero(expr) => format!("{expr} != 0"),
+    }
+}
+
+/// Decide one implementation predicate (already substituted into the
+/// caller's symbol space) over the entry domain: it is rewritten into the
+/// entry's symbol space through `caller_to_entry`, must mention entry shape
+/// parameters only, and admits the alternative only under `Always`.
+fn judge_predicate(
+    predicate: &Predicate,
+    caller_to_entry: &dyn Fn(&str) -> Option<Sym>,
+    domain: &SpecializationDomain,
+) -> Result<(), String> {
+    let rewrite = |expr: &Sym| family::substitute(expr, caller_to_entry);
+    let entry_form = match predicate {
+        Predicate::NonNegative(expr) => Predicate::NonNegative(rewrite(expr)),
+        Predicate::Zero(expr) => Predicate::Zero(rewrite(expr)),
+        Predicate::NonZero(expr) => Predicate::NonZero(rewrite(expr)),
+    };
+    let expr = match &entry_form {
+        Predicate::NonNegative(expr) | Predicate::Zero(expr) | Predicate::NonZero(expr) => expr,
+    };
+    let display = predicate_display(&entry_form);
+    for name in expr.params() {
+        if !domain.shapes().contains_key(&name) {
+            return Err(format!(
+                "the `where` predicate `{display}` depends on `{name}`, which is not a shape parameter of the entry"
+            ));
+        }
+    }
+    match predicate_verdict(&entry_form, domain) {
+        PredicateVerdict::Always => Ok(()),
+        PredicateVerdict::Never => Err(format!(
+            "predicate `{display}` fails on the whole specialization domain"
+        )),
+        PredicateVerdict::Mixed => Err(format!(
+            "predicate `{display}` is true on only part of the domain; declare a workload partition"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Program-level factory
 // ---------------------------------------------------------------------------
 
-type ShapeEnv = BTreeMap<String, ExtentExpr>;
+/// One resolved shape parameter of an occurrence: static, or one retained
+/// runtime extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeExtent {
+    Static(u64),
+    Runtime(RuntimeExtentId),
+}
+
+impl ShapeExtent {
+    fn extent(self) -> ExtentExpr {
+        match self {
+            ShapeExtent::Static(n) => ExtentExpr::Static(n),
+            ShapeExtent::Runtime(id) => ExtentExpr::Runtime(id),
+        }
+    }
+}
+
+fn static_extent(value: i64) -> Result<ShapeExtent, String> {
+    u64::try_from(value)
+        .map(ShapeExtent::Static)
+        .map_err(|_| format!("extent `{value}` is negative"))
+}
+
+/// Shape parameter name -> resolved extent, in one occurrence's symbol space.
+type ShapeEnv = BTreeMap<String, ShapeExtent>;
+/// Shape parameter name -> its expression over the entry's shape parameters.
+type SymEnv = BTreeMap<String, Sym>;
 type ElemEnv = BTreeMap<String, Elem>;
 
 struct Factory<'a> {
     program: &'a Program,
     target: &'a EffectiveTargetIdentity,
     supports: &'a dyn Fn(&IntrinsicUse) -> Result<(), String>,
-    entry: String,
+    domain: &'a SpecializationDomain,
+    /// The entry's shape parameters: exact ones static, bounded ones runtime.
+    entry_shapes: ShapeEnv,
+    shape_fields: Vec<ShapeField>,
     ids: Ids,
     next_choice: u32,
     next_graph: u32,
     choices: Vec<Option<ImplementationChoice>>,
     graphs: Vec<Option<TaskGraph>>,
     runtime_extents: Vec<RuntimeExtent>,
+    /// Runtime extents of entry-space shape expressions, by display form:
+    /// equal expressions share one extent program-wide.
+    shape_memo: BTreeMap<String, RuntimeExtentId>,
     rejections: Vec<OccurrenceRejection>,
     /// Set when any occurrence had no applicable implementation; the error
     /// cascades to the top as `NoImplementation`.
     no_implementation: bool,
-    depth: usize,
+    /// Definitions whose graphs are under construction (the static call
+    /// stack); re-entering one is recursion, which cannot terminate under
+    /// whole-program instantiation.
+    building: Vec<DefId>,
 }
 
 impl<'a> Factory<'a> {
@@ -403,22 +527,25 @@ impl<'a> Factory<'a> {
         program: &'a Program,
         target: &'a EffectiveTargetIdentity,
         supports: &'a dyn Fn(&IntrinsicUse) -> Result<(), String>,
-        entry: &str,
+        domain: &'a SpecializationDomain,
     ) -> Factory<'a> {
         Factory {
             program,
             target,
             supports,
-            entry: entry.to_string(),
+            domain,
+            entry_shapes: ShapeEnv::new(),
+            shape_fields: Vec::new(),
             ids: Ids::default(),
             next_choice: 0,
             next_graph: 0,
             choices: Vec::new(),
             graphs: Vec::new(),
             runtime_extents: Vec::new(),
+            shape_memo: BTreeMap::new(),
             rejections: Vec::new(),
             no_implementation: false,
-            depth: 0,
+            building: Vec::new(),
         }
     }
 
@@ -440,256 +567,396 @@ impl<'a> Factory<'a> {
         id
     }
 
-    fn runtime_extent(&mut self, value: RuntimeScalarExpr, capacity: u64) -> RuntimeExtentId {
+    fn runtime_extent(
+        &mut self,
+        value: RuntimeScalarExpr,
+        capacity: u64,
+        expected: Option<u64>,
+    ) -> RuntimeExtentId {
         let id = RuntimeExtentId(self.runtime_extents.len() as u32);
         self.runtime_extents.push(RuntimeExtent {
             id,
             value,
             capacity,
-            expected: None,
+            expected,
         });
         id
     }
 
+    /// Whether a symbolic expression mentions entry shape parameters only.
+    fn is_entry_shape_sym(&self, sym: &Sym) -> bool {
+        sym.params()
+            .iter()
+            .all(|name| self.entry_shapes.contains_key(name))
+    }
+
+    /// Resolve one entry-space shape expression: static when it folds to a
+    /// constant, otherwise one runtime extent shared by every equal
+    /// expression of the program.
+    fn shape_extent(&mut self, sym: &Sym) -> Result<ShapeExtent, String> {
+        if let Some(value) = sym.as_constant() {
+            return static_extent(value);
+        }
+        let key = sym.to_string();
+        if let Some(id) = self.shape_memo.get(&key) {
+            return Ok(ShapeExtent::Runtime(*id));
+        }
+        let expr = fold_scalar(self.shape_scalar_expr(sym)?);
+        let resolved = match expr {
+            RuntimeScalarExpr::Const(value) => static_extent(value)?,
+            RuntimeScalarExpr::Extent(id) => ShapeExtent::Runtime(id),
+            expr => {
+                // A shape expression mentions no graph value; its bound is
+                // proved from the shape fields' finite domains, or by the
+                // domain's own interval arithmetic. No proof is a
+                // construction error, never a substituted capacity.
+                let no_value = |id: GraphValueId| -> Result<GraphValueKind, String> {
+                    Err(format!("shape expression mentions graph value {}", id.0))
+                };
+                let capacity = match runtime_scalar_bound(
+                    &expr,
+                    &self.runtime_extents,
+                    &self.shape_fields,
+                    &no_value,
+                ) {
+                    Ok(capacity) => capacity,
+                    Err(reason) => match shape_interval(sym, self.domain) {
+                        Some((_, max)) => max,
+                        None => {
+                            return Err(format!(
+                                "shape expression `{sym}` has no finite bound over the specialization domain because {reason}"
+                            ))
+                        }
+                    },
+                };
+                ShapeExtent::Runtime(self.runtime_extent(expr, capacity, None))
+            }
+        };
+        if let ShapeExtent::Runtime(id) = resolved {
+            self.shape_memo.insert(key, id);
+        }
+        Ok(resolved)
+    }
+
+    fn shape_scalar_expr(&self, sym: &Sym) -> Result<RuntimeScalarExpr, String> {
+        let mut total = RuntimeScalarExpr::Const(0);
+        for (monomial, coefficient) in sym.monomials() {
+            let mut term = RuntimeScalarExpr::Const(coefficient);
+            for (atom, power) in monomial {
+                let atom_expr = self.shape_atom_expr(atom)?;
+                for _ in 0..*power {
+                    term = RuntimeScalarExpr::Mul(Box::new(term), Box::new(atom_expr.clone()));
+                }
+            }
+            total = RuntimeScalarExpr::Add(Box::new(total), Box::new(term));
+        }
+        Ok(total)
+    }
+
+    fn shape_atom_expr(&self, atom: &Atom) -> Result<RuntimeScalarExpr, String> {
+        match atom {
+            Atom::Param(name) => match self.entry_shapes.get(name) {
+                Some(ShapeExtent::Static(n)) => Ok(RuntimeScalarExpr::Const(*n as i64)),
+                Some(ShapeExtent::Runtime(id)) => Ok(RuntimeScalarExpr::Extent(*id)),
+                None => Err(format!("`{name}` is not a shape parameter of the entry")),
+            },
+            Atom::Quot(numerator, denominator) => Ok(RuntimeScalarExpr::Div(
+                Box::new(self.shape_scalar_expr(numerator)?),
+                Box::new(self.shape_scalar_expr(denominator)?),
+            )),
+            Atom::Rem(numerator, denominator) => Ok(RuntimeScalarExpr::Rem(
+                Box::new(self.shape_scalar_expr(numerator)?),
+                Box::new(self.shape_scalar_expr(denominator)?),
+            )),
+        }
+    }
+
+    /// Convert an interface type of the entry contract: symbolic extents are
+    /// entry shape expressions, element parameters resolve in `elems`.
+    fn convert_interface_type(
+        &mut self,
+        ty: &ValueType,
+        elems: &ElemEnv,
+        context: &str,
+    ) -> Result<ValueType, String> {
+        let convert_extent = |f: &mut Factory, extent: &ExtentExpr| -> Result<ExtentExpr, String> {
+            match extent {
+                ExtentExpr::Static(n) => Ok(ExtentExpr::Static(*n)),
+                ExtentExpr::Runtime(id) => Ok(ExtentExpr::Runtime(*id)),
+                ExtentExpr::Sym(sym) => {
+                    if !f.is_entry_shape_sym(sym) {
+                        return Err(format!(
+                            "{context} depends on `{sym}`, which is not an entry shape expression"
+                        ));
+                    }
+                    Ok(f.shape_extent(sym)?.extent())
+                }
+            }
+        };
+        match ty {
+            ValueType::Scalar(d) => Ok(ValueType::Scalar(*d)),
+            ValueType::Index { bound } => Ok(ValueType::Index {
+                bound: convert_extent(self, bound)?,
+            }),
+            ValueType::Range { bound } => Ok(ValueType::Range {
+                bound: convert_extent(self, bound)?,
+            }),
+            ValueType::Tensor(s) => {
+                let mut axes = Vec::new();
+                for axis in &s.axes {
+                    axes.push(convert_extent(self, axis)?);
+                }
+                Ok(ValueType::Tensor(s.specialize_elem(
+                    axes,
+                    convert_elem(&s.elem, elems, context)?,
+                )?))
+            }
+            ValueType::Tuple(items) => Ok(ValueType::Tuple(
+                NonEmpty::new(
+                    items
+                        .iter()
+                        .map(|item| self.convert_interface_type(item, elems, context))
+                        .collect::<Result<_, _>>()?,
+                )
+                .expect("the source tuple is nonempty"),
+            )),
+            ValueType::CapabilityValue(n) => Ok(ValueType::CapabilityValue(n.clone())),
+            ValueType::Void => Ok(ValueType::Void),
+        }
+    }
+
+    fn report(&self) -> ApplicabilityReport {
+        ApplicabilityReport {
+            entry: self.domain.entry().to_string(),
+            occurrences: self.rejections.clone(),
+        }
+    }
+}
+
+fn convert_elem(elem: &Elem, elems: &ElemEnv, context: &str) -> Result<Elem, String> {
+    match elem {
+        Elem::Param(p) => elems
+            .get(p)
+            .cloned()
+            .ok_or_else(|| format!("element parameter `{p}` of {context} is not bound")),
+        Elem::Dtype(_) | Elem::Repr(_) => Ok(elem.clone()),
+    }
+}
+
+impl<'a> Factory<'a> {
     /// Build the task graph of one alternative of one occurrence by the
     /// forward pass over the definition's checked body. The graph slot is
     /// reserved first so `LogicalAlternative`s can reference the id before
-    /// the (recursive) construction completes.
+    /// the (nested) construction completes. The graph is sealed with its
+    /// boundary before the slot is filled.
     fn build_graph(
         &mut self,
         definition: &Definition,
         shapes: ShapeEnv,
+        sym_env: SymEnv,
         elems: ElemEnv,
         choice: ChoiceId,
         alternative: u32,
-        is_entry: bool,
     ) -> Result<GraphId, BuildError> {
-        if self.depth > self.program.definitions.len() {
-            return Err(BuildError::Invalid(
-                "the static call graph is not acyclic".into(),
-            ));
+        if self.building.contains(&definition.id) {
+            return Err(BuildError::Invalid(format!(
+                "`{}` is reachable from its own body: recursion cannot terminate when every occurrence is instantiated",
+                definition.name
+            )));
         }
-        self.depth += 1;
+        self.building.push(definition.id);
         let graph_id = self.alloc_graph_slot();
         let builder = GraphBuilder::new(choice, alternative, std::mem::take(&mut self.ids));
-        let result = (|| -> Result<(TaskGraph, Ids), String> {
-            let invalid = |reason: String| reason;
-            let body = &definition.body;
-            let mut work = Work {
-                builder,
-                shapes,
-                elems,
-                local_tys: &body.locals,
-                locals: vec![None; body.locals.len()],
-                constants: BTreeMap::new(),
-                results: result_slots(&definition.result),
-                result_states: vec![
-                    None;
-                    definition
-                        .params
-                        .iter()
-                        .filter(|p| p.mode == Mode::Inout)
-                        .count()
-                ],
-                inout: definition
-                    .params
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.mode == Mode::Inout)
-                    .map(|(ordinal, p)| (ordinal as u32, p.local))
-                    .collect(),
-                loops: Vec::new(),
-                if_depth: 0,
-                extent_memo: BTreeMap::new(),
-                is_entry,
-            };
-
-            // Root region parameters: one value (or state) per interface leaf.
-            let mut root_params = Vec::new();
-            // (param local, leaf value id, is_tuple_component)
-            let mut param_leaf_values: Vec<Vec<(ValuePath, GraphValueId)>> =
-                vec![Vec::new(); definition.params.len()];
-            for (ordinal, param) in definition.params.iter().enumerate() {
-                let ty = work.convert_type(self, &param.ty).map_err(invalid)?;
-                for (path, leaf) in boundary_leaves(&ty) {
-                    match leaf {
-                        BoundaryLeaf::Tensor(shape) => {
-                            let storage = work.builder.declare_storage(
-                                shape.clone(),
-                                StorageOrigin::Parameter {
-                                    ordinal: ordinal as u32,
-                                    path: path.clone(),
-                                    name: param.name.clone(),
-                                },
-                                Initialization::FullyInitialized,
-                            );
-                            let view = work.builder.declare_view(
-                                storage,
-                                shape,
-                                match param.ownership {
-                                    ParamOwnership::Shared => Access::Shared,
-                                    _ => Access::Exclusive,
-                                },
-                                ViewTransform::Identity,
-                            );
-                            let value = work
-                                .builder
-                                .fresh_value(
-                                    ValueType::Tensor(work.builder.view(view).shape.clone()),
-                                    Some(view),
-                                )
-                                .map_err(invalid)?;
-                            let token = work.builder.fresh_state();
-                            work.builder.bind_state(token, storage);
-                            root_params.push(RegionParameter::Value {
-                                id: value,
-                                ty: ValueType::Tensor(work.builder.view(view).shape.clone()),
-                            });
-                            root_params.push(RegionParameter::State { id: token, storage });
-                            param_leaf_values[ordinal].push((path, value));
-                        }
-                        other => {
-                            let ty = leaf_value_type(&other);
-                            let value = work
-                                .builder
-                                .fresh_value(ty.clone(), None)
-                                .map_err(invalid)?;
-                            root_params.push(RegionParameter::Value { id: value, ty });
-                            param_leaf_values[ordinal].push((path, value));
-                        }
-                    }
-                }
-            }
-            work.builder.begin_root(root_params).map_err(invalid)?;
-
-            // Bind each parameter local: a single leaf binds directly; a
-            // tuple parameter packs its leaf values.
-            for (ordinal, param) in definition.params.iter().enumerate() {
-                let leaves = &param_leaf_values[ordinal];
-                let value = if leaves.len() == 1 {
-                    leaves[0].1
-                } else {
-                    let components = leaves.iter().map(|(_, id)| *id).collect::<Vec<_>>();
-                    let tys: Vec<ValueType> = components
-                        .iter()
-                        .map(|id| work.builder.value_type(*id).map_err(invalid))
-                        .collect::<Result<_, _>>()?;
-                    let ty = ValueType::Tuple(
-                        NonEmpty::new(tys).ok_or_else(|| invalid("a tuple is empty".into()))?,
-                    );
-                    let spec = PrimitiveSpec {
-                        op: PrimitiveOp::Primitive(PrimitiveId::TuplePack),
-                        inputs: components,
-                        reads: Vec::new(),
-                        write: None,
-                        outputs: vec![Output::Value(ty)],
-                        safety: Vec::new(),
-                        span: definition.span,
-                    };
-                    work.add(self, spec)?.expect("tuple pack has a value")
-                };
-                work.locals[param.local] = Some(value);
-            }
-
-            let flow = work.block(self, &body.root)?;
-            // A void body may fall through: its terminator retains completion
-            // and final states without an explicit `return`.
-            if !matches!(flow, Flow::Returned) && !definition.result.is_void() {
-                return Err(format!(
-                    "`{}` does not end every path in `return`",
-                    definition.name
-                ));
-            }
-
-            // Boundary results: the function result values (materialized into
-            // compiler-owned storage at the entry) and the final states of
-            // `inout` parameters.
-            let mut region_results = Vec::new();
-            let result_values: Vec<GraphValueId> = work
-                .results
-                .iter()
-                .map(|slot| {
-                    slot.ok_or_else(|| {
-                        "a `return` path does not bind every result value".to_string()
-                    })
-                })
-                .collect::<Result<_, String>>()
-                .map_err(invalid)?;
-            for value in result_values {
-                let ty = work.builder.value_type(value).map_err(invalid)?;
-                let value = if work.is_entry {
-                    work.materialize_result_leaf(self, value, &ty, definition.span)
-                        .map_err(invalid)?
-                } else {
-                    value
-                };
-                region_results.push(RegionResult::Value { id: value, ty });
-            }
-            let inout: Vec<(u32, usize)> = work.inout.clone();
-            for (ordinal, local) in &inout {
-                let storage = work
-                    .storage_of_local(*local)
-                    .ok_or_else(|| format!("inout parameter `{ordinal}` has no storage"))
-                    .map_err(invalid)?;
-                let token = work
-                    .builder
-                    .current_state(storage)
-                    .map_err(|reason| invalid(reason))?;
-                region_results.push(RegionResult::State {
-                    id: token,
-                    storage,
-                    join: None,
-                });
-            }
-            if region_results.is_empty() && !definition.result.is_void() {
-                return Err(format!(
-                    "`{}` produces no boundary results",
-                    definition.name
-                ));
-            }
-            work.builder.end_region(region_results).map_err(invalid)?;
-            work.builder.seal_check().map_err(invalid)?;
-            let builder = work.builder;
-            let sealed = builder.seal().expect("seal_check passed");
-            let (graph, ids) = sealed.finish();
-            Ok((graph, ids))
-        })();
+        let result = self.build_body(definition, shapes, sym_env, elems, builder);
+        self.building.pop();
         match result {
             Ok((graph, ids)) => {
                 self.ids = ids;
                 self.graphs[graph_id.index()] = Some(graph);
+                Ok(graph_id)
             }
             Err(reason) => {
                 // Construction errors are fatal for the whole program, so the
                 // allocator is not recovered.
                 if self.no_implementation {
                     self.no_implementation = false;
-                    self.depth -= 1;
                     return Err(BuildError::NoImplementation(self.report()));
                 }
-                self.depth -= 1;
-                return Err(BuildError::Invalid(reason));
+                Err(BuildError::Invalid(reason))
             }
         }
-        self.depth -= 1;
-        Ok(graph_id)
     }
 
-    fn report(&self) -> ApplicabilityReport {
-        ApplicabilityReport {
-            entry: self.entry.clone(),
-            occurrences: self.rejections.clone(),
+    fn build_body(
+        &mut self,
+        definition: &Definition,
+        shapes: ShapeEnv,
+        sym_env: SymEnv,
+        elems: ElemEnv,
+        builder: GraphBuilder,
+    ) -> Result<(TaskGraph, Ids), String> {
+        let body = &definition.body;
+        let mut work = Work {
+            builder,
+            shapes,
+            sym_env,
+            elems,
+            local_tys: &body.locals,
+            locals: vec![None; body.locals.len()],
+            constants: BTreeMap::new(),
+            returned: None,
+            exclusive: Vec::new(),
+            loops: Vec::new(),
+            if_depth: 0,
+            extent_memo: BTreeMap::new(),
+        };
+
+        // Root region parameters: one value (plus one state for tensors) per
+        // canonical interface leaf, and the boundary inputs they originate.
+        let mut root_params = Vec::new();
+        let mut inputs = BTreeMap::new();
+        let mut param_leaves: Vec<(ValueType, BTreeMap<ValuePath, GraphValueId>)> = Vec::new();
+        for (ordinal, param) in definition.params.iter().enumerate() {
+            let ty = work.convert_type(self, &param.ty)?;
+            let mut leaves = BTreeMap::new();
+            for (path, leaf) in boundary_leaves(&ty) {
+                let key = BoundaryLeaf::Input {
+                    param: ordinal as u32,
+                    leaf: path.clone(),
+                };
+                match leaf {
+                    LeafKind::Tensor(shape) => {
+                        let access = match param.ownership {
+                            ParamOwnership::Value => {
+                                return Err(format!(
+                                    "tensor leaf {path} of parameter `{}` is passed by value; tensor parameters are owned or borrowed",
+                                    param.name
+                                ));
+                            }
+                            ParamOwnership::Shared => Access::Shared,
+                            ParamOwnership::Owned | ParamOwnership::Exclusive => Access::Exclusive,
+                        };
+                        let storage = work.builder.declare_storage(
+                            shape.clone(),
+                            LogicalStorageOwner::Parameter(key.clone()),
+                            Initialization::FullyInitialized,
+                        );
+                        let view = work.builder.declare_view(
+                            ViewBase::Storage(storage),
+                            shape.clone(),
+                            access,
+                            ViewTransform::Identity,
+                        )?;
+                        let value = work.builder.fresh_value(work.builder.view_kind(view)?)?;
+                        let token = work.builder.fresh_state(storage)?;
+                        root_params.push(RegionParameter::Value {
+                            id: value,
+                            ty: ValueType::Tensor(shape.clone()),
+                        });
+                        root_params.push(RegionParameter::State { id: token, storage });
+                        if param.ownership == ParamOwnership::Exclusive {
+                            work.exclusive.push((key.clone(), storage));
+                        }
+                        inputs.insert(
+                            key,
+                            LogicalBoundaryInput::Tensor {
+                                value,
+                                state: token,
+                                ownership: param.ownership,
+                            },
+                        );
+                        leaves.insert(path, value);
+                    }
+                    LeafKind::Scalar(_)
+                    | LeafKind::Index(_)
+                    | LeafKind::Range(_)
+                    | LeafKind::Capability(_) => {
+                        let value = work.builder.fresh_value(leaf.produced_kind())?;
+                        root_params.push(RegionParameter::Value {
+                            id: value,
+                            ty: leaf.ty(),
+                        });
+                        inputs.insert(key, LogicalBoundaryInput::Value(value));
+                        leaves.insert(path, value);
+                    }
+                }
+            }
+            param_leaves.push((ty, leaves));
         }
-    }
-}
+        work.builder.begin_root(root_params)?;
 
-fn result_slots(result: &ValueType) -> Vec<Option<GraphValueId>> {
-    let count = match result {
-        ValueType::Void => 0,
-        ValueType::Tuple(items) => items.len(),
-        _ => 1,
-    };
-    vec![None; count]
+        // Bind each parameter local: leaves are repacked along the type's
+        // tuple structure (a single leaf binds directly).
+        for (param, (ty, leaves)) in definition.params.iter().zip(&param_leaves) {
+            let value = work.repack(ty, &ValuePath::default(), &|path| {
+                leaves.get(path).copied()
+            }, definition.span)?;
+            work.locals[param.local] = Some(value);
+        }
+
+        let flow = work.block(self, &body.root)?;
+        // A void body may fall through: its final states are its current
+        // states without an explicit `return`.
+        if !matches!(flow, Flow::Returned) && !definition.result.is_void() {
+            return Err(format!(
+                "`{}` does not end every path in `return`",
+                definition.name
+            ));
+        }
+
+        // Boundary results: one value per canonical leaf of the result type,
+        // decomposed from the returned components. A computed tensor is
+        // returned as it is; a view stays a view.
+        let result_ty = work.convert_type(self, &definition.result)?;
+        let mut results = BTreeMap::new();
+        if !result_ty.is_void() {
+            let returned = work
+                .returned
+                .clone()
+                .ok_or_else(|| format!("`{}` returns no values", definition.name))?;
+            for (path, leaf) in boundary_leaves(&result_ty) {
+                let (component, rest) = match &result_ty {
+                    ValueType::Tuple(_) => {
+                        let index = path.0[0] as usize;
+                        let component = returned.get(index).copied().ok_or_else(|| {
+                            format!("`{}` returns fewer components than its result", definition.name)
+                        })?;
+                        (component, &path.0[1..])
+                    }
+                    ValueType::Scalar(_)
+                    | ValueType::Index { .. }
+                    | ValueType::Range { .. }
+                    | ValueType::Tensor(_)
+                    | ValueType::CapabilityValue(_)
+                    | ValueType::Void => (
+                        returned.first().copied().ok_or_else(|| {
+                            format!("`{}` returns no value", definition.name)
+                        })?,
+                        &path.0[..],
+                    ),
+                };
+                let value = work.decompose_value(component, rest, definition.span)?;
+                let actual = work.builder.value_type(value)?;
+                if actual != leaf.ty() {
+                    return Err(format!(
+                        "`{}` returns {actual} at {path} where its result declares {}",
+                        definition.name,
+                        leaf.ty()
+                    ));
+                }
+                results.insert(
+                    BoundaryLeaf::Result { leaf: path },
+                    LogicalBoundaryResult { value },
+                );
+            }
+        }
+        let mut final_states = BTreeMap::new();
+        for (leaf, storage) in &work.exclusive {
+            final_states.insert(leaf.clone(), work.builder.current_state(*storage)?);
+        }
+        work.builder.end_region(Vec::new())?;
+        work.builder.seal(inputs, results, final_states)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +968,9 @@ enum Flow {
     Returned,
 }
 
-/// Constant-fold one retained runtime expression.
+/// Constant-fold one retained runtime expression, eliminating arithmetic
+/// identities (`0 + x`, `x + 0`, `1 * x`, `x * 1`) so a pure parameter
+/// reference folds to the referenced expression itself.
 fn fold_scalar(expr: RuntimeScalarExpr) -> RuntimeScalarExpr {
     fn binary(
         a: RuntimeScalarExpr,
@@ -719,23 +988,43 @@ fn fold_scalar(expr: RuntimeScalarExpr) -> RuntimeScalarExpr {
         rebuild(Box::new(a), Box::new(b))
     }
     match expr {
-        RuntimeScalarExpr::Add(a, b) => binary(
-            *a,
-            *b,
-            |x, y| x.checked_add(y),
-            |a, b| RuntimeScalarExpr::Add(a, b),
-        ),
+        RuntimeScalarExpr::Add(a, b) => {
+            let a = fold_scalar(*a);
+            let b = fold_scalar(*b);
+            let folded = match (&a, &b) {
+                (RuntimeScalarExpr::Const(x), RuntimeScalarExpr::Const(y)) => x.checked_add(*y),
+                _ => None,
+            };
+            match folded {
+                Some(value) => RuntimeScalarExpr::Const(value),
+                None => match (&a, &b) {
+                    (RuntimeScalarExpr::Const(0), _) => b,
+                    (_, RuntimeScalarExpr::Const(0)) => a,
+                    _ => RuntimeScalarExpr::Add(Box::new(a), Box::new(b)),
+                },
+            }
+        }
+        RuntimeScalarExpr::Mul(a, b) => {
+            let a = fold_scalar(*a);
+            let b = fold_scalar(*b);
+            let folded = match (&a, &b) {
+                (RuntimeScalarExpr::Const(x), RuntimeScalarExpr::Const(y)) => x.checked_mul(*y),
+                _ => None,
+            };
+            match folded {
+                Some(value) => RuntimeScalarExpr::Const(value),
+                None => match (&a, &b) {
+                    (RuntimeScalarExpr::Const(1), _) => b,
+                    (_, RuntimeScalarExpr::Const(1)) => a,
+                    _ => RuntimeScalarExpr::Mul(Box::new(a), Box::new(b)),
+                },
+            }
+        }
         RuntimeScalarExpr::Sub(a, b) => binary(
             *a,
             *b,
             |x, y| x.checked_sub(y),
             |a, b| RuntimeScalarExpr::Sub(a, b),
-        ),
-        RuntimeScalarExpr::Mul(a, b) => binary(
-            *a,
-            *b,
-            |x, y| x.checked_mul(y),
-            |a, b| RuntimeScalarExpr::Mul(a, b),
         ),
         RuntimeScalarExpr::Div(a, b) => binary(
             *a,
@@ -749,14 +1038,17 @@ fn fold_scalar(expr: RuntimeScalarExpr) -> RuntimeScalarExpr {
             |x, y| x.checked_rem_euclid(y),
             |a, b| RuntimeScalarExpr::Rem(a, b),
         ),
-        other => other,
+        RuntimeScalarExpr::Const(_)
+        | RuntimeScalarExpr::Value(_)
+        | RuntimeScalarExpr::Extent(_)
+        | RuntimeScalarExpr::ShapeField(_) => expr,
     }
 }
 
 /// What one symbolic atom resolves to in the current environment.
 enum ResolvedAtom {
     Value(GraphValueId),
-    Extent(ExtentExpr),
+    Shape(ShapeExtent),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -767,6 +1059,11 @@ struct LoopWrite {
 
 struct LoopInfo {
     binder: GraphValueId,
+    /// The binder's local identity: nested body regions rebind the binder
+    /// (and captured outer binders) to fresh region parameters, so a write
+    /// inside a nested region addresses the loop binder through the local's
+    /// current value, not the original binder value.
+    binder_local: LocalId,
     start: ExtentExpr,
     end: ExtentExpr,
     /// `if`-nesting depth at loop entry: writes at the same depth are
@@ -781,53 +1078,271 @@ struct LoopInfo {
 }
 
 struct Work<'w> {
-    builder: GraphBuilder<Building>,
+    builder: GraphBuilder,
     shapes: ShapeEnv,
+    sym_env: SymEnv,
     elems: ElemEnv,
     /// Checked local types (indexed by `LocalId`).
     local_tys: &'w [crate::sir::CheckedLocal],
-    /// Lexical environment: local -> current value (view-backed for tensors).
+    /// Lexical environment: local -> current value; `None` before binding.
     locals: Vec<Option<GraphValueId>>,
     /// Integer constants by producing value, for static coverage proofs.
     constants: BTreeMap<GraphValueId, i64>,
-    /// Function result slots, bound by `return`.
-    results: Vec<Option<GraphValueId>>,
-    /// Final states of `inout` parameters, bound by `return`.
-    result_states: Vec<Option<StateTokenId>>,
-    /// (interface ordinal, local) of `inout` parameters.
-    inout: Vec<(u32, usize)>,
+    /// The returned top-level components once a `return` executed on the
+    /// current path.
+    returned: Option<Vec<GraphValueId>>,
+    /// Exclusively borrowed tensor parameter leaves with their storages; the
+    /// boundary records their final states.
+    exclusive: Vec<(BoundaryLeaf, LogicalStorageId)>,
     loops: Vec<LoopInfo>,
     if_depth: usize,
+    /// Runtime extents of value-dependent symbolic extents of this graph.
     extent_memo: BTreeMap<String, RuntimeExtentId>,
-    is_entry: bool,
+}
+
+/// The interval of one leaf or operation of a retained runtime scalar, and
+/// its upper bound as a capacity. Total over `RuntimeScalarExpr`: every leaf
+/// has a representation-derived interval (a constant is exact, a runtime
+/// extent spans `[0, capacity]`, a shape field spans its finite domain, a
+/// graph value spans its kind's representation: `i32`/`u32` scalars their
+/// full range, a bounded index `[0, capacity(bound) - 1]`), and every
+/// operation propagates with checked `i128` arithmetic over the defined
+/// domain (a divisor interval admitting zero is clamped to its positive part;
+/// the source's `DivisorNonZero` obligation guarantees definedness at
+/// runtime). An `Err` names a construction defect: a leaf without a
+/// representation range, a divisor or modulus that is never positive, or a
+/// bound outside `u64`.
+fn runtime_scalar_bound(
+    expr: &RuntimeScalarExpr,
+    extents: &[RuntimeExtent],
+    fields: &[ShapeField],
+    value_kind: &dyn Fn(GraphValueId) -> Result<GraphValueKind, String>,
+) -> Result<u64, String> {
+    let (_, upper) = runtime_scalar_interval(expr, extents, fields, value_kind)?;
+    u64::try_from(upper).map_err(|_| format!("its bound {upper} is outside u64"))
+}
+
+fn runtime_scalar_interval(
+    expr: &RuntimeScalarExpr,
+    extents: &[RuntimeExtent],
+    fields: &[ShapeField],
+    value_kind: &dyn Fn(GraphValueId) -> Result<GraphValueKind, String>,
+) -> Result<(i128, i128), String> {
+    fn field_bounds(id: ShapeFieldId, fields: &[ShapeField]) -> Result<(i128, i128), String> {
+        let field = fields
+            .get(id.index())
+            .ok_or_else(|| format!("shape field {} does not exist", id.0))?;
+        Ok((
+            i128::from(field.domain.min()),
+            i128::from(field.domain.max()),
+        ))
+    }
+    fn extent_capacity(extent: &ExtentExpr, extents: &[RuntimeExtent]) -> Result<u64, String> {
+        match extent {
+            ExtentExpr::Static(n) => Ok(*n),
+            ExtentExpr::Runtime(id) => extents
+                .get(id.0 as usize)
+                .map(|extent| extent.capacity)
+                .ok_or_else(|| format!("runtime extent {} does not exist", id.0)),
+            ExtentExpr::Sym(sym) => Err(format!(
+                "index bound `{sym}` is still symbolic at the logical level"
+            )),
+        }
+    }
+    let binary = |left: &RuntimeScalarExpr, right: &RuntimeScalarExpr| {
+        Ok::<_, String>((
+            runtime_scalar_interval(left, extents, fields, value_kind)?,
+            runtime_scalar_interval(right, extents, fields, value_kind)?,
+        ))
+    };
+    let overflow = || "the interval arithmetic overflows".to_string();
+    match expr {
+        RuntimeScalarExpr::Const(value) => {
+            let value = i128::from(*value);
+            Ok((value, value))
+        }
+        RuntimeScalarExpr::Value(id) => match value_kind(*id)? {
+            GraphValueKind::Scalar(DType::I32) => {
+                Ok((i128::from(i32::MIN), i128::from(i32::MAX)))
+            }
+            GraphValueKind::Scalar(DType::U32) => Ok((0, i128::from(u32::MAX))),
+            GraphValueKind::Index { bound } => {
+                // `0 <= i < capacity(bound)`; an empty index domain is
+                // vacuous and contributes `[0, 0]`.
+                let capacity = extent_capacity(&bound, extents)?;
+                Ok((0, i128::from(capacity.saturating_sub(1))))
+            }
+            GraphValueKind::Scalar(DType::F32)
+            | GraphValueKind::Scalar(DType::BF16)
+            | GraphValueKind::Scalar(DType::F16)
+            | GraphValueKind::Scalar(DType::Bool)
+            | GraphValueKind::Void
+            | GraphValueKind::Range { .. }
+            | GraphValueKind::Tuple(_)
+            | GraphValueKind::Capability(_)
+            | GraphValueKind::Tensor { .. } => Err(format!(
+                "graph value {} is not an integer scalar or index",
+                id.0
+            )),
+        },
+        RuntimeScalarExpr::ShapeField(id) => field_bounds(*id, fields),
+        RuntimeScalarExpr::Extent(id) => {
+            let extent = extents
+                .get(id.0 as usize)
+                .ok_or_else(|| format!("runtime extent {} does not exist", id.0))?;
+            match &extent.value {
+                RuntimeScalarExpr::ShapeField(field) => field_bounds(*field, fields),
+                RuntimeScalarExpr::Const(_)
+                | RuntimeScalarExpr::Value(_)
+                | RuntimeScalarExpr::Extent(_)
+                | RuntimeScalarExpr::Add(..)
+                | RuntimeScalarExpr::Sub(..)
+                | RuntimeScalarExpr::Mul(..)
+                | RuntimeScalarExpr::Div(..)
+                | RuntimeScalarExpr::Rem(..) => Ok((0, i128::from(extent.capacity))),
+            }
+        }
+        RuntimeScalarExpr::Add(left, right) => {
+            let ((left_min, left_max), (right_min, right_max)) = binary(left, right)?;
+            Ok((
+                left_min.checked_add(right_min).ok_or_else(overflow)?,
+                left_max.checked_add(right_max).ok_or_else(overflow)?,
+            ))
+        }
+        RuntimeScalarExpr::Sub(left, right) => {
+            let ((left_min, left_max), (right_min, right_max)) = binary(left, right)?;
+            Ok((
+                left_min.checked_sub(right_max).ok_or_else(overflow)?,
+                left_max.checked_sub(right_min).ok_or_else(overflow)?,
+            ))
+        }
+        RuntimeScalarExpr::Mul(left, right) => {
+            let ((left_min, left_max), (right_min, right_max)) = binary(left, right)?;
+            let products = [
+                left_min.checked_mul(right_min).ok_or_else(overflow)?,
+                left_min.checked_mul(right_max).ok_or_else(overflow)?,
+                left_max.checked_mul(right_min).ok_or_else(overflow)?,
+                left_max.checked_mul(right_max).ok_or_else(overflow)?,
+            ];
+            Ok((
+                *products.iter().min().expect("four products"),
+                *products.iter().max().expect("four products"),
+            ))
+        }
+        RuntimeScalarExpr::Div(left, right) => {
+            // The bound is over the defined domain: the source's
+            // `DivisorNonZero` obligation (retained on the node) guarantees a
+            // nonzero divisor at runtime, so a divisor interval that merely
+            // admits zero (an `index[N]` is `[0, N-1]`) is clamped to
+            // `[max(min, 1), max]`. Only a divisor that is never positive is
+            // a construction error.
+            let ((left_min, left_max), (right_min, right_max)) = binary(left, right)?;
+            if right_max <= 0 {
+                return Err(format!(
+                    "the divisor of `{}` is never positive",
+                    describe(expr)
+                ));
+            }
+            let divisor_min = right_min.max(1);
+            let quotients = [
+                left_min / divisor_min,
+                left_min / right_max,
+                left_max / divisor_min,
+                left_max / right_max,
+            ];
+            Ok((
+                *quotients.iter().min().expect("four quotients"),
+                *quotients.iter().max().expect("four quotients"),
+            ))
+        }
+        RuntimeScalarExpr::Rem(left, right) => {
+            // Euclidean remainder by a positive divisor `d` lies in
+            // `[0, d - 1]` for any numerator, and never exceeds a
+            // nonnegative numerator. The divisor is clamped as for `Div`.
+            let ((left_min, left_max), (_, right_max)) = binary(left, right)?;
+            if right_max <= 0 {
+                return Err(format!(
+                    "the modulus of `{}` is never positive",
+                    describe(expr)
+                ));
+            }
+            let upper = if left_min >= 0 {
+                left_max.min(right_max - 1)
+            } else {
+                right_max - 1
+            };
+            Ok((0, upper))
+        }
+    }
+}
+
+/// A readable rendering of one retained runtime scalar, for diagnostics.
+fn describe(expr: &RuntimeScalarExpr) -> String {
+    match expr {
+        RuntimeScalarExpr::Const(value) => value.to_string(),
+        RuntimeScalarExpr::Value(id) => format!("value#{}", id.0),
+        RuntimeScalarExpr::Extent(id) => format!("runtime#{}", id.0),
+        RuntimeScalarExpr::ShapeField(id) => format!("shape#{}", id.0),
+        RuntimeScalarExpr::Add(a, b) => format!("({} + {})", describe(a), describe(b)),
+        RuntimeScalarExpr::Sub(a, b) => format!("({} - {})", describe(a), describe(b)),
+        RuntimeScalarExpr::Mul(a, b) => format!("({} * {})", describe(a), describe(b)),
+        RuntimeScalarExpr::Div(a, b) => format!("({} / {})", describe(a), describe(b)),
+        RuntimeScalarExpr::Rem(a, b) => format!("({} % {})", describe(a), describe(b)),
+    }
 }
 
 impl<'w> Work<'w> {
-    fn add(
-        &mut self,
-        f: &mut Factory,
-        spec: PrimitiveSpec,
-    ) -> Result<Option<GraphValueId>, String> {
+    fn add(&mut self, spec: PrimitiveSpec) -> Result<Option<GraphValueId>, String> {
         let outcome = self.builder.add_primitive(spec)?;
-        let _ = f;
         Ok(outcome.outputs.first().copied())
     }
 
-    fn storage_of_local(&self, local: usize) -> Option<LogicalStorageId> {
+    fn binding(&self, local: LocalId) -> Result<GraphValueId, String> {
         self.locals
             .get(local)
             .and_then(|binding| *binding)
-            .and_then(|id| {
-                self.builder
-                    .view_of_value(id)
-                    .map(|view| self.builder.view(view).storage)
-            })
+            .ok_or_else(|| format!("local `{}` is not bound", self.local_tys[local].name))
+    }
+
+    /// The view a local's current value reads through: `Some` exactly for a
+    /// view-backed tensor local (of storage or of a computed value).
+    fn view_of_local(&self, local: LocalId) -> Result<Option<LogicalViewId>, String> {
+        let value = self.binding(local)?;
+        Ok(match self.builder.value(value)?.tensor_source() {
+            Some(TensorSource::View(view)) => Some(view),
+            Some(TensorSource::Computed) | None => None,
+        })
+    }
+
+    /// The storage a local's current value reads through its view: `Some`
+    /// exactly when the view's base is logical storage. A computed tensor
+    /// and a view of one read no storage.
+    fn storage_of_local(&self, local: LocalId) -> Result<Option<LogicalStorageId>, String> {
+        Ok(match self.view_of_local(local)? {
+            Some(view) => match self.builder.view(view).base {
+                ViewBase::Storage(storage) => Some(storage),
+                ViewBase::Value(_) => None,
+            },
+            None => None,
+        })
+    }
+
+    /// Whether a tensor value has no logical storage behind it: a computed
+    /// tensor, directly or through views of one.
+    fn is_unstored_tensor(&self, value: GraphValueId) -> Result<bool, String> {
+        Ok(match self.builder.value(value)?.tensor_source() {
+            Some(TensorSource::Computed) => true,
+            Some(TensorSource::View(view)) => {
+                matches!(self.builder.view(view).base, ViewBase::Value(_))
+            }
+            None => false,
+        })
     }
 
     // -- symbolic extent resolution ----------------------------------------
 
     /// Convert a checked type to the logical level: `Sym` extents become
-    /// `Static` or fresh `Runtime` extents, element parameters resolve.
+    /// `Static` or `Runtime` extents, element parameters resolve.
     fn convert_type(&mut self, f: &mut Factory, ty: &ValueType) -> Result<ValueType, String> {
         match ty {
             ValueType::Scalar(d) => Ok(ValueType::Scalar(*d)),
@@ -837,15 +1352,13 @@ impl<'w> Work<'w> {
             ValueType::Range { bound } => Ok(ValueType::Range {
                 bound: self.convert_extent(f, bound)?,
             }),
-            ValueType::Tensor(s) => Ok(ValueType::Tensor(TensorType {
-                axes: s
-                    .axes
+            ValueType::Tensor(s) => Ok(ValueType::Tensor(s.specialize_elem(
+                s.axes
                     .iter()
                     .map(|axis| self.convert_extent(f, axis))
                     .collect::<Result<_, _>>()?,
-                elem: self.convert_elem(&s.elem)?,
-                packed_axis: s.packed_axis,
-            })),
+                self.convert_elem(&s.elem)?,
+            )?)),
             ValueType::Tuple(items) => Ok(ValueType::Tuple(
                 NonEmpty::new(
                     items
@@ -868,62 +1381,69 @@ impl<'w> Work<'w> {
         match extent {
             ExtentExpr::Static(n) => Ok(ExtentExpr::Static(*n)),
             ExtentExpr::Runtime(id) => Ok(ExtentExpr::Runtime(*id)),
-            ExtentExpr::Sym(sym) => self.resolve_sym(f, sym),
+            ExtentExpr::Sym(sym) => Ok(self.resolve_sym(f, sym)?.extent()),
         }
     }
 
     fn convert_elem(&self, elem: &Elem) -> Result<Elem, String> {
-        match elem {
-            Elem::Param(p) => self.elems.get(p).cloned().ok_or_else(|| {
-                format!("element parameter `{p}` is not bound at this specialization")
-            }),
-            other => Ok(other.clone()),
-        }
+        convert_elem(elem, &self.elems, "this occurrence")
     }
 
-    /// Resolve one symbolic extent: shape parameters through the environment,
-    /// value atoms to the current graph value (allocating a runtime extent).
-    fn resolve_sym(&mut self, f: &mut Factory, sym: &Sym) -> Result<ExtentExpr, String> {
+    /// Resolve one symbolic extent. A pure shape expression is rewritten into
+    /// the entry's symbol space and resolved program-wide; a value-dependent
+    /// expression resolves against the current graph values (allocating a
+    /// runtime extent memoized per graph).
+    fn resolve_sym(&mut self, f: &mut Factory, sym: &Sym) -> Result<ShapeExtent, String> {
         if let Some(value) = sym.as_constant() {
-            return Ok(ExtentExpr::Static(u64::try_from(value).unwrap_or(0)));
+            return static_extent(value);
+        }
+        let entry_form = family::substitute(sym, &|name| self.sym_env.get(name).cloned());
+        if f.is_entry_shape_sym(&entry_form) {
+            return f.shape_extent(&entry_form);
         }
         let memo_key = self.sym_key(sym)?;
         if let Some(id) = self.extent_memo.get(&memo_key) {
-            return Ok(ExtentExpr::Runtime(*id));
+            return Ok(ShapeExtent::Runtime(*id));
         }
         let expr = self.scalar_expr(f, sym)?;
-        if let RuntimeScalarExpr::Const(value) = expr {
-            return Ok(ExtentExpr::Static(value as u64));
+        let resolved = match expr {
+            RuntimeScalarExpr::Const(value) => static_extent(value)?,
+            RuntimeScalarExpr::Extent(id) => ShapeExtent::Runtime(id),
+            expr => {
+                // The retained expression itself is the bound authority: its
+                // extent leaves carry their capacities and its value leaves
+                // carry their representation ranges (i32/u32 scalars, bounded
+                // indices), so the bound is derived, never substituted.
+                let builder = &self.builder;
+                let value_kind = |id: GraphValueId| -> Result<GraphValueKind, String> {
+                    Ok(builder.value(id)?.kind().clone())
+                };
+                let capacity = runtime_scalar_bound(
+                    &expr,
+                    &f.runtime_extents,
+                    &f.shape_fields,
+                    &value_kind,
+                )
+                .map_err(|reason| {
+                    format!("extent `{sym}` has no finite bound because {reason}")
+                })?;
+                ShapeExtent::Runtime(f.runtime_extent(expr, capacity, None))
+            }
+        };
+        if let ShapeExtent::Runtime(id) = resolved {
+            self.extent_memo.insert(memo_key, id);
         }
-        let capacity = sym
-            .eval(&|name| {
-                self.shape_or_value(name)
-                    .and_then(|resolved| match resolved {
-                        ResolvedAtom::Extent(ExtentExpr::Static(value)) => Some(value as i64),
-                        _ => None,
-                    })
-            })
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(u64::MAX);
-        let id = f.runtime_extent(expr, capacity);
-        self.extent_memo.insert(memo_key, id);
-        Ok(ExtentExpr::Runtime(id))
+        Ok(resolved)
     }
 
     /// A memo key for one symbolic extent: its display plus the current value
     /// ids of every value atom it mentions (SSA rebinding changes the key).
     fn sym_key(&self, sym: &Sym) -> Result<String, String> {
         let mut key = sym.to_string();
-        for atom in sym.atoms() {
-            if let Atom::Param(name) = &atom {
-                if let Some(local) = atom_var(name) {
-                    let value = self
-                        .locals
-                        .get(local)
-                        .and_then(|binding| *binding)
-                        .ok_or_else(|| format!("`{name}` has no current value"))?;
-                    key.push_str(&format!("#{}", value.0));
-                }
+        for name in sym.params() {
+            if let Some(local) = atom_var(&name) {
+                let value = self.binding(local)?;
+                key.push_str(&format!("#{}", value.0));
             }
         }
         Ok(key)
@@ -937,7 +1457,7 @@ impl<'w> Work<'w> {
                 .and_then(|binding| *binding)
                 .map(ResolvedAtom::Value);
         }
-        self.shapes.get(name).cloned().map(ResolvedAtom::Extent)
+        self.shapes.get(name).copied().map(ResolvedAtom::Shape)
     }
 
     /// Build the retained runtime expression of one symbolic extent, with
@@ -961,24 +1481,11 @@ impl<'w> Work<'w> {
         match atom {
             Atom::Param(name) => match self.shape_or_value(name) {
                 Some(ResolvedAtom::Value(id)) => Ok(RuntimeScalarExpr::Value(id)),
-                Some(ResolvedAtom::Extent(ExtentExpr::Static(n))) => {
+                Some(ResolvedAtom::Shape(ShapeExtent::Static(n))) => {
                     Ok(RuntimeScalarExpr::Const(n as i64))
                 }
-                Some(ResolvedAtom::Extent(ExtentExpr::Runtime(id))) => {
+                Some(ResolvedAtom::Shape(ShapeExtent::Runtime(id))) => {
                     Ok(RuntimeScalarExpr::Extent(id))
-                }
-                Some(ResolvedAtom::Extent(ExtentExpr::Sym(sym))) => {
-                    let resolved = self.resolve_sym(f, &sym)?;
-                    self.atom_expr(f, &Atom::Param(format!("__resolved_{}", resolved)))
-                        .or_else(|_| {
-                            Ok(match resolved {
-                                ExtentExpr::Static(n) => RuntimeScalarExpr::Const(n as i64),
-                                ExtentExpr::Runtime(id) => RuntimeScalarExpr::Extent(id),
-                                ExtentExpr::Sym(_) => {
-                                    unreachable!("resolve_sym returns logical extents")
-                                }
-                            })
-                        })
                 }
                 None => {
                     // A runtime-length atom (`@dyn#n`) realizes to the runtime
@@ -1050,29 +1557,22 @@ impl<'w> Work<'w> {
         match terminator {
             BlockTerminator::Continue => Ok(Flow::Next),
             BlockTerminator::Return(values) => {
-                if !values.is_empty() {
-                    for slot in 0..self.results.len() {
-                        if self.results[slot].is_none() {
-                            let value = self
-                                .expr(f, values.get(slot).ok_or("a `return` arity mismatch")?)
-                                .map_err(|reason| reason)?;
-                            self.results[slot] = value;
-                        }
+                if values.is_empty() {
+                    // Either a void return, or the checker's marker after a
+                    // terminal `if` whose arms both returned (the joined
+                    // values are already installed).
+                    if self.returned.is_none() {
+                        self.returned = Some(Vec::new());
                     }
-                } else if self.results.iter().any(|slot| slot.is_none()) {
-                    // The values were installed by a terminal `if` inside this
-                    // block (the checker's empty `return` marker); require them.
-                    if self.results.iter().any(|slot| slot.is_none()) {
-                        return Err("a `return` path does not bind every result value".into());
+                } else {
+                    let mut returned = Vec::new();
+                    for value in values {
+                        returned.push(
+                            self.expr(f, value)?
+                                .ok_or("a returned expression is void")?,
+                        );
                     }
-                }
-                for (index, (_, local)) in self.inout.iter().enumerate() {
-                    if self.result_states[index].is_none() {
-                        let storage = self
-                            .storage_of_local(*local)
-                            .ok_or("an inout parameter has no storage")?;
-                        self.result_states[index] = Some(self.builder.current_state(storage)?);
-                    }
+                    self.returned = Some(returned);
                 }
                 Ok(Flow::Returned)
             }
@@ -1084,10 +1584,9 @@ impl<'w> Work<'w> {
             CheckedStmt::Let {
                 pattern,
                 value,
-                mutable,
+                mutable: _,
             } => {
-                let _ = mutable;
-                let value = self.expr(f, value)?.expect("`let` binds a value");
+                let value = self.expr(f, value)?.ok_or("`let` binds a void expression")?;
                 self.bind_pattern(f, pattern, value)?;
                 Ok(Flow::Next)
             }
@@ -1110,15 +1609,14 @@ impl<'w> Work<'w> {
                 then_body,
                 else_body,
             } => {
-                self.if_stmt(f, condition, then_body, else_body)?;
+                self.if_core(f, condition, then_body, else_body, None)?;
                 Ok(Flow::Next)
             }
             CheckedStmt::Evaluate(expr) => {
-                let value = self.expr(f, expr)?;
-                if value.is_some() {
+                if let Some(value) = self.expr(f, expr)? {
                     return Err(format!(
                         "an expression statement must be void; this one produces {}",
-                        self.builder.value_type(value.unwrap())?
+                        self.builder.value_type(value)?
                     ));
                 }
                 Ok(Flow::Next)
@@ -1146,7 +1644,7 @@ impl<'w> Work<'w> {
                     return Err("a tuple pattern does not match its value".into());
                 }
                 for (index, item) in items.iter().enumerate() {
-                    let component = self.tuple_get(f, value, index)?;
+                    let component = self.tuple_get(f, value, index, Span::default())?;
                     self.bind_pattern(f, item, component)?;
                 }
                 Ok(())
@@ -1159,7 +1657,9 @@ impl<'w> Work<'w> {
         f: &mut Factory,
         value: GraphValueId,
         index: usize,
+        span: Span,
     ) -> Result<GraphValueId, String> {
+        let _ = f;
         let ty = self.builder.value_type(value)?;
         let ValueType::Tuple(components) = &ty else {
             return Err("tuple.get needs a tuple".into());
@@ -1174,11 +1674,80 @@ impl<'w> Work<'w> {
             inputs: vec![value],
             reads: Vec::new(),
             write: None,
-            outputs: vec![Output::Value(component)],
+            outputs: vec![Output::Computed(component)],
             safety: Vec::new(),
-            span: Span::default(),
+            span,
         };
-        Ok(self.add(f, spec)?.expect("tuple.get has a value"))
+        Ok(self.add(spec)?.expect("tuple.get has a value"))
+    }
+
+    /// Decompose one value along an ordinal path with `tuple.get` nodes.
+    fn decompose_value(
+        &mut self,
+        value: GraphValueId,
+        path: &[u32],
+        span: Span,
+    ) -> Result<GraphValueId, String> {
+        let mut current = value;
+        for index in path {
+            let ty = self.builder.value_type(current)?;
+            let ValueType::Tuple(components) = &ty else {
+                return Err("a boundary path descends into a non-tuple".into());
+            };
+            let component = components
+                .as_slice()
+                .get(*index as usize)
+                .cloned()
+                .ok_or("a boundary path is out of bounds")?;
+            let spec = PrimitiveSpec {
+                op: PrimitiveOp::Primitive(PrimitiveId::TupleGet(*index as usize)),
+                inputs: vec![current],
+                reads: Vec::new(),
+                write: None,
+                outputs: vec![Output::Computed(component)],
+                safety: Vec::new(),
+                span,
+            };
+            current = self.add(spec)?.expect("tuple.get has a value");
+        }
+        Ok(current)
+    }
+
+    /// Rebuild a value of type `ty` from its canonical leaves: tuples pack
+    /// their components, a leaf is looked up at its path.
+    fn repack(
+        &mut self,
+        ty: &ValueType,
+        path: &ValuePath,
+        leaf: &dyn Fn(&ValuePath) -> Option<GraphValueId>,
+        span: Span,
+    ) -> Result<GraphValueId, String> {
+        match ty {
+            ValueType::Tuple(items) => {
+                let mut components = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    components.push(self.repack(item, &path.extend(index as u32), leaf, span)?);
+                }
+                let spec = PrimitiveSpec {
+                    op: PrimitiveOp::Primitive(PrimitiveId::TuplePack),
+                    inputs: components,
+                    reads: Vec::new(),
+                    write: None,
+                    outputs: vec![Output::Computed(ty.clone())],
+                    safety: Vec::new(),
+                    span,
+                };
+                Ok(self.add(spec)?.expect("tuple.pack has a value"))
+            }
+            ValueType::Void => Err("a void value cannot be repacked".into()),
+            ValueType::Scalar(_)
+            | ValueType::Index { .. }
+            | ValueType::Range { .. }
+            | ValueType::Tensor(_)
+            | ValueType::CapabilityValue(_) => {
+                leaf(path).ok_or_else(|| format!("no boundary leaf value at {path}"))
+            }
+        }
     }
 
     // -- expressions -------------------------------------------------------
@@ -1191,13 +1760,13 @@ impl<'w> Work<'w> {
                     Literal::Float(value) => PrimitiveOp::Constant(Literal::Float(*value)),
                     Literal::Bool(value) => PrimitiveOp::Constant(Literal::Bool(*value)),
                     Literal::ShapeParam(name) => match self.shapes.get(name) {
-                        Some(ExtentExpr::Static(n)) => {
+                        Some(ShapeExtent::Static(n)) => {
                             PrimitiveOp::Constant(Literal::Int(*n as i64))
                         }
-                        Some(ExtentExpr::Runtime(id)) => PrimitiveOp::RuntimeExtent(*id),
-                        _ => {
+                        Some(ShapeExtent::Runtime(id)) => PrimitiveOp::RuntimeExtent(*id),
+                        None => {
                             return Err(format!(
-                                "shape parameter `{name}` is not bound at this specialization"
+                                "shape parameter `{name}` is not bound at this occurrence"
                             ));
                         }
                     },
@@ -1208,47 +1777,43 @@ impl<'w> Work<'w> {
                     inputs: Vec::new(),
                     reads: Vec::new(),
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span: e.span,
                 };
-                let out = self.add(f, spec)?;
+                let out = self.add(spec)?;
                 if let (Some(id), Literal::Int(value)) = (out, literal) {
                     self.constants.insert(id, *value);
                 }
                 Ok(out)
             }
-            CheckedExprKind::Local(id) => self
-                .locals
-                .get(*id)
-                .and_then(|binding| *binding)
-                .map(Some)
-                .ok_or_else(|| format!("local `{}` is not bound", id)),
+            CheckedExprKind::Local(id) => Ok(Some(self.binding(*id)?)),
             CheckedExprKind::Primitive { id, operands } => self.primitive(f, e, id, operands),
             CheckedExprKind::Capability { id, args } => {
                 let mut inputs = Vec::new();
-                let mut reads = Vec::new();
                 for arg in args {
-                    let value = self
-                        .expr(f, arg)?
-                        .expect("a capability argument is a value");
-                    if let Some(storage) = self.builder.storage_of_value(value) {
-                        reads.push(storage);
-                    }
-                    inputs.push(value);
+                    inputs.push(
+                        self.expr(f, arg)?
+                            .ok_or("a capability argument is void")?,
+                    );
                 }
+                let reads = self.builder.reads_of(&inputs)?;
                 let ty = self.convert_type(f, &e.ty)?;
-                let (output, write) = self.computed_output(f, ty, e.span)?;
+                let outputs = if ty.is_void() {
+                    Vec::new()
+                } else {
+                    vec![Output::Computed(ty)]
+                };
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Capability(id.clone()),
                     inputs,
                     reads,
-                    write,
-                    outputs: vec![output],
+                    write: None,
+                    outputs,
                     safety: Vec::new(),
                     span: e.span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             CheckedExprKind::Call { call, args } => self.call(f, e, call, args),
         }
@@ -1261,71 +1826,191 @@ impl<'w> Work<'w> {
     ) -> Result<Vec<GraphValueId>, String> {
         let mut out = Vec::new();
         for operand in operands {
-            out.push(
-                self.expr(f, operand)?
-                    .expect("a primitive operand is a value"),
-            );
+            out.push(self.expr(f, operand)?.ok_or("a primitive operand is void")?);
         }
         Ok(out)
     }
 
-    fn operand_reads(&self, values: &[GraphValueId]) -> Vec<LogicalStorageId> {
-        let mut reads = Vec::new();
-        for value in values {
-            if let Some(storage) = self.builder.storage_of_value(*value) {
-                if !reads.contains(&storage) {
-                    reads.push(storage);
-                }
-            }
-        }
-        reads
-    }
-
-    /// Allocate fresh owned storage with an initializing write, returning the
-    /// backing view.
-    fn fresh_owned(
-        &mut self,
-        f: &mut Factory,
-        shape: TensorType,
-        _span: Span,
-    ) -> Result<LogicalViewId, String> {
+    /// Fresh local storage with an identity view, for allocation-family
+    /// primitives and materialization.
+    fn fresh_local(&mut self, shape: TensorType) -> Result<(LogicalStorageId, LogicalViewId), String> {
         let storage = self.builder.declare_storage(
             shape.clone(),
-            StorageOrigin::Owned,
+            LogicalStorageOwner::Local,
             Initialization::Uninitialized,
         );
-        let view =
-            self.builder
-                .declare_view(storage, shape, Access::Exclusive, ViewTransform::Identity);
-        let _ = f;
-        Ok(view)
+        let view = self
+            .builder
+            .declare_view(ViewBase::Storage(storage), shape, Access::Exclusive, ViewTransform::Identity)?;
+        Ok((storage, view))
     }
 
-    /// Give every computed tensor an explicit logical storage identity.
-    /// Scalar-like results remain SSA values; structural tuple operations are
-    /// handled separately because they preserve their component transports.
-    fn computed_output(
-        &mut self,
-        f: &mut Factory,
-        ty: ValueType,
-        span: Span,
-    ) -> Result<(Output, Option<WriteEffect>), String> {
-        let ValueType::Tensor(shape) = ty else {
-            return Ok((Output::Value(ty), None));
+    /// The base a view-producing or element-reading operand works over: one
+    /// logical storage read through a view, or a computed tensor value read
+    /// as a value (directly or through a view of one). A computed operand
+    /// never declares storage; a derived view over it names the value as its
+    /// base.
+    fn operand_base(&self, value: GraphValueId) -> Result<OperandBase, String> {
+        let (base, access, shape) = match self.builder.value(value)?.kind() {
+            GraphValueKind::Tensor { ty, source } => match source {
+                TensorSource::View(view) => {
+                    let declared = self.builder.view(*view);
+                    match declared.base {
+                        ViewBase::Storage(storage) => (
+                            ViewBase::Storage(storage),
+                            declared.access,
+                            declared.shape.clone(),
+                        ),
+                        // A view of a view flattens to the operand's base.
+                        ViewBase::Value(base) => {
+                            (ViewBase::Value(base), Access::Shared, declared.shape.clone())
+                        }
+                    }
+                }
+                TensorSource::Computed => {
+                    (ViewBase::Value(value), Access::Shared, ty.clone())
+                }
+            },
+            kind => {
+                return Err(format!(
+                    "operand {} is not a tensor ({:?})",
+                    value.0, kind
+                ))
+            }
         };
-        let view = self.fresh_owned(f, shape.clone(), span)?;
-        let storage = self.builder.view(view).storage;
-        Ok((
-            Output::View(view),
-            Some(WriteEffect {
+        Ok(OperandBase {
+            base,
+            access,
+            shape,
+        })
+    }
+
+    /// The storage a mutating operand (an element-write place, a copy
+    /// destination or an atomic base) writes through. An in-place write
+    /// names mutable state: a tensor value without storage behind it is
+    /// realized into its own local storage here, and when the operand
+    /// expression is a bare local the local rebinds to it so later in-place
+    /// writes and reads through it see one storage. This is the one
+    /// materialization construction performs; reads and call arguments never
+    /// reach it.
+    fn ensure_storage_operand(
+        &mut self,
+        value: GraphValueId,
+        operand: &CheckedExpr,
+        span: Span,
+    ) -> Result<(GraphValueId, LogicalViewId, LogicalStorageId), String> {
+        let unstored = self.is_unstored_tensor(value)?;
+        if !unstored {
+            let view = match self.builder.tensor_source(value)? {
+                TensorSource::View(view) => view,
+                TensorSource::Computed => {
+                    return Err("the write target is a computed tensor".into())
+                }
+            };
+            let storage = self.builder.storage_base(view)?;
+            return Ok((value, view, storage));
+        }
+        let (realized, view) = self.materialize_value(value, span)?;
+        let storage = self.builder.storage_base(view)?;
+        if let CheckedExprKind::Local(id) = &operand.kind {
+            self.locals[*id] = Some(realized);
+        }
+        Ok((realized, view, storage))
+    }
+
+    /// The storage a local's in-place write targets, realizing and rebinding
+    /// a tensor value without storage behind it (a computed tensor or a view
+    /// of one).
+    fn ensure_view_local(
+        &mut self,
+        local: LocalId,
+        span: Span,
+    ) -> Result<(GraphValueId, LogicalViewId, LogicalStorageId), String> {
+        let value = self.binding(local)?;
+        if self.is_unstored_tensor(value)? {
+            let (realized, view) = self.materialize_value(value, span)?;
+            let storage = self.builder.storage_base(view)?;
+            self.locals[local] = Some(realized);
+            Ok((realized, view, storage))
+        } else {
+            let view = match self.builder.tensor_source(value)? {
+                TensorSource::View(view) => view,
+                TensorSource::Computed => {
+                    return Err("the write target is a computed tensor".into())
+                }
+            };
+            let storage = self.builder.storage_base(view)?;
+            Ok((value, view, storage))
+        }
+    }
+
+    /// Realize one tensor value without storage behind it into fresh local
+    /// storage, through one `tensor.materialize` application. The only caller
+    /// is in-place-write realization; an authored `to_owned` reaches the same
+    /// primitive from the source.
+    fn materialize_value(
+        &mut self,
+        value: GraphValueId,
+        span: Span,
+    ) -> Result<(GraphValueId, LogicalViewId), String> {
+        let ValueType::Tensor(shape) = self.builder.value_type(value)? else {
+            return Err("materialize needs a tensor".into());
+        };
+        let (storage, view) = self.fresh_local(shape.clone())?;
+        let reads = self.builder.reads_of(&[value])?;
+        let spec = PrimitiveSpec {
+            op: PrimitiveOp::Primitive(PrimitiveId::Materialize),
+            inputs: vec![value],
+            reads,
+            write: Some(WriteEffect {
                 storage,
                 coverage: Coverage::full(shape.axes.len()),
                 atomic: false,
                 initializing: true,
             }),
-        ))
+            outputs: vec![Output::View(view)],
+            safety: Vec::new(),
+            span,
+        };
+        let materialized = self.add(spec)?.expect("materialize produces a value");
+        Ok((materialized, view))
     }
 
+    /// Realize every local about to be written in place whose current value
+    /// has no storage behind it, so the storage exists outside the construct
+    /// that writes it.
+    fn materialize_written_locals(
+        &mut self,
+        locals: impl IntoIterator<Item = LocalId>,
+        span: Span,
+    ) -> Result<(), String> {
+        for local in locals {
+            let value = self.binding(local)?;
+            if self.is_unstored_tensor(value)? {
+                self.ensure_view_local(local, span)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The base of one tensor operand of a view-producing or element-reading
+/// primitive, with the access a derived view carries and the shape the
+/// operand selects.
+struct OperandBase {
+    base: ViewBase,
+    access: Access,
+    shape: TensorType,
+}
+
+impl<'w> Work<'w> {
+    /// One primitive application. The tensor-kind decision is made here per
+    /// `PrimitiveId`: a primitive produces a view only where its semantics
+    /// name storage (allocation-family results, materialization, duplication)
+    /// or transform an operand (transpose, reshape, slice) — over a view of
+    /// storage, sharing that storage, or over a computed tensor, naming the
+    /// value as the new view's base; every other tensor result is a computed
+    /// value without storage.
     #[allow(clippy::too_many_lines)]
     fn primitive(
         &mut self,
@@ -1335,13 +2020,37 @@ impl<'w> Work<'w> {
         operands: &[CheckedExpr],
     ) -> Result<Option<GraphValueId>, String> {
         let mut values = self.operand_values(f, operands)?;
-        let reads = self.operand_reads(&values);
         // A slice view's realized axes are built by its own arm; converting the
         // checked type up front would resolve the runtime-length atom before
         // the view that defines it exists.
         let ty = match id {
             PrimitiveId::SliceView { .. } => ValueType::Void,
-            _ => self.convert_type(f, &e.ty)?,
+            PrimitiveId::TuplePack
+            | PrimitiveId::TupleGet(_)
+            | PrimitiveId::RangeMake
+            | PrimitiveId::RangeStart
+            | PrimitiveId::RangeEnd
+            | PrimitiveId::Unary(_)
+            | PrimitiveId::Binary(_)
+            | PrimitiveId::Cast(_)
+            | PrimitiveId::Math(_)
+            | PrimitiveId::Select
+            | PrimitiveId::TensorAlloc { .. }
+            | PrimitiveId::Fill { .. }
+            | PrimitiveId::Materialize
+            | PrimitiveId::Clone
+            | PrimitiveId::Load
+            | PrimitiveId::Decode
+            | PrimitiveId::PackedRead(_)
+            | PrimitiveId::Transpose
+            | PrimitiveId::Reshape
+            | PrimitiveId::ElementRead { .. }
+            | PrimitiveId::ElementWrite { .. }
+            | PrimitiveId::CopyInto
+            | PrimitiveId::Extent { .. }
+            | PrimitiveId::ValidExtent { .. }
+            | PrimitiveId::Atomic { .. }
+            | PrimitiveId::Reduce { .. } => self.convert_type(f, &e.ty)?,
         };
         let span = e.span;
         match id {
@@ -1351,23 +2060,23 @@ impl<'w> Work<'w> {
                     inputs: values,
                     reads: Vec::new(),
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
-            PrimitiveId::TupleGet(_index) => {
+            PrimitiveId::TupleGet(_) => {
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
-                    reads,
+                    reads: Vec::new(),
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::RangeMake => {
                 let ValueType::Range { bound } = &ty else {
@@ -1383,11 +2092,11 @@ impl<'w> Work<'w> {
                     inputs: values,
                     reads: Vec::new(),
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
                     safety,
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::RangeStart | PrimitiveId::RangeEnd => {
                 let spec = PrimitiveSpec {
@@ -1395,62 +2104,49 @@ impl<'w> Work<'w> {
                     inputs: values,
                     reads: Vec::new(),
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Unary(_) | PrimitiveId::Cast(_) | PrimitiveId::Math(_) => {
                 // A tensor-level cast of a packed operand decodes first: the
                 // decoded f32 elements then cast elementwise.
-                let values = if let (PrimitiveId::Cast(_), Some((first, rest))) =
-                    (id, values.split_first())
-                {
-                    match self.builder.value_type(*first) {
-                        Ok(ValueType::Tensor(source)) if matches!(source.elem, Elem::Repr(_)) => {
+                if let (PrimitiveId::Cast(_), Some(first)) = (id, values.first().copied()) {
+                    if let ValueType::Tensor(source) = self.builder.value_type(first)? {
+                        if matches!(source.elem, Elem::Repr(_)) {
                             let decoded_ty = ValueType::Tensor(TensorType {
                                 elem: Elem::Dtype(DType::F32),
                                 axes: source.axes,
-                                packed_axis: source.packed_axis,
+                                packed_axis: None,
                             });
-                            let (output, write) = self.computed_output(f, decoded_ty, span)?;
                             let spec = PrimitiveSpec {
                                 op: PrimitiveOp::Primitive(PrimitiveId::Decode),
-                                inputs: vec![*first],
-                                reads: self.operand_reads(&[*first]),
-                                write,
-                                outputs: vec![output],
+                                inputs: vec![first],
+                                reads: self.builder.reads_of(&[first])?,
+                                write: None,
+                                outputs: vec![Output::Computed(decoded_ty)],
                                 safety: Vec::new(),
                                 span,
                             };
-                            let decoded = self
-                                .add(f, spec)?
+                            values[0] = self
+                                .add(spec)?
                                 .ok_or("packed tensor decoding did not produce a logical value")?;
-                            vec![decoded]
-                                .into_iter()
-                                .chain(rest.iter().copied())
-                                .collect()
                         }
-                        _ => vec![*first]
-                            .into_iter()
-                            .chain(rest.iter().copied())
-                            .collect(),
                     }
-                } else {
-                    values
-                };
-                let (output, write) = self.computed_output(f, ty, span)?;
+                }
+                let reads = self.builder.reads_of(&values)?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
                     reads,
-                    write,
-                    outputs: vec![output],
+                    write: None,
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Binary(op) => {
                 let mut safety = Vec::new();
@@ -1470,30 +2166,30 @@ impl<'w> Work<'w> {
                     }
                     _ => {}
                 }
-                let (output, write) = self.computed_output(f, ty, span)?;
+                let reads = self.builder.reads_of(&values)?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
                     reads,
-                    write,
-                    outputs: vec![output],
+                    write: None,
+                    outputs: vec![Output::Computed(ty)],
                     safety,
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Select => {
-                let (output, write) = self.computed_output(f, ty, span)?;
+                let reads = self.builder.reads_of(&values)?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
                     reads,
-                    write,
-                    outputs: vec![output],
+                    write: None,
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::TensorAlloc { .. } => {
                 let ValueType::Tensor(shape) = &ty else {
@@ -1512,7 +2208,7 @@ impl<'w> Work<'w> {
                 } else {
                     let product = shape.axes.iter().try_fold(1u128, |acc, axis| match axis {
                         ExtentExpr::Static(n) => acc.checked_mul(*n as u128),
-                        _ => None,
+                        ExtentExpr::Sym(_) | ExtentExpr::Runtime(_) => None,
                     });
                     if !matches!(product, Some(p) if p <= u64::MAX as u128) {
                         safety.push(SafetyObligation::ShapeProductFits {
@@ -1521,8 +2217,7 @@ impl<'w> Work<'w> {
                         });
                     }
                 }
-                let view = self.fresh_owned(f, shape.clone(), span)?;
-                let storage = self.builder.view(view).storage;
+                let (storage, view) = self.fresh_local(shape.clone())?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
@@ -1537,14 +2232,16 @@ impl<'w> Work<'w> {
                     safety,
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
-            PrimitiveId::Fill { .. } => {
+            PrimitiveId::Fill { .. } | PrimitiveId::Materialize | PrimitiveId::Clone => {
+                // Allocation family: the result names fresh local storage,
+                // fully written by the primitive.
                 let ValueType::Tensor(shape) = &ty else {
-                    return Err("tensor.fill produces a tensor".into());
+                    return Err("an allocating primitive produces a tensor".into());
                 };
-                let view = self.fresh_owned(f, shape.clone(), span)?;
-                let storage = self.builder.view(view).storage;
+                let reads = self.builder.reads_of(&values)?;
+                let (storage, view) = self.fresh_local(shape.clone())?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
@@ -1559,72 +2256,38 @@ impl<'w> Work<'w> {
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
-            PrimitiveId::Materialize
-            | PrimitiveId::Clone
-            | PrimitiveId::Load
-            | PrimitiveId::Decode
-            | PrimitiveId::PackedRead(_) => {
-                let ValueType::Tensor(shape) = &ty else {
-                    return Err("a tensor-producing primitive produces a tensor".into());
-                };
-                let access = if matches!(id, PrimitiveId::PackedRead(_)) {
-                    Access::Shared
-                } else {
-                    Access::Exclusive
-                };
-                let storage = self.builder.declare_storage(
-                    shape.clone(),
-                    StorageOrigin::Owned,
-                    Initialization::Uninitialized,
-                );
-                let view = self.builder.declare_view(
-                    storage,
-                    shape.clone(),
-                    access,
-                    ViewTransform::Identity,
-                );
+            PrimitiveId::Load | PrimitiveId::Decode | PrimitiveId::PackedRead(_) => {
+                // Snapshot, decode and plane reads produce values.
+                if !matches!(ty, ValueType::Tensor(_)) {
+                    return Err("a tensor-reading primitive produces a tensor".into());
+                }
+                let reads = self.builder.reads_of(&values)?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
                     reads,
-                    write: Some(WriteEffect {
-                        storage,
-                        coverage: Coverage::full(shape.axes.len()),
-                        atomic: false,
-                        initializing: true,
-                    }),
-                    outputs: vec![Output::View(view)],
+                    write: None,
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Transpose => {
-                let view = match self.builder.view_of_value(values[0]) {
-                    Some(view) => view,
-                    None => {
-                        values[0] = self.materialize_value(f, values[0], span)?;
-                        self.builder
-                            .view_of_value(values[0])
-                            .expect("materialize produces a view")
-                    }
-                };
-                let source = self.builder.view(view);
-                let storage = source.storage;
-                let access = source.access;
-                let rank = source.shape.rank();
+                let base = self.operand_base(values[0])?;
+                let rank = base.shape.rank();
                 let permutation: Vec<u32> = (0..rank as u32).rev().collect();
+                let ValueType::Tensor(shape) = ty else {
+                    return Err("transpose produces a tensor".into());
+                };
                 let new_view = self.builder.declare_view(
-                    storage,
-                    match &ty {
-                        ValueType::Tensor(s) => s.clone(),
-                        _ => return Err("transpose produces a tensor".into()),
-                    },
-                    access,
+                    base.base,
+                    shape,
+                    base.access,
                     ViewTransform::Transpose { permutation },
-                );
+                )?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
@@ -1634,31 +2297,20 @@ impl<'w> Work<'w> {
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Reshape => {
-                let view = match self.builder.view_of_value(values[0]) {
-                    Some(view) => view,
-                    None => {
-                        values[0] = self.materialize_value(f, values[0], span)?;
-                        self.builder
-                            .view_of_value(values[0])
-                            .expect("materialize produces a view")
-                    }
+                let base = self.operand_base(values[0])?;
+                let source_shape = base.shape.axes.clone();
+                let ValueType::Tensor(shape) = ty else {
+                    return Err("reshape produces a tensor".into());
                 };
-                let source = self.builder.view(view);
-                let storage = source.storage;
-                let access = source.access;
-                let source_shape = source.shape.axes.clone();
                 let new_view = self.builder.declare_view(
-                    storage,
-                    match &ty {
-                        ValueType::Tensor(s) => s.clone(),
-                        _ => return Err("reshape produces a tensor".into()),
-                    },
-                    access,
+                    base.base,
+                    shape,
+                    base.access,
                     ViewTransform::Reshape { source_shape },
-                );
+                )?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
@@ -1668,28 +2320,24 @@ impl<'w> Work<'w> {
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::SliceView { indices } => {
-                let view = match self.builder.view_of_value(values[0]) {
-                    Some(view) => view,
-                    None => {
-                        values[0] = self.materialize_value(f, values[0], span)?;
-                        self.builder
-                            .view_of_value(values[0])
-                            .expect("materialize produces a view")
-                    }
-                };
-                let source = self.builder.view(view);
-                let storage = source.storage;
-                let access = source.access;
-                let base_axes = source.shape.axes.clone();
+                let base = self.operand_base(values[0])?;
+                let base_axes = base.shape.axes.clone();
+                if indices.len() > base_axes.len() {
+                    return Err(format!(
+                        "slice indexes {} axes of a rank-{} source",
+                        indices.len(),
+                        base_axes.len()
+                    ));
+                }
                 let mut axes = Vec::new();
                 let mut safety = Vec::new();
                 let mut cursor = 1; // operands after the base
                 for slot in indices {
                     match slot {
-                        crate::intrinsics::IndexSlot::Point => {
+                        IndexSlot::Point => {
                             axes.push(SliceAxis::Point(values[cursor]));
                             safety.push(SafetyObligation::IndexInBounds {
                                 index: values[cursor],
@@ -1697,7 +2345,7 @@ impl<'w> Work<'w> {
                             });
                             cursor += 1;
                         }
-                        crate::intrinsics::IndexSlot::Range { start, end } => {
+                        IndexSlot::Range { start, end } => {
                             let start_value = if *start {
                                 cursor += 1;
                                 Some(values[cursor - 1])
@@ -1737,11 +2385,13 @@ impl<'w> Work<'w> {
                 });
                 for slot in indices {
                     match slot {
-                        crate::intrinsics::IndexSlot::Point => {
+                        IndexSlot::Point => {
                             axis_cursor += 1;
                         }
-                        crate::intrinsics::IndexSlot::Range { .. } => {
-                            let (start, end) = range_values.next().unwrap_or((None, None));
+                        IndexSlot::Range { .. } => {
+                            let (start, end) = range_values
+                                .next()
+                                .expect("every range slot has a range axis");
                             let base_axis = base_axes[axis_cursor].clone();
                             let extent = match (start, end) {
                                 (None, None) => base_axis,
@@ -1750,11 +2400,18 @@ impl<'w> Work<'w> {
                                         Box::new(RuntimeScalarExpr::Value(end)),
                                         Box::new(RuntimeScalarExpr::Value(start)),
                                     );
+                                    // A sliced range is bounded by the axis it
+                                    // selects from.
                                     let capacity = match &base_axis {
                                         ExtentExpr::Static(value) => *value,
-                                        _ => u64::MAX,
+                                        ExtentExpr::Runtime(id) => f.runtime_extents[id.index()].capacity,
+                                        ExtentExpr::Sym(sym) => {
+                                            return Err(format!(
+                                                "slice source axis `{sym}` is still symbolic at the logical level"
+                                            ))
+                                        }
                                     };
-                                    let id = f.runtime_extent(expr, capacity);
+                                    let id = f.runtime_extent(expr, capacity, None);
                                     if let ValueType::Tensor(source) = &e.ty {
                                         if let Some(ExtentExpr::Sym(sym)) =
                                             source.axes.get(shape_axes.len())
@@ -1768,7 +2425,7 @@ impl<'w> Work<'w> {
                                     }
                                     ExtentExpr::Runtime(id)
                                 }
-                                _ => {
+                                (Some(_), None) | (None, Some(_)) => {
                                     return Err(
                                         "a one-sided runtime slice bound is not representable"
                                             .into(),
@@ -1784,117 +2441,107 @@ impl<'w> Work<'w> {
                     shape_axes.push(base_axes[axis_cursor].clone());
                     axis_cursor += 1;
                 }
-                let source_elem = source.shape.elem.clone();
-                let packed_axis = source.shape.packed_axis;
+                while axes.len() < base_axes.len() {
+                    axes.push(SliceAxis::Full);
+                }
+                let packed_axis = slice_packed_axis(&base.shape, &axes);
                 let new_view = self.builder.declare_view(
-                    storage,
+                    base.base,
                     TensorType {
-                        axes: shape_axes.clone(),
-                        elem: source_elem.clone(),
+                        axes: shape_axes,
+                        elem: base.shape.elem.clone(),
                         packed_axis,
                     },
-                    access,
+                    base.access,
                     ViewTransform::Slice { axes },
-                );
+                )?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
-                    reads: vec![storage],
+                    reads: Vec::new(),
                     write: None,
                     outputs: vec![Output::View(new_view)],
                     safety,
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::ElementRead { arity } => {
-                let base = match self.builder.view_of_value(values[0]) {
-                    Some(_) => values[0],
-                    // A computed dense value is explicitly stored before a
-                    // point read.
-                    None => self.materialize_value(f, values[0], span)?,
-                };
-                values[0] = base;
-                let view = self
-                    .builder
-                    .view_of_value(base)
-                    .ok_or("element read needs a storage-backed view")?;
-                let base = self.builder.view(view);
-                let storage = base.storage;
-                let indices: Vec<GraphValueId> = values[1..1 + arity].to_vec();
+                // A computed tensor (directly or through a view of one) is
+                // read as a value; only a view of storage reads storage.
+                let base = self.operand_base(values[0])?;
+                if *arity > base.shape.axes.len() || values.len() < 1 + arity {
+                    return Err(format!(
+                        "element read indexes {arity} axes of a rank-{} source",
+                        base.shape.axes.len()
+                    ));
+                }
                 let mut safety = Vec::new();
-                for (axis, index) in indices.iter().enumerate() {
+                for (axis, index) in values[1..1 + arity].iter().enumerate() {
                     safety.push(SafetyObligation::IndexInBounds {
                         index: *index,
                         extent: base.shape.axes[axis].clone(),
                     });
                 }
-                let spec = PrimitiveSpec {
-                    op: PrimitiveOp::Primitive(id.clone()),
-                    inputs: values,
-                    reads: vec![storage],
-                    write: None,
-                    outputs: vec![Output::Value(ty)],
-                    safety,
-                    span,
-                };
-                Ok(self.add(f, spec)?)
-            }
-            PrimitiveId::ElementWrite { arity } => {
-                // Reached from assignments (the normal path) or a checked
-                // expression position.
-                let view = self
-                    .builder
-                    .view_of_value(values[0])
-                    .ok_or("element write needs a storage-backed view")?;
-                self.element_write(
-                    f,
-                    values[0],
-                    view,
-                    &values[1..1 + arity],
-                    values[values.len() - 1],
-                    span,
-                )?;
-                Ok(None)
-            }
-            PrimitiveId::CopyInto => {
-                let view = self
-                    .builder
-                    .view_of_value(values[0])
-                    .ok_or("copy.into needs a storage-backed destination")?;
-                self.copy_into(f, values[0], view, values[1], span)?;
-                Ok(None)
-            }
-            PrimitiveId::Extent { axis } | PrimitiveId::ValidExtent { axis } => {
-                let _ = axis;
+                let reads = self.builder.reads_of(&values)?;
                 let spec = PrimitiveSpec {
                     op: PrimitiveOp::Primitive(id.clone()),
                     inputs: values,
                     reads,
                     write: None,
-                    outputs: vec![Output::Value(ty)],
+                    outputs: vec![Output::Computed(ty)],
+                    safety,
+                    span,
+                };
+                self.add(spec)
+            }
+            PrimitiveId::ElementWrite { arity } => {
+                // Reached from assignments (the normal path) or a checked
+                // expression position.
+                let (base, view, _storage) =
+                    self.ensure_storage_operand(values[0], &operands[0], span)?;
+                values[0] = base;
+                if values.len() <= 1 + arity {
+                    return Err("element write operands do not match its arity".into());
+                }
+                let indices = values[1..1 + arity].to_vec();
+                self.element_write(base, view, &indices, values[values.len() - 1], span)?;
+                Ok(None)
+            }
+            PrimitiveId::CopyInto => {
+                let (base, view, _storage) =
+                    self.ensure_storage_operand(values[0], &operands[0], span)?;
+                self.copy_into(base, view, values[1], span)?;
+                Ok(None)
+            }
+            PrimitiveId::Extent { .. } | PrimitiveId::ValidExtent { .. } => {
+                let reads = self.builder.reads_of(&values)?;
+                let spec = PrimitiveSpec {
+                    op: PrimitiveOp::Primitive(id.clone()),
+                    inputs: values,
+                    reads,
+                    write: None,
+                    outputs: vec![Output::Computed(ty)],
                     safety: Vec::new(),
                     span,
                 };
-                Ok(self.add(f, spec)?)
+                self.add(spec)
             }
             PrimitiveId::Atomic { op, arity } => {
-                let view = self
-                    .builder
-                    .view_of_value(values[0])
-                    .ok_or("atomic update needs a storage-backed view")?;
-                let base = self.builder.view(view);
-                let storage = base.storage;
+                let (base, view, storage) =
+                    self.ensure_storage_operand(values[0], &operands[0], span)?;
+                values[0] = base;
+                let source = self.builder.view(view);
                 let indices: Vec<GraphValueId> = values[1..1 + arity].to_vec();
                 let mut safety = Vec::new();
                 for (axis, index) in indices.iter().enumerate() {
                     safety.push(SafetyObligation::IndexInBounds {
                         index: *index,
-                        extent: base.shape.axes[axis].clone(),
+                        extent: source.shape.axes[axis].clone(),
                     });
                 }
-                let coverage = self.write_coverage(&base.shape.axes, &indices);
-                let dtype = base
+                let coverage = self.write_coverage(&source.shape.axes, &indices);
+                let dtype = source
                     .shape
                     .elem
                     .read_dtype()
@@ -1922,7 +2569,7 @@ impl<'w> Work<'w> {
                     safety,
                     span,
                 };
-                self.add(f, spec)?;
+                self.add(spec)?;
                 Ok(None)
             }
             PrimitiveId::Reduce {
@@ -1930,17 +2577,22 @@ impl<'w> Work<'w> {
                 axis,
                 unordered,
             } => {
-                if self.builder.view_of_value(values[0]).is_none() {
-                    values[0] = self.materialize_value(f, values[0], span)?;
-                }
+                // A computed operand is reduced directly; no storage is
+                // invented for it.
                 let operand_elem = match &operands[0].ty {
                     ValueType::Tensor(s) => s.elem.clone(),
-                    _ => return Err("reduce needs a tensor operand".into()),
+                    ValueType::Scalar(_)
+                    | ValueType::Index { .. }
+                    | ValueType::Range { .. }
+                    | ValueType::Tuple(_)
+                    | ValueType::CapabilityValue(_)
+                    | ValueType::Void => return Err("reduce needs a tensor operand".into()),
                 };
-                let elem = self.convert_elem(&operand_elem)?;
-                let input = match &elem {
-                    Elem::Dtype(d) => *d,
-                    _ => return Err("reduce needs a dense element".into()),
+                let input = match self.convert_elem(&operand_elem)? {
+                    Elem::Dtype(d) => d,
+                    Elem::Repr(_) | Elem::Param(_) => {
+                        return Err("reduce needs a dense element".into())
+                    }
                 };
                 let accumulator = accumulator_dtype(*op, input);
                 let order = if *unordered {
@@ -1954,13 +2606,35 @@ impl<'w> Work<'w> {
                     *op,
                     order,
                     accumulator,
-                    ty.clone(),
+                    ty,
                     span,
                 )?;
                 Ok(Some(value))
             }
         }
     }
+}
+
+/// Project a representation's packing axis through an exact slice: pointing
+/// a preceding axis shifts it; retaining the packed axis records its new
+/// output position; pointing the packed axis removes the axis descriptor
+/// while `Elem::Repr` and the multi-plane backing view are preserved so a
+/// later packed element read can decode through the slice transform.
+fn slice_packed_axis(source: &TensorType, axes: &[SliceAxis]) -> Option<usize> {
+    let packed = source.packed_axis?;
+    let mut output_axis = 0usize;
+    for (source_axis, selection) in axes.iter().enumerate() {
+        if source_axis == packed {
+            return match selection {
+                SliceAxis::Point(_) => None,
+                SliceAxis::Full | SliceAxis::Range { .. } => Some(output_axis),
+            };
+        }
+        if !matches!(selection, SliceAxis::Point(_)) {
+            output_axis += 1;
+        }
+    }
+    None
 }
 
 impl<'w> Work<'w> {
@@ -1977,65 +2651,93 @@ impl<'w> Work<'w> {
             .map(|axis| *axis == ExtentExpr::Static(0))
             .collect::<Vec<bool>>();
         for (axis, index) in indices.iter().enumerate() {
-            if let Some(info) = self.loops.iter().rev().find(|info| info.binder == *index) {
-                if self.if_depth == info.if_depth
-                    && info.start == ExtentExpr::Static(0)
-                    && info.end == axes[axis]
-                {
-                    covered[axis] = true;
-                }
+            if self.write_coverage_axis(&axes[axis], *index) {
+                covered[axis] = true;
             }
         }
         Coverage { axes: covered }
     }
 
+    /// One axis is covered by an index when the index is an enclosing loop's
+    /// binder, the write is unconditional within that loop, and the loop's
+    /// range covers the axis. Zero-sized axes are trivially covered.
+    fn write_coverage_axis(&self, extent: &ExtentExpr, index: GraphValueId) -> bool {
+        if *extent == ExtentExpr::Static(0) {
+            return true;
+        }
+        // The index addresses the loop binder either by its original value
+        // or through the local's current value (a nested region rebound it
+        // to a fresh parameter). A local currently holding the binder value
+        // is the binder's value, whatever id carries it.
+        self.loops.iter().rev().any(|info| {
+            let addresses_binder = info.binder == index
+                || self
+                    .locals
+                    .get(info.binder_local)
+                    .is_some_and(|current| *current == Some(index));
+            addresses_binder
+                && self.if_depth == info.if_depth
+                && info.start == ExtentExpr::Static(0)
+                && info.end == *extent
+        })
+    }
+
     /// Structural coverage of writing through one view: identity/reshape/
     /// transpose views are whole-storage writes; slice views cover the axes
     /// their static bounds provably span.
-    fn transform_coverage(&self, view: LogicalViewId) -> Coverage {
-        let view = self.builder.view(view);
-        let rank = self.builder.storage(view.storage).shape.axes.len();
-        match &view.transform {
+    fn transform_coverage(&self, view: LogicalViewId) -> Result<Coverage, String> {
+        let logical = self.builder.view(view);
+        let storage_axes = &self.builder.storage(self.builder.storage_base(view)?).shape.axes;
+        let rank = storage_axes.len();
+        match &logical.transform {
             ViewTransform::Identity
             | ViewTransform::Reshape { .. }
-            | ViewTransform::Transpose { .. } => Coverage::full(rank),
+            | ViewTransform::Transpose { .. } => Ok(Coverage::full(rank)),
             ViewTransform::Slice { axes } => {
                 let mut covered = Vec::with_capacity(rank);
+                let mut axis_cursor = 0usize;
                 for slot in axes {
-                    let axis = covered.len();
-                    let extent = self.builder.storage(view.storage).shape.axes[axis].clone();
+                    let extent = &storage_axes[axis_cursor];
                     let covers = match slot {
                         SliceAxis::Full => true,
-                        SliceAxis::Point(_) => false,
+                        SliceAxis::Point(index) => {
+                            // A point axis is covered when the index is an
+                            // enclosing loop's binder whose range covers the
+                            // axis (the same proof `write_coverage` applies
+                            // to element writes; the checker's disjoint-write
+                            // proof covers the loop's independence).
+                            self.write_coverage_axis(extent, *index)
+                        }
                         SliceAxis::Range { start, end } => {
                             let start_ok = start
                                 .map(|v| self.constants.get(&v) == Some(&0))
                                 .unwrap_or(true);
                             let end_ok = end
-                                .map(|v| match &extent {
+                                .map(|v| match extent {
                                     ExtentExpr::Static(n) => {
                                         self.constants.get(&v) == Some(&(*n as i64))
                                     }
-                                    _ => false,
+                                    ExtentExpr::Sym(_) | ExtentExpr::Runtime(_) => false,
                                 })
                                 .unwrap_or(true);
                             start_ok && end_ok
                         }
                     };
                     covered.push(covers);
+                    axis_cursor += 1;
                 }
                 while covered.len() < rank {
                     covered.push(true);
                 }
-                Coverage { axes: covered }
+                Ok(Coverage { axes: covered })
             }
         }
     }
 
     /// Range-safety obligations of writing through a slice view.
-    fn transform_safety(&self, view: LogicalViewId) -> Vec<SafetyObligation> {
+    fn transform_safety(&self, view: LogicalViewId) -> Result<Vec<SafetyObligation>, String> {
         let logical = self.builder.view(view);
-        let storage = self.builder.storage(logical.storage);
+        let storage = self.builder.storage(self.builder.storage_base(view)?);
         match &logical.transform {
             ViewTransform::Slice { axes } => {
                 let mut safety = Vec::new();
@@ -2052,9 +2754,11 @@ impl<'w> Work<'w> {
                         });
                     }
                 }
-                safety
+                Ok(safety)
             }
-            _ => Vec::new(),
+            ViewTransform::Identity
+            | ViewTransform::Reshape { .. }
+            | ViewTransform::Transpose { .. } => Ok(Vec::new()),
         }
     }
 
@@ -2083,7 +2787,6 @@ impl<'w> Work<'w> {
 
     fn element_write(
         &mut self,
-        f: &mut Factory,
         base_value: GraphValueId,
         view: LogicalViewId,
         indices: &[GraphValueId],
@@ -2091,7 +2794,14 @@ impl<'w> Work<'w> {
         span: Span,
     ) -> Result<(), String> {
         let base = self.builder.view(view);
-        let storage = base.storage;
+        let storage = self.builder.storage_base(view)?;
+        if indices.len() > base.shape.axes.len() {
+            return Err(format!(
+                "element write indexes {} axes of a rank-{} destination",
+                indices.len(),
+                base.shape.axes.len()
+            ));
+        }
         let mut safety = Vec::new();
         for (axis, index) in indices.iter().enumerate() {
             safety.push(SafetyObligation::IndexInBounds {
@@ -2120,26 +2830,21 @@ impl<'w> Work<'w> {
             safety,
             span,
         };
-        self.add(f, spec)?;
+        self.add(spec)?;
         Ok(())
     }
 
     fn copy_into(
         &mut self,
-        f: &mut Factory,
         dst_value: GraphValueId,
         view: LogicalViewId,
         src_value: GraphValueId,
         span: Span,
     ) -> Result<(), String> {
-        let storage = self.builder.view(view).storage;
-        let coverage = self.transform_coverage(view);
-        let safety = self.transform_safety(view);
-        let reads = self
-            .builder
-            .storage_of_value(src_value)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let storage = self.builder.storage_base(view)?;
+        let coverage = self.transform_coverage(view)?;
+        let safety = self.transform_safety(view)?;
+        let reads = self.builder.reads_of(&[src_value])?;
         self.record_write(storage);
         let spec = PrimitiveSpec {
             op: PrimitiveOp::Primitive(PrimitiveId::CopyInto),
@@ -2155,20 +2860,19 @@ impl<'w> Work<'w> {
             safety,
             span,
         };
-        self.add(f, spec)?;
+        self.add(spec)?;
         Ok(())
     }
 
     fn element_read(
         &mut self,
-        f: &mut Factory,
         base_value: GraphValueId,
         view: LogicalViewId,
         indices: &[GraphValueId],
         span: Span,
     ) -> Result<GraphValueId, String> {
         let base = self.builder.view(view);
-        let storage = base.storage;
+        let storage = self.builder.storage_base(view)?;
         let mut safety = Vec::new();
         for (axis, index) in indices.iter().enumerate() {
             safety.push(SafetyObligation::IndexInBounds {
@@ -2190,96 +2894,11 @@ impl<'w> Work<'w> {
             inputs,
             reads: vec![storage],
             write: None,
-            outputs: vec![Output::Value(ValueType::Scalar(dtype))],
+            outputs: vec![Output::Computed(ValueType::Scalar(dtype))],
             safety,
             span,
         };
-        Ok(self
-            .add(f, spec)?
-            .expect("an element read produces a scalar"))
-    }
-
-    /// Materialize one computed or borrowed tensor value into fresh owned
-    /// storage.
-    fn materialize_value(
-        &mut self,
-        f: &mut Factory,
-        value: GraphValueId,
-        span: Span,
-    ) -> Result<GraphValueId, String> {
-        let ty = self.builder.value_type(value)?;
-        let ValueType::Tensor(shape) = &ty else {
-            return Err("materialize needs a tensor".into());
-        };
-        let storage = self.builder.declare_storage(
-            shape.clone(),
-            StorageOrigin::Owned,
-            Initialization::Uninitialized,
-        );
-        let view = self.builder.declare_view(
-            storage,
-            shape.clone(),
-            Access::Exclusive,
-            ViewTransform::Identity,
-        );
-        let reads = self
-            .builder
-            .storage_of_value(value)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let spec = PrimitiveSpec {
-            op: PrimitiveOp::Primitive(PrimitiveId::Materialize),
-            inputs: vec![value],
-            reads,
-            write: Some(WriteEffect {
-                storage,
-                coverage: Coverage::full(shape.axes.len()),
-                atomic: false,
-                initializing: true,
-            }),
-            outputs: vec![Output::View(view)],
-            safety: Vec::new(),
-            span,
-        };
-        Ok(self.add(f, spec)?.expect("materialize produces a value"))
-    }
-
-    /// At the entry, every tensor leaf of a result becomes compiler-owned
-    /// storage: borrowed or computed values are materialized; tuples are
-    /// repacked from their materialized components.
-    fn materialize_result_leaf(
-        &mut self,
-        f: &mut Factory,
-        value: GraphValueId,
-        ty: &ValueType,
-        span: Span,
-    ) -> Result<GraphValueId, String> {
-        match ty {
-            ValueType::Tensor(_) => self.materialize_value(f, value, span),
-            ValueType::Tuple(items) => {
-                let mut components = Vec::new();
-                for (index, item) in items.iter().enumerate() {
-                    let component = self.tuple_get(f, value, index)?;
-                    components.push(self.materialize_result_leaf(f, component, item, span)?);
-                }
-                let tys = components
-                    .iter()
-                    .map(|id| self.builder.value_type(*id))
-                    .collect::<Result<_, _>>()?;
-                let packed = ValueType::Tuple(NonEmpty::new(tys).ok_or("a tuple result is empty")?);
-                let spec = PrimitiveSpec {
-                    op: PrimitiveOp::Primitive(PrimitiveId::TuplePack),
-                    inputs: components,
-                    reads: Vec::new(),
-                    write: None,
-                    outputs: vec![Output::Value(packed)],
-                    safety: Vec::new(),
-                    span,
-                };
-                Ok(self.add(f, spec)?.expect("tuple pack produces a value"))
-            }
-            _ => Ok(value),
-        }
+        Ok(self.add(spec)?.expect("an element read produces a scalar"))
     }
 
     // -- assignment ---------------------------------------------------------
@@ -2294,7 +2913,7 @@ impl<'w> Work<'w> {
         let span = value_expr.span;
         let value = self
             .expr(f, value_expr)?
-            .expect("an assignment value is a value");
+            .ok_or("an assignment value is void")?;
         self.assign_place(f, place, op, value, span)
     }
 
@@ -2308,58 +2927,65 @@ impl<'w> Work<'w> {
     ) -> Result<(), String> {
         match place {
             CheckedPlace::Local { root } => {
-                let current = self.locals[*root].ok_or("an assignment target is not bound")?;
+                let current = self.binding(*root)?;
                 let current_ty = self.builder.value_type(current)?;
                 let value_ty = self.builder.value_type(value)?;
-                if matches!(current_ty, ValueType::Tensor(_)) {
-                    if current_ty == value_ty {
-                        // Whole-tensor assignment writes into the target's
-                        // storage (a compound op computes elementwise first).
-                        let view = self
-                            .builder
-                            .view_of_value(current)
-                            .ok_or("a whole-tensor assignment needs a storage-backed target")?;
+                match self.builder.value(current)?.tensor_source() {
+                    Some(TensorSource::View(view)) if current_ty == value_ty => {
+                        // Whole-tensor assignment to a view-backed local
+                        // writes through the view (a compound op computes
+                        // elementwise first). A view of a computed value is
+                        // a snapshot: the write names the local's own state,
+                        // so the local realizes its storage first and
+                        // rebinds to it.
+                        let (current, view) = match self.builder.view(view).base {
+                            ViewBase::Storage(_) => (current, view),
+                            ViewBase::Value(_) => {
+                                let realized = self.materialize_value(current, span)?;
+                                self.locals[*root] = Some(realized.0);
+                                realized
+                            }
+                        };
                         if op == AssignOp::Assign {
-                            self.copy_into(f, current, view, value, span)?;
+                            self.copy_into(current, view, value, span)?;
                         } else {
                             let computed =
-                                self.binary_assign_op(f, op, current, value, &current_ty, span)?;
-                            self.copy_into(f, current, view, computed, span)?;
+                                self.binary_assign_op(op, current, value, &current_ty, span)?;
+                            self.copy_into(current, view, computed, span)?;
                         }
-                    } else {
+                    }
+                    Some(TensorSource::View(_)) => {
                         if op != AssignOp::Assign {
                             return Err(
-                                "a compound assignment cannot change the target's type".into()
+                                "a compound assignment cannot change the target's type".into(),
                             );
                         }
                         self.locals[*root] = Some(value);
                     }
-                } else if op == AssignOp::Assign {
-                    self.locals[*root] = Some(value);
-                } else {
-                    let computed =
-                        self.binary_assign_op(f, op, current, value, &current_ty, span)?;
-                    self.locals[*root] = Some(computed);
+                    Some(TensorSource::Computed) | None => {
+                        // A computed tensor or a plain value rebinds (SSA).
+                        if op == AssignOp::Assign {
+                            self.locals[*root] = Some(value);
+                        } else {
+                            if current_ty != value_ty {
+                                return Err(
+                                    "a compound assignment cannot change the target's type".into(),
+                                );
+                            }
+                            let computed =
+                                self.binary_assign_op(op, current, value, &current_ty, span)?;
+                            self.locals[*root] = Some(computed);
+                        }
+                    }
                 }
                 Ok(())
             }
             CheckedPlace::Element { root, indices } => {
-                let current = self.locals[*root].ok_or("an assignment target is not bound")?;
-                // A computed target is explicitly stored first; the local's
-                // current origin becomes that storage so later reads see
-                // these writes.
-                let current = match self.builder.view_of_value(current) {
-                    Some(_) => current,
-                    None => {
-                        let materialized = self.materialize_value(f, current, span)?;
-                        self.locals[*root] = Some(materialized);
-                        materialized
-                    }
-                };
-                let view = self
-                    .builder
-                    .view_of_value(current)
-                    .ok_or("an element assignment needs a storage-backed target")?;
+                // An in-place write names the local's mutable state: a value
+                // without storage behind it is realized into the local's own
+                // storage first, and the local rebinds to it so later reads
+                // see these writes.
+                let (current, view, _storage) = self.ensure_view_local(*root, span)?;
                 // Convert indices: values for points, optional bounds for
                 // ranges.
                 let mut point_indices = Vec::new();
@@ -2368,21 +2994,21 @@ impl<'w> Work<'w> {
                 for index in indices {
                     match index {
                         CheckedIndex::Point(p) => {
-                            let value = self.expr(f, p)?.expect("an index is a value");
+                            let value = self.expr(f, p)?.ok_or("an index is void")?;
                             point_indices.push(value);
-                            slots.push(crate::intrinsics::IndexSlot::Point);
+                            slots.push(IndexSlot::Point);
                             slot_args.push(SlotArg::Point(value));
                         }
                         CheckedIndex::Range { start, end } => {
                             let start_value = match start {
-                                Some(e) => Some(self.expr(f, e)?.expect("a bound is a value")),
+                                Some(e) => Some(self.expr(f, e)?.ok_or("a bound is void")?),
                                 None => None,
                             };
                             let end_value = match end {
-                                Some(e) => Some(self.expr(f, e)?.expect("a bound is a value")),
+                                Some(e) => Some(self.expr(f, e)?.ok_or("a bound is void")?),
                                 None => None,
                             };
-                            slots.push(crate::intrinsics::IndexSlot::Range {
+                            slots.push(IndexSlot::Range {
                                 start: start_value.is_some(),
                                 end: end_value.is_some(),
                             });
@@ -2396,26 +3022,27 @@ impl<'w> Work<'w> {
                 let all_points = slot_args.iter().all(|arg| matches!(arg, SlotArg::Point(_)));
                 if all_points {
                     if op == AssignOp::Assign {
-                        self.element_write(f, current, view, &point_indices, value, span)?;
+                        self.element_write(current, view, &point_indices, value, span)?;
                     } else {
-                        let read = self.element_read(f, current, view, &point_indices, span)?;
+                        let read = self.element_read(current, view, &point_indices, span)?;
                         let read_ty = self.builder.value_type(read)?;
-                        let computed = self.binary_assign_op(f, op, read, value, &read_ty, span)?;
-                        self.element_write(f, current, view, &point_indices, computed, span)?;
+                        let computed = self.binary_assign_op(op, read, value, &read_ty, span)?;
+                        self.element_write(current, view, &point_indices, computed, span)?;
                     }
                 } else {
                     if op != AssignOp::Assign {
                         return Err("a compound assignment cannot target a slice".into());
                     }
                     // Build the destination view, then copy the source into it.
-                    let sliced = self.make_slice_view(f, current, view, slots, slot_args, span)?;
-                    self.copy_into(f, sliced.0, sliced.1, value, span)?;
+                    let (sliced, sliced_view) =
+                        self.make_slice_view(f, current, view, slots, slot_args, span)?;
+                    self.copy_into(sliced, sliced_view, value, span)?;
                 }
                 Ok(())
             }
             CheckedPlace::Tuple(places) => {
                 for (index, place) in places.iter().enumerate() {
-                    let component = self.tuple_get(f, value, index)?;
+                    let component = self.tuple_get(f, value, index, span)?;
                     self.assign_place(f, place, op, component, span)?;
                 }
                 Ok(())
@@ -2425,7 +3052,6 @@ impl<'w> Work<'w> {
 
     fn binary_assign_op(
         &mut self,
-        f: &mut Factory,
         op: AssignOp,
         lhs: GraphValueId,
         rhs: GraphValueId,
@@ -2438,18 +3064,17 @@ impl<'w> Work<'w> {
             AssignOp::Sub => BinaryOp::Sub,
             AssignOp::Mul => BinaryOp::Mul,
         };
-        let (output, write) = self.computed_output(f, ty.clone(), span)?;
         let spec = PrimitiveSpec {
             op: PrimitiveOp::Primitive(PrimitiveId::Binary(binary)),
             inputs: vec![lhs, rhs],
-            reads: self.operand_reads(&[lhs, rhs]),
-            write,
-            outputs: vec![output],
+            reads: self.builder.reads_of(&[lhs, rhs])?,
+            write: None,
+            outputs: vec![Output::Computed(ty.clone())],
             safety: Vec::new(),
             span,
         };
         Ok(self
-            .add(f, spec)?
+            .add(spec)?
             .expect("a compound assignment computes a value"))
     }
 
@@ -2459,20 +3084,29 @@ impl<'w> Work<'w> {
         f: &mut Factory,
         base_value: GraphValueId,
         base_view: LogicalViewId,
-        slots: Vec<crate::intrinsics::IndexSlot>,
+        slots: Vec<IndexSlot>,
         args: Vec<SlotArg>,
         span: Span,
     ) -> Result<(GraphValueId, LogicalViewId), String> {
-        let base = self.builder.view(base_view);
-        let storage = base.storage;
+        let base = self.builder.view(base_view).clone();
         let access = base.access;
         let base_axes = base.shape.axes.clone();
+        if slots.len() != args.len() {
+            return Err("a slice slot list and its arguments disagree".into());
+        }
+        if slots.len() > base_axes.len() {
+            return Err(format!(
+                "slice indexes {} axes of a rank-{} destination",
+                slots.len(),
+                base_axes.len()
+            ));
+        }
         let mut inputs = vec![base_value];
         let mut axes = Vec::new();
         let mut safety = Vec::new();
         for (axis, (slot, arg)) in slots.iter().zip(&args).enumerate() {
             match (slot, arg) {
-                (crate::intrinsics::IndexSlot::Point, SlotArg::Point(value)) => {
+                (IndexSlot::Point, SlotArg::Point(value)) => {
                     inputs.push(*value);
                     axes.push(SliceAxis::Point(*value));
                     safety.push(SafetyObligation::IndexInBounds {
@@ -2480,10 +3114,7 @@ impl<'w> Work<'w> {
                         extent: base_axes[axis].clone(),
                     });
                 }
-                (
-                    crate::intrinsics::IndexSlot::Range { start, end },
-                    SlotArg::Range { start: s, end: e },
-                ) => {
+                (IndexSlot::Range { start, end }, SlotArg::Range { start: s, end: e }) => {
                     if let (true, Some(value)) = (start, s) {
                         inputs.push(*value);
                     }
@@ -2499,22 +3130,62 @@ impl<'w> Work<'w> {
                     }
                     axes.push(SliceAxis::Range { start: *s, end: *e });
                 }
-                _ => return Err("a slice slot's arguments do not match its shape".into()),
+                (IndexSlot::Point, SlotArg::Range { .. })
+                | (IndexSlot::Range { .. }, SlotArg::Point(_)) => {
+                    return Err("a slice slot's arguments do not match its shape".into())
+                }
             }
         }
-        // The result type keeps the base element; its axes shrink per the
-        // checker's recorded expression type, which the caller does not pass.
-        // Derive it structurally: points drop the axis, ranges keep it (their
-        // runtime extent), trailing axes are kept.
+        // The destination keeps the base element; its axes shrink
+        // structurally: points drop the axis, ranges carry the sliced
+        // extent (end - start, bounded by the base axis), trailing axes
+        // are kept.
         let mut shape_axes = Vec::new();
         let mut axis_cursor = 0;
+        let mut range_values = axes.iter().filter_map(|axis| match axis {
+            SliceAxis::Range { start, end } => Some((*start, *end)),
+            SliceAxis::Point(_) | SliceAxis::Full => None,
+        });
         for slot in &slots {
             match slot {
-                crate::intrinsics::IndexSlot::Point => {
+                IndexSlot::Point => {
                     axis_cursor += 1;
                 }
-                crate::intrinsics::IndexSlot::Range { .. } => {
-                    shape_axes.push(base_axes[axis_cursor].clone());
+                IndexSlot::Range { .. } => {
+                    let (start, end) = range_values
+                        .next()
+                        .expect("every range slot has a range axis");
+                    let base_axis = base_axes[axis_cursor].clone();
+                    let extent = match (start, end) {
+                        (None, None) => base_axis,
+                        (Some(start), Some(end)) => {
+                            let expr = RuntimeScalarExpr::Sub(
+                                Box::new(RuntimeScalarExpr::Value(end)),
+                                Box::new(RuntimeScalarExpr::Value(start)),
+                            );
+                            // A sliced range is bounded by the axis it
+                            // selects from.
+                            let capacity = match &base_axis {
+                                ExtentExpr::Static(value) => *value,
+                                ExtentExpr::Runtime(id) => {
+                                    f.runtime_extents[id.index()].capacity
+                                }
+                                ExtentExpr::Sym(sym) => {
+                                    return Err(format!(
+                                        "slice destination axis `{sym}` is still symbolic at the logical level"
+                                    ))
+                                }
+                            };
+                            ExtentExpr::Runtime(f.runtime_extent(expr, capacity, None))
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(
+                                "a one-sided runtime slice bound is not representable"
+                                    .into(),
+                            );
+                        }
+                    };
+                    shape_axes.push(extent);
                     axis_cursor += 1;
                 }
             }
@@ -2523,46 +3194,63 @@ impl<'w> Work<'w> {
             shape_axes.push(base_axes[axis_cursor].clone());
             axis_cursor += 1;
         }
-        let elem = base.shape.elem.clone();
-        let packed_axis = base.shape.packed_axis;
+        while axes.len() < base_axes.len() {
+            axes.push(SliceAxis::Full);
+        }
+        let packed_axis = slice_packed_axis(&base.shape, &axes);
         let shape = TensorType {
             axes: shape_axes,
-            elem,
+            elem: base.shape.elem.clone(),
             packed_axis,
         };
         let view = self
             .builder
-            .declare_view(storage, shape, access, ViewTransform::Slice { axes });
+            .declare_view(base.base, shape, access, ViewTransform::Slice { axes })?;
         let spec = PrimitiveSpec {
             op: PrimitiveOp::Primitive(PrimitiveId::SliceView { indices: slots }),
             inputs,
-            reads: vec![storage],
+            reads: Vec::new(),
             write: None,
             outputs: vec![Output::View(view)],
             safety,
             span,
         };
-        let value = self.add(f, spec)?.expect("a slice view produces a value");
+        let value = self.add(spec)?.expect("a slice view produces a value");
         Ok((value, view))
     }
+}
 
+enum SlotArg {
+    Point(GraphValueId),
+    Range {
+        start: Option<GraphValueId>,
+        end: Option<GraphValueId>,
+    },
+}
+
+/// One state parameter of a loop body: a carried tensor local of an ordered
+/// loop, or a joined storage of an independent loop.
+enum StateCarry {
+    Local(LocalId),
+    Joined,
+}
+
+impl<'w> Work<'w> {
     // -- loops --------------------------------------------------------------
 
     fn loop_stmt(
         &mut self,
         f: &mut Factory,
         kind: LoopKind,
-        binder: usize,
+        binder: LocalId,
         range: &CheckedRange,
         body: &CheckedBlock,
         mutation: &LoopMutationSummary,
     ) -> Result<(), String> {
         let span = range.start.span;
-        let start = self
-            .expr(f, &range.start)?
-            .expect("a range bound is a value");
-        let end = self.expr(f, &range.end)?.expect("a range bound is a value");
-        let binder_ty = self.convert_type(f, &self.local_tys[binder].ty)?;
+        let start = self.expr(f, &range.start)?.ok_or("a range bound is void")?;
+        let end = self.expr(f, &range.end)?.ok_or("a range bound is void")?;
+        let binder_ty = self.convert_type(f, &self.local_tys[binder].ty.clone())?;
         let ValueType::Index { bound } = &binder_ty else {
             return Err("a loop binder is an index".into());
         };
@@ -2571,86 +3259,76 @@ impl<'w> Work<'w> {
             end,
             bound: bound.clone(),
         };
-        let binder_id = self.builder.fresh_value(
-            ValueType::Index {
-                bound: bound.clone(),
-            },
-            None,
-        )?;
+        let binder_id = self.builder.fresh_value(GraphValueKind::Index {
+            bound: bound.clone(),
+        })?;
 
         // Symbolic range endpoints, for coverage proofs.
         let ctx_start = match &range.start.sym {
-            Some(sym) => self.resolve_sym(f, sym)?,
+            Some(sym) => self.resolve_sym(f, sym)?.extent(),
             None => ExtentExpr::Static(0),
         };
         let ctx_end = match &range.end.sym {
-            Some(sym) => self.resolve_sym(f, sym)?,
+            Some(sym) => self.resolve_sym(f, sym)?.extent(),
             None => bound.clone(),
         };
 
         let mut free = free_locals(body);
         free.remove(&binder);
-        let rebound = rebound_roots(body);
+        let storage_written = storage_written_roots(body);
+        let mutated: Vec<LocalId> = mutation
+            .carried
+            .iter()
+            .chain(&mutation.atomics)
+            .copied()
+            .filter(|local| free.contains(local))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        // A local the body writes in place whose value has no storage behind
+        // it (a computed tensor or a view of one) needs its storage outside
+        // the loop: realize it (and rebind) before the body.
+        self.materialize_written_locals(
+            mutated
+                .iter()
+                .copied()
+                .filter(|local| storage_written.contains(local)),
+            span,
+        )?;
 
         // Storages threaded through the body region: ordered loops carry the
-        // captured tensor locals the checker marked; independent loops thread
-        // every captured storage the body writes (their visits join).
+        // view-backed captured locals the checker marked; independent loops
+        // thread every captured storage the body writes (their visits join).
         let mut captured_storages = BTreeSet::new();
-        if kind == LoopKind::Ordered {
-            for local in &mutation.carried {
-                if let Some(storage) = self.storage_of_local(*local) {
-                    captured_storages.insert(storage);
-                }
-            }
-        } else {
-            // The checker's summary is exact; the syntactic write scan
-            // over-approximates call arguments borrowed into callees.
-            for local in mutation.carried.iter().chain(&mutation.atomics) {
-                if free.contains(local) {
-                    if let Some(storage) = self.storage_of_local(*local) {
-                        captured_storages.insert(storage);
-                    }
-                }
+        for local in &mutated {
+            if let Some(storage) = self.storage_of_local(*local)? {
+                captured_storages.insert(storage);
             }
         }
 
-        // Carried slots (ordered loops only): every changed captured local.
+        // Carried slots (ordered loops only): every changed captured local,
+        // as a state (storage-backed) or a value (a tensor without storage
+        // behind it, or a non-tensor).
         let mut carried_value_locals = Vec::new();
         let mut carried_state_locals = Vec::new();
-        if kind == LoopKind::Ordered {
-            for local in &mutation.carried {
-                let binding = self
-                    .locals
-                    .get(*local)
-                    .and_then(|binding| *binding)
-                    .ok_or("a carried local is not bound")?;
-                if self.builder.view_of_value(binding).is_some() {
-                    if rebound.contains(local) {
-                        return Err(format!(
-                            "captured tensor local {} is rebound to a different value inside an ordered loop; this is not representable",
-                            self.local_tys[*local].name
-                        ));
+        match kind {
+            LoopKind::Ordered => {
+                for local in &mutated {
+                    if self.storage_of_local(*local)?.is_some() {
+                        carried_state_locals.push(*local);
+                    } else {
+                        carried_value_locals.push(*local);
                     }
-                    carried_state_locals.push(*local);
-                } else {
-                    carried_value_locals.push(*local);
                 }
             }
-        } else {
-            // Independent loops admit no scalar or owned carry: the checker's
-            // exact written-capture set, not the over-approximating scan.
-            for local in mutation.carried.iter().chain(&mutation.atomics) {
-                if free.contains(local) {
-                    let binding = self
-                        .locals
-                        .get(*local)
-                        .and_then(|binding| *binding)
-                        .ok_or("a written local is not bound")?;
-                    if self.builder.view_of_value(binding).is_none()
-                        && !matches!(self.builder.value_type(binding)?, ValueType::Tensor(_))
-                    {
+            LoopKind::Independent => {
+                // Independent loops admit no value carry: every written
+                // capture is storage-backed after materialization.
+                for local in &mutated {
+                    if self.storage_of_local(*local)?.is_none() {
                         return Err(format!(
-                            "independent loop writes captured scalar local {}",
+                            "independent loop rebinds captured local `{}`; visits may only write storage",
                             self.local_tys[*local].name
                         ));
                     }
@@ -2669,44 +3347,41 @@ impl<'w> Work<'w> {
         });
         let mut invariant_values = Vec::new();
         for local in &free {
-            let binding = self
-                .locals
-                .get(*local)
-                .and_then(|binding| *binding)
-                .ok_or("a captured local is not bound")?;
-            let ty = self.builder.value_type(binding)?;
-            let view = self.builder.view_of_value(binding);
-            let param = self.builder.fresh_value(ty.clone(), view)?;
+            let binding = self.binding(*local)?;
+            let kind = self.builder.value(binding)?.kind().clone();
+            let param = self.builder.fresh_value(kind)?;
             param_ids.insert(*local, param);
-            params.push(RegionParameter::Value { id: param, ty });
+            params.push(RegionParameter::Value {
+                id: param,
+                ty: self.builder.value_type(binding)?,
+            });
             if !carried_value_locals.contains(local) {
                 invariant_values.push(binding);
             }
         }
-        let mut state_params = Vec::new();
+        let mut state_params: Vec<(StateCarry, LogicalStorageId)> = Vec::new();
         for local in carried_state_locals.iter().copied() {
             let storage = self
-                .storage_of_local(local)
+                .storage_of_local(local)?
                 .ok_or("a carried tensor local has no storage")?;
-            let token = self.builder.fresh_state();
-            self.builder.bind_state(token, storage);
+            let token = self.builder.fresh_state(storage)?;
             params.push(RegionParameter::State { id: token, storage });
-            state_params.push((local, storage, token));
+            state_params.push((StateCarry::Local(local), storage));
         }
         if kind == LoopKind::Independent {
             for storage in &captured_storages {
-                let token = self.builder.fresh_state();
-                self.builder.bind_state(token, *storage);
+                let token = self.builder.fresh_state(*storage)?;
                 params.push(RegionParameter::State {
                     id: token,
                     storage: *storage,
                 });
-                state_params.push((usize::MAX, *storage, token));
+                state_params.push((StateCarry::Joined, *storage));
             }
         }
 
         self.loops.push(LoopInfo {
             binder: binder_id,
+            binder_local: binder,
             start: ctx_start,
             end: ctx_end,
             if_depth: self.if_depth,
@@ -2732,15 +3407,26 @@ impl<'w> Work<'w> {
         let flow = self.block(f, body)?;
         // Capture the body-exit bindings of captured locals before restoring
         // the enclosing environment.
-        let mut body_exit: BTreeMap<usize, GraphValueId> = BTreeMap::new();
+        let mut body_exit: BTreeMap<LocalId, GraphValueId> = BTreeMap::new();
         for local in &free {
-            body_exit.insert(
-                *local,
-                self.locals
-                    .get(*local)
-                    .and_then(|binding| *binding)
-                    .ok_or("a captured local is not bound")?,
-            );
+            body_exit.insert(*local, self.binding(*local)?);
+        }
+        // A state-carried local must still name its storage at body exit.
+        for local in &carried_state_locals {
+            let storage = self.storage_of_local(*local)?;
+            let expected = state_params
+                .iter()
+                .find_map(|(carry, storage)| match carry {
+                    StateCarry::Local(candidate) if candidate == local => Some(*storage),
+                    StateCarry::Local(_) | StateCarry::Joined => None,
+                })
+                .expect("every state-carried local has a state parameter");
+            if storage != Some(expected) {
+                return Err(format!(
+                    "captured tensor local `{}` is rebound to a different value inside an ordered loop; this is not representable",
+                    self.local_tys[*local].name
+                ));
+            }
         }
         self.locals = saved_locals;
         if !matches!(flow, Flow::Next) {
@@ -2749,7 +3435,7 @@ impl<'w> Work<'w> {
         // Restore the pre-loop current states: the loop node consumes those
         // tokens and installs its own exit tokens.
         for (storage, token) in &pre_states {
-            self.builder.set_current_state(*storage, *token);
+            self.builder.set_current_state(*storage, *token)?;
         }
         let info = self.loops.pop().expect("the loop stack is balanced");
 
@@ -2764,12 +3450,7 @@ impl<'w> Work<'w> {
             let ty = self.builder.value_type(exit)?;
             body_results.push(RegionResult::Value { id: exit, ty });
             carried.push(CarriedSlot {
-                initial: RegionInput::Value(
-                    self.locals
-                        .get(*local)
-                        .and_then(|binding| *binding)
-                        .ok_or("a carried local is not bound")?,
-                ),
+                initial: RegionInput::Value(self.binding(*local)?),
                 body_parameter: RegionParameterId(
                     1 + free
                         .iter()
@@ -2781,31 +3462,28 @@ impl<'w> Work<'w> {
             });
             value_ordinal += 1;
         }
-        for (local, storage, _) in &state_params {
-            if *local == usize::MAX {
-                // Independent-loop state parameter: its result is assembled
-                // with the joins below.
-                continue;
+        for (ordinal, (carry, storage)) in state_params.iter().enumerate() {
+            match carry {
+                StateCarry::Joined => {
+                    // Independent-loop state parameter: its result is
+                    // assembled with the joins below.
+                }
+                StateCarry::Local(_) => {
+                    let token = self.builder.current_state(*storage)?;
+                    body_results.push(RegionResult::State {
+                        id: token,
+                        storage: *storage,
+                        join: None,
+                    });
+                    carried.push(CarriedSlot {
+                        initial: RegionInput::State(pre_states[storage]),
+                        body_parameter: RegionParameterId((1 + free.len() + ordinal) as u32),
+                        body_result: RegionResultId(body_results.len() as u32 - 1),
+                        loop_result: RegionResultId(value_ordinal),
+                    });
+                    value_ordinal += 1;
+                }
             }
-            let token = self.builder.current_state(*storage)?;
-            body_results.push(RegionResult::State {
-                id: token,
-                storage: *storage,
-                join: None,
-            });
-            carried.push(CarriedSlot {
-                initial: RegionInput::State(pre_states[storage]),
-                body_parameter: RegionParameterId(
-                    (1 + free.len()
-                        + state_params
-                            .iter()
-                            .position(|(l, _, _)| l == local)
-                            .expect("the state param exists")) as u32,
-                ),
-                body_result: RegionResultId(body_results.len() as u32 - 1),
-                loop_result: RegionResultId(value_ordinal),
-            });
-            value_ordinal += 1;
         }
         if kind == LoopKind::Independent {
             for storage in &captured_storages {
@@ -2868,33 +3546,15 @@ impl<'w> Work<'w> {
     }
 }
 
-enum SlotArg {
-    Point(GraphValueId),
-    Range {
-        start: Option<GraphValueId>,
-        end: Option<GraphValueId>,
-    },
-}
-
 struct ArmBuilt {
     region: GraphRegion,
-    bindings: BTreeMap<usize, GraphValueId>,
-    results: Vec<Option<GraphValueId>>,
-    result_states: Vec<Option<StateTokenId>>,
+    bindings: BTreeMap<LocalId, GraphValueId>,
+    /// The arm's returned components when the construct returns.
+    returned: Option<Vec<GraphValueId>>,
 }
 
 impl<'w> Work<'w> {
     // -- conditionals -------------------------------------------------------
-
-    fn if_stmt(
-        &mut self,
-        f: &mut Factory,
-        condition: &CheckedExpr,
-        then_body: &CheckedBlock,
-        else_body: &CheckedBlock,
-    ) -> Result<(), String> {
-        self.if_core(f, condition, then_body, else_body, None)
-    }
 
     /// An `if` where exactly one arm returns early: the continuing arm's
     /// region swallows the rest of the enclosing block, so both arms end in
@@ -2908,12 +3568,7 @@ impl<'w> Work<'w> {
         rest: &[CheckedStmt],
         terminator: &BlockTerminator,
     ) -> Result<Flow, String> {
-        let (then_rest, else_rest) = if returns_directly(then_body) {
-            (None, Some((rest, terminator)))
-        } else {
-            (Some((rest, terminator)), None)
-        };
-        self.if_core(f, condition, then_body, else_body, then_rest.or(else_rest))?;
+        self.if_core(f, condition, then_body, else_body, Some((rest, terminator)))?;
         Ok(Flow::Returned)
     }
 
@@ -2926,19 +3581,27 @@ impl<'w> Work<'w> {
         continuation: Option<(&[CheckedStmt], &BlockTerminator)>,
     ) -> Result<(), String> {
         let span = condition.span;
-        let cond = self.expr(f, condition)?.expect("a condition is a value");
+        let cond = self.expr(f, condition)?.ok_or("a condition is void")?;
         let then_free = free_locals(then_body);
         let else_free = free_locals(else_body);
-        let union_free: BTreeSet<usize> = then_free.union(&else_free).copied().collect();
-        let union_writes: BTreeSet<usize> = written_roots(then_body)
-            .union(&written_roots(else_body))
+        let union_free: BTreeSet<LocalId> = then_free.union(&else_free).copied().collect();
+        // A local an arm writes in place whose value has no storage behind
+        // it needs its storage outside the `if` so both arms join its state.
+        let storage_written: BTreeSet<LocalId> = storage_written_roots(then_body)
+            .union(&storage_written_roots(else_body))
             .copied()
             .filter(|local| union_free.contains(local))
-            // Only storage-backed locals join as states; a written scalar
-            // local rebinds and joins as a value.
-            .filter(|local| self.storage_of_local(*local).is_some())
             .collect();
-        let union_rebinds: BTreeSet<usize> = rebound_roots(then_body)
+        self.materialize_written_locals(storage_written.iter().copied(), span)?;
+        let mut union_writes: BTreeSet<LocalId> = BTreeSet::new();
+        for local in written_roots(then_body).union(&written_roots(else_body)) {
+            // Only storage-backed locals join as states; a written value
+            // local rebinds and joins as a value.
+            if union_free.contains(local) && self.storage_of_local(*local)?.is_some() {
+                union_writes.insert(*local);
+            }
+        }
+        let union_rebinds: BTreeSet<LocalId> = rebound_roots(then_body)
             .union(&rebound_roots(else_body))
             .copied()
             .filter(|local| union_free.contains(local))
@@ -2952,30 +3615,27 @@ impl<'w> Work<'w> {
         let mut param_ids = BTreeMap::new();
         let mut captured = Vec::new();
         for local in &union_free {
-            let binding = self
-                .locals
-                .get(*local)
-                .and_then(|binding| *binding)
-                .ok_or("a captured local is not bound")?;
-            let ty = self.builder.value_type(binding)?;
-            let view = self.builder.view_of_value(binding);
-            let param = self.builder.fresh_value(ty.clone(), view)?;
+            let binding = self.binding(*local)?;
+            let kind = self.builder.value(binding)?.kind().clone();
+            let param = self.builder.fresh_value(kind)?;
             param_ids.insert(*local, param);
             captured.push(IfCapture {
                 parameter: param,
                 outer: binding,
             });
-            params.push(RegionParameter::Value { id: param, ty });
+            params.push(RegionParameter::Value {
+                id: param,
+                ty: self.builder.value_type(binding)?,
+            });
         }
         let mut state_params = BTreeMap::new();
         for local in &union_writes {
             let storage = self
-                .storage_of_local(*local)
+                .storage_of_local(*local)?
                 .ok_or("a written local has no storage")?;
-            let token = self.builder.fresh_state();
-            self.builder.bind_state(token, storage);
+            let token = self.builder.fresh_state(storage)?;
             params.push(RegionParameter::State { id: token, storage });
-            state_params.insert(*local, (token, storage));
+            state_params.insert(*local, storage);
         }
 
         let then_cont = if returns_directly(then_body) {
@@ -2994,7 +3654,6 @@ impl<'w> Work<'w> {
             &param_ids,
             then_body,
             then_cont,
-            &union_free,
             &union_rebinds,
             &union_writes,
             returning,
@@ -3006,7 +3665,6 @@ impl<'w> Work<'w> {
             &param_ids,
             else_body,
             else_cont,
-            &union_free,
             &union_rebinds,
             &union_writes,
             returning,
@@ -3014,41 +3672,24 @@ impl<'w> Work<'w> {
         )?;
 
         // Explicit joins. Ordinals follow the arm result layout: rebound
-        // values, written states, then (when returning) result values and
-        // inout states.
+        // values, written states, then (when returning) result values.
         let mut joins = Vec::new();
         let mut joined_bindings = BTreeMap::new();
         let mut ordinal = 0u32;
         for local in &union_rebinds {
-            let then_value = then_arm.bindings[local];
-            let else_value = else_arm.bindings[local];
-            let ty = self.builder.value_type(then_value)?;
-            let view = match (
-                self.builder.view_of_value(then_value),
-                self.builder.view_of_value(else_value),
-            ) {
-                (Some(then_view), Some(else_view))
-                    if self.builder.view(then_view).storage
-                        == self.builder.view(else_view).storage =>
-                {
-                    Some(then_view)
-                }
-                _ => None,
-            };
-            let joined = self.builder.fresh_value(ty.clone(), view)?;
+            let joined = self.join_value(then_arm.bindings[local], else_arm.bindings[local])?;
             joins.push(JoinSlot::Value {
                 then_result: RegionResultId(ordinal),
                 else_result: RegionResultId(ordinal),
                 joined,
-                ty,
+                ty: self.builder.value_type(joined)?,
             });
             joined_bindings.insert(*local, joined);
             ordinal += 1;
         }
         for local in &union_writes {
-            let (_, storage) = state_params[local];
-            let joined = self.builder.fresh_state();
-            self.builder.bind_state(joined, storage);
+            let storage = state_params[local];
+            let joined = self.builder.fresh_state(storage)?;
             joins.push(JoinSlot::State {
                 then_result: RegionResultId(ordinal),
                 else_result: RegionResultId(ordinal),
@@ -3058,53 +3699,30 @@ impl<'w> Work<'w> {
             ordinal += 1;
         }
         if returning {
-            for slot in 0..self.results.len() {
-                let then_value =
-                    then_arm.results[slot].ok_or("a returning arm binds every result value")?;
-                let else_value =
-                    else_arm.results[slot].ok_or("a returning arm binds every result value")?;
-                let ty = self.builder.value_type(then_value)?;
-                let view = match (
-                    self.builder.view_of_value(then_value),
-                    self.builder.view_of_value(else_value),
-                ) {
-                    (Some(then_view), Some(else_view))
-                        if self.builder.view(then_view).storage
-                            == self.builder.view(else_view).storage =>
-                    {
-                        Some(then_view)
-                    }
-                    _ => None,
-                };
-                let joined = self.builder.fresh_value(ty.clone(), view)?;
+            let then_returned = then_arm
+                .returned
+                .as_ref()
+                .ok_or("a returning arm binds its result values")?;
+            let else_returned = else_arm
+                .returned
+                .as_ref()
+                .ok_or("a returning arm binds its result values")?;
+            if then_returned.len() != else_returned.len() {
+                return Err("the arms of a returning `if` return different arities".into());
+            }
+            let mut returned = Vec::new();
+            for (then_value, else_value) in then_returned.iter().zip(else_returned) {
+                let joined = self.join_value(*then_value, *else_value)?;
                 joins.push(JoinSlot::Value {
                     then_result: RegionResultId(ordinal),
                     else_result: RegionResultId(ordinal),
                     joined,
-                    ty,
+                    ty: self.builder.value_type(joined)?,
                 });
-                self.results[slot] = Some(joined);
+                returned.push(joined);
                 ordinal += 1;
             }
-            for (index, (_, local)) in self.inout.iter().enumerate() {
-                let _then_token = then_arm.result_states[index]
-                    .ok_or("a returning arm binds every inout state")?;
-                let _else_token = else_arm.result_states[index]
-                    .ok_or("a returning arm binds every inout state")?;
-                let storage = self
-                    .storage_of_local(*local)
-                    .ok_or("an inout parameter has no storage")?;
-                let joined = self.builder.fresh_state();
-                self.builder.bind_state(joined, storage);
-                joins.push(JoinSlot::State {
-                    then_result: RegionResultId(ordinal),
-                    else_result: RegionResultId(ordinal),
-                    joined,
-                    storage,
-                });
-                self.result_states[index] = Some(joined);
-                ordinal += 1;
-            }
+            self.returned = Some(returned);
         }
 
         self.builder.add_if(
@@ -3121,24 +3739,46 @@ impl<'w> Work<'w> {
         Ok(())
     }
 
+    /// The joined value of two arm values: the same view when both arms
+    /// leave one view value, otherwise a produced value of their type.
+    fn join_value(
+        &mut self,
+        then_value: GraphValueId,
+        else_value: GraphValueId,
+    ) -> Result<GraphValueId, String> {
+        let then_kind = self.builder.value(then_value)?.kind().clone();
+        let else_kind = self.builder.value(else_value)?.kind().clone();
+        let ty = self.builder.value_type(then_value)?;
+        if ty != self.builder.value_type(else_value)? {
+            return Err(format!(
+                "the arms of an `if` join values of different types: {ty} and {}",
+                self.builder.value_type(else_value)?
+            ));
+        }
+        let kind = if then_kind == else_kind {
+            then_kind
+        } else {
+            computed_kind(ty)?
+        };
+        self.builder.fresh_value(kind)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_arm(
         &mut self,
         f: &mut Factory,
         params: &[RegionParameter],
-        param_ids: &BTreeMap<usize, GraphValueId>,
+        param_ids: &BTreeMap<LocalId, GraphValueId>,
         body: &CheckedBlock,
         continuation: Option<(&[CheckedStmt], &BlockTerminator)>,
-        union_free: &BTreeSet<usize>,
-        union_rebinds: &BTreeSet<usize>,
-        union_writes: &BTreeSet<usize>,
+        union_rebinds: &BTreeSet<LocalId>,
+        union_writes: &BTreeSet<LocalId>,
         returning: bool,
         span: Span,
     ) -> Result<ArmBuilt, String> {
         self.builder.begin_region(params.to_vec())?;
         let saved_locals = self.locals.clone();
-        let saved_results = self.results.clone();
-        let saved_states = self.result_states.clone();
+        let saved_returned = self.returned.clone();
         for (local, param) in param_ids {
             self.locals[*local] = Some(*param);
         }
@@ -3165,18 +3805,14 @@ impl<'w> Work<'w> {
         let mut arm_results = Vec::new();
         let mut bindings = BTreeMap::new();
         for local in union_rebinds {
-            let value = self
-                .locals
-                .get(*local)
-                .and_then(|binding| *binding)
-                .ok_or("an arm binding is not bound")?;
+            let value = self.binding(*local)?;
             let ty = self.builder.value_type(value)?;
             arm_results.push(RegionResult::Value { id: value, ty });
             bindings.insert(*local, value);
         }
         for local in union_writes {
             let storage = self
-                .storage_of_local(*local)
+                .storage_of_local(*local)?
                 .ok_or("a written local has no storage")?;
             let token = self.builder.current_state(storage)?;
             arm_results.push(RegionResult::State {
@@ -3185,41 +3821,31 @@ impl<'w> Work<'w> {
                 join: None,
             });
         }
-        let mut results = Vec::new();
-        let mut result_states = Vec::new();
-        if returning {
-            results = self.results.clone();
-            result_states = self.result_states.clone();
-            for value in results.iter().flatten() {
+        let arm_returned = if returning {
+            let values = self
+                .returned
+                .clone()
+                .ok_or("a returning arm binds its result values")?;
+            for value in &values {
                 let ty = self.builder.value_type(*value)?;
                 arm_results.push(RegionResult::Value { id: *value, ty });
             }
-            for (index, (_, local)) in self.inout.iter().enumerate() {
-                let token =
-                    self.result_states[index].ok_or("a returning arm binds every inout state")?;
-                let storage = self
-                    .storage_of_local(*local)
-                    .ok_or("an inout parameter has no storage")?;
-                arm_results.push(RegionResult::State {
-                    id: token,
-                    storage,
-                    join: None,
-                });
-            }
-        }
+            Some(values)
+        } else {
+            None
+        };
         let region = self.builder.end_region(arm_results)?;
         self.locals = saved_locals;
-        self.results = saved_results;
-        self.result_states = saved_states;
-        let _ = union_free;
+        self.returned = saved_returned;
         Ok(ArmBuilt {
             region,
             bindings,
-            results,
-            result_states,
+            returned: arm_returned,
         })
     }
+}
 
+impl<'w> Work<'w> {
     // -- calls --------------------------------------------------------------
 
     fn call(
@@ -3232,25 +3858,10 @@ impl<'w> Work<'w> {
         let span = e.span;
         let mut arg_values = Vec::new();
         for arg in args {
-            arg_values.push(self.expr(f, arg)?.expect("a call argument is a value"));
+            arg_values.push(self.expr(f, arg)?.ok_or("a call argument is void")?);
         }
 
-        self.call_inner(f, e, call, args, arg_values, span)
-    }
-
-    fn call_inner(
-        &mut self,
-        f: &mut Factory,
-        e: &CheckedExpr,
-        call: &CheckedCall,
-        args: &[CheckedExpr],
-        arg_values: Vec<GraphValueId>,
-        span: Span,
-    ) -> Result<Option<GraphValueId>, String> {
-        let family_name = {
-            let index = program_index(f, call.family);
-            f.program.families[index].name.clone()
-        };
+        let family_name = f.program.families[call.family].name.clone();
         let candidates = family::candidates_of_call(f.program, call, &f.target.backend);
         if candidates.is_empty() {
             f.rejections.push(OccurrenceRejection {
@@ -3263,21 +3874,19 @@ impl<'w> Work<'w> {
                 f.target.backend
             ));
         }
-        let shapes = self.shapes.clone();
         let elems = self.elems.clone();
-        let caller_shape = |name: &str| {
-            shapes
-                .get(name)
-                .and_then(|extent| extent.as_static())
-                .map(|value| value as i64)
-        };
         let caller_elem = |name: &str| elems.get(name).cloned();
+        let sym_env = self.sym_env.clone();
+        let domain = f.domain;
+        let judge = |predicate: &Predicate| {
+            judge_predicate(predicate, &|name| sym_env.get(name).cloned(), domain)
+        };
         let app = family::applicable(
             f.program,
             &f.target.backend,
             f.supports,
             &candidates,
-            &caller_shape,
+            &judge,
             &caller_elem,
         );
         if app.alternatives.is_empty() {
@@ -3297,7 +3906,7 @@ impl<'w> Work<'w> {
         let choice = f.alloc_choice();
         let contract = f
             .program
-            .definition(f.program.families[program_index(f, call.family)].contract);
+            .definition(f.program.families[call.family].contract);
         if contract.params.len() != args.len() {
             return Err(format!(
                 "the contract of `{family_name}` has {} parameters but the call passes {} arguments",
@@ -3323,7 +3932,6 @@ impl<'w> Work<'w> {
         // Alternatives: one graph per (occurrence, alternative). The graph's
         // allocator is handed to the factory while the callee graphs are
         // built, then restored for the boundary construction.
-        f.ids = self.builder.take_ids();
         let mut alternatives = Vec::new();
         for (ordinal, resolved) in app.alternatives.iter().enumerate() {
             let candidate = &resolved.candidate;
@@ -3334,36 +3942,34 @@ impl<'w> Work<'w> {
             }
             let definition = f.program.definition(candidate.definition);
             let mut child_shapes = ShapeEnv::new();
+            let mut child_sym_env = SymEnv::new();
             for (param, sym) in &candidate.shape_args {
                 child_shapes.insert(param.clone(), self.resolve_sym(f, sym)?);
+                child_sym_env.insert(
+                    param.clone(),
+                    family::substitute(sym, &|name| self.sym_env.get(name).cloned()),
+                );
             }
             let mut child_elems = ElemEnv::new();
             for (param, elem) in &candidate.elem_args {
-                let resolved = match elem {
-                    Elem::Param(p) => self
-                        .elems
-                        .get(p)
-                        .cloned()
-                        .ok_or_else(|| format!("element parameter `{p}` is not bound here"))?,
-                    other => other.clone(),
-                };
-                child_elems.insert(param.clone(), resolved);
+                child_elems.insert(param.clone(), self.convert_elem(elem)?);
             }
-            let graph = f
-                .build_graph(
-                    definition,
-                    child_shapes,
-                    child_elems,
-                    choice,
-                    ordinal as u32,
-                    false,
-                )
-                .map_err(|error| match error {
-                    BuildError::Invalid(reason) => reason,
-                    BuildError::NoImplementation(_) => {
-                        "an inner occurrence has no applicable implementation".to_string()
-                    }
-                })?;
+            f.ids = self.builder.take_ids();
+            let built = f.build_graph(
+                definition,
+                child_shapes,
+                child_sym_env,
+                child_elems,
+                choice,
+                ordinal as u32,
+            );
+            self.builder.restore_ids(std::mem::take(&mut f.ids));
+            let graph = built.map_err(|error| match error {
+                BuildError::Invalid(reason) => reason,
+                BuildError::NoImplementation(_) => {
+                    "an inner occurrence has no applicable implementation".to_string()
+                }
+            })?;
             alternatives.push(LogicalAlternative {
                 definition: candidate.definition,
                 kind: candidate.kind,
@@ -3375,153 +3981,106 @@ impl<'w> Work<'w> {
         f.install_choice(
             choice,
             ImplementationChoice {
-                interface,
+                interface: interface.clone(),
                 alternatives: NonEmpty::new(alternatives)
                     .ok_or("the occurrence has alternatives")?,
             },
         );
-        self.builder.restore_ids(std::mem::take(&mut f.ids));
 
-        // Boundary inputs: one per interface leaf, at its canonical path.
-        let interface = f.choices[choice.index()]
-            .clone()
-            .expect("the choice was just installed")
-            .interface;
-        let mut boundary_inputs = Vec::new();
+        // The callee contract instantiated with this caller's identities:
+        // one input per interface leaf at its canonical path. A tensor leaf
+        // backed by caller storage consumes that storage's current state (an
+        // exclusive borrow gets its final state); a computed tensor leaf —
+        // the value itself, directly or through a view of one — is shared or
+        // moved as a value, with no caller storage fabricated for it; one
+        // produced value per result leaf.
+        let mut inputs = BTreeMap::new();
+        let mut final_states = BTreeMap::new();
         let mut exclusively_borrowed = Vec::new();
         for (ordinal, param) in interface.params.iter().enumerate() {
             let arg = arg_values[ordinal];
             for (path, leaf) in boundary_leaves(&param.ty) {
-                let leaf_value = self.decompose_value(f, arg, &path.0)?;
+                let key = BoundaryLeaf::Input {
+                    param: ordinal as u32,
+                    leaf: path.clone(),
+                };
+                let leaf_value = self.decompose_value(arg, &path.0, span)?;
                 match leaf {
-                    BoundaryLeaf::Tensor(_) => {
-                        // A tensor leaf must be storage-backed; computed
-                        // values are materialized first.
-                        let leaf_value = match self.builder.view_of_value(leaf_value) {
-                            Some(_) => leaf_value,
-                            None => self.materialize_value(f, leaf_value, span)?,
-                        };
-                        let view = self
-                            .builder
-                            .view_of_value(leaf_value)
-                            .expect("the value is view-backed");
-                        let storage = self.builder.view(view).storage;
-                        let token = self.builder.current_state(storage)?;
-                        let kind = match param.ownership {
-                            ParamOwnership::Value => {
-                                return Err("a tensor parameter must be borrowed or owned".into());
-                            }
-                            ParamOwnership::Shared => BoundaryInputKind::Shared {
-                                value: leaf_value,
-                                state: token,
+                    LeafKind::Tensor(_) => {
+                        if param.ownership == ParamOwnership::Value {
+                            return Err(format!(
+                                "tensor leaf {path} of parameter `{}` is passed by value; tensor parameters are owned or borrowed",
+                                param.name
+                            ));
+                        }
+                        let storage = match self.builder.tensor_source(leaf_value)? {
+                            TensorSource::View(view) => match self.builder.view(view).base {
+                                ViewBase::Storage(storage) => Some(storage),
+                                ViewBase::Value(_) => None,
                             },
-                            ParamOwnership::Exclusive => {
-                                exclusively_borrowed.push(storage);
-                                BoundaryInputKind::Exclusive {
-                                    value: leaf_value,
-                                    state: token,
+                            TensorSource::Computed => None,
+                        };
+                        match (param.ownership, storage) {
+                            (ownership, Some(storage)) => {
+                                let state = self.builder.current_state(storage)?;
+                                if ownership == ParamOwnership::Exclusive {
+                                    exclusively_borrowed.push(storage);
+                                    final_states
+                                        .insert(key.clone(), self.builder.fresh_state(storage)?);
                                 }
+                                inputs.insert(
+                                    key,
+                                    CallInput::Tensor {
+                                        value: leaf_value,
+                                        state,
+                                        ownership,
+                                    },
+                                );
                             }
-                            ParamOwnership::Owned => BoundaryInputKind::Move {
-                                value: leaf_value,
-                                state: token,
-                            },
-                        };
-                        boundary_inputs.push(BoundaryInput {
-                            path,
-                            param: ordinal as u32,
-                            kind,
-                        });
+                            (ParamOwnership::Shared | ParamOwnership::Owned, None) => {
+                                inputs.insert(
+                                    key,
+                                    CallInput::Computed {
+                                        value: leaf_value,
+                                        ownership: param.ownership,
+                                    },
+                                );
+                            }
+                            (ParamOwnership::Exclusive, None) => {
+                                return Err(format!(
+                                    "exclusively borrowed tensor leaf {path} of parameter `{}` is a computed value; an exclusive borrow requires a tensor place with storage",
+                                    param.name
+                                ));
+                            }
+                            (ParamOwnership::Value, None) => {
+                                return Err(format!(
+                                    "tensor leaf {path} of parameter `{}` is passed by value; tensor parameters are owned or borrowed",
+                                    param.name
+                                ));
+                            }
+                        }
                     }
-                    _ => boundary_inputs.push(BoundaryInput {
-                        path,
-                        param: ordinal as u32,
-                        kind: BoundaryInputKind::Value(leaf_value),
-                    }),
+                    LeafKind::Scalar(_)
+                    | LeafKind::Index(_)
+                    | LeafKind::Range(_)
+                    | LeafKind::Capability(_) => {
+                        inputs.insert(key, CallInput::Value(leaf_value));
+                    }
                 }
             }
         }
-
-        // Boundary results: one per result leaf at its canonical path, plus
-        // the next state of every `inout` parameter storage.
-        let mut boundary_results = Vec::new();
-        let mut result_leaf_values = Vec::new();
+        let mut results = BTreeMap::new();
         for (path, leaf) in boundary_leaves(&interface.result) {
-            match leaf {
-                BoundaryLeaf::Tensor(shape) => {
-                    let storage = self.builder.declare_storage(
-                        shape.clone(),
-                        StorageOrigin::Result {
-                            owner: Some(choice),
-                            path: path.clone(),
-                        },
-                        Initialization::FullyInitialized,
-                    );
-                    let token = self.builder.fresh_state();
-                    self.builder.bind_state(token, storage);
-                    let view = self.builder.declare_view(
-                        storage,
-                        shape,
-                        Access::Exclusive,
-                        ViewTransform::Identity,
-                    );
-                    let value = self.builder.fresh_value(
-                        ValueType::Tensor(self.builder.view(view).shape.clone()),
-                        Some(view),
-                    )?;
-                    result_leaf_values.push((path.clone(), value));
-                    boundary_results.push(BoundaryResult {
-                        path,
-                        kind: BoundaryResultKind::Storage {
-                            storage,
-                            ty: self.builder.view(view).shape.clone(),
-                            token,
-                        },
-                    });
-                }
-                _ => {
-                    let ty = leaf_value_type(&leaf);
-                    let value = self.builder.fresh_value(ty, None)?;
-                    result_leaf_values.push((path.clone(), value));
-                    boundary_results.push(BoundaryResult {
-                        path,
-                        kind: BoundaryResultKind::Value(value),
-                    });
-                }
-            }
+            let value = self.builder.fresh_value(leaf.produced_kind())?;
+            results.insert(BoundaryLeaf::Result { leaf: path }, value);
         }
-        for (ordinal, param) in interface.params.iter().enumerate() {
-            if param.mode != Mode::Inout {
-                continue;
-            }
-            let arg = arg_values[ordinal];
-            for (path, leaf) in boundary_leaves(&param.ty) {
-                if matches!(leaf, BoundaryLeaf::Tensor(_)) {
-                    let leaf_value = self.decompose_value(f, arg, &path.0)?;
-                    let view = self
-                        .builder
-                        .view_of_value(leaf_value)
-                        .ok_or("an inout argument leaf is storage-backed")?;
-                    let storage = self.builder.view(view).storage;
-                    let token = self.builder.fresh_state();
-                    self.builder.bind_state(token, storage);
-                    boundary_results.push(BoundaryResult {
-                        path,
-                        kind: BoundaryResultKind::State(token),
-                    });
-                }
-            }
-        }
-
-        let result_value_ids = result_leaf_values
-            .iter()
-            .map(|(_, value)| *value)
-            .collect::<Vec<_>>();
         self.builder.add_call(
             choice,
-            boundary_inputs,
-            boundary_results,
-            result_value_ids,
+            CallBoundary {
+                inputs,
+                results: results.clone(),
+                final_states,
+            },
             span,
         )?;
         // The callee returns every exclusively borrowed storage fully
@@ -3531,165 +4090,71 @@ impl<'w> Work<'w> {
             self.builder.mark_fully_initialized(storage);
         }
 
-        // The call's value: a single leaf passes through; tuples are repacked
-        // from their leaf values; void calls retain completion only.
-        let value = match &interface.result {
-            ValueType::Void => None,
-            ValueType::Tuple(_) if result_leaf_values.len() > 1 => {
-                let components = result_leaf_values
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .collect::<Vec<_>>();
-                let tys = components
-                    .iter()
-                    .map(|id| self.builder.value_type(*id))
-                    .collect::<Result<_, _>>()?;
-                let ty = ValueType::Tuple(NonEmpty::new(tys).expect("leaves are nonempty"));
-                let spec = PrimitiveSpec {
-                    op: PrimitiveOp::Primitive(PrimitiveId::TuplePack),
-                    inputs: components,
-                    reads: Vec::new(),
-                    write: None,
-                    outputs: vec![Output::Value(ty)],
-                    safety: Vec::new(),
-                    span,
-                };
-                Some(self.add(f, spec)?.expect("tuple pack produces a value"))
-            }
-            _ => Some(result_leaf_values[0].1),
-        };
-        Ok(value)
-    }
-
-    /// Decompose one value along an ordinal path with `tuple.get` nodes.
-    fn decompose_value(
-        &mut self,
-        f: &mut Factory,
-        value: GraphValueId,
-        path: &[u32],
-    ) -> Result<GraphValueId, String> {
-        let mut current = value;
-        for index in path {
-            current = self.tuple_get(f, current, *index as usize)?;
+        // The call's value: the result leaves repacked along the result
+        // type; void calls retain completion only.
+        if interface.result.is_void() {
+            return Ok(None);
         }
-        Ok(current)
+        let value = self.repack(
+            &interface.result,
+            &ValuePath::default(),
+            &|path| results.get(&BoundaryLeaf::Result { leaf: path.clone() }).copied(),
+            span,
+        )?;
+        Ok(Some(value))
     }
-}
-
-fn program_index(f: &Factory, family: usize) -> usize {
-    let _ = f;
-    family
 }
 
 // ---------------------------------------------------------------------------
 // Entry construction
 // ---------------------------------------------------------------------------
 
-fn entry_convert_type(
-    ty: &ValueType,
-    shapes: &ShapeEnv,
-    elems: &ElemEnv,
-    context: &str,
-) -> Result<ValueType, String> {
-    fn convert_extent(
-        extent: &ExtentExpr,
-        shapes: &ShapeEnv,
-        context: &str,
-    ) -> Result<ExtentExpr, String> {
-        match extent {
-            ExtentExpr::Static(n) => Ok(ExtentExpr::Static(*n)),
-            ExtentExpr::Runtime(id) => Ok(ExtentExpr::Runtime(*id)),
-            ExtentExpr::Sym(sym) => {
-                let value = sym.eval(&|name| {
-                    shapes
-                        .get(name)
-                        .and_then(|extent| extent.as_static())
-                        .map(|value| value as i64)
-                });
-                match value {
-                    Some(value) if value >= 0 => Ok(ExtentExpr::Static(value as u64)),
-                    Some(_) => Err(format!("{context} has a negative extent")),
-                    None => Err(format!(
-                        "{context} depends on `{sym}`, which is not a concrete entry shape"
-                    )),
-                }
-            }
-        }
-    }
-    fn convert_elem(elem: &Elem, elems: &ElemEnv, context: &str) -> Result<Elem, String> {
-        match elem {
-            Elem::Param(p) => elems
-                .get(p)
-                .cloned()
-                .ok_or_else(|| format!("element parameter `{p}` of {context} is not bound")),
-            other => Ok(other.clone()),
-        }
-    }
-    match ty {
-        ValueType::Scalar(d) => Ok(ValueType::Scalar(*d)),
-        ValueType::Index { bound } => Ok(ValueType::Index {
-            bound: convert_extent(bound, shapes, context)?,
-        }),
-        ValueType::Range { bound } => Ok(ValueType::Range {
-            bound: convert_extent(bound, shapes, context)?,
-        }),
-        ValueType::Tensor(s) => Ok(ValueType::Tensor(TensorType {
-            axes: s
-                .axes
-                .iter()
-                .map(|axis| convert_extent(axis, shapes, context))
-                .collect::<Result<_, _>>()?,
-            elem: convert_elem(&s.elem, elems, context)?,
-            packed_axis: s.packed_axis,
-        })),
-        ValueType::Tuple(items) => Ok(ValueType::Tuple(
-            NonEmpty::new(
-                items
-                    .iter()
-                    .map(|item| entry_convert_type(item, shapes, elems, context))
-                    .collect::<Result<_, _>>()?,
-            )
-            .expect("the source tuple is nonempty"),
-        )),
-        ValueType::CapabilityValue(n) => Ok(ValueType::CapabilityValue(n.clone())),
-        ValueType::Void => Ok(ValueType::Void),
-    }
-}
-
 pub(super) fn construct(
     program: &Program,
-    entry: &str,
     target: &EffectiveTargetIdentity,
     supports: &dyn Fn(&IntrinsicUse) -> Result<(), String>,
-    spec: Specialization,
+    domain: &SpecializationDomain,
 ) -> Result<LogicalProgram, BuildError> {
+    let entry = domain.entry();
     let family_index = program.family_index(entry).map_err(BuildError::Invalid)?;
-    let mut shapes = ShapeEnv::new();
-    for (name, value) in &spec.shapes {
-        if *value < 0 {
-            return Err(BuildError::Invalid(format!(
-                "shape parameter `{name}` is negative"
-            )));
-        }
-        shapes.insert(name.clone(), ExtentExpr::Static(*value as u64));
+    let contract = program.definition(program.families[family_index].contract);
+    let mut factory = Factory::new(program, target, supports, domain);
+
+    // Entry shape parameters: exact bindings are static extents; bounded
+    // bindings are the domain's retained invocation shape fields (one per
+    // bounded parameter, in declared order), each carried by one runtime
+    // extent with the field's capacity and expected value.
+    let fields = domain.shape_fields();
+    let mut field_extents: BTreeMap<String, RuntimeExtentId> = BTreeMap::new();
+    for field in &fields {
+        let extent = factory.runtime_extent(
+            RuntimeScalarExpr::ShapeField(field.id),
+            field.domain.max(),
+            Some(field.expected),
+        );
+        field_extents.insert(field.name.clone(), extent);
     }
-    let elems = spec.elems.clone();
-    let (candidates, unreachable) =
-        family::entry_candidates(program, family_index, &target.backend);
-    let mut factory = Factory::new(program, target, supports, entry);
-    let caller_shape = |name: &str| {
-        shapes
-            .get(name)
-            .and_then(|extent| extent.as_static())
-            .map(|value| value as i64)
-    };
+    factory.shape_fields = fields;
+    for name in &contract.shape_params {
+        let extent = match domain.binding(name) {
+            ShapeBinding::Exact(value) => ShapeExtent::Static(value),
+            ShapeBinding::Bounded { .. } => ShapeExtent::Runtime(field_extents[name]),
+        };
+        factory.entry_shapes.insert(name.clone(), extent);
+    }
+    let elems: ElemEnv = domain.elems().clone();
+
+    let (candidates, unreachable) = family::entry_candidates(program, family_index, &target.backend);
     let caller_elem = |name: &str| elems.get(name).cloned();
+    // Entry candidates bind their shape parameters to the entry's own
+    // symbols; predicates are decided directly over the domain.
+    let judge = |predicate: &Predicate| judge_predicate(predicate, &|_| None, domain);
     let app = family::applicable(
         program,
         &target.backend,
         supports,
         &candidates,
-        &caller_shape,
+        &judge,
         &caller_elem,
     );
     if app.alternatives.is_empty() {
@@ -3705,24 +4170,23 @@ pub(super) fn construct(
     }
 
     let entry_choice = factory.alloc_choice();
-    let contract = program.definition(program.families[family_index].contract);
     let context = format!("the contract of `{}`", contract.name);
+    let mut interface_params = Vec::new();
+    for param in &contract.params {
+        interface_params.push(InterfaceParam {
+            name: param.name.clone(),
+            mode: param.mode,
+            ownership: param.ownership,
+            ty: factory
+                .convert_interface_type(&param.ty, &elems, &context)
+                .map_err(BuildError::Invalid)?,
+        });
+    }
     let interface = FunctionInterface {
         name: contract.name.clone(),
-        params: {
-            let mut out = Vec::new();
-            for param in &contract.params {
-                out.push(InterfaceParam {
-                    name: param.name.clone(),
-                    mode: param.mode,
-                    ownership: param.ownership,
-                    ty: entry_convert_type(&param.ty, &shapes, &elems, &context)
-                        .map_err(BuildError::Invalid)?,
-                });
-            }
-            out
-        },
-        result: entry_convert_type(&contract.result, &shapes, &elems, &context)
+        params: interface_params,
+        result: factory
+            .convert_interface_type(&contract.result, &elems, &context)
             .map_err(BuildError::Invalid)?,
     };
 
@@ -3731,51 +4195,32 @@ pub(super) fn construct(
         let candidate = &resolved.candidate;
         let definition = program.definition(candidate.definition);
         let mut child_shapes = ShapeEnv::new();
+        let mut child_sym_env = SymEnv::new();
         for (param, sym) in &candidate.shape_args {
-            let value = sym.eval(&|name| {
-                shapes
-                    .get(name)
-                    .and_then(|extent| extent.as_static())
-                    .map(|value| value as i64)
-            });
-            match value {
-                Some(value) if value >= 0 => {
-                    child_shapes.insert(param.clone(), ExtentExpr::Static(value as u64));
-                }
-                Some(_) => {
-                    return Err(BuildError::Invalid(format!(
-                        "shape parameter `{param}` of `{}` binds a negative extent",
-                        definition.name
-                    )));
-                }
-                None => {
-                    return Err(BuildError::Invalid(format!(
-                        "shape parameter `{param}` of `{}` is not concrete at the entry",
-                        definition.name
-                    )));
-                }
+            if !factory.is_entry_shape_sym(sym) {
+                return Err(BuildError::Invalid(format!(
+                    "shape parameter `{param}` of `{}` is not bound by the entry domain",
+                    definition.name
+                )));
             }
+            child_shapes.insert(param.clone(), factory.shape_extent(sym).map_err(BuildError::Invalid)?);
+            child_sym_env.insert(param.clone(), sym.clone());
         }
         let mut child_elems = ElemEnv::new();
         for (param, elem) in &candidate.elem_args {
-            let resolved = match elem {
-                Elem::Param(p) => elems.get(p).cloned().ok_or_else(|| {
-                    BuildError::Invalid(format!(
-                        "element parameter `{p}` of `{}` is not bound at the entry",
-                        definition.name
-                    ))
-                })?,
-                other => other.clone(),
-            };
-            child_elems.insert(param.clone(), resolved);
+            child_elems.insert(
+                param.clone(),
+                convert_elem(elem, &elems, &format!("`{}`", definition.name))
+                    .map_err(BuildError::Invalid)?,
+            );
         }
         let graph = factory.build_graph(
             definition,
             child_shapes,
+            child_sym_env,
             child_elems,
             entry_choice,
             ordinal as u32,
-            true,
         )?;
         alternatives.push(LogicalAlternative {
             definition: candidate.definition,
@@ -3803,13 +4248,12 @@ pub(super) fn construct(
         .into_iter()
         .collect::<Option<Vec<ImplementationChoice>>>()
         .ok_or_else(|| BuildError::Invalid("a choice slot was not filled".into()))?;
-    let identity = logical_identity(program, entry, &target, &spec);
+    let identity = logical_identity(program, target, domain);
     Ok(LogicalProgram {
         identity,
-        entry: entry.to_string(),
         target: target.clone(),
-        shapes: spec.shapes,
-        elements: elems,
+        domain: domain.clone(),
+        shape_fields: IdVec::new(factory.shape_fields),
         entry_choice,
         choices: IdVec::new(choices),
         graphs: IdVec::new(graphs),
@@ -3817,61 +4261,21 @@ pub(super) fn construct(
     })
 }
 
-/// The logical identity: source identity, registry revision, entry and the
-/// concrete specialization. Changing any of them changes every downstream
-/// plan, cache and evidence identity.
+/// The logical identity: source identity, registry revision, target and the
+/// specialization domain (entry, every shape binding, every element
+/// binding). Changing any of them changes every downstream plan, cache and
+/// evidence identity.
 fn logical_identity(
     program: &Program,
-    entry: &str,
     target: &EffectiveTargetIdentity,
-    spec: &Specialization,
+    domain: &SpecializationDomain,
 ) -> LogicalIdentity {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(program.identity());
     hash.update(crate::intrinsics::REGISTRY_REVISION.as_bytes());
-    hash.update(entry.as_bytes());
     hash.update(target.backend.as_bytes());
     hash.update(target.capability_fingerprint.as_bytes());
-    for (name, value) in &spec.shapes {
-        hash.update(name.as_bytes());
-        hash.update(value.to_le_bytes());
-    }
-    for (name, elem) in &spec.elems {
-        hash.update(name.as_bytes());
-        hash.update(format!("{elem}").as_bytes());
-    }
+    hash.update(domain.identity_bytes());
     LogicalIdentity(hash.finalize().into())
-}
-
-/// Borrowed leaf classification for defensive verification.
-pub(super) enum BoundaryLeafRef {
-    Scalar,
-    Index,
-    Range,
-    Tensor,
-    Capability,
-}
-
-/// The canonical (path, leaf) list of one boundary type, for verification of
-/// call boundaries.
-pub(super) fn boundary_leaf_paths(ty: &ValueType) -> Vec<(ValuePath, BoundaryLeafRef)> {
-    fn walk(ty: &ValueType, path: &ValuePath, out: &mut Vec<(ValuePath, BoundaryLeafRef)>) {
-        match ty {
-            ValueType::Scalar(_) => out.push((path.clone(), BoundaryLeafRef::Scalar)),
-            ValueType::Index { .. } => out.push((path.clone(), BoundaryLeafRef::Index)),
-            ValueType::Range { .. } => out.push((path.clone(), BoundaryLeafRef::Range)),
-            ValueType::Tensor(_) => out.push((path.clone(), BoundaryLeafRef::Tensor)),
-            ValueType::Tuple(items) => {
-                for (i, item) in items.iter().enumerate() {
-                    walk(item, &path.extend(i as u32), out);
-                }
-            }
-            ValueType::CapabilityValue(_) => out.push((path.clone(), BoundaryLeafRef::Capability)),
-            ValueType::Void => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(ty, &ValuePath::default(), &mut out);
-    out
 }

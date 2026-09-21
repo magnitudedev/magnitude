@@ -107,7 +107,7 @@ impl InputState {
                 .collect(),
         })
     }
-    pub(crate) fn assemble(&self, tokens: &[u32]) -> Result<Assembled, String> {
+    pub(crate) fn assemble(&self, tokens: &[u32]) -> Result<Assembled, crate::Error> {
         let end = self
             .position
             .checked_add(tokens.len())

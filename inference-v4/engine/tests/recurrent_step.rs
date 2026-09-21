@@ -95,7 +95,7 @@ fn exercise(backend: &mut Backend<'_>) {
 }
 #[test]
 fn reference_recurrent_step() {
-    let program = seismic_engine::models::qwen35::program::program().unwrap();
+    let program = magnitude_engine::models::qwen35::program::program().unwrap();
     exercise(&mut Backend::Interpreter(&program, HashMap::new()));
 }
 #[test]
@@ -105,7 +105,7 @@ fn metal_recurrent_step() {
         plan::{PlanCompiler, Settings},
         Device,
     };
-    let program = seismic_engine::models::qwen35::program::program().unwrap();
+    let program = magnitude_engine::models::qwen35::program::program().unwrap();
     let device = Device::metal().unwrap();
     exercise(&mut Backend::Metal(PlanCompiler::new(
         &device,

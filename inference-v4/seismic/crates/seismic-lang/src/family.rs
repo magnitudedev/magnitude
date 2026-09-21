@@ -3,17 +3,17 @@
 //!
 //! Portable bodies and same-backend lowerings are peer semantic alternatives,
 //! a backend helper is reachable only from the same backend, and every
-//! candidate must satisfy its `where` predicates (under the occurrence's bound
-//! shapes), its caller-element requirements, and the effective capability
-//! environment.
+//! candidate must satisfy its `where` predicates (decided by the caller over
+//! the whole specialization domain), its caller-element requirements, and
+//! the effective capability environment.
 
 use crate::intrinsics::{CapabilityId, NumericalTransfer};
 use crate::logical::ImplementationKind;
 use crate::sir::{
     CandidateBinding, CheckedCall, DefId, DefKind, Definition, IntrinsicUse, Predicate, Program,
 };
-use crate::sym::Sym;
-use crate::types::{Elem, ExtentExpr};
+use crate::sym::{Atom, Sym};
+use crate::types::Elem;
 use std::collections::BTreeSet;
 
 /// One candidate of an occurrence: a definition plus how its generic
@@ -155,24 +155,25 @@ pub struct OccurrenceAlternatives {
 
 /// Evaluate applicability of `candidates` at one occurrence.
 ///
-/// `caller_shape` answers the concrete value of one caller shape parameter
-/// (`None` when it is runtime-determined or unknown); `caller_elem` answers
-/// the concrete element of one caller element parameter. A predicate over a
-/// value that is not concretely known is undecidable, so the candidate is
-/// inapplicable.
+/// `judge` decides one `where` predicate, already substituted into the
+/// caller's symbol space, over the caller's specialization domain: `Ok` when
+/// it holds on the whole domain, `Err(reason)` when it fails, is true on
+/// only part of the domain, or depends on a value that is not a shape
+/// parameter. `caller_elem` answers the concrete element of one caller
+/// element parameter.
 pub fn applicable(
     program: &Program,
     target: &str,
     supports_intrinsic: &dyn Fn(&IntrinsicUse) -> Result<(), String>,
     candidates: &[Candidate],
-    caller_shape: &dyn Fn(&str) -> Option<i64>,
+    judge: &dyn Fn(&Predicate) -> Result<(), String>,
     caller_elem: &dyn Fn(&str) -> Option<Elem>,
 ) -> OccurrenceAlternatives {
     let _ = target;
     let mut out = OccurrenceAlternatives::default();
     for candidate in candidates {
         let definition = program.definition(candidate.definition);
-        if let Err(reason) = predicates_hold(definition, candidate, caller_shape) {
+        if let Err(reason) = predicates_hold(definition, candidate, judge) {
             out.rejected.push((candidate.definition, reason));
             continue;
         }
@@ -209,11 +210,11 @@ pub fn applicable(
 }
 
 /// Substitute the candidate's shape bindings into the definition's `where`
-/// predicates and decide them under the caller's concrete shapes.
+/// predicates and hand each one to the caller's domain judge.
 fn predicates_hold(
     definition: &Definition,
     candidate: &Candidate,
-    caller_shape: &dyn Fn(&str) -> Option<i64>,
+    judge: &dyn Fn(&Predicate) -> Result<(), String>,
 ) -> Result<(), String> {
     for predicate in &definition.predicates {
         let bound = |name: &str| -> Option<Sym> {
@@ -224,66 +225,31 @@ fn predicates_hold(
                 .map(|(_, sym)| sym.clone())
         };
         let substituted = match predicate {
-            Predicate::NonNegative(expr) => substitute(expr, &bound),
-            Predicate::Zero(expr) => substitute(expr, &bound),
-            Predicate::NonZero(expr) => substitute(expr, &bound),
+            Predicate::NonNegative(expr) => Predicate::NonNegative(substitute(expr, &bound)),
+            Predicate::Zero(expr) => Predicate::Zero(substitute(expr, &bound)),
+            Predicate::NonZero(expr) => Predicate::NonZero(substitute(expr, &bound)),
         };
-        let eval = |expr: &Sym| -> Result<i64, String> {
-            expr.eval(caller_shape).ok_or_else(|| {
-                format!(
-                    "the `where` predicate `{expr}` depends on a value that is not a concrete shape at this occurrence"
-                )
-            })
-        };
-        match predicate {
-            Predicate::NonNegative(expr) => {
-                let value = eval(&substituted).map_err(|reason| {
-                    format!("predicate `0 <= {expr}` is undecidable: {reason}")
-                })?;
-                if value < 0 {
-                    return Err(format!(
-                        "predicate `0 <= {expr}` fails: the bound value is {value}"
-                    ));
-                }
-            }
-            Predicate::Zero(expr) => {
-                let value = eval(&substituted).map_err(|reason| {
-                    format!("predicate `{expr} == 0` is undecidable: {reason}")
-                })?;
-                if value != 0 {
-                    return Err(format!(
-                        "predicate `{expr} == 0` fails: the bound value is {value}"
-                    ));
-                }
-            }
-            Predicate::NonZero(expr) => {
-                let value = eval(&substituted).map_err(|reason| {
-                    format!("predicate `{expr} != 0` is undecidable: {reason}")
-                })?;
-                if value == 0 {
-                    return Err(format!(
-                        "predicate `{expr} != 0` fails: the bound value is 0"
-                    ));
-                }
-            }
-        }
+        judge(&substituted)?;
     }
     Ok(())
 }
 
-/// Substitute the candidate's bound shape parameters into one predicate
-/// expression; unbound parameters are kept symbolic (and therefore
-/// undecidable).
-fn substitute(expr: &Sym, bound: &dyn Fn(&str) -> Option<Sym>) -> Sym {
+/// Substitute bound parameters into one symbolic expression, inside
+/// quotient and remainder atoms as well; unbound parameters are kept
+/// symbolic.
+pub fn substitute(expr: &Sym, bound: &dyn Fn(&str) -> Option<Sym>) -> Sym {
     let mut out = Sym::constant(0);
     for (monomial, coefficient) in expr.monomials() {
         let mut term = Sym::constant(coefficient);
         for (atom, power) in monomial {
             let atom_value = match atom {
-                crate::sym::Atom::Param(name) => {
-                    bound(name).unwrap_or_else(|| Sym::atom(atom.clone()))
+                Atom::Param(name) => bound(name).unwrap_or_else(|| Sym::atom(atom.clone())),
+                Atom::Quot(numerator, denominator) => {
+                    substitute(numerator, bound).quot(&substitute(denominator, bound))
                 }
-                crate::sym::Atom::Quot(..) | crate::sym::Atom::Rem(..) => Sym::atom(atom.clone()),
+                Atom::Rem(numerator, denominator) => {
+                    substitute(numerator, bound).rem(&substitute(denominator, bound))
+                }
             };
             for _ in 0..*power {
                 term = term.mul(&atom_value);
@@ -352,14 +318,5 @@ fn authored_effects(definition: &Definition, uses: &[IntrinsicUse]) -> Vec<Numer
                 ),
             }]
         }
-    }
-}
-
-/// The concrete extent environment of one specialization, for predicate
-/// evaluation: shape parameter name -> concrete value when static.
-pub fn static_shape_of(extent: &ExtentExpr) -> Option<i64> {
-    match extent {
-        ExtentExpr::Static(n) => Some(*n as i64),
-        _ => None,
     }
 }

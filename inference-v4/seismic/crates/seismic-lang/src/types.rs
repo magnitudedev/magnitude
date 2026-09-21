@@ -192,8 +192,9 @@ pub struct TensorType {
 
 impl TensorType {
     pub fn new(axes: Vec<ExtentExpr>, elem: Elem) -> TensorType {
-        let packed_axis = match elem {
-            Elem::Repr(_) => Some(axes.len().saturating_sub(1)),
+        let packed_axis = match &elem {
+            Elem::Repr(name) => crate::repr::lookup(name)
+                .and_then(|representation| representation.packing_axis.resolve(axes.len())),
             _ => None,
         };
         TensorType {
@@ -205,6 +206,37 @@ impl TensorType {
 
     pub fn rank(&self) -> usize {
         self.axes.len()
+    }
+
+    /// Resolve a generic element parameter while preserving an already
+    /// explicit view descriptor. A parameter that becomes a packed
+    /// representation receives its packing axis from the registry.
+    pub fn specialize_elem(
+        &self,
+        axes: Vec<ExtentExpr>,
+        elem: Elem,
+    ) -> Result<TensorType, String> {
+        let packed_axis = match (&self.elem, &elem) {
+            (Elem::Param(_), Elem::Repr(name)) => Some(
+                crate::repr::lookup(name)
+                    .ok_or_else(|| format!("unknown representation `{name}`"))?
+                    .packing_axis
+                    .resolve(axes.len())
+                    .ok_or_else(|| {
+                        format!(
+                            "representation `{name}` has no packing axis at rank {}",
+                            axes.len()
+                        )
+                    })?,
+            ),
+            (Elem::Param(_), _) => None,
+            _ => self.packed_axis,
+        };
+        Ok(TensorType {
+            axes,
+            elem,
+            packed_axis,
+        })
     }
 }
 

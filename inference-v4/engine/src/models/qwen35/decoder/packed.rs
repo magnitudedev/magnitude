@@ -1,17 +1,13 @@
 //! Pack row-independent model stages while stateful mixers retain per-request
-//! views. Every operation still compiles through the same automatic path.
+//! views. Packing shares the decoder's prepared embedding composition; the
+//! only per-total state is buffer extent, and a packed batch selects a
+//! prepared capacity class without compiling.
 use super::*;
 use crate::inputs::TokenId;
 
-pub(super) struct PackedRows {
-    embedding: Composition,
-    hidden: Buffer,
-    tokens: Buffer,
-}
-impl PackedRows {
-    pub(super) fn compositions(&self) -> impl Iterator<Item = &Composition> {
-        std::iter::once(&self.embedding)
-    }
+pub(super) struct PackedBuffers {
+    pub(super) hidden: Buffer,
+    pub(super) tokens: Buffer,
 }
 struct Member {
     geometry: (usize, usize),
@@ -20,29 +16,27 @@ struct Member {
     hidden: Buffer,
 }
 impl Decoder {
-    fn ensure_packed(&mut self, count: usize) -> Result<(), Error> {
-        if self.packed.contains_key(&count) {
-            return Ok(());
+    fn packed_for(&mut self, total: usize) -> Result<&mut PackedBuffers, Error> {
+        if total == 0
+            || total > i32::MAX as usize
+            || total as u64 > self.packed_rows
+        {
+            return Err("packed row count exceeds the prepared envelope".into());
         }
-        if count == 0 || count > i32::MAX as usize {
-            return Err("packed row count exceeds index domain".into());
-        }
-        let base = self.rows.get(&(1, 1)).expect("base geometry");
-        let mut compiler = PlanCompiler::new(&self.device, &self.program, self.settings.clone());
-        let dimensions = [("M", count)];
-        let packed = PackedRows {
-            embedding: base.embedding.with_dimensions(&mut compiler, &dimensions)?,
-            hidden: self.device.buffer(
-                count
-                    .checked_mul(base.hidden.len())
-                    .ok_or("packed hidden extent overflow")?,
-            )?,
-            tokens: self
+        if !self.packed.contains_key(&total) {
+            let hidden = self
                 .device
-                .buffer(count.checked_mul(4).ok_or("packed token extent overflow")?)?,
-        };
-        self.packed.insert(count, packed);
-        Ok(())
+                .buffer(
+                    total
+                        .checked_mul(row_hidden_bytes(&self.geometry)?)
+                        .ok_or("packed hidden extent overflow")?,
+                )?;
+            let tokens = self
+                .device
+                .buffer(total.checked_mul(4).ok_or("packed token extent overflow")?)?;
+            self.packed.insert(total, PackedBuffers { hidden, tokens });
+        }
+        Ok(self.packed.get_mut(&total).expect("packed buffers prepared"))
     }
     pub(super) fn execute_generation_states(
         &mut self,
@@ -59,8 +53,13 @@ impl Decoder {
                 || row.proposal.tokens().iter().any(|token| {
                     u64::from(token.0) >= self.geometry.vocabulary || token.0 > i32::MAX as u32
                 })
+                || state.history_ranges().len() > self.max_ranges
                 || row.mask.is_some_and(|mask| {
-                    mask.len() != (self.geometry.vocabulary as usize).div_ceil(32)
+                    match usize::try_from(self.geometry.vocabulary) {
+                        Ok(vocabulary) => mask.len() != vocabulary.div_ceil(32),
+                        // A vocabulary beyond the host index domain admits no mask.
+                        Err(_) => true,
+                    }
                 })
             {
                 return Err("invalid packed model, context, vocabulary, or mask".into());
@@ -70,25 +69,26 @@ impl Decoder {
             sum.checked_add(row.proposal.tokens().len())
                 .ok_or("packed row count overflow")
         })?;
-        self.ensure_packed(total)?;
+        self.packed_for(total)?;
         for (state, row) in states.iter().zip(work) {
-            self.ensure_rows(
+            self.rows_for(
                 row.proposal.tokens().len(),
                 state.history_ranges().len().max(1),
             )?;
         }
-        if work.iter().any(|row| row.proposal.needs_sample()) && self.sampler.is_none() {
-            self.sampler = Some(Sampler::compile(
-                &self.device,
-                self.geometry.vocabulary as usize,
-                self.settings.clone(),
-            )?);
-        }
-        let block_count = self.rows.get(&(1, 1)).expect("base geometry").blocks.len();
-        let packed = self
-            .packed
-            .get_mut(&total)
-            .expect("packed geometry prepared");
+        let Decoder {
+            geometry,
+            device,
+            context_capacity,
+            embedding,
+            blocks,
+            readout: readout_stage,
+            sampler,
+            rows,
+            packed,
+            ..
+        } = self;
+        let packed = packed.get_mut(&total).expect("packed buffers prepared");
         packed.tokens.write(
             &work
                 .iter()
@@ -100,10 +100,7 @@ impl Decoder {
                 })
                 .collect::<Vec<_>>(),
         )?;
-        let width = usize::try_from(self.geometry.hidden)
-            .map_err(|_| "hidden width overflow")?
-            .checked_mul(4)
-            .ok_or("hidden byte width overflow")?;
+        let width = row_hidden_bytes(geometry)?;
         let mut offset = 0;
         let mut members = Vec::with_capacity(work.len());
         for (state, row) in states.iter().zip(work) {
@@ -131,7 +128,9 @@ impl Decoder {
         let mut selected = Vec::with_capacity(work.len());
         let mut state_results = vec![Vec::new(); work.len()];
         StateAdvance::execute_batch(&mut advances, |transitions| {
-            let embedded = packed.embedding.execute(
+            let embedded = execution::execute(
+                embedding,
+                &forward_shapes(total),
                 &HashMap::from([("tokens".into(), packed.tokens.clone())]),
                 &HashMap::new(),
             )?;
@@ -146,15 +145,19 @@ impl Decoder {
                 member.hidden = packed.hidden.view(packed_offset..packed_offset + bytes)?;
                 packed_offset += bytes;
             }
-            for index in 0..block_count {
+            for index in 0..blocks.len() {
                 for (member_index, (member, transition)) in
                     members.iter_mut().zip(transitions).enumerate()
                 {
-                    let rows = self
-                        .rows
-                        .get_mut(&member.geometry)
-                        .expect("member geometry prepared");
-                    let block = &mut rows.blocks[index];
+                    let rows = rows_entry(
+                        geometry,
+                        device,
+                        rows,
+                        member.geometry.0,
+                        member.geometry.1,
+                        *context_capacity,
+                    )?;
+                    let block = &blocks[index];
                     let mut tensors = HashMap::from([("hidden".into(), member.hidden.clone())]);
                     let i = block.state_index;
                     if block.attention {
@@ -196,7 +199,12 @@ impl Decoder {
                     }
                     // Complete this member before reusing geometry-local scratch
                     // or control buffers for another request of the same shape.
-                    let mixed = block.mixer.execute(&tensors, &HashMap::new())?;
+                    let shapes = if block.attention {
+                        attention_shapes(member.geometry.0, member.geometry.1)
+                    } else {
+                        forward_shapes(member.geometry.0)
+                    };
+                    let mixed = execution::execute(&block.mixer, &shapes, &tensors, &HashMap::new())?;
                     member.hidden = if block.attention {
                         result_buffer(&mixed, &[])?
                     } else {
@@ -204,7 +212,9 @@ impl Decoder {
                         state_results[member_index].push((i + 1, result_buffer(&mixed, &[1])?));
                         result_buffer(&mixed, &[2])?
                     };
-                    let fed = block.feedforward.execute(
+                    let fed = execution::execute(
+                        &block.feedforward,
+                        &forward_shapes(member.geometry.0),
                         &HashMap::from([("residual".into(), member.hidden.clone())]),
                         &HashMap::new(),
                     )?;
@@ -217,16 +227,22 @@ impl Decoder {
                     selected.push(Ok(None));
                     continue;
                 }
-                let rows = self
-                    .rows
-                    .get_mut(&member.geometry)
-                    .expect("member geometry prepared");
-                let logits = rows.readout.execute(
+                let rows = rows_entry(
+                    geometry,
+                    device,
+                    rows,
+                    member.geometry.0,
+                    member.geometry.1,
+                    *context_capacity,
+                )?;
+                let logits = execution::execute(
+                    readout_stage,
+                    &forward_shapes(member.geometry.0),
                     &HashMap::from([("hidden".into(), member.hidden.clone())]),
                     &HashMap::new(),
                 )?;
                 rows.logits = result_buffer(&logits, &[1])?;
-                let selection = self.sampler.as_mut().expect("sampler prepared").sample(
+                let selection = sampler.sample(
                     &rows.logits,
                     row.mask,
                     row.proposal.sampling(),

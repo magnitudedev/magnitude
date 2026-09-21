@@ -12,7 +12,7 @@ pub struct ScalarParameter {
     pub index_bound: Option<u64>,
     pub range: Option<RangeScalar>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RangeEndpoint {
     Start,
     End,

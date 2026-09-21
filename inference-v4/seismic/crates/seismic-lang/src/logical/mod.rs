@@ -4,32 +4,46 @@
 //! hierarchical SSA task graphs. It is built by one forward pass over the
 //! checked body (`normalize`): constructors create outputs and
 //! dependencies immediately, so nothing is reconstructed by recursive scanning
-//! afterwards. Validity is enforced during construction by the type-state
-//! `GraphBuilder` (`builder`) and re-checked defensively for cached data by
-//! `verify`.
+//! afterwards. Validity is enforced during construction by the private
+//! `GraphBuilder` (`builder`), whose consuming `seal` is the only constructor
+//! of a `TaskGraph`; a `LogicalProgram` exists only after every graph sealed.
+//! `verify` re-checks cached data against the same invariants.
 //!
-//! Logical storage and views carry semantic shape, origin, initialization,
+//! Logical storage and views carry semantic shape, owner, initialization,
 //! access and transforms only — no address space, byte stride, pointer,
 //! allocation or physical tile. The ownership/effect dependency is the
 //! state-token chain itself: every graph value and state token has exactly one
 //! region-parameter or node origin, reads consume the current state, and
 //! writes/atomics/moves/exclusive calls consume one state and produce the next.
+//!
+//! Every value has one exhaustive kind (`value::GraphValueKind`); a tensor is
+//! computed or a view whose base is one logical storage or one computed
+//! tensor value (`value::TensorSource`, `value::ViewBase`). Every graph owns
+//! one explicit boundary contract (`boundary::LogicalBoundary`) keyed by the
+//! canonical leaves of its checked interface; a call instantiates the callee's
+//! contract with the caller's identities (`boundary::CallBoundary`).
 
 use crate::intrinsics::{CapabilityId, IntrinsicId, PrimitiveId, ReduceOp};
 use crate::sir::{DefId, IntrinsicUse, LoopKind, Mode, ParamOwnership, Program};
 use crate::span::Span;
-use crate::types::{DType, Elem, ExtentExpr, NonEmpty, RuntimeExtentId, TensorType, ValueType};
+use crate::types::{DType, ExtentExpr, NonEmpty, RuntimeExtentId, TensorType, ValueType};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod builder;
 mod normalize;
 mod verify;
 
-pub use builder::{
-    Building, Complete, GraphBuilder, Ids, LoopOutcome, LoopSpec, Output, PrimitiveOutcome,
-    PrimitiveSpec, WriteEffect,
+pub mod boundary;
+pub mod specialization;
+pub mod value;
+
+pub use boundary::{
+    BoundaryLeaf, CallBoundary, CallInput, LogicalBoundary, LogicalBoundaryInput,
+    LogicalBoundaryResult,
 };
 pub use normalize::{ApplicabilityReport, LogicalConstructionError, OccurrenceRejection};
+pub use specialization::{ShapeField, ShapeFieldId, SpecializationDomain};
+pub use value::{GraphValue, GraphValueKind, LogicalStorageOwner, TensorSource, ViewBase};
 
 /// One definition of the checked program, as an implementation alternative.
 pub type DefinitionId = DefId;
@@ -39,8 +53,8 @@ pub type DefinitionId = DefId;
 // ---------------------------------------------------------------------------
 
 /// Identity of the logical program: changing semantics (source, registry
-/// revision, entry, or the concrete specialization) changes this key, and with
-/// it every downstream plan, cache and evidence identity.
+/// revision, entry, target, or the specialization domain) changes this key,
+/// and with it every downstream plan, cache and evidence identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogicalIdentity(pub [u8; 32]);
 
@@ -99,6 +113,68 @@ identity! {
     /// Position of one parameter in a region's parameter list.
     RegionParameterId
 }
+
+/// One nested logical region within a task graph. Region paths are logical
+/// identity; physical planning may reference them but may not extend them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegionStep {
+    IfThen(NodeId),
+    IfElse(NodeId),
+    LoopBody(NodeId),
+}
+
+impl RegionStep {
+    pub fn node(self) -> NodeId {
+        match self {
+            RegionStep::IfThen(node) | RegionStep::IfElse(node) | RegionStep::LoopBody(node) => {
+                node
+            }
+        }
+    }
+}
+
+pub type RegionPath = Vec<RegionStep>;
+
+/// One node within one task graph. Node ids are region-local.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeRef {
+    pub region: RegionPath,
+    pub node: NodeId,
+}
+
+/// Stable identity of one logical implementation graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphKey {
+    pub choice: ChoiceId,
+    pub logical_alternative: u32,
+}
+
+/// One program-wide logical node identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphNodeRef {
+    pub graph: GraphKey,
+    pub node: NodeRef,
+}
+
+/// One program-wide logical value identity. Graph value ids are unique across
+/// the whole program (one allocator serves every graph).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphValueRef {
+    pub graph: GraphKey,
+    pub value: GraphValueId,
+}
+
+/// One physical kernel leaf of a program-wide logical value. `path` names the
+/// canonical semantic leaf. A range remains one semantic ABI leaf but expands
+/// to two independently addressable kernel scalars, distinguished explicitly
+/// by `endpoint`; all other leaf kinds use `None`. Tensors remain one kernel
+/// leaf even when their representation has multiple storage planes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphValueLeafRef {
+    pub value: GraphValueRef,
+    pub path: crate::types::ValuePath,
+    pub endpoint: Option<crate::abi::RangeEndpoint>,
+}
 identity! {
     /// Position of one result in a region's result list (also used for the
     /// result ordinals a loop node exposes for its carried slots).
@@ -107,7 +183,7 @@ identity! {
 
 /// An id-indexed collection. Ids are unique within the owning artifact and
 /// may be globally allocated (gaps are legal); iteration is in id order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdVec<I, T> {
     items: std::collections::BTreeMap<u32, T>,
     marker: std::marker::PhantomData<I>,
@@ -166,6 +242,13 @@ impl<I: IdIndex, T> IdVec<I, T> {
         self.items.keys().map(|id| I::from_index(*id as usize))
     }
 
+    /// `(id, item)` pairs in id order.
+    pub fn entries(&self) -> impl Iterator<Item = (I, &T)> + '_ {
+        self.items
+            .iter()
+            .map(|(id, item)| (I::from_index(*id as usize), item))
+    }
+
     pub fn into_vec(self) -> Vec<T> {
         self.items.into_values().collect()
     }
@@ -203,6 +286,7 @@ id_index!(LogicalViewId);
 id_index!(GraphId);
 id_index!(ChoiceId);
 id_index!(RuntimeExtentId);
+id_index!(ShapeFieldId);
 
 impl IdIndex for NodeId {
     fn from_index(index: usize) -> Self {
@@ -217,28 +301,56 @@ impl IdIndex for NodeId {
 // The logical program
 // ---------------------------------------------------------------------------
 
+/// The logical program of one entry under one specialization domain on one
+/// effective target. Constructed only by `construct`, after every task graph
+/// sealed; every table is read through the typed accessors.
 #[derive(Clone, Debug)]
 pub struct LogicalProgram {
     pub identity: LogicalIdentity,
-    pub entry: String,
     pub target: EffectiveTargetIdentity,
-    /// Concrete shape parameters of the entry specialization.
-    pub shapes: BTreeMap<String, i64>,
-    /// Concrete element parameters of the entry specialization.
-    pub elements: BTreeMap<String, Elem>,
+    /// The complete, validated binding of every entry shape and element
+    /// parameter. The entry name is `domain.entry()`.
+    pub domain: SpecializationDomain,
+    /// One retained invocation shape field per bounded entry shape
+    /// parameter, in interface order. Exact parameters have no field.
+    pub shape_fields: IdVec<ShapeFieldId, ShapeField>,
     pub entry_choice: ChoiceId,
-    pub choices: IdVec<ChoiceId, ImplementationChoice>,
-    pub graphs: IdVec<GraphId, TaskGraph>,
-    pub runtime_extents: IdVec<RuntimeExtentId, RuntimeExtent>,
+    choices: IdVec<ChoiceId, ImplementationChoice>,
+    graphs: IdVec<GraphId, TaskGraph>,
+    runtime_extents: IdVec<RuntimeExtentId, RuntimeExtent>,
 }
 
 impl LogicalProgram {
+    pub fn entry(&self) -> &str {
+        self.domain.entry()
+    }
+
     pub fn choice(&self, id: ChoiceId) -> &ImplementationChoice {
         &self.choices[id]
     }
 
+    pub fn choices(&self) -> impl Iterator<Item = (ChoiceId, &ImplementationChoice)> + '_ {
+        self.choices.entries()
+    }
+
     pub fn graph(&self, id: GraphId) -> &TaskGraph {
         &self.graphs[id]
+    }
+
+    pub fn graphs(&self) -> impl Iterator<Item = (GraphId, &TaskGraph)> + '_ {
+        self.graphs.entries()
+    }
+
+    pub fn runtime_extent(&self, id: RuntimeExtentId) -> &RuntimeExtent {
+        &self.runtime_extents[id]
+    }
+
+    pub fn runtime_extents(&self) -> impl Iterator<Item = &RuntimeExtent> + '_ {
+        self.runtime_extents.iter()
+    }
+
+    pub fn shape_field(&self, id: ShapeFieldId) -> &ShapeField {
+        &self.shape_fields[id]
     }
 
     /// Defensive re-validation of cached data. Normal semantic discovery
@@ -251,7 +363,7 @@ impl LogicalProgram {
 
 /// The implementation decision at one call occurrence (the entry included).
 /// Every occurrence has its own `ChoiceId`; interned body templates never
-/// share occurrence identity, applicability, cost or result storage.
+/// share occurrence identity, applicability or cost.
 #[derive(Clone, Debug)]
 pub struct ImplementationChoice {
     pub interface: FunctionInterface,
@@ -263,9 +375,9 @@ pub struct ImplementationChoice {
 pub struct LogicalAlternative {
     pub definition: DefinitionId,
     pub kind: ImplementationKind,
-    /// The interned task graph of this definition under the occurrence's
-    /// specialization (internal storages are template-internal; result storage
-    /// is occurrence-owned and allocated by the caller).
+    /// The task graph of this definition under the occurrence's
+    /// specialization (its local storages are graph-internal; its results
+    /// are the values named by the graph's boundary).
     pub graph: GraphId,
     pub required_capabilities: BTreeSet<CapabilityId>,
     /// Authored numerical effects of this alternative. The portable reference
@@ -294,26 +406,74 @@ pub use crate::intrinsics::NumericalTransfer;
 // Task graphs and regions
 // ---------------------------------------------------------------------------
 
+/// One sealed implementation graph. The root region's parameters are the
+/// origins of the boundary's input values and entry states, in canonical
+/// interface-leaf order; the root region has no positional results — the
+/// boundary is the only statement of what the graph returns and which
+/// parameter states it leaves behind. Every value, storage, view and state
+/// token of the graph is defined exactly once in its table.
 #[derive(Clone, Debug)]
 pub struct TaskGraph {
     pub choice: ChoiceId,
     /// Ordinal of the alternative within the choice.
     pub alternative: u32,
-    /// The root region's value/state parameters, in interface order.
-    pub parameters: Vec<RegionParameter>,
-    pub storages: IdVec<LogicalStorageId, LogicalStorage>,
-    pub views: IdVec<LogicalViewId, LogicalView>,
-    pub root: GraphRegion,
-    /// The boundary results of this implementation, in canonical path order:
-    /// the function result leaves, then the final states of `inout` tensor
-    /// parameters.
-    pub results: Vec<RegionResult>,
+    pub boundary: LogicalBoundary,
+    root: GraphRegion,
+    values: IdVec<GraphValueId, GraphValue>,
+    storages: IdVec<LogicalStorageId, LogicalStorage>,
+    views: IdVec<LogicalViewId, LogicalView>,
+    /// The storage every state token of the graph versions.
+    states: IdVec<StateTokenId, LogicalStorageId>,
+}
+
+impl TaskGraph {
+    pub fn root(&self) -> &GraphRegion {
+        &self.root
+    }
+
+    /// The value with this id. Total: every value id of the graph is defined.
+    pub fn value(&self, id: GraphValueId) -> &GraphValue {
+        &self.values[id]
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &GraphValue> + '_ {
+        self.values.iter()
+    }
+
+    pub fn storage(&self, id: LogicalStorageId) -> &LogicalStorage {
+        &self.storages[id]
+    }
+
+    pub fn storages(&self) -> impl Iterator<Item = (LogicalStorageId, &LogicalStorage)> + '_ {
+        self.storages.entries()
+    }
+
+    pub fn view(&self, id: LogicalViewId) -> &LogicalView {
+        &self.views[id]
+    }
+
+    pub fn views(&self) -> impl Iterator<Item = (LogicalViewId, &LogicalView)> + '_ {
+        self.views.entries()
+    }
+
+    /// The storage a state token versions. Total: every state token of the
+    /// graph is defined.
+    pub fn state_storage(&self, token: StateTokenId) -> LogicalStorageId {
+        self.states[token]
+    }
+
+    pub fn states(&self) -> impl Iterator<Item = (StateTokenId, LogicalStorageId)> + '_ {
+        self.states.entries().map(|(token, storage)| (token, *storage))
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct GraphRegion {
     pub parameters: Vec<RegionParameter>,
     pub nodes: IdVec<NodeId, LogicalNode>,
+    /// Results of a nested region (branch joins, loop carries and visit
+    /// states). The root region's list is empty: its results are the graph
+    /// boundary.
     pub results: Vec<RegionResult>,
 }
 
@@ -373,17 +533,8 @@ pub struct AtomicOperation {
 }
 
 // ---------------------------------------------------------------------------
-// Values, storage, views
+// Storage, state and views
 // ---------------------------------------------------------------------------
-
-/// One SSA graph value. Tensor values are backed by exactly one logical view
-/// (`view`); scalar, index, range, tuple and capability values are pure data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GraphValue {
-    pub id: GraphValueId,
-    pub ty: ValueType,
-    pub view: Option<LogicalViewId>,
-}
 
 /// One version of one logical storage. A fresh token is produced by the
 /// region parameter or node that writes/initializes the storage; reads consume
@@ -396,30 +547,14 @@ pub struct StateToken {
     pub join: Option<StateJoin>,
 }
 
-/// Semantic storage: shape, origin, initialization. No address space, byte
-/// stride, pointer, allocation or physical tile.
+/// Semantic storage: shape, owner, initialization. No address space, byte
+/// stride, pointer, allocation or physical tile. Returning a value is a
+/// boundary fact, never a storage provenance.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalStorage {
     pub shape: TensorType,
-    pub origin: StorageOrigin,
+    pub owner: LogicalStorageOwner,
     pub initialization: Initialization,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StorageOrigin {
-    Parameter {
-        ordinal: u32,
-        path: crate::types::ValuePath,
-        name: String,
-    },
-    /// A boundary result storage. `owner: None` is compiler-owned (an entry
-    /// result); `owner: Some(choice)` is occurrence-owned (one call result).
-    Result {
-        owner: Option<ChoiceId>,
-        path: crate::types::ValuePath,
-    },
-    /// Storage allocated inside the graph that owns it.
-    Owned,
 }
 
 /// Initialization state of one storage: independent disjoint
@@ -470,11 +605,13 @@ impl Coverage {
     }
 }
 
-/// A semantic view of one storage. Access is carried here, transforms are
-/// shape-only structure; dynamic selection endpoints are graph values.
+/// A semantic view over one base: logical storage, or a computed tensor
+/// value. Access is carried here, transforms are shape-only structure;
+/// dynamic selection endpoints are graph values. A view of a computed value
+/// is read-only (`Access::Shared`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalView {
-    pub storage: LogicalStorageId,
+    pub base: ViewBase,
     pub shape: TensorType,
     pub access: Access,
     pub transform: ViewTransform,
@@ -513,6 +650,8 @@ pub struct LogicalNode {
     pub inputs: Vec<GraphValueId>,
     pub state_inputs: Vec<StateTokenId>,
     pub kind: LogicalNodeKind,
+    /// The values this node originates, with their exhaustive kinds (the same
+    /// records the graph's value table holds).
     pub outputs: Vec<GraphValue>,
     pub state_outputs: Vec<StateToken>,
     pub safety: Vec<SafetyObligation>,
@@ -642,71 +781,16 @@ pub enum ReductionOrder {
     Unordered,
 }
 
+/// One call: the occurrence-specific choice it selects from and the callee
+/// contract instantiated with the caller's identities. The node's inputs are
+/// the boundary input values (key order), its state inputs the consumed
+/// tensor states, its outputs the result values, and its state outputs the
+/// final states of exclusively borrowed caller storages. A void call has no
+/// outputs and retains its completion as a node of the region.
 #[derive(Clone, Debug)]
 pub struct CallNode {
-    /// The occurrence-specific choice this call selects from.
     pub choice: ChoiceId,
-    pub boundary_inputs: Vec<BoundaryInput>,
-    pub boundary_results: Vec<BoundaryResult>,
-}
-
-/// One interface parameter of a call, at its canonical path. Value parameters
-/// pass graph values; borrowed and owned tensors pass explicit states.
-#[derive(Clone, Debug)]
-pub struct BoundaryInput {
-    pub path: crate::types::ValuePath,
-    /// Interface parameter ordinal.
-    pub param: u32,
-    pub kind: BoundaryInputKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum BoundaryInputKind {
-    /// A plain value (scalar, index, range, tuple, capability value).
-    Value(GraphValueId),
-    /// A shared borrow: consumes the current state without versioning it.
-    Shared {
-        value: GraphValueId,
-        state: StateTokenId,
-    },
-    /// An exclusive mutable borrow: consumes the current state; the call
-    /// produces the next state.
-    Exclusive {
-        value: GraphValueId,
-        state: StateTokenId,
-    },
-    /// An owned tensor moved into the callee: consumes the current state; the
-    /// caller's storage is moved (no later use).
-    Move {
-        value: GraphValueId,
-        state: StateTokenId,
-    },
-}
-
-/// One result leaf of a call, at its canonical path. Tensor results are
-/// occurrence-owned storages allocated by the caller and written by the call;
-/// scalar/index/range/tuple leaves are result values; `inout` tensor
-/// parameters yield the next state of the caller's storage. A void call has no
-/// boundary results and retains its completion as a node of the region.
-#[derive(Clone, Debug)]
-pub struct BoundaryResult {
-    pub path: crate::types::ValuePath,
-    pub kind: BoundaryResultKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum BoundaryResultKind {
-    /// A data result value (scalar, index, range, or a tuple of these).
-    Value(GraphValueId),
-    /// Occurrence-owned (or, at the entry, compiler-owned) result storage,
-    /// fully initialized by the call.
-    Storage {
-        storage: LogicalStorageId,
-        ty: TensorType,
-        token: StateTokenId,
-    },
-    /// The next state of an `inout`/exclusively borrowed caller storage.
-    State(StateTokenId),
+    pub boundary: CallBoundary,
 }
 
 // ---------------------------------------------------------------------------
@@ -714,90 +798,36 @@ pub enum BoundaryResultKind {
 // ---------------------------------------------------------------------------
 
 /// A runtime-determined extent: `value` is the retained runtime expression
-/// used for all semantics; `capacity` is a resource/tuning bound only (logical
-/// construction installs the best proven static upper bound, or the maximal
-/// domain when none is proven; planning may lower it).
+/// used for all semantics; `capacity` is a resource/proof bound only. Logical
+/// construction derives it from the expression's leaves (shape-field domains,
+/// earlier extents' capacities, the representation ranges of its integer and
+/// index values) with checked interval arithmetic; an expression without a
+/// derivable finite bound is a construction error, never a substituted
+/// capacity. Planning may lower it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeExtent {
     pub id: RuntimeExtentId,
     pub value: RuntimeScalarExpr,
     pub capacity: u64,
-    /// The caller's expected runtime value, when the workload states one for
-    /// every entry parameter `value` closes over. Planning prices runtime
-    /// domains with it; semantics and resource bounds never read it.
+    /// The caller's expected runtime value. Sourced only from a bounded entry
+    /// shape binding: `Some` exactly when `value` is that binding's
+    /// `ShapeField`. Every other runtime extent (a value-derived slice
+    /// length, a shape expression) has no stated expectation and is priced at
+    /// its capacity. Semantics and resource bounds never read it.
     pub expected: Option<u64>,
 }
 
-impl LogicalProgram {
-    /// Record the expected runtime value of every runtime extent whose
-    /// retained expression closes over entry `index` parameters named in
-    /// `expected` (keyed by interface parameter name). Extents over other
-    /// values, or over parameters the workload leaves unstated, keep `None`
-    /// and are priced at their capacity.
-    pub fn install_expected_extents(&mut self, expected: &BTreeMap<String, i64>) {
-        if expected.is_empty() {
-            return;
-        }
-        let choice = &self.choices[self.entry_choice];
-        let mut values: BTreeMap<GraphValueId, i64> = BTreeMap::new();
-        for alternative in choice.alternatives.as_slice() {
-            let graph = &self.graphs[alternative.graph];
-            for (param, parameter) in choice.interface.params.iter().zip(&graph.parameters) {
-                if let (Some(value), RegionParameter::Value { id, .. }) =
-                    (expected.get(&param.name), parameter)
-                {
-                    values.insert(*id, *value);
-                }
-            }
-        }
-        // Extents may read earlier extents; ids are allocated in definition order.
-        let mut installed: Vec<Option<u64>> = Vec::with_capacity(self.runtime_extents.len());
-        for extent in self.runtime_extents.iter_mut() {
-            let evaluated = expected_scalar(&extent.value, &values, &installed)
-                .and_then(|value| u64::try_from(value).ok());
-            extent.expected = evaluated;
-            installed.push(evaluated);
-        }
-    }
-}
-
-/// Evaluate a retained runtime scalar under expected entry values; `None`
-/// when any leaf is unstated or the arithmetic is undefined.
-fn expected_scalar(
-    expr: &RuntimeScalarExpr,
-    values: &BTreeMap<GraphValueId, i64>,
-    extents: &[Option<u64>],
-) -> Option<i64> {
-    use RuntimeScalarExpr::*;
-    let binary = |a: &RuntimeScalarExpr, b: &RuntimeScalarExpr| {
-        Some((
-            expected_scalar(a, values, extents)?,
-            expected_scalar(b, values, extents)?,
-        ))
-    };
-    match expr {
-        Const(c) => Some(*c),
-        Value(id) => values.get(id).copied(),
-        Extent(id) => extents
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
-            .and_then(|v| i64::try_from(v).ok()),
-        Add(a, b) => binary(a, b).and_then(|(a, b)| a.checked_add(b)),
-        Sub(a, b) => binary(a, b).and_then(|(a, b)| a.checked_sub(b)),
-        Mul(a, b) => binary(a, b).and_then(|(a, b)| a.checked_mul(b)),
-        Div(a, b) => binary(a, b).and_then(|(a, b)| a.checked_div(b)),
-        Rem(a, b) => binary(a, b).and_then(|(a, b)| a.checked_rem(b)),
-    }
-}
-
-/// A retained runtime scalar expression over graph values and other runtime
-/// extents. Representation only; evaluation belongs to planning/resolution.
+/// A retained runtime scalar expression over graph values, invocation shape
+/// fields and other runtime extents. Representation only; evaluation belongs
+/// to planning/resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeScalarExpr {
     Const(i64),
     Value(GraphValueId),
     Extent(RuntimeExtentId),
+    /// The actual value of one bounded entry shape parameter, supplied by the
+    /// invocation and validated against its finite domain before submission.
+    ShapeField(ShapeFieldId),
     Add(Box<RuntimeScalarExpr>, Box<RuntimeScalarExpr>),
     Sub(Box<RuntimeScalarExpr>, Box<RuntimeScalarExpr>),
     Mul(Box<RuntimeScalarExpr>, Box<RuntimeScalarExpr>),
@@ -808,8 +838,14 @@ pub enum RuntimeScalarExpr {
 /// Runtime obligations created by logical construction; each physical
 /// alternative consumes every one of them later as `StaticallyProved` or
 /// `RuntimeChecked`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SafetyObligation {
+    /// An operation whose semantics start from the first element requires a
+    /// nonempty logical extent. This belongs to the semantic program rather
+    /// than to any backend reduction strategy.
+    ExtentPositive {
+        extent: ExtentExpr,
+    },
     IndexInBounds {
         index: GraphValueId,
         extent: ExtentExpr,
@@ -839,6 +875,7 @@ impl SafetyObligation {
     /// The values this obligation reads at runtime.
     pub fn values(&self) -> Vec<GraphValueId> {
         match self {
+            SafetyObligation::ExtentPositive { .. } => Vec::new(),
             SafetyObligation::IndexInBounds { index, .. } => vec![*index],
             SafetyObligation::RangeInBounds { start, end, .. } => vec![*start, *end],
             SafetyObligation::DivisorNonZero { value } => vec![*value],
@@ -853,34 +890,19 @@ impl SafetyObligation {
 // Construction entry point
 // ---------------------------------------------------------------------------
 
-/// Concrete semantic specialization of the entry: shape and element
-/// parameters. Part of the logical identity.
-pub struct Specialization {
-    pub shapes: BTreeMap<String, i64>,
-    pub elems: BTreeMap<String, Elem>,
-}
-
-/// Build the logical program of one entry for one effective target under one
-/// concrete specialization. Every call occurrence receives its own choice;
-/// applicability is evaluated per occurrence against the effective target
-/// (portable bodies and same-backend lowerings are peer semantic
-/// alternatives).
+/// Build the logical program of the domain's entry for one effective target
+/// under one specialization domain. Every call occurrence receives its own
+/// choice; applicability is evaluated per occurrence against the effective
+/// target and the domain (portable bodies and same-backend lowerings are
+/// peer semantic alternatives; an implementation predicate admits an
+/// alternative only when it holds on the whole domain).
 pub fn construct(
     program: &Program,
-    entry: &str,
     target: &EffectiveTargetIdentity,
     supports_intrinsic: &dyn Fn(&IntrinsicUse) -> Result<(), String>,
-    shapes: BTreeMap<String, i64>,
-    elems: BTreeMap<String, Elem>,
+    domain: &SpecializationDomain,
 ) -> Result<LogicalProgram, LogicalConstructionError> {
-    normalize::construct(
-        program,
-        entry,
-        target,
-        supports_intrinsic,
-        Specialization { shapes, elems },
-    )
-    .map_err(|error| match error {
+    normalize::construct(program, target, supports_intrinsic, domain).map_err(|error| match error {
         normalize::BuildError::NoImplementation(report) => {
             LogicalConstructionError::NoApplicableImplementation(report)
         }
@@ -893,6 +915,7 @@ mod tests {
     use super::*;
     use crate::program::{compile, SourceFile};
     use crate::types::DType;
+    use specialization::ShapeBinding;
     use std::collections::BTreeMap;
 
     fn check(sources: &[(&str, &str)]) -> Result<crate::sir::Program, String> {
@@ -917,8 +940,25 @@ mod tests {
         }
     }
 
-    fn shapes(entries: &[(&str, i64)]) -> BTreeMap<String, i64> {
-        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn exact(program: &Program, entry: &str, entries: &[(&str, u64)]) -> SpecializationDomain {
+        let shapes = entries
+            .iter()
+            .map(|(name, value)| (name.to_string(), ShapeBinding::Exact(*value)))
+            .collect();
+        SpecializationDomain::new(program, entry, shapes, BTreeMap::new())
+            .expect("the exact domain binds every entry parameter")
+    }
+
+    fn entry_graph(logical: &LogicalProgram) -> &TaskGraph {
+        logical.graph(
+            logical
+                .choice(logical.entry_choice)
+                .alternatives
+                .iter()
+                .next()
+                .expect("the entry has an alternative")
+                .graph,
+        )
     }
 
     /// One representative kernel: allocation, borrowed views, a reduction,
@@ -928,29 +968,24 @@ mod tests {
     #[test]
     fn representative_kernel_constructs_and_verifies() {
         let program = check(&[("kernel.seismic", KERNEL)]).expect("the kernel checks");
-        let logical = construct(
-            &program,
-            "linear",
-            &target("cpu"),
-            &supports_all,
-            shapes(&[("M", 4), ("N", 8)]),
-            BTreeMap::new(),
-        )
-        .expect("construction succeeds");
+        let domain = exact(&program, "linear", &[("M", 4), ("N", 8)]);
+        let logical = construct(&program, &target("cpu"), &supports_all, &domain)
+            .expect("construction succeeds");
         logical.verify().expect("the built program verifies");
 
         // The entry choice and one occurrence-specific call choice.
         assert_eq!(logical.entry_choice, ChoiceId(0));
-        assert_eq!(logical.choices.len(), 2);
+        assert_eq!(logical.choices().count(), 2);
         let entry = logical.choice(logical.entry_choice);
         assert_eq!(entry.interface.name, "linear");
         assert_eq!(entry.alternatives.iter().count(), 1);
 
         // The entry graph is a single call whose boundary passes two shared
-        // borrows and one move, and receives occurrence-owned result storage.
-        let entry_graph = logical.graph(entry.alternatives.iter().next().unwrap().graph);
+        // borrows and one move, and whose result leaf is a computed value of
+        // the caller (no fabricated result storage).
+        let entry_graph = entry_graph(&logical);
         let call = entry_graph
-            .root
+            .root()
             .nodes
             .iter()
             .find_map(|node| match &node.kind {
@@ -958,29 +993,51 @@ mod tests {
                 _ => None,
             })
             .expect("the entry body is one call");
-        let shared = call
-            .boundary_inputs
-            .iter()
-            .filter(|input| matches!(input.kind, BoundaryInputKind::Shared { .. }))
-            .count();
-        let moved = call
-            .boundary_inputs
-            .iter()
-            .filter(|input| matches!(input.kind, BoundaryInputKind::Move { .. }))
-            .count();
-        assert_eq!((shared, moved), (2, 1));
-        let storage_results = call
-            .boundary_results
-            .iter()
-            .filter(|result| matches!(result.kind, BoundaryResultKind::Storage { .. }))
-            .count();
-        assert_eq!(storage_results, 1);
+        let ownerships: Vec<ParamOwnership> = call
+            .boundary
+            .inputs
+            .values()
+            .map(|input| match input {
+                CallInput::Tensor { ownership, .. } => *ownership,
+                CallInput::Computed { ownership, .. } => *ownership,
+                CallInput::Value(_) => ParamOwnership::Value,
+            })
+            .collect();
+        assert_eq!(
+            ownerships,
+            vec![
+                ParamOwnership::Shared,
+                ParamOwnership::Shared,
+                ParamOwnership::Owned
+            ]
+        );
+        assert!(call.boundary.final_states.is_empty());
+        assert_eq!(call.boundary.results.len(), 1);
+        let (leaf, result) = call.boundary.results.iter().next().unwrap();
+        assert_eq!(
+            *leaf,
+            BoundaryLeaf::Result {
+                leaf: crate::types::ValuePath::default()
+            }
+        );
+        assert_eq!(
+            entry_graph.value(*result).tensor_source(),
+            Some(TensorSource::Computed)
+        );
+        // The entry boundary returns that computed value directly.
+        let returned = entry_graph
+            .boundary
+            .results()
+            .values()
+            .next()
+            .expect("the entry returns one leaf");
+        assert_eq!(returned.value, *result);
 
         // The callee graph contains the independent outer loop with a
         // disjoint-write join and the ordered inner loop with carries.
         let add_choice = logical
-            .choices
-            .iter()
+            .choices()
+            .map(|(_, choice)| choice)
             .find(|choice| choice.interface.name == "add")
             .expect("the call created its own choice");
         let add_graph = logical.graph(add_choice.alternatives.iter().next().unwrap().graph);
@@ -1013,22 +1070,24 @@ mod tests {
                         scan(&if_node.then_region, joins, carries);
                         scan(&if_node.else_region, joins, carries);
                     }
-                    _ => {}
+                    LogicalNodeKind::Primitive(_)
+                    | LogicalNodeKind::Reduction(_)
+                    | LogicalNodeKind::Call(_) => {}
                 }
             }
         }
         scan(
-            &add_graph.root,
+            add_graph.root(),
             &mut independent_joins,
             &mut ordered_carries,
         );
         assert!(independent_joins > 0, "the parallel loop joins its visits");
         assert!(ordered_carries > 0, "the ordered loop carries its state");
 
-        // The returned storage is fully initialized: the nested loops cover
-        // both axes structurally.
-        for storage in add_graph.storages.iter() {
-            if matches!(storage.origin, StorageOrigin::Parameter { .. }) {
+        // The returned parameter storage is fully initialized: the nested
+        // loops cover both axes structurally.
+        for (_, storage) in add_graph.storages() {
+            if matches!(storage.owner, LogicalStorageOwner::Parameter(_)) {
                 assert_eq!(storage.initialization, Initialization::FullyInitialized);
             }
         }
@@ -1043,25 +1102,15 @@ mod tests {
         .expect("the reductions check");
         let logical = construct(
             &program,
-            "sum",
             &target("cpu"),
             &supports_all,
-            shapes(&[("N", 16)]),
-            BTreeMap::new(),
+            &exact(&program, "sum", &[("N", 16)]),
         )
         .expect("construction succeeds");
         logical.verify().expect("verification succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
+        let graph = entry_graph(&logical);
         let reduction = graph
-            .root
+            .root()
             .nodes
             .iter()
             .find_map(|node| match &node.kind {
@@ -1072,27 +1121,22 @@ mod tests {
         assert_eq!(reduction.op, crate::intrinsics::ReduceOp::Sum);
         assert_eq!(reduction.accumulator, DType::F32);
         assert_eq!(reduction.order, ReductionOrder::Ascending);
+        // The cast operand is a computed tensor reduced without storage.
+        assert_eq!(
+            graph.value(reduction.operand).tensor_source(),
+            Some(TensorSource::Computed)
+        );
 
         let logical = construct(
             &program,
-            "arg",
             &target("cpu"),
             &supports_all,
-            shapes(&[("N", 16)]),
-            BTreeMap::new(),
+            &exact(&program, "arg", &[("N", 16)]),
         )
         .expect("construction succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
+        let graph = entry_graph(&logical);
         let reduction = graph
-            .root
+            .root()
             .nodes
             .iter()
             .find_map(|node| match &node.kind {
@@ -1105,6 +1149,38 @@ mod tests {
     }
 
     #[test]
+    fn computed_tensors_are_returned_without_storage() {
+        let program = check(&[(
+            "computed.seismic",
+            "fn f[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return f32(x)\n",
+        )])
+        .expect("the source checks");
+        let logical = construct(
+            &program,
+            &target("cpu"),
+            &supports_all,
+            &exact(&program, "f", &[("N", 4)]),
+        )
+        .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        let graph = entry_graph(&logical);
+        let returned = graph
+            .boundary
+            .results()
+            .values()
+            .next()
+            .expect("one result leaf");
+        assert_eq!(
+            graph.value(returned.value).tensor_source(),
+            Some(TensorSource::Computed)
+        );
+        // Only the parameter owns storage.
+        assert!(graph
+            .storages()
+            .all(|(_, storage)| matches!(storage.owner, LogicalStorageOwner::Parameter(_))));
+    }
+
+    #[test]
     fn safety_obligations_are_created_not_discharged() {
         let program = check(&[(
             "safety.seismic",
@@ -1113,24 +1189,14 @@ mod tests {
         .expect("the source checks");
         let logical = construct(
             &program,
-            "f",
             &target("cpu"),
             &supports_all,
-            shapes(&[("N", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "f", &[("N", 4)]),
         )
         .expect("construction succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
+        let graph = entry_graph(&logical);
         let obligations: Vec<&SafetyObligation> = graph
-            .root
+            .root()
             .nodes
             .iter()
             .flat_map(|node| node.safety.iter())
@@ -1158,43 +1224,249 @@ mod tests {
         .expect("the source checks");
         let logical = construct(
             &program,
-            "f",
             &target("cpu"),
             &supports_all,
-            shapes(&[("N", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "f", &[("N", 4)]),
         )
         .expect("construction succeeds");
         logical.verify().expect("verification succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
+        let graph = entry_graph(&logical);
         // The slice view shares the parameter storage and carries its transform.
         let parameter_storage_id = graph
-            .storages
-            .ids()
-            .zip(graph.storages.iter())
-            .find(|(_, storage)| matches!(storage.origin, StorageOrigin::Parameter { .. }))
+            .storages()
+            .find(|(_, storage)| matches!(storage.owner, LogicalStorageOwner::Parameter(_)))
             .map(|(id, _)| id)
             .expect("the parameter has storage");
         let sliced = graph
-            .views
-            .iter()
+            .views()
+            .map(|(_, view)| view)
             .find(|view| matches!(view.transform, ViewTransform::Slice { .. }))
             .expect("the slice is a view transform");
-        assert_eq!(sliced.storage, parameter_storage_id);
+        match sliced.base {
+            ViewBase::Storage(storage) => assert_eq!(storage, parameter_storage_id),
+            ViewBase::Value(_) => panic!("the slice views the parameter's storage"),
+        }
         assert!(graph
-            .root
+            .root()
             .nodes
             .iter()
             .flat_map(|node| node.safety.iter())
             .any(|o| matches!(o, SafetyObligation::RangeInBounds { .. })));
+        // `to_owned` names local storage; the returned value is its view.
+        let returned = graph
+            .boundary
+            .results()
+            .values()
+            .next()
+            .expect("one result leaf");
+        let Some(TensorSource::View(view)) = graph.value(returned.value).tensor_source() else {
+            panic!("to_owned produces a view of local storage");
+        };
+        match graph.view(view).base {
+            ViewBase::Storage(storage) => assert_eq!(
+                graph.storage(storage).owner,
+                LogicalStorageOwner::Local
+            ),
+            ViewBase::Value(_) => panic!("to_owned produces a view of local storage"),
+        }
+    }
+
+    #[test]
+    fn views_of_computed_tensors_name_the_value_as_base() {
+        // A view over a computed tensor is a view of that value: no storage
+        // is declared for the operand and none is fabricated for the result.
+        let program = check(&[(
+            "computed-view.seismic",
+            "fn f[N](x: &tensor[N, N] f32) -> tensor[N, N] f32:\n    return reshape(f32(x), (N, N))\n",
+        )])
+        .expect("the source checks");
+        let logical = construct(
+            &program,
+            &target("cpu"),
+            &supports_all,
+            &exact(&program, "f", &[("N", 4)]),
+        )
+        .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        let graph = entry_graph(&logical);
+        let returned = graph
+            .boundary
+            .results()
+            .values()
+            .next()
+            .expect("one result leaf");
+        let Some(TensorSource::View(view)) = graph.value(returned.value).tensor_source() else {
+            panic!("the reshape of a computed tensor is a view");
+        };
+        // The view's base is the computed cast value, not any storage.
+        let ViewBase::Value(base) = graph.view(view).base else {
+            panic!("the reshape views the computed value");
+        };
+        assert_eq!(
+            graph.value(base).tensor_source(),
+            Some(TensorSource::Computed)
+        );
+        assert_eq!(graph.view(view).access, Access::Shared);
+        assert!(matches!(
+            graph.view(view).transform,
+            ViewTransform::Reshape { .. }
+        ));
+        // Only the parameter owns storage; the reshape reads no storage.
+        assert!(graph
+            .storages()
+            .all(|(_, storage)| matches!(storage.owner, LogicalStorageOwner::Parameter(_))));
+        let reshape_node = graph
+            .root()
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    LogicalNodeKind::Primitive(PrimitiveApplication {
+                        op: PrimitiveOp::Primitive(PrimitiveId::Reshape),
+                    })
+                )
+            })
+            .expect("the reshape is one node");
+        assert!(reshape_node.state_inputs.is_empty());
+    }
+
+    #[test]
+    fn computed_tensors_are_read_as_values() {
+        let program = check(&[(
+            "computed-read.seismic",
+            "fn f[N](x: &tensor[N] f32) -> f32:\n    return f32(x)[0]\n",
+        )])
+        .expect("the source checks");
+        let logical = construct(
+            &program,
+            &target("cpu"),
+            &supports_all,
+            &exact(&program, "f", &[("N", 4)]),
+        )
+        .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        let graph = entry_graph(&logical);
+        let read = graph
+            .root()
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    LogicalNodeKind::Primitive(PrimitiveApplication {
+                        op: PrimitiveOp::Primitive(PrimitiveId::ElementRead { .. }),
+                    })
+                )
+            })
+            .expect("the element read is one node");
+        // The computed operand is read as a value: no storage dependency.
+        assert!(read.state_inputs.is_empty());
+        assert!(graph.storages().all(|(_, storage)| {
+            matches!(storage.owner, LogicalStorageOwner::Parameter(_))
+        }));
+    }
+
+    #[test]
+    fn computed_tensors_are_call_arguments_without_storage() {
+        // A call result and a cast are computed values at the logical level;
+        // the owned move and the shared borrow of them pass the values
+        // themselves, with no caller storage fabricated for either.
+        let program = check(&[(
+            "computed-arg.seismic",
+            "fn dup[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return f32(x)\n\nfn add[N](a: tensor[N] f32, b: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(b) + a\n\nfn f[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return add(dup(x), f32(x))\n",
+        )])
+        .expect("the source checks");
+        let logical = construct(
+            &program,
+            &target("cpu"),
+            &supports_all,
+            &exact(&program, "f", &[("N", 4)]),
+        )
+        .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        let graph = entry_graph(&logical);
+        let call = graph
+            .root()
+            .nodes
+            .iter()
+            .find_map(|node| match &node.kind {
+                LogicalNodeKind::Call(call)
+                    if logical.choice(call.choice).interface.name == "add" =>
+                {
+                    Some(call)
+                }
+                _ => None,
+            })
+            .expect("the entry body ends in the `add` call");
+        let mut moved = 0;
+        let mut shared = 0;
+        for input in call.boundary.inputs.values() {
+            match input {
+                // The owned move of the computed call result: the value.
+                CallInput::Computed { value, ownership } => {
+                    assert_eq!(
+                        graph.value(*value).tensor_source(),
+                        Some(TensorSource::Computed)
+                    );
+                    match ownership {
+                        ParamOwnership::Owned => moved += 1,
+                        ParamOwnership::Shared => shared += 1,
+                        ParamOwnership::Exclusive | ParamOwnership::Value => {
+                            panic!("a computed argument is shared or moved")
+                        }
+                    }
+                }
+                CallInput::Tensor { .. } => {
+                    panic!("every argument is a computed value")
+                }
+                CallInput::Value(_) => panic!("every argument is a tensor leaf"),
+            }
+        }
+        assert_eq!(moved, 1);
+        assert_eq!(shared, 1);
+        // No caller storage was fabricated for either computed argument.
+        assert!(graph.storages().all(|(_, storage)| {
+            matches!(storage.owner, LogicalStorageOwner::Parameter(_))
+        }));
+    }
+
+    #[test]
+    fn in_place_writes_to_computed_locals_realize_state() {
+        // A `let mut` local written in place names mutable state: its
+        // realization into local storage is the write's own state, the one
+        // materialization construction performs.
+        let program = check(&[(
+            "write-computed.seismic",
+            "fn f[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut v = f32(x)\n    v[0] = 1.0\n    return v\n",
+        )])
+        .expect("the source checks");
+        let logical = construct(
+            &program,
+            &target("cpu"),
+            &supports_all,
+            &exact(&program, "f", &[("N", 4)]),
+        )
+        .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        let graph = entry_graph(&logical);
+        let returned = graph
+            .boundary
+            .results()
+            .values()
+            .next()
+            .expect("one result leaf");
+        let Some(TensorSource::View(view)) = graph.value(returned.value).tensor_source() else {
+            panic!("the written local is a view of its realized storage");
+        };
+        let ViewBase::Storage(storage) = graph.view(view).base else {
+            panic!("the written local's storage is logical storage");
+        };
+        assert_eq!(graph.storage(storage).owner, LogicalStorageOwner::Local);
+        assert_eq!(
+            graph.storage(storage).initialization,
+            Initialization::FullyInitialized
+        );
     }
 
     #[test]
@@ -1206,25 +1478,15 @@ mod tests {
         .expect("the source checks");
         let logical = construct(
             &program,
-            "hist",
             &target("metal"),
             &supports_all,
-            shapes(&[("N", 128)]),
-            BTreeMap::new(),
+            &exact(&program, "hist", &[("N", 128)]),
         )
         .expect("construction succeeds on the same backend");
         logical.verify().expect("verification succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
+        let graph = entry_graph(&logical);
         let loop_node = graph
-            .root
+            .root()
             .nodes
             .iter()
             .find_map(|node| match &node.kind {
@@ -1234,7 +1496,7 @@ mod tests {
             .expect("the parallel loop is a loop node");
         assert_eq!(loop_node.kind, LoopKind::Independent);
         let join = graph
-            .root
+            .root()
             .nodes
             .iter()
             .flat_map(|node| node.state_outputs.iter())
@@ -1255,11 +1517,9 @@ mod tests {
         .expect("the source checks");
         let error = construct(
             &program,
-            "f",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "f", &[("M", 4)]),
         )
         .expect_err("the metal-only family is inapplicable on cpu");
         match error {
@@ -1276,33 +1536,27 @@ mod tests {
     }
 
     #[test]
-    fn identity_tracks_the_specialization() {
+    fn identity_tracks_the_domain() {
         let program = check(&[("kernel.seismic", KERNEL)]).expect("the kernel checks");
         let a = construct(
             &program,
-            "linear",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 4), ("N", 8)]),
-            BTreeMap::new(),
+            &exact(&program, "linear", &[("M", 4), ("N", 8)]),
         )
         .expect("construction succeeds");
         let b = construct(
             &program,
-            "linear",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 4), ("N", 8)]),
-            BTreeMap::new(),
+            &exact(&program, "linear", &[("M", 4), ("N", 8)]),
         )
         .expect("construction succeeds");
         let c = construct(
             &program,
-            "linear",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 5), ("N", 8)]),
-            BTreeMap::new(),
+            &exact(&program, "linear", &[("M", 5), ("N", 8)]),
         )
         .expect("construction succeeds");
         assert_eq!(a.identity, b.identity);
@@ -1310,135 +1564,45 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_unfinished_and_invalid_graphs() {
-        use super::builder::{GraphBuilder, Ids, PrimitiveSpec, WriteEffect};
-
-        // Sealing with an open region fails.
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder
-            .begin_root(Vec::new())
-            .expect("the root region opens");
-        assert!(builder.seal().is_err(), "a region is still open");
-
-        // A sealable void graph finishes.
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder.begin_root(Vec::new()).expect("root opens");
-        builder
-            .end_region(Vec::new())
-            .expect("a void graph has no results");
-        let (graph, _) = builder.seal().expect("seal succeeds").finish();
-        assert!(graph.results.is_empty());
-
-        // Reading a value that does not dominate the use fails.
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder.begin_root(Vec::new()).expect("root opens");
-        let spec = PrimitiveSpec {
-            op: PrimitiveOp::Constant(crate::sir::Literal::Int(1)),
-            inputs: vec![GraphValueId(99)],
-            reads: Vec::new(),
-            write: None,
-            outputs: vec![Output::Value(ValueType::Scalar(DType::I32))],
-            safety: Vec::new(),
-            span: Span::default(),
-        };
-        assert!(builder.add_primitive(spec).is_err());
-        let _ = builder.end_region(Vec::new());
-
-        // Reading uninitialized storage fails; writes initialize it.
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder.begin_root(Vec::new()).expect("root opens");
-        let storage = builder.declare_storage(
-            TensorType::new(
-                vec![ExtentExpr::Static(4)],
-                crate::types::Elem::Dtype(DType::F32),
+    fn bounded_shapes_become_one_runtime_extent_each() {
+        let program = check(&[("kernel.seismic", KERNEL)]).expect("the kernel checks");
+        let shapes = [
+            (
+                "M".to_string(),
+                ShapeBinding::Bounded {
+                    min: 1,
+                    max: 64,
+                    expected: 16,
+                },
             ),
-            StorageOrigin::Owned,
-            Initialization::Uninitialized,
-        );
-        let token = builder.fresh_state();
-        builder.bind_state(token, storage);
-        builder.set_current_state(storage, token);
-        let view = builder.declare_view(
-            storage,
-            TensorType::new(
-                vec![ExtentExpr::Static(4)],
-                crate::types::Elem::Dtype(DType::F32),
-            ),
-            Access::Exclusive,
-            ViewTransform::Identity,
-        );
-        let value = builder
-            .fresh_value(
-                ValueType::Tensor(TensorType::new(
-                    vec![ExtentExpr::Static(4)],
-                    crate::types::Elem::Dtype(DType::F32),
-                )),
-                Some(view),
-            )
-            .expect("the value is backed by the view");
-        let read = PrimitiveSpec {
-            op: PrimitiveOp::Primitive(PrimitiveId::Materialize),
-            inputs: vec![value],
-            reads: vec![storage],
-            write: None,
-            outputs: Vec::new(),
-            safety: Vec::new(),
-            span: Span::default(),
+            ("N".to_string(), ShapeBinding::Exact(8)),
+        ]
+        .into_iter()
+        .collect();
+        let domain = SpecializationDomain::new(&program, "linear", shapes, BTreeMap::new())
+            .expect("the bounded domain binds every entry parameter");
+        let logical = construct(&program, &target("cpu"), &supports_all, &domain)
+            .expect("construction succeeds");
+        logical.verify().expect("verification succeeds");
+        assert_eq!(logical.shape_fields.len(), 1);
+        let field = logical.shape_field(ShapeFieldId(0));
+        assert_eq!(field.name, "M");
+        assert_eq!(field.expected, 16);
+        let sourced: Vec<&RuntimeExtent> = logical
+            .runtime_extents()
+            .filter(|extent| extent.value == RuntimeScalarExpr::ShapeField(ShapeFieldId(0)))
+            .collect();
+        assert_eq!(sourced.len(), 1);
+        assert_eq!(sourced[0].capacity, 64);
+        assert_eq!(sourced[0].expected, Some(16));
+        // The entry interface retains the runtime extent for `M` and the
+        // static extent for `N`.
+        let entry = logical.choice(logical.entry_choice);
+        let ValueType::Tensor(shape) = &entry.interface.params[0].ty else {
+            panic!("x is a tensor");
         };
-        assert!(
-            builder.add_primitive(read).is_err(),
-            "uninitialized storage cannot be read"
-        );
-        // A whole write initializes the storage; a partial write does not.
-        let write = PrimitiveSpec {
-            op: PrimitiveOp::Primitive(PrimitiveId::Fill {
-                value: 0.0,
-                dtype: DType::F32,
-            }),
-            inputs: Vec::new(),
-            reads: Vec::new(),
-            write: Some(WriteEffect {
-                storage,
-                coverage: Coverage::full(1),
-                atomic: false,
-                initializing: true,
-            }),
-            outputs: Vec::new(),
-            safety: Vec::new(),
-            span: Span::default(),
-        };
-        builder.add_primitive(write).expect("the write initializes");
-        assert_eq!(
-            builder.initialization(storage),
-            &Initialization::FullyInitialized
-        );
-
-        // Branch regions must share parameter schemas.
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder.begin_root(Vec::new()).expect("root opens");
-        let condition = builder
-            .fresh_value(ValueType::Scalar(DType::Bool), None)
-            .expect("the condition allocates");
-        builder.begin_region(Vec::new()).expect("then opens");
-        let then_region = builder.end_region(Vec::new()).expect("then closes");
-        builder
-            .begin_region(vec![RegionParameter::Value {
-                id: condition,
-                ty: ValueType::Scalar(DType::Bool),
-            }])
-            .expect("else opens");
-        let else_region = builder.end_region(Vec::new()).expect("else closes");
-        assert!(builder
-            .add_if(
-                condition,
-                then_region,
-                else_region,
-                Vec::new(),
-                Vec::new(),
-                Span::default()
-            )
-            .is_err());
-        let _ = builder.end_region(Vec::new());
+        assert_eq!(shape.axes[0], ExtentExpr::Runtime(sourced[0].id));
+        assert_eq!(shape.axes[1], ExtentExpr::Static(8));
     }
 
     #[test]
@@ -1452,87 +1616,18 @@ mod tests {
         .expect("the sources check");
         let logical = construct(
             &program,
-            "fill",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 4), ("N", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "fill", &[("M", 4), ("N", 4)]),
         )
         .expect("construction succeeds");
         logical.verify().expect("verification succeeds");
-        let graph = logical.graph(
-            logical
-                .choice(logical.entry_choice)
-                .alternatives
-                .iter()
-                .next()
-                .unwrap()
-                .graph,
-        );
-        let out_storage = graph
-            .storages
-            .iter()
-            .find(|storage| matches!(storage.origin, StorageOrigin::Parameter { .. }))
+        let graph = entry_graph(&logical);
+        let (_, out_storage) = graph
+            .storages()
+            .find(|(_, storage)| matches!(storage.owner, LogicalStorageOwner::Parameter(_)))
             .expect("the output parameter has storage");
         assert_eq!(out_storage.initialization, Initialization::FullyInitialized);
-
-        // The builder-level lattice: a partial write leaves an axis uncovered
-        // and two disjoint partial writes compose to full coverage.
-        use super::builder::{GraphBuilder, Ids, PrimitiveSpec, WriteEffect};
-        let mut builder = GraphBuilder::new(ChoiceId(0), 0, Ids::default());
-        builder.begin_root(Vec::new()).expect("root opens");
-        let storage = builder.declare_storage(
-            TensorType::new(
-                vec![ExtentExpr::Static(2), ExtentExpr::Static(2)],
-                crate::types::Elem::Dtype(DType::F32),
-            ),
-            StorageOrigin::Owned,
-            Initialization::Uninitialized,
-        );
-        let write = |builder: &mut GraphBuilder<Building>, coverage: Coverage| {
-            let spec = PrimitiveSpec {
-                op: PrimitiveOp::Primitive(PrimitiveId::Fill {
-                    value: 0.0,
-                    dtype: DType::F32,
-                }),
-                inputs: Vec::new(),
-                reads: Vec::new(),
-                write: Some(WriteEffect {
-                    storage,
-                    coverage,
-                    atomic: false,
-                    initializing: false,
-                }),
-                outputs: Vec::new(),
-                safety: Vec::new(),
-                span: Span::default(),
-            };
-            builder.add_primitive(spec).expect("the write applies");
-        };
-        let _ = builder.fresh_state();
-        builder.set_current_state(storage, StateTokenId(0));
-        write(
-            &mut builder,
-            Coverage {
-                axes: vec![true, false],
-            },
-        );
-        assert_eq!(
-            builder.initialization(storage),
-            &Initialization::PartiallyInitialized(Coverage {
-                axes: vec![true, false]
-            })
-        );
-        write(
-            &mut builder,
-            Coverage {
-                axes: vec![false, true],
-            },
-        );
-        assert_eq!(
-            builder.initialization(storage),
-            &Initialization::FullyInitialized
-        );
     }
 
     #[test]
@@ -1544,11 +1639,9 @@ mod tests {
         .expect("the sources check");
         let cpu = construct(
             &program,
-            "f",
             &target("cpu"),
             &supports_all,
-            shapes(&[("M", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "f", &[("M", 4)]),
         )
         .expect("construction succeeds on cpu");
         let entry = cpu.choice(cpu.entry_choice);
@@ -1565,11 +1658,9 @@ mod tests {
 
         let metal = construct(
             &program,
-            "f",
             &target("metal"),
             &supports_all,
-            shapes(&[("M", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "f", &[("M", 4)]),
         )
         .expect("the portable body still applies on metal");
         let entry = metal.choice(metal.entry_choice);
@@ -1590,22 +1681,18 @@ mod tests {
         // Supporting the capability: both alternatives apply.
         let logical = construct(
             &program,
-            "g",
             &target("metal"),
             &|_| Ok(()),
-            shapes(&[("M", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "g", &[("M", 4)]),
         )
         .expect("construction succeeds");
         logical.verify().expect("verification succeeds");
         // Rejecting it: the inner occurrence has no implementation.
         let error = construct(
             &program,
-            "g",
             &target("metal"),
             &|_| Err("no subgroup hardware".to_string()),
-            shapes(&[("M", 4)]),
-            BTreeMap::new(),
+            &exact(&program, "g", &[("M", 4)]),
         )
         .expect_err("the capability is absent");
         match error {

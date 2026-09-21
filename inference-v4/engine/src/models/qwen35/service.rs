@@ -25,16 +25,30 @@ enum Sequence {
     Resident(OwnedSequence),
     Evicted,
 }
-fn preparation_error(error: seismic_runtime::Error) -> PrepareError {
+fn preparation_error(error: crate::Error) -> PrepareError {
     match error {
-        seismic_runtime::Error::Capacity {
+        crate::Error::Capacity {
             required,
             available,
         } => PrepareError::Capacity {
             required: required as u64,
             available: available as u64,
         },
-        seismic_runtime::Error::Failure(message) => PrepareError::Fatal(message),
+        crate::Error::Request(message) => PrepareError::Fatal(message),
+        crate::Error::Invocation(failure) => {
+            PrepareError::Fatal(failure.to_string())
+        }
+        crate::Error::Execution(failure) => PrepareError::Fatal(failure.to_string()),
+        crate::Error::LimitBelowCharges { limit, charged } => PrepareError::Fatal(format!(
+            "allocation limit {limit} cannot be below the {charged} retained charged bytes"
+        )),
+        crate::Error::Range {
+            requested,
+            available,
+        } => PrepareError::Fatal(format!(
+            "{requested} bytes requested of a {available}-byte bound range"
+        )),
+        crate::Error::External(failure) => PrepareError::Fatal(failure.to_string()),
     }
 }
 impl QwenExecutor {
@@ -148,7 +162,11 @@ impl Executor for QwenExecutor {
                     .iter()
                     .any(|token| u64::from(token.0) >= self.decoder.geometry().vocabulary)
                 || row.mask.as_ref().is_some_and(|mask| {
-                    mask.len() != (self.decoder.geometry().vocabulary as usize).div_ceil(32)
+                    match usize::try_from(self.decoder.geometry().vocabulary) {
+                        Ok(vocabulary) => mask.len() != vocabulary.div_ceil(32),
+                        // A vocabulary beyond the host index domain admits no mask.
+                        Err(_) => true,
+                    }
                 })
             {
                 return Err(fail("proposal exceeds decoder context or vocabulary"));
@@ -230,13 +248,14 @@ impl Executor for QwenExecutor {
             .join(";"))
     }
     fn reclaim_idle(&mut self) -> Result<u64, String> {
-        Ok(self.decoder.reclaim_idle()? as u64)
+        Ok(self.decoder.reclaim_idle().map_err(|e| e.to_string())? as u64)
     }
     fn reclaimable(&self, requests: &[RequestId]) -> Result<u64, String> {
-        Ok(
-            OwnedSequence::reclaimable(self.decoder.state_store(), &self.selected(requests)?)?
-                as u64,
+        Ok(OwnedSequence::reclaimable(
+            self.decoder.state_store(),
+            &self.selected(requests)?,
         )
+        .map_err(|e| e.to_string())? as u64)
     }
     fn evict(&mut self, requests: &[RequestId]) -> Result<u64, String> {
         let bytes = self.reclaimable(requests)?;

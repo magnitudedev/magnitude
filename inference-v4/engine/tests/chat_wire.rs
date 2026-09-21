@@ -1,4 +1,4 @@
-use seismic_engine::{
+use magnitude_engine::{
     chat::{
         wire::{ModelLimits, Request},
         TemplateBundle, TemplateSelection, TemplateVariant,

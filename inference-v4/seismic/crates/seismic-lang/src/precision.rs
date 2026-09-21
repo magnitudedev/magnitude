@@ -303,6 +303,24 @@ impl NumericalAssessment {
         }
     }
 
+    /// An analytical compiler proof against one concrete bounded policy.
+    /// Unlike sampled qualification, the proof applies to the complete
+    /// observable result and therefore does not carry per-output samples.
+    pub fn proven(
+        validated_policy: PrecisionPolicy,
+        reason: impl Into<String>,
+    ) -> Result<Self, String> {
+        if !matches!(validated_policy, PrecisionPolicy::Bounded { .. }) {
+            return Err("an analytical numerical proof requires a bounded policy".into());
+        }
+        Ok(Self {
+            evidence: EvidenceClass::Proven,
+            validated_policy: Some(validated_policy),
+            outputs: Vec::new(),
+            reasons: vec![reason.into()],
+        })
+    }
+
     pub fn qualified(
         validated_policy: PrecisionPolicy,
         outputs: Vec<OutputAssessment>,
@@ -343,7 +361,7 @@ impl NumericalAssessment {
                     _ => false,
                 };
                 let validated = match self.evidence {
-                    EvidenceClass::Qualified => {
+                    EvidenceClass::Qualified | EvidenceClass::Proven => {
                         self.validated_policy.as_ref().is_some_and(|validated| {
                             policy_is_at_least_as_permissive(policy, validated)
                         })
@@ -352,7 +370,8 @@ impl NumericalAssessment {
                 };
                 evidence_ok
                     && validated
-                    && (self.evidence == EvidenceClass::Exact || !self.outputs.is_empty())
+                    && (matches!(self.evidence, EvidenceClass::Exact | EvidenceClass::Proven)
+                        || !self.outputs.is_empty())
                     && self.outputs.iter().all(|output| {
                         let Some(tolerance) = policy.tolerance(&output.output) else {
                             return false;

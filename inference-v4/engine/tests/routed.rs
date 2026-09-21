@@ -1,7 +1,7 @@
 #[path = "support/reference.rs"]
 mod reference;
 use reference::{allocate, fill, Backend};
-use seismic_engine::models::qwen35::program::program;
+use magnitude_engine::models::qwen35::program::program;
 use seismic_lang::types::{DType, Elem};
 use serde_json::Value;
 use std::collections::HashMap;
