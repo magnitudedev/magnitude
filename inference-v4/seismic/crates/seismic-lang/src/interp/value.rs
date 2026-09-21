@@ -1,128 +1,64 @@
-//! Runtime values of the reference interpreter.
+use super::TensorData;
+use crate::ids::RepresentationId;
 use crate::types::DType;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// A scalar with the dtype it was produced at. Integers and bools are carried exactly.
-pub(super) type S = (DType, f64);
-
-#[derive(Debug)]
-pub struct Dense {
-    pub dtype: DType,
-    pub data: Vec<f64>,
-    pub init: Vec<bool>,
-}
+pub(super) type Scalar = (DType, f64);
 
 #[derive(Clone, Debug)]
-pub enum Backing {
-    /// Index into the interpreter's tensor table. Packed tensors are immutable, so a packed
-    /// snapshot is a descriptor over its tensor.
-    Tensor(usize),
-    Owned(Rc<RefCell<Dense>>),
+pub(super) enum Backing {
+    Argument(usize),
+    Owned(Rc<RefCell<TensorData>>),
 }
 
-/// A strided selection of a backing store. Positions are zero-based.
+/// A logical strided view. Storage representations stay on the backing; a
+/// view never manufactures a second physical interpretation.
 #[derive(Clone, Debug)]
-pub struct Shaped {
-    pub backing: Backing,
-    pub shape: Vec<usize>,
-    pub strides: Vec<usize>,
-    pub offset: usize,
+pub struct TensorValue {
+    pub(super) backing: Backing,
+    pub(super) representation: RepresentationId,
+    pub(super) shape: Vec<usize>,
+    /// Backing-flat position of every logical row-major element. Keeping the
+    /// logical index map explicit makes arbitrary compositions of
+    /// slice/transpose/reshape exact without inventing backend view rules.
+    pub(super) positions: Vec<usize>,
 }
 
-impl Shaped {
-    pub fn tensor(id: usize, shape: &[usize]) -> Shaped {
-        Shaped {
-            backing: Backing::Tensor(id),
+impl TensorValue {
+    pub(super) fn argument(id: usize, representation: RepresentationId, shape: &[usize]) -> Self {
+        Self {
+            backing: Backing::Argument(id),
+            representation,
             shape: shape.to_vec(),
-            strides: row_major(shape),
-            offset: 0,
+            positions: (0..shape.iter().product()).collect(),
         }
     }
 
-    pub fn owned(dtype: DType, shape: Vec<usize>, data: Vec<f64>) -> Shaped {
-        let init = vec![true; data.len()];
-        Shaped::from_dense(shape, Dense { dtype, data, init })
-    }
-
-    pub fn uninit(dtype: DType, shape: Vec<usize>) -> Shaped {
-        let n = shape.iter().product();
-        Shaped::from_dense(
+    pub(super) fn owned(tensor: TensorData) -> Self {
+        let representation = tensor.representation();
+        let shape = tensor.shape().to_vec();
+        Self {
+            backing: Backing::Owned(Rc::new(RefCell::new(tensor))),
+            representation,
+            positions: (0..shape.iter().product()).collect(),
             shape,
-            Dense {
-                dtype,
-                data: vec![f64::NAN; n],
-                init: vec![false; n],
-            },
-        )
-    }
-
-    fn from_dense(shape: Vec<usize>, dense: Dense) -> Shaped {
-        Shaped {
-            strides: row_major(&shape),
-            shape,
-            offset: 0,
-            backing: Backing::Owned(Rc::new(RefCell::new(dense))),
         }
     }
 
-    pub fn count(&self) -> usize {
+    pub fn element_count(&self) -> usize {
         self.shape.iter().product()
     }
 
-    /// Flat backing positions in row-major order of this selection.
-    pub fn flats(&self) -> Vec<usize> {
-        let n = self.count();
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0usize; self.shape.len()];
-        let mut flat = self.offset;
-        for _ in 0..n {
-            out.push(flat);
-            let mut k = idx.len();
-            while k > 0 {
-                k -= 1;
-                idx[k] += 1;
-                flat += self.strides[k];
-                if idx[k] < self.shape[k] {
-                    break;
-                }
-                flat -= self.strides[k] * idx[k];
-                idx[k] = 0;
-            }
-        }
-        out
-    }
-
-    /// Whether this selection is exactly its owned buffer in row-major order, unshared.
-    pub fn exclusive(&self) -> bool {
-        match &self.backing {
-            Backing::Owned(rc) => {
-                Rc::strong_count(rc) == 1
-                    && self.offset == 0
-                    && self.strides == row_major(&self.shape)
-                    && rc.borrow().data.len() == self.count()
-            }
-            Backing::Tensor(_) => false,
-        }
-    }
-
-    pub fn transposed(&self) -> Result<Shaped, String> {
-        if self.shape.len() != 2 {
-            return Err(format!("transpose of a rank-{} value", self.shape.len()));
-        }
-        Ok(Shaped {
-            backing: self.backing.clone(),
-            shape: vec![self.shape[1], self.shape[0]],
-            strides: vec![self.strides[1], self.strides[0]],
-            offset: self.offset,
-        })
+    pub(super) fn flat_positions(&self) -> Vec<usize> {
+        self.positions.clone()
     }
 }
 
 pub(super) fn row_major(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![1usize; shape.len()];
-    for i in (0..shape.len().saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
+    let mut strides = vec![1; shape.len()];
+    for axis in (0..shape.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1];
     }
     strides
 }
@@ -131,39 +67,27 @@ pub(super) fn row_major(shape: &[usize]) -> Vec<usize> {
 pub enum Value {
     Scalar(DType, f64),
     Range(i64, i64),
-    Tensor(Shaped),
+    Tensor(TensorValue),
     Tuple(Vec<Value>),
     Void,
 }
 
 impl Value {
-    pub fn int(v: i64) -> Value {
-        Value::Scalar(DType::I32, v as f64)
+    pub(super) fn scalar(value: Scalar) -> Self {
+        Self::Scalar(value.0, value.1)
     }
 
-    pub fn scalar(s: S) -> Value {
-        Value::Scalar(s.0, s.1)
-    }
-
-    pub fn shaped(&self) -> Option<&Shaped> {
+    pub(super) fn as_scalar(&self) -> Result<Scalar, String> {
         match self {
-            Value::Tensor(s) => Some(s),
-            _ => None,
+            Self::Scalar(dtype, value) => Ok((*dtype, *value)),
+            _ => Err("semantic value is not scalar".to_owned()),
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    pub(super) fn as_tensor(&self) -> Result<&TensorValue, String> {
         match self {
-            Value::Scalar(..) => "a scalar",
-            Value::Range(..) => "a range",
-            Value::Tensor(_) => "a tensor value",
-            Value::Tuple(_) => "a tuple",
-            Value::Void => "void",
+            Self::Tensor(value) => Ok(value),
+            _ => Err("semantic value is not a tensor".to_owned()),
         }
     }
-}
-
-pub(super) enum Flow {
-    Next,
-    Return(Value),
 }

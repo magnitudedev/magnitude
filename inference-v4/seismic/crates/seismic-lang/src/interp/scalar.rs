@@ -1,12 +1,12 @@
-//! Scalar operation semantics: every operation is performed at its dtype and rounded once.
+//! Scalar operation semantics. Ordinary primitives execute at their dtype;
+//! unary reference math evaluates the language-owned ordered primitive recipe.
 use super::round_to;
-use super::value::S;
+use super::value::Scalar;
 use crate::intrinsics::MathOp;
-use crate::numeric::{integer_division_is_defined, integer_shift_is_defined, integer_value};
-use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
+use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::DType;
 
-fn boolean(b: bool) -> S {
+fn boolean(b: bool) -> Scalar {
     (DType::Bool, u8::from(b) as f64)
 }
 
@@ -14,7 +14,20 @@ fn bits(v: f64) -> u32 {
     v as i64 as u32
 }
 
-pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S, String> {
+fn integer_value(dtype: DType, bits: u32) -> i64 {
+    match dtype {
+        DType::I32 => i64::from(bits as i32),
+        DType::U32 => i64::from(bits),
+        _ => unreachable!("checked integer operation has a non-integer dtype"),
+    }
+}
+
+pub(super) fn binary(
+    op: BinaryOp,
+    a: Scalar,
+    b: Scalar,
+    hint: Option<DType>,
+) -> Result<Scalar, String> {
     use BinaryOp::*;
     let comparison = matches!(op, Eq | Ne | Lt | Le | Gt | Ge);
     match (a.0, b.0) {
@@ -47,7 +60,7 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
                 Sub => value((p as u32).wrapping_sub(q as u32)),
                 Mul => value((p as u32).wrapping_mul(q as u32)),
                 Div | Rem => {
-                    if !integer_division_is_defined(d, Some(p), Some(q)) {
+                    if q == 0 || (d == DType::I32 && p == i64::from(i32::MIN) && q == -1) {
                         return Err("integer division by zero or signed overflow".into());
                     }
                     let r = if op == Rem {
@@ -59,7 +72,7 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
                         .ok_or_else(|| "integer division overflow".to_string())
                 }
                 Shl | Shr => {
-                    if !integer_shift_is_defined(Some(q)) {
+                    if !(0..32).contains(&q) {
                         return Err("integer shift count must be in 0..32".into());
                     }
                     value(if op == Shl {
@@ -104,7 +117,7 @@ pub(super) fn binary(op: BinaryOp, a: S, b: S, hint: Option<DType>) -> Result<S,
     }
 }
 
-pub(super) fn unary(op: UnaryOp, a: S) -> Result<S, String> {
+pub(super) fn unary(op: UnaryOp, a: Scalar) -> Result<Scalar, String> {
     match (op, a.0) {
         (UnaryOp::Neg, d) if d.is_float() => Ok((d, -a.1)),
         (UnaryOp::Neg, d) if d.is_int() => {
@@ -118,7 +131,7 @@ pub(super) fn unary(op: UnaryOp, a: S) -> Result<S, String> {
 
 /// Integer-to-integer casts preserve bits; everything else converts by value with the
 /// destination's rounding (saturating for float-to-integer).
-pub(super) fn cast(to: DType, a: S) -> S {
+pub(super) fn cast(to: DType, a: Scalar) -> Scalar {
     if a.0.is_int() && to.is_int() {
         (to, integer_value(to, bits(a.1)) as f64)
     } else {
@@ -126,26 +139,7 @@ pub(super) fn cast(to: DType, a: S) -> S {
     }
 }
 
-pub(super) fn assign(op: AssignOp, current: S, value: S) -> Result<S, String> {
-    let op = match op {
-        AssignOp::Assign => return Ok(cast(current.0, value)),
-        AssignOp::Add => BinaryOp::Add,
-        AssignOp::Sub => BinaryOp::Sub,
-        AssignOp::Mul => BinaryOp::Mul,
-    };
-    let (d, x) = (current.0, current.1);
-    if d.is_int() {
-        return Ok(cast(d, binary(op, (d, x), cast(d, value), Some(d))?));
-    }
-    let r = match op {
-        BinaryOp::Add => x + value.1,
-        BinaryOp::Sub => x - value.1,
-        _ => x * value.1,
-    };
-    Ok((d, round_to(d, r)))
-}
-
-pub(super) fn math(op: MathOp, args: &[S]) -> Result<S, String> {
+pub(super) fn math(op: MathOp, args: &[Scalar]) -> Result<Scalar, String> {
     let arity = if op == MathOp::Fma {
         3
     } else if matches!(op, MathOp::Max | MathOp::Min) {
@@ -170,22 +164,43 @@ pub(super) fn math(op: MathOp, args: &[S]) -> Result<S, String> {
                 (d, round_to(d, a.mul_add(b, c)))
             }
         }
-        MathOp::Exp | MathOp::ExpFast => (d, round_to(d, a.exp())),
-        MathOp::Rsqrt => (d, round_to(d, 1.0 / a.sqrt())),
-        MathOp::Sqrt => (d, round_to(d, a.sqrt())),
-        MathOp::Log => (d, round_to(d, a.ln())),
-        MathOp::Sin => (d, round_to(d, a.sin())),
-        MathOp::Cos => (d, round_to(d, a.cos())),
+        MathOp::Exp | MathOp::Rsqrt | MathOp::Sqrt | MathOp::Log | MathOp::Sin | MathOp::Cos => {
+            reference_math(op, d, a)
+        }
+        // `exp_fast` is explicitly approximate and is never admitted as a
+        // reference recipe operation.
+        MathOp::ExpFast => (d, round_to(d, a.exp())),
         MathOp::Abs => {
             if d == DType::I32 {
                 (d, f64::from((a as i32).wrapping_abs()))
             } else if d.is_int() {
                 (d, a)
             } else {
-                (d, round_to(d, a.abs()))
+                reference_math(op, d, a)
             }
         }
         MathOp::Max => (d, a.max(args[1].1)),
         MathOp::Min => (d, a.min(args[1].1)),
     })
+}
+
+fn reference_math(op: MathOp, dtype: DType, value: f64) -> Scalar {
+    use super::tensor::{bf16_round, f16_bits, f16_to_f32};
+    use crate::reference_math::{evaluate, recipe, ReferenceMathOp, ReferenceScalar};
+    let input = match dtype {
+        DType::F16 => ReferenceScalar::F16(f16_bits(value as f32)),
+        DType::BF16 => ReferenceScalar::BF16((bf16_round(value as f32).to_bits() >> 16) as u16),
+        DType::F32 => ReferenceScalar::F32((value as f32).to_bits()),
+        _ => unreachable!("reference transcendental input is not floating"),
+    };
+    let op = ReferenceMathOp::try_from(op)
+        .unwrap_or_else(|()| unreachable!("non-reference operation reached reference evaluator"));
+    let output = evaluate(&recipe(op, dtype), input);
+    let value = match output {
+        ReferenceScalar::F16(bits) => f16_to_f32(bits) as f64,
+        ReferenceScalar::BF16(bits) => f32::from_bits(u32::from(bits) << 16) as f64,
+        ReferenceScalar::F32(bits) => f32::from_bits(bits) as f64,
+        _ => unreachable!("reference transcendental output is not floating"),
+    };
+    (dtype, value)
 }

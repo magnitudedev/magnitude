@@ -27,28 +27,22 @@ enum Sequence {
 }
 fn preparation_error(error: crate::Error) -> PrepareError {
     match error {
-        crate::Error::Capacity {
+        crate::Error::Call(seismic::CallError::Invocation(
+            seismic::InvocationError::AllocationCapacity {
+                required,
+                available,
+            },
+        )) => PrepareError::Capacity {
             required,
             available,
-        } => PrepareError::Capacity {
-            required: required as u64,
-            available: available as u64,
         },
         crate::Error::Request(message) => PrepareError::Fatal(message),
-        crate::Error::Invocation(failure) => {
-            PrepareError::Fatal(failure.to_string())
-        }
+        crate::Error::Target(failure) => PrepareError::Fatal(failure.to_string()),
+        crate::Error::Load(failure) => PrepareError::Fatal(failure.to_string()),
+        crate::Error::Call(failure) => PrepareError::Fatal(failure.to_string()),
+        crate::Error::Tensor(failure) => PrepareError::Fatal(failure.to_string()),
+        crate::Error::MemoryLimit(failure) => PrepareError::Fatal(failure.to_string()),
         crate::Error::Execution(failure) => PrepareError::Fatal(failure.to_string()),
-        crate::Error::LimitBelowCharges { limit, charged } => PrepareError::Fatal(format!(
-            "allocation limit {limit} cannot be below the {charged} retained charged bytes"
-        )),
-        crate::Error::Range {
-            requested,
-            available,
-        } => PrepareError::Fatal(format!(
-            "{requested} bytes requested of a {available}-byte bound range"
-        )),
-        crate::Error::External(failure) => PrepareError::Fatal(failure.to_string()),
     }
 }
 impl QwenExecutor {
@@ -251,11 +245,10 @@ impl Executor for QwenExecutor {
         Ok(self.decoder.reclaim_idle().map_err(|e| e.to_string())? as u64)
     }
     fn reclaimable(&self, requests: &[RequestId]) -> Result<u64, String> {
-        Ok(OwnedSequence::reclaimable(
-            self.decoder.state_store(),
-            &self.selected(requests)?,
+        Ok(
+            OwnedSequence::reclaimable(self.decoder.state_store(), &self.selected(requests)?)
+                .map_err(|e| e.to_string())? as u64,
         )
-        .map_err(|e| e.to_string())? as u64)
     }
     fn evict(&mut self, requests: &[RequestId]) -> Result<u64, String> {
         let bytes = self.reclaimable(requests)?;

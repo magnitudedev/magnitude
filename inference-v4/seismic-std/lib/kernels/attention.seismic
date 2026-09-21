@@ -7,8 +7,8 @@ fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] A, vt: &tens
     for i in 0..M:
         for j in 0..K:
             seed[i, j] = 0.0
-    let mut s = matmul(to_owned(qt), to_owned(kt), seed)
-    let rowmax = reduce(f32(s), 1, max)
+    let mut s = matmul(qt, kt, seed)
+    let rowmax = reduce(s, 1, max)
     let mut m2 = tensor[M] f32
     for i in 0..M:
         m2[i] = max(m[i], rowmax[i] * scale)
@@ -18,7 +18,7 @@ fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] A, vt: &tens
     let mut a = tensor[M] f32
     for i in 0..M:
         a[i] = exp(m[i] - m2[i])
-    let rowsum = reduce(f32(s), 1, sum)
+    let rowsum = reduce(s, 1, sum)
     for i in 0..M:
         l[i] = fma(l[i], a[i], rowsum[i])
     for i in 0..M:
@@ -34,14 +34,14 @@ fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] A, vt: &tens
     for i in 0..M:
         m[i] = m2[i]
 
-# Causal attention over grouped query heads. Each visible range is a logical
-# algorithmic window, independent of compiler partitioning. Empty history has no
-# update effect; decoding consumes the fresh dense row before cache-codec rounding.
+# Attention over grouped query heads against a resident history. Each row sees one
+# logical window `visible[row] = [lo, hi)` of the history, independent of compiler
+# partitioning. An empty window has no update effect.
 fn attention[Q, T, H, KV, W](q: &tensor[Q, H, W] A, k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
-                                    visible: &tensor[Q, 2] i32, result: &mut tensor[Q, H, W] A, scale: f32):
+                             visible: &tensor[Q, 2] i32, result: &mut tensor[Q, H, W] A, scale: f32):
     parallel for rows in 0..Q:
         parallel for kv_heads in 0..KV:
-            let qt = load(q[rows, kv_heads * (H / KV) : (kv_heads + 1) * (H / KV)])
+            let qt = q[rows, kv_heads * (H / KV) : (kv_heads + 1) * (H / KV)]
             let mut m = tensor[H / KV] f32
             let mut l = tensor[H / KV] f32
             let mut acc = tensor[H / KV, W] f32
@@ -54,44 +54,40 @@ fn attention[Q, T, H, KV, W](q: &tensor[Q, H, W] A, k: &tensor[T, KV, W] A, v: &
                     acc[i, j] = 0.0
             let lo = visible[rows, 0]
             let hi = visible[rows, 1]
-            let kt = load(k[lo : hi, kv_heads])
-            let vt = load(v[lo : hi, kv_heads])
-            if extent(kt, 0) > 0:
-                attention_update(qt, kt, vt, m, l, acc, scale)
+            if hi > lo:
+                attention_update(qt, k[lo : hi, kv_heads], v[lo : hi, kv_heads], m, l, acc, scale)
             let mut y = tensor[H / KV, W] f32
             for i in 0..H / KV:
                 for j in 0..W:
                     y[i, j] = acc[i, j] / l[i]
             result[rows, kv_heads * (H / KV) : (kv_heads + 1) * (H / KV)] = y
 
-# Decode attends to the previously visible history plus the new dense row. Fresh
-# inputs do not acquire history-codec rounding before their first consumption.
-fn attention_decode[T, G, KV, W](q: &tensor[1, KV * G, W] A, k: &tensor[T, KV, W] A,
-    v: &tensor[T, KV, W] A, fresh_key: &tensor[1, KV, W] A, fresh_value: &tensor[1, KV, W] A,
-    visible: &tensor[1, 2] i32, result: &mut tensor[1, KV * G, W] A, scale: f32):
-    parallel for kv_heads in 0..KV:
-        let qt = load(q[0, kv_heads * G : (kv_heads + 1) * G])
-        let mut m = tensor[G] f32
-        let mut l = tensor[G] f32
-        let mut acc = tensor[G, W] f32
-        for i in 0..G:
-            m[i] = -inf
-        for i in 0..G:
-            l[i] = 0.0
-        for i in 0..G:
-            for j in 0..W:
-                acc[i, j] = 0.0
-        let lo = visible[0, 0]
-        let hi = visible[0, 1]
-        let kt = load(k[lo : hi, kv_heads])
-        let vt = load(v[lo : hi, kv_heads])
-        if extent(kt, 0) > 0:
-            attention_update(qt, kt, vt, m, l, acc, scale)
-        let fresh_kt = load(fresh_key[0 : 1, kv_heads])
-        let fresh_vt = load(fresh_value[0 : 1, kv_heads])
-        attention_update(qt, fresh_kt, fresh_vt, m, l, acc, scale)
-        let mut y = tensor[G, W] f32
-        for i in 0..G:
-            for j in 0..W:
-                y[i, j] = acc[i, j] / l[i]
-        result[0, kv_heads * G : (kv_heads + 1) * G] = y
+# Attention for M fresh rows appended after a resident history: each row attends to
+# its R visible history windows and causally to the fresh keys and values up to and
+# including itself. Fresh inputs do not acquire history-codec rounding before their
+# first consumption; a single decode row is the M = 1, R = 1 case.
+fn attention_append[M, T, G, KV, W, R](q: &tensor[M, KV * G, W] A, k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
+    fresh_key: &tensor[M, KV, W] A, fresh_value: &tensor[M, KV, W] A,
+    visible: &tensor[M, R, 2] i32, result: &mut tensor[M, KV * G, W] A, scale: f32):
+    parallel for rows in 0..M:
+        parallel for kv_heads in 0..KV:
+            let qt = q[rows, kv_heads * G : (kv_heads + 1) * G]
+            let mut m = tensor[G] f32
+            let mut l = tensor[G] f32
+            let mut acc = tensor[G, W] f32
+            for i in 0..G:
+                m[i] = -inf
+                l[i] = 0.0
+                for j in 0..W:
+                    acc[i, j] = 0.0
+            for span in 0..R:
+                let lo = visible[rows, span, 0]
+                let hi = visible[rows, span, 1]
+                if hi > lo:
+                    attention_update(qt, k[lo : hi, kv_heads], v[lo : hi, kv_heads], m, l, acc, scale)
+            attention_update(qt, fresh_key[0 : rows + 1, kv_heads], fresh_value[0 : rows + 1, kv_heads], m, l, acc, scale)
+            let mut y = tensor[G, W] f32
+            for i in 0..G:
+                for j in 0..W:
+                    y[i, j] = acc[i, j] / l[i]
+            result[rows, kv_heads * G : (kv_heads + 1) * G] = y

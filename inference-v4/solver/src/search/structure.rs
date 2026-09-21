@@ -112,9 +112,20 @@ impl Structure {
                             result,
                         } => s.derive(&[left.0, right.0], &[result.0], &mut derived),
                     },
-                    Constraint::BoolAnd { output, inputs } => s.derive(
+                    Constraint::BoolAnd { output, inputs }
+                    | Constraint::BoolOr { output, inputs } => s.derive(
                         &inputs.iter().map(|v| v.0).collect::<Vec<_>>(),
                         &[output.0],
+                        &mut derived,
+                    ),
+                    Constraint::BoolNot { output, input } => {
+                        s.derive(&[input.0], &[output.0], &mut derived)
+                    }
+                    Constraint::ReifiedLinearLe {
+                        indicator, terms, ..
+                    } => s.derive(
+                        &terms.iter().map(|term| term.variable.0).collect::<Vec<_>>(),
+                        &[indicator.0],
                         &mut derived,
                     ),
                     Constraint::InactiveValue {

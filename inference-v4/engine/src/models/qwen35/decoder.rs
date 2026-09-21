@@ -1,133 +1,194 @@
-//! Qwen sequence forwards and multi-request generation. Sequence successors
-//! remain private until shared completion and independent request acceptance.
-//! Every numerical composition is prepared once, eagerly, under the decoder's
-//! declared workload envelope; a forward selects prepared capacity classes
-//! and never compiles.
+//! Qwen sequence execution through generated Seismic bindings. Runtime tensor
+//! descriptors are the complete specialization domain; the engine owns no
+//! compiler plans, shape envelopes, capacity classes, or raw backend buffers.
+
 mod conditioning;
-mod packed;
+
 use super::{Description, FeedForwardWeights, Geometry, HeadMapping, MixerWeights};
 use crate::{
-    execution::{self, StageBatch},
     generation::{
         sampling::{Sampler, Selection},
         Proposal, Sampling,
     },
+    kernels,
     models::sequence::{Advance, OwnedSequence, SequenceWork},
-    preparation::{
-        CompositionSpec, EnvelopeShape, IntegerRange, PreparedComposition, PreparationSession,
-        Settings, WorkloadEnvelope,
-    },
-    state::{ComponentSpec, SequenceState, StateAdvance, StateStore},
+    state::{AdvanceBindings, ComponentSpec, SequenceState, StateAdvance, StateStore},
     weights::{descriptor::WeightDescriptor, residency::ResidentWeight},
     Error,
 };
-use conditioning::{Conditioning, PreparedOverlay};
-use seismic_lang::types::{DType, Elem};
-use seismic_runtime::{plan::InvocationResults, Buffer, Device, ExecutionObservation};
+use conditioning::{Conditioning, Overlay};
+use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor, Workflow};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{hash_map::Entry as HashEntry, HashMap},
     rc::Rc,
+    time::Instant,
 };
-fn names(xs: &[&str]) -> HashSet<String> {
-    xs.iter().map(|s| (*s).into()).collect()
-}
-fn weights(xs: Vec<(&str, ResidentWeight)>) -> HashMap<String, ResidentWeight> {
-    xs.into_iter().map(|(n, w)| (n.into(), w)).collect()
-}
-fn scalar(xs: &[(&str, f64)]) -> HashMap<String, f64> {
-    xs.iter().map(|(n, v)| ((*n).into(), *v)).collect()
-}
-fn exact(value: u64) -> EnvelopeShape {
-    EnvelopeShape::Exact(value)
-}
-fn varying(capacity: u64) -> EnvelopeShape {
-    EnvelopeShape::Bounded {
-        min: 1,
-        max: capacity,
-        expected: 1,
-    }
-}
-/// The declared decoder workload envelope: what invocations the prepared
-/// decoder must admit. Context capacity bounds forward rows and rotary
-/// positions; `max_ranges` bounds attention visibility fragmentation;
-/// `readout_capacity` bounds selected-row readouts. Packed row capacity is
-/// `max_sequences * context_capacity`.
-pub struct DecoderWorkload {
+
+/// Model-state capacity, not a compiler specialization envelope.
+pub struct DecoderCapacity {
     pub context_capacity: usize,
     pub max_sequences: usize,
-    pub max_ranges: usize,
-    pub readout_capacity: usize,
 }
+
+struct Embedding {
+    kernel: Kernel<kernels::qwen_embedding_rows::Entry>,
+    table: ResidentWeight,
+}
+
+struct Attention {
+    kernel: Kernel<kernels::qwen_attention_sequence::Entry>,
+    input_norm: ResidentWeight,
+    query_gate: ResidentWeight,
+    key: ResidentWeight,
+    value: ResidentWeight,
+    query_norm: ResidentWeight,
+    key_norm: ResidentWeight,
+    output: ResidentWeight,
+    rotary_components: Tensor,
+    base: f32,
+    epsilon: f32,
+    scale: f32,
+}
+
+struct Recurrent {
+    kernel: Kernel<kernels::qwen_recurrent_sequence::Entry>,
+    input_norm: ResidentWeight,
+    qkv: ResidentWeight,
+    gate: ResidentWeight,
+    alpha: ResidentWeight,
+    beta: ResidentWeight,
+    convolution: ResidentWeight,
+    rate: ResidentWeight,
+    time_bias: ResidentWeight,
+    norm: ResidentWeight,
+    output: ResidentWeight,
+    epsilon: f32,
+    preparation_epsilon: f32,
+    grouped: bool,
+}
+
+enum Mixer {
+    Attention(Attention),
+    Recurrent(Recurrent),
+}
+
+struct Dense {
+    kernel: Kernel<kernels::qwen_dense_suffix::Entry>,
+    norm: ResidentWeight,
+    gate: ResidentWeight,
+    up: ResidentWeight,
+    down: ResidentWeight,
+    epsilon: f32,
+}
+
+struct Routed {
+    kernel: Kernel<kernels::qwen_routed_suffix::Entry>,
+    selected: u64,
+    norm: ResidentWeight,
+    router: ResidentWeight,
+    shared_router: ResidentWeight,
+    expert_gate: ResidentWeight,
+    expert_up: ResidentWeight,
+    expert_down: ResidentWeight,
+    shared_gate: ResidentWeight,
+    shared_up: ResidentWeight,
+    shared_down: ResidentWeight,
+    epsilon: f32,
+    normalize: bool,
+}
+
+enum FeedForward {
+    Dense(Dense),
+    Routed(Routed),
+}
+
 struct Block {
-    mixer: PreparedComposition,
-    feedforward: PreparedComposition,
+    mixer: Mixer,
+    feedforward: FeedForward,
     state_index: usize,
-    attention: bool,
 }
+
+struct ReadoutKernels {
+    rows: Kernel<kernels::qwen_readout_rows::Entry>,
+    selected: Kernel<kernels::qwen_readout_selected::Entry>,
+    norm: ResidentWeight,
+    weight: ResidentWeight,
+    epsilon: f32,
+}
+
 struct Rows {
-    hidden: Buffer,
-    logits: Buffer,
-    coordinates: Buffer,
-    visible: Buffer,
-    tokens: Buffer,
-    destinations: Buffer,
+    logits: Tensor,
+    coordinates: Tensor,
+    visible: Tensor,
+    tokens: Tensor,
+    destinations: Tensor,
 }
+
 struct SelectedRows {
-    ids: Buffer,
-    logits: Buffer,
+    ids: Tensor,
+    logits: Tensor,
 }
+
+enum PendingReadout {
+    Rows(kernels::qwen_readout_rows::WorkflowResults),
+    Selected(kernels::qwen_readout_selected::WorkflowResults),
+}
+
 pub struct Decoder {
     geometry: Geometry,
     store: Rc<StateStore>,
     device: Rc<Device>,
     conditioning: Conditioning,
     context_capacity: usize,
-    max_ranges: usize,
-    packed_rows: u64,
-    embedding: PreparedComposition,
+    embedding: Embedding,
     blocks: Vec<Block>,
-    readout: PreparedComposition,
-    selected: PreparedComposition,
+    readout: ReadoutKernels,
     sampler: Sampler,
     rows: HashMap<(usize, usize), Rows>,
     selected_rows: HashMap<usize, SelectedRows>,
-    packed: HashMap<usize, packed::PackedBuffers>,
 }
+
+#[derive(Clone, Debug)]
+pub struct StageExecutionObservation {
+    pub host_seconds: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct DecoderStepObservation {
     pub stage: String,
     pub block: Option<usize>,
     pub entry: String,
-    pub execution: ExecutionObservation,
+    pub execution: StageExecutionObservation,
 }
+
+#[derive(Clone, Debug)]
+pub struct DecoderBatchObservation {
+    pub host_seconds: f64,
+}
+
 struct ConditionedInput<'a> {
     coordinates: &'a [[i32; 4]],
-    overlays: &'a [PreparedOverlay],
+    overlays: &'a [Overlay],
 }
-fn forward_shapes(count: usize) -> BTreeMap<String, u64> {
-    BTreeMap::from([("M".into(), count as u64)])
+
+fn element(dtype: DType) -> Element {
+    Element::dense(dtype)
 }
-fn attention_shapes(count: usize, ranges: usize) -> BTreeMap<String, u64> {
-    BTreeMap::from([("M".into(), count as u64), ("R".into(), ranges as u64)])
+
+fn shape(value: usize, what: &str) -> Result<u64, Error> {
+    u64::try_from(value).map_err(|_| format!("{what} exceeds the Seismic shape domain").into())
 }
-fn selected_shapes(count: usize, ids: usize) -> BTreeMap<String, u64> {
-    BTreeMap::from([("M".into(), count as u64), ("S".into(), ids as u64)])
+
+fn tensor_bytes(values: impl IntoIterator<Item = i32>) -> Vec<u8> {
+    values
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>()
 }
-fn row_hidden_bytes(geometry: &Geometry) -> Result<usize, Error> {
-    usize::try_from(geometry.hidden)
-        .ok()
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| "residual allocation overflow".into())
-}
-fn logits_bytes(geometry: &Geometry) -> Result<usize, Error> {
-    usize::try_from(geometry.vocabulary)
-        .ok()
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| "logits allocation overflow".into())
-}
+
 fn rows_entry<'a>(
     geometry: &Geometry,
-    device: &Rc<Device>,
+    device: &Device,
     rows: &'a mut HashMap<(usize, usize), Rows>,
     count: usize,
     ranges: usize,
@@ -136,82 +197,194 @@ fn rows_entry<'a>(
     if count == 0 || ranges == 0 || count > context_capacity {
         return Err("invalid forward row count".into());
     }
-    if !rows.contains_key(&(count, ranges)) {
-        let bytes = |width: usize| count.checked_mul(width).ok_or("forward buffer overflow");
-        let visible_width = ranges
-            .checked_mul(8)
-            .ok_or("visibility buffer overflow")?;
-        let allocated = Rows {
-            hidden: device.buffer(bytes(row_hidden_bytes(geometry)?)?)?,
-            logits: device.buffer(logits_bytes(geometry)?)?,
-            coordinates: device.buffer(bytes(16)?)?,
-            visible: device.buffer(bytes(visible_width)?)?,
-            tokens: device.buffer(bytes(4)?)?,
-            destinations: device.buffer(bytes(4)?)?,
-        };
-        rows.insert((count, ranges), allocated);
+    match rows.entry((count, ranges)) {
+        HashEntry::Occupied(entry) => Ok(entry.into_mut()),
+        HashEntry::Vacant(entry) => {
+            let m = shape(count, "forward row count")?;
+            let r = shape(ranges, "visibility range count")?;
+            Ok(entry.insert(Rows {
+                logits: Tensor::zeros(device, Element::f32(), &[1, geometry.vocabulary])?,
+                coordinates: Tensor::zeros(device, Element::i32(), &[m, 4])?,
+                visible: Tensor::zeros(device, Element::i32(), &[m, r, 2])?,
+                tokens: Tensor::zeros(device, Element::i32(), &[m])?,
+                destinations: Tensor::zeros(device, Element::i32(), &[m])?,
+            }))
+        }
     }
-    Ok(rows.get_mut(&(count, ranges)).expect("row buffers prepared"))
 }
+
 fn selected_entry<'a>(
-    device: &Rc<Device>,
-    context_capacity: usize,
+    device: &Device,
     selected: &'a mut HashMap<usize, SelectedRows>,
     ids: usize,
 ) -> Result<&'a mut SelectedRows, Error> {
-    if ids == 0 || ids > context_capacity {
-        return Err("selected readout size exceeds the prepared envelope".into());
+    if ids == 0 {
+        return Err("selected readout must contain at least one id".into());
     }
-    if !selected.contains_key(&ids) {
-        let bytes = ids
-            .checked_mul(4)
-            .ok_or("selected readout size overflow")?;
-        selected.insert(
-            ids,
-            SelectedRows {
-                ids: device.buffer(bytes)?,
-                logits: device.buffer(bytes)?,
-            },
-        );
+    match selected.entry(ids) {
+        HashEntry::Occupied(entry) => Ok(entry.into_mut()),
+        HashEntry::Vacant(entry) => {
+            let extent = shape(ids, "selected readout size")?;
+            Ok(entry.insert(SelectedRows {
+                ids: Tensor::zeros(device, Element::i32(), &[extent])?,
+                logits: Tensor::zeros(device, Element::f32(), &[1, extent])?,
+            }))
+        }
     }
-    Ok(selected.get_mut(&ids).expect("selection prepared"))
 }
-fn execute_stage(
-    composition: &PreparedComposition,
-    shapes: &BTreeMap<String, u64>,
-    tensors: &HashMap<String, Buffer>,
+
+fn observed<T>(
+    observations: &mut Option<Vec<DecoderStepObservation>>,
     stage: &str,
     block: Option<usize>,
-    observations: &mut Option<Vec<DecoderStepObservation>>,
-    batch: &mut Option<StageBatch>,
-) -> Result<InvocationResults, Error> {
-    let invocation = execution::invoke(composition, shapes, tensors, &HashMap::new())?;
-    let results = execution::result_planes(&invocation);
-    let entry = composition.entry().to_string();
-    if let Some(batch) = batch {
-        batch.add(invocation);
-    } else if let Some(observations) = observations {
-        let (_, observation) = execution::run_observed(invocation)?;
+    entry: &str,
+    call: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let started = Instant::now();
+    let result = call()?;
+    if let Some(observations) = observations {
         observations.push(DecoderStepObservation {
             stage: stage.into(),
             block,
-            entry,
-            execution: observation,
+            entry: entry.into(),
+            execution: StageExecutionObservation {
+                host_seconds: started.elapsed().as_secs_f64(),
+            },
         });
-    } else {
-        execution::run(invocation)?;
     }
-    Ok(results)
+    Ok(result)
 }
-fn result_buffer(results: &InvocationResults, path: &[u32]) -> Result<Buffer, Error> {
-    execution::result_buffer(results, path).map_err(Error::from)
+
+impl Embedding {
+    fn execute(&self, tokens: &Tensor) -> Result<Tensor, Error> {
+        Ok(self
+            .kernel
+            .call(kernels::qwen_embedding_rows::Args {
+                table: self.table.tensor(),
+                tokens,
+            })?
+            .value)
+    }
 }
-/// Explicit numerical output; state-only execution omits the vocabulary projection.
+
+impl Block {
+    fn attention(&self) -> bool {
+        matches!(self.mixer, Mixer::Attention(_))
+    }
+
+    fn mix(
+        &self,
+        hidden: &Tensor,
+        rows: &Rows,
+        transition: AdvanceBindings<'_>,
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>), Error> {
+        match &self.mixer {
+            Mixer::Attention(mixer) => {
+                let index = self.state_index;
+                let mut history_key = transition.history[index].clone();
+                let mut history_value = transition.history[index + 1].clone();
+                let result = mixer.kernel.call(kernels::qwen_attention_sequence::Args {
+                    hidden,
+                    input_norm: mixer.input_norm.tensor(),
+                    query_gate_weight: mixer.query_gate.tensor(),
+                    key_weight: mixer.key.tensor(),
+                    value_weight: mixer.value.tensor(),
+                    query_norm: mixer.query_norm.tensor(),
+                    key_norm: mixer.key_norm.tensor(),
+                    output_weight: mixer.output.tensor(),
+                    coordinates: &rows.coordinates,
+                    rotary_components: &mixer.rotary_components,
+                    visible: &rows.visible,
+                    history_key: &mut history_key,
+                    history_value: &mut history_value,
+                    destinations: &rows.destinations,
+                    base: mixer.base,
+                    epsilon: mixer.epsilon,
+                    scale: mixer.scale,
+                })?;
+                Ok((result.value, Vec::new()))
+            }
+            Mixer::Recurrent(mixer) => {
+                let index = self.state_index;
+                let result = mixer.kernel.call(kernels::qwen_recurrent_sequence::Args {
+                    hidden,
+                    input_norm: mixer.input_norm.tensor(),
+                    qkv_weight: mixer.qkv.tensor(),
+                    gate_weight: mixer.gate.tensor(),
+                    alpha_weight: mixer.alpha.tensor(),
+                    beta_weight: mixer.beta.tensor(),
+                    convolution: mixer.convolution.tensor(),
+                    rate: mixer.rate.tensor(),
+                    time_bias: mixer.time_bias.tensor(),
+                    recurrent_norm: mixer.norm.tensor(),
+                    output_weight: mixer.output.tensor(),
+                    window: &transition.previous[index],
+                    delta: &transition.previous[index + 1],
+                    epsilon: mixer.epsilon,
+                    preparation_epsilon: mixer.preparation_epsilon,
+                    grouped: mixer.grouped,
+                })?;
+                Ok((result.r2, vec![(index, result.r0), (index + 1, result.r1)]))
+            }
+        }
+    }
+
+    fn feedforward(&self, residual: &Tensor) -> Result<Tensor, Error> {
+        match &self.feedforward {
+            FeedForward::Dense(feedforward) => Ok(feedforward
+                .kernel
+                .call(kernels::qwen_dense_suffix::Args {
+                    residual,
+                    norm: feedforward.norm.tensor(),
+                    gate_weight: feedforward.gate.tensor(),
+                    up_weight: feedforward.up.tensor(),
+                    down_weight: feedforward.down.tensor(),
+                    eps: feedforward.epsilon,
+                })?
+                .r6),
+            FeedForward::Routed(feedforward) => {
+                let rows = *residual
+                    .extents()
+                    .first()
+                    .ok_or("routed residual tensor has no row axis")?;
+                let mut routes = Tensor::zeros(
+                    &residual.device(),
+                    Element::i32(),
+                    &[rows, feedforward.selected],
+                )?;
+                let mut scores = Tensor::zeros(
+                    &residual.device(),
+                    Element::f32(),
+                    &[rows, feedforward.selected],
+                )?;
+                Ok(feedforward
+                    .kernel
+                    .call(kernels::qwen_routed_suffix::Args {
+                        residual,
+                        norm: feedforward.norm.tensor(),
+                        router: feedforward.router.tensor(),
+                        shared_router: feedforward.shared_router.tensor(),
+                        expert_gate: feedforward.expert_gate.tensor(),
+                        expert_up: feedforward.expert_up.tensor(),
+                        expert_down: feedforward.expert_down.tensor(),
+                        shared_gate: feedforward.shared_gate.tensor(),
+                        shared_up: feedforward.shared_up.tensor(),
+                        shared_down: feedforward.shared_down.tensor(),
+                        routes: &mut routes,
+                        scores: &mut scores,
+                        eps: feedforward.epsilon,
+                        normalize: i32::from(feedforward.normalize),
+                    })?
+                    .r14)
+            }
+        }
+    }
+}
+
+/// Explicit numerical output; state-only execution omits vocabulary projection.
 pub enum Readout<'a> {
     StateOnly,
     Logits,
-    /// Final-row logits in exactly this order. Duplicates are retained; an empty
-    /// selection advances state without projecting any vocabulary rows.
     Selected(&'a [u32]),
     Sample {
         mask: Option<&'a [u32]>,
@@ -220,6 +393,7 @@ pub enum Readout<'a> {
         position: usize,
     },
 }
+
 #[derive(Debug)]
 pub enum ReadoutOutput {
     StateOnly,
@@ -227,6 +401,7 @@ pub enum ReadoutOutput {
     Selected(Vec<f32>),
     Sample(Selection),
 }
+
 fn generation_selection(output: &ReadoutOutput) -> Result<Option<crate::inputs::TokenId>, String> {
     match output {
         ReadoutOutput::Sample(Selection::Token(token)) => Ok(Some(*token)),
@@ -240,6 +415,7 @@ fn generation_selection(output: &ReadoutOutput) -> Result<Option<crate::inputs::
         }
     }
 }
+
 pub struct ExecutedAdvance<'a> {
     advance: StateAdvance<'a>,
     output: ReadoutOutput,
@@ -255,6 +431,7 @@ impl ExecutedAdvance<'_> {
         self.advance.abort();
     }
 }
+
 pub struct ConditionedAdvance<'a> {
     advance: ExecutedAdvance<'a>,
     input: &'a mut super::inputs::InputState,
@@ -273,6 +450,7 @@ impl ConditionedAdvance<'_> {
         self.advance.abort();
     }
 }
+
 pub struct DecodedAdvance<'a> {
     advance: StateAdvance<'a>,
     logits: Vec<f32>,
@@ -299,15 +477,404 @@ impl DecodedAdvance<'_> {
         self.advance.abort();
     }
 }
-/// Logical members of one numerical preparation; masks are request-local.
+
 pub struct GenerationWork<'a, S = ()> {
     pub sequence: &'a OwnedSequence<S>,
     pub proposal: &'a Proposal,
     pub mask: Option<&'a [u32]>,
 }
+
 impl Decoder {
-    /// Reserve every sequence successor before executing any member. Selection
-    /// outcomes remain independent after all synchronous execution completes.
+    pub fn compile(
+        device: Rc<Device>,
+        description: &Description,
+        mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, Error>,
+        precision: PrecisionPolicy,
+        capacity: DecoderCapacity,
+    ) -> Result<Self, Error> {
+        let geometry = &description.geometry;
+        geometry.validate().map_err(|error| error.to_string())?;
+        if description.blocks.len() != geometry.layers.len() {
+            return Err("decoder requires complete block descriptors".into());
+        }
+        let DecoderCapacity {
+            context_capacity,
+            max_sequences,
+        } = capacity;
+        if context_capacity == 0
+            || context_capacity as u64 > geometry.context_limit
+            || context_capacity > i32::MAX as usize
+            || max_sequences == 0
+        {
+            return Err("invalid decoder state capacity".into());
+        }
+        let history_capacity = context_capacity
+            .checked_mul(max_sequences)
+            .filter(|value| *value <= i32::MAX as usize)
+            .ok_or("history capacity overflow")?;
+        let activation = geometry.activation_dtype;
+        let activation_element = element(activation);
+        let rotary_base = geometry.rotary_base as f32;
+        let epsilon = geometry.epsilon as f32;
+        let preparation_epsilon = (geometry.epsilon * geometry.recurrent_width as f64) as f32;
+        let attention_scale = 1.0 / (geometry.attention_width as f32).sqrt();
+        if !rotary_base.is_finite()
+            || rotary_base <= 0.0
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || !preparation_epsilon.is_finite()
+            || preparation_epsilon <= 0.0
+            || !attention_scale.is_finite()
+            || attention_scale <= 0.0
+        {
+            return Err("Qwen numerical parameters are not representable as f32".into());
+        }
+
+        // Rotary coordinate selection is model semantics. Materialize its
+        // immutable per-pair map once; the tensor axis also exposes P to the
+        // generated call schema, allowing S to be inferred exactly from 2P+S.
+        let rotary_pairs = geometry.rotary_width / 2;
+        let height_limit = geometry.rotary_sections[1]
+            .checked_mul(3)
+            .ok_or("rotary height section overflow")?;
+        let width_limit = geometry.rotary_sections[2]
+            .checked_mul(3)
+            .ok_or("rotary width section overflow")?;
+        let rotary_components = Tensor::from_host(
+            &device,
+            Element::i32(),
+            &[rotary_pairs],
+            &tensor_bytes((0..rotary_pairs).map(|pair| {
+                if pair % 3 == 1 && pair < height_limit {
+                    1
+                } else if pair % 3 == 2 && pair < width_limit {
+                    2
+                } else {
+                    0
+                }
+            })),
+        )?;
+
+        let mut import_checked =
+            |descriptor: &WeightDescriptor, dtype: DType| -> Result<ResidentWeight, Error> {
+                let weight = import(descriptor, dtype)?;
+                if !weight.belongs_to(&device) {
+                    return Err(Error::from(format!(
+                        "imported weight {} belongs to another device",
+                        descriptor.name
+                    )));
+                }
+                Ok(weight)
+            };
+
+        let table = import_checked(&description.embedding, activation)?;
+        let embedding = Embedding {
+            kernel: kernels::qwen_embedding_rows::for_device_with(
+                &device,
+                precision.clone(),
+                kernels::qwen_embedding_rows::Elements {
+                    EW: table.element(),
+                    A: activation_element,
+                },
+            )?,
+            table,
+        };
+
+        let mut blocks = Vec::with_capacity(description.blocks.len());
+        let mut components = Vec::new();
+        let mut history_rows = Vec::new();
+        for (index, block) in description.blocks.iter().enumerate() {
+            let input_norm = import_checked(&block.input_norm, activation)?;
+            let (mixer, state_index) = match &block.mixer {
+                MixerWeights::Attention(weights) => {
+                    let state_index = history_rows.len();
+                    let spec = ComponentSpec {
+                        shape: vec![
+                            usize::try_from(geometry.kv_heads)
+                                .map_err(|_| "KV heads exceed host range")?,
+                            usize::try_from(geometry.attention_width)
+                                .map_err(|_| "attention width exceeds host range")?,
+                        ],
+                        dtype: activation,
+                    };
+                    history_rows.extend([spec.clone(), spec]);
+                    let query_gate = import_checked(&weights.query_gate, activation)?;
+                    let key = import_checked(&weights.key, activation)?;
+                    let value = import_checked(&weights.value, activation)?;
+                    let query_norm = import_checked(&weights.query_norm, DType::F32)?;
+                    let key_norm = import_checked(&weights.key_norm, DType::F32)?;
+                    let output = import_checked(&weights.output, activation)?;
+                    let kernel = kernels::qwen_attention_sequence::for_device_with(
+                        &device,
+                        precision.clone(),
+                        kernels::qwen_attention_sequence::Elements {
+                            NW: input_norm.element(),
+                            QW: query_gate.element(),
+                            KW: key.element(),
+                            VW: value.element(),
+                            OW: output.element(),
+                            A: activation_element,
+                        },
+                    )?;
+                    (
+                        Mixer::Attention(Attention {
+                            kernel,
+                            input_norm,
+                            query_gate,
+                            key,
+                            value,
+                            query_norm,
+                            key_norm,
+                            output,
+                            rotary_components: rotary_components.clone(),
+                            base: rotary_base,
+                            epsilon,
+                            scale: attention_scale,
+                        }),
+                        state_index,
+                    )
+                }
+                MixerWeights::Recurrent(weights) => {
+                    let state_index = components.len();
+                    let host = |value| {
+                        usize::try_from(value).map_err(|_| "component exceeds address range")
+                    };
+                    components.push(ComponentSpec {
+                        shape: vec![
+                            host(geometry.convolution_width - 1)?,
+                            host(geometry.recurrent_channels().map_err(|e| e.to_string())?)?,
+                        ],
+                        dtype: activation,
+                    });
+                    components.push(ComponentSpec {
+                        shape: vec![
+                            host(geometry.recurrent_value_heads)?,
+                            host(geometry.recurrent_width)?,
+                            host(geometry.recurrent_width)?,
+                        ],
+                        dtype: DType::F32,
+                    });
+                    let qkv = import_checked(&weights.query_key_value, activation)?;
+                    let gate = import_checked(&weights.gate, activation)?;
+                    let alpha = import_checked(&weights.alpha, activation)?;
+                    let beta = import_checked(&weights.beta, activation)?;
+                    let convolution = import_checked(&weights.convolution, DType::F32)?;
+                    let rate = import_checked(&weights.decay, DType::F32)?;
+                    let time_bias = import_checked(&weights.time_bias, DType::F32)?;
+                    let norm = import_checked(&weights.norm, activation)?;
+                    let output = import_checked(&weights.output, activation)?;
+                    let kernel = kernels::qwen_recurrent_sequence::for_device_with(
+                        &device,
+                        precision.clone(),
+                        kernels::qwen_recurrent_sequence::Elements {
+                            NW: input_norm.element(),
+                            QW: qkv.element(),
+                            GW: gate.element(),
+                            AW: alpha.element(),
+                            BW: beta.element(),
+                            RN: norm.element(),
+                            OW: output.element(),
+                            A: activation_element,
+                        },
+                    )?;
+                    (
+                        Mixer::Recurrent(Recurrent {
+                            kernel,
+                            input_norm,
+                            qkv,
+                            gate,
+                            alpha,
+                            beta,
+                            convolution,
+                            rate,
+                            time_bias,
+                            norm,
+                            output,
+                            epsilon,
+                            preparation_epsilon,
+                            grouped: geometry.recurrent_head_mapping == HeadMapping::Grouped,
+                        }),
+                        state_index,
+                    )
+                }
+            };
+            if (geometry.layers[index] == super::MixerKind::Attention)
+                != matches!(mixer, Mixer::Attention(_))
+            {
+                return Err("block descriptor disagrees with layer order".into());
+            }
+
+            let feedforward = match &block.feedforward {
+                FeedForwardWeights::Dense(weights) => {
+                    if geometry.experts.is_some() {
+                        return Err("dense feedforward disagrees with routed geometry".into());
+                    }
+                    let norm = import_checked(&block.feedforward_norm, activation)?;
+                    let gate = import_checked(&weights.gate, activation)?;
+                    let up = import_checked(&weights.up, activation)?;
+                    let down = import_checked(&weights.down, activation)?;
+                    let kernel = kernels::qwen_dense_suffix::for_device_with(
+                        &device,
+                        precision.clone(),
+                        kernels::qwen_dense_suffix::Elements {
+                            A: activation_element,
+                            NW: norm.element(),
+                            GW: gate.element(),
+                            UW: up.element(),
+                            DW: down.element(),
+                        },
+                    )?;
+                    FeedForward::Dense(Dense {
+                        kernel,
+                        norm,
+                        gate,
+                        up,
+                        down,
+                        epsilon,
+                    })
+                }
+                FeedForwardWeights::Routed(weights) => {
+                    let experts = geometry
+                        .experts
+                        .as_ref()
+                        .ok_or("routed feedforward lacks expert geometry")?;
+                    let norm = import_checked(&block.feedforward_norm, activation)?;
+                    let router = import_checked(&weights.router, activation)?;
+                    let shared_router = import_checked(&weights.shared_router, DType::F32)?;
+                    let expert_gate = import_checked(&weights.expert_gate, activation)?;
+                    let expert_up = import_checked(&weights.expert_up, activation)?;
+                    let expert_down = import_checked(&weights.expert_down, activation)?;
+                    let shared_gate = import_checked(&weights.shared_gate, activation)?;
+                    let shared_up = import_checked(&weights.shared_up, activation)?;
+                    let shared_down = import_checked(&weights.shared_down, activation)?;
+                    let kernel = kernels::qwen_routed_suffix::for_device_with(
+                        &device,
+                        precision.clone(),
+                        kernels::qwen_routed_suffix::Elements {
+                            A: activation_element,
+                            NW: norm.element(),
+                            RW: router.element(),
+                            SRW: shared_router.element(),
+                            EGW: expert_gate.element(),
+                            EUW: expert_up.element(),
+                            EDW: expert_down.element(),
+                            SGW: shared_gate.element(),
+                            SUW: shared_up.element(),
+                            SDW: shared_down.element(),
+                        },
+                    )?;
+                    FeedForward::Routed(Routed {
+                        kernel,
+                        selected: experts.selected,
+                        norm,
+                        router,
+                        shared_router,
+                        expert_gate,
+                        expert_up,
+                        expert_down,
+                        shared_gate,
+                        shared_up,
+                        shared_down,
+                        epsilon,
+                        normalize: experts.normalize_selected,
+                    })
+                }
+            };
+            blocks.push(Block {
+                mixer,
+                feedforward,
+                state_index,
+            });
+        }
+
+        let output_norm = import_checked(&description.output_norm, activation)?;
+        let output = import_checked(&description.output, activation)?;
+        let readout_elements = || kernels::qwen_readout_rows::Elements {
+            A: activation_element,
+            NW: output_norm.element(),
+            OW: output.element(),
+        };
+        let readout = ReadoutKernels {
+            rows: kernels::qwen_readout_rows::for_device_with(
+                &device,
+                precision.clone(),
+                readout_elements(),
+            )?,
+            selected: kernels::qwen_readout_selected::for_device_with(
+                &device,
+                precision.clone(),
+                kernels::qwen_readout_selected::Elements {
+                    A: activation_element,
+                    NW: output_norm.element(),
+                    OW: output.element(),
+                },
+            )?,
+            norm: output_norm,
+            weight: output,
+            epsilon,
+        };
+        let store = StateStore::new(
+            device.clone(),
+            context_capacity,
+            history_capacity,
+            history_rows,
+            components,
+        )?;
+        let vocabulary = usize::try_from(geometry.vocabulary)
+            .map_err(|_| "vocabulary exceeds the host index domain")?;
+        let sampler = Sampler::compile(&device, vocabulary, precision.clone())?;
+        let conditioning = Conditioning::new(&device, precision, geometry.hidden)?;
+        let mut rows = HashMap::new();
+        rows_entry(geometry, &device, &mut rows, 1, 1, context_capacity)?;
+        Ok(Self {
+            geometry: geometry.clone(),
+            store,
+            device,
+            conditioning,
+            context_capacity,
+            embedding,
+            blocks,
+            readout,
+            sampler,
+            rows,
+            selected_rows: HashMap::new(),
+        })
+    }
+
+    fn rows_for(&mut self, count: usize, ranges: usize) -> Result<&mut Rows, Error> {
+        rows_entry(
+            &self.geometry,
+            &self.device,
+            &mut self.rows,
+            count,
+            ranges,
+            self.context_capacity,
+        )
+    }
+    pub fn geometry(&self) -> &Geometry {
+        &self.geometry
+    }
+    pub fn context_capacity(&self) -> usize {
+        self.context_capacity
+    }
+    pub fn memory_usage(&self) -> seismic::MemoryUsage {
+        self.device.memory_usage()
+    }
+    pub fn reclaim_idle(&mut self) -> Result<usize, Error> {
+        let before = self.device.memory_usage().charged;
+        self.rows.retain(|geometry, _| *geometry == (1, 1));
+        self.selected_rows.clear();
+        self.store.release_idle()?;
+        let released = before.saturating_sub(self.device.memory_usage().charged);
+        usize::try_from(released).map_err(|_| "released byte count exceeds host range".into())
+    }
+    pub fn state_store(&self) -> &Rc<StateStore> {
+        &self.store
+    }
+    pub fn compiled_kernel_count(&self) -> usize {
+        5 + self.blocks.len() * 2
+    }
+
     pub fn prepare_generation_batch(
         &mut self,
         work: &[GenerationWork<'_>],
@@ -321,9 +888,6 @@ impl Decoder {
             })
             .collect::<Vec<_>>();
         OwnedSequence::prepare_completed_batch(&sequences, |states| {
-            if work.len() > 1 {
-                return self.execute_generation_states(states, work);
-            }
             let mut selected = Vec::with_capacity(work.len());
             for (row, state) in work.iter().zip(states.iter_mut()) {
                 let tokens = row
@@ -350,10 +914,7 @@ impl Decoder {
             Ok(selected)
         })
     }
-    /// Conditioned members retain semantic successors with the numerical fork.
-    /// Each member executes ordinary Seismic compositions; acceptance remains
-    /// independent after every member has completed. Packed conditioned rows
-    /// are not yet implemented by this entry.
+
     pub fn prepare_conditioned_generation_batch(
         &mut self,
         work: &[GenerationWork<'_, super::inputs::InputState>],
@@ -369,7 +930,12 @@ impl Decoder {
         OwnedSequence::prepare_completed_batch_with_semantics(&sequences, |states| {
             let mut selected = Vec::with_capacity(work.len());
             for (row, (state, input)) in work.iter().zip(states.iter_mut()) {
-                let tokens: Vec<_> = row.proposal.tokens().iter().map(|token| token.0).collect();
+                let tokens = row
+                    .proposal
+                    .tokens()
+                    .iter()
+                    .map(|token| token.0)
+                    .collect::<Vec<_>>();
                 let readout = if row.proposal.needs_sample() {
                     Readout::Sample {
                         mask: row.mask,
@@ -388,466 +954,76 @@ impl Decoder {
             Ok(selected)
         })
     }
-    /// Prepare the whole decoder under one declared workload envelope. Every
-    /// capacity class of every composition is compiled and natively sealed
-    /// before the decoder is returned; a failure retains nothing.
-    pub fn compile(
-        device: Rc<Device>,
-        description: &Description,
-        mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, String>,
-        settings: Settings,
-        workload: DecoderWorkload,
-    ) -> Result<Self, Error> {
-        let g = &description.geometry;
-        g.validate().map_err(|e| e.to_string())?;
-        if description.blocks.len() != g.layers.len() {
-            return Err("decoder requires complete block descriptors".into());
-        }
-        let DecoderWorkload {
-            context_capacity,
-            max_sequences,
-            max_ranges,
-            readout_capacity,
-        } = workload;
-        if context_capacity == 0
-            || context_capacity as u64 > g.context_limit
-            || context_capacity > i32::MAX as usize
-            || max_sequences == 0
-            || max_ranges == 0
-            || max_ranges > context_capacity
-            || readout_capacity == 0
-            || readout_capacity > context_capacity
-        {
-            return Err("invalid decoder workload envelope".into());
-        }
-        let history_capacity = context_capacity
-            .checked_mul(max_sequences)
-            .filter(|n| *n <= i32::MAX as usize)
-            .ok_or("history capacity overflow")?;
-        let packed_rows = u64::try_from(
-            max_sequences
-                .checked_mul(context_capacity)
-                .ok_or("packed capacity overflow")?,
-        )
-        .ok()
-        .filter(|&n| n <= i64::from(i32::MAX) as u64)
-        .ok_or("packed capacity exceeds index domain")?;
-        let program = super::program::program()?;
-        let mut session = PreparationSession::new(&device, &program, settings.clone());
-        let activation = g.activation_dtype;
-        let elements = BTreeMap::from([("A".into(), Elem::Dtype(activation))]);
-        let mut bound = |entry: &str,
-                         shapes: BTreeMap<String, EnvelopeShape>,
-                         bound_weights: HashMap<String, ResidentWeight>,
-                         external: &[&str],
-                         bound_scalars: HashMap<String, f64>| {
-            session.prepare(CompositionSpec {
-                entry: entry.into(),
-                envelope: WorkloadEnvelope::geometric(shapes, elements.clone())?,
-                weights: bound_weights,
-                external: names(external),
-                intermediates: HashSet::new(),
-                scalars: bound_scalars,
-            })
-        };
-        let embedding = bound(
-            "qwen_embedding_rows",
-            BTreeMap::from([
-                ("M".into(), varying(packed_rows)),
-                ("V".into(), exact(g.vocabulary)),
-                ("D".into(), exact(g.hidden)),
-            ]),
-            weights(vec![("table", import(&description.embedding, activation)?)]),
-            &["tokens"],
-            HashMap::new(),
-        )?
-        .control_domain(
-            "tokens",
-            IntegerRange {
-                min: 0,
-                max: i128::from(g.vocabulary) - 1,
-            },
-        )?;
-        let attention_envelope = BTreeMap::from([
-            ("M".into(), varying(context_capacity as u64)),
-            ("D".into(), exact(g.hidden)),
-            ("T".into(), exact(history_capacity as u64)),
-            ("R".into(), varying(max_ranges as u64)),
-            ("G".into(), exact(g.attention_heads / g.kv_heads)),
-            ("KV".into(), exact(g.kv_heads)),
-            ("P".into(), exact(g.rotary_width / 2)),
-            (
-                "S".into(),
-                exact(g.attention_width - g.rotary_width),
-            ),
-            ("SH".into(), exact(g.rotary_sections[1])),
-            ("SW".into(), exact(g.rotary_sections[2])),
-        ]);
-        let recurrent_envelope = BTreeMap::from([
-            ("M".into(), varying(context_capacity as u64)),
-            ("H".into(), exact(g.hidden)),
-            ("NK".into(), exact(g.recurrent_key_heads)),
-            (
-                "GV".into(),
-                exact(g.recurrent_value_heads / g.recurrent_key_heads),
-            ),
-            ("W".into(), exact(g.recurrent_width)),
-            ("C".into(), exact(g.convolution_width)),
-        ]);
-        let dense_envelope = BTreeMap::from([
-            ("M".into(), varying(context_capacity as u64)),
-            ("H".into(), exact(g.hidden)),
-            ("F".into(), exact(g.intermediate)),
-        ]);
-        let mut blocks = Vec::new();
-        let mut components = Vec::new();
-        let mut history_rows = Vec::new();
-        for (index, block) in description.blocks.iter().enumerate() {
-            let input_norm = import(&block.input_norm, activation)?;
-            let (mixer, state_index, attention) = match &block.mixer {
-                MixerWeights::Attention(a) => {
-                    let state_index = history_rows.len();
-                    let row_bytes = usize::try_from(
-                        g.kv_heads
-                            .checked_mul(g.attention_width)
-                            .and_then(|n| n.checked_mul(u64::from(activation.bytes())))
-                            .ok_or("KV geometry overflow")?,
-                    )
-                    .map_err(|_| "KV row exceeds address range")?;
-                    history_rows.extend([row_bytes, row_bytes]);
-                    let mixer = bound(
-                        "qwen_attention_sequence",
-                        attention_envelope.clone(),
-                        weights(vec![
-                            ("input_norm", input_norm),
-                            ("query_gate_weight", import(&a.query_gate, activation)?),
-                            ("key_weight", import(&a.key, activation)?),
-                            ("value_weight", import(&a.value, activation)?),
-                            ("query_norm", import(&a.query_norm, DType::F32)?),
-                            ("key_norm", import(&a.key_norm, DType::F32)?),
-                            ("output_weight", import(&a.output, activation)?),
-                        ]),
-                        &[
-                            "hidden",
-                            "destinations",
-                            "coordinates",
-                            "visible",
-                            "history_key",
-                            "history_value",
-                        ],
-                        scalar(&[
-                            ("base", g.rotary_base),
-                            ("epsilon", g.epsilon),
-                            ("scale", 1.0 / (g.attention_width as f64).sqrt()),
-                        ]),
-                    )?
-                    .control_inputs(&["visible"])?
-                    .control_domain(
-                        "coordinates",
-                        IntegerRange {
-                            min: 0,
-                            max: i128::from(i32::MAX),
-                        },
-                    )?
-                    .control_domain(
-                        "destinations",
-                        IntegerRange {
-                            min: 0,
-                            max: history_capacity as i128 - 1,
-                        },
-                    )?;
-                    (mixer, state_index, true)
-                }
-                MixerWeights::Recurrent(r) => {
-                    let state_index = components.len();
-                    let to_usize =
-                        |n| usize::try_from(n).map_err(|_| "component exceeds address range");
-                    components.push(ComponentSpec {
-                        shape: vec![
-                            to_usize(g.convolution_width - 1)?,
-                            to_usize(g.recurrent_channels().map_err(|e| e.to_string())?)?,
-                        ],
-                        dtype: activation,
-                    });
-                    components.push(ComponentSpec {
-                        shape: vec![
-                            to_usize(g.recurrent_value_heads)?,
-                            to_usize(g.recurrent_width)?,
-                            to_usize(g.recurrent_width)?,
-                        ],
-                        dtype: DType::F32,
-                    });
-                    let mixer = bound(
-                        "qwen_recurrent_sequence",
-                        recurrent_envelope.clone(),
-                        weights(vec![
-                            ("input_norm", input_norm),
-                            ("qkv_weight", import(&r.query_key_value, activation)?),
-                            ("gate_weight", import(&r.gate, activation)?),
-                            ("alpha_weight", import(&r.alpha, activation)?),
-                            ("beta_weight", import(&r.beta, activation)?),
-                            ("convolution", import(&r.convolution, DType::F32)?),
-                            ("rate", import(&r.decay, DType::F32)?),
-                            ("time_bias", import(&r.time_bias, DType::F32)?),
-                            ("recurrent_norm", import(&r.norm, activation)?),
-                            ("output_weight", import(&r.output, activation)?),
-                        ]),
-                        &["hidden", "window", "delta"],
-                        scalar(&[
-                            ("epsilon", g.epsilon),
-                            ("preparation_epsilon", g.epsilon * g.recurrent_width as f64),
-                            (
-                                "grouped",
-                                f64::from(g.recurrent_head_mapping == HeadMapping::Grouped),
-                            ),
-                        ]),
-                    )?;
-                    (mixer, state_index, false)
-                }
-            };
-            if (g.layers[index] == super::MixerKind::Attention) != attention {
-                return Err("block descriptor disagrees with layer order".into());
-            }
-            let feedforward = match &block.feedforward {
-                FeedForwardWeights::Dense(ff) => {
-                    if g.experts.is_some() {
-                        return Err("dense feedforward disagrees with routed geometry".into());
-                    }
-                    bound(
-                        "qwen_dense_suffix",
-                        dense_envelope.clone(),
-                        weights(vec![
-                            ("norm", import(&block.feedforward_norm, activation)?),
-                            ("gate_weight", import(&ff.gate, activation)?),
-                            ("up_weight", import(&ff.up, activation)?),
-                            ("down_weight", import(&ff.down, activation)?),
-                        ]),
-                        &["residual"],
-                        scalar(&[("eps", g.epsilon)]),
-                    )?
-                }
-                FeedForwardWeights::Routed(ff) => {
-                    let experts = g
-                        .experts
-                        .as_ref()
-                        .ok_or("routed feedforward lacks expert geometry")?;
-                    bound(
-                        "qwen_routed_suffix",
-                        BTreeMap::from([
-                            ("M".into(), varying(context_capacity as u64)),
-                            ("H".into(), exact(g.hidden)),
-                            ("E".into(), exact(experts.count)),
-                            ("K".into(), exact(experts.selected)),
-                            ("F".into(), exact(experts.intermediate)),
-                            ("S".into(), exact(experts.shared_intermediate)),
-                        ]),
-                        weights(vec![
-                            ("norm", import(&block.feedforward_norm, activation)?),
-                            ("router", import(&ff.router, activation)?),
-                            ("shared_router", import(&ff.shared_router, DType::F32)?),
-                            ("expert_gate", import(&ff.expert_gate, activation)?),
-                            ("expert_up", import(&ff.expert_up, activation)?),
-                            ("expert_down", import(&ff.expert_down, activation)?),
-                            ("shared_gate", import(&ff.shared_gate, activation)?),
-                            ("shared_up", import(&ff.shared_up, activation)?),
-                            ("shared_down", import(&ff.shared_down, activation)?),
-                        ]),
-                        &["residual"],
-                        scalar(&[
-                            ("eps", g.epsilon),
-                            ("normalize", f64::from(experts.normalize_selected)),
-                        ]),
-                    )?
-                }
-            };
-            blocks.push(Block {
-                mixer,
-                feedforward,
-                state_index,
-                attention,
-            });
-        }
-        let readout_weights = weights(vec![
-            ("norm", import(&description.output_norm, activation)?),
-            ("weight", import(&description.output, activation)?),
-        ]);
-        let selected = bound(
-            "qwen_readout_selected",
-            BTreeMap::from([
-                ("M".into(), varying(context_capacity as u64)),
-                ("V".into(), exact(g.vocabulary)),
-                ("D".into(), exact(g.hidden)),
-                ("S".into(), varying(readout_capacity as u64)),
-            ]),
-            readout_weights.clone(),
-            &["hidden", "selected"],
-            scalar(&[("epsilon", g.epsilon)]),
-        )?
-        .control_domain(
-            "selected",
-            IntegerRange {
-                min: 0,
-                max: i128::from(g.vocabulary) - 1,
-            },
-        )?;
-        let readout = bound(
-            "qwen_readout_rows",
-            BTreeMap::from([
-                ("M".into(), varying(context_capacity as u64)),
-                ("V".into(), exact(g.vocabulary)),
-                ("D".into(), exact(g.hidden)),
-            ]),
-            readout_weights,
-            &["hidden"],
-            scalar(&[("epsilon", g.epsilon)]),
-        )?;
-        let store = StateStore::new(
-            device.clone(),
-            context_capacity,
-            history_capacity,
-            history_rows,
-            components,
-        )?;
-        let vocabulary = usize::try_from(g.vocabulary)
-            .map_err(|_| "vocabulary exceeds the host index domain")?;
-        let sampler = Sampler::compile(&device, vocabulary, settings.clone())?;
-        let conditioning = Conditioning::new(device.clone(), program, settings, g.hidden);
-        let mut rows = HashMap::new();
-        rows_entry(g, &device, &mut rows, 1, 1, context_capacity)?;
-        Ok(Self {
-            geometry: g.clone(),
-            store,
-            device,
-            conditioning,
-            context_capacity,
-            max_ranges,
-            packed_rows,
-            embedding,
-            blocks,
-            readout,
-            selected,
-            sampler,
-            rows,
-            selected_rows: HashMap::new(),
-            packed: HashMap::new(),
-        })
-    }
-    fn rows_for(&mut self, count: usize, ranges: usize) -> Result<&mut Rows, Error> {
-        let Decoder {
-            geometry,
-            device,
-            rows,
-            context_capacity,
-            ..
-        } = self;
-        rows_entry(geometry, device, rows, count, ranges, *context_capacity)
-    }
-    pub fn geometry(&self) -> &Geometry {
-        &self.geometry
-    }
-    pub fn context_capacity(&self) -> usize {
-        self.context_capacity
-    }
-    pub fn memory_usage(&self) -> seismic_runtime::memory::Usage {
-        self.device.memory_usage()
-    }
-    /// Drop idle row buffers and selection storage. Prepared compositions are
-    /// retained; preparation state never depends on execution.
-    pub fn reclaim_idle(&mut self) -> Result<usize, Error> {
-        let before = self.device.memory_usage().charged;
-        self.rows.retain(|geometry, _| *geometry == (1, 1));
-        self.selected_rows.clear();
-        self.packed.clear();
-        self.store.release_idle()?;
-        Ok(before - self.device.memory_usage().charged)
-    }
-    pub fn state_store(&self) -> &Rc<StateStore> {
-        &self.store
-    }
-    /// Kernels compiled for the prepared decoder. Constant after preparation:
-    /// a forward can never compile, so a nonzero difference is impossible.
-    pub fn compiled_kernel_count(&self) -> usize {
-        self.embedding.kernel_count()
-            + self
-                .blocks
-                .iter()
-                .map(|b| b.mixer.kernel_count() + b.feedforward.kernel_count())
-                .sum::<usize>()
-            + self.readout.kernel_count()
-            + self.selected.kernel_count()
-            + self.sampler.kernel_count()
-    }
+
     pub fn propose<'a>(
         &mut self,
         state: &'a mut SequenceState,
         token: u32,
     ) -> Result<DecodedAdvance<'a>, Error> {
-        self.propose_impl(state, &[token], false, false, Readout::Logits, None)
-            .map(|(advance, _, _)| advance.decoded())
+        self.propose_impl(state, &[token], false, Readout::Logits, None)
+            .map(|(advance, _)| advance.decoded())
     }
     pub fn propose_observed<'a>(
         &mut self,
         state: &'a mut SequenceState,
         token: u32,
     ) -> Result<(DecodedAdvance<'a>, Vec<DecoderStepObservation>), Error> {
-        self.propose_impl(state, &[token], true, false, Readout::Logits, None)
-            .map(|(advance, steps, _)| (advance.decoded(), steps))
+        self.propose_impl(state, &[token], true, Readout::Logits, None)
+            .map(|(advance, steps)| (advance.decoded(), steps))
     }
     pub fn propose_batched<'a>(
         &mut self,
         state: &'a mut SequenceState,
         token: u32,
-    ) -> Result<(DecodedAdvance<'a>, ExecutionObservation), Error> {
-        self.propose_impl(state, &[token], false, true, Readout::Logits, None)
-            .map(|(advance, _, batch)| {
-                (
-                    advance.decoded(),
-                    batch.expect("batched execution records completion"),
-                )
-            })
+    ) -> Result<(DecodedAdvance<'a>, DecoderBatchObservation), Error> {
+        let started = Instant::now();
+        let advance = self.propose(state, token)?;
+        Ok((
+            advance,
+            DecoderBatchObservation {
+                host_seconds: started.elapsed().as_secs_f64(),
+            },
+        ))
     }
-    /// Evaluate a complete prompt (or prompt continuation) as one multi-row
-    /// forward. Only final-row logits are read back; commit accepts all rows.
     pub fn prefill<'a>(
         &mut self,
         state: &'a mut SequenceState,
         tokens: &[u32],
     ) -> Result<DecodedAdvance<'a>, Error> {
-        self.propose_impl(state, tokens, false, false, Readout::Logits, None)
-            .map(|(advance, _, _)| advance.decoded())
+        self.propose_impl(state, tokens, false, Readout::Logits, None)
+            .map(|(advance, _)| advance.decoded())
     }
     pub fn prefill_observed<'a>(
         &mut self,
         state: &'a mut SequenceState,
         tokens: &[u32],
     ) -> Result<(DecodedAdvance<'a>, Vec<DecoderStepObservation>), Error> {
-        self.propose_impl(state, tokens, true, false, Readout::Logits, None)
-            .map(|(advance, steps, _)| (advance.decoded(), steps))
+        self.propose_impl(state, tokens, true, Readout::Logits, None)
+            .map(|(advance, steps)| (advance.decoded(), steps))
     }
     pub fn prefill_batched<'a>(
         &mut self,
         state: &'a mut SequenceState,
         tokens: &[u32],
-    ) -> Result<(DecodedAdvance<'a>, ExecutionObservation), Error> {
-        self.propose_impl(state, tokens, false, true, Readout::Logits, None)
-            .map(|(advance, _, batch)| {
-                (
-                    advance.decoded(),
-                    batch.expect("batched execution records completion"),
-                )
-            })
+    ) -> Result<(DecodedAdvance<'a>, DecoderBatchObservation), Error> {
+        let started = Instant::now();
+        let advance = self.prefill(state, tokens)?;
+        Ok((
+            advance,
+            DecoderBatchObservation {
+                host_seconds: started.elapsed().as_secs_f64(),
+            },
+        ))
     }
-    /// Complete forward and optional device selection before exposing an advance.
     pub fn execute<'a>(
         &mut self,
         state: &'a mut SequenceState,
         tokens: &[u32],
         readout: Readout<'_>,
     ) -> Result<ExecutedAdvance<'a>, Error> {
-        self.propose_impl(state, tokens, false, true, readout, None)
-            .map(|(advance, _, _)| advance)
+        self.propose_impl(state, tokens, false, readout, None)
+            .map(|(advance, _)| advance)
     }
-    /// Advance semantic and numerical state as one accepted transaction.
     pub fn execute_conditioned<'a>(
         &mut self,
         state: &'a mut SequenceState,
@@ -862,9 +1038,6 @@ impl Decoder {
             return Err("conditioned input differs from decoder continuation or owner".into());
         }
         let assembled = input.assemble(tokens)?;
-        // Explicit conditioned-input preparation: every overlay composition is
-        // compiled here, in full, before any numerical inference submission is
-        // built by the forward below.
         let overlays = self.conditioning.prepare(&assembled)?;
         let next = input.after(
             input
@@ -881,355 +1054,333 @@ impl Decoder {
             coordinates: &coordinates,
             overlays: &overlays,
         };
-        let (advance, _, _) =
-            self.propose_impl(state, tokens, false, true, readout, Some(&conditioned))?;
+        let (advance, _) = self.propose_impl(state, tokens, false, readout, Some(&conditioned))?;
         Ok(ConditionedAdvance {
             advance,
             input,
             next,
         })
     }
+
     fn propose_impl<'a>(
         &mut self,
         state: &'a mut SequenceState,
         tokens: &[u32],
-        observed: bool,
-        batched: bool,
+        collect_observations: bool,
         readout: Readout<'_>,
         conditioned: Option<&ConditionedInput<'_>>,
-    ) -> Result<
-        (
-            ExecutedAdvance<'a>,
-            Vec<DecoderStepObservation>,
-            Option<ExecutionObservation>,
-        ),
-        Error,
-    > {
-        let mut observations = observed.then(Vec::new);
-        let mut batch = batched.then(StageBatch::default);
-        let mut batch_observation = None;
-        let Decoder {
-            geometry,
-            store,
-            device,
-            context_capacity,
-            max_ranges,
-            embedding,
-            blocks,
-            readout: readout_stage,
-            selected: selected_stage,
-            sampler,
-            rows,
-            selected_rows,
-            ..
-        } = self;
-        if !state.belongs_to(store) {
+    ) -> Result<(ExecutedAdvance<'a>, Vec<DecoderStepObservation>), Error> {
+        if !state.belongs_to(&self.store) {
             return Err("sequence belongs to another decoder state store".into());
         }
         if tokens.is_empty()
-            || tokens
-                .iter()
-                .any(|&t| u64::from(t) >= geometry.vocabulary || t > i32::MAX as u32)
+            || tokens.iter().any(|&token| {
+                u64::from(token) >= self.geometry.vocabulary || token > i32::MAX as u32
+            })
         {
             return Err("token is outside vocabulary".into());
         }
-        let ranges = state.history_ranges();
-        if tokens.len() > *context_capacity - state.position() {
+        if tokens.len() > self.context_capacity - state.position() {
             return Err("forward exceeds context limit".into());
         }
-        if ranges.len() > *max_ranges {
-            return Err("forward visibility exceeds the prepared envelope".into());
-        }
+        let Decoder {
+            geometry,
+            device,
+            conditioning,
+            context_capacity,
+            embedding,
+            blocks,
+            readout: readout_kernels,
+            sampler,
+            rows: row_cache,
+            selected_rows,
+            ..
+        } = self;
+        let history_ranges = state.history_ranges();
+        let range_count = history_ranges.len().max(1);
         let selected_ids = match &readout {
             Readout::Selected(ids) => {
-                if ids
-                    .iter()
-                    .any(|&id| u64::from(id) >= geometry.vocabulary || id > i32::MAX as u32)
-                {
+                if ids.iter().any(|&id| u64::from(id) >= geometry.vocabulary) {
                     return Err("selected readout token is outside vocabulary".into());
                 }
-                Some(ids.len())
+                Some(*ids)
             }
             _ => None,
         };
-        let shape_ranges = ranges.len().max(1);
         let mut selected = selected_ids
-            .filter(|&ids| ids > 0)
-            .map(|ids| selected_entry(device, *context_capacity, selected_rows, ids))
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                let selected = selected_entry(device, selected_rows, ids.len())?;
+                selected
+                    .ids
+                    .write_from_host(&tensor_bytes(ids.iter().map(|&id| id as i32)))?;
+                Ok::<_, Error>(selected)
+            })
             .transpose()?;
-        if let (Some(entry), Readout::Selected(ids)) = (selected.as_ref(), &readout) {
-            entry.ids.write(
-                &ids.iter()
-                    .flat_map(|&id| (id as i32).to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )?;
-        }
-        let rows =
-            rows_entry(geometry, device, rows, tokens.len(), shape_ranges, *context_capacity)?;
+        let rows = rows_entry(
+            geometry,
+            device,
+            row_cache,
+            tokens.len(),
+            range_count,
+            *context_capacity,
+        )?;
         let position =
             i32::try_from(state.position()).map_err(|_| "rotary position exceeds index domain")?;
-        let coordinates: Vec<[i32; 4]> = match conditioned {
+        let coordinates = match conditioned {
             Some(input) => input.coordinates.to_vec(),
             None => tokens
                 .iter()
                 .enumerate()
-                .map(|(i, _)| [position + i as i32; 4])
-                .collect(),
-        };
-        rows.coordinates.write(
-            &coordinates
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_le_bytes())
+                .map(|(row, _)| [position + row as i32; 4])
                 .collect::<Vec<_>>(),
-        )?;
-        let ranges = if ranges.is_empty() {
+        };
+        rows.coordinates
+            .write_from_host(&tensor_bytes(coordinates.into_iter().flatten()))?;
+        let visible = if history_ranges.is_empty() {
             vec![(0, 0)]
         } else {
-            ranges
+            history_ranges
         };
-        rows.visible.write(
-            &tokens
-                .iter()
-                .flat_map(|_| {
-                    ranges
-                        .iter()
-                        .flat_map(|&(start, count)| [start as i32, (start + count) as i32])
-                })
-                .flat_map(i32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )?;
-        rows.tokens.write(
-            &tokens
-                .iter()
-                .flat_map(|&t| (t as i32).to_le_bytes())
-                .collect::<Vec<_>>(),
-        )?;
+        rows.visible
+            .write_from_host(&tensor_bytes(tokens.iter().flat_map(|_| {
+                visible
+                    .iter()
+                    .flat_map(|&(start, count)| [start as i32, (start + count) as i32])
+            })))?;
+        rows.tokens
+            .write_from_host(&tensor_bytes(tokens.iter().map(|&token| token as i32)))?;
+
+        let mut observations = collect_observations.then(Vec::new);
         let mut advance = state.begin(tokens.len())?;
         let mut state_results = Vec::new();
+        let mut resolved_state_results = Vec::new();
+        let mut pending_readout = None;
         advance.execute(|transition| {
-            rows.destinations.write(
-                &transition
-                    .destinations
-                    .iter()
-                    .flat_map(|&d| (d as i32).to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )?;
-            let embedding = execute_stage(
-                embedding,
-                &forward_shapes(tokens.len()),
-                &HashMap::from([("tokens".into(), rows.tokens.clone())]),
-                "embedding",
-                None,
-                &mut observations,
-                &mut batch,
-            )?;
-            let mut hidden = result_buffer(&embedding, &[1])?;
+            rows.destinations.write_from_host(&tensor_bytes(
+                transition.destinations.iter().map(|&value| value as i32),
+            ))?;
+            let mut workflow = device.workflow();
+            let mut hidden = workflow
+                .enqueue(
+                    &embedding.kernel,
+                    kernels::qwen_embedding_rows::WorkflowArgs {
+                        table: embedding.table.tensor().into(),
+                        tokens: (&rows.tokens).into(),
+                    },
+                )?
+                .value;
             if let Some(input) = conditioned {
                 for overlay in input.overlays {
-                    let out = hidden.view(
-                        overlay.offset
-                            ..overlay
-                                .offset
-                                .checked_add(overlay.length)
-                                .ok_or("feature destination overflow")?,
-                    )?;
-                    execute_stage(
-                        &overlay.composition,
-                        &forward_shapes(overlay.count),
-                        &HashMap::from([
-                            ("input".into(), overlay.source.clone()),
-                            ("out".into(), out),
-                        ]),
-                        "conditioning",
-                        None,
-                        &mut observations,
-                        &mut batch,
-                    )?;
+                    conditioning.enqueue(&mut workflow, overlay, &hidden)?;
                 }
             }
-            for (block_index, block) in blocks.iter().enumerate() {
-                let mut tensors = HashMap::from([("hidden".into(), hidden.clone())]);
-                if block.attention {
-                    let i = block.state_index;
-                    tensors.extend([
-                        ("destinations".into(), rows.destinations.clone()),
-                        ("coordinates".into(), rows.coordinates.clone()),
-                        ("visible".into(), rows.visible.clone()),
-                        ("history_key".into(), transition.history[i].clone()),
-                        ("history_value".into(), transition.history[i + 1].clone()),
-                    ]);
-                } else {
-                    let i = block.state_index;
-                    tensors.extend([
-                        ("window".into(), transition.previous[i].clone()),
-                        ("delta".into(), transition.previous[i + 1].clone()),
-                    ]);
-                }
-                let shapes = if block.attention {
-                    attention_shapes(tokens.len(), shape_ranges)
-                } else {
-                    forward_shapes(tokens.len())
+            for block in blocks {
+                let mixed = match &block.mixer {
+                    Mixer::Attention(mixer) => {
+                        let index = block.state_index;
+                        let mut history_key = transition.history[index].clone();
+                        let mut history_value = transition.history[index + 1].clone();
+                        workflow
+                            .enqueue(
+                                &mixer.kernel,
+                                kernels::qwen_attention_sequence::WorkflowArgs {
+                                    hidden: (&hidden).into(),
+                                    input_norm: mixer.input_norm.tensor().into(),
+                                    query_gate_weight: mixer.query_gate.tensor().into(),
+                                    key_weight: mixer.key.tensor().into(),
+                                    value_weight: mixer.value.tensor().into(),
+                                    query_norm: mixer.query_norm.tensor().into(),
+                                    key_norm: mixer.key_norm.tensor().into(),
+                                    output_weight: mixer.output.tensor().into(),
+                                    coordinates: (&rows.coordinates).into(),
+                                    rotary_components: (&mixer.rotary_components).into(),
+                                    visible: (&rows.visible).into(),
+                                    history_key: (&mut history_key).into(),
+                                    history_value: (&mut history_value).into(),
+                                    destinations: (&rows.destinations).into(),
+                                    base: mixer.base,
+                                    epsilon: mixer.epsilon,
+                                    scale: mixer.scale,
+                                },
+                            )?
+                            .value
+                    }
+                    Mixer::Recurrent(mixer) => {
+                        let index = block.state_index;
+                        let result = workflow.enqueue(
+                            &mixer.kernel,
+                            kernels::qwen_recurrent_sequence::WorkflowArgs {
+                                hidden: (&hidden).into(),
+                                input_norm: mixer.input_norm.tensor().into(),
+                                qkv_weight: mixer.qkv.tensor().into(),
+                                gate_weight: mixer.gate.tensor().into(),
+                                alpha_weight: mixer.alpha.tensor().into(),
+                                beta_weight: mixer.beta.tensor().into(),
+                                convolution: mixer.convolution.tensor().into(),
+                                rate: mixer.rate.tensor().into(),
+                                time_bias: mixer.time_bias.tensor().into(),
+                                recurrent_norm: mixer.norm.tensor().into(),
+                                output_weight: mixer.output.tensor().into(),
+                                window: (&transition.previous[index]).into(),
+                                delta: (&transition.previous[index + 1]).into(),
+                                epsilon: mixer.epsilon,
+                                preparation_epsilon: mixer.preparation_epsilon,
+                                grouped: mixer.grouped,
+                            },
+                        )?;
+                        let mixed = result.r2.clone();
+                        state_results.push((index, result));
+                        mixed
+                    }
                 };
-                let mixed = execute_stage(
-                    &block.mixer,
-                    &shapes,
-                    &tensors,
-                    "mixer",
-                    Some(block_index),
-                    &mut observations,
-                    &mut batch,
-                )?;
-                hidden = if block.attention {
-                    result_buffer(&mixed, &[])?
-                } else {
-                    let i = block.state_index;
-                    state_results.push((i, result_buffer(&mixed, &[0])?));
-                    state_results.push((i + 1, result_buffer(&mixed, &[1])?));
-                    result_buffer(&mixed, &[2])?
+                hidden = match &block.feedforward {
+                    FeedForward::Dense(feedforward) => {
+                        workflow
+                            .enqueue(
+                                &feedforward.kernel,
+                                kernels::qwen_dense_suffix::WorkflowArgs {
+                                    residual: (&mixed).into(),
+                                    norm: feedforward.norm.tensor().into(),
+                                    gate_weight: feedforward.gate.tensor().into(),
+                                    up_weight: feedforward.up.tensor().into(),
+                                    down_weight: feedforward.down.tensor().into(),
+                                    eps: feedforward.epsilon,
+                                },
+                            )?
+                            .r6
+                    }
+                    FeedForward::Routed(feedforward) => {
+                        let row_count = u64::try_from(tokens.len())
+                            .map_err(|_| "routed row count exceeds u64")?;
+                        let mut routes = Tensor::zeros(
+                            device,
+                            Element::i32(),
+                            &[row_count, feedforward.selected],
+                        )?;
+                        let mut scores = Tensor::zeros(
+                            device,
+                            Element::f32(),
+                            &[row_count, feedforward.selected],
+                        )?;
+                        workflow
+                            .enqueue(
+                                &feedforward.kernel,
+                                kernels::qwen_routed_suffix::WorkflowArgs {
+                                    residual: (&mixed).into(),
+                                    norm: feedforward.norm.tensor().into(),
+                                    router: feedforward.router.tensor().into(),
+                                    shared_router: feedforward.shared_router.tensor().into(),
+                                    expert_gate: feedforward.expert_gate.tensor().into(),
+                                    expert_up: feedforward.expert_up.tensor().into(),
+                                    expert_down: feedforward.expert_down.tensor().into(),
+                                    shared_gate: feedforward.shared_gate.tensor().into(),
+                                    shared_up: feedforward.shared_up.tensor().into(),
+                                    shared_down: feedforward.shared_down.tensor().into(),
+                                    routes: (&mut routes).into(),
+                                    scores: (&mut scores).into(),
+                                    eps: feedforward.epsilon,
+                                    normalize: i32::from(feedforward.normalize),
+                                },
+                            )?
+                            .r14
+                    }
                 };
-                let feedforward = execute_stage(
-                    &block.feedforward,
-                    &forward_shapes(tokens.len()),
-                    &HashMap::from([("residual".into(), hidden.clone())]),
-                    "feedforward",
-                    Some(block_index),
-                    &mut observations,
-                    &mut batch,
-                )?;
-                hidden = result_buffer(&feedforward, &[6])
-                    .or_else(|_| result_buffer(&feedforward, &[14]))?;
             }
-            if let (Some(selected), Some(ids)) = (selected.as_mut(), selected_ids) {
-                let results = execute_stage(
-                    selected_stage,
-                    &selected_shapes(tokens.len(), ids),
-                    &HashMap::from([
-                        ("hidden".into(), hidden.clone()),
-                        ("selected".into(), selected.ids.clone()),
-                    ]),
-                    "readout_selected",
-                    None,
-                    &mut observations,
-                    &mut batch,
-                )?;
-                selected.logits = result_buffer(&results, &[1])?;
+            if let Some(selected) = selected.as_mut() {
+                pending_readout = Some(PendingReadout::Selected(workflow.enqueue(
+                    &readout_kernels.selected,
+                    kernels::qwen_readout_selected::WorkflowArgs {
+                        hidden: (&hidden).into(),
+                        norm: readout_kernels.norm.tensor().into(),
+                        weight: readout_kernels.weight.tensor().into(),
+                        selected: (&selected.ids).into(),
+                        epsilon: readout_kernels.epsilon,
+                    },
+                )?));
             } else if !matches!(&readout, Readout::StateOnly | Readout::Selected(_)) {
-                let results = execute_stage(
-                    readout_stage,
-                    &forward_shapes(tokens.len()),
-                    &HashMap::from([("hidden".into(), hidden.clone())]),
-                    "readout",
-                    None,
-                    &mut observations,
-                    &mut batch,
-                )?;
-                rows.logits = result_buffer(&results, &[1])?;
+                pending_readout = Some(PendingReadout::Rows(workflow.enqueue(
+                    &readout_kernels.rows,
+                    kernels::qwen_readout_rows::WorkflowArgs {
+                        hidden: (&hidden).into(),
+                        norm: readout_kernels.norm.tensor().into(),
+                        weight: readout_kernels.weight.tensor().into(),
+                        epsilon: readout_kernels.epsilon,
+                    },
+                )?));
             }
-            if let Some(batch) = batch.take() {
-                let observed = batch.execute_observed()?;
-                batch_observation = Some(execution::batch_observation(&observed));
+            let started = Instant::now();
+            let completion = workflow.submit()?;
+            if let Some(observations) = &mut observations {
+                observations.push(DecoderStepObservation {
+                    stage: "workflow".into(),
+                    block: None,
+                    entry: "qwen_decoder_step".into(),
+                    execution: StageExecutionObservation {
+                        host_seconds: started.elapsed().as_secs_f64(),
+                    },
+                });
+            }
+            for (index, result) in state_results.drain(..) {
+                let result =
+                    completion.resolve::<kernels::qwen_recurrent_sequence::Entry>(result)?;
+                resolved_state_results.push((index, result.r0));
+                resolved_state_results.push((index + 1, result.r1));
+            }
+            match pending_readout.take() {
+                Some(PendingReadout::Rows(result)) => {
+                    rows.logits = completion
+                        .resolve::<kernels::qwen_readout_rows::Entry>(result)?
+                        .value;
+                }
+                Some(PendingReadout::Selected(result)) => {
+                    if let Some(selected) = selected.as_mut() {
+                        selected.logits = completion
+                            .resolve::<kernels::qwen_readout_selected::Entry>(result)?
+                            .value;
+                    }
+                }
+                None => {}
             }
             Ok(())
         })?;
-        for (index, buffer) in state_results {
-            advance.replace_following(index, buffer)?;
+        for (index, tensor) in resolved_state_results {
+            advance.replace_following(index, tensor)?;
         }
         let output = match readout {
             Readout::StateOnly => ReadoutOutput::StateOnly,
-            Readout::Selected(_) => {
-                let mut bytes = vec![0; selected.as_ref().map_or(0, |s| s.logits.len())];
-                if let Some(selected) = selected {
-                    selected.logits.read(&mut bytes)?;
-                }
-                ReadoutOutput::Selected(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect(),
-                )
-            }
-            Readout::Logits => {
-                let mut bytes = vec![0; rows.logits.len()];
-                rows.logits.read(&mut bytes)?;
-                ReadoutOutput::Logits(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect(),
-                )
-            }
+            Readout::Selected(_) => ReadoutOutput::Selected(
+                selected
+                    .map(|selection| selection.logits.read_to_host())
+                    .transpose()?
+                    .unwrap_or_default()
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect(),
+            ),
+            Readout::Logits => ReadoutOutput::Logits(
+                rows.logits
+                    .read_to_host()?
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect(),
+            ),
             Readout::Sample {
                 mask,
                 sampling,
                 seed,
                 position,
-            } => ReadoutOutput::Sample(
-                sampler.sample(&rows.logits, mask, sampling, seed, position)?,
-            ),
+            } => ReadoutOutput::Sample(sampler.sample(
+                &rows.logits,
+                mask,
+                sampling,
+                seed,
+                position,
+            )?),
         };
         Ok((
             ExecutedAdvance { advance, output },
             observations.unwrap_or_default(),
-            batch_observation,
         ))
-    }
-}
-
-#[cfg(test)]
-mod conditioned_transaction_tests {
-    use super::super::{inputs::InputState, preparation::InputPlan};
-    use super::*;
-    use crate::inputs::TokenId;
-    #[test]
-    #[ignore = "requires a Metal device"]
-    fn conditioning_commits_only_after_numerical_completion_and_acceptance() {
-        let device = Rc::new(Device::metal().unwrap());
-        let store = StateStore::new(device.clone(), 8, 8, vec![], vec![]).unwrap();
-        let mut state = store.create().unwrap();
-        let mut input = InputState::new(
-            &device,
-            Rc::new(InputPlan::text(vec![TokenId(7)]).unwrap()),
-            0,
-            vec![],
-            3,
-        )
-        .unwrap();
-        let next = input.after(1).unwrap();
-        let unfinished = ExecutedAdvance {
-            advance: state.begin(1).unwrap(),
-            output: ReadoutOutput::StateOnly,
-        };
-        assert!(ConditionedAdvance {
-            advance: unfinished,
-            input: &mut input,
-            next
-        }
-        .commit()
-        .is_err());
-        assert_eq!((state.position(), input.position()), (0, 0));
-        for accept in [false, true] {
-            let next = input.after(1).unwrap();
-            let mut advance = state.begin(1).unwrap();
-            // Lifecycle-only completion; this test makes no numerical claim.
-            advance.execute(|_| Ok(())).unwrap();
-            let staged = ConditionedAdvance {
-                advance: ExecutedAdvance {
-                    advance,
-                    output: ReadoutOutput::StateOnly,
-                },
-                input: &mut input,
-                next,
-            };
-            if accept {
-                staged.commit().unwrap();
-            } else {
-                staged.abort();
-            }
-            assert_eq!(
-                (state.position(), input.position()),
-                if accept { (1, 1) } else { (0, 0) }
-            );
-        }
     }
 }

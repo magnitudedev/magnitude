@@ -8,8 +8,7 @@ use magnitude_solver::model::{
     Arithmetic, Constraint, Cost, Factor, FactorKind, LinearTerm, Model, VarId,
 };
 use magnitude_solver::scheduling::{
-    Activity, ArenaExpression, ArenaPacking, Demand, Interval, Reservation,
-    SchedulingConstraint,
+    Activity, ArenaExpression, ArenaPacking, Demand, Interval, Reservation, SchedulingConstraint,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -118,12 +117,28 @@ fn constraint_value(constraint: &Constraint, v: &[i64]) -> LabResult<bool> {
                 .zip(tuple)
                 .all(|(var, &value)| v[var.0] == value)
         }),
+        Constraint::ForbiddenTuple { variables, values } => !variables
+            .iter()
+            .zip(values)
+            .all(|(variable, &value)| v[variable.0] == value),
         Constraint::ExactlyOne { variables } => {
             variables.iter().filter(|var| v[var.0] == 1).count() == 1
         }
+        Constraint::Clause { literals } => literals
+            .iter()
+            .any(|literal| v[literal.variable.0] == literal.value),
         Constraint::BoolAnd { output, inputs } => {
             v[output.0] == i64::from(inputs.iter().all(|var| v[var.0] == 1))
         }
+        Constraint::BoolOr { output, inputs } => {
+            v[output.0] == i64::from(inputs.iter().any(|var| v[var.0] == 1))
+        }
+        Constraint::BoolNot { output, input } => v[output.0] == i64::from(v[input.0] == 0),
+        Constraint::ReifiedLinearLe {
+            indicator,
+            terms,
+            rhs,
+        } => v[indicator.0] == i64::from(affine(terms, v)? <= *rhs),
         Constraint::Implies {
             premise,
             consequence,
@@ -324,7 +339,13 @@ fn arena_value(packing: &ArenaPacking, v: &[i64]) -> LabResult<bool> {
         .map(|&(left, right)| (left.min(right), left.max(right)))
         .collect();
     let mut placed: Vec<(u32, u64, u64)> = Vec::new();
-    Ok(arena_place(&active, 0, &mut placed, &edges, packing.capacity))
+    Ok(arena_place(
+        &active,
+        0,
+        &mut placed,
+        &edges,
+        packing.capacity,
+    ))
 }
 
 /// Exhaustive placement search: every candidate offset for one item is the

@@ -1,11 +1,11 @@
 //! Full-model, single-session measurement through the unified runtime pipeline.
 //! The caller supplies only the search budget; this module cannot choose an
 //! implementation. The decoder is fully prepared at load; every forward
-//! selects prepared capacity classes, so a warm sample compiles nothing.
+//! selects among the prepared domain-covering variants, so a warm sample
+//! compiles nothing.
 use super::{decoder::Decoder, loading::Model};
-use crate::preparation::Settings;
 use crate::Error;
-use seismic_runtime::Device;
+use seismic::{Device, PrecisionPolicy};
 use serde::Serialize;
 use std::{path::Path, rc::Rc, time::Instant};
 
@@ -52,14 +52,14 @@ impl Baseline {
     pub fn load(
         path: impl AsRef<Path>,
         device: Rc<Device>,
-        settings: Settings,
+        precision: PrecisionPolicy,
         context_capacity: usize,
     ) -> Result<Self, Error> {
         let start = Instant::now();
-        let backend = device.backend().to_string();
+        let backend = device.backend().as_str().to_owned();
         let model = Model::open(path)?;
         let artifact = model.description().artifact_identity.to_string();
-        let decoder = model.load(device, settings, context_capacity, 1)?;
+        let decoder = model.load(device, precision, context_capacity, 1)?;
         Ok(Self {
             decoder,
             artifact,

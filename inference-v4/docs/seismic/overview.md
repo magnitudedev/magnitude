@@ -1,148 +1,99 @@
 # Seismic
 
-**Seismic is a kernel language, compiler, and runtime packaged as a Rust library.**
-Authors write numerical kernels with their logical execution structure. The compiler
-selects among the authored implementations, contiguous fusion groups, and numerical
-dimensions, and realizes the selection through prescribed backend mappings. It never
-invents execution structure.
+Seismic is a general-purpose kernel language, compiler, runtime, and standard library exposed as a
+Rust library. Source describes logical computation, ownership, ordering, and semantic operations.
+The compiler owns materialization, vectorization, tiling, placement, allocation, launch geometry,
+scheduling, target selection, and native emission.
 
-The governing language specification is
-`specs/26-09-19/seismic-logical-language-and-capabilities-spec.md`. These documents
-describe the logical source contract and identify temporary physical-IR migration gaps.
+Every callable function has one portable body that defines its meaning. Portable implementations
+and applicable backend lowerings are alternatives in one plan space; neither is a fallback. Kernel
+source never contains model topology, hardware names, workload buckets, physical storage classes,
+or launch policy.
 
-## Principles
-
-1. **Semantics are authored; mapping is selected.** An implementation fixes its
-   algorithm, ownership, ordered and independent loops, values, and state scopes.
-   Authors never write physical blocks, storage classes, participant groups, launch
-   geometry, candidate lists, or hardware constants. Portable code cannot observe a
-   selected physical mapping.
-
-2. **Optimization is selection over a finite supplied family.** The decisions are:
-   one applicable implementation per active static call occurrence, one exact cover
-   of contiguous intervals per active sequence of execution units, and one value per
-   active numerical site. There is no search over graphs, producer placement,
-   reduction trees, layouts, storage placement, or schedules.
-
-3. **One authority.** The selected witness drives checking, the estimate, and
-   emission. Nothing downstream of selection chooses, repairs, or re-tiles. A
-   reconstruction that disagrees with the witness is a compiler defect, not an
-   infeasible candidate.
-
-4. **No hidden search and no hidden policy.** A backend hook is a deterministic
-   function of its inputs. Every performance preference lives in the solver
-   objective as an explicit local cost factor. Anything a backend fixes, it fixes
-   by one documented rule.
-
-5. **Select in IR, before native compilation.** Selection evaluates arithmetic over
-   the family. Native source is generated once, for the selected witness. No
-   compile-and-benchmark loop exists.
-
-6. **Precision is a hard selection contract.** The first portable body defines the
-   numerical reference. Alternative bodies expose numerical effects; exact, proven,
-   or whole-witness-qualified evidence determines whether the caller's output policy
-   admits them. Performance is optimized only within that admissible family.
-
-7. **The compiler is generic.** No model names, model dimensions, or pattern
-   recognition of particular kernels exist in the compiler or a backend. Model
-   knowledge lives in authored sources and engine bindings.
-
-8. **Unknown is not zero; unsupported is not infeasible.** Missing analysis, a missing
-   mapping, missing target coverage, proved infeasibility, and an exhausted budget
-   are distinct outcomes. None triggers a fallback.
-
-9. **Honest results.** A selected execution is *feasible* unless the solver proved it
-   optimal over the stated family under the stated estimate model. Estimates are
-   labelled estimates; the current Metal estimate model is labelled unqualified.
-
-10. **Fix the system, not the kernel.** When a natural structure cannot be expressed
-    or realized, the owning layer changes: the language, a mapping, or a library
-    body. Sources do not work around compiler defects.
-
-## Responsibilities
-
-| Owner | Establishes | Does not |
-| --- | --- | --- |
-| Kernel or library author | Algorithm, logical tensors and borrows, ordered and independent loops, state, alternative portable bodies, target lowerings, backend-specific helpers | Declare physical blocks, storage classes, schedules, candidate lists, or hardware constants |
-| Lowering author | A target implementation within the ownership its signature grants | Restructure the caller or widen its scope |
-| Checker | Types, shapes, bounded indices/ranges, moves, borrows, initialization, loop independence, capability declarations and uses | Prove bodies equivalent |
-| Family construction | Applicable candidates per occurrence, numerical sites, execution-unit sequences, obligations | Enumerate compositions; drop what it cannot analyze |
-| Backend mapping | Site domains, hard limits, legal intervals, local cost factors, a constructive seed, deterministic realization | Rank, filter by profitability, or search |
-| Numerical assessment | Exact reference status, conservative proof bounds, or matching whole-witness qualification | Treat unknown as zero or infer application tolerance |
-| Solver | The joint assignment under a budget, with precision as hard constraints and performance as the objective | Invent calls, source loops, ownership effects, or acceptable error |
-| Instantiation and emission | Exactly the witness | Any second tiling, fusion, staging, or placement policy |
-| Runtime | Native compilation of a checked selection, binding, validation, submission, completion | Select, substitute, or fall back |
-
-## Packages
-
-| Package | Responsibility |
-| --- | --- |
-| `seismic-lang` | Logical syntax, ownership/borrow checker, checked IR, reference interpreter, joint family, and the bridge to execution IR; the symbolic prover, representations, capabilities, and ABI. |
-| `seismic-compiler` | Joint selection: solver export, seed validation, budgeted search, witness audit, replay, search analysis; the `Backend` contract; logical-to-physical mapping helpers shared by backends. |
-| `magnitude-solver` | Generic exact and neighborhood search with guards, residual decomposition, and proof reuse. Knows nothing about Seismic. |
-| `seismic-realization` | Target-neutral realization contracts shared by backends: invocation ABI and conditions, launch phases, tile placement, and the local storage type rule. |
-| `seismic-metal` | The Metal mapping, realized execution, MSL emission, device runtime. |
-| `seismic-runtime` | Devices, buffers, compilation of a selected execution, plan compiler, invocation validation. |
-| `seismic-cli` | `check`, `print`, `select`, `emit`, `analyze-search`, `bindings`. |
-| `seismic-std` | The standard kernel library and its Metal lowerings, authored in Seismic. |
-| `seismic-cpu` | The CPU mapping, scalar realized execution, Cranelift native compilation, worker threads and host buffers. |
-| `seismic-cuda` | The CUDA mapping, scalar realized execution printed as PTX, driver runtime (loaded dynamically). |
-
-Model topology belongs to user libraries. Artifacts, residency, logical state,
-scheduling, and serving belong to the host application.
-
-## Flow
+## Public lifecycle
 
 ```text
-plain `.seismic` sources (portable functions, target lowerings, backend-specific helpers)
-    -> checked closed program: structured IR and contract families
-    -> joint family for (entry, target, workload)
-    -> backend: site domains, limits, intervals, cost factors, seed
-    -> budgeted joint selection -> audited witness
-    -> instantiation: concrete execution IR, verified
-    -> backend realization: deterministic mapping rules
-    -> emission -> native compilation -> bound, validated invocation
+.seismic source
+    -> seismic-build: checked bundle + typed Rust bindings
+    -> DeviceCatalog::discover
+    -> open device and acquire its complete target profile
+    -> generated entry for_device(device, precision policy)
+    -> PreparedKernel covering the full inferred target domain
+    -> generated Args call with tensors and ordinary semantic parameters
+    -> validated variant selection and native execution
 ```
 
-The reference interpreter executes the first portable bodies and defines finite-precision
-reference behavior. A production backend must reproduce it exactly or carry evidence accepted by
-the caller's precision policy.
+Consumers import the public `seismic` API and generated bindings. Tensors carry their device,
+representation, shape, and layout. Consumers do not provide specialization domains, workload
+envelopes, shape buckets, expected dimensions, tuning grids, physical buffers, binding indices,
+or compiler artifacts.
+
+Opening a device is the profile boundary. Discovery is cheap enumeration; opening creates the real
+execution service, queries capabilities and limits, runs the fixed primitive probes required for
+that exact target, and returns a usable device only after its profile is complete. A prepared
+kernel is bound to that opened target and its precision policy.
+
+## One compiler path
+
+```text
+CheckedModule -> LogicalEntry -> ImplementationDraft<B>
+              -> NativeKernelCandidate<B> -> NativeKernel<B>
+              -> PlanSpace<B> -> FrozenPlan<B> -> ExecutableVariant<B>
+              -> PreparedKernel<B> -> PreparedWorkflow<B>
+              -> AdmittedWorkflowRun<B> -> Execution<B> -> Completion<B>
+```
+
+This is the only production path. Structural drafts are native-compiled and reconciled before
+they can enter `PlanSpace`; the required universal implementation closes first and optional
+templates consume one total preparation budget. Each admitted alternative contains its executable
+schedule, typed kernels, native contracts, allocation topology, resource constraints, numerical
+transfer, and profile-derived duration. Exact symbolic planning chooses and freezes alternatives while retaining
+runtime dimensions as symbols, then builds a non-empty variant portfolio whose guards provably
+cover the full target-representable semantic domain.
+
+Frozen-plan translation consumes already closed native kernels without compiling or redesigning
+them. Production model execution composes prepared kernels into a dependency-closed workflow;
+admission selects variants and reserves all resources atomically. Runtime validates public
+invocations and executes typed native schedules; it does not retry compilation, repair a plan,
+choose a fallback, or rediscover compiler legality.
+
+## Language and precision guarantees
+
+Owned tensors move, shared borrows may overlap, and mutable borrows are exclusive. Ordered loops
+may carry state; `parallel for` asserts independent logical iterations and admits only disjoint
+writes or explicit portable atomics. Materialization required by an implementation is inserted by
+the compiler rather than authored as a source workaround.
+
+The first applicable portable body defines reference operation order, casts, rounding, and
+exceptional-value behavior. Exact, bounded, and unconstrained precision policies determine which
+derived implementation transfers are admissible before selection. Fast math, contraction,
+reassociation, approximate operations, reduced precision, and flush-to-zero are never implicit
+backend defaults.
+
+## Responsibility boundaries
+
+| Participant | Owns |
+| --- | --- |
+| Kernel/library author | Logical algorithms, values, borrows, semantic control, portable bodies, and explicit target capability use |
+| Checker and semantic registry | Types, shapes, effects, ownership, capabilities, canonical semantics, checked identities, and inferred call schema/domain |
+| Compiler | Complete implementation construction, exact constraints, storage and resources, numerical assessment, duration modeling, solving, freezing, and exact portfolio coverage |
+| Backend | Exact-device profile acquisition, capability implementations, native emission, and execution service |
+| Runtime | Public invocation validation, deterministic variant selection, allocation, binding, submission, completion, and real execution failures |
+| Host application | Model or application topology, tensors, semantic parameters, device choice, precision policy, and session orchestration |
+
+Magnitude's inference engine is one host application. Model layers, cache policy, sampling, and
+session behavior remain engine responsibilities; they do not enter Seismic's compiler or public
+kernel abstractions.
 
 ## Outcomes
 
-| Outcome | Meaning |
-| --- | --- |
-| Invalid source | Type, effect, ownership, or declaration error. |
-| Missing target coverage | No applicable portable body, target lowering, or backend-specific helper has a complete supported dependency tree for a reached call. |
-| Unsupported structural mapping | The backend has no mapping for a meaningful structure. |
-| Incompatible composition | Required interfaces or hard capacities cannot agree. |
-| Infeasible | The exported family is proved to have no solution. |
-| Selection incomplete | The budget ended without a checked configuration. |
-| Analysis unavailable | A required quantity, estimate, or numerical proof has no supported derivation. |
-| Missing qualification | Qualified evidence was requested but no matching whole-witness record exists. |
-| Reconstruction defect | A witness, seed, or instantiation disagreed with the family. Compiler defect. |
-| Selected, feasible | Complete checked execution; estimated performance only. |
-| Selected, model-optimal | Additionally optimal over the stated family and estimate model. |
+A valid source entry either prepares a fully covered executable portfolio or returns a typed
+source, target, or preparation error before execution. After a generated call passes invocation
+validation, execution can still report data-dependent checks, allocation/submission/synchronization
+failures, or device loss. It cannot report disagreement between compiler phases.
 
-## Current scope
-
-- Metal, CPU, and CUDA are backends on the logical-to-physical compilation pipeline.
-- Width domains offer only divisors of static extents, so tail pieces do not occur.
-- Compiler-owned physical staging currently has only a synchronous, same-participant mapping.
-- Some intermediate physical results cannot yet cross a launch.
-- The estimate model is unqualified. No performance claim follows from a selection.
-- Static numerical proof coverage is conservative; unproved alternatives require matching
-  whole-witness qualification or remain available only to unconstrained exploration.
-
-## Further reading
-
-| Document | Focus |
-| --- | --- |
-| [Language](language.md) | Source surface and its rules |
-| [Compiler](compiler.md) | Stages, authoritative representations, permitted transformations |
-| [Execution](execution.md) | Region semantics as realized, execution units, instantiation rules |
-| [Tuning](tuning.md) | Joint selection, search, proof status, replay |
-| [Backends](backends.md) | The `Backend` contract and the Metal mapping |
-| [Runtime](runtime.md) | Executable boundary, binding, validation, reuse |
-| [Accounting](accounting.md) | Derived quantities, estimates, and their authority |
-| [Inference V4](../overview.md) | Enclosing inference-engine architecture |
+The durable sources of truth are [Seismic compilation](../../../design/inference/seismic-compilation.md),
+[language and capabilities](../../../design/inference/seismic-language-and-capabilities.md),
+[numerical precision](../../../design/inference/seismic-numerical-precision.md), and
+[structured solving](../../../design/inference/solver.md). The concise
+[compiler overview](compiler.md) describes the artifact boundaries in more detail.

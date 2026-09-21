@@ -7,10 +7,7 @@ license.workspace = true
 [dependencies]
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
-seismic-realization.workspace = true
 seismic-metal.workspace = true
 seismic-cpu.workspace = true
 seismic-cuda.workspace = true
-
-[dev-dependencies]
-seismic-std.workspace = true
+opentelemetry = "0.33.0"

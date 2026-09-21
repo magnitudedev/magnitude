@@ -210,13 +210,13 @@ impl Parser {
                 Tok::Indent => {
                     return Err(self.error(
                         "unexpected indentation; declarations start at the left margin".into(),
-                    ))
+                    ));
                 }
                 other => {
                     return Err(self.error(format!(
                         "expected `fn` or `lower`, found {}",
                         other.describe()
-                    )))
+                    )));
                 }
             }
         }
@@ -445,7 +445,7 @@ impl Parser {
                     Tok::Op(Op::LBracket) => {
                         return Err(self.error(format!(
                             "`{word}` takes no shape; the shaped type is `tensor`"
-                        )))
+                        )));
                     }
                     Tok::Op(Op::Dot) => {
                         return Err(Diagnostic::new(
@@ -685,7 +685,10 @@ impl Parser {
                 match op {
                     Some(op) => {
                         if !is_place(&target) {
-                            return Err(Diagnostic::new(target.span, "cannot assign to this expression; a target is a name, an indexed place or a tuple of them"));
+                            return Err(Diagnostic::new(
+                                target.span,
+                                "cannot assign to this expression; a target is a name, an indexed place or a tuple of them",
+                            ));
                         }
                         self.bump();
                         StmtKind::Assign {
@@ -945,7 +948,7 @@ impl Parser {
                 return Err(self.error(format!(
                     "expected an expression, found {}",
                     other.describe()
-                )))
+                )));
             }
         };
         self.bump();

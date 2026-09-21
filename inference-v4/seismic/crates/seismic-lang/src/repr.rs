@@ -1,30 +1,58 @@
-//! Packed representations. A representation is a property of data: at portable
-//! scope an element read is its decoded value; at backend scope the packet
-//! structure is exposed through the accessors here.
+//! Packed representations (crate-private tables behind `registry`). A
+//! representation is a property of data: at portable scope an element read is
+//! its decoded value; the physical plane structure here feeds the registry's
+//! `RepresentationInfo`, the reference decoder, and the decode recipe.
 
-use crate::intrinsics::PlaneField;
-use crate::sym::Sym;
 use crate::types::DType;
 
+/// One readable physical plane of a packed representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlaneField {
+    Words,
+    Scale,
+    Bias,
+    Coefficients,
+    ScaleFactor,
+    BiasFactor,
+    BlockScale,
+}
+
+impl PlaneField {
+    pub fn name(self) -> &'static str {
+        match self {
+            PlaneField::Words => "words",
+            PlaneField::Scale => "scale",
+            PlaneField::Bias => "bias",
+            PlaneField::Coefficients => "coefficients",
+            PlaneField::ScaleFactor => "scale_factor",
+            PlaneField::BiasFactor => "bias_factor",
+            PlaneField::BlockScale => "block_scale",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Repr {
-    pub name: &'static str,
-    pub packing_axis: PackingAxisRule,
+pub(crate) struct Repr {
+    pub(crate) name: &'static str,
+    pub(crate) packing_axis: PackingAxisRule,
     /// values per quantization group
-    pub group: u32,
+    pub(crate) group: u32,
     /// bits per code
-    pub bits: u32,
-    pub coefficients: Coefficients,
-    pub code: CodeInterpretation,
+    pub(crate) bits: u32,
+    pub(crate) coefficients: Coefficients,
+    pub(crate) code: CodeInterpretation,
+    /// Floating code carried by the value plane. Integer quantized formats
+    /// leave this absent and use `code`.
+    pub(crate) float_code: Option<FloatCodeFormat>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PackingAxisRule {
+pub(crate) enum PackingAxisRule {
     Last,
 }
 
 impl PackingAxisRule {
-    pub fn resolve(self, rank: usize) -> Option<usize> {
+    pub(crate) fn resolve(self, rank: usize) -> Option<usize> {
         match self {
             Self::Last => rank.checked_sub(1),
         }
@@ -35,19 +63,19 @@ impl PackingAxisRule {
 /// representation group. The same physical plane geometry owns native storage
 /// declarations and raw snapshot copies on every backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotLayout {
-    pub physical_width: u64,
-    pub strides: Vec<u64>,
-    pub planes: Vec<SnapshotPlane>,
+pub(crate) struct SnapshotLayout {
+    pub(crate) physical_width: u64,
+    pub(crate) strides: Vec<u64>,
+    pub(crate) planes: Vec<SnapshotPlane>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotPlane {
-    pub plane: Plane,
-    pub elements_per_row: u64,
-    pub elements: u64,
+pub(crate) struct SnapshotPlane {
+    pub(crate) plane: Plane,
+    pub(crate) elements_per_row: u64,
+    pub(crate) elements: u64,
 }
 impl Repr {
-    pub fn snapshot_layout(&self, capacities: &[u64]) -> Option<SnapshotLayout> {
+    pub(crate) fn snapshot_layout(&self, capacities: &[u64]) -> Option<SnapshotLayout> {
         let (&width, outer) = capacities.split_last()?;
         let group = u64::from(self.storage_group());
         let physical_width = if width == 0 {
@@ -91,10 +119,13 @@ impl Repr {
 /// Physical coefficient encoding. Hierarchical fields are interleaved scale,
 /// bias (when present); factors are shared by a larger group.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Coefficients {
+pub(crate) enum Coefficients {
     Direct {
         dtype: DType,
         bias: bool,
+        /// Logical values carried by one physical packet. This may contain
+        /// several independently scaled quantization groups.
+        packet_group: u32,
     },
     Hierarchical {
         factor_group: u32,
@@ -104,6 +135,8 @@ pub enum Coefficients {
         bias: bool,
         bias_sign: i32,
     },
+    /// One floating scale code shared by the representation group.
+    BlockFloat { format: FloatCodeFormat },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,17 +146,74 @@ pub enum PlaneEncoding {
         bits: u32,
         interpretation: CodeInterpretation,
     },
+    /// A closed floating code format packed bytewise, never a scalar dtype.
+    FloatCode {
+        format: FloatCodeFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FloatCodeFormat {
+    E2M1,
+    E4M3,
+    /// NVIDIA unsigned E4M3 scale code. Its physical byte is E4M3FN with
+    /// the sign bit ignored by NVFP4 matrix hardware.
+    UE4M3,
+}
+
+impl FloatCodeFormat {
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::E2M1 => 4,
+            Self::E4M3 | Self::UE4M3 => 8,
+        }
+    }
+
+    /// Exact value of the closed NVIDIA floating-code format.
+    pub fn decode(self, raw: u32) -> f32 {
+        let bits = self.bits();
+        let raw = raw & ((1u32 << bits) - 1);
+        let sign = if raw & (1 << (bits - 1)) == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        match self {
+            Self::E2M1 => {
+                let exponent = (raw >> 1) & 0x3;
+                let mantissa = raw & 0x1;
+                if exponent == 0 {
+                    sign * (mantissa as f32 * 0.5)
+                } else {
+                    sign * (1.0 + mantissa as f32 * 0.5) * 2.0f32.powi(exponent as i32 - 1)
+                }
+            }
+            Self::E4M3 | Self::UE4M3 => {
+                let sign = if self == Self::UE4M3 { 1.0 } else { sign };
+                let raw = if self == Self::UE4M3 { raw & 0x7f } else { raw };
+                let exponent = (raw >> 3) & 0xf;
+                let mantissa = raw & 0x7;
+                if exponent == 0 {
+                    sign * (mantissa as f32 / 8.0) * 2.0f32.powi(-6)
+                } else if exponent == 0xf && mantissa == 0x7 {
+                    f32::NAN.copysign(sign)
+                } else {
+                    sign * (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+                }
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Plane {
-    pub name: &'static str,
+pub(crate) struct Plane {
+    pub(crate) name: &'static str,
     /// Logical values sharing `fields` entries in this plane.
-    pub group: u32,
-    pub fields: u32,
-    pub encoding: PlaneEncoding,
+    pub(crate) group: u32,
+    pub(crate) fields: u32,
+    pub(crate) encoding: PlaneEncoding,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Coefficient {
+pub(crate) enum Coefficient {
     Direct {
         plane: Plane,
     },
@@ -135,50 +225,46 @@ pub enum Coefficient {
     },
 }
 impl Plane {
-    pub fn dtype(&self) -> DType {
+    pub(crate) fn dtype(&self) -> DType {
         match self.encoding {
             PlaneEncoding::Dense(dtype) => dtype,
             PlaneEncoding::Packed { .. } => DType::U32,
+            PlaneEncoding::FloatCode { .. } => DType::U32,
         }
     }
-    pub fn entry_bits(&self) -> u32 {
+    pub(crate) fn entry_bits(&self) -> u32 {
         match self.encoding {
             PlaneEncoding::Dense(dtype) => dtype.bytes() * 8,
             PlaneEncoding::Packed { bits, .. } => bits,
+            PlaneEncoding::FloatCode { format } => format.bits(),
         }
     }
-    pub fn entries(&self, values: u64) -> Option<u64> {
+    pub(crate) fn entries(&self, values: u64) -> Option<u64> {
         values
             .div_ceil(u64::from(self.group))
             .checked_mul(u64::from(self.fields))
     }
-    pub fn storage_elements(&self, values: u64) -> Option<u64> {
+    pub(crate) fn storage_elements(&self, values: u64) -> Option<u64> {
         let entries = self.entries(values)?;
         match self.encoding {
             PlaneEncoding::Dense(_) => Some(entries),
             PlaneEncoding::Packed { bits, .. } => {
                 entries.checked_mul(u64::from(bits)).map(|n| n.div_ceil(32))
             }
+            PlaneEncoding::FloatCode { format } => entries
+                .checked_mul(u64::from(format.bits()))
+                .map(|bits| bits.div_ceil(8)),
         }
     }
-    pub fn bytes(&self, values: u64) -> Option<u64> {
-        self.storage_elements(values)?
-            .checked_mul(u64::from(self.dtype().bytes()))
-    }
-    /// Raw accessor extent. Owning packed rows are complete storage groups.
-    pub fn extent(&self, values: &Sym) -> Sym {
-        let entries = values
-            .quot(&Sym::constant(i64::from(self.group)))
-            .scale(i64::from(self.fields));
+    pub(crate) fn bytes(&self, values: u64) -> Option<u64> {
         match self.encoding {
-            PlaneEncoding::Dense(_) => entries,
-            PlaneEncoding::Packed { bits, .. } => entries
-                .scale(i64::from(bits))
-                .add(&Sym::constant(31))
-                .quot(&Sym::constant(32)),
+            PlaneEncoding::FloatCode { .. } => self.storage_elements(values),
+            _ => self
+                .storage_elements(values)?
+                .checked_mul(u64::from(self.dtype().bytes())),
         }
     }
-    pub fn byte_offset(&self, logical: u64) -> Option<u64> {
+    pub(crate) fn byte_offset(&self, logical: u64) -> Option<u64> {
         if !logical.is_multiple_of(u64::from(self.group)) {
             return None;
         }
@@ -198,7 +284,7 @@ pub enum CodeInterpretation {
     Table(&'static [i32]),
 }
 impl Repr {
-    pub fn decode_code(&self, raw: u32) -> i32 {
+    pub(crate) fn decode_code(&self, raw: u32) -> i32 {
         self.code.decode(raw, self.bits)
     }
 }
@@ -243,11 +329,17 @@ impl PlaneSchema {
     }
 }
 
-/// A named temporary of a decode recipe; its dtype is
-/// `DecodeRecipe::temporaries[index]`. Every temporary is defined by exactly
-/// one step before any use.
+/// A typed temporary of one sealed decode recipe. Handles are created only by
+/// `RecipeBuilder`; the representation/output pair prevents a temporary from
+/// one recipe being used with another recipe that happens to have the same
+/// ordinal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DecodeTemp(pub u32);
+pub struct DecodeTemp {
+    representation: &'static str,
+    output: DType,
+    ordinal: u32,
+    dtype: DType,
+}
 
 /// One typed step of a decode recipe. Arithmetic steps operate on `f32`
 /// temporaries and round once at `f32`.
@@ -270,12 +362,15 @@ pub enum DecodeStep {
         bits: u32,
         interpretation: CodeInterpretation,
     },
+    /// Decode one closed floating code to its exact `f32` value.
+    DecodeFloatCode {
+        into: DecodeTemp,
+        raw: DecodeTemp,
+        format: FloatCodeFormat,
+    },
     /// `into: f32 := from` converted by value (exact for every `i32` code
     /// and every `f16`/`bf16` coefficient).
-    ConvertToF32 {
-        into: DecodeTemp,
-        from: DecodeTemp,
-    },
+    ConvertToF32 { into: DecodeTemp, from: DecodeTemp },
     /// `into: f32 := left * right`, rounded once.
     Multiply {
         into: DecodeTemp,
@@ -283,10 +378,7 @@ pub enum DecodeStep {
         right: DecodeTemp,
     },
     /// `into: f32 := -from`.
-    Negate {
-        into: DecodeTemp,
-        from: DecodeTemp,
-    },
+    Negate { into: DecodeTemp, from: DecodeTemp },
     /// `into: f32 := factor * multiplicand + addend`, rounded once (the
     /// reference evaluates the product and sum exactly and rounds to `f32`).
     MultiplyAdd {
@@ -306,10 +398,11 @@ pub enum DecodeStep {
 
 impl DecodeStep {
     /// The temporary this step defines.
-    pub fn defines(&self) -> DecodeTemp {
+    pub(crate) fn defines(&self) -> DecodeTemp {
         match self {
             DecodeStep::ReadPlaneField { into, .. }
             | DecodeStep::InterpretCode { into, .. }
+            | DecodeStep::DecodeFloatCode { into, .. }
             | DecodeStep::ConvertToF32 { into, .. }
             | DecodeStep::Multiply { into, .. }
             | DecodeStep::Negate { into, .. }
@@ -319,10 +412,11 @@ impl DecodeStep {
     }
 
     /// The temporaries this step reads, in operand order.
-    pub fn uses(&self) -> Vec<DecodeTemp> {
+    pub(crate) fn uses(&self) -> Vec<DecodeTemp> {
         match self {
             DecodeStep::ReadPlaneField { .. } => Vec::new(),
             DecodeStep::InterpretCode { raw, .. } => vec![*raw],
+            DecodeStep::DecodeFloatCode { raw, .. } => vec![*raw],
             DecodeStep::ConvertToF32 { from, .. }
             | DecodeStep::Negate { from, .. }
             | DecodeStep::Cast { from, .. } => vec![*from],
@@ -343,24 +437,63 @@ impl DecodeStep {
 /// code interpretation, or bias sign.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeRecipe {
-    pub planes: Vec<PlaneSchema>,
-    /// The dtype of every temporary, indexed by `DecodeTemp`.
-    pub temporaries: Vec<DType>,
-    pub steps: Vec<DecodeStep>,
+    representation: &'static str,
+    output_dtype: DType,
+    planes: Vec<PlaneSchema>,
+    temporary_count: u32,
+    steps: Vec<DecodeStep>,
     /// The temporary holding the decoded value.
-    pub output: DecodeTemp,
+    output: DecodeTemp,
 }
 
 impl DecodeRecipe {
-    /// The dtype of one temporary of this recipe.
+    pub fn planes(&self) -> &[PlaneSchema] {
+        &self.planes
+    }
+
+    pub fn steps(&self) -> &[DecodeStep] {
+        &self.steps
+    }
+
+    pub fn temporary_count(&self) -> usize {
+        self.temporary_count as usize
+    }
+
+    pub fn output(&self) -> DecodeTemp {
+        self.output
+    }
+
+    /// The dtype of one temporary. A foreign handle is an internal registry
+    /// programming error, not a runtime decoding condition.
     pub fn dtype(&self, temp: DecodeTemp) -> DType {
-        self.temporaries[temp.0 as usize]
+        self.assert_owns(temp);
+        temp.dtype
+    }
+
+    /// Dense ordinal used only to index emitter-local values. The recipe has
+    /// already proved that every operand precedes its defining step.
+    pub fn ordinal(&self, temp: DecodeTemp) -> usize {
+        self.assert_owns(temp);
+        temp.ordinal as usize
+    }
+
+    fn assert_owns(&self, temp: DecodeTemp) {
+        assert_eq!(
+            (temp.representation, temp.output),
+            (self.representation, self.output_dtype),
+            "decode temporary belongs to another sealed recipe"
+        );
+        assert!(
+            temp.ordinal < self.temporary_count,
+            "decode temporary is outside its sealed recipe"
+        );
     }
 }
 
 /// Builds a decode recipe: allocates typed temporaries and appends steps.
 struct RecipeBuilder<'a> {
     name: &'static str,
+    output: DType,
     planes: &'a [PlaneSchema],
     temporaries: Vec<DType>,
     steps: Vec<DecodeStep>,
@@ -369,7 +502,12 @@ struct RecipeBuilder<'a> {
 impl RecipeBuilder<'_> {
     fn temp(&mut self, dtype: DType) -> DecodeTemp {
         self.temporaries.push(dtype);
-        DecodeTemp(self.temporaries.len() as u32 - 1)
+        DecodeTemp {
+            representation: self.name,
+            output: self.output,
+            ordinal: self.temporaries.len() as u32 - 1,
+            dtype,
+        }
     }
 
     fn ordinal(&self, field: PlaneField) -> u32 {
@@ -404,6 +542,13 @@ impl RecipeBuilder<'_> {
             bits,
             interpretation,
         });
+        into
+    }
+
+    fn float_code(&mut self, raw: DecodeTemp, format: FloatCodeFormat) -> DecodeTemp {
+        let into = self.temp(DType::F32);
+        self.steps
+            .push(DecodeStep::DecodeFloatCode { into, raw, format });
         into
     }
 
@@ -465,7 +610,7 @@ impl RecipeBuilder<'_> {
     }
 }
 
-pub const REPRS: &[Repr] = &[
+pub(crate) const REPRS: &[Repr] = &[
     // MLX affine 4-bit, group 64: bf16 scale and bias per group.
     Repr {
         name: "q4g64",
@@ -475,8 +620,10 @@ pub const REPRS: &[Repr] = &[
         coefficients: Coefficients::Direct {
             dtype: DType::BF16,
             bias: true,
+            packet_group: 64,
         },
         code: CodeInterpretation::Unsigned,
+        float_code: None,
     },
     Repr {
         name: "q4g32",
@@ -486,8 +633,10 @@ pub const REPRS: &[Repr] = &[
         coefficients: Coefficients::Direct {
             dtype: DType::F32,
             bias: true,
+            packet_group: 32,
         },
         code: CodeInterpretation::Unsigned,
+        float_code: None,
     },
     Repr {
         name: "q4k",
@@ -495,6 +644,7 @@ pub const REPRS: &[Repr] = &[
         group: 32,
         bits: 4,
         code: CodeInterpretation::Unsigned,
+        float_code: None,
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
@@ -510,6 +660,7 @@ pub const REPRS: &[Repr] = &[
         group: 32,
         bits: 5,
         code: CodeInterpretation::Unsigned,
+        float_code: None,
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
@@ -525,6 +676,7 @@ pub const REPRS: &[Repr] = &[
         group: 16,
         bits: 6,
         code: CodeInterpretation::Offset(32),
+        float_code: None,
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
@@ -542,8 +694,10 @@ pub const REPRS: &[Repr] = &[
         coefficients: Coefficients::Direct {
             dtype: DType::F16,
             bias: false,
+            packet_group: 32,
         },
         code: CodeInterpretation::TwosComplement,
+        float_code: None,
     },
     Repr {
         name: "iq4g32",
@@ -553,10 +707,12 @@ pub const REPRS: &[Repr] = &[
         coefficients: Coefficients::Direct {
             dtype: DType::F32,
             bias: false,
+            packet_group: 256,
         },
         code: CodeInterpretation::Table(&[
             -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
         ]),
+        float_code: None,
     },
     Repr {
         name: "q8g32",
@@ -566,17 +722,32 @@ pub const REPRS: &[Repr] = &[
         coefficients: Coefficients::Direct {
             dtype: DType::F32,
             bias: false,
+            packet_group: 32,
         },
         code: CodeInterpretation::Unsigned,
+        float_code: None,
+    },
+    Repr {
+        name: "nvfp4_e2m1_block16",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: 4,
+        coefficients: Coefficients::BlockFloat {
+            format: FloatCodeFormat::UE4M3,
+        },
+        // Physical extraction is unsigned; interpretation is the explicit
+        // floating-code decode below.
+        code: CodeInterpretation::Unsigned,
+        float_code: Some(FloatCodeFormat::E2M1),
     },
 ];
 
-pub fn lookup(name: &str) -> Option<&'static Repr> {
+pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
     REPRS.iter().find(|r| r.name == name)
 }
 
 impl CodeInterpretation {
-    pub fn decode(&self, raw: u32, bits: u32) -> i32 {
+    pub(crate) fn decode(&self, raw: u32, bits: u32) -> i32 {
         match self {
             Self::Unsigned => raw as i32,
             Self::TwosComplement => ((raw << (32 - bits)) as i32) >> (32 - bits),
@@ -587,21 +758,24 @@ impl CodeInterpretation {
 }
 
 impl Repr {
-    pub fn has_bias(&self) -> bool {
+    pub(crate) fn has_bias(&self) -> bool {
         match self.coefficients {
             Coefficients::Direct { bias, .. } | Coefficients::Hierarchical { bias, .. } => bias,
+            Coefficients::BlockFloat { .. } => false,
         }
     }
-    pub fn coefficient_dtype(&self) -> DType {
+    pub(crate) fn coefficient_dtype(&self) -> DType {
         match self.coefficients {
             Coefficients::Direct { dtype, .. } => dtype,
             Coefficients::Hierarchical { .. } => DType::F32,
+            Coefficients::BlockFloat { .. } => DType::F32,
         }
     }
-    pub fn storage_group(&self) -> u32 {
+    pub(crate) fn storage_group(&self) -> u32 {
         match self.coefficients {
-            Coefficients::Direct { .. } => self.group,
+            Coefficients::Direct { packet_group, .. } => packet_group,
             Coefficients::Hierarchical { factor_group, .. } => factor_group,
+            Coefficients::BlockFloat { .. } => self.group,
         }
     }
     /// Ordered physical ABI planes with their typed field identities.
@@ -612,14 +786,17 @@ impl Repr {
                 name: "words",
                 group: 1,
                 fields: 1,
-                encoding: PlaneEncoding::Packed {
-                    bits: self.bits,
-                    interpretation: self.code.clone(),
+                encoding: match self.float_code {
+                    Some(format) => PlaneEncoding::FloatCode { format },
+                    None => PlaneEncoding::Packed {
+                        bits: self.bits,
+                        interpretation: self.code.clone(),
+                    },
                 },
             },
         )];
         match &self.coefficients {
-            Coefficients::Direct { dtype, bias } => {
+            Coefficients::Direct { dtype, bias, .. } => {
                 result.push((
                     PlaneField::Scale,
                     Plane {
@@ -682,12 +859,21 @@ impl Repr {
                     ));
                 }
             }
+            Coefficients::BlockFloat { format } => result.push((
+                PlaneField::BlockScale,
+                Plane {
+                    name: "block_scale",
+                    group: self.group,
+                    fields: 1,
+                    encoding: PlaneEncoding::FloatCode { format: *format },
+                },
+            )),
         }
         result
     }
 
     /// Ordered physical ABI planes; logical scale/bias accessors may decode several planes.
-    pub fn planes(&self) -> Vec<Plane> {
+    pub(crate) fn planes(&self) -> Vec<Plane> {
         self.plane_table()
             .into_iter()
             .map(|(_, plane)| plane)
@@ -695,7 +881,7 @@ impl Repr {
     }
 
     /// The complete typed schema of every plane, in ABI order.
-    pub fn plane_schemas(&self) -> Vec<PlaneSchema> {
+    pub(crate) fn plane_schemas(&self) -> Vec<PlaneSchema> {
         self.plane_table()
             .into_iter()
             .enumerate()
@@ -713,7 +899,7 @@ impl Repr {
 
     /// The typed decode recipe of this representation producing `f32`
     /// (the portable `decode` result).
-    pub fn decode_recipe(&self) -> DecodeRecipe {
+    pub(crate) fn decode_recipe(&self) -> DecodeRecipe {
         self.decode_recipe_to(DType::F32)
     }
 
@@ -723,17 +909,23 @@ impl Repr {
     /// where a direct coefficient is the plane value and a hierarchical
     /// coefficient is `factor * coefficient_code` (with the bias sign
     /// applied), exactly as the reference interpreter evaluates it.
-    pub fn decode_recipe_to(&self, output: DType) -> DecodeRecipe {
+    pub(crate) fn decode_recipe_to(&self, output: DType) -> DecodeRecipe {
         let planes = self.plane_schemas();
         let mut recipe = RecipeBuilder {
             name: self.name,
+            output,
             planes: &planes,
             temporaries: Vec::new(),
             steps: Vec::new(),
         };
         let raw = recipe.read(PlaneField::Words, 0);
-        let code = recipe.interpret(raw, self.bits, self.code.clone());
-        let code_value = recipe.to_f32(code);
+        let code_value = match self.float_code {
+            Some(format) => recipe.float_code(raw, format),
+            None => {
+                let code = recipe.interpret(raw, self.bits, self.code.clone());
+                recipe.to_f32(code)
+            }
+        };
         let (scale, bias) = match &self.coefficients {
             Coefficients::Direct { bias, .. } => {
                 let scale = recipe.read(PlaneField::Scale, 0);
@@ -766,15 +958,19 @@ impl Repr {
                         *bits,
                         interpretation.clone(),
                     );
-                    Some(match *bias_sign {
-                        1 => product,
-                        -1 => recipe.negate(product),
-                        other => panic!("`{}` bias sign {other} is not a sign", self.name),
+                    Some(if *bias_sign < 0 {
+                        recipe.negate(product)
+                    } else {
+                        product
                     })
                 } else {
                     None
                 };
                 (scale, bias)
+            }
+            Coefficients::BlockFloat { format } => {
+                let raw = recipe.read(PlaneField::BlockScale, 0);
+                (recipe.float_code(raw, *format), None)
             }
         };
         let value = match bias {
@@ -787,52 +983,101 @@ impl Repr {
             recipe.cast(value, output)
         };
         let RecipeBuilder {
-            temporaries, steps, ..
-        } = recipe;
-        DecodeRecipe {
-            planes,
+            name,
+            output,
             temporaries,
+            steps,
+            ..
+        } = recipe;
+        assert_eq!(
+            output_temp.dtype, output,
+            "decode recipe output type differs from its requested type"
+        );
+        assert_eq!(
+            steps.len(),
+            temporaries.len(),
+            "decode recipe must define exactly one new temporary per step"
+        );
+        for (ordinal, step) in steps.iter().enumerate() {
+            let defined = step.defines();
+            assert_eq!(
+                defined.ordinal as usize, ordinal,
+                "decode recipe temporary definitions are not canonical"
+            );
+            for used in step.uses() {
+                assert_eq!(
+                    (used.representation, used.output),
+                    (name, output),
+                    "decode step uses a temporary from another recipe"
+                );
+                assert!(
+                    used.ordinal < defined.ordinal,
+                    "decode recipe reads a temporary before its definition"
+                );
+            }
+        }
+        DecodeRecipe {
+            representation: name,
+            output_dtype: output,
+            planes,
+            temporary_count: u32::try_from(temporaries.len())
+                .expect("decode recipe has more than u32::MAX temporaries"),
             steps,
             output: output_temp,
         }
     }
-    pub fn plane(&self, name: &str) -> Option<Plane> {
+    pub(crate) fn plane(&self, name: &str) -> Option<Plane> {
         self.planes().into_iter().find(|p| p.name == name)
     }
-    pub fn plane_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn plane_index(&self, name: &str) -> Option<usize> {
         self.planes().iter().position(|p| p.name == name)
     }
-    pub fn coefficient(&self, bias: bool) -> Option<Coefficient> {
+    /// The logical scale (`bias == false`) or bias coefficient structure.
+    /// `None` when the representation has no bias.
+    pub(crate) fn coefficient(&self, bias: bool) -> Option<Coefficient> {
         if bias && !self.has_bias() {
             return None;
         }
-        Some(match self.coefficients {
-            Coefficients::Direct { .. } => Coefficient::Direct {
-                plane: self.plane(if bias { "bias" } else { "scale" }).unwrap(),
-            },
-            Coefficients::Hierarchical { bias_sign, .. } => Coefficient::Product {
-                factor: self
-                    .plane(if bias { "bias_factor" } else { "scale_factor" })
-                    .unwrap(),
-                coefficients: self.plane("coefficients").unwrap(),
+        let table = self.plane_table();
+        let find = |field: PlaneField| {
+            table
+                .iter()
+                .find(|(candidate, _)| *candidate == field)
+                .map(|(_, plane)| plane.clone())
+        };
+        match self.coefficients {
+            Coefficients::Direct { .. } => Some(Coefficient::Direct {
+                plane: find(if bias {
+                    PlaneField::Bias
+                } else {
+                    PlaneField::Scale
+                })?,
+            }),
+            Coefficients::Hierarchical { bias_sign, .. } => Some(Coefficient::Product {
+                factor: find(if bias {
+                    PlaneField::BiasFactor
+                } else {
+                    PlaneField::ScaleFactor
+                })?,
+                coefficients: find(PlaneField::Coefficients)?,
                 field: u32::from(bias),
                 sign: if bias { bias_sign } else { 1 },
-            },
-        })
+            }),
+            Coefficients::BlockFloat { .. } => Some(Coefficient::Direct {
+                plane: find(PlaneField::BlockScale)?,
+            }),
+        }
     }
-    pub fn bits_per_value(&self) -> f64 {
+    pub(crate) fn bits_per_value(&self) -> f64 {
         self.planes()
             .iter()
             .map(|p| p.entry_bits() as f64 * p.fields as f64 / p.group as f64)
             .sum()
     }
-    pub fn groups_extent(&self, k: &Sym) -> Sym {
-        k.quot(&Sym::constant(self.group as i64))
-    }
 }
 
 /// Little-endian contiguous packed entry; reads only bytes containing the entry.
-pub fn read_packed(bytes: &[u8], entry: usize, bits: u32) -> u32 {
+pub(crate) fn read_packed(bytes: &[u8], entry: usize, bits: u32) -> u32 {
     let first = entry * bits as usize;
     let mut value = 0;
     for bit in 0..bits as usize {
@@ -840,7 +1085,7 @@ pub fn read_packed(bytes: &[u8], entry: usize, bits: u32) -> u32 {
     }
     value
 }
-pub fn write_packed(bytes: &mut [u8], entry: usize, bits: u32, value: u32) {
+pub(crate) fn write_packed(bytes: &mut [u8], entry: usize, bits: u32, value: u32) {
     let first = entry * bits as usize;
     for bit in 0..bits as usize {
         let index = (first + bit) / 8;
@@ -857,14 +1102,12 @@ mod tests {
     /// as `f64`, with plane contents supplied per (ordinal, entry): a packed
     /// entry is its raw code, a dense entry its value.
     fn evaluate(recipe: &DecodeRecipe, value: u64, plane_entry: &dyn Fn(u32, u64) -> f64) -> f64 {
-        let mut temporaries: Vec<Option<f64>> = vec![None; recipe.temporaries.len()];
-        let get = |temporaries: &[Option<f64>], temp: DecodeTemp| {
-            temporaries[temp.0 as usize].expect("temporary defined before use")
-        };
-        for step in &recipe.steps {
+        let mut temporaries: Vec<f64> = Vec::with_capacity(recipe.temporary_count());
+        let get = |temporaries: &[f64], temp: DecodeTemp| temporaries[recipe.ordinal(temp)];
+        for step in recipe.steps() {
             let result = match step {
                 DecodeStep::ReadPlaneField { plane, field, .. } => {
-                    let schema = &recipe.planes[*plane as usize];
+                    let schema = &recipe.planes()[*plane as usize];
                     plane_entry(*plane, schema.entry(value, *field))
                 }
                 DecodeStep::InterpretCode {
@@ -873,6 +1116,9 @@ mod tests {
                     interpretation,
                     ..
                 } => f64::from(interpretation.decode(get(&temporaries, *raw) as u32, *bits)),
+                DecodeStep::DecodeFloatCode { raw, format, .. } => {
+                    f64::from(format.decode(get(&temporaries, *raw) as u32))
+                }
                 DecodeStep::ConvertToF32 { from, .. } => get(&temporaries, *from) as f32 as f64,
                 DecodeStep::Multiply { left, right, .. } => {
                     (get(&temporaries, *left) * get(&temporaries, *right)) as f32 as f64
@@ -883,8 +1129,10 @@ mod tests {
                     multiplicand,
                     addend,
                     ..
-                } => (get(&temporaries, *factor) * get(&temporaries, *multiplicand)
-                    + get(&temporaries, *addend)) as f32 as f64,
+                } => {
+                    (get(&temporaries, *factor) * get(&temporaries, *multiplicand)
+                        + get(&temporaries, *addend)) as f32 as f64
+                }
                 DecodeStep::Cast { from, to, .. } => {
                     assert_eq!(*to, DType::F32, "the test evaluator casts to f32 only");
                     get(&temporaries, *from) as f32 as f64
@@ -892,12 +1140,12 @@ mod tests {
             };
             let into = step.defines();
             assert!(
-                temporaries[into.0 as usize].is_none(),
-                "temporary {into:?} defined twice"
+                recipe.ordinal(into) == temporaries.len(),
+                "sealed recipe definition order changed"
             );
-            temporaries[into.0 as usize] = Some(result);
+            temporaries.push(result);
         }
-        get(&temporaries, recipe.output)
+        get(&temporaries, recipe.output())
     }
 
     /// Deterministic plane contents for a representation: packed entries
@@ -914,6 +1162,12 @@ mod tests {
                         .wrapping_add(ordinal.wrapping_mul(97))
                         & ((1u32 << bits) - 1),
                 ),
+                PlaneEncoding::FloatCode { format } => f64::from(
+                    (entry as u32)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add(ordinal.wrapping_mul(97))
+                        & ((1u32 << format.bits()) - 1),
+                ),
                 PlaneEncoding::Dense(_) => 0.375 + entry as f64 * 0.125 - f64::from(ordinal),
             }
         }
@@ -925,10 +1179,13 @@ mod tests {
             let recipe = repr.decode_recipe();
             let plane_entry = synthetic_plane_entry(repr);
             let planes = repr.planes();
-            assert_eq!(recipe.planes.len(), planes.len());
-            for (schema, plane) in recipe.planes.iter().zip(&planes) {
+            assert_eq!(recipe.planes().len(), planes.len());
+            for (schema, plane) in recipe.planes().iter().zip(&planes) {
                 assert_eq!(schema.field.name(), plane.name);
-                assert_eq!(schema.ordinal as usize, repr.plane_index(plane.name).unwrap());
+                assert_eq!(
+                    schema.ordinal as usize,
+                    repr.plane_index(plane.name).unwrap()
+                );
                 assert_eq!(schema.encoding, plane.encoding);
                 assert_eq!(schema.group, plane.group);
                 assert_eq!(schema.fields, plane.fields);
@@ -943,6 +1200,7 @@ mod tests {
                         bits,
                         interpretation,
                     } => interpretation.decode(raw as u32, *bits) as f32,
+                    PlaneEncoding::FloatCode { format } => format.decode(raw as u32),
                     PlaneEncoding::Dense(_) => raw as f32,
                 }
             };
@@ -972,7 +1230,11 @@ mod tests {
                     }
                 };
                 let code = plane_entry(0, flat as u64) as u32;
-                let expected = (coefficient(false) as f64 * repr.decode_code(code) as f64
+                let decoded_code = match repr.float_code {
+                    Some(format) => format.decode(code),
+                    None => repr.decode_code(code) as f32,
+                };
+                let expected = (coefficient(false) as f64 * f64::from(decoded_code)
                     + coefficient(true) as f64) as f32 as f64;
                 let actual = evaluate(&recipe, flat as u64, &plane_entry);
                 assert_eq!(actual, expected, "`{}` at {flat}", repr.name);
@@ -985,24 +1247,46 @@ mod tests {
         for repr in REPRS {
             for output in [DType::F32, DType::BF16] {
                 let recipe = repr.decode_recipe_to(output);
-                let mut defined = vec![false; recipe.temporaries.len()];
-                for step in &recipe.steps {
+                let mut defined = vec![false; recipe.temporary_count()];
+                for step in recipe.steps() {
                     for used in step.uses() {
-                        assert!(defined[used.0 as usize], "`{}`: {step:?} uses an undefined temporary", repr.name);
+                        assert!(
+                            defined[recipe.ordinal(used)],
+                            "`{}`: {step:?} uses an undefined temporary",
+                            repr.name
+                        );
                     }
                     let into = step.defines();
-                    assert!(!defined[into.0 as usize], "`{}`: {step:?} redefines a temporary", repr.name);
-                    defined[into.0 as usize] = true;
+                    assert!(
+                        !defined[recipe.ordinal(into)],
+                        "`{}`: {step:?} redefines a temporary",
+                        repr.name
+                    );
+                    defined[recipe.ordinal(into)] = true;
                     match step {
                         DecodeStep::ReadPlaneField { into, plane, field } => {
-                            let schema = &recipe.planes[*plane as usize];
+                            let schema = &recipe.planes()[*plane as usize];
                             assert!(*field < schema.fields);
                             assert_eq!(recipe.dtype(*into), schema.storage_dtype);
                         }
-                        DecodeStep::InterpretCode { into, raw, bits, .. } => {
+                        DecodeStep::InterpretCode {
+                            into, raw, bits, ..
+                        } => {
                             assert_eq!(recipe.dtype(*raw), DType::U32);
                             assert_eq!(recipe.dtype(*into), DType::I32);
                             assert!((1..=32).contains(bits));
+                        }
+                        DecodeStep::DecodeFloatCode {
+                            into, raw, format, ..
+                        } => {
+                            assert_eq!(recipe.dtype(*raw), DType::U32);
+                            assert_eq!(recipe.dtype(*into), DType::F32);
+                            assert!(matches!(
+                                format,
+                                FloatCodeFormat::E2M1
+                                    | FloatCodeFormat::E4M3
+                                    | FloatCodeFormat::UE4M3
+                            ));
                         }
                         DecodeStep::ConvertToF32 { into, .. } => {
                             assert_eq!(recipe.dtype(*into), DType::F32);
@@ -1033,10 +1317,14 @@ mod tests {
                     }
                 }
                 assert!(defined.iter().all(|defined| *defined));
-                assert_eq!(recipe.dtype(recipe.output), output);
-                assert_eq!(recipe.steps.last().unwrap().defines(), recipe.output);
+                assert_eq!(recipe.dtype(recipe.output()), output);
+                assert_eq!(recipe.steps().last().unwrap().defines(), recipe.output());
                 assert_eq!(
-                    recipe.steps.iter().filter(|step| matches!(step, DecodeStep::Cast { .. })).count(),
+                    recipe
+                        .steps
+                        .iter()
+                        .filter(|step| matches!(step, DecodeStep::Cast { .. }))
+                        .count(),
                     usize::from(output != DType::F32)
                 );
             }
@@ -1058,7 +1346,9 @@ mod tests {
                     bias_sign: -1,
                     ..
                 } => 1,
-                Coefficients::Hierarchical { .. } | Coefficients::Direct { .. } => 0,
+                Coefficients::Hierarchical { .. }
+                | Coefficients::Direct { .. }
+                | Coefficients::BlockFloat { .. } => 0,
             };
             assert_eq!(negations, expected, "`{}`", repr.name);
             let has_add = recipe

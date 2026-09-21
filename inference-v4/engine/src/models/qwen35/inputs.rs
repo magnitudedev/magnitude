@@ -1,7 +1,7 @@
 //! Immutable semantic continuation. Successors retain only unconsumed image
 //! leases; cloning a checkpoint preserves its own earlier continuation.
 use super::{preparation::InputPlan, vision_runtime::Features};
-use seismic_runtime::{Buffer, Device};
+use seismic::{Device, Tensor};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -15,7 +15,7 @@ pub struct InputState {
     features: HashMap<String, Features>,
 }
 pub(crate) struct FeatureSlice {
-    pub source: Buffer,
+    pub source: Tensor,
     pub destination: usize,
     pub count: usize,
 }
@@ -127,10 +127,6 @@ impl InputState {
             return Err("input tokens differ from the bound prompt".into());
         }
         let mut features = Vec::new();
-        let row_bytes = self
-            .width
-            .checked_mul(4)
-            .ok_or("feature row byte overflow")?;
         for span in self
             .plan
             .layout()
@@ -140,20 +136,17 @@ impl InputState {
         {
             let start = self.position.max(span.start);
             let count = end.min(span.end) - start;
-            let offset = (start - span.start)
-                .checked_mul(row_bytes)
-                .ok_or("feature slice overflow")?;
-            let length = count
-                .checked_mul(row_bytes)
-                .ok_or("feature slice overflow")?;
             let feature = self
                 .features
                 .get(&span.identity)
                 .ok_or("unconsumed feature is missing")?;
             features.push(FeatureSlice {
-                source: feature
-                    .buffer()
-                    .view(offset..offset.checked_add(length).ok_or("feature slice overflow")?)?,
+                source: feature.buffer().slice_leading(
+                    u64::try_from(start - span.start)
+                        .map_err(|_| "feature slice start exceeds tensor index range")?,
+                    u64::try_from(end.min(span.end) - span.start)
+                        .map_err(|_| "feature slice end exceeds tensor index range")?,
+                )?,
                 destination: start - self.position,
                 count,
             });
@@ -175,6 +168,14 @@ mod tests {
         },
         models::qwen35::preparation::{interpret, ImageGeometry},
     };
+    use seismic::{BackendName, DeviceCatalog, Element};
+
+    fn metal() -> Device {
+        DeviceCatalog::discover()
+            .unwrap()
+            .open_backend(BackendName::Metal)
+            .unwrap()
+    }
     fn plan() -> Rc<InputPlan> {
         let geometry = ImageGeometry {
             channels: 1,
@@ -218,23 +219,20 @@ mod tests {
         )
     }
     fn feature(device: &Device, plan: &InputPlan) -> Features {
+        let bytes = (0..12)
+            .flat_map(|n| (n as f32).to_le_bytes())
+            .collect::<Vec<_>>();
         Features::test_fixture(
             plan.layout().spans()[0].identity.clone(),
             4,
             3,
-            device
-                .buffer_from(
-                    &(0..12)
-                        .flat_map(|n| (n as f32).to_le_bytes())
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap(),
+            Tensor::from_host(device, Element::f32(), &[4, 3], &bytes).unwrap(),
         )
     }
     #[test]
     #[ignore = "requires a Metal device"]
     fn partial_images_retain_exact_slices_and_checkpoint_ownership() {
-        let device = Device::metal().unwrap();
+        let device = metal();
         let plan = plan();
         let initial =
             InputState::new(&device, plan.clone(), 0, vec![feature(&device, &plan)], 3).unwrap();
@@ -243,12 +241,11 @@ mod tests {
         assert_eq!(first.features.len(), 1);
         assert_eq!(first.features[0].destination, 2);
         assert_eq!(first.features[0].count, 2);
-        assert_eq!(first.features[0].source.len(), 24);
+        assert_eq!(first.features[0].source.byte_len(), 24);
         let partial = initial.after(4).unwrap();
         let second = partial.assemble(&[99, 99, 100]).unwrap();
         assert_eq!(second.features[0].destination, 0);
-        let mut actual = vec![0; 24];
-        second.features[0].source.read(&mut actual).unwrap();
+        let actual = second.features[0].source.read_to_host().unwrap();
         assert_eq!(
             actual,
             (6..12)
@@ -276,7 +273,7 @@ mod tests {
             models::sequence::{OwnedSequence, SequenceWork},
             state::StateStore,
         };
-        let device = Rc::new(Device::metal().unwrap());
+        let device = Rc::new(metal());
         let store = StateStore::new(device.clone(), 8, 16, vec![], vec![]).unwrap();
         let plan = plan();
         let input =
@@ -320,8 +317,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Metal device"]
     fn input_rejects_missing_duplicate_wrong_geometry_foreign_and_changed_tokens() {
-        let device = Device::metal().unwrap();
-        let foreign = Device::metal().unwrap();
+        let device = metal();
+        let foreign = metal();
         let plan = plan();
         assert!(InputState::new(&device, plan.clone(), 0, vec![], 3).is_err());
         let f = feature(&device, &plan);

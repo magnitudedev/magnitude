@@ -1034,14 +1034,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "seismic-compiler",
- "seismic-cpu",
- "seismic-cuda",
- "seismic-lang",
- "seismic-metal",
- "seismic-realization",
- "seismic-runtime",
- "seismic-std",
+ "seismic",
+ "seismic-build",
  "serde",
  "serde_json",
  "sha2",
@@ -1062,9 +1056,6 @@ name = "magnitude-solver-lab"
 version = "0.1.0"
 dependencies = [
  "magnitude-solver",
- "seismic-compiler",
- "seismic-lang",
- "seismic-std",
  "serde",
  "serde_json",
 ]
@@ -1594,15 +1585,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "seismic-cli"
+name = "seismic"
 version = "0.1.0"
 dependencies = [
  "seismic-compiler",
- "seismic-cpu",
- "seismic-cuda",
  "seismic-lang",
- "seismic-metal",
- "seismic-realization",
+ "seismic-runtime",
+]
+
+[[package]]
+name = "seismic-build"
+version = "0.1.0"
+dependencies = [
+ "seismic-lang",
+ "seismic-std",
+ "sha2",
+]
+
+[[package]]
+name = "seismic-cli"
+version = "0.1.0"
+dependencies = [
+ "seismic-lang",
+ "seismic-std",
 ]
 
 [[package]]
@@ -1611,7 +1616,7 @@ version = "0.1.0"
 dependencies = [
  "magnitude-solver",
  "seismic-lang",
- "seismic-realization",
+ "sha2",
 ]
 
 [[package]]
@@ -1625,7 +1630,7 @@ dependencies = [
  "cranelift-native",
  "seismic-compiler",
  "seismic-lang",
- "seismic-realization",
+ "sha2",
 ]
 
 [[package]]
@@ -1635,8 +1640,7 @@ dependencies = [
  "libloading",
  "seismic-compiler",
  "seismic-lang",
- "seismic-realization",
- "seismic-std",
+ "sha2",
 ]
 
 [[package]]
@@ -1655,28 +1659,19 @@ dependencies = [
  "objc2-metal",
  "seismic-compiler",
  "seismic-lang",
- "seismic-realization",
-]
-
-[[package]]
-name = "seismic-realization"
-version = "0.1.0"
-dependencies = [
- "magnitude-solver",
- "seismic-lang",
+ "sha2",
 ]
 
 [[package]]
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
+ "opentelemetry",
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
  "seismic-lang",
  "seismic-metal",
- "seismic-realization",
- "seismic-std",
 ]
 
 [[package]]

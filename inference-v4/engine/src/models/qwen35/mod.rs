@@ -7,7 +7,6 @@ pub mod inputs;
 pub mod loading;
 pub mod mlx;
 pub mod preparation;
-pub mod program;
 pub mod service;
 pub mod session;
 pub mod vision;
@@ -16,7 +15,7 @@ use crate::weights::{
     descriptor::{ArtifactIdentity, WeightDescriptor},
     Error,
 };
-use seismic_lang::types::DType;
+use seismic::DType;
 use serde::Serialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

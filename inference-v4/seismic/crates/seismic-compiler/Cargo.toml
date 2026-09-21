@@ -9,5 +9,5 @@ path = "src/compiler.rs"
 
 [dependencies]
 seismic-lang.workspace = true
-seismic-realization.workspace = true
 magnitude-solver = { path = "../../../solver" }
+sha2 = "=0.11.0"

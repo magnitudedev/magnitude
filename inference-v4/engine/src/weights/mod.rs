@@ -10,21 +10,23 @@ use std::{fmt, io};
 pub enum Error {
     Io(io::Error),
     Invalid(String),
+    Seismic(crate::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "weight source: {e}"),
             Self::Invalid(e) => f.write_str(e),
+            Self::Seismic(e) => write!(f, "weight execution: {e}"),
         }
     }
 }
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        if let Self::Io(e) = self {
-            Some(e)
-        } else {
-            None
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Seismic(e) => Some(e),
+            Self::Invalid(_) => None,
         }
     }
 }
@@ -33,3 +35,23 @@ impl From<io::Error> for Error {
         Self::Io(e)
     }
 }
+
+impl From<crate::Error> for Error {
+    fn from(error: crate::Error) -> Self {
+        Self::Seismic(error)
+    }
+}
+
+macro_rules! seismic_error {
+    ($source:ty) => {
+        impl From<$source> for Error {
+            fn from(error: $source) -> Self {
+                Self::Seismic(error.into())
+            }
+        }
+    };
+}
+
+seismic_error!(seismic::TensorError);
+seismic_error!(seismic::LoadError);
+seismic_error!(seismic::CallError);

@@ -1,22 +1,26 @@
-//! The Seismic language: source syntax checked into the semantic program,
-//! typed through the intrinsic registry with canonical types and traversal.
+//! The Seismic language: parser, type/effect checker, the opaque
+//! `CheckedModule`, the checked-bundle boundary, `LogicalEntry`/`CallSchema`,
+//! typed registry identities, and the one symbolic expression arena.
 //!
-//! `syntax` -> `check` -> `sir` (checked) -> reference interpretation (`interp`).
-//! Logical construction and specialization consume the checked program next.
+//! Public checked semantics are the opaque `checked`/`bundle` boundary and
+//! the read-only `entry` graph. Primitive enums remain in `intrinsics`; the
+//! string-keyed intrinsic and representation tables are private registry
+//! construction details. The semantic oracle is a validation consumer of the
+//! same entry graph, never a production execution path.
 
-pub mod abi;
-pub mod check;
-pub mod family;
+pub mod bundle;
+pub mod checked;
+pub mod entry;
+pub mod expr;
+pub mod ids;
+pub mod registry;
+
+mod check;
 pub mod intrinsics;
-pub mod layout;
-pub mod logical;
-pub mod numeric;
 pub mod precision;
-pub mod program;
-pub mod repr;
-pub mod sir;
+pub mod reference_math;
+pub(crate) mod repr;
 pub mod span;
-pub mod sym;
 pub mod syntax;
 pub mod types;
 

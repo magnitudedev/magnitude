@@ -1,130 +1,140 @@
-//! Aligned, thread-affine host storage with retained byte views.
-use std::{cell::RefCell, rc::Rc};
+//! Aligned host storage for one global allocation.
+//!
+//! A `Buffer` is one allocation of the host heap at the profile's
+//! allocation alignment. Kernels receive its address through the launch
+//! frame; the runtime reads and writes it through `DeviceService`. The
+//! runtime's submission discipline is single-threaded per device: no host
+//! access overlaps a launch that binds the buffer, which is what makes the
+//! raw address a valid kernel operand.
 
-/// Why a host buffer operation failed. The runtime boundary maps these
-/// into `ExecutionFailure::External` (allocation) or rejects the request
-/// before submission (range/in-use facts of the caller's binding).
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+/// Why a host allocation could not be made: the only real failure of a
+/// host buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BufferError {
-    /// The requested size is not representable as a host allocation.
-    SizeOverflow,
-    /// The host allocation failed.
-    Allocation,
-    /// A view or transfer lies outside its parent view's bytes.
-    OutOfRange,
-    /// The backing storage is already borrowed for another operation.
-    InUse,
+pub enum AllocationFailure {
+    /// The size and alignment do not form a valid host layout.
+    Unrepresentable,
+    /// The host allocator refused.
+    OutOfMemory,
 }
 
-impl std::fmt::Display for BufferError {
+impl std::fmt::Display for AllocationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SizeOverflow => f.write_str("CPU allocation size overflow"),
-            Self::Allocation => f.write_str("CPU allocation failed"),
-            Self::OutOfRange => f.write_str("CPU view or transfer exceeds its parent"),
-            Self::InUse => f.write_str("CPU storage is already in use"),
+            Self::Unrepresentable => {
+                f.write_str("CPU allocation size is not representable on the host")
+            }
+            Self::OutOfMemory => f.write_str("CPU allocation failed"),
         }
     }
 }
 
-impl std::error::Error for BufferError {}
+struct Allocation {
+    pointer: NonNull<u8>,
+    layout: Layout,
+}
 
+// The allocation is plain bytes owned by this struct; sharing it across
+// threads is sound because every access goes through the raw address under
+// the submission discipline documented at the module level.
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        if self.layout.size() != 0 {
+            // `pointer` came from `alloc_zeroed(self.layout)` in `Buffer::new`.
+            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        }
+    }
+}
+
+/// One host allocation, shared by handle.
 #[derive(Clone)]
 pub struct Buffer {
-    pub(crate) storage: Rc<RefCell<Vec<u64>>>,
-    pub(crate) offset: usize,
-    len: usize,
+    inner: Arc<Allocation>,
 }
+
 impl Buffer {
-    pub fn new(bytes: usize) -> Result<Self, BufferError> {
-        let words = bytes
-            .checked_add(7)
-            .ok_or(BufferError::SizeOverflow)?
-            / 8;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(words)
-            .map_err(|_| BufferError::Allocation)?;
-        storage.resize(words, 0);
+    /// A zeroed allocation of `bytes` at `alignment` (a power of two).
+    pub fn new(bytes: u64, alignment: u64) -> Result<Self, AllocationFailure> {
+        let size = usize::try_from(bytes).map_err(|_| AllocationFailure::Unrepresentable)?;
+        let align = usize::try_from(alignment).map_err(|_| AllocationFailure::Unrepresentable)?;
+        let layout =
+            Layout::from_size_align(size, align).map_err(|_| AllocationFailure::Unrepresentable)?;
+        let pointer = if size == 0 {
+            NonNull::<u8>::dangling()
+        } else {
+            // A non-zero-sized layout, as `alloc_zeroed` requires.
+            let raw = unsafe { alloc_zeroed(layout) };
+            NonNull::new(raw).ok_or(AllocationFailure::OutOfMemory)?
+        };
         Ok(Self {
-            storage: Rc::new(RefCell::new(storage)),
-            offset: 0,
-            len: bytes,
+            inner: Arc::new(Allocation { pointer, layout }),
         })
     }
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BufferError> {
-        let buffer = Self::new(bytes.len())?;
-        buffer.write(bytes)?;
-        Ok(buffer)
+
+    pub fn len(&self) -> u64 {
+        self.inner.layout.size() as u64
     }
-    pub fn len(&self) -> usize {
-        self.len
-    }
+
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.inner.layout.size() == 0
     }
-    pub fn view(&self, range: std::ops::Range<usize>) -> Result<Self, BufferError> {
-        if range.start > range.end || range.end > self.len {
-            return Err(BufferError::OutOfRange);
-        }
-        Ok(Self {
-            storage: self.storage.clone(),
-            offset: self
-                .offset
-                .checked_add(range.start)
-                .ok_or(BufferError::SizeOverflow)?,
-            len: range.end - range.start,
-        })
+
+    /// The host address of byte 0. Valid while any handle is alive.
+    pub fn data_pointer(&self) -> *mut u8 {
+        self.inner.pointer.as_ptr()
     }
-    pub fn write(&self, bytes: &[u8]) -> Result<(), BufferError> {
-        if bytes.len() > self.len {
-            return Err(BufferError::OutOfRange);
-        }
-        let mut storage = self
-            .storage
-            .try_borrow_mut()
-            .map_err(|_| BufferError::InUse)?;
-        // The checked view lies within the word allocation. No host slices into
-        // that private allocation escape, so the input cannot alias it.
+
+    /// Copies `bytes` into the buffer at `offset`. The range lies inside the
+    /// allocation: the runtime sizes every transfer from the schema, so an
+    /// out-of-range transfer is a violated precondition of this wrapper
+    /// (§13.3.3).
+    pub fn write(&self, offset: u64, bytes: &[u8]) {
+        let range = self.range(offset, bytes.len());
+        // In-range by `range`; the source is a separate host slice.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                storage.as_mut_ptr().cast::<u8>().add(self.offset),
+                self.data_pointer().add(range),
                 bytes.len(),
-            );
-        }
-        Ok(())
+            )
+        };
     }
-    pub fn read(&self, bytes: &mut [u8]) -> Result<(), BufferError> {
-        if bytes.len() > self.len {
-            return Err(BufferError::OutOfRange);
-        }
-        let storage = self
-            .storage
-            .try_borrow()
-            .map_err(|_| BufferError::InUse)?;
-        // u64 has no invalid bit patterns. Reading initialized allocation bytes
-        // is valid, and the caller cannot hold a slice into this private owner.
+
+    /// Copies bytes out of the buffer at `offset` (same precondition as
+    /// `write`).
+    pub fn read(&self, offset: u64, into: &mut [u8]) {
+        let range = self.range(offset, into.len());
         unsafe {
             std::ptr::copy_nonoverlapping(
-                storage.as_ptr().cast::<u8>().add(self.offset),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-            );
-        }
-        Ok(())
+                self.data_pointer().add(range),
+                into.as_mut_ptr(),
+                into.len(),
+            )
+        };
     }
-    /// The host pointer of this view's bytes. The Rc allocation outlives the
-    /// view; no growth occurs while the kernel borrows it. Public so the
-    /// runtime crate's CPU adapter can extract validated buffer pointers.
-    ///
-    /// The single-threaded borrow discipline of submission guarantees no
-    /// overlapping borrow at this point; the caller owns that invariant.
-    pub fn data_pointer(&self) -> *mut u8 {
-        let mut storage = self
-            .storage
-            .try_borrow_mut()
-            .expect("CPU storage is already in use");
-        unsafe { storage.as_mut_ptr().cast::<u8>().add(self.offset) }
+
+    fn range(&self, offset: u64, len: usize) -> usize {
+        let end = offset.checked_add(len as u64);
+        match end {
+            Some(end) if end <= self.len() => offset as usize,
+            _ => panic!(
+                "Buffer precondition violated: transfer of {len} bytes at offset {offset} exceeds the {}-byte allocation",
+                self.len()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer")
+            .field("bytes", &self.len())
+            .finish()
     }
 }

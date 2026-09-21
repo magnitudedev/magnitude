@@ -43,7 +43,7 @@ impl<'a> Lexer<'a> {
                     return Err(Diagnostic::new(
                         Span::new(self.pos, self.pos + 1),
                         "tabs are not allowed; use spaces",
-                    ))
+                    ));
                 }
                 b'\r' => self.pos += 1,
                 b'#' => self.skip_comment(),
@@ -108,7 +108,7 @@ impl<'a> Lexer<'a> {
                     return Err(Diagnostic::new(
                         Span::new(self.pos, self.pos + 1),
                         "tabs are not allowed; use spaces",
-                    ))
+                    ));
                 }
                 b'\r' => self.pos += 1,
                 _ => break,

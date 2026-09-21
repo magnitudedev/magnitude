@@ -1,6 +1,6 @@
 //! Header-only interpretation of the stored dtypes admitted by V3's MLX loader.
 use super::Error;
-use seismic_lang::types::DType;
+use seismic::DType;
 use serde::{
     de::{self, MapAccess, Visitor},
     Deserialize, Deserializer,

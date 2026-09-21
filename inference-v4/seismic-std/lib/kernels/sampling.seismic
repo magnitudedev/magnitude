@@ -51,19 +51,16 @@ fn sample_rows[M, V](logits: &tensor[M, V] f32, mask: &tensor[M, (V + 31) / 32] 
                     let uniform = (f32(c0 >> 9) + 0.5) * 0.00000011920928955078125
                     value = value - log(-log(uniform))
                 scores[token] = value
-        let bad = reduce(i32(invalid), 0, max)
-        let maximum = reduce(f32(scores), 0, max)
-        let winner = reduce(f32(scores), 0, argmax)
-        let mut choice = tensor[2] i32
-        for i in 0..2:
-            let mut status = i32(0)
-            if maximum == -inf:
-                status = 1
-            if bad != 0:
-                status = 2
-            choice[i] = status
-            if i == 0:
-                choice[i] = -1
-                if status == 0:
-                    choice[i] = winner
-        result[rows] = choice
+        let bad = reduce(invalid, 0, max)
+        let maximum = reduce(scores, 0, max)
+        let winner = reduce(scores, 0, argmax)
+        let mut status = i32(0)
+        if maximum == -inf:
+            status = 1
+        if bad != 0:
+            status = 2
+        let mut token = i32(-1)
+        if status == 0:
+            token = winner
+        result[rows, 0] = token
+        result[rows, 1] = status

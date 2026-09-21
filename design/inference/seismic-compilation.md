@@ -2,264 +2,314 @@
 applies_to:
   - inference-v4/seismic/crates/seismic-lang/**
   - inference-v4/seismic/crates/seismic-compiler/**
-  - inference-v4/seismic/crates/seismic-realization/**
   - inference-v4/seismic/crates/seismic-metal/**
   - inference-v4/seismic/crates/seismic-cpu/**
   - inference-v4/seismic/crates/seismic-cuda/**
   - inference-v4/seismic/crates/seismic-runtime/**
+  - inference-v4/seismic/crates/seismic/**
+  - inference-v4/seismic/crates/seismic-build/**
+  - inference-v4/solver/**
   - inference-v4/engine/**
 ---
 
 # Seismic compilation
 
-The sole production path is:
+The sole artifact progression is:
 
 ```text
-CheckedProgram
-  -> SpecializationDomain (complete exact/bounded entry shape and element bindings)
-  -> LogicalProgram
-  -> form_plan_space: the core forms one PlanSpace<BackendDialect>
-     from the backend's declarative mapping catalog
-  -> solve one global planning model
-  -> resolve the one complete assignment -> PhysicalPlan<BackendDialect>
-  -> mechanically encode every sealed launch
-  -> assemble NativeArtifact
-  -> prepare one validated invocation and execute
+CheckedModule -> LogicalEntry -> ImplementationDraft<B>
+             -> NativeKernelCandidate<B> -> NativeKernel<B>
+             -> PlanSpace<B> -> FrozenPlan<B> -> ExecutableVariant<B>
+             -> PreparedKernel<B> -> WorkflowDraft<B>
+             -> PreparedWorkflow<B> -> AdmittedWorkflowRun<B>
+             -> Execution<B> -> Completion<B>
 ```
 
-There is no baseline compiler, fallback scheduler, retry compiler, repair pass,
-alternative native compiler, or post-selection resource check. Serial, CPU-worker,
-grid, grid-stride, subgroup, matrix, fused, split, and multi-launch executions are
-peer strategies in the one `PlanSpace`; the universally applicable serial and
-grid-stride forms are ordinary members of that space, not a side channel.
+Each transition consumes its input. There is no other semantic layer, no
+realization subsystem, no independently sealed strategy, dataflow,
+placement, kernel, consequence, or occurrence artifact, no reference
+fallback, retry compiler, compatibility route, greedy selector, or backup
+implementation. Private algorithms may normalize, infer, schedule, or emit,
+but they never introduce a public or cross-crate artifact that restates the
+program.
+
+## Principles
+
+1. One fact, one owner, one representation. A fact that affects legality,
+   selection, resources, numerics, layout, or execution is owned by exactly
+   one artifact; other layers consume it by reference or as a derived value.
+2. Invalid compiler states are unrepresentable where the semantic category is
+   known: private fields, opaque scoped ids, typed builders, non-empty
+   collections, refined enums, consuming transitions. Validators do not
+   compensate for open structs.
+3. Alternatives are closed: an implementation contains its schedule, kernels,
+   transfers, storage topology, constraints, numerical transfer, and modeled duration.
+4. Planning uses complete machine truth. Device-wide facts are in the device
+   contract, concrete kernel facts are in reflection-reconciled native-kernel
+   contracts, and measured performance facts are in the execution profile.
+5. Native compilation and reconciliation happen before plan-space admission.
+   They consume kernel-affecting choices, do not redesign, and cannot reject a
+   later selected plan for a planning fact.
+6. Runtime executes; it does not prove. It never discovers an inconsistency
+   between compiler artifacts.
+7. Errors model reality; panics model bugs. A large family of panic sites is
+   itself an architectural defect.
 
 ## Artifacts and authority
 
-1. `CheckedProgram` owns types, ownership, mutation permission, control and
-   reference meaning, function families, and capabilities. It decides nothing
-   about tasks, launches, memory spaces, or limits.
-2. `LogicalProgram` is one target/workload specialization: occurrence-qualified
-   implementation choices plus hierarchical SSA task graphs. It owns
-   specialization, logical storage and views, structured control, calls,
-   reductions, dependencies, safety obligations, and runtime extents. It names
-   no participants, geometry, allocation, barriers, or opcodes.
-3. `PlanSpace<D>` is solver input, not serialized IR. It owns legal
-   algorithms and mappings, fusion and splitting, physical storage and
-   transport, synchronization, exact hard resources, bounded native-resource
-   contracts, capabilities, numerics, and cost.
-   It also retains the complete effective target profile supplied once by the
-   backend; planning and resource legality have no second target authority.
-4. The planning model owns the one global implementation, strategy, tuning,
-   activation, dispatch, storage-placement, capability, safety, and
-   numerical-policy assignment.
-5. `PhysicalPlan<D>` owns the selected nested schedule, opcodes, runtime
-   geometry expressions, offsets, resources, and the numerical assessment.
-   The root plan alone owns the public ABI, the global storage table, and the
-   internal arena; nested call bodies reference transports in that same
-   table and never own a second ABI or arena.
-6. `NativeArtifact` is the mechanical encoding of the physical plan. It
-   mirrors the physical execution tree, collapsing only statically empty or
-   singleton structural wrappers; dynamic `If`/`Repeat` control is never
-   flattened away.
-   Backend `encode` over one sealed launch is the sole physical-to-native
-   launch transition; assembly consumes that encoded launch and never
-   re-emits a retained launch through a second path.
-7. The runtime validates bindings once at preparation, binds dense indices,
-   evaluates retained execution expressions, submits in retained order,
-   skips zero-work launches, and reports status. It makes no compilation or
-   selection decision; the explicit plan-preparation module is the only
-   runtime-crate caller of the compiler.
+| Artifact | Owns | Must not own |
+|---|---|---|
+| `CheckedModule` | source semantics, types, effects, canonical bodies, lowering declarations, capability requirements, stable identities | target decisions, schedules, allocations, native code |
+| `LogicalEntry` | monomorphized entry semantics, `CallSchema`, `EntryDomain`, canonical operation graph, provenance, the entry's expression arena | placement, algorithm selection, native limits |
+| `DeviceContract<B>` | device-wide compatibility, capabilities, hard limits, memory rules, toolchain modes, and numerical environment | kernel-specific limits, measured rates, selected plan |
+| `NativeKernel<B>` | one concrete kernel handle, exact ABI, launch domain, reflected resources, numerical mode, and service footprint | unresolved codegen choices, performance observations |
+| `ExecutionProfile<B>` | measured service definitions, uncertainty, qualification domains, and per-open performance identity | legality, program semantics, transient availability |
+| `PlanSpace<B>` | exactly one universal implementation, zero or more optimized machine-closed implementations, and one exact finite solver model | partial proposals, unreconciled native candidates, fallback |
+| `FrozenPlan<B>` | one fixed physical choice with symbolic invocation dimensions, exact guard, layouts, allocations, structured commands, numerical assessment | alternatives, solver objects, logical IR, native mirrors |
+| `ExecutableVariant<B>` | one native structured schedule, guard/duration/layout evaluators, binding table, identity, assessment | physical plan, logical program, plan space |
+| `PreparedKernel<B>` | call schema, target domain, non-empty covered portfolio, deterministic selector | compilation logic, uncovered domain, inter-call scheduling |
+| `PreparedWorkflow<B>` | dependency-closed topology, symbolic access hazards, and reusable submission structure | transient reservations, selected invocation variants |
+| `AdmittedWorkflowRun<B>` | bound invocations, selected variants, one atomic reservation set, retained resources, and submission ownership | compiler repair, retry selection |
 
-Solver state is private planning state and is never executable.
+Only the checker and the validated bundle decoder construct a checked
+module. Only the module constructs a logical entry. Only the portfolio
+builder constructs a prepared kernel, after proving coverage.
 
-## One schedule authority
+## Identities and expressions
 
-Order is expressed once, as a structured execution tree of
-`Launch`/`Guard`/`Call`/`If`/`Repeat` steps. Sibling steps complete in order; `Guard`
-evaluates a retained structural safety predicate before subsequent work; `If`
-evaluates one retained predicate and one branch; `Repeat` evaluates a
-retained half-open range and rebinds its scalar binder and carries each
-visit. Loops or conditionals consumed wholly by one launch become kernel-local
-control; those containing retained calls or multiple launches become the
-corresponding structured schedule steps. There are no phase lists and no
-predecessor edges parallel to item order.
+Every semantic identity is an opaque arena index with a crate-private
+constructor; region-local identity carries its region. Stable identity is
+content-derived and is the only identity that crosses a bundle boundary or
+enters a cache key.
 
-A resolved repeat retains its bound through native encoding. Executors validate
-`0 <= start <= end <= bound` before conversion or iteration and report an
-invalid range as a typed execution-contract failure.
+One hash-consed typed expression DAG per entry (`Nat`, `Int`, `Bool`,
+`Scalar<T>`, `Duration`) drives solver constraints, partial evaluation,
+applicability guards, layout, geometry, allocation sizes, numerical bounds,
+and modeled duration. Its free symbols are call dimensions, call scalars, target
+constants, finite decisions, loop binders, and schedule scalar slots. There
+is no string symbol, sentinel, or second formula language. Integer semantics
+are mathematical; runtime representability restricts the target domain
+rather than wrapping.
 
-Retained calls remain nested: a sealed call retains the child plan body and
-its boundary environment, whose routes resolve directly to caller storage
-IDs. An absorbed call is owned completely by its ancestor physical strategy
-and has no call step. Only the root boundary has ABI allocations.
+The one DAG has two non-interchangeable authority wrappers. `PlanningExpr`
+contains only finite decisions, exact Boolean/table/linear structure, and
+target constants accepted by the complete solver adapter. `InvocationExpr`
+is the total checked evaluation language for call-dependent products,
+division, remainder, alignment, folds, guards, geometry, and layout. Planning
+expressions embed into invocation expressions; invocation expressions never
+enter the solver. Raw solver assignments are private and become
+`FeasibleAssignment` only after direct evaluation of every immutable planning
+constraint.
 
-Logical values, inter-step transports, and kernel-local values are distinct.
-Transports carry storage, executor scalars, tuples, or boundary values between
-schedule components. A kernel-local SSA value exists only inside one kernel
-and is never represented as a transport. Kernel inputs, SSA definitions,
-iteration axes, and published outputs are typed separately.
-Closed kernel places are the sole authority for storage views and transforms;
-backend opcodes reference places instead of copying view metadata.
+## Machine contracts and capabilities
 
-## Family, model, and solve
+Catalog discovery only enumerates unopened physical devices. Opening a device
+creates the production service/queue, queries a device contract, runs the fixed
+primitive probe suite, assembles the execution profile, and returns a usable public device
+only after all of those steps succeed. A profile is never constructed during
+catalog discovery or independently paired with a later-opened service.
 
-The compiler core alone forms the complete `PlanSpace<D>`: occurrence
-canonicalization, strategy shapes, routes, residences, kernel blocks, and
-consequences are core-owned formers over sealed intermediates. A backend
-supplies only a declarative mapping catalog (optional rule families that
-propose over occurrence facts), its typed intrinsic catalog with exhaustive
-encoders, and the native assembler; backends never import logical
-construction, plan-space construction, or solver construction. Every
-physical strategy owns one complete root logical occurrence and may own
-complete descendant call occurrences. A retained call remains a schedule
-`Call` and activates a child strategy; an absorbed call is owned and
-realized completely by its ancestor strategy. The selected strategies form
-a non-overlapping ownership tree rooted at the entry. Cross-call fusion
-never copies, imports, remaps, or mutates a logical graph.
+The device contract is assembled once from backend revision, hardware identity
+and device-wide limits, driver and toolchain versions, dtype support, the
+numerical environment, and the static capability registry. It contains no
+fact whose truth depends on a particular compiled function or pipeline.
 
-View transforms obey the same qualification boundary as values. Templates use
-graph-qualified dynamic endpoints, kernel-block formation resolves them to
-closed kernel value references, and physical plans and backends never carry
-bare graph-local endpoint ids.
+Every numeric performance fact is either derived by a sound
+documented rule from architectural/device facts or measured by a backend-owned
+primitive-service probe on the exact opened device before planning and
+compilation. Measured facts bind their probe/methodology, interval/uncertainty,
+and complete target identity into a per-open execution-profile identity. A
+separate stable compatibility identity contains only legality/codegen facts and
+keys native artifacts; raw timing observations do not invalidate reusable
+native code. Prepared selection is never reused under a different execution
+profile. Candidate implementations are never
+benchmarked to create these facts. There are no calibrated coefficients,
+fitted curves, arbitrary weights, guessed defaults, copied values from similar
+hardware, nominal-peak shortcuts, or unknowns represented as zero.
 
-Every applicable portable alternative receives a universal physical strategy,
-or that is a compiler defect. Strategies are formed by the core's private
-formers over the complete owned-occurrence set; there is no public
-plan-space, strategy, or kernel-block builder. Mapping, fusion, splitting,
-scheduling, calls, and obligation discharge consume canonical
-occurrence-qualified identities, and a strategy seals only when every
-obligation of every owned graph has been consumed exactly once.
+Kernel-affecting decisions are fixed before native formation. Compilation
+produces an unusable `NativeKernelCandidate`; reconciliation consumes it and
+authoritative reflection to construct `NativeKernel`. Its contract records
+the actual ABI, launch domain, pipeline/function limits, static local memory,
+register and spill usage where exposed, cooperative requirements, numerical
+mode, service footprint, and compatibility identity. Unknown legality or
+selection facts are not represented as zero and prevent admission of that
+native implementation. Native compilation is absent below `PlanSpace`.
 
-The plan space supplies only legal choices and their exact constraints; it carries
-no selected, default, constructive, or executable assignment. The one global
-model includes implementation, physical strategy, tuning, child activation,
-dispatch and resources, storage activation, interference and offsets,
-capability, safety, and whole-plan numerical policy. Global placement owns
-every active device offset and constrains every storage end by device capacity;
-interfering lifetimes receive ordering constraints, and sequential sibling
-internals may reuse space.
+Every emitted command, primitive, and intrinsic declares demand over sealed
+service classes in the same registration that supplies its lowering. Profile
+assembly requires exactly one authoritative query, derivation, or measurement
+provider for every referenced class and rejects duplicate/unused providers.
+There is no optional/default/catch-all service. A backend that cannot construct
+the required execution model does not advertise that target as complete. Capabilities are typed
+intrinsic families; a backend advertises a signature only when the same
+registration provides its typed lowering, resource rules, and native
+emission. Registration is sealed at compiler initialization; an inconsistent
+registry is a startup panic. Native compilation is forbidden from returning
+an unsupported-capability or resource result for anything the profile
+represents.
 
-The solver is the sole selection authority. Its feasible assignment contains
-every implementation, strategy, tuning, activation, and offset decision.
-Internal arena size is the deterministic maximum active storage end, not a
-second selected value. The optimization budget limits optimization only:
-feasibility is decided first, so a budget can never cause a no-incumbent
-production failure. Production returns the best incumbent with an optimality
-flag, never a partial plan.
+Service measurements retain distinct batches for dependency, setup, and
+capacity observations, including workload units, timer resolution, raw
+observations, digest, method, and acquisition duration. Qualification cases
+state only held-out production service demands and observations; core computes
+their prediction through the same service model used for selection. Service
+intervals carry correlation identity and an explicit qualification domain.
 
-Resolution consumes exactly the solver's complete assignment; it is a
-substitution, not a second decision. It evaluates solved
-expressions, allocates dense IDs, instantiates boundaries, substitutes
-offsets/geometry/opcodes, and recurses; it performs no ordinary legality
-check and cannot substitute a plan-space-time or backend-time decision for a
-solver assignment. The resulting `PhysicalPlan` is self-contained and
-sealed: construction is private to the core's seal, every reference is a
-dense typed index that is in-bounds by construction, physical
-storage and scalar-slot references are resolved IDs, input scalar references
-carry final ABI byte offsets, result scalar destinations carry final result
-field IDs, and storage placement is a closed typed variant. No backend
-retains or replays the plan space to reconstruct those identities.
+## Implementations
 
-## Native emission
+Implementation factories, portable and backend-specific, receive a semantic
+function, the target profile, the shared arena, the precision policy, and
+core-owned builders. A factory may decline before construction; once
+construction begins it returns a closed implementation or a real preparation
+error. Calls are resolved during construction: every applicable child
+implementation is spliced under a finite decision, composing guards,
+constraints, lifetimes, transfers, durations, provenance, and effect ordering.
+No call survives into a schedule.
 
-The compiler core encodes each physical launch exactly once and the backend
-assembles the already-encoded hierarchy. Encoders may assign native names and
-instruction spellings, but cannot introduce algorithms, allocation, geometry,
-synchronization, copies, or numerical transformations, and cannot reject a
-selected opcode. Emission failures are compiler defects, toolchain failures,
-or system failures — never a reason to retry another candidate.
+Factories use a sealed refinement-rule API. They cannot fabricate raw schedule,
+storage, synchronization, numerical-transfer, or demand nodes. Each rule
+consumes semantic obligations and produces locally valid executable structure;
+only a draft with no remaining value, event, output, lifetime, numerical, or
+demand obligations can close.
 
-Native compilation is not a planning oracle. Reflected native facts
-(telemetry and the selected bounded native-resource contract) evaluate
-physical geometry; a fact outside its declared domain is a compiler defect.
+Kernel IR is typed by value category and representation; branches own their
+joins and repeats own their carries with identical typed schemas. Global and
+launch-local storage are different types; native launch bindings accept only
+global views. Materialization is a compiler operation derived from use, never
+source ceremony. Allocation topology (representation, alignment, symbolic
+bytes, lifetime, alias facts, reuse decisions) is owned by the implementation
+and every resource expression derives from it once.
 
-## ABI and invocation
+## Planning and coverage
 
-The root ABI is created once from the entry interface and the canonical leaf
-traversal: dense tensor leaves have one typed buffer, packed leaves have
-registry-ordered planes, scalar and index inputs are typed fields, and input
-ranges are adjacent start/end fields. Tensor results are runtime-allocated by
-path and plane; scalar, index, and range results decode from a
-compiler-owned result scalar block. Internal arena and nested boundaries
-never appear in the ABI; capability values are forbidden.
+Every compile-time decision is a finite explicit domain owned by one
+implementation. A codegen decision changes emitted instructions, static local
+memory, numerical mode, ABI, or native resources and is enumerated before
+native formation. A launch decision changes only runtime geometry within one
+closed native launch domain and may remain in the planning model. Invocation
+dimensions stay symbolic. Target limits and
+numerical admissibility are solver constraints, never post-selection checks.
+The solver exports Boolean structure exactly, including disjunction,
+negation, and reified comparison.
 
-Invocation results expose owned tensor planes separately from typed scalar
-results. Scalar results retain canonical result paths; range results retain an
-explicit start/end endpoint, never positional pairing by convention.
+Modeled duration is the result of the target-semantic resource/dependency execution model
+over the same structured schedule, typed operations, allocation topology,
+geometry, and target profile as execution. Core construction accounts for
+exact dynamic launch multiplicity, operation/intrinsic classes, dependency
+latency, issue-resource demand, effective concurrency and residency, memory
+transactions, overlap, barriers, atomics, and command synchronization. A
+factory cannot assign or omit duration. Proxy lexicographic counters, empirical
+calibration, arbitrary weights, hard-coded timing guesses, and nominal peak
+formulas are forbidden. Missing behavior is a compiler/backend-model bug, not
+acceptable estimate error. Structural demand is exact; physical service time
+is measured and retains timer/acquisition uncertainty because future wall-clock
+time changes with thermals, power, OS scheduling, and contention. The model
+propagates that interval and never describes a prediction as physical proof.
+Data-dependent control and addressing widen the interval across every possible
+path/access class; the compiler never invents branch probabilities, cache-hit
+rates, or expected input distributions.
 
-A range remains one semantic boundary leaf but expands in compiler core to two
-explicit physical kernel leaves (`Start` and `End`). All other semantic leaves
-expand to one kernel leaf. Backends consume those identities directly and do
-not infer aggregate structure from transports.
+Backend qualification requires relative interval half-width at most 1% for
+compute-service facts and 2% for memory, transfer, dispatch, synchronization,
+barrier, and atomic facts. Fixed held-out regular compositions must be predicted
+within 5% absolute relative error. These compositions validate uncertainty; they
+never fit correction coefficients or candidate-specific behavior. Selection
+intervals include acquisition, semantic, and composition uncertainty, and an
+overlapping difference is not reported as a physical performance win.
+Metadata such as constants, views, and allocation
+declarations cannot form launch boundaries, and structured control stays
+within a launch unless a real execution or synchronization boundary requires
+otherwise.
 
-Packed tensor leaves expand to the representation registry's ordered physical
-planes. Each plane has its own storage view, ABI buffer when public, and direct
-native binding slot; no layer collapses a packed leaf to its first plane.
+Coverage is constructional. `PlanSpace::new` requires one
+`UniversalImplementation` whose type admits no decisions, whose numerical
+transfer is exact, and whose legality is total over the independently derived
+target domain. Optimized implementations have a different type and cannot
+impersonate it. Optional optimization is governed by one preparation budget
+covering solver work/memory, optimized assignments, unique native templates,
+native compile time and code bytes, executable variants, and metadata bytes.
+Budget exhaustion retains the already-closed universal portfolio and reports
+non-optimality; it never returns partial coverage. Consumers supply no
+envelopes, buckets, classes, or expected shapes.
 
-Native bindings are direct-only: every storage plane, by-value scalar, and
-system block has one core-assigned slot. Unsupported descriptor/argument-table
-modes are absent rather than modeled differently from their native encoding.
+Selection at invocation validates the call against the schema and target
+domain, evaluates guards, and picks the minimum `(upper_duration, identity)`.
+Non-overlapping intervals establish measured separation; overlap is recorded
+honestly rather than treated as proof that future wall-clock time is ordered. Zero
+matches after validation contradicts the private constructor and is a panic.
 
-Alias rules are retained in the root ABI (shared-read ranges may overlap;
-exclusive/owned ranges are disjoint from other live parameter ranges;
-results are distinct). The runtime validates them over actual byte ranges
-before submission. Invocation values or aliasing that violate the retained
-ABI are invocation errors, rejected before submission.
+## Native formation and runtime
 
-Physical strategies cannot allocate or redefine root ABI storage. Every
-kernel allocation and synchronization object is declared by the physical
-kernel that uses it. Solver resource constraints, the selected physical plan,
-and native emission consume those same declarations; emission cannot create an
-undeclared local allocation or staging resource.
+Each backend forms and reconciles native kernels before plan-space admission.
+A frozen plan selects only closed kernels and binds one native schedule over
+the shared structured step type; there are no backend schedule mirrors and no
+late physical/native comparison. Native errors are toolchain, malformed
+output, device loss, cache, and toolchain resource exhaustion only.
 
-## Consumer preparation
+Runtime execution is workflow-based. Closing `WorkflowDraft` derives all
+inter-call hazards from semantic event manifests and retains unresolved
+may-alias relationships as binding obligations. Admission validates every
+call, jointly selects admissible variants, atomically acquires one reservation
+set, and constructs `AdmittedWorkflowRun`. Only that owned value can submit;
+submission returns an execution handle and completion releases resources.
+There is no device-wide lock held across execution and synchronization.
+`Kernel::call` is a synchronous one-node workflow convenience; production
+model execution prepares at least one complete decoder-step workflow. Runtime
+never infers placement, repairs a plan, retries selection after execution, or
+interprets the portable body.
 
-Compilation is preparation-only for every consumer. The engine compiles each
-component — decoder, sampler, conditioned overlays, encoder, and weight
-import — through one preparation session before any request; execution and
-inference modules hold prepared artifacts and cannot import the compiler. A
-request outside a prepared workload envelope is rejected as a caller
-diagnostic, never compiled on demand. Prepared artifacts are keyed by
-complete specialization identity, so serving the same workload dispatches
-among sealed compilations and never recompiles.
+## Public integration
 
-## Failure boundaries
+`seismic-build` checks sources at build time, emits a versioned checked
+bundle, and generates typed bindings (`Args`, `Results`, entry handles).
+Consumers import only `seismic` and `seismic-build`, provide tensors and
+ordinary parameters, prepare with `for_device`, and `call`. Only genuinely
+polymorphic element representations are compile-time bindings.
 
-Production failures are one closed taxonomy:
+## Failure taxonomy
 
-- invalid semantic program (diagnostics);
-- no applicable implementation (an exact capability signature is absent);
-- planning infeasible (the complete planning model has no valid assignment);
-- compiler bug (a retained invariant is contradicted);
-- toolchain failure; and
-- system failure.
+Source, bundle, target, preparation (`NoApplicableImplementation`,
+`NumericalPolicyInfeasible`, `TargetDomainUnrepresentable`,
+`SolverResourceExhausted`, `NativeCompilation`), invocation, and execution
+errors are the complete typed taxonomy. No variant means two compiler phases
+disagreed. Permitted panics are: inconsistent static registry, out-of-arena
+private id, violated FFI precondition by Seismic code, unrecoverable poisoned
+lock, solver witness contradicting the immutable model, and the prepared
+kernel coverage invariant.
 
-No failure silently changes backend, search effort, or precision policy.
+## Identity, caching, telemetry
 
-## Invariants
+Native cache keys are module semantic hash, entry, backend/compiler version,
+stable compatibility identity, native-kernel identity, precision policy identity,
+implementation/variant identity, and native toolchain identity. In-process
+prepared portfolio keys additionally include the per-open execution-profile
+identity. Runtime dimensions never create preparation keys. The cache stores checked bundles and executable variants; decoding
+validates version, hash, target identity, and binary integrity. Telemetry is
+OpenTelemetry at preparation, native compilation, selection, allocation, and
+execution; it carries no legality fact back into planning.
 
-- Every active logical node, call, dependency, obligation, and result is
-  consumed exactly once by the strategy that owns its complete occurrence.
-- Parallel work is visible only as logical domains plus explicit participant
-  maps; logical rank is not native grid rank.
-- Ordered work cannot become parallel without a different semantic
-  implementation.
-- Calls remain nested through resolution and emission; emitters never
-  receive logical call bodies.
-- Storage, synchronization, resources, and numerical effects belong to
-  selected executable objects; every aggregate is scalar SSA or planned
-  storage, and no implicit native local array exists.
-- Solver selection resolves once; native emission and runtime never retry
-  planning.
-- Sealed artifacts expose accessors only; no public field or constructor
-  bypasses the core's seal, and dense indices are in-bounds by construction.
-- Backend catalogs are declarative: a rule either proposes over occurrence
-  facts or declines; it never constructs schedule structure.
-- `PlanSpace` contains no assignment, default selection, placement, or
-  executable witness; every physical decision consumed by resolution comes
-  from the solver assignment.
-- Backend encoders accept one physical launch and cannot see the plan space.
-- Native assembly accepts only the physical plan; template-to-physical replay
-  maps and plan-space retention are forbidden.
-- Runtime executes physical plan order and never infers ABI identity from
-  names.
+## Acceptance criteria
+
+- No struct literal or public constructor can fabricate a checked module,
+  logical entry, implementation, native kernel, frozen plan, prepared kernel,
+  prepared workflow, or admitted run.
+- Every id is opaque and scoped; no map is keyed by a bare region-local
+  number.
+- Every runtime and solver formula references a node of the entry arena.
+- Only directly evaluated `FeasibleAssignment` values freeze, and freezing
+  performs no native compilation or legality decision.
+- It is impossible to construct a prepared kernel with an uncovered
+  target-domain point.
+- An unreconciled native candidate cannot enter planning or execution.
+- Device contracts contain no pipeline-specific fact; concrete Metal and CUDA
+  resource/launch behavior comes from each native-kernel contract.
+- Only an admitted workflow can submit, and its selected variants,
+  reservations, buffers, and native objects have one owned lifetime.
+- Backend crates contain one native schedule type instance and no plan
+  mirror; runtime crates contain no compiler-consistency branch.
+- The engine imports only `seismic` and its generated bindings.
+- The forbidden symbols of the superseded architecture (proposal, recipe,
+  algorithm label, placement enum spanning ABI and local storage, sealed
+  value joins, encoded plan mirrors, workload envelopes, capacity classes,
+  defect taxonomies) do not exist.

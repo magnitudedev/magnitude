@@ -1,13 +1,33 @@
 use magnitude_engine::state::{ComponentSpec, SequenceState, StateStore};
-use seismic_lang::types::DType;
-use seismic_runtime::Device;
+use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
 use std::rc::Rc;
+fn device() -> Device {
+    DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap()
+}
+fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_engine::Error> {
+    let mut tensor = tensor.clone();
+    tensor.write_from_host(bytes)?;
+    Ok(())
+}
+fn read(tensor: &Tensor) -> Vec<u8> {
+    tensor.read_to_host().unwrap()
+}
 fn store(history: bool, values: bool) -> Rc<StateStore> {
     StateStore::new(
-        Rc::new(Device::metal().unwrap()),
+        Rc::new(device()),
         16,
         32,
-        if history { vec![16] } else { vec![] },
+        if history {
+            vec![ComponentSpec {
+                shape: vec![4],
+                dtype: DType::F32,
+            }]
+        } else {
+            vec![]
+        },
         if values {
             vec![ComponentSpec {
                 shape: vec![4],
@@ -24,7 +44,7 @@ fn accept(state: &mut SequenceState, count: usize) {
     advance
         .execute(|b| {
             for v in b.following {
-                v.write(&vec![0; v.len()])?;
+                write(v, &vec![0; v.byte_len() as usize])?;
             }
             Ok(())
         })
@@ -60,15 +80,14 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let store = store(true, true);
     let mut state = store.create().unwrap();
     let original = state.values()[0].clone();
-    let mut before = [0; 16];
-    original.read(&mut before).unwrap();
+    let before = read(&original);
     let mut advance = state.begin(5).unwrap();
     assert_eq!(advance.destinations(), [0, 1, 2, 3, 4]);
     assert!(advance
         .execute(|b| {
             assert_eq!(store.occupied_rows(), 5);
-            b.following[0].write(&[0xff; 16])?;
-            b.history[0].write(&[0x33; 16])?;
+            write(&b.following[0], &[0xff; 16])?;
+            write(&b.history[0], &[0x33; 16])?;
             Err("failed after physical writes".into())
         })
         .is_err());
@@ -76,13 +95,12 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     assert!(advance.commit().is_err());
     assert_eq!(state.position(), 0);
     assert_eq!(store.occupied_rows(), 0);
-    let mut after = [0; 16];
-    original.read(&mut after).unwrap();
+    let after = read(&original);
     assert_eq!(before, after);
     let mut advance = state.begin(5).unwrap();
     advance
         .execute(|b| {
-            b.following[0].write(&[0x22; 16])?;
+            write(&b.following[0], &[0x22; 16])?;
             Ok(())
         })
         .unwrap();
@@ -103,15 +121,13 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     let mut advance = parent.begin(1).unwrap();
     advance
         .execute(|b| {
-            b.following[0].write(&[0x22; 16])?;
+            write(&b.following[0], &[0x22; 16])?;
             Ok(())
         })
         .unwrap();
     advance.commit().unwrap();
-    let mut parent_bytes = [0; 16];
-    let mut child_bytes = [0; 16];
-    parent.values()[0].read(&mut parent_bytes).unwrap();
-    child.values()[0].read(&mut child_bytes).unwrap();
+    let parent_bytes = read(&parent.values()[0]);
+    let child_bytes = read(&child.values()[0]);
     assert_eq!(parent_bytes, [0x22; 16]);
     assert_eq!(child_bytes, [0; 16]);
     assert_eq!(store.occupied_rows(), 0);
@@ -218,8 +234,7 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         assert_eq!(store.release_idle().unwrap(), 0);
         // Explicitly retained physical pins remain usable after logical release.
         for buffer in old {
-            let mut bytes = vec![0; buffer.len()];
-            buffer.read(&mut bytes).unwrap();
+            let bytes = read(&buffer);
         }
         assert_eq!(store.history().unwrap().len(), usize::from(history));
         assert_eq!(store.release_idle().unwrap(), if history { 512 } else { 0 });
@@ -252,12 +267,12 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     drop(checkpoint);
     assert_eq!(store.reclaimable(&[&parent]).unwrap(), 0);
     assert_eq!(store.reclaimable(&[&parent, &fork, &parent]).unwrap(), 16);
-    let external = parent.values()[0].view(0..4).unwrap();
+    let external = parent.values()[0].clone();
     assert_eq!(store.reclaimable(&[&parent, &fork]).unwrap(), 0);
     drop(external);
     drop(parent);
     assert_eq!(store.reclaimable(&[&fork]).unwrap(), 16);
-    let other = StateStore::new(Rc::new(Device::metal().unwrap()), 16, 32, vec![], vec![]).unwrap();
+    let other = StateStore::new(Rc::new(device()), 16, 32, vec![], vec![]).unwrap();
     assert!(other.reclaimable(&[&fork]).is_err());
 }
 
@@ -277,8 +292,8 @@ fn shared_execution_publishes_completion_for_all_rows_or_none() {
             .destinations
             .iter()
             .all(|row| !bindings[1].destinations.contains(row)));
-        bindings[0].following[0].write(&[1; 16])?;
-        bindings[1].following[0].write(&[2; 16])?;
+        write(&bindings[0].following[0], &[1; 16])?;
+        write(&bindings[1].following[0], &[2; 16])?;
         Ok(())
     })
     .unwrap();
@@ -287,14 +302,13 @@ fn shared_execution_publishes_completion_for_all_rows_or_none() {
     assert_eq!(first.position(), 2);
     assert_eq!(second.position(), 0);
     assert_eq!(store.occupied_rows(), 2);
-    let mut bytes = [0; 16];
-    first.values()[0].read(&mut bytes).unwrap();
+    let mut bytes = read(&first.values()[0]);
     assert_eq!(bytes, [1; 16]);
-    second.values()[0].read(&mut bytes).unwrap();
+    bytes = read(&second.values()[0]);
     assert_eq!(bytes, [0; 16]);
     let mut advances = vec![first.begin(1).unwrap(), second.begin(1).unwrap()];
     assert!(StateAdvance::execute_batch(&mut advances, |bindings| {
-        bindings[0].following[0].write(&[3; 16])?;
+        write(&bindings[0].following[0], &[3; 16])?;
         Err("shared native completion failed".into())
     })
     .is_err());

@@ -12,8 +12,9 @@ members = [
   "seismic/crates/seismic-cuda",
   "seismic/crates/seismic-cli",
   "seismic/crates/seismic-compiler",
-  "seismic/crates/seismic-realization",
   "seismic/crates/seismic-runtime",
+  "seismic/crates/seismic",
+  "seismic/crates/seismic-build",
 ]
 
 [workspace.package]
@@ -28,9 +29,10 @@ seismic-lang = { path = "seismic/crates/seismic-lang" }
 seismic-metal = { path = "seismic/crates/seismic-metal" }
 seismic-cpu = { path = "seismic/crates/seismic-cpu" }
 seismic-cuda = { path = "seismic/crates/seismic-cuda" }
-seismic-realization = { path = "seismic/crates/seismic-realization" }
 seismic-compiler = { path = "seismic/crates/seismic-compiler" }
 seismic-runtime = { path = "seismic/crates/seismic-runtime" }
+seismic = { path = "seismic/crates/seismic" }
+seismic-build = { path = "seismic/crates/seismic-build" }
 
 [profile.dev]
 debug = "line-tables-only"

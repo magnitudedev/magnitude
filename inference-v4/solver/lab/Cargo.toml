@@ -9,23 +9,3 @@ license.workspace = true
 magnitude-solver = { path = "..", features = ["serde"] }
 serde.workspace = true
 serde_json = "=1.0.151"
-
-[features]
-qwen-source = ["dep:seismic-lang", "dep:seismic-std", "dep:seismic-compiler"]
-
-[dependencies.seismic-lang]
-workspace = true
-optional = true
-
-[dependencies.seismic-std]
-workspace = true
-optional = true
-
-[dependencies.seismic-compiler]
-workspace = true
-optional = true
-
-[[bin]]
-name = "qwen-source"
-path = "src/bin/qwen_source.rs"
-required-features = ["qwen-source"]

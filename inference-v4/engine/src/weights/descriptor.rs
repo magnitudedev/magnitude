@@ -1,6 +1,6 @@
 //! Logical roles and stored values, independent of container interpretation.
 use super::{source::FileSource, Error};
-use seismic_lang::types::DType;
+use seismic::DType;
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

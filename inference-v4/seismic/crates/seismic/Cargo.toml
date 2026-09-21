@@ -1,0 +1,10 @@
+[package]
+name = "seismic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-lang.workspace = true
+seismic-compiler.workspace = true
+seismic-runtime.workspace = true

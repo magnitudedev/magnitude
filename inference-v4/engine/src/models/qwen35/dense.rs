@@ -1,16 +1,7 @@
-//! Prepared dense feedforward suffix of a Qwen block. `DenseSuffix::compile`
-//! is model preparation: it compiles and seals the whole (exact) workload
-//! envelope before returning; execution invokes the sealed plan only.
-use crate::{
-    execution,
-    preparation::{
-        CompositionSpec, EnvelopeShape, PreparationSession, Program, Settings, WorkloadEnvelope,
-    },
-    weights::residency::ResidentWeight,
-};
-use seismic_lang::types::{DType, Elem};
-use seismic_runtime::{Buffer, Device};
-use std::collections::{BTreeMap, HashMap, HashSet};
+//! Prepared dense feedforward suffix of a Qwen block.
+
+use crate::{kernels, weights::residency::ResidentWeight};
+use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
 
 #[derive(Clone)]
 pub struct DenseWeights {
@@ -19,27 +10,27 @@ pub struct DenseWeights {
     pub up: ResidentWeight,
     pub down: ResidentWeight,
 }
+
 #[derive(Clone, Copy)]
 pub struct DenseInvocation {
     pub rows: usize,
     pub activation: DType,
     pub epsilon: f32,
 }
-/// Owns the sealed prepared composition and weights. The compiler/runtime own
-/// all result destinations.
+
 pub struct DenseSuffix {
-    composition: crate::preparation::PreparedComposition,
+    kernel: Kernel<kernels::qwen_dense_suffix::Entry>,
     weights: DenseWeights,
     epsilon: f32,
-    rows: usize,
+    rows: u64,
 }
+
 impl DenseSuffix {
     pub fn compile(
         device: &Device,
-        program: &Program,
         invocation: DenseInvocation,
         weights: DenseWeights,
-        settings: Settings,
+        precision: PrecisionPolicy,
     ) -> Result<Self, String> {
         let DenseInvocation {
             rows,
@@ -64,67 +55,55 @@ impl DenseSuffix {
             || gate_hidden != hidden
             || weights.up.descriptor().shape != [*intermediate, *hidden]
             || weights.down.descriptor().shape != [*hidden, *intermediate]
+            || [&weights.norm, &weights.gate, &weights.up, &weights.down]
+                .into_iter()
+                .any(|weight| !weight.belongs_to(device))
         {
-            return Err(
-                "dense suffix weights disagree on hidden and intermediate dimensions".into(),
-            );
+            return Err("dense suffix weights disagree on device or dimensions".into());
         }
-        let mut session = PreparationSession::new(device, program, settings);
-        let envelope = WorkloadEnvelope::new(
-            BTreeMap::from([
-                ("M".into(), EnvelopeShape::Exact(rows as u64)),
-                ("H".into(), EnvelopeShape::Exact(*hidden)),
-                ("F".into(), EnvelopeShape::Exact(*intermediate)),
-            ]),
-            BTreeMap::from([
-                ("A".into(), Elem::Dtype(activation)),
-                ("NW".into(), weights.norm.element().clone()),
-                ("GW".into(), weights.gate.element().clone()),
-                ("UW".into(), weights.up.element().clone()),
-                ("DW".into(), weights.down.element().clone()),
-            ]),
-            Vec::new(),
+        let rows = u64::try_from(rows)
+            .map_err(|_| "dense suffix row count exceeds the Seismic shape domain")?;
+        let kernel = kernels::qwen_dense_suffix::for_device_with(
+            device,
+            precision,
+            kernels::qwen_dense_suffix::Elements {
+                A: Element::dense(activation),
+                NW: weights.norm.element(),
+                GW: weights.gate.element(),
+                UW: weights.up.element(),
+                DW: weights.down.element(),
+            },
         )
-        .map_err(|e| e.to_string())?;
-        let composition = session.prepare(CompositionSpec {
-            entry: "qwen_dense_suffix".into(),
-            envelope,
-            weights: HashMap::from([
-                ("norm".into(), weights.norm.clone()),
-                ("gate_weight".into(), weights.gate.clone()),
-                ("up_weight".into(), weights.up.clone()),
-                ("down_weight".into(), weights.down.clone()),
-            ]),
-            external: HashSet::from(["residual".into()]),
-            intermediates: HashSet::new(),
-            scalars: HashMap::new(),
-        })
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
         Ok(Self {
-            composition,
+            kernel,
             weights,
             epsilon,
             rows,
         })
     }
+
     pub fn kernel_count(&self) -> usize {
-        self.composition.kernel_count()
+        1
     }
-    pub fn execute(&self, residual: &Buffer) -> Result<Buffer, String> {
-        let results = execution::execute(
-            &self.composition,
-            &BTreeMap::from([("M".into(), self.rows as u64)]),
-            &HashMap::from([("residual".into(), residual.clone())]),
-            &HashMap::from([("eps".into(), f64::from(self.epsilon))]),
-        )
-        .map_err(|e| e.to_string())?;
-        results
-            .planes
-            .into_iter()
-            .find(|result| result.path == [6] && result.plane.is_empty())
-            .map(|result| result.buffer)
-            .ok_or_else(|| "dense suffix returned no F32 residual result".into())
+
+    pub fn execute(&self, residual: &Tensor) -> Result<Tensor, String> {
+        if residual.extents() != [self.rows, self.weights.norm.descriptor().shape[0]] {
+            return Err("dense suffix residual has the wrong shape".into());
+        }
+        self.kernel
+            .call(kernels::qwen_dense_suffix::Args {
+                residual,
+                norm: self.weights.norm.tensor(),
+                gate_weight: self.weights.gate.tensor(),
+                up_weight: self.weights.up.tensor(),
+                down_weight: self.weights.down.tensor(),
+                eps: self.epsilon,
+            })
+            .map(|results| results.r6)
+            .map_err(|error| error.to_string())
     }
+
     pub fn weights(&self) -> &DenseWeights {
         &self.weights
     }

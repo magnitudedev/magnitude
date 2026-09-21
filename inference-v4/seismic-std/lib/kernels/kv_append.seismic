@@ -5,5 +5,5 @@ fn kv_append[T, KV, W](key: &tensor[1, KV, W] A, value: &tensor[1, KV, W] A,
                              history_key: &mut tensor[T, KV, W] A, history_value: &mut tensor[T, KV, W] A,
                              destination: index[T]):
     parallel for heads in 0..KV:
-        history_key[destination, heads] = load(key[0, heads])
-        history_value[destination, heads] = load(value[0, heads])
+        history_key[destination, heads] = key[0, heads]
+        history_value[destination, heads] = value[0, heads]

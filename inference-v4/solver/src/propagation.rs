@@ -107,38 +107,24 @@ pub fn propagate_constraint(
                 );
             }
         }
-        Constraint::LinearLe { terms, rhs } => {
-            let merged = model::merged_terms(terms)?;
-            let (lower, _) = model::linear_bounds(terms, domains)?;
-            for (variable, coefficient) in merged {
-                let domain = &domains[variable.0];
-                let extreme = if coefficient > 0 {
-                    domain.min()
-                } else {
-                    domain.max()
-                };
-                let Some(extreme) = extreme else {
-                    result.infeasible = true;
-                    break;
-                };
-                let own_min = coefficient
-                    .checked_mul(extreme as i128)
-                    .ok_or_else(|| Error::Overflow("propagation affine product".into()))?;
-                let others = lower
-                    .checked_sub(own_min)
-                    .ok_or_else(|| Error::Overflow("propagation affine residual".into()))?;
-                let allowance = rhs
-                    .checked_sub(others)
-                    .ok_or_else(|| Error::Overflow("propagation affine allowance".into()))?;
-                let next = if coefficient > 0 {
-                    let max = floor_div(allowance, coefficient)?;
-                    restrict_wide(domain, i64::MIN as i128, max)?
-                } else {
-                    let min = ceil_div(allowance, coefficient)?;
-                    restrict_wide(domain, min, i64::MAX as i128)?
-                };
+        Constraint::ForbiddenTuple { variables, values } => {
+            let mut unknown = None;
+            for (variable, value) in variables.iter().zip(values) {
+                if domains[variable.0].singleton_value() == Some(*value) {
+                    continue;
+                }
+                if unknown.is_some() {
+                    return Ok(result);
+                }
+                unknown = Some((*variable, *value));
+            }
+            if let Some((variable, value)) = unknown {
+                let next = domains[variable.0].without(value);
                 merge(&mut result, replace(domains, variable, next)?);
             }
+        }
+        Constraint::LinearLe { terms, rhs } => {
+            merge(&mut result, propagate_linear_le(terms, *rhs, domains)?);
         }
         Constraint::ExactlyOne { variables } => {
             let fixed = variables
@@ -160,6 +146,22 @@ pub fn propagate_constraint(
                 if possible.len() == 1 {
                     merge(&mut result, assign(domains, possible[0], 1)?);
                 }
+            }
+        }
+        Constraint::Clause { literals } => {
+            let unresolved = literals
+                .iter()
+                .filter_map(|literal| match literal.state(domains) {
+                    Ok(None) => Some(Ok(*literal)),
+                    Ok(Some(_)) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let [literal] = unresolved.as_slice() {
+                merge(
+                    &mut result,
+                    assign(domains, literal.variable, literal.value)?,
+                );
             }
         }
         Constraint::BoolAnd { output, inputs } => {
@@ -186,6 +188,62 @@ pub fn propagate_constraint(
                 if possible_false.len() == 1 {
                     merge(&mut result, assign(domains, possible_false[0], 0)?);
                 }
+            }
+        }
+        Constraint::BoolOr { output, inputs } => {
+            if inputs
+                .iter()
+                .any(|v| domains[v.0].singleton_value() == Some(1))
+            {
+                merge(&mut result, assign(domains, *output, 1)?);
+            } else if inputs
+                .iter()
+                .all(|v| domains[v.0].singleton_value() == Some(0))
+            {
+                merge(&mut result, assign(domains, *output, 0)?);
+            }
+            if domains[output.0].singleton_value() == Some(0) {
+                for input in inputs {
+                    merge(&mut result, assign(domains, *input, 0)?);
+                }
+            } else if domains[output.0].singleton_value() == Some(1) {
+                let possible_true: Vec<_> = model::unique_scope(inputs.iter().copied())
+                    .into_iter()
+                    .filter(|v| domains[v.0].contains(1))
+                    .collect();
+                if possible_true.len() == 1 {
+                    merge(&mut result, assign(domains, possible_true[0], 1)?);
+                }
+            }
+        }
+        Constraint::BoolNot { output, input } => {
+            if let Some(value) = domains[input.0].singleton_value() {
+                merge(&mut result, assign(domains, *output, 1 - value)?);
+            }
+            if let Some(value) = domains[output.0].singleton_value() {
+                merge(&mut result, assign(domains, *input, 1 - value)?);
+            }
+        }
+        Constraint::ReifiedLinearLe {
+            indicator,
+            terms,
+            rhs,
+        } => {
+            let (lower, upper) = model::linear_bounds(terms, domains)?;
+            if upper <= *rhs {
+                merge(&mut result, assign(domains, *indicator, 1)?);
+            } else if lower > *rhs {
+                merge(&mut result, assign(domains, *indicator, 0)?);
+            }
+            match domains[indicator.0].singleton_value() {
+                Some(1) => merge(&mut result, propagate_linear_le(terms, *rhs, domains)?),
+                Some(0) => {
+                    let lower = rhs
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Overflow("reified affine complement".into()))?;
+                    merge(&mut result, propagate_linear_ge(terms, lower, domains)?);
+                }
+                _ => (),
             }
         }
         Constraint::Implies {
@@ -222,6 +280,90 @@ pub fn propagate_constraint(
         }
         Constraint::Schedule(schedule) => merge(&mut result, schedule.propagate(domains)?),
         Constraint::Arithmetic(arithmetic) => merge(&mut result, arithmetic.propagate(domains)?),
+    }
+    Ok(result)
+}
+
+fn propagate_linear_le(
+    terms: &[crate::model::LinearTerm],
+    rhs: i128,
+    domains: &mut [Domain],
+) -> Result<Propagation> {
+    let mut result = Propagation::default();
+    let merged = model::merged_terms(terms)?;
+    let (lower, _) = model::linear_bounds(terms, domains)?;
+    for (variable, coefficient) in merged {
+        let domain = &domains[variable.0];
+        let extreme = if coefficient > 0 {
+            domain.min()
+        } else {
+            domain.max()
+        };
+        let Some(extreme) = extreme else {
+            result.infeasible = true;
+            break;
+        };
+        let own_min = coefficient
+            .checked_mul(extreme as i128)
+            .ok_or_else(|| Error::Overflow("propagation affine product".into()))?;
+        let others = lower
+            .checked_sub(own_min)
+            .ok_or_else(|| Error::Overflow("propagation affine residual".into()))?;
+        let allowance = rhs
+            .checked_sub(others)
+            .ok_or_else(|| Error::Overflow("propagation affine allowance".into()))?;
+        let next = if coefficient > 0 {
+            restrict_wide(domain, i64::MIN as i128, floor_div(allowance, coefficient)?)?
+        } else {
+            restrict_wide(domain, ceil_div(allowance, coefficient)?, i64::MAX as i128)?
+        };
+        merge(&mut result, replace(domains, variable, next)?);
+    }
+    Ok(result)
+}
+
+fn propagate_linear_ge(
+    terms: &[crate::model::LinearTerm],
+    rhs: i128,
+    domains: &mut [Domain],
+) -> Result<Propagation> {
+    let mut result = Propagation::default();
+    let merged = model::merged_terms(terms)?;
+    let (_, upper) = model::linear_bounds(terms, domains)?;
+    for (variable, coefficient) in merged {
+        let domain = &domains[variable.0];
+        let extreme = if coefficient > 0 {
+            domain.max()
+        } else {
+            domain.min()
+        };
+        let Some(extreme) = extreme else {
+            result.infeasible = true;
+            break;
+        };
+        let own_max = coefficient
+            .checked_mul(extreme as i128)
+            .ok_or_else(|| Error::Overflow("propagation affine product".into()))?;
+        let others = upper
+            .checked_sub(own_max)
+            .ok_or_else(|| Error::Overflow("propagation affine residual".into()))?;
+        let requirement = rhs
+            .checked_sub(others)
+            .ok_or_else(|| Error::Overflow("propagation affine requirement".into()))?;
+        let next = if coefficient > 0 {
+            restrict_wide(
+                domain,
+                ceil_div(requirement, coefficient)?,
+                i64::MAX as i128,
+            )?
+        } else {
+            restrict_wide(
+                domain,
+                i64::MIN as i128,
+                floor_div(requirement, coefficient)?,
+            )?
+        };
+        merge(&mut result, replace(domains, variable, next)?);
     }
     Ok(result)
 }

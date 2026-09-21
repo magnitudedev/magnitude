@@ -2,12 +2,11 @@
 //!
 //! `Telemetry::open` installs the process-global tracer provider (default
 //! endpoint: the local Motel collector's standard `/v1/traces` path). Every
-//! engine phase then records spans through the global tracer — compilation
-//! (entry, kernel count, estimated cost, optimality), weight import (name,
-//! encoding, elements), and one child span per executed launch (dispatched
-//! geometry and wall time, from the executor's own `LaunchExecution`
-//! records). With no provider installed the global tracer is a no-op, so
-//! telemetry never breaks execution; export failures are ignored.
+//! engine-owned phases then record spans through the global tracer. Seismic
+//! itself owns preparation, variant selection, allocation, and launch spans;
+//! the engine records only model-level work such as weight import. With no
+//! provider installed the global tracer is a no-op, so telemetry never breaks
+//! execution; export failures are ignored.
 
 use opentelemetry::global;
 use opentelemetry::trace::{Span, SpanKind, Tracer};
@@ -35,9 +34,7 @@ impl Telemetry {
             .build()
         {
             Ok(exporter) => SdkTracerProvider::builder()
-                .with_span_processor(opentelemetry_sdk::trace::SimpleSpanProcessor::new(
-                    exporter,
-                ))
+                .with_span_processor(opentelemetry_sdk::trace::SimpleSpanProcessor::new(exporter))
                 .build(),
             Err(_) => SdkTracerProvider::builder().build(),
         };
@@ -70,30 +67,6 @@ pub fn tracer() -> global::BoxedTracer {
     global::tracer(SERVICE)
 }
 
-/// Record one compiled entry: entry name, kernel count, the solver's
-/// estimated cost and optimality verdict, and wall time.
-pub fn span_compile(
-    entry: &str,
-    kernels: u64,
-    estimated_cost: u64,
-    optimal: bool,
-    seconds: f64,
-) {
-    let tracer = tracer();
-    let mut span = tracer
-        .span_builder(format!("compile {entry}"))
-        .with_kind(SpanKind::Internal)
-        .with_attributes(vec![
-            key_str("magnitude.entry", entry),
-            key_u64("magnitude.kernels", kernels),
-            key_u64("magnitude.estimated_cost", estimated_cost),
-            KeyValue::new("magnitude.optimal", optimal),
-            KeyValue::new("magnitude.seconds", seconds),
-        ])
-        .start(&tracer);
-    span.end();
-}
-
 /// Record one imported weight (name, encoding, elements, wall time).
 pub fn span_import(weight: &str, encoding: &str, elements: u64, seconds: f64) {
     let tracer = tracer();
@@ -105,24 +78,6 @@ pub fn span_import(weight: &str, encoding: &str, elements: u64, seconds: f64) {
             key_str("magnitude.encoding", encoding),
             key_u64("magnitude.elements", elements),
             KeyValue::new("magnitude.seconds", seconds),
-        ])
-        .start(&tracer);
-    span.end();
-}
-
-/// Record one executed launch: dispatched geometry and wall time.
-pub fn span_launch(launch: &seismic_realization::physical::LaunchExecution) {
-    let tracer = tracer();
-    let mut span = tracer
-        .span_builder(format!("launch {}", launch.launch.index()))
-        .with_kind(SpanKind::Internal)
-        .with_attributes(vec![
-            key_u64("magnitude.work_items", launch.work_items),
-            key_u64("magnitude.participants", launch.participants),
-            key_u64("magnitude.workgroups.0", launch.workgroups[0]),
-            key_u64("magnitude.workgroups.1", launch.workgroups[1]),
-            key_u64("magnitude.workgroups.2", launch.workgroups[2]),
-            KeyValue::new("magnitude.seconds", launch.seconds),
         ])
         .start(&tracer);
     span.end();

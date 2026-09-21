@@ -5,6 +5,6 @@ fn gated_norm[NV, W](result: &tensor[NV, W] bf16, w: &tensor[W] bf16, z: &tensor
         let wt = f32(w)
         let x = f32(result[heads])
         let g = f32(z[0, heads * W : (heads + 1) * W])
-        let ss = sum_any_order(to_owned(x * x))
+        let ss = sum_any_order(x * x)
         let inv = rsqrt(ss / f32(W) + eps)
         y[0, heads * W : (heads + 1) * W] = x * inv * wt * (g / (1.0 + exp(-g)))

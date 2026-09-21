@@ -1,46 +1,52 @@
-# Recurrent input preparation for one row. Per channel: convolve the window of the C - 1
-# previous inputs and the new one, apply silu, and shift the window. Per head: queries
-# (heads 0..NK) and keys (NK..2NK) are L2-normalized with epsilon, queries with gain
-# 1/sqrt(W); values pass through. Per value head: beta = sigmoid(beta_in) and
-# decay = exp(rate * softplus(alpha + dt_bias)).
-fn recurrent_prepare[NK, NV, W, C](projected: &tensor[1, (2 * NK + NV) * W] A, conv: &tensor[(2 * NK + NV) * W, C] CW,
-                                          window: &tensor[C - 1, (2 * NK + NV) * W] A,
-                                          next_window: &mut tensor[C - 1, (2 * NK + NV) * W] A,
-                                          alpha: &tensor[1, NV] A, beta_in: &tensor[1, NV] A,
-                                          rate: &tensor[NV] f32, dt_bias: &tensor[NV] f32, eps: f32,
-                                          qkv: &mut tensor[2 * NK + NV, W] A, beta: &mut tensor[NV] A, decay: &mut tensor[NV] f32):
-    parallel for heads in 0..(2 * NK + NV):
-        let x = load(projected[0, heads * W : (heads + 1) * W])
-        let win = load(window[0 : C - 1, heads * W : (heads + 1) * W])
-        let wt = load(conv[heads * W : (heads + 1) * W, 0 : C])
-        let mut y = tensor[W] f32
-        for i in 0..W:
-            let mut s = f32(wt[i, C - 1]) * f32(x[i])
-            for j in 0..C - 1:
-                s = fma(f32(wt[i, j]), f32(win[j, i]), s)
-            y[i] = s / (1.0 + exp(-s))
-        let mut nw = tensor[C - 1, W] f32
-        for j in 0..C - 1:
+# Recurrent input preparation for M ordered rows. Per channel: convolve the window of the
+# C - 1 previous inputs and the new one (earlier rows of this call are the previous
+# inputs of later rows), apply silu; the published window is the last C - 1 inputs.
+# Per head: queries (heads 0..NK) and keys (NK..2NK) are L2-normalized with epsilon,
+# queries with gain 1/sqrt(W); values pass through. Per value head: beta =
+# sigmoid(beta_in) and decay = exp(rate * softplus(alpha + dt_bias)).
+fn recurrent_prepare_rows[M, NK, NV, W, C](projected: &tensor[M, (2 * NK + NV) * W] A, conv: &tensor[(2 * NK + NV) * W, C] CW,
+                                           window: &tensor[C - 1, (2 * NK + NV) * W] A,
+                                           next_window: &mut tensor[C - 1, (2 * NK + NV) * W] A,
+                                           alpha: &tensor[M, NV] A, beta_in: &tensor[M, NV] A,
+                                           rate: &tensor[NV] f32, dt_bias: &tensor[NV] f32, eps: f32,
+                                           qkv: &mut tensor[M, 2 * NK + NV, W] A, beta: &mut tensor[M, NV] A, decay: &mut tensor[M, NV] f32):
+    parallel for rows in 0..M:
+        parallel for heads in 0..2 * NK + NV:
+            let mut y = tensor[W] f32
             for i in 0..W:
-                if j < C - 2:
-                    nw[j, i] = f32(win[j + 1, i])
-                else:
-                    nw[j, i] = f32(x[i])
-        next_window[0 : C - 1, heads * W : (heads + 1) * W] = nw
-        let mut inv = f32(1.0)
-        if heads < 2 * NK:
-            let ss = sum_any_order(to_owned(f32(y) * f32(y)))
-            inv = rsqrt(ss + eps)
-            if heads < NK:
-                inv = inv * rsqrt(f32(W))
-        qkv[heads] = f32(y) * inv
-    parallel for value_heads in 0..NV:
-        let mut b = tensor[1] f32
-        let mut d = tensor[1] f32
-        for i in 0..1:
-            b[i] = 1.0 / (1.0 + exp(-f32(beta_in[0, value_heads])))
-        for i in 0..1:
-            let sh = f32(alpha[0, value_heads]) + dt_bias[value_heads]
-            d[i] = exp(rate[value_heads] * (max(sh, 0.0) + log(1.0 + exp(-abs(sh)))))
-        beta[value_heads : value_heads + 1] = b
-        decay[value_heads : value_heads + 1] = d
+                let mut s = f32(conv[heads * W + i, C - 1]) * f32(projected[rows, heads * W + i])
+                for j in 0..C - 1:
+                    let mut previous = f32(0.0)
+                    if rows + j < C - 1:
+                        previous = f32(window[rows + j, heads * W + i])
+                    else:
+                        previous = f32(projected[rows + j - (C - 1), heads * W + i])
+                    s = fma(f32(conv[heads * W + i, j]), previous, s)
+                y[i] = s / (1.0 + exp(-s))
+            let mut inv = f32(1.0)
+            if heads < 2 * NK:
+                inv = rsqrt(sum_any_order(y * y) + eps)
+                if heads < NK:
+                    inv = inv * rsqrt(f32(W))
+            qkv[rows, heads] = y * inv
+    parallel for rows in 0..M:
+        parallel for value_heads in 0..NV:
+            beta[rows, value_heads] = 1.0 / (1.0 + exp(-f32(beta_in[rows, value_heads])))
+            let shifted = f32(alpha[rows, value_heads]) + dt_bias[value_heads]
+            decay[rows, value_heads] = exp(rate[value_heads] * (max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))))
+    parallel for column in 0..(2 * NK + NV) * W:
+        for j in 0..C - 1:
+            if M + j < C - 1:
+                next_window[j, column] = window[M + j, column]
+            else:
+                next_window[j, column] = projected[M + j - (C - 1), column]
+
+# One row: the M = 1 case of `recurrent_prepare_rows`.
+fn recurrent_prepare[NK, NV, W, C](projected: &tensor[1, (2 * NK + NV) * W] A, conv: &tensor[(2 * NK + NV) * W, C] CW,
+                                   window: &tensor[C - 1, (2 * NK + NV) * W] A,
+                                   next_window: &mut tensor[C - 1, (2 * NK + NV) * W] A,
+                                   alpha: &tensor[1, NV] A, beta_in: &tensor[1, NV] A,
+                                   rate: &tensor[NV] f32, dt_bias: &tensor[NV] f32, eps: f32,
+                                   qkv: &mut tensor[2 * NK + NV, W] A, beta: &mut tensor[NV] A, decay: &mut tensor[NV] f32):
+    recurrent_prepare_rows[NK = NK, NV = NV](projected, conv, window, next_window, alpha, beta_in, rate, dt_bias, eps,
+                                             reshape(qkv, (1, 2 * NK + NV, W)), reshape(beta, (1, NV)), reshape(decay, (1, NV)))

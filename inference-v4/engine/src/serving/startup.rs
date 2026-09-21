@@ -10,7 +10,7 @@ use crate::{
         runtime::{Runtime, Service},
     },
 };
-use seismic_runtime::{plan::Settings, Device};
+use seismic::{Device, PrecisionPolicy};
 use std::{path::Path, rc::Rc, sync::Arc};
 
 pub struct ExecutionLimits {
@@ -28,7 +28,7 @@ pub fn qwen(
     path: impl AsRef<Path>,
     config: Config,
     limits: ExecutionLimits,
-    execution: impl FnOnce() -> Result<(Device, Settings), String> + Send + 'static,
+    execution: impl FnOnce() -> Result<(Device, PrecisionPolicy), String> + Send + 'static,
 ) -> Result<Server<QwenExecutor>, String> {
     if limits.storage_bytes == 0 || limits.control_capacity == 0 {
         return Err("startup requires positive storage and control budgets".into());
@@ -53,16 +53,20 @@ pub fn qwen(
     let service = Service::spawn(
         move || {
             let vocabulary = Vocabulary::new(worker_tokenizer, projection, limits.grammar_cache)?;
-            let (device, settings) = execution()?;
+            let (device, precision) = execution()?;
+            let storage_bytes = u64::try_from(limits.storage_bytes)
+                .map_err(|_| "storage budget exceeds the device accounting domain")?;
             device
-                .set_memory_limit(Some(limits.storage_bytes))
+                .set_memory_limit(Some(storage_bytes))
                 .map_err(|e| e.to_string())?;
-            let decoder = model.load(
-                Rc::new(device),
-                settings,
-                context,
-                limits.scheduler.max_requests,
-            )?;
+            let decoder = model
+                .load(
+                    Rc::new(device),
+                    precision,
+                    context,
+                    limits.scheduler.max_requests,
+                )
+                .map_err(|error| error.to_string())?;
             Runtime::new(QwenExecutor::new(decoder)?, vocabulary, limits.scheduler)
         },
         limits.control_capacity,

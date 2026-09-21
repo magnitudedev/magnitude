@@ -1,71 +1,125 @@
-//! Minimal dynamically loaded driver ABI. Symbols are resolved once; all owned
-//! objects keep their driver/context alive. No CUDA headers or libraries are
-//! required to build this crate or load hardware-independent tools.
+//! Minimal dynamically loaded CUDA driver ABI. Symbols are resolved once per
+//! process; every owned object keeps its driver and primary context alive.
+//! No CUDA headers or libraries are required to build this crate, so it
+//! builds on hosts without CUDA and fails at device discovery instead.
+//!
+//! Every wrapper here has one precondition: it is called with valid handles
+//! it produced itself. Violating that from Seismic's own code is a bug of
+//! this module (§13.3.3); the driver's own failures are typed
+//! [`DriverError`]s.
+//!
+//! Contexts: the backend uses the device's *primary* context, retained by
+//! ordinal. The current-context binding is thread-local driver state, so
+//! every entry point makes the context current for the duration of the call
+//! ([`Context::enter`]); the context object itself may be shared between
+//! threads, which is why the handles below are `Send + Sync`.
+
 use libloading::Library;
-use std::{
-    ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr},
-    fmt,
-    rc::Rc,
-};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
+use std::fmt;
+use std::sync::{Arc, OnceLock};
+
 pub type Handle = *mut c_void;
 type ResultCode = c_int;
+
 macro_rules! driver {
     ($( $field:ident: $ty:ty => $symbol:literal ),* $(,)?) => {
-        pub(crate) struct Driver { $(pub $field:$ty,)* _library:Library }
+        pub(crate) struct Driver { $(pub $field:$ty,)* _library: Library }
         impl Driver {
-            pub fn load()->Result<Rc<Self>,String> {
-                #[cfg(target_os="windows")] let names=&["nvcuda.dll"];
-                #[cfg(not(target_os="windows"))] let names=&["libcuda.so.1"];
-                let mut errors=Vec::new();
+            fn load_library() -> Result<Self, String> {
+                #[cfg(target_os = "windows")]
+                let names = &["nvcuda.dll"];
+                #[cfg(not(target_os = "windows"))]
+                let names = &["libcuda.so.1"];
+                let mut errors = Vec::new();
                 for name in names {
                     // CUDA driver symbols have the documented C ABI. Keeping the
-                    // library in Driver preserves every copied function pointer.
-                    let library=match unsafe {Library::new(name)} {Ok(l)=>l,Err(e)=>{errors.push(e.to_string());continue}};
+                    // library in `Driver` preserves every copied function pointer.
+                    let library = match unsafe { Library::new(name) } {
+                        Ok(library) => library,
+                        Err(error) => {
+                            errors.push(error.to_string());
+                            continue;
+                        }
+                    };
                     unsafe {
-                        $(let $field: $ty=*library.get(concat!($symbol,"\0").as_bytes()).map_err(|e|format!("CUDA driver symbol {}: {e}",$symbol))?;)*
-                        let driver=Rc::new(Self { $($field,)* _library:library });
-                        driver.check((driver.init)(0),"initialization")?;
+                        $(let $field: $ty = *library
+                            .get(concat!($symbol, "\0").as_bytes())
+                            .map_err(|e| format!("CUDA driver symbol {}: {e}", $symbol))?;)*
+                        let driver = Self { $($field,)* _library: library };
+                        driver.check((driver.init)(0), "initialization").map_err(|e| e.to_string())?;
                         return Ok(driver);
                     }
                 }
-                Err(format!("CUDA driver unavailable: {}",errors.join("; ")))
+                Err(format!("CUDA driver unavailable: {}", errors.join("; ")))
             }
         }
     }
 }
+
 driver! {
-    init: unsafe extern "system" fn(c_uint)->ResultCode => "cuInit",
-    device_total_memory: unsafe extern "system" fn(*mut usize,c_int)->ResultCode => "cuDeviceTotalMem_v2",
-    occupancy_blocks: unsafe extern "system" fn(*mut c_int,Handle,c_int,usize)->ResultCode => "cuOccupancyMaxActiveBlocksPerMultiprocessor",
-    device_get: unsafe extern "system" fn(*mut c_int,c_int)->ResultCode => "cuDeviceGet",
-    device_name: unsafe extern "system" fn(*mut c_char,c_int,c_int)->ResultCode => "cuDeviceGetName",
-    device_attribute: unsafe extern "system" fn(*mut c_int,c_int,c_int)->ResultCode => "cuDeviceGetAttribute",
-    driver_version: unsafe extern "system" fn(*mut c_int)->ResultCode => "cuDriverGetVersion",
-    context_create: unsafe extern "system" fn(*mut Handle,c_uint,c_int)->ResultCode => "cuCtxCreate_v2",
-    context_destroy: unsafe extern "system" fn(Handle)->ResultCode => "cuCtxDestroy_v2",
-    context_get: unsafe extern "system" fn(*mut Handle)->ResultCode => "cuCtxGetCurrent",
-    context_set: unsafe extern "system" fn(Handle)->ResultCode => "cuCtxSetCurrent",
-    synchronize: unsafe extern "system" fn()->ResultCode => "cuCtxSynchronize",
-    allocate: unsafe extern "system" fn(*mut u64,usize)->ResultCode => "cuMemAlloc_v2",
-    free: unsafe extern "system" fn(u64)->ResultCode => "cuMemFree_v2",
-    upload: unsafe extern "system" fn(u64,*const c_void,usize)->ResultCode => "cuMemcpyHtoD_v2",
-    download: unsafe extern "system" fn(*mut c_void,u64,usize)->ResultCode => "cuMemcpyDtoH_v2",
-    module_load: unsafe extern "system" fn(*mut Handle,*const c_void,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuModuleLoadDataEx",
-    link_create: unsafe extern "system" fn(c_uint,*mut c_int,*mut *mut c_void,*mut Handle)->ResultCode => "cuLinkCreate_v2",
-    link_add_data: unsafe extern "system" fn(Handle,c_int,*mut c_void,usize,*const c_char,c_uint,*mut c_int,*mut *mut c_void)->ResultCode => "cuLinkAddData_v2",
-    link_complete: unsafe extern "system" fn(Handle,*mut *mut c_void,*mut usize)->ResultCode => "cuLinkComplete",
-    link_destroy: unsafe extern "system" fn(Handle)->ResultCode => "cuLinkDestroy",
-    module_unload: unsafe extern "system" fn(Handle)->ResultCode => "cuModuleUnload",
-    module_function: unsafe extern "system" fn(*mut Handle,Handle,*const c_char)->ResultCode => "cuModuleGetFunction",
-    function_attribute: unsafe extern "system" fn(*mut c_int,c_int,Handle)->ResultCode => "cuFuncGetAttribute",
-    launch: unsafe extern "system" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->ResultCode => "cuLaunchKernel",
-    launch_cooperative: unsafe extern "system" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->ResultCode => "cuLaunchCooperativeKernel",
-    memcpy_device: unsafe extern "system" fn(u64,u64,usize)->ResultCode => "cuMemcpyDtoD_v2",
-    memset_d8: unsafe extern "system" fn(u64,c_uchar,usize)->ResultCode => "cuMemsetD8_v2",
-    error_string: unsafe extern "system" fn(ResultCode,*mut *const c_char)->ResultCode => "cuGetErrorString",
+    init: unsafe extern "system" fn(c_uint) -> ResultCode => "cuInit",
+    device_count: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDeviceGetCount",
+    device_get: unsafe extern "system" fn(*mut c_int, c_int) -> ResultCode => "cuDeviceGet",
+    device_name: unsafe extern "system" fn(*mut c_char, c_int, c_int) -> ResultCode => "cuDeviceGetName",
+    device_attribute: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode => "cuDeviceGetAttribute",
+    device_total_memory: unsafe extern "system" fn(*mut usize, c_int) -> ResultCode => "cuDeviceTotalMem_v2",
+    driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
+    primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
+    primary_context_release: unsafe extern "system" fn(c_int) -> ResultCode => "cuDevicePrimaryCtxRelease_v2",
+    context_get: unsafe extern "system" fn(*mut Handle) -> ResultCode => "cuCtxGetCurrent",
+    context_set: unsafe extern "system" fn(Handle) -> ResultCode => "cuCtxSetCurrent",
+    stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
+    stream_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamDestroy_v2",
+    stream_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamSynchronize",
+    event_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuEventCreate",
+    event_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventDestroy_v2",
+    event_record: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuEventRecord",
+    event_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventSynchronize",
+    event_elapsed_time: unsafe extern "system" fn(*mut f32, Handle, Handle) -> ResultCode => "cuEventElapsedTime",
+    allocate: unsafe extern "system" fn(*mut u64, usize) -> ResultCode => "cuMemAlloc_v2",
+    free: unsafe extern "system" fn(u64) -> ResultCode => "cuMemFree_v2",
+    allocate_host: unsafe extern "system" fn(*mut *mut c_void, usize) -> ResultCode => "cuMemAllocHost_v2",
+    free_host: unsafe extern "system" fn(*mut c_void) -> ResultCode => "cuMemFreeHost",
+    upload: unsafe extern "system" fn(u64, *const c_void, usize) -> ResultCode => "cuMemcpyHtoD_v2",
+    upload_async: unsafe extern "system" fn(u64, *const c_void, usize, Handle) -> ResultCode => "cuMemcpyHtoDAsync_v2",
+    download: unsafe extern "system" fn(*mut c_void, u64, usize) -> ResultCode => "cuMemcpyDtoH_v2",
+    memcpy_device_async: unsafe extern "system" fn(u64, u64, usize, Handle) -> ResultCode => "cuMemcpyDtoDAsync_v2",
+    memset_d8_async: unsafe extern "system" fn(u64, c_uchar, usize, Handle) -> ResultCode => "cuMemsetD8Async",
+    memset_d16_async: unsafe extern "system" fn(u64, u16, usize, Handle) -> ResultCode => "cuMemsetD16Async",
+    memset_d32_async: unsafe extern "system" fn(u64, c_uint, usize, Handle) -> ResultCode => "cuMemsetD32Async",
+    module_load: unsafe extern "system" fn(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuModuleLoadDataEx",
+    module_unload: unsafe extern "system" fn(Handle) -> ResultCode => "cuModuleUnload",
+    module_function: unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> ResultCode => "cuModuleGetFunction",
+    link_create: unsafe extern "system" fn(c_uint, *mut c_int, *mut *mut c_void, *mut Handle) -> ResultCode => "cuLinkCreate_v2",
+    link_add_data: unsafe extern "system" fn(Handle, c_int, *mut c_void, usize, *const c_char, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuLinkAddData_v2",
+    link_complete: unsafe extern "system" fn(Handle, *mut *mut c_void, *mut usize) -> ResultCode => "cuLinkComplete",
+    link_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuLinkDestroy",
+    function_attribute: unsafe extern "system" fn(*mut c_int, c_int, Handle) -> ResultCode => "cuFuncGetAttribute",
+    function_set_attribute: unsafe extern "system" fn(Handle, c_int, c_int) -> ResultCode => "cuFuncSetAttribute",
+    occupancy_max_active_blocks: unsafe extern "system" fn(*mut c_int, Handle, c_int, usize) -> ResultCode => "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+    launch: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchKernel",
+    launch_cooperative: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchCooperativeKernel",
+    error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString",
 }
+
+// The driver's function pointers and the loaded library are plain data; the
+// CUDA driver API is documented thread-safe.
+unsafe impl Send for Driver {}
+unsafe impl Sync for Driver {}
+
+static DRIVER: OnceLock<Result<Arc<Driver>, String>> = OnceLock::new();
+
 impl Driver {
-    pub fn check_typed(&self, result: ResultCode, operation: &str) -> Result<(), DriverError> {
+    /// The process-wide driver, loaded on first use. A host without a usable
+    /// driver reports the loader's message.
+    pub fn load() -> Result<Arc<Self>, String> {
+        DRIVER
+            .get_or_init(|| Self::load_library().map(Arc::new))
+            .clone()
+    }
+
+    pub fn check(&self, result: ResultCode, operation: &'static str) -> Result<(), DriverError> {
         if result == 0 {
             return Ok(());
         }
@@ -78,23 +132,50 @@ impl Driver {
             }
         };
         Err(DriverError {
-            operation: operation.into(),
+            operation,
             code: result,
             description,
         })
     }
 
-    pub fn check(&self, result: ResultCode, operation: &str) -> Result<(), String> {
-        self.check_typed(result, operation)
-            .map_err(|error| error.to_string())
+    /// One `cuDeviceGetAttribute` query.
+    pub fn attribute(&self, key: c_int, device: c_int) -> Result<i32, DriverError> {
+        let mut value = 0;
+        unsafe {
+            self.check(
+                (self.device_attribute)(&mut value, key, device),
+                "device attribute",
+            )?;
+        }
+        Ok(value)
     }
 }
 
+/// One failed driver call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriverError {
-    pub operation: String,
+    pub operation: &'static str,
     pub code: i32,
     pub description: String,
+}
+
+impl DriverError {
+    /// CUDA result codes that mean the device or its context is gone
+    /// (`CUDA_ERROR_DEINITIALIZED`, `_ILLEGAL_ADDRESS`, `_LAUNCH_TIMEOUT`,
+    /// `_LAUNCH_FAILED`, `_ASSERT`, `_HARDWARE_STACK_ERROR`,
+    /// `_ILLEGAL_INSTRUCTION`, `_MISALIGNED_ADDRESS`, `_INVALID_ADDRESS_SPACE`,
+    /// `_INVALID_PC`, `_ECC_UNCORRECTABLE`, `_DEVICE_UNAVAILABLE`).
+    pub fn is_device_loss(&self) -> bool {
+        matches!(
+            self.code,
+            4 | 46 | 214 | 700 | 702 | 710 | 714 | 715 | 716 | 717 | 718 | 719
+        )
+    }
+
+    /// `CUDA_ERROR_OUT_OF_MEMORY`.
+    pub fn is_out_of_memory(&self) -> bool {
+        self.code == 2
+    }
 }
 
 impl fmt::Display for DriverError {
@@ -108,29 +189,42 @@ impl fmt::Display for DriverError {
 }
 
 impl std::error::Error for DriverError {}
+
+/// The retained primary context of one device ordinal.
 pub(crate) struct Context {
-    pub driver: Rc<Driver>,
+    pub driver: Arc<Driver>,
     raw: Handle,
+    ordinal: c_int,
 }
+
+// The raw handle is an opaque driver object usable from any thread once made
+// current there (`enter`).
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
 impl Context {
-    pub fn new(driver: Rc<Driver>, device: c_int) -> Result<Rc<Self>, String> {
-        let mut previous = std::ptr::null_mut();
+    pub fn retain(driver: Arc<Driver>, ordinal: c_int) -> Result<Arc<Self>, DriverError> {
         let mut raw = std::ptr::null_mut();
         unsafe {
-            driver.check((driver.context_get)(&mut previous), "current context query")?;
             driver.check(
-                (driver.context_create)(&mut raw, 0, device),
-                "context creation",
+                (driver.primary_context_retain)(&mut raw, ordinal),
+                "primary context retain",
             )?;
-            let context = Rc::new(Self {
-                driver: driver.clone(),
-                raw,
-            });
-            driver.check((driver.context_set)(previous), "restore context")?;
-            Ok(context)
         }
+        Ok(Arc::new(Self {
+            driver,
+            raw,
+            ordinal,
+        }))
     }
-    pub fn enter(&self) -> Result<Current<'_>, String> {
+
+    pub fn ordinal(&self) -> c_int {
+        self.ordinal
+    }
+
+    /// Makes this context current on the calling thread until the guard
+    /// drops, restoring the previous binding afterwards.
+    pub fn enter(&self) -> Result<Current<'_>, DriverError> {
         let mut previous = std::ptr::null_mut();
         unsafe {
             self.driver.check(
@@ -146,17 +240,149 @@ impl Context {
         })
     }
 }
+
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe {
-            (self.driver.context_destroy)(self.raw);
+            (self.driver.primary_context_release)(self.ordinal);
         }
     }
 }
+
+/// One explicit CUDA stream bound to the opened production context. The
+/// executor and profiler never rely on legacy-default-stream process state.
+pub(crate) struct Stream {
+    raw: Handle,
+    context: Arc<Context>,
+}
+
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl Stream {
+    pub fn new(context: &Arc<Context>) -> Result<Arc<Self>, DriverError> {
+        let _current = context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            context.driver.check(
+                (context.driver.stream_create)(&mut raw, 0),
+                "stream creation",
+            )?;
+        }
+        Ok(Arc::new(Self {
+            raw,
+            context: context.clone(),
+        }))
+    }
+
+    pub fn raw(&self) -> Handle {
+        self.raw
+    }
+
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
+    }
+
+    pub fn synchronize(&self) -> Result<(), DriverError> {
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.stream_synchronize)(self.raw),
+                "stream synchronization",
+            )
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            unsafe {
+                (self.context.driver.stream_destroy)(self.raw);
+            }
+        }
+    }
+}
+
+/// CUDA event pair timing uses the device event timebase. Elapsed values are
+/// returned in nanoseconds without discarding the driver's fractional
+/// millisecond resolution; uncertainty is attached by profile acquisition.
+pub(crate) struct Event {
+    raw: Handle,
+    context: Arc<Context>,
+}
+
+impl Event {
+    pub fn new(context: &Arc<Context>) -> Result<Self, DriverError> {
+        let _current = context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            context
+                .driver
+                .check((context.driver.event_create)(&mut raw, 0), "event creation")?;
+        }
+        Ok(Self {
+            raw,
+            context: context.clone(),
+        })
+    }
+
+    pub fn record(&self, stream: &Stream) -> Result<(), DriverError> {
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "Event::record precondition: event and stream belong to one opened CUDA context"
+        );
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.event_record)(self.raw, stream.raw()),
+                "event record",
+            )
+        }
+    }
+
+    pub fn synchronize(&self) -> Result<(), DriverError> {
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.event_synchronize)(self.raw),
+                "event synchronization",
+            )
+        }
+    }
+
+    pub fn elapsed_ns(start: &Self, end: &Self) -> Result<f64, DriverError> {
+        assert!(
+            Arc::ptr_eq(&start.context, &end.context),
+            "Event::elapsed_ns precondition: events belong to one opened CUDA context"
+        );
+        let _current = start.context.enter()?;
+        let mut milliseconds = 0.0f32;
+        unsafe {
+            start.context.driver.check(
+                (start.context.driver.event_elapsed_time)(&mut milliseconds, start.raw, end.raw),
+                "event elapsed time",
+            )?;
+        }
+        Ok(f64::from(milliseconds) * 1_000_000.0)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            unsafe {
+                (self.context.driver.event_destroy)(self.raw);
+            }
+        }
+    }
+}
+
 pub(crate) struct Current<'a> {
     driver: &'a Driver,
     previous: Handle,
 }
+
 impl Drop for Current<'_> {
     fn drop(&mut self) {
         unsafe {
@@ -165,13 +391,18 @@ impl Drop for Current<'_> {
     }
 }
 
+/// One device allocation, freed with its context.
 pub(crate) struct Allocation {
     pub pointer: u64,
     pub bytes: usize,
-    pub context: Rc<Context>,
+    pub context: Arc<Context>,
 }
+
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
 impl Allocation {
-    pub fn new(context: &Rc<Context>, bytes: usize) -> Result<Self, String> {
+    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
         let _current = context.enter()?;
         let mut pointer = 0;
         unsafe {
@@ -186,51 +417,145 @@ impl Allocation {
             context: context.clone(),
         })
     }
-    pub fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), String> {
-        if offset
-            .checked_add(bytes.len())
-            .is_none_or(|end| end > self.bytes)
-        {
-            return Err("CUDA upload exceeds allocation".into());
+
+    /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.
+    /// The generic runtime binds buffers whose extents the executable derived
+    /// from the same layout roots, so a violation is a bug of this crate.
+    pub fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= self.bytes),
+            "Allocation::upload_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            bytes.len(),
+            self.bytes
+        );
+        if bytes.is_empty() {
+            return Ok(());
         }
         let _current = self.context.enter()?;
-        if !bytes.is_empty() {
-            unsafe {
-                self.context.driver.check(
-                    (self.context.driver.upload)(
-                        self.pointer + offset as u64,
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                    ),
-                    "upload",
-                )?;
-            }
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.upload)(
+                    self.pointer + offset as u64,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                ),
+                "upload",
+            )
         }
-        Ok(())
     }
-    pub fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), String> {
-        if offset
-            .checked_add(bytes.len())
-            .is_none_or(|end| end > self.bytes)
-        {
-            return Err("CUDA download exceeds allocation".into());
+
+    /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.
+    pub fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DriverError> {
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= self.bytes),
+            "Allocation::download_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            bytes.len(),
+            self.bytes
+        );
+        if bytes.is_empty() {
+            return Ok(());
         }
         let _current = self.context.enter()?;
-        if !bytes.is_empty() {
-            unsafe {
-                self.context.driver.check(
-                    (self.context.driver.download)(
-                        bytes.as_mut_ptr().cast(),
-                        self.pointer + offset as u64,
-                        bytes.len(),
-                    ),
-                    "download",
-                )?;
-            }
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.download)(
+                    bytes.as_mut_ptr().cast(),
+                    self.pointer + offset as u64,
+                    bytes.len(),
+                ),
+                "download",
+            )
         }
-        Ok(())
     }
 }
+
+/// Pinned host staging retained until every asynchronous upload that reads
+/// it has completed on the submission stream.
+pub(crate) struct PinnedUpload {
+    pointer: *mut u8,
+    bytes: usize,
+    context: Arc<Context>,
+}
+
+// The CUDA driver owns the pinned allocation and accepts it from any host
+// thread while its primary context is current there.
+unsafe impl Send for PinnedUpload {}
+
+impl PinnedUpload {
+    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
+        let _current = context.enter()?;
+        let mut pointer = std::ptr::null_mut();
+        unsafe {
+            context.driver.check(
+                (context.driver.allocate_host)(&mut pointer, bytes.max(1)),
+                "pinned host allocation",
+            )?;
+        }
+        Ok(Self {
+            pointer: pointer.cast(),
+            bytes,
+            context: context.clone(),
+        })
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer, self.bytes) }
+    }
+
+    /// Enqueues a copy from this retained staging allocation on the exact
+    /// production stream owned by the opened CUDA service.
+    pub fn upload(
+        &self,
+        stream: &Stream,
+        source_offset: usize,
+        destination: u64,
+        bytes: usize,
+    ) -> Result<(), DriverError> {
+        assert!(
+            source_offset
+                .checked_add(bytes)
+                .is_some_and(|end| end <= self.bytes),
+            "PinnedUpload::upload source range exceeds its private staging allocation"
+        );
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "PinnedUpload::upload precondition: staging and stream belong to one opened CUDA context"
+        );
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.upload_async)(
+                    destination,
+                    self.pointer.add(source_offset).cast(),
+                    bytes,
+                    stream.raw(),
+                ),
+                "asynchronous upload",
+            )
+        }
+    }
+}
+
+impl Drop for PinnedUpload {
+    fn drop(&mut self) {
+        // The executor synchronizes the stream before releasing an in-flight
+        // staging allocation. Driver teardown/device loss is the only path
+        // where entering the context may fail; free is then best-effort.
+        if let Ok(_current) = self.context.enter() {
+            unsafe {
+                (self.context.driver.free_host)(self.pointer.cast());
+            }
+        }
+    }
+}
+
 impl Drop for Allocation {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
@@ -240,10 +565,16 @@ impl Drop for Allocation {
         }
     }
 }
+
+/// One loaded module; unloaded with its context.
 pub(crate) struct Module {
     pub raw: Handle,
-    pub context: Rc<Context>,
+    pub context: Arc<Context>,
 }
+
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
+
 impl Drop for Module {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
@@ -254,14 +585,14 @@ impl Drop for Module {
     }
 }
 
-/// Retains JIT log buffers until the link state is destroyed. The driver owns the
-/// completed cubin until destruction; callers receive an owned byte-for-byte copy.
+/// A JIT link state; retains its log buffers until destroyed.
 struct Linker {
     raw: Handle,
-    context: Rc<Context>,
+    context: Arc<Context>,
     info: Vec<u8>,
     error: Vec<u8>,
 }
+
 impl Drop for Linker {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
@@ -272,16 +603,30 @@ impl Drop for Linker {
     }
 }
 
-pub(crate) fn compile_image(
-    context: &Rc<Context>,
-    source: &str,
-) -> Result<(Vec<u8>, String), String> {
-    let _current = context.enter()?;
+/// A toolchain (JIT) failure with the driver's log.
+#[derive(Clone, Debug)]
+pub(crate) enum JitError {
+    /// The driver rejected the PTX or failed to link it.
+    Toolchain { error: DriverError, log: String },
+    /// A driver call unrelated to the PTX text failed.
+    Driver(DriverError),
+    /// The driver returned an empty or oversized image.
+    MalformedImage(String),
+}
+
+fn log_text(buffer: &[u8]) -> String {
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+/// PTX -> cubin through the driver JIT.
+pub(crate) fn compile_image(context: &Arc<Context>, source: &str) -> Result<Vec<u8>, JitError> {
+    let _current = context.enter().map_err(JitError::Driver)?;
     let driver = &context.driver;
     let mut info = vec![0u8; 16384];
     let mut error = vec![0u8; 16384];
-    // CUDA driver ABI: INFO_LOG_BUFFER/SIZE, ERROR_LOG_BUFFER/SIZE,
-    // TARGET_FROM_CUCONTEXT and LOG_VERBOSE. No resource cap or fallback policy.
+    // CUDA driver JIT options: INFO_LOG_BUFFER(3)/SIZE(4), ERROR_LOG_BUFFER(5)/SIZE(6),
+    // TARGET_FROM_CUCONTEXT(8), LOG_VERBOSE(12).
     let mut options = [3, 4, 5, 6, 8, 12];
     let mut values = [
         info.as_mut_ptr().cast(),
@@ -293,15 +638,17 @@ pub(crate) fn compile_image(
     ];
     let mut raw = std::ptr::null_mut();
     unsafe {
-        driver.check(
-            (driver.link_create)(
-                options.len() as u32,
-                options.as_mut_ptr(),
-                values.as_mut_ptr(),
-                &mut raw,
-            ),
-            "JIT link creation",
-        )?;
+        driver
+            .check(
+                (driver.link_create)(
+                    options.len() as u32,
+                    options.as_mut_ptr(),
+                    values.as_mut_ptr(),
+                    &mut raw,
+                ),
+                "JIT link creation",
+            )
+            .map_err(JitError::Driver)?;
     }
     let linker = Linker {
         raw,
@@ -309,10 +656,13 @@ pub(crate) fn compile_image(
         info,
         error,
     };
+    // The emitter never writes a NUL byte into PTX text (all text is
+    // formatted from ASCII mnemonics and decimal/hex literals).
     let mut input = std::ffi::CString::new(source)
-        .map_err(|_| "PTX contains NUL")?
+        .expect("PTX emitter precondition: emitted text contains no NUL byte")
         .into_bytes_with_nul();
     let status = unsafe {
+        // CU_JIT_INPUT_PTX = 1
         (driver.link_add_data)(
             linker.raw,
             1,
@@ -324,36 +674,165 @@ pub(crate) fn compile_image(
             std::ptr::null_mut(),
         )
     };
-    let check = |status, operation| {
-        driver.check(status, operation).map_err(|error| {
-            let end = linker
-                .error
-                .iter()
-                .position(|b| *b == 0)
-                .unwrap_or(linker.error.len());
-            format!("{error}\n{}", String::from_utf8_lossy(&linker.error[..end]))
-        })
+    let toolchain = |status, operation| {
+        driver
+            .check(status, operation)
+            .map_err(|error| JitError::Toolchain {
+                error,
+                log: log_text(&linker.error),
+            })
     };
-    check(status, "PTX compilation")?;
+    toolchain(status, "PTX compilation")?;
     let mut image = std::ptr::null_mut();
     let mut size = 0;
-    check(
+    toolchain(
         unsafe { (driver.link_complete)(linker.raw, &mut image, &mut size) },
         "native image linking",
     )?;
     if image.is_null() || size == 0 || size > isize::MAX as usize {
-        return Err("driver returned an invalid native image".into());
+        return Err(JitError::MalformedImage(format!(
+            "driver returned an invalid native image ({size} bytes); log: {}",
+            log_text(&linker.info)
+        )));
     }
-    // cuLinkComplete's image remains valid until cuLinkDestroy. Copy before the
-    // RAII state releases it; loaded modules never borrow this driver's pointer.
-    let cubin = unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec();
-    let end = linker
-        .info
-        .iter()
-        .position(|b| *b == 0)
-        .unwrap_or(linker.info.len());
-    Ok((
-        cubin,
-        String::from_utf8_lossy(&linker.info[..end]).into_owned(),
-    ))
+    // The image remains valid until `cuLinkDestroy`; copy before the linker
+    // drops.
+    Ok(unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec())
+}
+
+/// cubin -> loaded module + entry function handle.
+pub(crate) fn load_module(
+    context: &Arc<Context>,
+    image: &[u8],
+    entry: &str,
+) -> Result<(Module, Handle), JitError> {
+    let _current = context.enter().map_err(JitError::Driver)?;
+    let driver = &context.driver;
+    let mut raw = std::ptr::null_mut();
+    let mut log = vec![0u8; 16384];
+    // ERROR_LOG_BUFFER(5)/SIZE(6)
+    let mut options = [5, 6];
+    let mut values = [log.as_mut_ptr().cast::<c_void>(), log.len() as *mut c_void];
+    let status = unsafe {
+        (driver.module_load)(
+            &mut raw,
+            image.as_ptr().cast(),
+            options.len() as u32,
+            options.as_mut_ptr(),
+            values.as_mut_ptr(),
+        )
+    };
+    driver
+        .check(status, "native image loading")
+        .map_err(|error| JitError::Toolchain {
+            error,
+            log: log_text(&log),
+        })?;
+    let module = Module {
+        raw,
+        context: context.clone(),
+    };
+    // Entry names are `seismic_kernel_<n>`: ASCII without NUL.
+    let name = std::ffi::CString::new(entry)
+        .expect("PTX emitter precondition: entry names contain no NUL byte");
+    let mut function: Handle = std::ptr::null_mut();
+    unsafe {
+        driver
+            .check(
+                (driver.module_function)(&mut function, module.raw, name.as_ptr()),
+                "kernel lookup",
+            )
+            .map_err(JitError::Driver)?;
+    }
+    Ok((module, function))
+}
+
+pub(crate) fn module_function(module: &Module, entry: &str) -> Result<Handle, JitError> {
+    let _current = module.context.enter().map_err(JitError::Driver)?;
+    let name = std::ffi::CString::new(entry)
+        .expect("PTX probe entry precondition: entry names contain no NUL byte");
+    let mut function = std::ptr::null_mut();
+    unsafe {
+        module
+            .context
+            .driver
+            .check(
+                (module.context.driver.module_function)(&mut function, module.raw, name.as_ptr()),
+                "kernel lookup",
+            )
+            .map_err(JitError::Driver)?;
+    }
+    Ok(function)
+}
+
+/// Authoritative `cuFuncGetAttribute` reflection on one loaded function.
+/// Native reconciliation consumes these facts before planning admission.
+pub(crate) fn function_attribute(
+    context: &Arc<Context>,
+    function: Handle,
+    key: c_int,
+) -> Result<i32, DriverError> {
+    let _current = context.enter()?;
+    let mut value = 0;
+    unsafe {
+        context.driver.check(
+            (context.driver.function_attribute)(&mut value, key, function),
+            "native function attribute",
+        )?;
+    }
+    Ok(value)
+}
+
+/// `cuFuncSetAttribute` on a loaded function.
+pub(crate) fn set_function_attribute(
+    context: &Arc<Context>,
+    function: Handle,
+    key: c_int,
+    value: c_int,
+) -> Result<(), DriverError> {
+    let _current = context.enter()?;
+    unsafe {
+        context.driver.check(
+            (context.driver.function_set_attribute)(function, key, value),
+            "native function attribute update",
+        )
+    }
+}
+
+/// Authoritative occupancy of one concrete loaded function for an exact
+/// block size and dynamic-shared byte count.
+pub(crate) fn occupancy_max_active_blocks(
+    context: &Arc<Context>,
+    function: Handle,
+    block_threads: u32,
+    dynamic_shared_bytes: u64,
+) -> Result<u32, DriverError> {
+    let _current = context.enter()?;
+    let block_threads = c_int::try_from(block_threads).map_err(|_| DriverError {
+        operation: "native function occupancy query",
+        code: -1,
+        description: "block thread count exceeds driver ABI".into(),
+    })?;
+    let dynamic_shared_bytes = usize::try_from(dynamic_shared_bytes).map_err(|_| DriverError {
+        operation: "native function occupancy query",
+        code: -1,
+        description: "dynamic shared byte count exceeds driver ABI".into(),
+    })?;
+    let mut blocks = 0;
+    unsafe {
+        context.driver.check(
+            (context.driver.occupancy_max_active_blocks)(
+                &mut blocks,
+                function,
+                block_threads,
+                dynamic_shared_bytes,
+            ),
+            "native function occupancy query",
+        )?;
+    }
+    u32::try_from(blocks).map_err(|_| DriverError {
+        operation: "native function occupancy query",
+        code: -1,
+        description: "driver returned a negative active-block count".into(),
+    })
 }

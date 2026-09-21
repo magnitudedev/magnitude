@@ -1,12 +1,12 @@
 //! One long-context session through the unified runtime pipeline: a prose payload
 //! prefilled in fixed chunks, then greedy decode. Mirrors the V3 session-bench prose
 //! workload (`benchmark_fixtures/prose.py`, serving `--prefill-tokens`). Every forward
-//! selects prepared capacity classes; the compilation count is fixed at load.
+//! selects among prepared domain-covering variants; the compilation count is
+//! fixed at load.
 use super::{decoder::Decoder, loading::Model};
-use crate::preparation::Settings;
-use crate::Error;
 use crate::inputs::{ByteBpeTokenizer, SpecialTokens, TokenId};
-use seismic_runtime::Device;
+use crate::Error;
+use seismic::{Device, PrecisionPolicy};
 use serde::Serialize;
 use std::{path::Path, rc::Rc, time::Instant};
 
@@ -67,6 +67,12 @@ pub struct Latency {
 pub struct Report {
     pub artifact: String,
     pub backend: String,
+    pub device: String,
+    pub device_memory_bytes: u64,
+    pub precision_policy: String,
+    pub engine_version: String,
+    pub host_os: String,
+    pub host_arch: String,
     pub context_capacity: usize,
     pub fixture_text_sha256: String,
     pub payload_tokens: usize,
@@ -95,6 +101,9 @@ pub struct Session {
     tokenizer: ByteBpeTokenizer,
     artifact: String,
     backend: String,
+    device: String,
+    device_memory_bytes: u64,
+    precision_policy: String,
     context_capacity: usize,
     load_seconds: f64,
 }
@@ -148,20 +157,26 @@ impl Session {
     pub fn load(
         path: impl AsRef<Path>,
         device: Rc<Device>,
-        settings: Settings,
+        precision: PrecisionPolicy,
         context_capacity: usize,
     ) -> Result<Self, Error> {
         let start = Instant::now();
-        let backend = device.backend().to_string();
+        let backend = device.backend().as_str().to_owned();
+        let device_name = device.info().name.clone();
+        let device_memory_bytes = device.info().memory_bytes;
+        let precision_policy = format!("{precision:?}");
         let model = Model::open(path)?;
         let artifact = model.description().artifact_identity.to_string();
         let tokenizer = ByteBpeTokenizer::new(model.tokenizer_config()?)?;
-        let decoder = model.load(device, settings, context_capacity, 1)?;
+        let decoder = model.load(device, precision, context_capacity, 1)?;
         Ok(Self {
             decoder,
             tokenizer,
             artifact,
             backend,
+            device: device_name,
+            device_memory_bytes,
+            precision_policy,
             context_capacity,
             load_seconds: start.elapsed().as_secs_f64(),
         })
@@ -279,6 +294,12 @@ impl Session {
         Ok(Report {
             artifact: self.artifact.clone(),
             backend: self.backend.clone(),
+            device: self.device.clone(),
+            device_memory_bytes: self.device_memory_bytes,
+            precision_policy: self.precision_policy.clone(),
+            engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+            host_os: std::env::consts::OS.to_owned(),
+            host_arch: std::env::consts::ARCH.to_owned(),
             context_capacity: self.context_capacity,
             fixture_text_sha256,
             payload_tokens: payload.len(),

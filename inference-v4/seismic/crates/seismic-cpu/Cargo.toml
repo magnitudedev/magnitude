@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
-seismic-realization.workspace = true
+sha2 = "=0.11.0"
 cranelift-codegen = "=0.125.4"
 cranelift-frontend = "=0.125.4"
 cranelift-module = "=0.125.4"

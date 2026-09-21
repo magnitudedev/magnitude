@@ -1,16 +1,15 @@
 //! Statements: bindings, state updates, loops, branches, and return paths —
 //! emitted as the section-5 checked statement set.
 
-use super::{elem_rounds, var_atom, Checker, LocalKind, ValueClass};
-use crate::sir::ParamOwnership;
-use crate::sir::{
-    BlockTerminator, CheckedBlock, CheckedExpr, CheckedExprKind, CheckedIndex, CheckedPlace,
-    CheckedRange, CheckedStmt, LoopKind, LoopMutationSummary, Pattern,
+use super::ir::{
+    Block as CheckedBlock, Expr as CheckedExpr, ExprKind as CheckedExprKind, Index as CheckedIndex,
+    LoopKind, Ownership as ParamOwnership, Pattern, Place as CheckedPlace, Stmt as CheckedStmt,
+    Terminator as BlockTerminator,
 };
+use super::{elem_rounds, Checker, LocalKind, ValueClass};
 use crate::span::Span;
-use crate::sym::Sym;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, ExprKind as A};
-use crate::types::{DType, Elem, ExtentExpr, ValueType};
+use crate::types::{DType, Elem, ValueType};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +185,7 @@ impl<'a> Checker<'a> {
                 if matches!(
                     value.kind,
                     CheckedExprKind::Primitive {
-                        id: crate::intrinsics::PrimitiveId::TensorAlloc { .. },
+                        id: crate::intrinsics::PrimitiveId::TensorAlloc,
                         ..
                     }
                 ) {
@@ -204,7 +203,7 @@ impl<'a> Checker<'a> {
                                 name.span,
                                 format!(
                                     "tensor borrow of `{}` overlaps a live {} borrow",
-                                    self.locals[root].name,
+                                    self.locals[root.index()].name,
                                     if exclusive {
                                         "mutable"
                                     } else {
@@ -220,9 +219,9 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if !state && ty.scalar_dtype() == Some(DType::I32) {
-                    match &value.sym {
+                    match value.sym {
                         Some(sym) => {
-                            self.scalar_symbols.insert(id, sym.clone());
+                            self.scalar_symbols.insert(id, sym);
                         }
                         None => {
                             // A scalar argmax over an axis is an index into that axis.
@@ -236,18 +235,18 @@ impl<'a> Checker<'a> {
                                 operands,
                             } = &value.kind
                             {
-                                if let Some(ExtentExpr::Sym(extent)) = operands
+                                if let Some(extent) = operands
                                     .first()
                                     .and_then(|o| o.ty.shaped())
-                                    .and_then(|s| s.axes.get(*axis))
+                                    .and_then(|s| s.axes.get(*axis as usize))
                                 {
-                                    let atom = var_atom(&name.name, id);
-                                    self.facts.set_range(
-                                        atom.clone(),
-                                        Sym::constant(0),
-                                        extent.sub(&Sym::constant(1)),
-                                    );
-                                    self.atoms.insert(id, atom);
+                                    let (_, symbol, _) = self.arena.loop_binder();
+                                    let zero = self.arena.int(0);
+                                    let one = self.arena.int(1);
+                                    let upper = self.arena.int_sub(*extent, one);
+                                    self.facts.set_range(symbol, zero, upper);
+                                    self.symbols.insert(id, symbol);
+                                    self.locals[id.index()].symbol = Some(symbol);
                                 }
                             }
                         }
@@ -288,7 +287,7 @@ impl<'a> Checker<'a> {
                     let component = part.unwrap_or_else(|| {
                         CheckedExpr::new(
                             CheckedExprKind::Primitive {
-                                id: crate::intrinsics::PrimitiveId::TupleGet(i),
+                                id: crate::intrinsics::PrimitiveId::TupleGet(i as u32),
                                 operands: vec![value.clone()],
                             },
                             ty.clone(),
@@ -328,7 +327,7 @@ impl<'a> Checker<'a> {
                     };
                     targets.push((
                         self.state_place(name)?,
-                        self.locals[self.lookup(&name.name)?].ty.clone(),
+                        self.locals[self.lookup(&name.name)?.index()].ty.clone(),
                     ));
                 }
                 let expected = ValueType::Tuple(
@@ -366,20 +365,23 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
+                let mut authorities = Vec::new();
                 for (place, _) in &targets {
-                    self.write_place(place, true, target.span)?;
+                    let root = self.write_place(place, true, target.span)?;
+                    authorities.extend(self.exclusive_write_authority(root, place));
                 }
                 let places = targets.into_iter().map(|(p, _)| p).collect();
                 Some(CheckedStmt::Assign {
                     place: CheckedPlace::Tuple(places),
                     op,
                     value,
+                    authorities,
                 })
             }
             A::Name(name) => {
                 let place = self.state_place(name)?;
                 let ty = match &place {
-                    CheckedPlace::Local { root } => self.locals[*root].ty.clone(),
+                    CheckedPlace::Local(root) => self.locals[root.index()].ty.clone(),
                     _ => unreachable!(),
                 };
                 let value = self.expr(value, Some(&ty))?;
@@ -412,7 +414,13 @@ impl<'a> Checker<'a> {
                     self.moved.insert(source);
                 }
                 self.unassigned.remove(&root);
-                Some(CheckedStmt::Assign { place, op, value })
+                let authorities = self.exclusive_write_authority(root, &place);
+                Some(CheckedStmt::Assign {
+                    place,
+                    op,
+                    value,
+                    authorities,
+                })
             }
             A::Index { .. } => {
                 let (root, indices, selected) = self.place(target)?;
@@ -431,12 +439,12 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 if !self.writable_root(self.root_var_local(binding)) {
-                    self.error(target.span, format!("`{}` is not writable storage; writing requires `let mut` state or a `&mut tensor` parameter", self.locals[binding].name));
+                    self.error(target.span, format!("`{}` is not writable storage; writing requires `let mut` state or a `&mut tensor` parameter", self.locals[binding.index()].name));
                     return None;
                 }
                 // Packed representations are readable and decodable but never
                 // writable; no reachable interpreter or emitter panic remains.
-                if let Some(shaped) = self.locals[binding].ty.shaped() {
+                if let Some(shaped) = self.locals[binding.index()].ty.shaped() {
                     if matches!(shaped.elem, Elem::Repr(_)) {
                         self.error(
                             target.span,
@@ -452,14 +460,14 @@ impl<'a> Checker<'a> {
                     .map(|(_, axes)| axes.clone());
                 if self.unassigned.contains(&root) && pending.is_none() && self.init_loop_depth == 0
                 {
-                    self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through a complete `for … in 0..extent` traversal", self.locals[root].name));
+                    self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through a complete `for … in 0..extent` traversal", self.locals[root.index()].name));
                     return None;
                 }
                 let covers = op == AssignOp::Assign
                     && pending.as_ref().is_some_and(|axes| {
                         indices.len() == axes.len()
                             && indices.iter().zip(axes).all(|(index, axis)| match index {
-                                CheckedIndex::Point(p) => {
+                                CheckedIndex::Point { value: p, .. } => {
                                     matches!(&p.kind, CheckedExprKind::Local(v) if v == axis)
                                 }
                                 _ => false,
@@ -495,15 +503,21 @@ impl<'a> Checker<'a> {
                             self.arith_assign(&ValueType::Scalar(dtype), &value, op)?;
                         }
                         self.write(root, binding, &indices, false, target.span)?;
+                        let checked_place = CheckedPlace::Element {
+                            root,
+                            indices: indices.clone(),
+                        };
+                        let authorities = self.exclusive_write_authority(root, &checked_place);
                         if covers {
                             self.unassigned.remove(&root);
                             self.pending_full_assign
                                 .retain(|(variable, _)| *variable != root);
                         }
                         Some(CheckedStmt::Assign {
-                            place: CheckedPlace::Element { root, indices },
+                            place: checked_place,
                             op,
                             value,
+                            authorities,
                         })
                     }
                     ValueType::Tensor(_) => {
@@ -532,13 +546,19 @@ impl<'a> Checker<'a> {
                             return None;
                         }
                         self.write(root, binding, &indices, false, target.span)?;
+                        let checked_place = CheckedPlace::Element {
+                            root,
+                            indices: indices.clone(),
+                        };
+                        let authorities = self.exclusive_write_authority(root, &checked_place);
                         if covers
                             || indices.iter().all(|i| {
                                 matches!(
                                     i,
                                     CheckedIndex::Range {
                                         start: None,
-                                        end: None
+                                        end: None,
+                                        ..
                                     }
                                 )
                             })
@@ -548,9 +568,10 @@ impl<'a> Checker<'a> {
                                 .retain(|(variable, _)| *variable != root);
                         }
                         Some(CheckedStmt::Assign {
-                            place: CheckedPlace::Element { root, indices },
+                            place: checked_place,
                             op,
                             value,
+                            authorities,
                         })
                     }
                     other => {
@@ -578,9 +599,9 @@ impl<'a> Checker<'a> {
         place: &CheckedPlace,
         whole: bool,
         span: Span,
-    ) -> Option<crate::sir::LocalId> {
+    ) -> Option<super::ir::LocalId> {
         match place {
-            CheckedPlace::Local { root } => self.write(*root, *root, &[], whole, span),
+            CheckedPlace::Local(root) => self.write(*root, *root, &[], whole, span),
             CheckedPlace::Element { root, indices } => {
                 self.write(*root, *root, indices, whole, span)
             }
@@ -605,7 +626,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        match self.kinds[id] {
+        match self.kinds[id.index()] {
             LocalKind::State => {}
             LocalKind::Param(i) if self.sig.params[i].ownership == ParamOwnership::Exclusive => {}
             _ => {
@@ -613,14 +634,14 @@ impl<'a> Checker<'a> {
                 return None;
             }
         }
-        if matches!(self.locals[id].ty, ValueType::CapabilityValue(_)) {
+        if matches!(self.locals[id.index()].ty, ValueType::Opaque { .. }) {
             self.error(
                 name.span,
                 "a capability value is immutable once produced and cannot be reassigned",
             );
             return None;
         }
-        Some(CheckedPlace::Local { root: id })
+        Some(CheckedPlace::Local(id))
     }
 
     fn arith_assign(
@@ -645,10 +666,7 @@ impl<'a> Checker<'a> {
             return Some(());
         }
         if let (ValueType::Tensor(a), Some(v)) = (target, value.ty.scalar_dtype()) {
-            if a.elem
-                .read_dtype()
-                .is_none_or(|t| DType::promote(t, v).is_some())
-            {
+            if DType::promote(a.elem.read_dtype(), v).is_some() {
                 return Some(());
             }
         }
@@ -774,16 +792,33 @@ impl<'a> Checker<'a> {
             (BinaryOp::And, true) | (BinaryOp::Or, false) => return,
             _ => {}
         }
-        let (Some(l), Some(r)) = (&lhs.sym, &rhs.sym) else {
+        let (Some(l), Some(r)) = (lhs.sym, rhs.sym) else {
             return;
         };
-        let one = Sym::constant(1);
+        let one = self.arena.int(1);
         match (op, negate) {
-            (BinaryOp::Lt, false) | (BinaryOp::Ge, true) => self.assume_nonneg(&r.sub(l).sub(&one)),
-            (BinaryOp::Le, false) | (BinaryOp::Gt, true) => self.assume_nonneg(&r.sub(l)),
-            (BinaryOp::Gt, false) | (BinaryOp::Le, true) => self.assume_nonneg(&l.sub(r).sub(&one)),
-            (BinaryOp::Ge, false) | (BinaryOp::Lt, true) => self.assume_nonneg(&l.sub(r)),
-            (BinaryOp::Eq, false) | (BinaryOp::Ne, true) => self.assume_zero(&l.sub(r)),
+            (BinaryOp::Lt, false) | (BinaryOp::Ge, true) => {
+                let d = self.arena.int_sub(r, l);
+                let d = self.arena.int_sub(d, one);
+                self.assume_nonneg(d)
+            }
+            (BinaryOp::Le, false) | (BinaryOp::Gt, true) => {
+                let d = self.arena.int_sub(r, l);
+                self.assume_nonneg(d)
+            }
+            (BinaryOp::Gt, false) | (BinaryOp::Le, true) => {
+                let d = self.arena.int_sub(l, r);
+                let d = self.arena.int_sub(d, one);
+                self.assume_nonneg(d)
+            }
+            (BinaryOp::Ge, false) | (BinaryOp::Lt, true) => {
+                let d = self.arena.int_sub(l, r);
+                self.assume_nonneg(d)
+            }
+            (BinaryOp::Eq, false) | (BinaryOp::Ne, true) => {
+                let d = self.arena.int_sub(l, r);
+                self.assume_zero(d)
+            }
             _ => {}
         }
     }
@@ -801,7 +836,7 @@ impl<'a> Checker<'a> {
             A::Name(name)
                 if self
                     .lookup(&name.name)
-                    .is_some_and(|id| matches!(self.locals[id].ty, ValueType::Range { .. }))
+                    .is_some_and(|id| matches!(self.locals[id.index()].ty, ValueType::Range { .. }))
         );
         if !is_range && !is_range_value {
             self.error(
@@ -819,7 +854,7 @@ impl<'a> Checker<'a> {
             self.error(iter.span, "a range loop source is a `range[N]` value");
             return None;
         };
-        let bound = bound.sym().cloned().unwrap_or_else(|| Sym::constant(1));
+        let bound = bound;
         let (range_exprs, lo_sym, hi_sym) = match &range.kind {
             CheckedExprKind::Primitive {
                 id: crate::intrinsics::PrimitiveId::RangeMake,
@@ -836,7 +871,7 @@ impl<'a> Checker<'a> {
                         operands: vec![range.clone()],
                     },
                     ValueType::Scalar(DType::I32),
-                    Some(Sym::constant(0)),
+                    Some(self.arena.int(0)),
                     iter.span,
                 );
                 let hi = CheckedExpr::new(
@@ -845,17 +880,18 @@ impl<'a> Checker<'a> {
                         operands: vec![range.clone()],
                     },
                     ValueType::Scalar(DType::I32),
-                    Some(bound.clone()),
+                    Some(bound),
                     iter.span,
                 );
-                ((lo, hi), Some(Sym::constant(0)), Some(bound.clone()))
+                ((lo, hi), Some(self.arena.int(0)), Some(bound))
             }
         };
         let (Some(lo_sym), Some(hi_sym)) = (lo_sym, hi_sym) else {
             self.error(iter.span, "range bounds must be symbolic integers");
             return None;
         };
-        let cardinality = match hi_sym.sub(&lo_sym).as_constant() {
+        let width = self.arena.int_sub(hi_sym, lo_sym);
+        let cardinality = match super::prove::constant(&self.arena, width) {
             Some(n) if n <= 0 => LoopCardinality::Zero,
             Some(1) => LoopCardinality::One,
             _ => LoopCardinality::RepeatedOrUnknown,
@@ -866,17 +902,17 @@ impl<'a> Checker<'a> {
         self.push_scope();
         let binder = self.declare(
             &target.name,
-            ValueType::Index {
-                bound: crate::sir::sym_extent(hi_sym.clone()),
-            },
+            ValueType::Index { bound: hi_sym },
             target.span,
             LocalKind::Binder,
             false,
         );
-        let atom = var_atom(&target.name, binder);
-        self.facts
-            .set_range(atom.clone(), lo_sym.clone(), hi_sym.sub(&Sym::constant(1)));
-        self.atoms.insert(binder, atom);
+        let (_, symbol, _) = self.arena.loop_binder();
+        let one = self.arena.int(1);
+        let upper = self.arena.int_sub(hi_sym, one);
+        self.facts.set_range(symbol, lo_sym, upper);
+        self.symbols.insert(binder, symbol);
+        self.locals[binder.index()].symbol = Some(symbol);
         if parallel {
             self.logical_parallel.push((floor, binder));
         }
@@ -891,7 +927,7 @@ impl<'a> Checker<'a> {
         let prior_pending = self.pending_full_assign.clone();
         let mut pending = Vec::new();
         for tensor in self.unassigned.iter().copied() {
-            let ValueType::Tensor(shaped) = &self.locals[tensor].ty else {
+            let ValueType::Tensor(shaped) = &self.locals[tensor.index()].ty else {
                 continue;
             };
             let prefix = prior_pending
@@ -900,10 +936,12 @@ impl<'a> Checker<'a> {
                 .map(|(_, axes)| axes.clone())
                 .unwrap_or_default();
             let axis = prefix.len();
-            let Some(ExtentExpr::Sym(extent)) = shaped.axes.get(axis) else {
+            let Some(extent) = shaped.axes.get(axis) else {
                 continue;
             };
-            if lo_sym.is_zero() && &hi_sym == extent {
+            if super::prove::is_zero(&self.arena, lo_sym)
+                && super::prove::same(&self.arena, hi_sym, *extent)
+            {
                 let mut axes = prefix;
                 axes.push(binder);
                 pending.push((tensor, axes));
@@ -923,18 +961,7 @@ impl<'a> Checker<'a> {
         self.pop_scope();
         self.finish_loop_ownership(moved_before, floor, cardinality, iter.span);
         self.reads = reads_before;
-        let mutation = LoopMutationSummary {
-            carried: {
-                let mut seen = HashSet::new();
-                ctx.writes
-                    .iter()
-                    .copied()
-                    .filter(|l| *l < floor && seen.insert(*l))
-                    .collect()
-            },
-            disjoint_writes: ctx.whole_writes.is_empty(),
-            atomics: ctx.atomics,
-        };
+        let _ = ctx;
         let kind = if parallel {
             LoopKind::Independent
         } else {
@@ -943,12 +970,9 @@ impl<'a> Checker<'a> {
         let checked = CheckedStmt::Loop {
             kind,
             binder,
-            range: CheckedRange {
-                start: range_exprs.0,
-                end: range_exprs.1,
-            },
+            start: range_exprs.0,
+            end: range_exprs.1,
             body: body_block,
-            mutation,
         };
         let loop_block = CheckedBlock {
             statements: vec![checked.clone()],
@@ -956,10 +980,11 @@ impl<'a> Checker<'a> {
         };
         let pending: Vec<_> = self.unassigned.iter().copied().collect();
         for variable in pending {
-            let Some(shaped) = self.locals[variable].ty.shaped().cloned() else {
+            let Some(shaped) = self.locals[variable.index()].ty.shaped().cloned() else {
                 continue;
             };
             if super::writes_cover(
+                &mut self.arena,
                 &self.locals,
                 &loop_block,
                 variable,
@@ -981,7 +1006,7 @@ impl<'a> Checker<'a> {
     /// single-iteration loop carries its exit state forward.
     fn finish_loop_ownership(
         &mut self,
-        moved_before: HashSet<crate::sir::LocalId>,
+        moved_before: HashSet<super::ir::LocalId>,
         captured_floor: usize,
         cardinality: LoopCardinality,
         span: Span,
@@ -992,14 +1017,14 @@ impl<'a> Checker<'a> {
             LoopCardinality::One => {
                 self.moved = moved_after
                     .into_iter()
-                    .filter(|id| *id < captured_floor)
+                    .filter(|id| id.index() < captured_floor)
                     .collect();
             }
             LoopCardinality::RepeatedOrUnknown => {
                 let mut consumed: Vec<_> = moved_after
                     .difference(&moved_before)
                     .copied()
-                    .filter(|id| *id < captured_floor)
+                    .filter(|id| id.index() < captured_floor)
                     .collect();
                 consumed.sort_unstable();
                 for id in consumed {
@@ -1007,7 +1032,7 @@ impl<'a> Checker<'a> {
                         span,
                         format!(
                             "loop may repeat after moving captured owned tensor `{}`; reinitialize it before the iteration ends",
-                            self.locals[id].name
+                            self.locals[id.index()].name
                         ),
                     );
                 }
@@ -1066,9 +1091,6 @@ impl<'a> Checker<'a> {
             exprs.push(e);
         }
         for (e, ty) in exprs.iter().zip(&expected) {
-            if !self.check_escape(e, self.sig.params.len(), "`return`") {
-                return None;
-            }
             if !self.assignable(ty, &e.ty) {
                 self.error(
                     e.span,
@@ -1081,29 +1103,6 @@ impl<'a> Checker<'a> {
             }
         }
         Some(PartialStmt::Terminal(exprs))
-    }
-
-    /// A value leaving its scope cannot borrow storage that dies with the scope.
-    fn check_escape(&mut self, e: &CheckedExpr, floor: usize, boundary: &str) -> bool {
-        let parts: Vec<&CheckedExpr> = match &e.kind {
-            CheckedExprKind::Primitive {
-                id: crate::intrinsics::PrimitiveId::TuplePack,
-                operands,
-            } => operands.iter().collect(),
-            _ => vec![e],
-        };
-        for part in parts {
-            if matches!(self.class_of(part), ValueClass::Borrowed) {
-                if let Some(root) = self.root_var(part) {
-                    if root >= floor && matches!(self.kinds[root], LocalKind::State) {
-                        let name = self.locals[root].name.clone();
-                        self.error(part.span, format!("this view borrows local state `{name}`, which dies with its scope; {boundary} an owned tensor (`to_owned`) instead"));
-                        return false;
-                    }
-                }
-            }
-        }
-        true
     }
 }
 

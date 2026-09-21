@@ -14,6 +14,14 @@ and explicit resource interactions. Production bounds derive from those same
 terms. Unsupported coverage remains unresolved. Invalid inputs and arithmetic
 failures are errors, never infeasibility. Objective arithmetic is checked.
 
+The constraint vocabulary represents Boolean structure exactly: clauses over
+signed literals, reified conjunction and disjunction of Boolean variables, and
+bidirectionally reified linear comparison, in addition to guarded constraints,
+tables, domains, and arithmetic relations. An adapter can therefore export
+disjunction, negation, implication, and reified comparison without
+approximation, and a coverage query (is a predicate unsatisfiable over bounded
+symbols?) is an ordinary feasibility solve.
+
 One search interface accepts an immutable model and incremental limits, with
 selectable exact or neighborhood implementations. Both return the same outcomes:
 `Optimal` and `Infeasible` require proofs about the original model; `Incomplete`

@@ -45,15 +45,21 @@ impl ArenaExpression {
         match self {
             Self::Constant(value) => Ok(*value),
             Self::Variable(variable) => values.get(variable.0).copied().ok_or_else(|| {
-                Error::InvalidModel(format!("arena expression names variable {} absent from the assignment", variable.0))
+                Error::InvalidModel(format!(
+                    "arena expression names variable {} absent from the assignment",
+                    variable.0
+                ))
             }),
-            Self::Sum(terms) => terms.iter().try_fold(0i64, |sum, (coefficient, expression)| {
-                let term = expression.evaluate(values)?.checked_mul(*coefficient).ok_or_else(|| {
-                    Error::Overflow("arena expression product".into())
-                })?;
-                sum.checked_add(term)
-                    .ok_or_else(|| Error::Overflow("arena expression sum".into()))
-            }),
+            Self::Sum(terms) => terms
+                .iter()
+                .try_fold(0i64, |sum, (coefficient, expression)| {
+                    let term = expression
+                        .evaluate(values)?
+                        .checked_mul(*coefficient)
+                        .ok_or_else(|| Error::Overflow("arena expression product".into()))?;
+                    sum.checked_add(term)
+                        .ok_or_else(|| Error::Overflow("arena expression sum".into()))
+                }),
             Self::Product(factors) => factors.iter().try_fold(1i64, |product, factor| {
                 product
                     .checked_mul(factor.evaluate(values)?)
@@ -62,14 +68,18 @@ impl ArenaExpression {
             Self::Quotient(numerator, denominator) => {
                 let denominator = denominator.evaluate(values)?;
                 if denominator <= 0 {
-                    return Err(Error::InvalidModel("arena expression has a nonpositive divisor".into()));
+                    return Err(Error::InvalidModel(
+                        "arena expression has a nonpositive divisor".into(),
+                    ));
                 }
                 Ok(numerator.evaluate(values)?.div_euclid(denominator))
             }
             Self::Remainder(numerator, denominator) => {
                 let denominator = denominator.evaluate(values)?;
                 if denominator <= 0 {
-                    return Err(Error::InvalidModel("arena expression has a nonpositive divisor".into()));
+                    return Err(Error::InvalidModel(
+                        "arena expression has a nonpositive divisor".into(),
+                    ));
                 }
                 Ok(numerator.evaluate(values)?.rem_euclid(denominator))
             }
@@ -79,20 +89,27 @@ impl ArenaExpression {
     fn minimum(&self, domains: &[Domain]) -> Result<i64> {
         match self {
             Self::Constant(value) => Ok(*value),
-            Self::Variable(variable) => domains
-                .get(variable.0)
-                .and_then(Domain::min)
-                .ok_or_else(|| Error::InvalidModel("arena expression has an empty variable domain".into())),
-            Self::Sum(terms) => terms.iter().try_fold(0i64, |sum, (coefficient, expression)| {
-                if *coefficient < 0 {
-                    return Ok(0);
-                }
-                let term = expression.minimum(domains)?.checked_mul(*coefficient).ok_or_else(|| {
-                    Error::Overflow("arena lower-bound product".into())
-                })?;
-                sum.checked_add(term)
-                    .ok_or_else(|| Error::Overflow("arena lower-bound sum".into()))
-            }),
+            Self::Variable(variable) => {
+                domains
+                    .get(variable.0)
+                    .and_then(Domain::min)
+                    .ok_or_else(|| {
+                        Error::InvalidModel("arena expression has an empty variable domain".into())
+                    })
+            }
+            Self::Sum(terms) => terms
+                .iter()
+                .try_fold(0i64, |sum, (coefficient, expression)| {
+                    if *coefficient < 0 {
+                        return Ok(0);
+                    }
+                    let term = expression
+                        .minimum(domains)?
+                        .checked_mul(*coefficient)
+                        .ok_or_else(|| Error::Overflow("arena lower-bound product".into()))?;
+                    sum.checked_add(term)
+                        .ok_or_else(|| Error::Overflow("arena lower-bound sum".into()))
+                }),
             Self::Product(factors) => factors.iter().try_fold(1i64, |product, factor| {
                 product
                     .checked_mul(factor.minimum(domains)?)
@@ -112,9 +129,12 @@ impl ArenaExpression {
                     .map(|(coefficient, expression)| (*coefficient, expression.remap(variables)))
                     .collect(),
             ),
-            Self::Product(factors) => {
-                Self::Product(factors.iter().map(|factor| factor.remap(variables)).collect())
-            }
+            Self::Product(factors) => Self::Product(
+                factors
+                    .iter()
+                    .map(|factor| factor.remap(variables))
+                    .collect(),
+            ),
             Self::Quotient(left, right) => Self::Quotient(
                 Box::new(left.remap(variables)),
                 Box::new(right.remap(variables)),
@@ -189,21 +209,34 @@ impl ArenaPacking {
     }
 
     pub fn validate(&self, domains: &[Domain]) -> Result<()> {
-        let ordinals = self.items.iter().map(|item| item.ordinal).collect::<BTreeSet<_>>();
+        let ordinals = self
+            .items
+            .iter()
+            .map(|item| item.ordinal)
+            .collect::<BTreeSet<_>>();
         if ordinals.len() != self.items.len() {
-            return Err(Error::InvalidModel("arena item ordinals must be unique".into()));
+            return Err(Error::InvalidModel(
+                "arena item ordinals must be unique".into(),
+            ));
         }
         for item in &self.items {
             if item.alignment == 0 {
-                return Err(Error::InvalidModel("arena item alignment must be nonzero".into()));
+                return Err(Error::InvalidModel(
+                    "arena item alignment must be nonzero".into(),
+                ));
             }
             if item.activation.is_empty() {
-                return Err(Error::InvalidModel("arena item activation DNF must contain a clause".into()));
+                return Err(Error::InvalidModel(
+                    "arena item activation DNF must contain a clause".into(),
+                ));
             }
             for clause in &item.activation {
                 for literal in clause {
                     let domain = domains.get(literal.variable.0).ok_or_else(|| {
-                        Error::InvalidModel(format!("arena activation names unknown variable {}", literal.variable.0))
+                        Error::InvalidModel(format!(
+                            "arena activation names unknown variable {}",
+                            literal.variable.0
+                        ))
                     })?;
                     let _ = domain;
                 }
@@ -212,10 +245,14 @@ impl ArenaPacking {
         let mut edges = BTreeSet::new();
         for &(left, right) in &self.interference {
             if left == right || !ordinals.contains(&left) || !ordinals.contains(&right) {
-                return Err(Error::InvalidModel("arena interference edge is invalid".into()));
+                return Err(Error::InvalidModel(
+                    "arena interference edge is invalid".into(),
+                ));
             }
             if !edges.insert((left.min(right), left.max(right))) {
-                return Err(Error::InvalidModel("arena interference edge is duplicated".into()));
+                return Err(Error::InvalidModel(
+                    "arena interference edge is duplicated".into(),
+                ));
             }
         }
         Ok(())
@@ -223,7 +260,11 @@ impl ArenaPacking {
 
     pub fn assess(&self, domains: &[Domain]) -> Result<Assessment> {
         self.validate(domains)?;
-        if self.scope().iter().all(|variable| domains[variable.0].is_singleton()) {
+        if self
+            .scope()
+            .iter()
+            .all(|variable| domains[variable.0].is_singleton())
+        {
             let values = domains
                 .iter()
                 .map(|domain| domain.singleton_value().unwrap_or(0))
@@ -261,7 +302,10 @@ impl ArenaPacking {
             let mut clique = vec![*item];
             for candidate in active.iter().skip(index + 1) {
                 if clique.iter().all(|member| {
-                    edges.contains(&(member.ordinal.min(candidate.ordinal), member.ordinal.max(candidate.ordinal)))
+                    edges.contains(&(
+                        member.ordinal.min(candidate.ordinal),
+                        member.ordinal.max(candidate.ordinal),
+                    ))
                 }) {
                     clique.push(*candidate);
                 }
@@ -297,15 +341,12 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 
 /// Deterministic exact certificate constructor shared by solver evaluation and
 /// plan decoding. `None` is a proof that no placement fits the capacity.
-pub fn arena_offsets(
-    packing: &ArenaPacking,
-    values: &[i64],
-) -> Result<Option<BTreeMap<u32, u64>>> {
+pub fn arena_offsets(packing: &ArenaPacking, values: &[i64]) -> Result<Option<BTreeMap<u32, u64>>> {
     let active = |item: &ArenaItem| {
         item.activation.iter().any(|clause| {
-            clause.iter().all(|literal| {
-                values.get(literal.variable.0).copied() == Some(literal.value)
-            })
+            clause
+                .iter()
+                .all(|literal| values.get(literal.variable.0).copied() == Some(literal.value))
         })
     };
     let edges = packing
@@ -316,9 +357,8 @@ pub fn arena_offsets(
     let mut items = Vec::new();
     for item in &packing.items {
         if active(item) {
-            let bytes = u64::try_from(item.bytes.evaluate(values)?).map_err(|_| {
-                Error::InvalidModel("arena item size is negative".into())
-            })?;
+            let bytes = u64::try_from(item.bytes.evaluate(values)?)
+                .map_err(|_| Error::InvalidModel("arena item size is negative".into()))?;
             if bytes > packing.capacity {
                 return Ok(None);
             }
@@ -334,7 +374,11 @@ pub fn arena_offsets(
             .iter()
             .filter(|(left, right)| *left == item.ordinal || *right == item.ordinal)
             .count();
-        (std::cmp::Reverse(degree), std::cmp::Reverse(item.bytes), item.ordinal)
+        (
+            std::cmp::Reverse(degree),
+            std::cmp::Reverse(item.bytes),
+            item.ordinal,
+        )
     });
 
     fn candidates(
@@ -354,17 +398,23 @@ pub fn arena_offsets(
         let mut candidates = candidates
             .into_iter()
             .filter_map(|offset| align_up(offset, item.alignment))
-            .filter(|offset| offset.checked_add(item.bytes).is_some_and(|end| end <= capacity))
+            .filter(|offset| {
+                offset
+                    .checked_add(item.bytes)
+                    .is_some_and(|end| end <= capacity)
+            })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
         candidates.dedup();
         candidates.retain(|offset| {
             let end = *offset + item.bytes;
-            placed.iter().all(|(&ordinal, &(other_offset, other_bytes))| {
-                !edges.contains(&(ordinal.min(item.ordinal), ordinal.max(item.ordinal)))
-                    || end <= other_offset
-                    || other_offset + other_bytes <= *offset
-            })
+            placed
+                .iter()
+                .all(|(&ordinal, &(other_offset, other_bytes))| {
+                    !edges.contains(&(ordinal.min(item.ordinal), ordinal.max(item.ordinal)))
+                        || end <= other_offset
+                        || other_offset + other_bytes <= *offset
+                })
         });
         candidates
     }

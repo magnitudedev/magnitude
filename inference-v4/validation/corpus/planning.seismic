@@ -1,0 +1,80 @@
+# §20.5 Planning and execution.
+#
+# The source side of the planning structures: domains the compiler must cover exactly,
+# temporaries it must place, per-visit locals, movement primitives, data-dependent checks,
+# and the numerical freedoms a policy admits or refuses.
+
+# Variant guards: the source domain has a boundary the compiler must cover on both sides,
+# and the entry divides by the extent it iterates.
+fn bounded_domain[N](x: &tensor[N] f32, y: &mut tensor[N] f32) where N >= 1:
+    parallel for i in 0..N:
+        y[i] = x[i] / f32(N)
+
+# Exact coverage: a domain stated by divisibility, so the compiler covers the whole set of
+# admitted extents and rejects the rest at invocation.
+fn divisible_domain[N](x: &tensor[N] f32, y: &mut tensor[N] f32) where N % 8 == 0:
+    parallel for i in 0..N:
+        y[i] = x[i] + f32(i)
+
+# Global arena reuse: sequential temporaries whose lifetimes do not overlap.
+fn sequential_temporaries[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let first = to_owned(x * 2.0)
+    let second = to_owned(first + 1.0)
+    let third = to_owned(second * second)
+    return third
+
+# Workgroup and participant local allocations: an owned local inside an independent loop is
+# private to its visit.
+fn visit_local[M, W](x: &tensor[M, W] f32, y: &mut tensor[M] f32):
+    parallel for r in 0..M:
+        let mut local = tensor[W] f32
+        for j in 0..W:
+            local[j] = x[r, j] * x[r, j]
+        y[r] = reduce(local, 0, sum)
+
+# Copy, fill, and scalar move: the primitive movements and scalar results of a call.
+fn copy_fill_scalar[N](x: &tensor[N] f32, value: f32) -> (tensor[N] f32, tensor[N] f32, f32, i32):
+    let copied = to_owned(x)
+    let mut filled = ones_like(x)
+    for i in 0..N:
+        filled[i] = filled[i] * value
+    let winner = reduce(x, 0, argmax)
+    return copied, filled, value * 2.0, winner
+
+# Range parameters: a caller-supplied `range[N]` drives an ordered loop over part of the
+# output; the rest keeps the caller's contents.
+fn range_window[N](x: &tensor[N] f32, y: &mut tensor[N] f32, span: range[N]):
+    for i in span:
+        y[i] = x[i] * 2.0
+
+# Data-dependent checks: an index read from a tensor is checked at execution; a failed
+# check is a typed execution error, never undefined behavior.
+fn gather_rows[N, E, W](table: &tensor[E, W] f32, routes: &tensor[N] i32, y: &mut tensor[N, W] f32):
+    parallel for i in 0..N:
+        y[i] = table[routes[i]]
+
+# Data-dependent range: bounds read from a tensor select a history window whose extent is a
+# runtime value; an empty window contributes nothing.
+fn windowed_sum[T, W](history: &tensor[T, W] f32, bounds: &tensor[2] i32, y: &mut tensor[W] f32):
+    let lo = bounds[0]
+    let hi = bounds[1]
+    let window = history[lo:hi]
+    parallel for j in 0..W:
+        y[j] = reduce(window[:, j], 0, sum)
+
+# Target resource boundary points: a per-visit local whose size follows a shape symbol; the
+# harness invokes it around a target's local-memory boundaries.
+fn wide_local[M, W](x: &tensor[M, W] f32, y: &mut tensor[M, W] f32):
+    parallel for r in 0..M:
+        let mut local = tensor[W] f32
+        for j in 0..W:
+            local[j] = exp(x[r, j])
+        let total = reduce(local, 0, sum)
+        for j in 0..W:
+            y[r, j] = local[j] / total
+
+# Numerical evidence: the only freedom is the reassociating body of `row_total`; an exact
+# policy must plan the reference body, a bounded policy may plan either.
+fn evidence_sum[M, N](x: &tensor[M, N] f32, y: &mut tensor[M] f32):
+    parallel for r in 0..M:
+        y[r] = row_total(x[r])

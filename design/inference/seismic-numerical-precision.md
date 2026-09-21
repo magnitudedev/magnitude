@@ -14,8 +14,17 @@ not a source-level permission, a backend-wide fast-math mode, or a performance p
 ## Authority
 
 The first applicable portable function body defines reference operation order, casts,
-accumulation, rounding, and exceptional-value behavior. Other portable bodies and target
-implementations are alternatives; their presence asserts availability, not equivalence.
+accumulation, rounding, and exceptional-value behavior. Unary reference transcendental operations
+are defined by the versioned recipe in `seismic-lang`: one ordered graph of ordinary f32/u32/i32
+primitive steps with rounding after every floating step. The semantic interpreter evaluates that
+graph and kernel construction instantiates that same graph; neither owns another formula. “Exact”
+means zero deviation from this language-defined recipe. It does not claim the recipe is the
+correctly-rounded mathematical real function. `exp_fast` is explicitly approximate and is never
+silently treated as reference `exp`. FMA, min, and max retain their direct multi-operand primitive
+semantics rather than entering the unary recipe.
+
+Other portable bodies and target implementations are alternatives; their presence asserts
+availability, not equivalence.
 
 The compilation caller owns acceptable output deviation. A policy is part of specialization
 identity and is either exact, explicitly bounded, or unconstrained. Unconstrained selection is for
@@ -34,15 +43,19 @@ Every selected execution has one numerical assessment: exact, proven, qualified,
   an identified corpus and native numerical environment.
 - Unknown is never interpreted as zero and is selectable only by an unconstrained policy.
 
-Numerical admissibility is a hard solver constraint. Performance is optimized only within the
-admissible family. Evidence is whole-witness evidence and does not transfer to a different program,
-entry, specialization, witness, backend environment, corpus, or compiler method.
+Numerical admissibility is a hard solver constraint encoded before solving: a predicate over
+decisions and invocation symbols that is true exactly when the derived transfer satisfies the
+policy analytically or matching evidence exists. It is never checked after selection. Performance
+is optimized only within the admissible family. Evidence is keyed by exact implementation identity
+and decision assignment, numerical-environment identity, semantic domain predicate, policy, corpus, and
+qualification version; it does not transfer across any of these.
 
-Transfers compose through nested schedules, repeated loops, reductions, calls, and dtype
-conversions; the composed assessment of the selected assignment is checked against the caller's
-policy as one constraint. When no admissible assignment exists, the complete planning model is
-reported infeasible; the compiler does not infer a cause from a rejected probe assignment. Search
-effort limits optimization only and cannot turn a feasible program into a no-incumbent failure.
+Every implementation's transfer is derived from its actual operations, order, data types,
+reductions, approximations, and intrinsic semantics; it is never a manually asserted label.
+Transfers compose through spliced calls, repeats, reductions, and dtype conversions with one
+model, so local and accumulated error share it. When no admissible assignment exists over some
+part of the target domain, preparation fails with `NumericalPolicyInfeasible`. Search effort
+limits optimization only and cannot turn a feasible program into a no-incumbent failure.
 
 A qualification retains the exact bounded policy used for elementwise checking. It may satisfy a
 later policy only when every tolerance and special-value requirement is at least as permissive and
@@ -60,19 +73,30 @@ The same comparison semantics govern qualification, backend sweeps, and engine v
 
 ## Backend guarantees
 
-Global fast-math modes remain disabled. Reassociation, approximate transcendentals, contraction,
-storage and accumulation dtype, publication rounding, and backend intrinsics are distinct
-numerical effects. Realization must reproduce the choices assessed before selection; it cannot
-introduce an unrecorded numerical freedom.
+Fast math is off unless a concrete implementation operation is admitted by the policy through
+its recorded transfer. Reassociation, approximate transcendentals, contraction, storage and
+accumulation dtype, publication rounding, flush-to-zero, and backend intrinsics are distinct
+numerical effects recorded during kernel construction. Native compilation reproduces exactly the
+choices assessed before selection; it cannot enable a relaxation the transfer does not record.
+Each ordinary operation produced by a reference recipe is a separate rounding boundary. CPU
+workers enter a saved/restored strict IEEE floating environment (nearest-even and gradual
+underflow), Cranelift receives distinct strict operations, CUDA emits rounding-qualified PTX
+without `.ftz`, and Metal uses precise non-fast-math operations. A backend unable to preserve those
+boundaries cannot advertise the reference path; contraction, reassociation, FTZ/DAZ, or native
+approximate math must be represented by a different implementation and numerical transfer.
 
 ## Runtime and identity
 
-Runtime selection accepts an immutable qualification catalog and ignores nonmatching records.
-Every accepted witness is structurally audited against the current family and backend before it is
-realized. The retained selection includes the policy assessment and qualification identity.
+Preparation accepts an immutable evidence catalog; a record participates only through the
+admissibility predicate of the implementation it keys. Every executable variant carries its
+numerical assessment (exact, proven, qualified with evidence keys, or unknown) and the policy
+identity it was prepared under. Runtime never re-evaluates numerical legality.
 
-Changing the policy or available evidence invalidates reuse. Device numerical identity is separate
-from performance-estimate identity.
+Changing the policy or available evidence changes the preparation identity.
+`NumericalEnvironmentIdentity` is distinct from compatibility and per-open
+execution-profile identities. Reprofiling unchanged numerical behavior cannot
+invalidate evidence, while any change to emitted numerical mode or the native
+kernel's numerical contract does.
 
 ## Intentional limits
 

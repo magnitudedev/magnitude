@@ -6,8 +6,8 @@
 //! cumulative factor, so decomposition sees the complete coupling relation.
 //! A finite horizon belongs to the supplied model; no guessed horizon is added.
 
-pub mod repetition;
 mod arena;
+pub mod repetition;
 mod resources;
 
 pub use arena::{arena_offsets, ArenaExpression, ArenaItem, ArenaLiteral, ArenaPacking};

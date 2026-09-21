@@ -8,11 +8,11 @@
 use magnitude_engine::{
     generation::constraints::CacheLimits,
     models::qwen35::loading::Model,
-    telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
     service::policy::Limits,
     serving::{startup::ExecutionLimits, Config},
+    telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
-use seismic_runtime::{plan::Settings, Device};
+use seismic::{BackendName, Device, DeviceCatalog, PrecisionPolicy};
 use std::{path::PathBuf, time::Duration};
 
 fn value_of(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -21,13 +21,10 @@ fn value_of(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<Strin
 }
 
 fn backend_device(name: &str) -> Result<Device, String> {
-    let device = match name {
-        "metal" => Device::metal(),
-        "cuda" => Device::cuda(),
-        "cpu" => Device::cpu(),
-        other => return Err(format!("unknown backend: {other}")),
-    };
-    device.map_err(|e| format!("opening {name} device: {e}"))
+    let backend = BackendName::parse(name).ok_or_else(|| format!("unknown backend: {name}"))?;
+    DeviceCatalog::discover()
+        .and_then(|catalog| catalog.open_backend(backend))
+        .map_err(|e| format!("opening {name} device: {e}"))
 }
 
 fn default_backend() -> &'static str {
@@ -67,20 +64,31 @@ fn parse_options() -> Result<Options, String> {
         match flag.as_str() {
             "--model" => model = Some(PathBuf::from(value_of(&flag, &mut args)?)),
             "--host" => host = value_of(&flag, &mut args)?,
-            "--port" => port = value_of(&flag, &mut args)?.parse().map_err(|e| format!("{e}"))?,
+            "--port" => {
+                port = value_of(&flag, &mut args)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
+            }
             "--backend" => backend = value_of(&flag, &mut args)?,
             "--context-tokens" => {
-                context_tokens =
-                    value_of(&flag, &mut args)?.parse().map_err(|e| format!("{e}"))?
+                context_tokens = value_of(&flag, &mut args)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
             }
             "--memory-gib" => {
-                memory_gib = value_of(&flag, &mut args)?.parse().map_err(|e| format!("{e}"))?
+                memory_gib = value_of(&flag, &mut args)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
             }
             "--max-active" => {
-                max_active = value_of(&flag, &mut args)?.parse().map_err(|e| format!("{e}"))?
+                max_active = value_of(&flag, &mut args)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
             }
             "--output-capacity" => {
-                output_capacity = value_of(&flag, &mut args)?.parse().map_err(|e| format!("{e}"))?
+                output_capacity = value_of(&flag, &mut args)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
             }
             "--served-model" => served_model = Some(value_of(&flag, &mut args)?),
             "--telemetry" => telemetry_endpoint = Some(value_of(&flag, &mut args)?),
@@ -126,7 +134,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let options = parse_options()?;
-    let telemetry = Telemetry::open(&options.telemetry_endpoint);
+    let _telemetry = Telemetry::open(&options.telemetry_endpoint);
     eprintln!(
         "magnitude-engine: telemetry -> {}",
         options.telemetry_endpoint
@@ -174,18 +182,18 @@ fn run() -> Result<(), String> {
             decode_share: 0.5,
             locality_seconds: 1.0,
         },
-        grammar_cache: CacheLimits { entries: 16, bytes: 64 << 20 },
+        grammar_cache: CacheLimits {
+            entries: 16,
+            bytes: 64 << 20,
+        },
     };
     let backend = options.backend.clone();
-    let execution =
-        move || -> Result<(Device, Settings), String> { Ok((backend_device(&backend)?, Settings::default())) };
+    let execution = move || -> Result<(Device, PrecisionPolicy), String> {
+        Ok((backend_device(&backend)?, PrecisionPolicy::default()))
+    };
     let composed = std::time::Instant::now();
-    let server = magnitude_engine::serving::startup::qwen(
-        &options.model,
-        config,
-        limits,
-        execution,
-    )?;
+    let server =
+        magnitude_engine::serving::startup::qwen(&options.model, config, limits, execution)?;
     let compile_seconds = composed.elapsed().as_secs_f64();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

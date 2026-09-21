@@ -44,8 +44,11 @@ fn routed_input[M, E, K, H, F](x: &tensor[M, H] A, routes: &tensor[M, K] i32,
             parallel for cols in 0..F:
                 let xt = x[row:row + 1]
                 let expert = routes[row, choice]
-                let mut acc = to_owned(zeros_like(out[row, choice:choice + 1, cols:cols + 1], dtype=f32))
-                acc = matmul(to_owned(xt), to_owned(weight[expert, cols:cols + 1]), acc)
+                let acc = matmul(
+                    xt,
+                    weight[expert, cols:cols + 1],
+                    zeros_like(out[row, choice:choice + 1, cols:cols + 1], dtype=f32),
+                )
                 out[row, choice, cols] = acc[0, 0]
 
 
@@ -64,8 +67,11 @@ fn routed_output[M, E, K, H, F](x: &tensor[M, K, F] A, routes: &tensor[M, K] i32
         parallel for choice in 0..K:
             parallel for cols in 0..H:
                 let expert = routes[row, choice]
-                let mut acc = to_owned(zeros_like(out[row, choice:choice + 1, cols:cols + 1], dtype=f32))
-                acc = matmul(to_owned(x[row, choice:choice + 1]), to_owned(weight[expert, cols:cols + 1]), acc)
+                let acc = matmul(
+                    x[row, choice:choice + 1],
+                    weight[expert, cols:cols + 1],
+                    zeros_like(out[row, choice:choice + 1, cols:cols + 1], dtype=f32),
+                )
                 out[row, choice, cols] = acc[0, 0]
 
 
@@ -97,15 +103,14 @@ fn qwen_routed_suffix[M, H, E, K, F, S](residual: &tensor[M, H] f32, norm: &tens
     expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
     expert_down: &tensor[E, H, F] EDW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
-    shared_down: &tensor[H, S] SDW, eps: f32, normalize: i32)
+    shared_down: &tensor[H, S] SDW, routes: &mut tensor[M, K] i32,
+    scores: &mut tensor[M, K] f32, eps: f32, normalize: i32)
     -> (tensor[M, H] A, tensor[M, E] f32, tensor[M, K] i32, tensor[M, K] f32,
         tensor[M, K, F] A, tensor[M, K, F] A, tensor[M, K, F] A,
         tensor[M, K, H] A, tensor[M, S] A, tensor[M, S] A, tensor[M, S] A,
         tensor[M, S] A, tensor[M, H] A, tensor[M, 1] A, tensor[M, H] f32):
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
-    let mut routes = tensor[M, K] i32
-    let mut scores = tensor[M, K] f32
     let mut gate = tensor[M, K, F] A
     let mut up = tensor[M, K, F] A
     let mut product = tensor[M, K, F] A

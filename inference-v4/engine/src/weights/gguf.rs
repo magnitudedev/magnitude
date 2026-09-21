@@ -394,7 +394,7 @@ impl GgufArtifact {
         descriptor: &super::descriptor::WeightDescriptor,
     ) -> Result<super::descriptor::Stored, Error> {
         use super::descriptor::{Stored, StoredTensor};
-        use seismic_lang::types::DType;
+        use seismic::DType;
         let tensor = self
             .directory
             .tensor(&descriptor.name)

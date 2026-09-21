@@ -10,8 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 seismic-lang.workspace = true
-seismic-metal.workspace = true
-seismic-cpu.workspace = true
-seismic-cuda.workspace = true
-seismic-compiler.workspace = true
-seismic-realization.workspace = true
+seismic-std.workspace = true

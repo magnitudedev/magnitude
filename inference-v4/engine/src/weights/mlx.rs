@@ -5,7 +5,7 @@ use super::{
     source::FileSource,
     Error,
 };
-use seismic_lang::types::DType;
+use seismic::DType;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 

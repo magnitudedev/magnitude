@@ -1,13 +1,16 @@
 //! Artifact interpretation is device-free. Loading imports the interpreted weight
 //! roles through ordinary automatic selection on the caller's execution owner.
 use super::{decoder::Decoder, gguf, mlx, Description};
-use crate::preparation::Settings;
-use crate::weights::{
-    gguf::GgufArtifact,
-    mlx::MlxArtifact,
-    residency::{Importer, ResidentWeight},
+use crate::{
+    weights::{
+        gguf::GgufArtifact,
+        mlx::MlxArtifact,
+        residency::{Importer, ResidentWeight},
+        Error as WeightError,
+    },
+    Error,
 };
-use seismic_runtime::Device;
+use seismic::{Device, PrecisionPolicy};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -100,38 +103,41 @@ impl Model {
     pub fn load_vision(
         &self,
         device: Rc<Device>,
-        settings: Settings,
-    ) -> Result<super::vision_runtime::Encoder, String> {
-        let description = self.vision_description()?;
+        precision: PrecisionPolicy,
+    ) -> Result<super::vision_runtime::Encoder, Error> {
+        let description = self.vision_description().map_err(Error::from)?;
         let Artifact::Mlx { artifact, .. } = &self.artifact else {
-            return Err("GGUF Qwen vision artifacts are not supported".into());
+            return Err(Error::Request(
+                "GGUF Qwen vision artifacts are not supported".into(),
+            ));
         };
-        let mut importer =
-            Importer::new(device.clone(), settings.clone()).map_err(|e| e.to_string())?;
-        super::vision_runtime::Encoder::load(device, &description, settings, |descriptor, dtype| {
-            let stored = artifact.stored(descriptor).map_err(|e| e.to_string())?;
-            importer
-                .import(descriptor, &stored, dtype)
-                .map_err(|e| format!("import {}: {e}", descriptor.name))
-        })
+        let mut importer = Importer::new(device.clone(), precision.clone());
+        super::vision_runtime::Encoder::load(
+            device,
+            &description,
+            precision,
+            |descriptor, dtype| {
+                let stored = artifact.stored(descriptor).map_err(weight_error)?;
+                importer
+                    .import(descriptor, &stored, dtype)
+                    .map_err(weight_error)
+            },
+        )
     }
     pub fn load(
         self,
         device: Rc<Device>,
-        settings: Settings,
+        precision: PrecisionPolicy,
         context: usize,
         sequences: usize,
-    ) -> Result<Decoder, String> {
-        let mut importer =
-            Importer::new(device.clone(), settings.clone()).map_err(|e| e.to_string())?;
+    ) -> Result<Decoder, Error> {
+        let mut importer = Importer::new(device.clone(), precision.clone());
         let mut resident: HashMap<(String, String, String), ResidentWeight> = HashMap::new();
-        let workload = super::decoder::DecoderWorkload {
+        let workload = super::decoder::DecoderCapacity {
             context_capacity: context,
             max_sequences: sequences,
-            max_ranges: context,
-            readout_capacity: context,
         };
-        let result = Decoder::compile(
+        Decoder::compile(
             device,
             &self.description,
             |descriptor, dtype| {
@@ -147,17 +153,23 @@ impl Model {
                     Artifact::Mlx { artifact, .. } => artifact.stored(descriptor),
                     Artifact::Gguf { artifact, .. } => artifact.stored(descriptor),
                 }
-                .map_err(|e| e.to_string())?;
+                .map_err(weight_error)?;
                 let weight = importer
                     .import(descriptor, &stored, dtype)
-                    .map_err(|e| format!("import {}: {e}", descriptor.name))?;
+                    .map_err(weight_error)?;
                 resident.insert(key, weight.clone());
                 Ok(weight)
             },
-            settings,
+            precision,
             workload,
         )
-        .map_err(|e| e.to_string());
-        result
+    }
+}
+
+fn weight_error(error: WeightError) -> Error {
+    match error {
+        WeightError::Seismic(error) => error,
+        WeightError::Io(error) => Error::Request(format!("weight source: {error}")),
+        WeightError::Invalid(message) => Error::Request(message),
     }
 }

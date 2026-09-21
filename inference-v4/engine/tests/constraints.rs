@@ -380,8 +380,7 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
         models::sequence::OwnedSequence,
         state::{ComponentSpec, StateStore},
     };
-    use seismic_lang::types::DType;
-    use seismic_runtime::Device;
+    use seismic::{BackendName, DType, DeviceCatalog};
     use std::rc::Rc;
     fn advance(g: &mut Generation, sequence: &OwnedSequence, token: u32) {
         let Readiness::Ready(proposal) = g.ready(8).unwrap() else {
@@ -391,8 +390,9 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
             .prepare_completed(proposal.position(), proposal.tokens().len(), |state| {
                 let mut next = state.begin(proposal.tokens().len())?;
                 next.execute(|b| {
-                    b.following[0]
-                        .write(&(token as f32).to_le_bytes())
+                    let mut value = b.following[0].clone();
+                    value
+                        .write_from_host(&(token as f32).to_le_bytes())
                         .map_err(Into::into)
                 })?;
                 next.commit()?;
@@ -404,9 +404,8 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
     }
     fn value(sequence: &OwnedSequence) -> f32 {
         let state = sequence.checkpoint().unwrap().fork();
-        let mut bytes = [0; 4];
-        state.values()[0].read(&mut bytes).unwrap();
-        f32::from_le_bytes(bytes)
+        let bytes = state.values()[0].read_to_host().unwrap();
+        f32::from_le_bytes(bytes.try_into().unwrap())
     }
     let tokenizer = tokenizer();
     let grammar = vocabulary(tokenizer.clone())
@@ -429,10 +428,18 @@ fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_togethe
     )
     .unwrap();
     let store = StateStore::new(
-        Rc::new(Device::metal().unwrap()),
+        Rc::new(
+            DeviceCatalog::discover()
+                .unwrap()
+                .open_backend(BackendName::Metal)
+                .unwrap(),
+        ),
         16,
         64,
-        vec![4],
+        vec![ComponentSpec {
+            shape: vec![4],
+            dtype: DType::F32,
+        }],
         vec![ComponentSpec {
             shape: vec![1],
             dtype: DType::F32,

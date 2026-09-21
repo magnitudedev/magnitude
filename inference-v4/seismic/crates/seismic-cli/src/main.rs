@@ -1,342 +1,140 @@
-//! `seismic` command-line tool over the structured pipeline:
-//! sources -> semantic program -> logical program -> resolved physical program -> native artifact.
+//! Source-facing Seismic tooling.
+//!
+//! This binary deliberately stops at the checked-module boundary. Target
+//! preparation and execution belong to generated Rust bindings plus the
+//! public `seismic` API; exposing plan-space, solver, frozen-plan, or native
+//! schedule internals here would recreate the public escape hatch W9 removes.
 
-mod bindings;
-mod select;
-
-use seismic_lang::logical::specialization::{ShapeBinding, SpecializationDomain};
-use seismic_lang::precision::{EvidenceRequirement, InputRange, Limit, PrecisionPolicy, Tolerance};
-use seismic_lang::program::{collect_files, compile};
-use seismic_lang::sir::Program;
-use seismic_lang::syntax;
-use seismic_lang::types::{DType, Elem};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use seismic_lang::checked::{check_source, CheckedModule, SourceFile, SourceSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  seismic check <file|dir>...
-  seismic print <file|dir>...
-  seismic select <file|dir>... --fn <name> --shape K=V,... [--element NAME=TYPE,...] [--precision exact|bounded|unconstrained] [--atol V] [--rtol V] [--relative-floor V] [--ulps N] [--output-tolerance NAME=ATOL:RTOL:FLOOR:ULPS|-] [--input-range NAME=MIN..MAX] [--allow-special-changes nan,infinity,signed-zero,subnormal] [--evidence proven|qualified] [--target cpu|cuda|metal]
-  seismic emit <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
-  seismic analyze-search <file|dir>... --fn <name> --shape K=V,... [precision options] [--target cpu|cuda|metal]
-  seismic bindings <file|dir>... --fn <name> [--element NAME=TYPE,...]
-`select`, `emit` and `analyze-search` target Metal unless `--target` is given. `select` prints
-the resolved physical assignment and exact resources. `emit` prints MSL on Metal, PTX on CUDA,
-or the resolved terminal module and physical report on CPU. Implementation choices are compiler-owned.";
+  seismic check [--no-std] <file|dir>...
+  seismic entries [--no-std] <file|dir>...
 
-/// The default target of `select`, `emit` and `analyze-search`.
-pub const TARGET: &str = "metal";
-/// Targets with a backend on the structured pipeline. A ported backend adds its name here
-/// and one arm in `select::Target`.
-pub const TARGETS: &[&str] = &["metal", "cpu", "cuda"];
-
-pub struct Options {
-    pub paths: Vec<PathBuf>,
-    /// The backend `select`, `emit` and `analyze-search` run on.
-    pub target: String,
-    pub function: Option<String>,
-    pub shapes: BTreeMap<String, i64>,
-    pub elems: BTreeMap<String, Elem>,
-    pub precision: PrecisionPolicy,
-}
-
-impl Options {
-    pub fn entry(&self) -> Result<&str, String> {
-        self.function
-            .as_deref()
-            .ok_or_else(|| "--fn is required".to_string())
-    }
-
-    /// The complete specialization domain of one inspection request.
-    pub fn domain(&self, program: &Program) -> Result<SpecializationDomain, String> {
-        SpecializationDomain::new(
-            program,
-            self.entry()?,
-            self.shapes
-                .iter()
-                .map(|(name, value)| {
-                    (*value)
-                        .try_into()
-                        .map(|value| (name.clone(), ShapeBinding::Exact(value)))
-                        .map_err(|_| format!("shape `{name}` must be a valid extent"))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?,
-            self.elems.clone(),
-        )
-        .map_err(|error| error.to_string())
-    }
-}
+`check` parses and semantically checks one closed module.
+`entries` prints the generated-binding surface of that checked module.";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let rest = args.get(1..).unwrap_or(&[]);
-    let result = match args.first().map(String::as_str) {
-        Some("check") => check(rest),
-        Some("print") => print_files(rest),
-        Some("select") => select::select(rest),
-        Some("emit") => select::emit(rest),
-        Some("analyze-search") => select::analyze_search(rest),
-        Some("bindings") => bindings::bindings(rest),
-        Some("help") | Some("--help") | Some("-h") => {
-            println!("{USAGE}");
+    let mut arguments = std::env::args().skip(1);
+    let Some(command) = arguments.next() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    if matches!(command.as_str(), "help" | "--help" | "-h") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut include_std = true;
+    let mut paths = Vec::new();
+    for argument in arguments {
+        if argument == "--no-std" {
+            include_std = false;
+        } else if argument.starts_with('-') {
+            eprintln!("unknown option `{argument}`\n{USAGE}");
+            return ExitCode::from(2);
+        } else {
+            paths.push(PathBuf::from(argument));
+        }
+    }
+
+    let result = load(paths, include_std).and_then(|module| match command.as_str() {
+        "check" => {
+            println!("checked {} exported entries", module.entries().len());
             Ok(())
         }
-        Some(other) => Err(format!("unknown command `{other}`\n{USAGE}")),
-        None => Err(USAGE.to_string()),
-    };
+        "entries" => {
+            print_entries(&module);
+            Ok(())
+        }
+        other => Err(format!("unknown command `{other}`\n{USAGE}")),
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e}");
+        Err(error) => {
+            eprintln!("{error}");
             ExitCode::from(1)
         }
     }
 }
 
-/// Parse `args`, accepting only the flags in `allowed`.
-pub fn options(args: &[String], allowed: &[&str]) -> Result<Options, String> {
-    fn bounded(policy: &mut PrecisionPolicy) -> &mut Tolerance {
-        if !matches!(policy, PrecisionPolicy::Bounded { .. }) {
-            *policy = PrecisionPolicy::bounded(Tolerance::EXACT);
-        }
-        let PrecisionPolicy::Bounded { default, .. } = policy else {
-            unreachable!()
-        };
-        default
+fn load(paths: Vec<PathBuf>, include_std: bool) -> Result<CheckedModule, String> {
+    if paths.is_empty() && !include_std {
+        return Err("no .seismic source was provided".to_owned());
     }
-    let mut o = Options {
-        paths: Vec::new(),
-        target: TARGET.into(),
-        function: None,
-        shapes: BTreeMap::new(),
-        elems: BTreeMap::new(),
-        precision: PrecisionPolicy::default(),
+    let mut files = Vec::new();
+    for path in paths {
+        collect(&path, &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+
+    let mut sources = if include_std {
+        seismic_std::sources()
+    } else {
+        SourceSet::default()
     };
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        if !arg.starts_with("--") {
-            o.paths.push(PathBuf::from(arg));
-            continue;
-        }
-        if !allowed.contains(&arg.as_str()) {
-            return Err(format!(
-                "unsupported option `{arg}`; implementation choices are compiler-owned"
-            ));
-        }
-        let value = rest
-            .next()
-            .ok_or_else(|| format!("{arg} requires a value"))?;
-        match arg.as_str() {
-            "--target" => {
-                if !TARGETS.contains(&value.as_str()) {
-                    return Err(format!(
-                        "unknown target `{value}`; expected one of {}",
-                        TARGETS.join(", ")
-                    ));
-                }
-                o.target = value.clone();
-            }
-            "--fn" => o.function = Some(value.clone()),
-            "--shape" => {
-                for binding in value.split(',') {
-                    let (name, extent) = binding
-                        .split_once('=')
-                        .ok_or_else(|| format!("bad shape binding `{binding}`; expected K=V"))?;
-                    let extent: i64 = extent
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("bad shape value `{extent}`"))?;
-                    if extent < 0 {
-                        return Err(format!("shape `{name}` must be nonnegative"));
-                    }
-                    if o.shapes.insert(name.trim().to_string(), extent).is_some() {
-                        return Err(format!("duplicate shape binding {name}"));
-                    }
-                }
-            }
-            "--element" => {
-                for binding in value.split(',') {
-                    let (name, element) = binding.split_once('=').ok_or_else(|| {
-                        format!("bad element binding `{binding}`; expected NAME=TYPE")
-                    })?;
-                    let element = element.trim();
-                    let element = if let Some(dtype) = DType::from_name(element) {
-                        Elem::Dtype(dtype)
-                    } else if seismic_lang::repr::lookup(element).is_some() {
-                        Elem::Repr(element.into())
-                    } else {
-                        return Err(format!("unknown concrete element type {element}"));
-                    };
-                    if o.elems.insert(name.trim().to_string(), element).is_some() {
-                        return Err(format!("duplicate element binding {name}"));
-                    }
-                }
-            }
-            "--precision" => {
-                o.precision = match value.as_str() {
-                    "exact" => PrecisionPolicy::Exact,
-                    "bounded"
-                        if matches!(o.precision, PrecisionPolicy::Bounded { .. }) =>
-                    {
-                        o.precision
-                    }
-                    "bounded" => PrecisionPolicy::bounded(Tolerance::EXACT),
-                    "unconstrained" => PrecisionPolicy::Unconstrained,
-                    other => {
-                        return Err(format!(
-                            "bad --precision `{other}`; expected exact, bounded or unconstrained"
-                        ))
-                    }
-                }
-            }
-            "--atol" | "--rtol" | "--relative-floor" => {
-                let parsed: f64 = value
-                    .parse()
-                    .map_err(|_| format!("bad numerical limit `{value}`"))?;
-                let limit = Limit::new(parsed)?;
-                let tolerance = bounded(&mut o.precision);
-                match arg.as_str() {
-                    "--atol" => tolerance.absolute = limit,
-                    "--rtol" => tolerance.relative = limit,
-                    _ => tolerance.relative_floor = limit,
-                }
-            }
-            "--ulps" => {
-                bounded(&mut o.precision).ulps = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("bad ULP limit `{value}`"))?,
-                );
-            }
-            "--evidence" => {
-                let requirement = match value.as_str() {
-                    "proven" => EvidenceRequirement::Proven,
-                    "qualified" => EvidenceRequirement::Qualified,
-                    other => {
-                        return Err(format!(
-                            "bad --evidence `{other}`; expected proven or qualified"
-                        ))
-                    }
-                };
-                bounded(&mut o.precision);
-                let PrecisionPolicy::Bounded { evidence, .. } = &mut o.precision else {
-                    unreachable!()
-                };
-                *evidence = requirement;
-            }
-            "--output-tolerance" => {
-                let (name, limits) = value.split_once('=').ok_or_else(|| {
-                    format!("bad output tolerance `{value}`; expected NAME=ATOL:RTOL:FLOOR:ULPS|-")
-                })?;
-                let fields: Vec<_> = limits.split(':').collect();
-                if fields.len() != 4 || name.trim().is_empty() {
-                    return Err(format!(
-                        "bad output tolerance `{value}`; expected NAME=ATOL:RTOL:FLOOR:ULPS|-"
-                    ));
-                }
-                let parse = |text: &str| -> Result<Limit, String> {
-                    Limit::new(
-                        text.parse()
-                            .map_err(|_| format!("bad numerical limit `{text}`"))?,
-                    )
-                };
-                let tolerance = Tolerance {
-                    absolute: parse(fields[0])?,
-                    relative: parse(fields[1])?,
-                    relative_floor: parse(fields[2])?,
-                    ulps: if fields[3] == "-" {
-                        None
-                    } else {
-                        Some(
-                            fields[3]
-                                .parse()
-                                .map_err(|_| format!("bad ULP limit `{}`", fields[3]))?,
-                        )
-                    },
-                };
-                bounded(&mut o.precision);
-                let PrecisionPolicy::Bounded { outputs, .. } = &mut o.precision else {
-                    unreachable!()
-                };
-                if outputs.insert(name.trim().into(), tolerance).is_some() {
-                    return Err(format!("duplicate output tolerance `{}`", name.trim()));
-                }
-            }
-            "--input-range" => {
-                let (name, range) = value
-                    .split_once('=')
-                    .ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
-                let (minimum, maximum) = range
-                    .split_once("..")
-                    .ok_or_else(|| format!("bad input range `{value}`; expected NAME=MIN..MAX"))?;
-                let range = InputRange::new(
-                    minimum
-                        .parse()
-                        .map_err(|_| format!("bad range minimum `{minimum}`"))?,
-                    maximum
-                        .parse()
-                        .map_err(|_| format!("bad range maximum `{maximum}`"))?,
-                )?;
-                bounded(&mut o.precision);
-                let PrecisionPolicy::Bounded { inputs, .. } = &mut o.precision else {
-                    unreachable!()
-                };
-                if inputs.insert(name.trim().into(), range).is_some() {
-                    return Err(format!("duplicate input range `{}`", name.trim()));
-                }
-            }
-            "--allow-special-changes" => {
-                bounded(&mut o.precision);
-                let PrecisionPolicy::Bounded { specials, .. } = &mut o.precision else {
-                    unreachable!()
-                };
-                for name in value.split(',') {
-                    match name.trim() {
-                        "nan" => specials.nan = false,
-                        "infinity" => specials.infinity = false,
-                        "signed-zero" => specials.signed_zero = false,
-                        "subnormal" => specials.subnormal = false,
-                        other => return Err(format!("unknown special-value class `{other}`; expected nan, infinity, signed-zero or subnormal")),
-                    }
-                }
-            }
-            other => return Err(format!("option `{other}` has no parser")),
-        }
+    for path in files {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        sources.push(SourceFile {
+            path: path.to_string_lossy().replace('\\', "/"),
+            text,
+        });
     }
-    if o.paths.is_empty() {
-        return Err(format!("no files given\n{USAGE}"));
-    }
-    Ok(o)
+    check_source(sources).map_err(|error| error.to_string())
 }
 
-/// Compile every collected file as one closed program; diagnostics are rendered in full.
-pub fn load_program(o: &Options) -> Result<(usize, Program), String> {
-    let files = collect_files(&o.paths)?;
-    let program = compile(&files).map_err(|diagnostics| {
-        let mut out: Vec<String> = diagnostics.iter().map(|d| d.render()).collect();
-        out.push(format!("{} error(s)", diagnostics.len()));
-        out.join("\n")
-    })?;
-    Ok((files.len(), program))
-}
-
-fn check(args: &[String]) -> Result<(), String> {
-    let o = options(args, &[])?;
-    let (files, program) = load_program(&o)?;
-    println!(
-        "ok: {files} file(s), {} definition(s), {} linked function family(ies)",
-        program.definitions.len(),
-        program.families.len(),
-    );
+fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.is_file() {
+        if path.extension() != Some(OsStr::new("seismic")) {
+            return Err(format!("{} is not a .seismic file", path.display()));
+        }
+        files.push(path.to_path_buf());
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{} is neither a file nor a directory",
+            path.display()
+        ));
+    }
+    let mut children = std::fs::read_dir(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    children.sort_by_key(std::fs::DirEntry::path);
+    for child in children {
+        let child_path = child.path();
+        if child
+            .file_type()
+            .map_err(|error| format!("{}: {error}", child_path.display()))?
+            .is_dir()
+            || child_path.extension() == Some(OsStr::new("seismic"))
+        {
+            collect(&child_path, files)?;
+        }
+    }
     Ok(())
 }
 
-fn print_files(args: &[String]) -> Result<(), String> {
-    let o = options(args, &[])?;
-    for f in collect_files(&o.paths)? {
-        let file = syntax::parse(&f.text).map_err(|d| d.render(&f.path, &f.text))?;
-        print!("{}", syntax::print(&file));
+fn print_entries(module: &CheckedModule) {
+    for entry in module.entries() {
+        if entry.element_parameters.is_empty() {
+            println!("{}", entry.name);
+        } else {
+            println!("{}<{}>", entry.name, entry.element_parameters.join(", "));
+        }
+        for parameter in &entry.parameters {
+            println!("  argument {}: {:?}", parameter.name, parameter.kind);
+        }
+        for result in &entry.results {
+            println!("  result {:?}: {:?}", result.path, result.kind);
+        }
     }
-    Ok(())
 }

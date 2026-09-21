@@ -53,5 +53,5 @@ fn erf_values[N](source: tensor[N] f32) -> tensor[N] f32:
 fn gelu[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U):
     parallel for rows in 0..M:
         let source = f32(x[rows])
-        let probability = erf_values(to_owned(source * 0.7071067811865476))
-        result[rows] = 0.5 * source * (1.0 + f32(probability))
+        let probability = erf_values(source * 0.7071067811865476)
+        result[rows] = 0.5 * source * (1.0 + probability)
