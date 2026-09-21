@@ -648,7 +648,8 @@ export const installAcnHealthRoutes = (
       if (path === "/rpc" || path.startsWith("/rpc/")) {
         return HttpServerResponse.text("Magnitude application control is available only on the machine running Magnitude.", { status: 403 })
       }
-      if (path.startsWith("/inference/") && !authorizesRemoteInference({ authorization: request.headers.authorization, "x-api-key": request.headers["x-api-key"] }, network)) {
+      // Preflight carries no credentials by design; the request that follows is checked.
+      if (path.startsWith("/inference/") && request.method !== "OPTIONS" && !authorizesRemoteInference({ authorization: request.headers.authorization, "x-api-key": request.headers["x-api-key"] }, network)) {
         return HttpServerResponse.unsafeJson({ error: {
           message: "A Magnitude API key is required from other devices. Copy it from Settings → Network access and send it as a Bearer token.",
           type: "authentication_error",

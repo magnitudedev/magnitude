@@ -191,6 +191,10 @@ describe("ACN network access", () => {
       expect(yield* bearer.text).toBe("inference models")
       expect((yield* get(`${remote}/inference/v1/models`, { "x-api-key": "mag-test-key" })).status).toBe(200)
 
+      const preflight = yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://localhost:3000" } }))
+      expect(preflight.status).toBe(204)
+      expect(preflight.headers["access-control-allow-origin"]).toBe("http://localhost:3000")
+      expect((yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://evil.com" } }))).status).toBe(403)
       expect((yield* get(`${remote}/health`, { host: "evil.com" })).status).toBe(421)
       expect((yield* get(`${remote}/health`, { host: "my-mac.local:1" })).status).toBe(200)
       expect((yield* get(`${remote}/health`, { host: "host.docker.internal:1" })).status).toBe(200)
