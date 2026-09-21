@@ -159,14 +159,15 @@ export const windowsNetworkFault = Layer.effect(NetworkFault, Effect.gen(functio
     const isolation = WindowsNetworkIsolation.make({ _tag: "windows", rule: NetworkRuleId.make(`magnitude_lab_${randomUUID().replaceAll("-", "")}`),
       controlPlane, resolvers, ranges, externalIpv6Reachable: false })
     const common = { LAB_NETWORK_RULE: isolation.rule, LAB_NETWORK_RANGES: isolation.ranges.join(",") }
-    yield* powershell(String.raw`$ErrorActionPreference='Stop'
-if (Get-NetFirewallRule -Name $env:LAB_NETWORK_RULE -ErrorAction SilentlyContinue) {throw 'Network isolation rule already exists'}
-New-NetFirewallRule -Name $env:LAB_NETWORK_RULE -DisplayName $env:LAB_NETWORK_RULE -Direction Outbound -Action Block -Enabled True -Profile Any -RemoteAddress ($env:LAB_NETWORK_RANGES -split ',') | Out-Null
-if (-not (Get-NetFirewallRule -Name $env:LAB_NETWORK_RULE -ErrorAction Stop).Enabled) {throw 'Network isolation rule is not enabled'}`, common)
+    // A rule can commit before PowerShell returns an error or loses its response.
     yield* Effect.addFinalizer(() => powershell(String.raw`$ErrorActionPreference='Stop'
 $rule=Get-NetFirewallRule -Name $env:LAB_NETWORK_RULE -ErrorAction SilentlyContinue
 if ($rule) {$rule | Remove-NetFirewallRule -ErrorAction Stop}`, { LAB_NETWORK_RULE: isolation.rule }).pipe(
       Effect.catchAll(error => Effect.sync(() => { onCleanupError(error.message) }))))
+    yield* powershell(String.raw`$ErrorActionPreference='Stop'
+if (Get-NetFirewallRule -Name $env:LAB_NETWORK_RULE -ErrorAction SilentlyContinue) {throw 'Network isolation rule already exists'}
+New-NetFirewallRule -Name $env:LAB_NETWORK_RULE -DisplayName $env:LAB_NETWORK_RULE -Direction Outbound -Action Block -Enabled True -Profile Any -RemoteAddress ($env:LAB_NETWORK_RANGES -split ',') | Out-Null
+if (-not (Get-NetFirewallRule -Name $env:LAB_NETWORK_RULE -ErrorAction Stop).Enabled) {throw 'Network isolation rule is not enabled'}`, common)
     return isolation
   }) } satisfies NetworkFault
 }))
