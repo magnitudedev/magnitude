@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef unsigned long long LumeU64;
 
@@ -41,6 +42,13 @@ static BOOL parseUnsignedEnvironmentValue(const char *name, LumeU64 *value) {
 }
 
 static BOOL loadConfiguration(void) {
+    const char *expectedProcess = getenv("LUME_METAL_PROCESS_NAME");
+    const char *process = getprogname();
+    if (!expectedProcess || !*expectedProcess || !process ||
+        strcmp(expectedProcess, process) != 0) {
+        return NO;
+    }
+
     LumeU64 appleFamilyMax = 0;
     if (!parseUnsignedEnvironmentValue(
             "LUME_METAL_APPLE_FAMILY_MAX",

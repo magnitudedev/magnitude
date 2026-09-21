@@ -13,6 +13,7 @@ test("qualified Namespace Metal configuration becomes candidate-only loader cont
   expect(await Effect.runPromise(namespaceMetalEnvironment(configured, "darwin"))).toEqual({
     PATH: "/usr/bin",
     DYLD_INSERT_LIBRARIES: configured.LAB_NAMESPACE_METAL_SHIM,
+    LUME_METAL_PROCESS_NAME: "magnitude-inference",
     LUME_METAL_APPLE_FAMILY_MAX: "1007",
     LUME_METAL_MAX_THREADGROUP_MEMORY: "32768",
   })
@@ -28,6 +29,7 @@ test("partial, broadened, conflicting and non-macOS profiles are rejected", asyn
     [{ ...configured, LAB_NAMESPACE_METAL_FAMILY_MAX: "1009" }, "darwin"],
     [{ ...configured, LAB_NAMESPACE_METAL_MAX_THREADGROUP_MEMORY: "65536" }, "darwin"],
     [{ ...configured, DYLD_INSERT_LIBRARIES: "/tmp/other.dylib" }, "darwin"],
+    [{ ...configured, LUME_METAL_PROCESS_NAME: "other" }, "darwin"],
     [configured, "linux"],
   ] as const) expect((await Effect.runPromise(namespaceMetalEnvironment(environment, platform).pipe(Effect.either)))._tag).toBe("Left")
 })

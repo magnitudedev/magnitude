@@ -262,8 +262,11 @@ shim, then enables it only when an executable stock-device probe identifies that
 proves Apple family 7 is unadvertised, and produces the expected SIMD result. A second executable
 probe must pass with Apple family 7 exposed and the device's existing 32 KiB threadgroup-memory
 limit unchanged. The worker exports a receipt-bound lab capability; only candidate application,
-CLI and harness processes translate it into loader variables. Physical Macs and non-Namespace
-workers receive no override. The profile does not change product Metal selection policy.
+CLI and harness launches translate it into loader variables so the managed inference child can
+inherit them. The shim checks the executable name before installing any Metal hook and activates
+only inside `magnitude-inference`; Electron, the service host, CLIs and harnesses retain stock Metal
+behavior. Physical Macs and non-Namespace workers receive no override. The profile does not change
+product Metal selection policy.
 Windows client allocation requires an operator-verified licensing basis in administrator
 configuration. Multitenant hosting emits Azure's Windows client license declaration; Visual Studio
 dev/test eligibility does not imply that declaration. Credits, image visibility and Server diagnostic

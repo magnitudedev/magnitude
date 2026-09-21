@@ -108,11 +108,15 @@ subprocess.run(['codesign','--force','--sign','-',str(metal_shim)],check=True)
 subprocess.run(['xcrun','swiftc','-O','-target','arm64-apple-macosx13.0',str(metal_probe),'-o',str(metal_probe_binary)],check=True)
 stock_metal=json.loads(output(str(metal_probe_binary)))
 if stock_metal.get('device')=='Apple Paravirtual device' and not stock_metal.get('apple7') and stock_metal.get('simdReductionExecuted') and stock_metal.get('simdReductionResult')==528:
- metal_environment={**os.environ,'DYLD_INSERT_LIBRARIES':str(metal_shim),'LUME_METAL_APPLE_FAMILY_MAX':'1007',
+ inactive_environment={**os.environ,'DYLD_INSERT_LIBRARIES':str(metal_shim),'LUME_METAL_PROCESS_NAME':'magnitude-inference','LUME_METAL_APPLE_FAMILY_MAX':'1007',
   'LUME_METAL_MAX_THREADGROUP_MEMORY':str(stock_metal['maxThreadgroupMemory'])}
+ inactive_metal=json.loads(subprocess.check_output([str(metal_probe_binary)],env=inactive_environment,text=True))
+ if inactive_metal.get('apple7') or inactive_metal.get('maxThreadgroupMemory')!=stock_metal.get('maxThreadgroupMemory'):
+  raise SystemExit('Namespace Metal compatibility profile escaped its executable boundary')
+ metal_environment={**inactive_environment,'LUME_METAL_PROCESS_NAME':metal_probe_binary.name}
  profiled_metal=json.loads(subprocess.check_output([str(metal_probe_binary)],env=metal_environment,text=True))
  if not profiled_metal.get('apple7') or not profiled_metal.get('simdReductionExecuted'):raise SystemExit('Namespace Metal compatibility profile did not establish its qualified capability')
- metal_compatibility={'enabled':True,'stock':stock_metal,'profiled':profiled_metal,'shimSha256':hashlib.sha256(metal_shim.read_bytes()).hexdigest(),
+ metal_compatibility={'enabled':True,'stock':stock_metal,'inactive':inactive_metal,'profiled':profiled_metal,'shimSha256':hashlib.sha256(metal_shim.read_bytes()).hexdigest(),
   'probeSha256':hashlib.sha256(metal_probe_binary.read_bytes()).hexdigest()}
 elif stock_metal.get('apple7') and stock_metal.get('simdReductionExecuted'):
  metal_compatibility={'enabled':False,'stock':stock_metal,'probeSha256':hashlib.sha256(metal_probe_binary.read_bytes()).hexdigest()}

@@ -20,9 +20,10 @@ export const namespaceMetalEnvironment = (inherited: Readonly<Record<string, str
   const memory = yield* Schema.decodeUnknown(Memory)(inherited.LAB_NAMESPACE_METAL_MAX_THREADGROUP_MEMORY).pipe(
     Effect.mapError(() => fail("Namespace Metal threadgroup-memory receipt is invalid")))
   if (memory !== 32_768) return yield* fail("Namespace Metal compatibility must retain the qualified 32 KiB threadgroup-memory limit")
-  if (["DYLD_INSERT_LIBRARIES", "LUME_METAL_APPLE_FAMILY_MAX", "LUME_METAL_MAX_THREADGROUP_MEMORY"].some(key => key in inherited)) {
+  if (["DYLD_INSERT_LIBRARIES", "LUME_METAL_PROCESS_NAME", "LUME_METAL_APPLE_FAMILY_MAX", "LUME_METAL_MAX_THREADGROUP_MEMORY"].some(key => key in inherited)) {
     return yield* fail("Namespace Metal compatibility conflicts with an existing loader configuration")
   }
   const environment = Object.fromEntries(Object.entries(inherited).filter(([key]) => !keys.includes(key as typeof keys[number])))
-  return { ...environment, DYLD_INSERT_LIBRARIES: shim, LUME_METAL_APPLE_FAMILY_MAX: "1007", LUME_METAL_MAX_THREADGROUP_MEMORY: "32768" }
+  return { ...environment, DYLD_INSERT_LIBRARIES: shim, LUME_METAL_PROCESS_NAME: "magnitude-inference",
+    LUME_METAL_APPLE_FAMILY_MAX: "1007", LUME_METAL_MAX_THREADGROUP_MEMORY: "32768" }
 })
