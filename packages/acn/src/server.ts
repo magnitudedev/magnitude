@@ -540,6 +540,10 @@ const makeInferenceProxy = (
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
     }
     if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const upgradeOrigin = source.headers.get("origin")
+      if (upgradeOrigin !== null && !isAllowedCorsOrigin(upgradeOrigin)) {
+        return HttpServerResponse.empty({ status: 403 })
+      }
       return yield* makeCodexWebSocketProxy(request, source, icn, usage)
     }
     const response = anthropicGateway !== undefined
