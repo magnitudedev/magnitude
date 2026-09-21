@@ -93,7 +93,8 @@ export const transportWorkerRunner = (runtimes: readonly (typeof GuestRuntime.Ty
         if (unpacked.exitCode !== 0) return yield* nativeFailure(`Worker input bundle extraction exited ${unpacked.exitCode}`, unpacked)
         const response = yield* transport.execute(machine, runtime.executable, [...runtime.args, remoteJob], Math.max(1, deadline - Date.now()))
         if (response.exitCode !== 0) return yield* nativeFailure(`Guest worker exited ${response.exitCode} without an accepted result`, response)
-        const reply = yield* Schema.decodeUnknown(Schema.parseJson(WorkerReply))(response.stdout)
+        const reply = yield* Schema.decodeUnknown(Schema.parseJson(WorkerReply))(response.stdout).pipe(
+          Effect.catchAll(() => nativeFailure("Guest worker returned an invalid protocol response", response)))
         if (!Schema.equivalence(WorkClaim)(assignment.claim, reply.claim)) return yield* fail("Guest result belongs to another assignment or attempt")
         yield* validateTargetResult(assignment.target, reply.result)
         const evidence = new Map<Digest, number>()

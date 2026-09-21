@@ -2,13 +2,24 @@ import { expect, test } from "vitest"
 import { Effect, Schema } from "effect"
 import { NativeExecution } from "../src/execution-telemetry"
 import { targets } from "../src/catalog"
-import { attestGeneration, attestHost, type HostObservation } from "../src/hardware"
+import { attestGeneration, attestHost, PciBusId, type HostObservation } from "../src/hardware"
 
 const a10 = targets.find(t => t.os === "ubuntu" && t.backend === "cuda" && t.hardware === "a10")!
 const host: HostObservation = { os: "ubuntu", version: "24.04.5", build: "fixture", arch: "x64", cpuVendor: "AuthenticAMD", cpuName: "AMD EPYC",
-  machineModel: "Virtual Machine", memoryBytes: 128 * 1024 ** 3, gpus: [{ name: "NVIDIA A10", backend: "cuda", uuid: "fixture-gpu", driver: "fixture", memoryBytes: 24 * 1024 ** 3 }] }
-const allocation = { kind: "device" as const, backend: "CUDA", physical_id: "fixture-gpu", native_index: 0, model_bytes: 1024 }
+  machineModel: "Virtual Machine", memoryBytes: 128 * 1024 ** 3, gpus: [{ name: "NVIDIA A10", backend: "cuda", uuid: "fixture-gpu", pciBusId: Schema.decodeUnknownSync(PciBusId)("0000000F:01:00.0"), driver: "fixture", memoryBytes: 24 * 1024 ** 3 }] }
+const allocation = { kind: "device" as const, backend: "CUDA", physical_id: "000f:01:00.0", native_index: 0, model_bytes: 1024 }
 const generation = Schema.decodeUnknownSync(NativeExecution)({ traceId: "a".repeat(32), model: "fixture-model", requestId: "7", workerPid: 42, workerGeneration: "1", allocations: [allocation] })
+test("CUDA matches the physical PCI device across native padding without accepting aliases or ambiguous devices", async () => {
+  for (const physical_id of ["000f:01:00.0", "0000000F:01:00.0"]) {
+    await Effect.runPromise(attestGeneration(a10, host, "fixture-model", { ...generation, allocations: [{ ...allocation, physical_id }] }))
+  }
+  for (const physical_id of ["000f:02:00.0", "000f:01:01.0", "000f:01:00.1", "000e:01:00.0", "000f:01:00.0-v0", "fixture-gpu", "0:1:0.0"]) {
+    expect((await Effect.runPromise(attestGeneration(a10, host, "fixture-model", { ...generation, allocations: [{ ...allocation, physical_id }] }).pipe(Effect.either)))._tag).toBe("Left")
+  }
+  for (const gpus of [[{ ...host.gpus[0]!, pciBusId: null }], [host.gpus[0]!, { ...host.gpus[0]!, uuid: "other-gpu" }]]) {
+    expect((await Effect.runPromise(attestGeneration(a10, { ...host, gpus }, "fixture-model", generation).pipe(Effect.either)))._tag).toBe("Left")
+  }
+})
 test("host checks distinguish A10 from A100 and Intel from AMD", async () => {
   await Effect.runPromise(attestHost(a10, host))
   expect(await Effect.runPromise(attestHost(a10, { ...host, gpus: [{ ...host.gpus[0]!, name: "NVIDIA A100" }] }).pipe(Effect.either))).toMatchObject({ _tag: "Left" })
@@ -43,7 +54,7 @@ test("RTX PRO 6000 requires the actual Blackwell Server Edition device", async (
 test("Metal without a physical ID requires exactly one device at native index zero", () => Effect.runPromise(Effect.gen(function* () {
   const target = targets.find(t => t.os === "macos" && t.version === "15" && t.backend === "metal")!
   const apple: HostObservation = { ...host, os: "macos", version: "15.5", arch: "arm64", cpuVendor: "Apple", cpuName: "Apple M4",
-    gpus: [{ ...host.gpus[0]!, backend: "metal", name: "Apple M4", uuid: "apple-device" }] }
+    gpus: [{ ...host.gpus[0]!, backend: "metal", pciBusId: null, name: "Apple M4", uuid: "apple-device" }] }
   const observed = { ...generation, allocations: [{ ...allocation, backend: "MTL", physical_id: null }] }
   yield* attestGeneration(target, apple, "fixture-model", observed)
   for (const invalid of [

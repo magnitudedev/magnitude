@@ -24,11 +24,11 @@ test("Windows identity distinguishes clients and supported Server editions despi
 })
 
 test("NVIDIA inventory records native identity and handles unavailable unified-memory totals honestly", async () => {
-  expect(await Effect.runPromise(nvidiaDevices("GPU-one, NVIDIA A10, 580.1, 23028\nGPU-two, NVIDIA GB10, 580.1, [N/A]"))).toEqual([
-    { uuid: "GPU-one", name: "NVIDIA A10", driver: "580.1", backend: "cuda", memoryBytes: 23028 * 1024 ** 2 },
-    { uuid: "GPU-two", name: "NVIDIA GB10", driver: "580.1", backend: "cuda", memoryBytes: null },
+  expect(await Effect.runPromise(nvidiaDevices("GPU-one, NVIDIA A10, 580.1, 23028, 00000000:02:00.0\nGPU-two, NVIDIA GB10, 580.1, [N/A], 0000000F:01:00.0"))).toEqual([
+    { uuid: "GPU-one", pciBusId: "00000000:02:00.0", name: "NVIDIA A10", driver: "580.1", backend: "cuda", memoryBytes: 23028 * 1024 ** 2 },
+    { uuid: "GPU-two", pciBusId: "0000000f:01:00.0", name: "NVIDIA GB10", driver: "580.1", backend: "cuda", memoryBytes: null },
   ])
-  for (const line of ["bad output", "GPU-one, NVIDIA A10, 580.1, nonsense", "GPU-one, NVIDIA A10, 580.1, -1", "GPU-one, NVIDIA A10, 580.1, 1, extra"]) {
+  for (const line of ["bad output", "GPU-one, NVIDIA A10, 580.1, nonsense, 0000:01:00.0", "GPU-one, NVIDIA A10, 580.1, -1, 0000:01:00.0", "GPU-one, NVIDIA A10, 580.1, 1, malformed", "GPU-one, NVIDIA A10, 580.1, 1, 0000:01:20.0", "GPU-one, NVIDIA A10, 580.1, 1, 0000:01:00.8"]) {
     expect((await Effect.runPromise(nvidiaDevices(line).pipe(Effect.either)))._tag).toBe("Left")
   }
 })

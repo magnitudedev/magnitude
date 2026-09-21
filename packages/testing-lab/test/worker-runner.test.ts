@@ -23,7 +23,7 @@ import { transportWorkerRunner, WorkerTransports } from "../src/worker-runner"
 import { temporaryDatabase } from "./postgres"
 import { WorkerDiagnostic } from "../src/worker-diagnostics"
 
-for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable", "native-exit", "unpack-exit"] as const) {
+for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence", "foreign-owner", "untrusted-local", "shared-disposable", "native-exit", "unpack-exit", "invalid-protocol"] as const) {
   test(`transported workers reject unauthorized or mismatched results: ${mode}`, () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const processes = yield* ProcessExecutor
@@ -75,6 +75,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(baseline)))).toBe(baseline)
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(oldBytes)))).toBe(oldBytes)
           expect(yield* fs.readFileString(join(dirname(args[0]!), "objects", sha256(bytes)))).toBe(bytes)
+          if (mode === "invalid-protocol") return { exitCode: 0, stdout: "unexpected browser logging token=private-token", stderr: "" }
           if (mode === "native-exit") return { exitCode: 42, stdout: "worker started", stderr: "native startup failed https://example.test/file?sig=private-capability token=private-token" }
           const output = mode === "corrupt-evidence" ? "corrupt evidence" : evidence
           yield* fs.writeFileString(join(dirname(args[0]!), "objects", sha256(evidence)), output)
@@ -95,7 +96,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
       if (["foreign-owner", "untrusted-local", "shared-disposable"].includes(mode)) expect(uploads).toBe(0)
       else expect(uploads).toBe(1)
       expect(yield* inputs.missing(request.owner, [sha256(evidence)])).toEqual(mode === "success" ? [] : [sha256(evidence)])
-      if (mode === "native-exit" || mode === "unpack-exit") {
+      if (mode === "native-exit" || mode === "unpack-exit" || mode === "invalid-protocol") {
         expect(result._tag).toBe("Left")
         if (result._tag !== "Left") throw new Error("Expected native execution failure")
         const items = Option.getOrThrow(result.left.evidence)
@@ -108,7 +109,7 @@ for (const mode of ["success", "wrong-claim", "missing-case", "corrupt-evidence"
         expect(Buffer.byteLength(wire)).toBe(items[0]!.bytes)
         const diagnostic = yield* Schema.decodeUnknown(Schema.parseJson(WorkerDiagnostic))(wire)
         expect(diagnostic.runId).toBe(assignment.claim.runId)
-        expect(diagnostic.output).toContain(mode === "native-exit" ? "native startup failed" : "input extraction failed")
+        expect(diagnostic.output).toContain(mode === "native-exit" ? "native startup failed" : mode === "invalid-protocol" ? "unexpected browser logging" : "input extraction failed")
         expect(diagnostic.output).not.toContain("private-capability")
         expect(diagnostic.output).not.toContain("private-token")
       }

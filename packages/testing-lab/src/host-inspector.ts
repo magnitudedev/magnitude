@@ -38,8 +38,8 @@ export const linuxIdentity = (wire: string, dgx: string = "") => Effect.gen(func
 
 export const nvidiaDevices = (wire: string) => Effect.forEach(wire.trim() ? wire.trim().split(/\r?\n/) : [], line => Effect.gen(function* () {
   const fields = line.split(",").map(s => s.trim())
-  if (fields.length !== 4 || !fields[0]!.startsWith("GPU-") || (!/^\d+(\.\d+)?$/.test(fields[3]!) && fields[3] !== "[N/A]" && fields[3] !== "N/A")) return yield* fail("Malformed NVIDIA device query")
-  return yield* decode(ObservedGpu, { uuid: fields[0], name: fields[1], driver: fields[2], backend: "cuda", memoryBytes: /N\/A/.test(fields[3]!) ? null : Number(fields[3]) * 1024 ** 2 })
+  if (fields.length !== 5 || !fields[0]!.startsWith("GPU-") || (!/^\d+(\.\d+)?$/.test(fields[3]!) && fields[3] !== "[N/A]" && fields[3] !== "N/A")) return yield* fail("Malformed NVIDIA device query")
+  return yield* decode(ObservedGpu, { uuid: fields[0], name: fields[1], driver: fields[2], backend: "cuda", pciBusId: fields[4], memoryBytes: /N\/A/.test(fields[3]!) ? null : Number(fields[3]) * 1024 ** 2 })
 }))
 
 const WindowsReport = Schema.Struct({ productType: Schema.Int, version: Schema.String, build: Schema.String, architecture: Schema.Int,
@@ -66,7 +66,7 @@ const metalQuery = `import Foundation
 import Metal
 let devices: [[String: Any]] = MTLCopyAllDevices().map { device in
   ["name": device.name, "backend": "metal", "uuid": "metal-registry:\\(device.registryID)",
-   "driver": ProcessInfo.processInfo.operatingSystemVersionString,
+   "driver": ProcessInfo.processInfo.operatingSystemVersionString, "pciBusId": NSNull(),
    "memoryBytes": device.hasUnifiedMemory ? ProcessInfo.processInfo.physicalMemory as Any : NSNull()]
 }
 let data = try JSONSerialization.data(withJSONObject: devices, options: [.sortedKeys])
@@ -99,7 +99,7 @@ export const HostInspectorLive = Layer.effect(HostInspector, Effect.gen(function
           machineModel: cpu.machine_model, memoryBytes: Number(yield* run("/usr/sbin/sysctl", ["-n", "hw.memsize"])), gpus })
       } else {
         const requiresNvidia = target.backend === "cuda" || ["a10", "rtx-pro-6000", "dgx-spark"].includes(target.hardware)
-        const queried = yield* run("nvidia-smi", ["--query-gpu=uuid,name,driver_version,memory.total", "--format=csv,noheader,nounits"]).pipe(Effect.either)
+        const queried = yield* run("nvidia-smi", ["--query-gpu=uuid,name,driver_version,memory.total,pci.bus_id", "--format=csv,noheader,nounits"]).pipe(Effect.either)
         if (queried._tag === "Left" && requiresNvidia) return yield* fail(`NVIDIA inspection failed: ${queried.left.message}`)
         const gpus = queried._tag === "Right" ? yield* nvidiaDevices(queried.right) : []
         if (process.platform === "win32") {

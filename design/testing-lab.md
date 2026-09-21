@@ -571,7 +571,9 @@ or explicitly identified CPU-device model allocation with no target-model accele
 CPU-device allocations may coexist with accelerator allocations but cannot qualify GPU execution.
 GPU acceptance requires positive
 target-model allocation on the requested backend and hardware. Physical identifiers must match
-host discovery exactly. Metal's absent physical identifier is accepted only for native index zero
+host discovery exactly. CUDA's native PCI address is matched to independently queried NVIDIA PCI
+inventory, normalizing only hexadecimal case and domain zero padding; a GPU UUID is a distinct identifier.
+Metal's absent physical identifier is accepted only for native index zero
 on a host with exactly one enumerated Metal device; multiple-device ambiguity fails explicitly.
 Requested layer counts are not a substitute for resident target-model allocation evidence.
 The scoped execution collector accepts OTLP/JSON only on random loopback routes, retains only

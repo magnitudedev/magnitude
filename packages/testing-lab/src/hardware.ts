@@ -1,9 +1,17 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { Architecture, AssertionFailure, Target } from "./domain"
 import { NativeExecution } from "./execution-telemetry"
 
+// CUDA and NVIDIA's inventory use different domain padding/case for the same PCI address.
+export const PciBusId = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{4,8}:[a-f0-9]{2}:[01][a-f0-9]\.[0-7]$/i),
+  Schema.transform(Schema.String, { strict: true,
+    decode: value => {
+      const separator = value.indexOf(":")
+      return value.slice(0, separator).toLowerCase().padStart(8, "0") + value.slice(separator).toLowerCase()
+    },
+    encode: value => value }), Schema.brand("LabPciBusId"))
 export const ObservedGpu = Schema.Struct({ name: Schema.NonEmptyString, backend: Schema.Literal("cuda", "metal"),
-  uuid: Schema.NonEmptyString, driver: Schema.String, memoryBytes: Schema.NullOr(Schema.Int.pipe(Schema.nonNegative())) })
+  uuid: Schema.NonEmptyString, pciBusId: Schema.NullOr(PciBusId), driver: Schema.String, memoryBytes: Schema.NullOr(Schema.Int.pipe(Schema.nonNegative())) })
 export const HostObservation = Schema.Struct({ os: Target.fields.os, version: Schema.NonEmptyString, build: Schema.String,
   arch: Architecture, cpuVendor: Schema.String, cpuName: Schema.String, machineModel: Schema.String,
   gpus: Schema.Array(ObservedGpu), memoryBytes: Schema.Int.pipe(Schema.positive()) })
@@ -44,11 +52,12 @@ export const attestGeneration = (target: Target, host: HostObservation, expected
     const backend = allocation.backend.toLowerCase() === "mtl" ? "metal" : allocation.backend.toLowerCase()
     if (backend !== target.backend) return yield* new AssertionFailure({ message: "Target-model allocation used a different backend" })
     const available = host.gpus.filter(gpu => gpu.backend === backend)
+    const pciBusId = Schema.decodeUnknownOption(PciBusId)(allocation.physical_id)
     // Metal has no exported physical ID today. Only one enumerated device at index zero
     // is unambiguous; CUDA and multi-device hosts require an exact physical identity.
     const matches = allocation.physical_id === null
       ? backend === "metal" && allocation.native_index === 0 && available.length === 1 ? available : []
-      : available.filter(gpu => gpu.uuid === allocation.physical_id)
+      : available.filter(gpu => backend === "cuda" ? Option.exists(pciBusId, id => gpu.pciBusId === id) : gpu.uuid === allocation.physical_id)
     if (matches.length !== 1 || !gpuMatches(target.hardware, matches[0]!.name)) {
       return yield* new AssertionFailure({ message: "Target-model allocation cannot be uniquely matched to the requested hardware" })
     }
