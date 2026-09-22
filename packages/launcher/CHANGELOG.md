@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.1.4
+
+### Patch Changes
+
+- [`6b56b68`](https://github.com/magnitudedev/magnitude/commit/6b56b68640051e65b4a1e28e053e3b11d74518b0) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add a configurable model storage folder, opt-in network access with a generated API key so other devices, containers, and WSL can use local inference, a redesigned Settings page, the real version in development builds, and tighter CORS and WebSocket origin checks on the local service.
+
 ## 0.1.3
 
 ### Patch Changes
