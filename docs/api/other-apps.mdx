@@ -1,0 +1,29 @@
+---
+title: "Other apps"
+description: "Use Magnitude from any OpenAI-compatible or Anthropic-compatible app."
+---
+
+Any app that lets you set a custom base URL can use Magnitude on this computer. For an app or agent on another device, in a container, or inside WSL, see [Other devices](/api/other-devices).
+
+## OpenAI-compatible apps
+
+| Setting | Value |
+| --- | --- |
+| Provider | OpenAI-compatible |
+| Base URL | `http://127.0.0.1:10100/inference/v1` |
+| API key | Any value. Magnitude does not check it on this computer. |
+| Model | An exact ID from `/inference/v1/models` |
+
+If the app asks for a full endpoint URL instead of a base URL, use `http://127.0.0.1:10100/inference/v1/chat/completions`.
+
+## Anthropic-compatible apps
+
+Use `http://127.0.0.1:10100/inference/anthropic` as the base URL. Requests must include `max_tokens`.
+
+## Check the connection
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/models
+```
+
+A model list means Magnitude is running and the API is available. See [Endpoints](/api/endpoints) for the full route list.

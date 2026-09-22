@@ -46,7 +46,7 @@ Check your internet connection and free disk space. Read the failure in **My Mod
 
 ## A model won't load or was stopped
 
-Read its error in **Status** or **My Models**. Close memory-heavy applications or choose a smaller recommendation. A model's fit assessment does not reserve that memory against other apps.
+Read its error in **Status** or **My Models**. Close memory-heavy applications or choose a smaller recommendation. A model's fit assessment does not reserve that memory against other apps. Longer conversations use more memory; a fresh conversation can help.
 
 Stopping a model does not delete its files. Use **Load model** to try again when enough memory is available.
 
@@ -58,6 +58,14 @@ Stopping a model does not delete its files. Use **Load model** to try again when
 4. Keep Magnitude running and check Status if requests still fail.
 
 See your [integration guide](/integrations/overview) for specific model-selection and gateway behavior.
+
+## My agent runs in WSL, a container, or on another computer
+
+Connections cannot detect or configure agents there. Configure the agent by hand with the base URL and API key from **Settings → Network access**; see [Other devices](/api/other-devices). If the connection is refused, network access is off or the chosen address does not include that network. A `401` means the key is missing or changed. A `421 Invalid Host header` means the request used a hostname Magnitude does not accept; see [Other devices](/api/other-devices#troubleshooting).
+
+## My models disappeared after changing the model folder
+
+Changing **Model storage** does not move models. They are still in the previous folder. Move them with the command shown in Settings, or switch back with **Use default**. See [Settings](/settings#model-storage).
 
 ## An app update failed
 
@@ -71,7 +79,7 @@ Some Linux desktops do not provide a supported tray host. Open Magnitude from th
 
 ## Responses are slower than expected
 
-Check **Usage** to distinguish generation speed from time to first token. Loading, longer prompts, concurrent agents, and memory pressure can all affect response time. Try a smaller or faster recommendation and reduce simultaneous work. See [Inference](/inference).
+Check **Usage** to distinguish generation speed from time to first token. Loading, longer prompts, concurrent agents, and memory pressure can all affect response time. Try a smaller or faster recommendation and reduce simultaneous work. See [Usage](/models#usage).
 
 ## Report a problem
 

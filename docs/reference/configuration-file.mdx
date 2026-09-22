@@ -1,0 +1,49 @@
+---
+title: "Configuration file"
+description: "Every key in config.json."
+---
+
+Magnitude reads `~/.magnitude/config.json`, or `%USERPROFILE%\.magnitude\config.json` on Windows. **Settings** writes the same file. Keys Magnitude does not know are preserved.
+
+```json
+{
+  "appearance": "system",
+  "autoDownloadUpdates": true,
+  "modelsDirectory": "/Volumes/SSD/Magnitude/models",
+  "network": {
+    "enabled": true,
+    "bind": "100.64.1.5",
+    "apiKey": "mag-…",
+    "requireApiKey": true,
+    "allowedHosts": ["my-mac.local"]
+  },
+  "contextLimits": { "softCapRatio": 0.9, "softCapMaxTokens": 200000 },
+  "providers": {}
+}
+```
+
+| Key | Values | Applies |
+| --- | --- | --- |
+| `appearance` | `system`, `light`, `dark` | Immediately |
+| `autoDownloadUpdates` | `true`, `false` | Immediately |
+| `modelsDirectory` | Absolute path of the model folder. Absent means `~/.magnitude/models`. A symbolic link is followed. | Next start |
+| `network.enabled` | `true` to accept connections from other devices. Absent or `false` means this computer only. | Next start |
+| `network.bind` | One IP address of this computer. Absent means all interfaces. | Next start |
+| `network.apiKey` | The key other devices must send. Generated when network access is first enabled; **Regenerate** in Settings replaces it. | Next start |
+| `network.requireApiKey` | `false` lets other devices connect without a key. Default `true`. | Next start |
+| `network.allowedHosts` | Hostnames accepted in requests from other devices, in addition to IP addresses, `localhost`, `host.docker.internal`, and `.ts.net` names. | Next start |
+| `contextLimits.softCapRatio` | Fraction of a model's context window used before compaction. Default `0.9`. | Next model load |
+| `contextLimits.softCapMaxTokens` | Absolute cap on context tokens, or `null`. | Next model load |
+| `providers` | OpenAI-compatible endpoints to expose alongside local models. Run `magnitude docs custom-endpoints` for the schema. | Immediately |
+
+Invalid values are ignored and logged. A relative `modelsDirectory` or a `network.bind` that is not an IP address falls back to the default, and **Settings** shows the reason.
+
+## Other files in `~/.magnitude`
+
+| Path | Contents |
+| --- | --- |
+| `models/` | Downloaded models, unless `modelsDirectory` points elsewhere. |
+| `cache/` | Cached and derived data. Safe to delete while Magnitude is not running. |
+| `harness-connections.json` | Connection records for **Connections**. |
+
+Do not delete the whole directory to fix one problem. Removing the app and removing model data are separate actions.

@@ -25,17 +25,24 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 ## Configuration
 
-Default configuration files:
+**Connect** writes `~/.omp/agent/models.yml` and `~/.omp/agent/config.yml`. Location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`.
 
-- `~/.omp/agent/models.yml`
-- `~/.omp/agent/config.yml`
+Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Other devices](/api/other-devices) for `ADDRESS` and `API_KEY`.
 
-On Windows, `~` means your user profile directory.
+`~/.omp/agent/models.yml`:
 
-Supported location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`. The paths displayed in Connections show which files Magnitude is actually checking.
-
-## Repair or disconnect
-
-If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
+```yaml
+providers:
+  magnitude:
+    baseUrl: http://ADDRESS:10100/inference/v1
+    apiKey: API_KEY
+    api: openai-completions
+    models:
+      - id: MODEL_ID
+        name: MODEL_ID
+        reasoning: false
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 32768
+        maxTokens: 8192
+```

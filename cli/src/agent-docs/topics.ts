@@ -2,6 +2,7 @@ import customEndpointsMarkdown from "./topics/custom-endpoints.md" with { type: 
 import cliMarkdown from "./topics/cli.md" with { type: "text" }
 import recommendationsMarkdown from "./topics/recommendations.md" with { type: "text" }
 import speculativeMethodsMarkdown from "./topics/speculative-methods.md" with { type: "text" }
+import remoteAccessMarkdown from "./topics/remote-access.md" with { type: "text" }
 
 export interface DocumentationTopic {
   readonly id: string
@@ -29,6 +30,11 @@ export const documentationTopics: readonly DocumentationTopic[] = [
     id: "custom-endpoints",
     description: "Configure an OpenAI-compatible Chat Completions endpoint",
     markdown: customEndpointsMarkdown,
+  },
+  {
+    id: "remote-access",
+    description: "Reach the Magnitude inference API from another device, a container, or WSL",
+    markdown: remoteAccessMarkdown,
   },
 ]
 

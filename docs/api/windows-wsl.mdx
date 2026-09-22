@@ -1,0 +1,46 @@
+---
+title: "Windows and WSL"
+description: "Use Magnitude on Windows from agents inside WSL."
+---
+
+Magnitude runs on Windows. Agents installed inside a WSL distribution run in a separate Linux environment with its own network, so `127.0.0.1` inside WSL is the distribution, not Windows. **Connections** cannot detect or configure agents inside WSL; configure them by hand as shown under **Configuration** on the agent's page; see [Other devices](/api/other-devices#configure-the-app-or-agent).
+
+## Mirrored networking
+
+On Windows 11 22H2 and later, WSL can mirror the Windows network. With mirrored networking, `http://127.0.0.1:10100` works inside WSL exactly as on Windows, and Magnitude's network access setting is not needed.
+
+Enable it in **WSL Settings → Networking → Networking mode → Mirrored**, or add to `%USERPROFILE%\.wslconfig`:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+Then run `wsl --shutdown` in PowerShell and start the distribution again.
+
+Inside WSL, use `http://127.0.0.1:10100/inference/v1` as the base URL. No API key is needed.
+
+## NAT networking
+
+In the default NAT mode, WSL reaches Windows through the host address.
+
+1. In Magnitude, open **Settings → Network access**, turn it on, and copy the API key. Keep **All interfaces** selected. Restart Magnitude.
+2. Inside WSL, find the Windows host address:
+
+   ```sh
+   ip route show default | awk '{print $3}'
+   ```
+
+3. Use `http://HOST_ADDRESS:10100/inference/v1` as the base URL and the API key as the key.
+
+If the connection is refused, allow inbound connections through the Hyper-V firewall from an administrator PowerShell:
+
+```powershell
+New-NetFirewallHyperVRule -Name "Magnitude" -DisplayName "Magnitude" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 10100
+```
+
+The host address can change when WSL restarts. Mirrored networking avoids this.
+
+## The CLI inside WSL
+
+WSL can run Windows programs, so `magnitude.exe` works from a WSL shell. It controls the Windows installation and edits Windows configuration files, not files inside the distribution.

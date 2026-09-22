@@ -25,18 +25,21 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 ## Configuration
 
-Default configuration files:
+**Connect** writes `~/.codex/config.toml`, `~/.codex/magnitude.config.toml`, and `~/.codex/magnitude.models.json`. Location overrides: `CODEX_HOME`.
 
-- `~/.codex/config.toml`
-- `~/.codex/magnitude.config.toml`
-- `~/.codex/magnitude.models.json`
+Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Other devices](/api/other-devices) for `ADDRESS` and `API_KEY`.
 
-On Windows, `~` means your user profile directory.
+`~/.codex/config.toml`:
 
-Supported location overrides: `CODEX_HOME`. The paths displayed in Connections show which files Magnitude is actually checking.
+```toml
+model_provider = "magnitude"
+model = "magnitude-local/MODEL_ID"
 
-## Repair or disconnect
+[model_providers.magnitude]
+name = "Magnitude"
+base_url = "http://ADDRESS:10100/inference/v1/proxies/codex"
+wire_api = "responses"
+env_key = "MAGNITUDE_API_KEY"
+```
 
-If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
+Export `MAGNITUDE_API_KEY` with the API key before starting Codex. Codex warns that model metadata is not found and continues. Only local models are available from another device.

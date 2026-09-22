@@ -34,3 +34,15 @@ No. It runs in the background, loads models when your agent needs them, and unlo
 ## Is it private?
 
 Yes. Prompts, files, and models stay on your machine. Once a model is downloaded, no internet connection is needed.
+
+## Can I use Magnitude from another computer, a container, or WSL?
+
+Yes. Turn on **Network access** in Settings and use the address and API key it shows. Only inference is available from other devices. See [Other devices](/api/other-devices) and [Windows and WSL](/api/windows-wsl).
+
+## Can I keep models on another drive?
+
+Yes. Change **Model storage** in Settings, then move the existing models with the command it shows. See [Settings](/settings#model-storage).
+
+## Why is the first response slow and later ones fast?
+
+Models load on demand and unload when idle, so the first request after a pause includes loading. Later turns reuse cached context, and supported models use speculative decoding. Click **Load model** in **My Models** to load ahead of time.
