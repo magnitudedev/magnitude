@@ -11,13 +11,16 @@
 <p align="center"><strong>Run the best local models for your machine</strong></p>
 
 <p align="center">
+  <a href="https://magnitude.dev/download"><img src="https://img.shields.io/badge/-Download-gray?style=flat-square&labelColor=0369a1&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjIuMjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI%2BPHBhdGggZD0iTTEyIDN2MTIiLz48cGF0aCBkPSJtNyAxMCA1IDUgNS01Ii8%2BPHBhdGggZD0iTTQgMTd2MmEyIDIgMCAwIDAgMiAyaDEyYTIgMiAwIDAgMCAyLTJ2LTIiLz48L3N2Zz4%3D" alt="Download Magnitude"></a>
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
-  <a href="https://discord.gg/EHt48pPWdC"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord"></a>
-  <a href="https://x.com/usemagnitude"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter"></a>
+  <a href="https://discord.gg/EHt48pPWdC"><img src="https://img.shields.io/badge/-Discord-gray?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2" alt="Discord"></a>
+  <a href="https://x.com/usemagnitude"><img src="https://img.shields.io/badge/-Twitter-gray?style=flat-square&logo=x&logoColor=white&labelColor=000000" alt="Follow Magnitude on Twitter"></a>
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
 Magnitude is an open source inference engine optimized for consumer hardware. It profiles your machine, recommends the best models for it, then downloads, tunes, and runs them. One click connects the agent you already use. Works on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
+
+**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
@@ -25,9 +28,7 @@ https://github.com/user-attachments/assets/8317d05b-8a6e-40e0-b45d-81011ecbc329
 
 ## Get started
 
-**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
-
-1. Install and open the Magnitude app.
+1. [Download Magnitude](https://magnitude.dev/download), install it, and open the app.
 2. Choose a recommended model in **Discover** and download it.
 3. Connect your agent in **Connections** and start using it.
 
