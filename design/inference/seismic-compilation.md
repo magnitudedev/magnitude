@@ -1,13 +1,6 @@
 ---
 applies_to:
-  - inference-v4/seismic/crates/seismic-lang/**
-  - inference-v4/seismic/crates/seismic-compiler/**
-  - inference-v4/seismic/crates/seismic-metal/**
-  - inference-v4/seismic/crates/seismic-cpu/**
-  - inference-v4/seismic/crates/seismic-cuda/**
-  - inference-v4/seismic/crates/seismic-runtime/**
-  - inference-v4/seismic/crates/seismic/**
-  - inference-v4/seismic/crates/seismic-build/**
+  - inference-v4/seismic/**
   - inference-v4/solver/**
   - inference-v4/engine/**
 ---
@@ -17,12 +10,12 @@ applies_to:
 The ordinary compiler artifact progression is:
 
 ```text
-CheckedModule -> LogicalEntry -> ImplementationDraft<B>
-             -> NativeKernelCandidate<B> -> NativeKernel<B>
-             -> PlanSpace<B> -> FrozenPlan<B> -> ExecutableVariant<B>
-             -> PreparedKernel<B> -> WorkflowDraft<B>
-             -> PreparedWorkflow<B> -> AdmittedWorkflowRun<B>
-             -> Execution<B> -> Completion<B>
+CheckedModule -> LogicalEntry -> RefinedCandidateFamilies<T>
+             -> CandidateDomain<T> + private RealizationRegistry<T, H>
+             -> EvaluatedCandidateDomain<T> -> PlannedPolicy<T>
+             -> exact materialization -> PreparedKernel<T, H>
+             -> WorkflowGraphDraft<T, E> -> BoundWorkflowGraph<T, E>
+             -> AdmittedRun<T, E> -> SubmittedRun<T, E> -> Completion
 ```
 
 Each transition consumes its input. There is no other semantic layer, no
@@ -43,7 +36,7 @@ CheckedModule -> LogicalEntry -> InvocationContract
 ```
 
 This route reuses the checked entry contract and public tensor runtime but constructs none of
-`ImplementationDraft`, compiler kernel IR, `PlanSpace`, `FrozenPlan`, `ExecutableVariant`,
+`RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `PlannedPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or workflow artifacts. It has no tuning, solving, duration model, candidate
 selection, retry, or fallback. The distinct public handle makes direct-only use structural.
 
@@ -57,10 +50,11 @@ selection, retry, or fallback. The distinct public handle makes direct-only use 
    collections, refined enums, consuming transitions. Validators do not
    compensate for open structs.
 3. Alternatives are closed: an implementation contains its schedule, kernels,
-   transfers, storage topology, constraints, numerical transfer, and modeled duration.
-4. Planning uses complete machine truth. Device-wide facts are in the device
-   contract, concrete kernel facts are in reflection-reconciled native-kernel
-   contracts, and measured performance facts are in the execution profile.
+   transfers, storage topology, constraints, and numerical transfer. Prediction is
+   derived from that closed structure; factories do not own timing estimates.
+4. Candidate evaluation uses one declared method and returns a complete model
+   for the entire sealed domain or fails without a partial result. Planning
+   consumes only `EvaluatedCandidateDomain` and cannot observe the method.
 5. Native compilation and reconciliation happen before plan-space admission.
    They consume kernel-affecting choices, do not redesign, and cannot reject a
    later selected plan for a planning fact.
@@ -75,19 +69,32 @@ selection, retry, or fallback. The distinct public handle makes direct-only use 
 |---|---|---|
 | `CheckedModule` | source semantics, types, effects, canonical bodies, lowering declarations, top-level native asset references and launch expressions, capability requirements, stable identities | target decisions, schedules, allocations, native code bytes |
 | `LogicalEntry` | monomorphized entry semantics, `CallSchema`, `EntryDomain`, canonical operation graph, provenance, the entry's expression arena | placement, algorithm selection, native limits |
-| `DeviceContract<B>` | device-wide compatibility, capabilities, hard limits, memory rules, toolchain modes, and numerical environment | kernel-specific limits, measured rates, selected plan |
-| `NativeKernel<B>` | one concrete kernel handle, exact ABI, launch domain, reflected resources, numerical mode, and service footprint | unresolved codegen choices, performance observations |
-| `ExecutionProfile<B>` | measured service definitions, uncertainty, qualification domains, and per-open performance identity | legality, program semantics, transient availability |
-| `PlanSpace<B>` | exactly one universal implementation, zero or more optimized machine-closed implementations, and one exact finite solver model | partial proposals, unreconciled native candidates, fallback |
-| `FrozenPlan<B>` | one fixed physical choice with symbolic invocation dimensions, exact guard, layouts, allocations, structured commands, numerical assessment | alternatives, solver objects, logical IR, native mirrors |
-| `ExecutableVariant<B>` | one native structured schedule, guard/duration/layout evaluators, binding table, identity, assessment | physical plan, logical program, plan space |
-| `PreparedKernel<B>` | call schema, target domain, non-empty covered portfolio, deterministic selector | compilation logic, uncovered domain, inter-call scheduling |
-| `PreparedWorkflow<B>` | dependency-closed topology, symbolic access hazards, and reusable submission structure | transient reservations, selected invocation variants |
-| `AdmittedWorkflowRun<B>` | bound invocations, selected variants, one atomic reservation set, retained resources, and submission ownership | compiler repair, retry selection |
+| `DeviceDescription<T>` | immutable device-wide compatibility, capabilities, hard limits, memory rules, toolchain modes, numerical environment and target facts | compiler registrations, native handles, measured rates, selected plan |
+| `CompilerRegistry<T>` | compiler policy: structural factories, lowering registrations, launch rules and emitted-intrinsic coverage | device observations, native contexts, analytical coefficients, executor state |
+| `RealizationRegistry<T, H>` | opaque native handles keyed by reconciled implementation and artifact identity, retained privately by preparation until materialization | domain membership, performance models, planning decisions |
+| `RefinedCandidateFamilies<T>` | one universal structural family, optional optimized families, finite axes, construction report and one `ClosedExecutableIr<T>` per family | native handles, performance models, solver state |
+| `CandidateDomain<T>` | invocation domain, every reconciled family, immutable native descriptions and identities, finite axes, and one authoritative constraint relation | native handles, evaluator identity, partial scores, planner search policy |
+| `EvaluatedCandidateDomain<T>` | exactly one objective/model for every family, correlated uncertainty, provenance and evaluator-neutral evaluation identity | gaps, unassessed regions, method-specific planner behavior |
+| `PlannedPolicy<T>` | non-empty handle-free portfolio, exact guards, evaluated costs, layouts, structured commands, numerical assessments, coverage and deterministic selection | native handles, evaluator or solver services, uncovered regions |
+| `ExecutableVariant<T, H>` | one materialized structured schedule, opaque native kernels, guard/duration/layout evaluators, binding table, identity and assessment | candidate alternatives, logical program, solver state, public kernel enumeration |
+| `PreparedKernel<T, H>` | call schema, target domain, non-empty covered portfolio, deterministic selector | compilation logic, uncovered domain, inter-call scheduling |
+| `BoundWorkflowGraph<T, E>` | selected variants, closed output descriptors, dependency topology, access hazards, lifetimes and complete symbolic resource requirements | reservations, allocations, submission |
+| `AdmittedRun<T, E>` | one whole-graph reservation transaction, physical bindings, persistent leases, access permits and opaque submission ownership | binding, selection, replanning |
+| `SubmittedRun<T, E>` | native completion owner plus every retained admission resource | allocation, policy evaluation, early resource release |
+
+Executable kernel, schedule, storage and representation definitions have one
+shared IR owner. Its coordinated construction API owns scoped identities and
+child import; consumers cannot mutate closed artifacts or rebrand handles.
+Refinement constructs those artifacts without timing. The independent estimator
+reads them through a backend vocabulary contract that requires no native service.
+Native formation/reflection uses a separate service contract and explicit live
+context; immutable Metal target facts contain no device handle. The preparation
+orchestrator retains the native-before-planning order above.
 
 Only the checker and the validated bundle decoder construct a checked
-module. Only the module constructs a logical entry. Only the portfolio
-builder constructs a prepared kernel, after proving coverage.
+module. Only the module constructs a logical entry. Only preparation owns the
+paired realization registry; planning constructs a handle-free policy after
+proving coverage, and exact materialization alone constructs a prepared kernel.
 
 ## Identities and expressions
 
@@ -117,30 +124,46 @@ constraint.
 
 ## Machine contracts and capabilities
 
-Catalog discovery only enumerates unopened physical devices. Opening a Metal device creates the
-production service/queue immediately. Its device contract and fixed primitive execution profile
-are acquired together and cached on first use by ordinary compiler preparation or capability
-introspection. This preserves exact pairing with the opened service while allowing explicitly
-selected direct native calls to avoid profiling entirely. Other backends may still acquire their
-complete profile while opening.
+Catalog discovery only enumerates unopened physical devices. Opening a Metal
+device creates the production service/queue immediately and derives the
+device legality description. Hardware characterization is a separate,
+analytical-evaluator dependency: a fixed, versioned probe manifest is compiled
+once by a narrow native adapter, acquired as one aggregate raw-observation
+bundle, and interpreted by a pure certifier. Candidate-domain construction,
+generic evaluation, planning, direct native calls, and runtime execution do not
+depend on characterization.
 
-The device contract is assembled once from backend revision, hardware identity
+The device description is assembled once from backend revision, hardware identity
 and device-wide limits, driver and toolchain versions, dtype support, the
 numerical environment, and the static capability registry. It contains no
 fact whose truth depends on a particular compiled function or pipeline.
 
-Every numeric performance fact is either derived by a sound
-documented rule from architectural/device facts or measured by a backend-owned
-primitive-service probe on the exact opened device before planning and
-compilation. Measured facts bind their probe/methodology, interval/uncertainty,
-and complete target identity into a per-open execution-profile identity. A
-separate stable compatibility identity contains only legality/codegen facts and
-keys native artifacts; raw timing observations do not invalidate reusable
-native code. Prepared selection is never reused under a different execution
-profile. Candidate implementations are never
-benchmarked to create these facts. There are no calibrated coefficients,
-fitted curves, arbitrary weights, guessed defaults, copied values from similar
-hardware, nominal-peak shortcuts, or unknowns represented as zero.
+Every numeric performance fact is either queried, derived by a sound documented
+physical rule, or measured by a fixed primitive probe on the exact opened
+device. The target-closed Metal cost program owns the finite fact vocabulary.
+The renderer and analytical demand traversal consume that same program; neither
+may reconstruct performance-bearing work from a broad semantic class. Measured
+facts bind their raw observations, probe and method identity, endpoint,
+environment, uncertainty, model version, and complete target identity into the
+certified-profile identity. A separate stable compatibility identity contains
+only legality/codegen facts and keys native artifacts; timing evidence does not
+invalidate reusable native code. Prepared selection is never reused under a
+different evaluation identity. Candidate implementations are never benchmarked
+to create analytical facts. There are no calibrated corrections, fitted
+candidate curves, arbitrary weights, guessed defaults, copied values from
+similar hardware, nominal-peak shortcuts, or unknowns represented as zero.
+
+Characterization constructs a complete immutable profile or no profile. Its
+successful type has an infallible, exhaustive fact projection and contains no
+optional required parameter in the installed service vocabulary. Acquisition
+failures are aggregated across the fixed batch; certification is pure and
+replayable from the retained raw bundle. `ExecutionProfileParts<T>` owns the
+exact `Arc<DeviceDescription<T>>` from which its observations were acquired,
+and `AnalyticalEvaluationContext<T>` consumes those bound parts with one model
+definition. A concrete analytical evaluator cannot be installed until this
+profile exists. The production profile boundary is structurally closed for the
+built-in service vocabularies, but its physical formulas and evidence remain
+unqualified until the independent estimator and characterization gates pass.
 
 Kernel-affecting decisions are fixed before native formation. Compilation
 produces an unusable `NativeKernelCandidate`; reconciliation consumes it and
@@ -149,14 +172,16 @@ the actual ABI, launch domain, pipeline/function limits, static local memory,
 register and spill usage where exposed, cooperative requirements, numerical
 mode, service footprint, and compatibility identity. Unknown legality or
 selection facts are not represented as zero and prevent admission of that
-native implementation. Native compilation is absent below `PlanSpace`.
+native implementation. Native compilation is complete before
+`CandidateDomain` is sealed and is absent from evaluation and planning.
 
-Every emitted command, primitive, and intrinsic declares demand over sealed
-service classes in the same registration that supplies its lowering. Profile
-assembly requires exactly one authoritative query, derivation, or measurement
-provider for every referenced class and rejects duplicate/unused providers.
-There is no optional/default/catch-all service. A backend that cannot construct
-the required execution model does not advertise that target as complete. Capabilities are typed
+Every emitted command, physical primitive, memory relation, synchronization
+operation, and intrinsic is visible in the target-closed cost program or in the
+closed workflow lifecycle model. The Metal physical vocabulary includes every
+finite execution regime required by its formulas; it has no optional, default,
+catch-all, or unassessed branch. A backend that cannot close the program or
+construct all of its required facts cannot install the analytical evaluator.
+Capabilities are typed
 intrinsic families; a backend advertises a signature only when the same
 registration provides its typed lowering, resource rules, and native
 emission. Registration is sealed at compiler initialization; an inconsistent
@@ -164,23 +189,35 @@ registry is a startup panic. Native compilation is forbidden from returning
 an unsupported-capability or resource result for anything the profile
 represents.
 
-Service measurements retain distinct batches for dependency, setup, and
-capacity observations, including workload units, timer resolution, raw
-observations, digest, method, and acquisition duration. Qualification cases
-state only held-out production service demands and observations; core computes
-their prediction through the same service model used for selection. Service
-intervals carry correlation identity and an explicit qualification domain.
+Primitive measurements retain their workload identity, timer resolution, raw
+observations, ordering, digest, endpoint, environmental controls, compilation
+time, execution time, and total acquisition time. Qualification freezes the
+profile before measuring separate held-out candidate families. Qualification
+observations never feed back into the profile or evaluator. Accuracy and
+ranking criteria are versioned and selected before held-out evaluation from
+measurement noise and candidate decision sensitivity; the architecture does
+not prescribe fixed percentage thresholds in advance.
 
 ## Implementations
 
-Implementation factories, portable and backend-specific, receive a semantic
-function, the target profile, the shared arena, the precision policy, and
+Refinement factories, portable and backend-specific, receive a semantic
+function, pure target rules, the shared arena, the precision policy, and
 core-owned builders. A factory may decline before construction; once
-construction begins it returns a closed implementation or a real preparation
-error. Calls are resolved during construction: every applicable child
-implementation is spliced under a finite decision, composing guards,
-constraints, lifetimes, transfers, durations, provenance, and effect ordering.
-No call survives into a schedule.
+construction begins it returns a closed candidate family or a real preparation
+error. Calls are resolved during construction: every applicable child family is
+spliced under an explicit finite decision, composing constraints, lifetimes,
+transfers, provenance, and effect ordering. No call survives into a schedule.
+`RefinedCandidateFamilies` owns one universal family, optional optimized
+families, their finite axes, and an honest construction report. It owns neither
+performance models nor native handles. Structural identity excludes timing
+facts; the later evaluation identity invalidates predictions.
+
+Kernel construction requires only the backend intrinsic vocabulary and its
+numerical/resource rules. Native compilation and execution services are separate
+requirements. Prediction consumes the closed IR and a read-only execution model;
+its service algebra has no compiler or device dependency. Native realization,
+prediction, and solver admission remain distinct operations in preparation.
+The current native-before-planning lifecycle remains required above.
 
 Factories use a sealed refinement-rule API. They cannot fabricate raw schedule,
 storage, synchronization, numerical-transfer, or demand nodes. Each rule
@@ -208,45 +245,42 @@ numerical admissibility are solver constraints, never post-selection checks.
 The solver exports Boolean structure exactly, including disjunction,
 negation, and reified comparison.
 
-Modeled duration is the result of the target-semantic resource/dependency execution model
-over the same structured schedule, typed operations, allocation topology,
-geometry, and target profile as execution. Core construction accounts for
-exact dynamic launch multiplicity, operation/intrinsic classes, dependency
-latency, issue-resource demand, effective concurrency and residency, memory
-transactions, overlap, barriers, atomics, and command synchronization. A
-factory cannot assign or omit duration. Proxy lexicographic counters, empirical
-calibration, arbitrary weights, hard-coded timing guesses, and nominal peak
-formulas are forbidden. Missing behavior is a compiler/backend-model bug, not
-acceptable estimate error. Structural demand is exact; physical service time
-is measured and retains timer/acquisition uncertainty because future wall-clock
-time changes with thermals, power, OS scheduling, and contention. The model
-propagates that interval and never describes a prediction as physical proof.
-Data-dependent control and addressing widen the interval across every possible
-path/access class; the compiler never invents branch probabilities, cache-hit
-rates, or expected input distributions.
+Modeled duration is the result of the target-closed physical execution model
+over the same structured schedule, exact operation program, allocation
+topology, geometry, memory/address relations, path/cohort facts, native
+realization bounds, workflow lifecycle, and certified device profile as
+execution. Construction accounts for dynamic launch multiplicity,
+dependencies, issue resources, concurrency and residency, cache and memory
+transactions, overlap, barriers, atomics, submission, synchronization and
+completion. A factory cannot assign or omit duration. Proxy lexicographic
+counters, empirical candidate calibration, arbitrary weights, hard-coded
+timing guesses, and nominal peak formulas are forbidden. A missing regime
+prevents cost-program or profile construction; it cannot become a successful
+partial estimate. The model propagates correlated evidence and uncertainty and
+never describes a prediction as physical proof. Data-dependent control,
+addressing or contention uses a sound all-path relation or rejects closure; the
+compiler never invents branch probabilities, cache-hit rates, retry counts, or
+expected input distributions.
 
-Backend qualification requires relative interval half-width at most 1% for
-compute-service facts and 2% for memory, transfer, dispatch, synchronization,
-barrier, and atomic facts. Fixed held-out regular compositions must be predicted
-within 5% absolute relative error. These compositions validate uncertainty; they
-never fit correction coefficients or candidate-specific behavior. Selection
-intervals include acquisition, semantic, and composition uncertainty, and an
-overlapping difference is not reported as a physical performance win.
+Qualification criteria are selected and frozen before held-out evaluation.
+They must establish useful candidate ordering for the declared domain and
+bound the cases where modeled differences cannot justify an ordering. Held-out
+measurements validate the model and its uncertainty; they never fit correction
+coefficients or candidate-specific behavior.
 Metadata such as constants, views, and allocation
 declarations cannot form launch boundaries, and structured control stays
 within a launch unless a real execution or synchronization boundary requires
 otherwise.
 
-Coverage is constructional. `PlanSpace::new` requires one
-`UniversalImplementation` whose type admits no decisions, whose numerical
-transfer is exact, and whose legality is total over the independently derived
-target domain. Optimized implementations have a different type and cannot
-impersonate it. Optional optimization is governed by one preparation budget
-covering solver work/memory, optimized assignments, unique native templates,
-native compile time and code bytes, executable variants, and metadata bytes.
-Budget exhaustion retains the already-closed universal portfolio and reports
-non-optimality; it never returns partial coverage. Consumers supply no
-envelopes, buckets, classes, or expected shapes.
+Coverage is constructional. `CandidateDomain` requires one universal family
+whose type admits no residual choice, whose numerical transfer is admissible,
+and whose legality is total over the independently derived invocation domain.
+Optimized families have a different type and cannot impersonate it. Refinement,
+evaluation, and planning own distinct budgets and typed coverage reports.
+Budget exhaustion preserves the complete domain already constructed and the
+universal prepared policy, while reporting exactly which search scope was not
+exhausted. It never turns a partially evaluated domain into success. Consumers
+supply no envelopes, buckets, classes, or expected shapes.
 
 Selection at invocation validates the call against the schema and target
 domain, evaluates guards, and picks the minimum `(upper_duration, identity)`.
@@ -262,12 +296,21 @@ the shared structured step type; there are no backend schedule mirrors and no
 late physical/native comparison. Native errors are toolchain, malformed
 output, device loss, cache, and toolchain resource exhaustion only.
 
-Runtime execution is workflow-based. Closing `WorkflowDraft` derives all
-inter-call hazards from semantic event manifests and retains unresolved
-may-alias relationships as binding obligations. Admission validates every
-call, jointly selects admissible variants, atomically acquires one reservation
-set, and constructs `AdmittedWorkflowRun`. Only that owned value can submit;
-submission returns an execution handle and completion releases resources.
+Runtime execution is workflow-based. Runtime state is generic only over target
+family `T` and native executor `E`. The native compiler is a preparation-local
+service constrained by `NativeCompiler<T, Handle = E::Handle>` and does not
+enter prepared or runtime types; the analytical model is erased inside
+`AnalyticalEvaluationContext<T>`. `WorkflowGraphDraft::bind` derives all
+inter-call hazards from semantic event manifests, evaluates prepared policies,
+closes output descriptors, and retains unresolved may-alias relationships as
+binding obligations. `BoundWorkflowGraph::admit` atomically acquires one
+whole-graph reservation set and constructs `AdmittedRun`. Only that owned value
+can submit; submission constructs `SubmittedRun`, and terminal completion
+releases resources.
+`execute_variant` is the sole constructor of `ExecutionEnvironment`; runtime
+cannot inspect a variant's schedule, enumerate its native kernels, or construct
+an environment. A backend submission receives only the selected native handle
+through `ExecutionEnvironment::kernel_handle` while executing a closed command.
 There is no device-wide lock held across execution and synchronization.
 `Kernel::call` is a synchronous one-node workflow convenience; production
 model execution prepares at least one complete decoder-step workflow. Runtime
@@ -322,7 +365,7 @@ execution; it carries no legality fact back into planning.
 - It is impossible to construct a prepared kernel with an uncovered
   target-domain point.
 - An unreconciled native candidate cannot enter planning or execution.
-- Device contracts contain no pipeline-specific fact; concrete Metal and CUDA
+- Device descriptions contain no pipeline-specific fact; concrete Metal and CUDA
   resource/launch behavior comes from each native-kernel contract.
 - Only an admitted workflow can submit, and its selected variants,
   reservations, buffers, and native objects have one owned lifetime.

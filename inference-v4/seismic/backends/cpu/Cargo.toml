@@ -1,0 +1,18 @@
+[package]
+name = "seismic-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-ir.workspace = true
+seismic-estimator.workspace = true
+seismic-lang.workspace = true
+seismic-target.workspace = true
+seismic-compiler.workspace = true
+sha2 = "=0.11.0"
+cranelift-codegen = "=0.125.4"
+cranelift-frontend = "=0.125.4"
+cranelift-module = "=0.125.4"
+cranelift-jit = "=0.125.4"
+cranelift-native = "=0.125.4"

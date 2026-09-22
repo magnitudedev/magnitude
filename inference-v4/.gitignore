@@ -1,0 +1,27 @@
+# Rust/CMake outputs, including standalone validation crates.
+/target/
+**/target/
+
+# `seismic/target` is a source crate whose name collides with Cargo's output
+# directory name. Re-include only its source tree; nested build output stays ignored.
+!seismic/target/
+!seismic/target/Cargo.toml
+!seismic/target/src/
+!seismic/target/src/**
+
+# Local compiler/runtime cache.
+.seismic-cache/
+
+# Generated validation fixtures, reports, measurements, and environments.
+validation/**/results/
+validation/**/venv/
+validation/**/.venv/
+validation/**/*.json
+validation/**/*.jsonl
+validation/**/*.ndjson
+validation/**/__pycache__/
+
+# Solver lab output.
+solver/lab/results/
+solver/lab/evidence/
+solver/lab/**/__pycache__/

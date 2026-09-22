@@ -3,7 +3,7 @@
 //! tensors at the call boundary; the engine owns no compiler envelope.
 
 use crate::{kernels, models::qwen35::inputs::Assembled, Error};
-use seismic::{Device, Kernel, PrecisionPolicy, Tensor, Workflow, WorkflowTensor};
+use seismic::{Device, Kernel, PrecisionPolicy, Tensor, WorkflowDraft, WorkflowTensor};
 
 pub(super) struct Overlay {
     pub(super) source: Tensor,
@@ -64,7 +64,7 @@ impl Conditioning {
 
     pub(super) fn enqueue(
         &self,
-        workflow: &mut Workflow,
+        workflow: &mut WorkflowDraft,
         overlay: &Overlay,
         hidden: &WorkflowTensor,
     ) -> Result<(), Error> {

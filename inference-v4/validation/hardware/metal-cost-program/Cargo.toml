@@ -1,0 +1,13 @@
+[package]
+name = "seismic-metal-cost-program-proof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+seismic-ir = { path = "../../../seismic/ir" }
+
+[lib]
+path = "src/lib.rs"

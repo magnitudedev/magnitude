@@ -17,7 +17,7 @@ use crate::{
     Error,
 };
 use conditioning::{Conditioning, Overlay};
-use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor, Workflow};
+use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
 use std::{
     collections::{hash_map::Entry as HashEntry, HashMap},
     rc::Rc,
@@ -1310,7 +1310,7 @@ impl Decoder {
                 )?));
             }
             let started = Instant::now();
-            let completion = workflow.submit()?;
+            let completion = workflow.bind()?.admit()?.submit()?;
             if let Some(observations) = &mut observations {
                 observations.push(DecoderStepObservation {
                     stage: "workflow".into(),

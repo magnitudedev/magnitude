@@ -1615,7 +1615,10 @@ name = "seismic-compiler"
 version = "0.1.0"
 dependencies = [
  "magnitude-solver",
+ "seismic-estimator",
+ "seismic-ir",
  "seismic-lang",
+ "seismic-target",
  "sha2",
 ]
 
@@ -1629,7 +1632,10 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "seismic-compiler",
+ "seismic-estimator",
+ "seismic-ir",
  "seismic-lang",
+ "seismic-target",
  "sha2",
 ]
 
@@ -1639,6 +1645,35 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "seismic-compiler",
+ "seismic-estimator",
+ "seismic-ir",
+ "seismic-lang",
+ "seismic-target",
+ "sha2",
+]
+
+[[package]]
+name = "seismic-estimator"
+version = "0.1.0"
+dependencies = [
+ "seismic-ir",
+ "seismic-lang",
+ "sha2",
+]
+
+[[package]]
+name = "seismic-estimator-metal"
+version = "0.1.0"
+dependencies = [
+ "seismic-estimator",
+ "seismic-ir",
+ "seismic-lang",
+]
+
+[[package]]
+name = "seismic-ir"
+version = "0.1.0"
+dependencies = [
  "seismic-lang",
  "sha2",
 ]
@@ -1658,7 +1693,11 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "seismic-compiler",
+ "seismic-estimator",
+ "seismic-estimator-metal",
+ "seismic-ir",
  "seismic-lang",
+ "seismic-target",
  "sha2",
 ]
 
@@ -1670,14 +1709,24 @@ dependencies = [
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
+ "seismic-ir",
  "seismic-lang",
  "seismic-metal",
+ "seismic-target",
 ]
 
 [[package]]
 name = "seismic-std"
 version = "0.1.0"
 dependencies = [
+ "seismic-lang",
+]
+
+[[package]]
+name = "seismic-target"
+version = "0.1.0"
+dependencies = [
+ "seismic-ir",
  "seismic-lang",
 ]
 
