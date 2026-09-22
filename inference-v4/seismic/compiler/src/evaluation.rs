@@ -8,8 +8,8 @@
 use crate::candidate_domain::{
     CandidateDomain, CandidateDomainParts, DomainCandidate, TargetDomain,
 };
-use crate::implementation::{Implementation, ImplementationIdentity, UniversalImplementation};
 use crate::numerics::EvidenceCatalog;
+use crate::refinement::{CandidateFamily, CandidateFamilyIdentity, ChoiceDeclaration};
 use crate::target::{ExecutionProfile, TargetConstants};
 use seismic_estimator::FactProvenance;
 use seismic_lang::entry::{CallSchema, SemanticEventManifest};
@@ -29,6 +29,14 @@ pub struct EvaluationIdentity {
 }
 
 impl EvaluationIdentity {
+    pub(crate) fn new(device: DeviceDescriptionIdentity, provenance: EvaluationProvenance) -> Self {
+        Self {
+            device,
+            protocol: provenance.protocol,
+            evidence_fingerprint: provenance.evidence_fingerprint,
+        }
+    }
+
     pub fn device(&self) -> &DeviceDescriptionIdentity {
         &self.device
     }
@@ -58,9 +66,9 @@ impl EvaluationProvenance {
 /// Read-only executable projection granted to evaluators. Native handles,
 /// reflected artifacts, and execution services are intentionally absent.
 pub struct TargetClosedExecutableView<'a, K: seismic_ir::target::KernelDialect> {
-    identity: &'a ImplementationIdentity,
+    identity: &'a CandidateFamilyIdentity,
     execution: seismic_ir::execution::ClosedExecutionView<'a, K>,
-    choices: &'a [crate::candidate_domain::ChoiceAxis],
+    choices: &'a [ChoiceDeclaration],
     constraints: &'a [crate::candidate_domain::DomainConstraint],
 }
 
@@ -74,27 +82,26 @@ impl<K: seismic_ir::target::KernelDialect> Clone for TargetClosedExecutableView<
 
 impl<'a, T: seismic_target::TargetFamily> TargetClosedExecutableView<'a, T> {
     pub(crate) fn new(
-        implementation: &'a Implementation<T>,
-        choices: &'a [crate::candidate_domain::ChoiceAxis],
+        family: &'a CandidateFamily<T>,
         constraints: &'a [crate::candidate_domain::DomainConstraint],
     ) -> Self {
         Self {
-            identity: implementation.identity(),
-            execution: implementation.closed_execution(),
-            choices,
+            identity: family.identity(),
+            execution: family.executable.view(),
+            choices: family.choices(),
             constraints,
         }
     }
 }
 
 impl<'a, K: seismic_ir::target::KernelDialect> TargetClosedExecutableView<'a, K> {
-    pub fn identity(&self) -> &'a ImplementationIdentity {
+    pub fn identity(&self) -> &'a CandidateFamilyIdentity {
         self.identity
     }
     pub fn execution(&self) -> seismic_ir::execution::ClosedExecutionView<'a, K> {
         self.execution
     }
-    pub fn choices(&self) -> &'a [crate::candidate_domain::ChoiceAxis] {
+    pub fn choices(&self) -> &'a [ChoiceDeclaration] {
         self.choices
     }
     pub fn constraints(&self) -> &'a [crate::candidate_domain::DomainConstraint] {
@@ -236,12 +243,21 @@ pub enum EvaluationMapError<E> {
     InvalidModel(EvaluationModelError),
 }
 
-pub trait CandidateEvaluator {
-    type Domain;
-    type EvaluatedDomain;
-    type Error;
+pub(crate) use crate::evaluation_session::EvaluationSession;
 
-    fn evaluate(&self, domain: Self::Domain) -> Result<Self::EvaluatedDomain, Self::Error>;
+/// Common evaluator contract. Search, realization requests, retention, and
+/// the closed invocation selection rule are one responsibility. Both
+/// analytical and feedback implementations return this same policy type.
+pub(crate) trait CandidateEvaluator<T, C>
+where
+    T: seismic_target::TargetFamily,
+    C: seismic_target::NativeCompiler<T>,
+{
+    fn evaluate(
+        &self,
+        domain: CandidateDomain<T>,
+        session: &mut EvaluationSession<'_, T, C>,
+    ) -> Result<crate::planning::SelectionPolicy<T>, crate::errors::PreparationError>;
 }
 
 /// Immutable analytical closure for one opened target. Assembly derives the
@@ -443,15 +459,11 @@ impl<'a, T: seismic_target::TargetFamily> AnalyticalEvaluator<'a, T> {
     }
 }
 
-impl<T: seismic_target::TargetFamily> CandidateEvaluator for AnalyticalEvaluator<'_, T> {
-    type Domain = CandidateDomain<T>;
-    type EvaluatedDomain = EvaluatedCandidateDomain<T>;
-    type Error = EvaluationError;
-
-    fn evaluate(
+impl<T: seismic_target::TargetFamily> AnalyticalEvaluator<'_, T> {
+    pub(crate) fn evaluate_domain(
         &self,
         domain: CandidateDomain<T>,
-    ) -> Result<EvaluatedCandidateDomain<T>, EvaluationError> {
+    ) -> Result<AnalyticalDomainModel<T>, EvaluationError> {
         if domain.device_identity() != self.context.device.identity() {
             return Err(EvaluationError::DeviceMismatch);
         }
@@ -546,7 +558,7 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
     /// Constructional total map over the sealed domain. The closure is called
     /// exactly once for the universal family and once for every optimized
     /// family. Any error consumes the domain and returns no partial result.
-    pub fn try_evaluate_total<E>(
+    pub(crate) fn try_evaluate_total<E>(
         self,
         provenance: EvaluationProvenance,
         objective: PerformanceObjective,
@@ -554,8 +566,9 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
             &mut ExprArena,
             TargetClosedExecutableView<'_, B>,
         ) -> Result<CandidatePerformanceModel, E>,
-    ) -> Result<EvaluatedCandidateDomain<B>, EvaluationMapError<E>> {
+    ) -> Result<AnalyticalDomainModel<B>, EvaluationMapError<E>> {
         let CandidateDomainParts {
+            domain_token,
             entry,
             module,
             schema,
@@ -571,25 +584,21 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
             precision,
             optimization_exhausted,
         } = self.into_parts();
-        let identity = EvaluationIdentity {
-            device: device.clone(),
-            protocol: provenance.protocol,
-            evidence_fingerprint: provenance.evidence_fingerprint,
-        };
-        let universal_view = TargetClosedExecutableView::new(universal.as_inner(), &[], &[]);
+        let identity = EvaluationIdentity::new(device.clone(), provenance);
+        let universal_view =
+            TargetClosedExecutableView::new(&universal.family, universal.constraints.conjuncts());
         let performance =
             evaluate(&mut arena, universal_view).map_err(EvaluationMapError::Evaluator)?;
         validate_performance_model(&arena, universal_view, objective, &performance)
             .map_err(EvaluationMapError::InvalidModel)?;
         let universal = EvaluatedUniversal {
-            implementation: universal,
+            candidate: universal,
             performance,
         };
         let mut evaluated = Vec::with_capacity(optimized.len());
         for candidate in optimized {
             let view = TargetClosedExecutableView::new(
-                candidate.implementation.as_inner(),
-                &candidate.axes,
+                &candidate.family,
                 candidate.constraints.conjuncts(),
             );
             let performance = evaluate(&mut arena, view).map_err(EvaluationMapError::Evaluator)?;
@@ -600,7 +609,8 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
                 performance,
             });
         }
-        Ok(EvaluatedCandidateDomain {
+        Ok(AnalyticalDomainModel {
+            domain_token,
             entry,
             module,
             schema,
@@ -657,7 +667,8 @@ fn validate_performance_model<K: seismic_ir::target::KernelDialect>(
 }
 
 #[derive(Debug)]
-pub struct EvaluatedCandidateDomain<B: seismic_target::TargetFamily> {
+pub(crate) struct AnalyticalDomainModel<B: seismic_target::TargetFamily> {
+    domain_token: u64,
     entry: StableEntryId,
     module: ModuleHash,
     schema: Arc<CallSchema>,
@@ -675,24 +686,33 @@ pub struct EvaluatedCandidateDomain<B: seismic_target::TargetFamily> {
     optimization_exhausted: bool,
 }
 
-impl<B: seismic_target::TargetFamily> EvaluatedCandidateDomain<B> {
-    pub fn entry(&self) -> StableEntryId {
-        self.entry
-    }
-    pub fn module(&self) -> ModuleHash {
-        self.module
-    }
-    pub fn schema(&self) -> &Arc<CallSchema> {
-        &self.schema
-    }
-    pub fn target_domain(&self) -> TargetDomain {
-        self.target_domain
+impl<B: seismic_target::TargetFamily> AnalyticalDomainModel<B> {
+    pub(crate) fn from_parts(parts: AnalyticalDomainModelParts<B>) -> Self {
+        Self {
+            domain_token: parts.domain_token,
+            entry: parts.entry,
+            module: parts.module,
+            schema: parts.schema,
+            semantic_events: parts.semantic_events,
+            target_domain: parts.target_domain,
+            constants: parts.constants,
+            device: parts.device,
+            evaluation: parts.evaluation,
+            target: parts.target,
+            evidence: parts.evidence,
+            arena: parts.arena,
+            universal: parts.universal,
+            optimized: parts.optimized,
+            precision: parts.precision,
+            optimization_exhausted: parts.optimization_exhausted,
+        }
     }
 
     /// Passive consuming projection used by planning. No solver state or
     /// planning policy is created by the evaluated domain itself.
-    pub(crate) fn into_parts(self) -> EvaluatedCandidateDomainParts<B> {
-        EvaluatedCandidateDomainParts {
+    pub(crate) fn into_parts(self) -> AnalyticalDomainModelParts<B> {
+        AnalyticalDomainModelParts {
+            domain_token: self.domain_token,
             entry: self.entry,
             module: self.module,
             schema: self.schema,
@@ -710,11 +730,38 @@ impl<B: seismic_target::TargetFamily> EvaluatedCandidateDomain<B> {
             optimization_exhausted: self.optimization_exhausted,
         }
     }
+
+    pub(crate) fn into_candidate_domain(self) -> (CandidateDomain<B>, EvaluationIdentity) {
+        let parts = self.into_parts();
+        let evaluation = parts.evaluation;
+        let domain = CandidateDomain::from_parts(CandidateDomainParts {
+            domain_token: parts.domain_token,
+            entry: parts.entry,
+            module: parts.module,
+            schema: parts.schema,
+            semantic_events: parts.semantic_events,
+            target_domain: parts.target_domain,
+            constants: parts.constants,
+            device: parts.device,
+            target: parts.target,
+            evidence: parts.evidence,
+            arena: parts.arena,
+            universal: parts.universal.candidate,
+            optimized: parts
+                .optimized
+                .into_iter()
+                .map(|value| value.candidate)
+                .collect(),
+            precision: parts.precision,
+            optimization_exhausted: parts.optimization_exhausted,
+        });
+        (domain, evaluation)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct EvaluatedUniversal<B: seismic_target::TargetFamily> {
-    pub(crate) implementation: UniversalImplementation<B>,
+    pub(crate) candidate: DomainCandidate<B>,
     pub(crate) performance: CandidatePerformanceModel,
 }
 
@@ -725,7 +772,8 @@ pub(crate) struct EvaluatedCandidate<B: seismic_target::TargetFamily> {
 }
 
 #[derive(Debug)]
-pub(crate) struct EvaluatedCandidateDomainParts<B: seismic_target::TargetFamily> {
+pub(crate) struct AnalyticalDomainModelParts<B: seismic_target::TargetFamily> {
+    pub(crate) domain_token: u64,
     pub(crate) entry: StableEntryId,
     pub(crate) module: ModuleHash,
     pub(crate) schema: Arc<CallSchema>,

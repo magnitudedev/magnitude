@@ -8,8 +8,8 @@
 //!
 //! The only artifact progression is
 //! `CheckedModule -> LogicalEntry -> CandidateDomain<B>
-//!  -> EvaluatedCandidateDomain<B> -> PlannedPolicy<B>
-//!  -> PreparedKernel<T, H>`.
+//!  -> CandidateEvaluator -> SelectionPolicy<B> -> PreparedKernel<B, H>`.
+//! Evaluator-internal estimation and solver state are not artifact boundaries.
 //!
 //! Planning authority and raw solver witnesses are intentionally absent from
 //! the public API:
@@ -36,14 +36,16 @@ pub mod refinement;
 pub mod solve;
 pub mod target;
 
+mod evaluation_session;
 mod expression;
 mod frozen;
 mod portable;
 mod realization;
 
 pub use planning::{
-    plan, OptimizationCompletion, PlannedPolicy, PlanningBudgetReport, PlanningBudgetResource,
-    PlanningCoverage, PlanningError, PlanningInfeasibleReport, PlanningLimit, TargetCoverage,
+    OptimizationCompletion, PlanningBudgetReport, PlanningBudgetResource, PlanningCoverage,
+    PlanningError, PlanningInfeasibleReport, PlanningLimit, SelectionPolicy, TargetCoverage,
 };
 pub use preparation_budget::{PlanningBudget, PreparationBudget};
 pub use prepare::prepare_analytically;
+pub use prepared::{CandidateIndex, SelectionFunction};

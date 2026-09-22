@@ -25,9 +25,9 @@ pub(crate) mod native;
 
 use crate::numerics::NumericalTransfer;
 use crate::refinement::{
-    CandidateFamily, CandidateFamilyIdentity, CandidateFamilyParts, ConstructionAuthority,
-    FactoryIdentity, ImplementationProvenance, PublishedResult, PublishedScalarKind,
-    RefinementBudget, ResultPublication,
+    CandidateFamily, CandidateFamilyIdentity, CandidateFamilyParts, ChoiceDeclaration,
+    ConstructionAuthority, FactoryIdentity, ImplementationProvenance, PublishedResult,
+    PublishedScalarKind, RefinementBudget, ResultPublication,
 };
 use crate::target::{CompilerRegistry, TargetConstants};
 use seismic_ir::construction::Construction;
@@ -63,180 +63,52 @@ pub struct ImplementationIdentity {
     pub structure: [u8; 32],
 }
 
-/// Stable pre-compilation identities for a family's native templates.  This
-/// sits on the realization side of the boundary so [`CandidateFamily`] has no
-/// native operation.
-pub(crate) fn candidate_native_template_identities<B: seismic_target::TargetFamily>(
-    family: &CandidateFamily<B>,
-    target: &DeviceDescription<B>,
-) -> Vec<[u8; 32]> {
-    family
-        .executable
-        .kernels()
-        .kernels()
-        .enumerate()
-        .map(|(ordinal, _)| {
-            let mut digest =
-                seismic_ir::identity::StructureDigest::new("seismic-native-template-v1");
-            digest.bytes(&family.identity.structure);
-            digest.hashed(&ordinal);
-            digest.bytes(&target.compatibility_identity().fingerprint);
-            digest.finish()
-        })
-        .collect()
-}
-
 /// Consumes one pure family into a natively reconciled implementation.
 ///
 /// Universal launch specialization uses only reflected native legality.
 /// Performance evaluation is owned by `evaluation` after the whole candidate
 /// domain has been sealed and cannot change executable structure.
 pub(crate) fn reconcile_candidate_with_descriptions<B: seismic_target::TargetFamily>(
-    mut family: CandidateFamily<B>,
+    family: Arc<CandidateFamily<B>>,
+    assignment: seismic_lang::expr::PartialAssignment,
     arena: &mut ExprArena,
     target: &DeviceDescription<B>,
     registry: &CompilerRegistry<B>,
-    constants: &TargetConstants,
-    native_descriptions: Vec<seismic_target::NativeKernelDescription<B>>,
+    native: &crate::realization::RealizedNativeSet<B>,
 ) -> Result<Implementation<B>, crate::errors::PreparationError> {
-    let mut total_launch_certificate = None;
-    if family.authority == ConstructionAuthority::UniversalPortable {
-        let (certificate, chunks) = specialize_universal_launches(
-            arena,
-            constants,
-            family.executable.schedule(),
-            &native_descriptions,
-        )?;
-        family.executable = family.executable.chunk_semantic_launches(arena, chunks);
-        total_launch_certificate = Some(certificate);
-    }
-
-    let (reflected, native_launch_modes) = native_hard_constraints(
-        arena,
-        target,
-        registry,
-        family.executable.schedule(),
-        family.executable.kernels(),
-        family.executable.launch_layouts(),
-        &native_descriptions,
-        family.authority != ConstructionAuthority::UniversalPortable,
-    );
+    let (reflected, native_launch_modes) =
+        native_hard_constraints(arena, target, registry, &family, native);
     let combined = arena.and(family.hard_constraints, reflected);
     let side_conditions = arena.side_conditions(AnyExpr::Bool(combined));
-    family.hard_constraints = arena.and(side_conditions, combined);
+    let hard_constraints = arena.and(side_conditions, combined);
 
     let mut digest = seismic_ir::identity::StructureDigest::new("seismic-implementation-native-v1");
     digest.bytes(&family.identity.structure);
-    for native in &native_descriptions {
-        digest.bytes(&native.identity.compatibility.fingerprint);
-        digest.bytes(&native.identity.artifact_digest);
-        digest.bytes(&native.numerical_identity.fingerprint);
+    digest.bytes(&native.assignment_identity());
+    for description in native.descriptions() {
+        digest.bytes(&description.identity.compatibility.fingerprint);
+        digest.bytes(&description.identity.artifact_digest);
+        digest.bytes(&description.numerical_identity.fingerprint);
     }
     let identity = ImplementationIdentity {
         factory: family.identity.factory.clone(),
         structure: digest.finish(),
     };
+    let native_descriptions = native.descriptions().cloned().collect::<Vec<_>>();
+    let mut native_kernel_remap = vec![None; family.kernels().kernels().count()];
+    for original in native.original_kernels() {
+        native_kernel_remap[original.ordinal() as usize] = native.native_kernel_index(original);
+    }
     Ok(Implementation {
         family,
         identity,
+        assignment_identity: native.assignment_identity(),
+        assignment,
+        hard_constraints,
         native_descriptions,
+        native_kernel_remap,
         native_launch_modes,
-        total_launch_certificate,
     })
-}
-
-/// Private construction witness that every semantic launch was rewritten to
-/// exact chunks within its reconciled native grid domain.
-/// It has no public constructor: possession is the proof consumed by
-/// `UniversalImplementation`.
-#[derive(Debug)]
-struct TotalLaunchCertificate {
-    maximum_grid_x: Vec<u64>,
-}
-
-fn specialize_universal_launches<B: seismic_target::TargetFamily>(
-    arena: &mut ExprArena,
-    constants: &TargetConstants,
-    schedule: &ParametricSchedule,
-    native_kernels: &[seismic_target::NativeKernelDescription<B>],
-) -> Result<
-    (
-        TotalLaunchCertificate,
-        Vec<(seismic_ir::schedule::LaunchId, NatExpr)>,
-    ),
-    crate::errors::PreparationError,
-> {
-    let mut fixed = seismic_lang::expr::PartialAssignment::new();
-    for (symbol, value) in constants.bindings() {
-        fixed.bind(*symbol, *value);
-    }
-    let launches = schedule.launches().to_vec();
-    let mut caps = Vec::with_capacity(launches.len());
-    for (ordinal, launch) in launches.iter().enumerate() {
-        let semantic = match (launch.parallel_extent, launch.logical_base) {
-            (Some(_), Some(_)) => true,
-            (None, None) => false,
-            _ => {
-                return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                    "launch {ordinal} has incomplete compiler-owned logical indexing"
-                )));
-            }
-        };
-        let native = &native_kernels[launch.kernel.index() as usize];
-        if !semantic {
-            let mut concrete_grid = [0u64; 3];
-            for (axis, value) in launch.grid.iter().enumerate() {
-                let value = arena.partial(*value, &fixed);
-                let NodeView::NatConst(value) = arena.view(AnyExpr::Nat(value)) else {
-                    return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                        "fixed launch {ordinal} grid is not constructionally closed"
-                    )));
-                };
-                if value == 0 || value > native.launch.max_grid[axis] {
-                    return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                        "fixed launch {ordinal} exceeds reflected grid legality"
-                    )));
-                }
-                concrete_grid[axis] = value;
-            }
-            caps.push(concrete_grid[0]);
-            continue;
-        }
-        if launch.mode != seismic_ir::schedule::LaunchMode::Independent {
-            return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                "semantic launch {ordinal} is not independently chunkable"
-            )));
-        }
-        for axis in 1..3 {
-            let axis = arena.partial(launch.grid[axis], &fixed);
-            if !matches!(arena.view(AnyExpr::Nat(axis)), NodeView::NatConst(1)) {
-                return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                    "semantic launch {ordinal} is not exactly invertible as a one-dimensional launch"
-                )));
-            }
-        }
-        let cap = native.launch.max_grid[0];
-        if cap == 0 {
-            return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                "semantic launch {ordinal} has zero reflected grid capacity"
-            )));
-        }
-        caps.push(cap);
-    }
-    let mut chunks = Vec::new();
-    for (ordinal, cap) in caps.iter().copied().enumerate() {
-        if launches[ordinal].parallel_extent.is_none() {
-            continue;
-        }
-        let id = schedule.launch_id(ordinal as u32);
-        chunks.push((id, arena.nat(cap)));
-    }
-    Ok((
-        TotalLaunchCertificate {
-            maximum_grid_x: caps,
-        },
-        chunks,
-    ))
 }
 
 #[cfg(test)]
@@ -345,18 +217,20 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
     arena: &mut ExprArena,
     target: &DeviceDescription<B>,
     registry: &CompilerRegistry<B>,
-    schedule: &ParametricSchedule,
-    kernels: &KernelArena<B>,
-    launch_layouts: &[seismic_ir::storage::LaunchLocalLayout],
-    native_descriptions: &[seismic_target::NativeKernelDescription<B>],
-    include_grid_x: bool,
-) -> (BoolExpr, Vec<B::NativeLaunchMode>) {
+    family: &CandidateFamily<B>,
+    native: &crate::realization::RealizedNativeSet<B>,
+) -> (BoolExpr, Vec<Option<B::NativeLaunchMode>>) {
     let mut constraints = Vec::new();
-    let mut native_launch_modes = Vec::with_capacity(schedule.launches().len());
-    for (launch, local_layout) in schedule.launches().iter().zip(launch_layouts) {
-        let native = &native_descriptions[launch.kernel.index() as usize];
-        let kernel = kernels.kernel(launch.kernel);
-        let domain = &native.launch;
+    let schedule = family.schedule();
+    let mut native_launch_modes = vec![None; schedule.launches().len()];
+    for id in native.active_launches() {
+        let launch = schedule.launch(*id);
+        let local_layout = &family.launch_layouts()[id.index() as usize];
+        let description = native
+            .description(launch.kernel)
+            .unwrap_or_else(|| panic!("active launch has no realized native kernel"));
+        let kernel = family.kernels().kernel(launch.kernel);
+        let domain = &description.launch;
         let required_mode = match launch.mode {
             seismic_ir::schedule::LaunchMode::Independent => {
                 registry.independent_launch_mode().clone()
@@ -393,14 +267,12 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
                 launch.workgroup[axis],
                 workgroup_max,
             ));
-            if axis != 0 || include_grid_x {
-                let grid_max = arena.nat(domain.max_grid[axis]);
-                constraints.push(arena.nat_cmp(
-                    seismic_lang::expr::CmpOp::Le,
-                    launch.grid[axis],
-                    grid_max,
-                ));
-            }
+            let grid_max = arena.nat(domain.max_grid[axis]);
+            constraints.push(arena.nat_cmp(
+                seismic_lang::expr::CmpOp::Le,
+                launch.grid[axis],
+                grid_max,
+            ));
         }
         let local_max = arena.nat(domain.max_dynamic_local_bytes);
         constraints.push(arena.nat_cmp(
@@ -408,17 +280,16 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
             local_layout.workgroup_bytes,
             local_max,
         ));
-        native_launch_modes.push(required_mode);
+        native_launch_modes[id.index() as usize] = Some(required_mode);
         constraints.extend(registry.native_launch_constraints(
             target,
             arena,
             launch,
             local_layout,
             kernel,
-            native,
+            description,
         ));
     }
-    assert_eq!(native_launch_modes.len(), schedule.launches().len());
     (arena.all(&constraints), native_launch_modes)
 }
 
@@ -493,69 +364,17 @@ fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> St
 /// already been folded into `hard_constraints`.
 #[derive(Debug)]
 pub struct Implementation<B: seismic_target::TargetFamily> {
-    family: CandidateFamily<B>,
+    family: Arc<CandidateFamily<B>>,
     identity: ImplementationIdentity,
+    assignment_identity: [u8; 32],
+    assignment: seismic_lang::expr::PartialAssignment,
+    hard_constraints: BoolExpr,
     native_descriptions: Vec<seismic_target::NativeKernelDescription<B>>,
-    native_launch_modes: Vec<B::NativeLaunchMode>,
-    total_launch_certificate: Option<TotalLaunchCertificate>,
+    native_kernel_remap: Vec<Option<u32>>,
+    native_launch_modes: Vec<Option<B::NativeLaunchMode>>,
 }
 
 impl<B: seismic_target::TargetFamily> Implementation<B> {
-    pub(crate) fn retained_metadata_bytes(&self) -> u64 {
-        let family = &self.family;
-        let local_allocations = family.executable.local_allocations();
-        let mut bytes = std::mem::size_of_val(self)
-            .saturating_add(family.executable.schedule().retained_bytes())
-            .saturating_add(family.executable.kernels().retained_bytes())
-            .saturating_add(family.executable.storage().retained_bytes())
-            .saturating_add(local_allocations.retained_bytes())
-            .saturating_add(
-                family.executable.allocation_constraints().len() * std::mem::size_of::<BoolExpr>(),
-            )
-            .saturating_add(family.executable.retained_layout_bytes())
-            .saturating_add(
-                family.launch_scratch.capacity()
-                    * std::mem::size_of::<seismic_ir::storage::LaunchScratchRequirements>(),
-            )
-            .saturating_add(
-                family.launch_abi.capacity()
-                    * std::mem::size_of::<Vec<seismic_ir::storage::LaunchAbiRequirement>>(),
-            )
-            .saturating_add(
-                family
-                    .launch_abi
-                    .iter()
-                    .map(|abi| {
-                        abi.capacity()
-                            * std::mem::size_of::<seismic_ir::storage::LaunchAbiRequirement>()
-                    })
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                family.decisions.capacity() * std::mem::size_of::<(DecisionId, &'static str)>(),
-            )
-            .saturating_add(
-                family.provenance.callees.capacity() * std::mem::size_of::<StableFunctionId>(),
-            )
-            .saturating_add(
-                family.result_publications.capacity() * std::mem::size_of::<ResultPublication>(),
-            )
-            .saturating_add(
-                family
-                    .result_publications
-                    .iter()
-                    .map(|result| result.path.capacity() * std::mem::size_of::<u32>())
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                self.native_descriptions.capacity()
-                    * std::mem::size_of::<seismic_target::NativeKernelDescription<B>>(),
-            );
-        // The transfer owns nested output/effect/operation/evidence vectors;
-        // its explicit estimator remains colocated with that representation.
-        bytes = bytes.saturating_add(family.numerical_transfer.retained_bytes());
-        u64::try_from(bytes).unwrap_or(u64::MAX)
-    }
     pub fn identity(&self) -> &ImplementationIdentity {
         &self.identity
     }
@@ -571,8 +390,17 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     pub(crate) fn native_descriptions(&self) -> &[seismic_target::NativeKernelDescription<B>] {
         &self.native_descriptions
     }
-    pub(crate) fn native_launch_modes(&self) -> &[B::NativeLaunchMode] {
+    pub(crate) fn native_launch_modes(&self) -> &[Option<B::NativeLaunchMode>] {
         &self.native_launch_modes
+    }
+    pub(crate) fn native_kernel_remap(&self) -> &[Option<u32>] {
+        &self.native_kernel_remap
+    }
+    pub(crate) fn assignment(&self) -> &seismic_lang::expr::PartialAssignment {
+        &self.assignment
+    }
+    pub(crate) fn assignment_identity(&self) -> [u8; 32] {
+        self.assignment_identity
     }
     pub(crate) fn native_numerical_identity(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
@@ -601,11 +429,15 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     pub fn launch_abi(&self) -> &[Vec<seismic_ir::storage::LaunchAbiRequirement>] {
         self.family.launch_abi()
     }
-    pub fn decisions(&self) -> &[(DecisionId, &'static str)] {
-        self.family.decisions()
+    pub fn decisions(&self) -> Vec<(DecisionId, &'static str)> {
+        self.family
+            .choices()
+            .iter()
+            .map(|choice| (choice.decision(), choice.meaning()))
+            .collect()
     }
     pub fn hard_constraints(&self) -> BoolExpr {
-        self.family.hard_constraints()
+        self.hard_constraints
     }
     pub fn numerical_transfer(&self) -> &NumericalTransfer {
         self.family.numerical_transfer()
@@ -624,81 +456,57 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct UniversalImplementation<B: seismic_target::TargetFamily>(Arc<Implementation<B>>);
-
-impl<B: seismic_target::TargetFamily> UniversalImplementation<B> {
-    fn new(implementation: Implementation<B>) -> Self {
-        Self(Arc::new(implementation))
+pub(crate) fn validate_universal_implementation<B: seismic_target::TargetFamily>(
+    implementation: &Implementation<B>,
+    arena: &mut ExprArena,
+    target_domain: BoolExpr,
+    constants: &TargetConstants,
+) -> Result<(), crate::errors::PreparationError> {
+    if implementation.authority() != ConstructionAuthority::UniversalPortable
+        || implementation.numerical_role() != seismic_lang::entry::NumericalRole::Reference
+    {
+        return Err(crate::errors::PreparationError::UniversalClosure(
+            "implementation lacks checked reference provenance".into(),
+        ));
     }
-    pub(crate) fn from_closed_reference(
-        mut implementation: Implementation<B>,
-        arena: &mut ExprArena,
-        target_domain: BoolExpr,
-        constants: &TargetConstants,
-    ) -> Result<Self, crate::errors::PreparationError> {
-        let certificate = implementation
-            .total_launch_certificate
-            .take()
-            .ok_or_else(|| {
-                crate::errors::PreparationError::UniversalClosure(
-                    "implementation lacks a total launch certificate".into(),
-                )
-            })?;
-        if certificate.maximum_grid_x.len() != implementation.schedule().launches().len()
-            || certificate.maximum_grid_x.iter().any(|cap| *cap == 0)
-        {
-            return Err(crate::errors::PreparationError::UniversalClosure(
-                "total launch certificate does not cover the closed schedule".into(),
-            ));
-        }
-        if implementation.authority() != ConstructionAuthority::UniversalPortable
-            || implementation.numerical_role() != seismic_lang::entry::NumericalRole::Reference
-        {
-            return Err(crate::errors::PreparationError::UniversalClosure(
-                "implementation lacks checked reference provenance".into(),
-            ));
-        }
-        if !implementation.decisions().is_empty() {
-            return Err(crate::errors::PreparationError::UniversalClosure(
-                "reference implementation contains finite decisions".into(),
-            ));
-        }
-        if !implementation.numerical_transfer().is_exact() {
-            return Err(crate::errors::PreparationError::UniversalClosure(
-                "reference numerical transfer is not exact".into(),
-            ));
-        }
-        let mut fixed = seismic_lang::expr::PartialAssignment::new();
-        for (symbol, value) in constants.bindings() {
-            fixed.bind(*symbol, *value);
-        }
-        let mut close = |expression: BoolExpr| {
-            let expression = arena.partial(expression, &fixed);
-            if arena.free_symbols(AnyExpr::Bool(expression)).is_empty() {
-                if let Ok(value) =
-                    arena.eval_bool(expression, &seismic_lang::expr::Assignment::new())
-                {
-                    return arena.bool(value);
-                }
+    if !implementation.decisions().is_empty() {
+        return Err(crate::errors::PreparationError::UniversalClosure(
+            "reference implementation contains finite decisions".into(),
+        ));
+    }
+    if !implementation.numerical_transfer().is_exact() {
+        return Err(crate::errors::PreparationError::UniversalClosure(
+            "reference numerical transfer is not exact".into(),
+        ));
+    }
+    let mut fixed = seismic_lang::expr::PartialAssignment::new();
+    for (symbol, value) in constants.bindings() {
+        fixed.bind(*symbol, *value);
+    }
+    let mut close = |expression: BoolExpr| {
+        let expression = arena.partial(expression, &fixed);
+        if arena.free_symbols(AnyExpr::Bool(expression)).is_empty() {
+            if let Ok(value) = arena.eval_bool(expression, &seismic_lang::expr::Assignment::new()) {
+                return arena.bool(value);
             }
-            expression
+        }
+        expression
+    };
+    let target_domain = close(target_domain);
+    let semantic_coverage = close(implementation.semantic_coverage().node());
+    let hard_constraints = close(implementation.hard_constraints());
+    let coverage = arena.all(&[semantic_coverage, hard_constraints]);
+    let total = arena.implies(target_domain, coverage);
+    if !matches!(arena.view(AnyExpr::Bool(total)), NodeView::BoolConst(true)) {
+        let symbol_summary = |expression: BoolExpr| {
+            arena
+                .free_symbols(AnyExpr::Bool(expression))
+                .into_iter()
+                .map(|symbol| format!("{symbol:?}:{:?}", arena.symbol_kind(symbol)))
+                .collect::<Vec<_>>()
+                .join(",")
         };
-        let target_domain = close(target_domain);
-        let semantic_coverage = close(implementation.semantic_coverage().node());
-        let hard_constraints = close(implementation.hard_constraints());
-        let coverage = arena.all(&[semantic_coverage, hard_constraints]);
-        let total = arena.implies(target_domain, coverage);
-        if !matches!(arena.view(AnyExpr::Bool(total)), NodeView::BoolConst(true)) {
-            let symbol_summary = |expression: BoolExpr| {
-                arena
-                    .free_symbols(AnyExpr::Bool(expression))
-                    .into_iter()
-                    .map(|symbol| format!("{symbol:?}:{:?}", arena.symbol_kind(symbol)))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            return Err(crate::errors::PreparationError::UniversalClosure(format!(
+        return Err(crate::errors::PreparationError::UniversalClosure(format!(
                 "post-native legality is not constructionally total over TargetDomain (target={:?} target_symbols=[{}], semantic={:?}, hard={:?} hard_detail={} hard_symbols=[{}], implication={:?})",
                 arena.view(AnyExpr::Bool(target_domain)),
                 symbol_summary(target_domain),
@@ -708,33 +516,8 @@ impl<B: seismic_target::TargetFamily> UniversalImplementation<B> {
                 symbol_summary(hard_constraints),
                 arena.view(AnyExpr::Bool(total)),
             )));
-        }
-        Ok(Self::new(implementation))
     }
-    pub(crate) fn shared(&self) -> Arc<Implementation<B>> {
-        self.0.clone()
-    }
-    pub(crate) fn as_inner(&self) -> &Implementation<B> {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OptimizedImplementation<B: seismic_target::TargetFamily>(Arc<Implementation<B>>);
-
-impl<B: seismic_target::TargetFamily> OptimizedImplementation<B> {
-    fn new(implementation: Implementation<B>) -> Self {
-        Self(Arc::new(implementation))
-    }
-    pub(crate) fn from_closed(implementation: Implementation<B>) -> Self {
-        Self::new(implementation)
-    }
-    pub(crate) fn as_inner(&self) -> &Implementation<B> {
-        &self.0
-    }
-    pub(crate) fn shared(&self) -> Arc<Implementation<B>> {
-        self.0.clone()
-    }
+    Ok(())
 }
 
 /// What a factory sees.
@@ -1382,7 +1165,7 @@ mod internals {
         result_slots: HashMap<SemanticValueId, ScalarPublication>,
         pending_result_paths: HashMap<SemanticValueId, Vec<Vec<u32>>>,
         pub(super) schedule_region: u32,
-        decisions: Vec<(DecisionId, &'static str)>,
+        choices: Vec<ChoiceDeclaration>,
         constraints: Vec<BoolExpr>,
         callees: Vec<StableFunctionId>,
         conditional_child_transfers: Vec<ConditionalNumericalTransfer>,
@@ -1741,7 +1524,7 @@ mod internals {
                 result_slots: HashMap::new(),
                 pending_result_paths,
                 schedule_region: 0,
-                decisions: Vec::new(),
+                choices: Vec::new(),
                 constraints: Vec::new(),
                 callees: Vec::new(),
                 conditional_child_transfers: Vec::new(),
@@ -1760,7 +1543,12 @@ mod internals {
         }
         pub(super) fn decision(&mut self, name: &'static str, domain: FiniteDomain) -> DecisionId {
             let decision = self.arena.decision(domain);
-            self.decisions.push((decision, name));
+            let active_when = self.arena.bool(true);
+            self.choices.push(ChoiceDeclaration {
+                decision,
+                meaning: name,
+                active_when,
+            });
             decision
         }
         pub(super) fn constrain(&mut self, predicate: BoolExpr) {
@@ -2533,7 +2321,13 @@ mod internals {
                 let imported = self
                     .construction
                     .import(self.arena, child_ir, &forced_slots);
-                self.decisions.extend(parts.decisions);
+                let child_choices = if let Some(decision) = decision {
+                    let selected = self.arena.decision_is(decision, ordinal as i64);
+                    crate::refinement::activate_choices(self.arena, selected, parts.choices)
+                } else {
+                    parts.choices
+                };
+                self.choices.extend(child_choices);
                 self.callees.push(parts.provenance.root);
                 self.callees.extend(parts.provenance.callees);
                 if let Some(decision) = decision {
@@ -2565,7 +2359,7 @@ mod internals {
             let coverage = self.semantic_coverage;
             if self.authority == ConstructionAuthority::UniversalPortable {
                 assert!(
-                    self.decisions.is_empty(),
+                    self.choices.is_empty(),
                     "universal portable implementation cannot contain finite decisions"
                 );
             }
@@ -2595,8 +2389,16 @@ mod internals {
             let (planned, reuse_decisions, reuse_constraints) =
                 crate::refinement::refine_allocation_choices(self.arena, analyzed, reuse_policy)
                     .into_parts();
-            self.decisions.extend(reuse_decisions);
+            for (decision, meaning) in reuse_decisions {
+                let active_when = self.arena.bool(true);
+                self.choices.push(ChoiceDeclaration {
+                    decision,
+                    meaning,
+                    active_when,
+                });
+            }
             self.constraints.extend(reuse_constraints);
+            crate::refinement::validate_choice_declarations(self.arena, &self.choices);
             let liveness = planned.liveness();
             let slots = planned.slots();
             let launch_layouts: Vec<_> = planned
@@ -2766,7 +2568,7 @@ mod internals {
                 executable,
                 launch_scratch,
                 launch_abi,
-                decisions: self.decisions,
+                choices: self.choices,
                 hard_constraints,
                 numerical_transfer,
                 provenance: ImplementationProvenance {
@@ -3822,10 +3624,10 @@ mod internals {
             ConstructionAuthority::UniversalPortable => b"universal",
             ConstructionAuthority::Optimized => b"optimized",
         });
-        digest.hashed(&builder.decisions.len());
-        for (decision, name) in &builder.decisions {
-            digest.bytes(name.as_bytes());
-            digest.hashed(builder.arena.decision_domain(*decision).values());
+        digest.hashed(&builder.choices.len());
+        for choice in &builder.choices {
+            digest.bytes(choice.meaning.as_bytes());
+            digest.hashed(builder.arena.decision_domain(choice.decision).values());
         }
 
         assert_eq!(allocation_ids.len(), storage.allocation_count() as usize);
@@ -3897,9 +3699,9 @@ mod internals {
             }
             digest.hashed(&slots[index].and_then(|decision| {
                 builder
-                    .decisions
+                    .choices
                     .iter()
-                    .position(|(candidate, _)| *candidate == decision)
+                    .position(|choice| choice.decision == decision)
             }));
         }
         digest.hashed(&storage.views().len());
@@ -4051,9 +3853,9 @@ mod internals {
                     Some((decision, expected)) => {
                         digest.bool(true);
                         let ordinal = builder
-                            .decisions
+                            .choices
                             .iter()
-                            .position(|(candidate, _)| *candidate == decision)
+                            .position(|choice| choice.decision == decision)
                             .expect("numerical transfer references an unowned decision");
                         digest.hashed(&ordinal);
                         digest.i64(expected);
@@ -4567,9 +4369,9 @@ mod internals {
                     digest.bytes(b"choose");
                     digest.hashed(
                         &builder
-                            .decisions
+                            .choices
                             .iter()
-                            .position(|(candidate, _)| candidate == decision),
+                            .position(|choice| &choice.decision == decision),
                     );
                     for (value, body) in options {
                         digest.hashed(value);

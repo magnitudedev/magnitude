@@ -7,6 +7,7 @@ pub mod identity;
 pub mod kernel;
 pub mod repr;
 pub mod schedule;
+pub mod specialization;
 pub mod storage;
 pub mod target;
 

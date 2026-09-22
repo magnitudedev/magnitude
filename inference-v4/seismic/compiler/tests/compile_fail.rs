@@ -60,6 +60,27 @@ const CASES: &[Case] = &[
         name: "execution_environment_literal",
         diagnostic: "of struct `ExecutionEnvironment` are private",
     },
+    Case {
+        name: "selection_function_literal",
+        diagnostic: "field `program` of struct `SelectionFunction` is private",
+    },
+    Case {
+        name: "candidate_index_literal",
+        diagnostic: "private fields",
+    },
+    Case {
+        name: "selection_policy_literal",
+        diagnostic:
+            "fields `candidates` and `selection_function` of struct `SelectionPolicy` are private",
+    },
+    Case {
+        name: "candidate_evaluator_boundary",
+        diagnostic: "trait `CandidateEvaluator` is private",
+    },
+    Case {
+        name: "evaluation_session_boundary",
+        diagnostic: "struct `EvaluationSession` is private",
+    },
 ];
 
 #[test]

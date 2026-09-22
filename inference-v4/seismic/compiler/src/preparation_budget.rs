@@ -1,14 +1,11 @@
 //! Separate construction and planning budgets.
 //!
-//! [`PreparationBudget`] limits refinement and native realization.  It is
-//! consumed before a [`CandidateDomain`](crate::candidate_domain::CandidateDomain)
-//! is sealed. [`PlanningBudget`] limits only the subsequent search and
-//! portfolio materialization over an already evaluated domain. Keeping the
-//! two values distinct prevents candidate construction from silently spending
-//! (or inheriting) planner resources.
+//! [`PreparationBudget`] limits structural refinement and demand-driven native
+//! realization. [`PlanningBudget`] limits evaluator search and retained-policy
+//! materialization. Keeping them distinct prevents structural/native work from
+//! silently spending solver and policy-retention resources.
 
 use seismic_target::NativeArtifactMetrics;
-use std::collections::HashSet;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,11 +15,9 @@ pub struct PreparationBudget {
     pub refinement_constructed_alternatives: u64,
     /// Monotonic elapsed-time ceiling for the complete refinement session.
     pub refinement_construction_wall_time: Duration,
-    pub unique_native_templates: u64,
     pub native_compile_wall_time: Duration,
     pub native_code_bytes: u64,
     pub metadata_bytes: u64,
-    pub required_native_templates: u64,
     pub required_native_compile_wall_time: Duration,
     pub required_native_code_bytes: u64,
     pub required_retained_metadata_bytes: u64,
@@ -33,11 +28,9 @@ impl Default for PreparationBudget {
         Self {
             refinement_constructed_alternatives: 256,
             refinement_construction_wall_time: Duration::from_secs(2),
-            unique_native_templates: 256,
             native_compile_wall_time: Duration::from_secs(2),
             native_code_bytes: 256 * 1024 * 1024,
             metadata_bytes: 64 * 1024 * 1024,
-            required_native_templates: 4_096,
             required_native_compile_wall_time: Duration::from_secs(60),
             required_native_code_bytes: 256 * 1024 * 1024,
             required_retained_metadata_bytes: 64 * 1024 * 1024,
@@ -74,7 +67,6 @@ impl Default for PlanningBudget {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparationBudgetTracker {
     limit: PreparationBudget,
-    native_templates: HashSet<[u8; 32]>,
     native_compile_wall_time: Duration,
     native_code_bytes: u64,
     metadata_bytes: u64,
@@ -87,7 +79,6 @@ impl PreparationBudgetTracker {
     pub(crate) fn new(limit: PreparationBudget) -> Self {
         Self {
             limit,
-            native_templates: HashSet::new(),
             native_compile_wall_time: Duration::ZERO,
             native_code_bytes: 0,
             metadata_bytes: 0,
@@ -95,43 +86,6 @@ impl PreparationBudgetTracker {
             required_native_code_bytes: 0,
             required_metadata_bytes: 0,
         }
-    }
-
-    /// Records every previously unseen template in one already-admitted
-    /// implementation. The implementation remains retained if this exact
-    /// charge crosses the optional ceiling; `false` stops later admission.
-    pub(crate) fn record_native_templates(&mut self, identities: &[[u8; 32]]) -> bool {
-        let new = identities
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .filter(|identity| !self.native_templates.contains(identity))
-            .collect::<Vec<_>>();
-        self.native_templates.extend(new);
-        (self.native_templates.len() as u64) <= self.limit.unique_native_templates
-    }
-
-    /// Records mandatory universal templates even when their size alone
-    /// crosses an optional optimization limit. Coverage is never refused by
-    /// an optimization budget; `false` prevents subsequent optional work.
-    pub(crate) fn record_required_native_templates(
-        &mut self,
-        identities: &[[u8; 32]],
-    ) -> Result<bool, crate::errors::PreparationError> {
-        self.native_templates.extend(identities.iter().copied());
-        if self.native_templates.len() as u64 > self.limit.required_native_templates {
-            return Err(crate::errors::PreparationError::UniversalClosure(
-                "native template count exceeds the fixed universal ceiling".into(),
-            ));
-        }
-        Ok(self.native_templates.len() as u64 <= self.limit.unique_native_templates)
-    }
-
-    pub(crate) fn charge_metadata(&mut self, bytes: u64) -> bool {
-        let total = self.metadata_bytes.saturating_add(bytes);
-        self.metadata_bytes = total;
-        total <= self.limit.metadata_bytes
     }
 
     fn charge_required_metadata(
@@ -153,14 +107,6 @@ impl PreparationBudgetTracker {
         }
         self.required_metadata_bytes = total;
         Ok(())
-    }
-
-    pub(crate) fn record_required_metadata(
-        &mut self,
-        bytes: u64,
-    ) -> Result<bool, crate::errors::PreparationError> {
-        self.charge_required_metadata(bytes)?;
-        Ok(self.charge_metadata(bytes))
     }
 
     pub(crate) fn record_required_native_artifact(
@@ -225,20 +171,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn template_recording_is_deduplicated_and_retained() {
-        let mut tracker = PreparationBudgetTracker::new(PreparationBudget {
-            unique_native_templates: 2,
-            ..PreparationBudget::default()
-        });
-        let a = [1; 32];
-        let b = [2; 32];
-        let c = [3; 32];
-        assert!(tracker.record_native_templates(&[a, a, b]));
-        assert!(!tracker.record_native_templates(&[a, c]));
-        assert!(!tracker.record_native_templates(&[a, b]));
-    }
-
-    #[test]
     fn completed_native_artifact_is_recorded_before_exhaustion() {
         let mut tracker = PreparationBudgetTracker::new(PreparationBudget {
             native_code_bytes: 4,
@@ -259,15 +191,16 @@ mod tests {
     #[test]
     fn mandatory_work_is_retained_and_stops_optional_work() {
         let mut tracker = PreparationBudgetTracker::new(PreparationBudget {
-            unique_native_templates: 0,
             metadata_bytes: 0,
             ..PreparationBudget::default()
         });
         assert!(!tracker
-            .record_required_native_templates(&[[7; 32]])
+            .record_required_native_artifact(NativeArtifactMetrics {
+                compilation_ns: 0,
+                code_bytes: 0,
+                metadata_bytes: 1,
+            })
             .unwrap());
-        assert!(!tracker.record_required_metadata(1).unwrap());
-        assert!(!tracker.record_native_templates(&[[8; 32]]));
     }
 
     #[test]
@@ -277,18 +210,6 @@ mod tests {
             ..PlanningBudget::default()
         };
         assert_eq!(budget.solver_memory_bytes, 0);
-    }
-
-    #[test]
-    fn mandatory_hard_ceiling_is_a_typed_failure() {
-        let mut tracker = PreparationBudgetTracker::new(PreparationBudget {
-            required_native_templates: 0,
-            ..PreparationBudget::default()
-        });
-        assert!(matches!(
-            tracker.record_required_native_templates(&[[1; 32]]),
-            Err(crate::errors::PreparationError::UniversalClosure(_))
-        ));
     }
 
     #[test]

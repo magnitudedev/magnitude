@@ -80,50 +80,7 @@ impl NumericalTransfer {
     /// Heap storage retained by this transfer, including recursively inlined
     /// callees. Budget accounting deliberately follows owned capacities so a
     /// transfer cannot hide an unbounded allocation behind its shallow size.
-    pub(crate) fn retained_bytes(&self) -> usize {
-        let mut bytes = std::mem::size_of::<Self>()
-            .saturating_add(
-                self.outputs
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<OutputTransfer>()),
-            )
-            .saturating_add(
-                self.effects
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<NumericalEffect>()),
-            )
-            .saturating_add(
-                self.operations
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<NumericalOperation>()),
-            )
-            .saturating_add(
-                self.children
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<ConditionalNumericalTransfer>()),
-            );
-        for output in &self.outputs {
-            bytes = bytes.saturating_add(
-                output
-                    .path
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            );
-        }
-        // BTreeMap has no capacity API. Charge every retained key/value plus
-        // the key's separately allocated UTF-8 buffer; the conservative
-        // pointer overhead covers the tree links and allocator bookkeeping.
-        for (name, _range) in &self.input_assumptions {
-            bytes = bytes
-                .saturating_add(std::mem::size_of::<(String, InputRange)>())
-                .saturating_add(name.capacity())
-                .saturating_add(3 * std::mem::size_of::<usize>());
-        }
-        for child in &self.children {
-            bytes = bytes.saturating_add(child.transfer.retained_bytes());
-        }
-        bytes
-    }
+
     /// True when the implementation reproduces the reference exactly.
     pub fn is_exact(&self) -> bool {
         self.effects.is_empty()
@@ -264,6 +221,63 @@ pub enum NumericalAssessment {
     Unknown,
 }
 
+/// The complete numerical requirement that can be derived before native
+/// realization. It deliberately contains no native or post-compilation
+/// identity. A qualified policy keeps analytically unproved coordinates
+/// searchable, but the obligation remains unresolved until exact evidence is
+/// matched after realization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StructuralNumericalObligation {
+    analytic: BoolExpr,
+    qualification_allowed: bool,
+}
+
+impl StructuralNumericalObligation {
+    pub fn analytic_predicate(self) -> BoolExpr {
+        self.analytic
+    }
+
+    pub fn qualification_allowed(self) -> bool {
+        self.qualification_allowed
+    }
+
+    /// Predicate safe for structural search. When qualification is allowed,
+    /// search may retain an analytically unproved point, but publication still
+    /// requires [`admissibility`] after native identity exists.
+    pub fn search_predicate(self, arena: &mut ExprArena) -> BoolExpr {
+        if self.qualification_allowed {
+            arena.bool(true)
+        } else {
+            self.analytic
+        }
+    }
+}
+
+/// Derive everything the numerical policy can establish without native
+/// compilation. This is the sole pre-native numerical boundary.
+pub fn structural_obligation(
+    arena: &mut ExprArena,
+    transfer: &NumericalTransfer,
+    policy: &PrecisionPolicy,
+) -> StructuralNumericalObligation {
+    let analytic = match policy {
+        PrecisionPolicy::Unconstrained => arena.bool(true),
+        PrecisionPolicy::Exact => internals::exact_predicate(arena, transfer),
+        PrecisionPolicy::Bounded { .. } => internals::analytic_predicate(arena, transfer, policy),
+    };
+    let qualification_allowed = matches!(
+        policy,
+        PrecisionPolicy::Bounded {
+            evidence: EvidenceRequirement::Qualified,
+            ..
+        }
+    );
+    StructuralNumericalObligation {
+        analytic,
+        qualification_allowed,
+    }
+}
+
 /// Builds the admissibility predicate of one implementation under a policy:
 /// a `BoolExpr` over decisions and invocation symbols that is true exactly
 /// when the transfer satisfies the policy (analytically or by matching
@@ -391,23 +405,9 @@ mod internals {
         native_numerics: [u8; 32],
         domain: [u8; 32],
     ) -> BoolExpr {
-        if matches!(policy, PrecisionPolicy::Unconstrained) {
-            return arena.bool(true);
-        }
-        if matches!(policy, PrecisionPolicy::Exact) {
-            return exact_predicate(arena, transfer);
-        }
-
-        let analytic = analytic_predicate(arena, transfer, policy);
-        let allow_qualified = matches!(
-            policy,
-            PrecisionPolicy::Bounded {
-                evidence: EvidenceRequirement::Qualified,
-                ..
-            }
-        );
-        if !allow_qualified {
-            return analytic;
+        let obligation = structural_obligation(arena, transfer, policy);
+        if !obligation.qualification_allowed {
+            return obligation.analytic;
         }
         let policy = PolicyIdentity::of(policy);
         let qualified =
@@ -440,10 +440,10 @@ mod internals {
                 })
                 .collect::<Vec<_>>();
         let evidence = arena.any(&qualified);
-        arena.or(analytic, evidence)
+        arena.or(obligation.analytic, evidence)
     }
 
-    fn analytic_predicate(
+    pub(super) fn analytic_predicate(
         arena: &mut ExprArena,
         transfer: &NumericalTransfer,
         policy: &PrecisionPolicy,
@@ -527,7 +527,7 @@ mod internals {
         arena.all(&terms)
     }
 
-    fn exact_predicate(arena: &mut ExprArena, transfer: &NumericalTransfer) -> BoolExpr {
+    pub(super) fn exact_predicate(arena: &mut ExprArena, transfer: &NumericalTransfer) -> BoolExpr {
         let local = transfer.effects().is_empty()
             && transfer.operations().is_empty()
             && transfer

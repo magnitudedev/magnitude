@@ -7,10 +7,39 @@
 //! so it is deterministic, finite, and never repeats an assignment.
 
 use crate::expression::PlanningExpr;
-use crate::implementation::ImplementationIdentity;
+use crate::refinement::CandidateFamilyIdentity;
 use seismic_lang::expr::{
-    BoolExpr, DecisionId, ExprArena, PartialAssignment, SymbolId, SymbolKind, SymbolValue,
+    BoolExpr, DecisionId, DurationExpr, ExprArena, PartialAssignment, SymbolId, SymbolKind,
+    SymbolValue,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnsupportedObjective {
+    InvocationDependent,
+    UndeclaredDecision,
+    NonAffine,
+    RationalOverflow,
+    SolverRangeOverflow,
+    MixedObjectiveModes,
+}
+
+impl std::fmt::Display for UnsupportedObjective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::InvocationDependent => "objective retains an invocation symbol",
+            Self::UndeclaredDecision => "objective retains an undeclared decision",
+            Self::NonAffine => "objective is outside the exact affine duration subset",
+            Self::RationalOverflow => "objective has no representable shared rational scale",
+            Self::SolverRangeOverflow => "objective exceeds the solver's exact scalar range",
+            Self::MixedObjectiveModes => {
+                "objective-bearing and feasibility-only candidates were mixed"
+            }
+        };
+        f.write_str(reason)
+    }
+}
+
+impl std::error::Error for UnsupportedObjective {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SolverAllowance {
     pub work: u64,
@@ -36,15 +65,13 @@ impl RawAssignment {
 pub(crate) struct FeasibleAssignment(RawAssignment);
 
 impl FeasibleAssignment {
-    pub(crate) fn universal() -> Self {
-        Self(RawAssignment::new(0, Vec::new()))
-    }
     pub(crate) fn implementation(&self) -> u32 {
         self.0.implementation
     }
     pub(crate) fn decisions(&self) -> &[(DecisionId, i64)] {
         &self.0.decisions
     }
+    #[cfg(test)]
     pub(crate) fn value(&self, decision: DecisionId) -> Option<i64> {
         self.0.value(decision)
     }
@@ -54,6 +81,7 @@ impl RawAssignment {
     fn decisions(&self) -> &[(DecisionId, i64)] {
         &self.decisions
     }
+    #[cfg(test)]
     fn value(&self, decision: DecisionId) -> Option<i64> {
         self.decisions
             .iter()
@@ -105,12 +133,28 @@ impl<'a> SolverModelBuilder<'a> {
     pub(crate) fn implementation(
         &mut self,
         index: u32,
-        identity: ImplementationIdentity,
+        identity: CandidateFamilyIdentity,
         decisions: &[DecisionId],
         planning: PlanningExpr<BoolExpr>,
     ) {
         self.inner
             .implementation(index, identity, decisions, planning)
+    }
+
+    /// Registers an implementation whose analytical upper-duration objective
+    /// is exactly representable by the solver. This deliberately rejects
+    /// residual invocation symbols and non-affine expressions: neither may be
+    /// replaced by a proxy scalar objective.
+    pub(crate) fn implementation_with_objective(
+        &mut self,
+        index: u32,
+        identity: CandidateFamilyIdentity,
+        decisions: &[DecisionId],
+        planning: PlanningExpr<BoolExpr>,
+        objective: DurationExpr,
+    ) -> Result<(), UnsupportedObjective> {
+        self.inner
+            .implementation_with_objective(index, identity, decisions, planning, objective)
     }
 
     pub fn build(self) -> SolverModel {
@@ -161,7 +205,8 @@ impl AssignmentCursor<'_> {
 mod internals {
     use super::*;
     use magnitude_solver::model::{
-        Constraint, Domain, Fragment, LinearTerm, Literal, ModelBuilder as GenericBuilder, VarId,
+        Constraint, Cost, Domain, Fragment, LinearTerm, Literal, ModelBuilder as GenericBuilder,
+        VarId,
     };
     use magnitude_solver::{Algorithm, Limits, Options, Outcome, Policy, Search};
     use seismic_lang::expr::{
@@ -174,14 +219,15 @@ mod internals {
 
     struct PendingImplementation {
         index: u32,
-        identity: ImplementationIdentity,
+        identity: CandidateFamilyIdentity,
         decisions: Vec<DecisionId>,
         planning: PlanningExpr<BoolExpr>,
+        objective: Option<RationalSymbolAffine>,
     }
 
     struct Implementation {
         index: u32,
-        identity: ImplementationIdentity,
+        identity: CandidateFamilyIdentity,
         selected: VarId,
         decisions: Vec<(DecisionId, SymbolId, VarId)>,
         exact_filter: Option<CompiledDecisionPredicate>,
@@ -202,6 +248,7 @@ mod internals {
     #[derive(Debug)]
     pub(super) struct Model {
         base: Fragment,
+        units: &'static str,
         variables: Vec<(String, Domain)>,
         implementations: Vec<Implementation>,
         assignment_variables: Vec<VarId>,
@@ -213,6 +260,7 @@ mod internals {
         targets: PartialAssignment,
         bound_targets: HashSet<SymbolId>,
         implementations: Vec<PendingImplementation>,
+        objective_scale: Option<u64>,
     }
 
     impl<'a> ModelBuilder<'a> {
@@ -222,6 +270,7 @@ mod internals {
                 targets: PartialAssignment::new(),
                 bound_targets: HashSet::new(),
                 implementations: Vec::new(),
+                objective_scale: None,
             }
         }
 
@@ -242,10 +291,71 @@ mod internals {
         pub(super) fn implementation(
             &mut self,
             index: u32,
-            identity: ImplementationIdentity,
+            identity: CandidateFamilyIdentity,
             decisions: &[DecisionId],
             planning: PlanningExpr<BoolExpr>,
         ) {
+            self.register_implementation(index, identity, decisions, planning, None)
+                .unwrap_or_else(|error| {
+                    panic!("mixed objective modes in private solver adapter: {error:?}")
+                });
+        }
+
+        pub(super) fn implementation_with_objective(
+            &mut self,
+            index: u32,
+            identity: CandidateFamilyIdentity,
+            decisions: &[DecisionId],
+            planning: PlanningExpr<BoolExpr>,
+            objective: DurationExpr,
+        ) -> Result<(), UnsupportedObjective> {
+            let declared = decisions
+                .iter()
+                .map(|decision| self.arena.decision_symbol(*decision))
+                .collect::<HashSet<_>>();
+            let objective = self.arena.partial(objective, &self.targets);
+            for symbol in self.arena.free_symbols(AnyExpr::Duration(objective)) {
+                match self.arena.symbol_kind(symbol) {
+                    SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_) => {
+                        return Err(UnsupportedObjective::InvocationDependent)
+                    }
+                    SymbolKind::Decision(_) if declared.contains(&symbol) => {}
+                    SymbolKind::Decision(_) => {
+                        return Err(UnsupportedObjective::UndeclaredDecision)
+                    }
+                    _ => return Err(UnsupportedObjective::NonAffine),
+                }
+            }
+            let objective_total = self.arena.side_conditions(AnyExpr::Duration(objective));
+            let planning_node = self.arena.and(planning.node(), objective_total);
+            let planning = PlanningExpr::new(self.arena, planning_node)
+                .expect("objective side conditions use only declared planning symbols");
+            let objective = rational_duration_affine(self.arena, objective, &declared)?;
+            let scale = self
+                .objective_scale
+                .map_or(Ok(objective.denominator), |scale| {
+                    checked_lcm(scale, objective.denominator)
+                })?;
+            for implementation in &self.implementations {
+                let Some(existing) = &implementation.objective else {
+                    return Err(UnsupportedObjective::MixedObjectiveModes);
+                };
+                existing.validate_solver_range(scale, self.arena)?;
+            }
+            objective.validate_solver_range(scale, self.arena)?;
+            self.register_implementation(index, identity, decisions, planning, Some(objective))?;
+            self.objective_scale = Some(scale);
+            Ok(())
+        }
+
+        fn register_implementation(
+            &mut self,
+            index: u32,
+            identity: CandidateFamilyIdentity,
+            decisions: &[DecisionId],
+            planning: PlanningExpr<BoolExpr>,
+            objective: Option<RationalSymbolAffine>,
+        ) -> Result<(), UnsupportedObjective> {
             if self
                 .implementations
                 .iter()
@@ -259,6 +369,11 @@ mod internals {
                 .any(|implementation| implementation.identity == identity)
             {
                 panic!("SolverModelBuilder implementation identity was registered twice");
+            }
+            if !self.implementations.is_empty()
+                && self.implementations[0].objective.is_some() != objective.is_some()
+            {
+                return Err(UnsupportedObjective::MixedObjectiveModes);
             }
             let mut unique = HashSet::new();
             for decision in decisions {
@@ -296,7 +411,9 @@ mod internals {
                 identity,
                 decisions: decisions.to_vec(),
                 planning,
+                objective,
             });
+            Ok(())
         }
 
         pub(super) fn build(self) -> Option<Model> {
@@ -313,8 +430,13 @@ mod internals {
                 }
             }
 
+            let units = if self.objective_scale.is_some() {
+                "analytical upper duration (exact shared rational scale)"
+            } else {
+                "feasibility"
+            };
             let mut builder = GenericBuilder::new();
-            builder.units("feasibility");
+            builder.units(units);
             let mut decision_vars = HashMap::<DecisionId, VarId>::new();
             let mut decision_symbols = HashMap::<SymbolId, VarId>::new();
             let mut decision_bounds = HashMap::<VarId, (i64, i64)>::new();
@@ -392,6 +514,17 @@ mod internals {
                         });
                     }
                 }
+                if let Some(objective) = pending.objective {
+                    let scale = self
+                        .objective_scale
+                        .expect("objective-bearing implementations have a shared scale");
+                    let cost = objective
+                        .solver_cost(scale, &decision_symbols)
+                        .expect("objective range was certified during registration");
+                    exporter
+                        .builder
+                        .guarded_cost(vec![Literal::new(selected, 1)], cost);
+                }
                 implementations.push(Implementation {
                     index: pending.index,
                     identity: pending.identity,
@@ -421,6 +554,7 @@ mod internals {
             });
             Some(Model {
                 base,
+                units,
                 variables,
                 implementations,
                 assignment_variables,
@@ -447,7 +581,7 @@ mod internals {
             exclusions: &[Vec<i64>],
         ) -> (Arc<magnitude_solver::Model>, Vec<VarId>) {
             let mut builder = GenericBuilder::new();
-            builder.units("feasibility");
+            builder.units(self.units);
             let bindings = self
                 .variables
                 .iter()
@@ -1021,6 +1155,319 @@ mod internals {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct SymbolAffine {
+        constant: i128,
+        terms: BTreeMap<SymbolId, i128>,
+    }
+
+    impl SymbolAffine {
+        fn constant(constant: i128) -> Self {
+            Self {
+                constant,
+                terms: BTreeMap::new(),
+            }
+        }
+
+        fn symbol(symbol: SymbolId) -> Self {
+            Self {
+                constant: 0,
+                terms: BTreeMap::from([(symbol, 1)]),
+            }
+        }
+
+        fn add(&mut self, other: Self, scale: i128) -> Result<(), UnsupportedObjective> {
+            self.constant = self
+                .constant
+                .checked_add(
+                    other
+                        .constant
+                        .checked_mul(scale)
+                        .ok_or(UnsupportedObjective::RationalOverflow)?,
+                )
+                .ok_or(UnsupportedObjective::RationalOverflow)?;
+            for (symbol, coefficient) in other.terms {
+                let next = self
+                    .terms
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(
+                        coefficient
+                            .checked_mul(scale)
+                            .ok_or(UnsupportedObjective::RationalOverflow)?,
+                    )
+                    .ok_or(UnsupportedObjective::RationalOverflow)?;
+                if next == 0 {
+                    self.terms.remove(&symbol);
+                } else {
+                    self.terms.insert(symbol, next);
+                }
+            }
+            Ok(())
+        }
+
+        fn scale(&mut self, scale: i128) -> Result<(), UnsupportedObjective> {
+            self.constant = self
+                .constant
+                .checked_mul(scale)
+                .ok_or(UnsupportedObjective::RationalOverflow)?;
+            for coefficient in self.terms.values_mut() {
+                *coefficient = coefficient
+                    .checked_mul(scale)
+                    .ok_or(UnsupportedObjective::RationalOverflow)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RationalSymbolAffine {
+        numerator: SymbolAffine,
+        denominator: u64,
+    }
+
+    impl RationalSymbolAffine {
+        fn zero() -> Self {
+            Self {
+                numerator: SymbolAffine::constant(0),
+                denominator: 1,
+            }
+        }
+
+        fn add_fraction(
+            &mut self,
+            mut numerator: SymbolAffine,
+            denominator: u64,
+        ) -> Result<(), UnsupportedObjective> {
+            if denominator == 0 {
+                return Err(UnsupportedObjective::RationalOverflow);
+            }
+            let common = checked_lcm(self.denominator, denominator)?;
+            self.numerator
+                .scale(i128::from(common / self.denominator))?;
+            numerator.scale(i128::from(common / denominator))?;
+            self.numerator.add(numerator, 1)?;
+            self.denominator = common;
+            Ok(())
+        }
+
+        fn scale_integer(&mut self, scale: i128) -> Result<(), UnsupportedObjective> {
+            self.numerator.scale(scale)
+        }
+
+        fn validate_solver_range(
+            &self,
+            shared_scale: u64,
+            arena: &ExprArena,
+        ) -> Result<(), UnsupportedObjective> {
+            if shared_scale % self.denominator != 0 {
+                return Err(UnsupportedObjective::RationalOverflow);
+            }
+            let scale = i128::from(shared_scale / self.denominator);
+            let constant = self
+                .numerator
+                .constant
+                .checked_mul(scale)
+                .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+            let mut lower = constant;
+            let mut upper = constant;
+            for (symbol, coefficient) in &self.numerator.terms {
+                let coefficient = coefficient
+                    .checked_mul(scale)
+                    .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+                i64::try_from(coefficient)
+                    .map_err(|_| UnsupportedObjective::SolverRangeOverflow)?;
+                let SymbolKind::Decision(decision) = arena.symbol_kind(*symbol) else {
+                    return Err(UnsupportedObjective::UndeclaredDecision);
+                };
+                let domain = arena.decision_domain(decision);
+                let first = i128::from(
+                    *domain
+                        .values()
+                        .first()
+                        .expect("finite decision domains are non-empty"),
+                );
+                let last = i128::from(
+                    *domain
+                        .values()
+                        .last()
+                        .expect("finite decision domains are non-empty"),
+                );
+                let (term_lower, term_upper) = if coefficient >= 0 {
+                    (
+                        coefficient.checked_mul(first),
+                        coefficient.checked_mul(last),
+                    )
+                } else {
+                    (
+                        coefficient.checked_mul(last),
+                        coefficient.checked_mul(first),
+                    )
+                };
+                lower = lower
+                    .checked_add(term_lower.ok_or(UnsupportedObjective::SolverRangeOverflow)?)
+                    .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+                upper = upper
+                    .checked_add(term_upper.ok_or(UnsupportedObjective::SolverRangeOverflow)?)
+                    .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+            }
+            if lower < 0 || u64::try_from(upper).is_err() {
+                return Err(UnsupportedObjective::SolverRangeOverflow);
+            }
+            Ok(())
+        }
+
+        fn solver_cost(
+            self,
+            shared_scale: u64,
+            symbols: &HashMap<SymbolId, VarId>,
+        ) -> Result<Cost, UnsupportedObjective> {
+            if shared_scale % self.denominator != 0 {
+                return Err(UnsupportedObjective::RationalOverflow);
+            }
+            let scale = i128::from(shared_scale / self.denominator);
+            let constant = self
+                .numerator
+                .constant
+                .checked_mul(scale)
+                .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+            let terms = self
+                .numerator
+                .terms
+                .into_iter()
+                .map(|(symbol, coefficient)| {
+                    let variable = symbols
+                        .get(&symbol)
+                        .copied()
+                        .ok_or(UnsupportedObjective::UndeclaredDecision)?;
+                    let coefficient = coefficient
+                        .checked_mul(scale)
+                        .ok_or(UnsupportedObjective::SolverRangeOverflow)?;
+                    Ok(LinearTerm::new(
+                        variable,
+                        i64::try_from(coefficient)
+                            .map_err(|_| UnsupportedObjective::SolverRangeOverflow)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, UnsupportedObjective>>()?;
+            Ok(Cost::Linear { constant, terms })
+        }
+    }
+
+    fn checked_lcm(left: u64, right: u64) -> Result<u64, UnsupportedObjective> {
+        fn gcd(mut left: u64, mut right: u64) -> u64 {
+            while right != 0 {
+                (left, right) = (right, left % right);
+            }
+            left
+        }
+        left.checked_div(gcd(left, right))
+            .and_then(|value| value.checked_mul(right))
+            .ok_or(UnsupportedObjective::RationalOverflow)
+    }
+
+    fn rational_duration_affine(
+        arena: &ExprArena,
+        expression: DurationExpr,
+        declared: &HashSet<SymbolId>,
+    ) -> Result<RationalSymbolAffine, UnsupportedObjective> {
+        match arena.view(AnyExpr::Duration(expression)) {
+            NodeView::Duration(terms) => {
+                let mut result = RationalSymbolAffine::zero();
+                for term in terms {
+                    let mut demand = symbol_affine(arena, AnyExpr::Nat(term.demand), declared)?;
+                    demand.scale(i128::from(term.upper_numerator))?;
+                    result.add_fraction(demand, term.denominator)?;
+                }
+                Ok(result)
+            }
+            NodeView::Nary {
+                op: NaryOp::DurationAdd,
+                operands,
+            } => {
+                let mut result = RationalSymbolAffine::zero();
+                for operand in operands {
+                    let AnyExpr::Duration(duration) = *operand else {
+                        return Err(UnsupportedObjective::NonAffine);
+                    };
+                    let part = rational_duration_affine(arena, duration, declared)?;
+                    result.add_fraction(part.numerator, part.denominator)?;
+                }
+                Ok(result)
+            }
+            NodeView::DurationScale { duration, by } => {
+                let mut duration = rational_duration_affine(arena, duration, declared)?;
+                let by = symbol_affine(arena, AnyExpr::Nat(by), declared)?;
+                if by.terms.is_empty() {
+                    duration.scale_integer(by.constant)?;
+                    return Ok(duration);
+                }
+                if duration.numerator.terms.is_empty() {
+                    let constant = duration.numerator.constant;
+                    let denominator = duration.denominator;
+                    let mut result = RationalSymbolAffine::zero();
+                    let mut numerator = by;
+                    numerator.scale(constant)?;
+                    result.add_fraction(numerator, denominator)?;
+                    return Ok(result);
+                }
+                Err(UnsupportedObjective::NonAffine)
+            }
+            _ => Err(UnsupportedObjective::NonAffine),
+        }
+    }
+
+    fn symbol_affine(
+        arena: &ExprArena,
+        expression: AnyExpr,
+        declared: &HashSet<SymbolId>,
+    ) -> Result<SymbolAffine, UnsupportedObjective> {
+        match arena.view(expression) {
+            NodeView::NatConst(value) => Ok(SymbolAffine::constant(i128::from(value))),
+            NodeView::IntConst(value) => Ok(SymbolAffine::constant(i128::from(value))),
+            NodeView::Symbol(symbol) if declared.contains(&symbol) => {
+                Ok(SymbolAffine::symbol(symbol))
+            }
+            NodeView::Symbol(_) => Err(UnsupportedObjective::UndeclaredDecision),
+            NodeView::Unary {
+                op: UnaryOp::NatFromInt | UnaryOp::IntFromNat,
+                operand,
+            } => symbol_affine(arena, operand, declared),
+            NodeView::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                lhs,
+                rhs,
+            } => {
+                let mut left = symbol_affine(arena, lhs, declared)?;
+                left.add(
+                    symbol_affine(arena, rhs, declared)?,
+                    if op == BinaryOp::Add { 1 } else { -1 },
+                )?;
+                Ok(left)
+            }
+            NodeView::Binary {
+                op: BinaryOp::Mul,
+                lhs,
+                rhs,
+            } => match (
+                symbol_affine(arena, lhs, declared)?,
+                symbol_affine(arena, rhs, declared)?,
+            ) {
+                (mut value, SymbolAffine { constant, terms }) if terms.is_empty() => {
+                    value.scale(constant)?;
+                    Ok(value)
+                }
+                (SymbolAffine { constant, terms }, mut value) if terms.is_empty() => {
+                    value.scale(constant)?;
+                    Ok(value)
+                }
+                _ => Err(UnsupportedObjective::NonAffine),
+            },
+            _ => Err(UnsupportedObjective::NonAffine),
+        }
+    }
+
     #[derive(Clone)]
     struct Affine {
         constant: i128,
@@ -1108,7 +1555,7 @@ mod internals {
 mod tests {
     use super::*;
     use crate::refinement::FactoryIdentity;
-    use seismic_lang::expr::{CmpOp, FiniteDomain};
+    use seismic_lang::expr::{Assignment, CmpOp, DurationTerm, FiniteDomain};
     use std::collections::BTreeSet;
 
     #[test]
@@ -1128,7 +1575,7 @@ mod tests {
             let mut builder = SolverModelBuilder::new(&mut arena);
             builder.implementation(
                 0,
-                ImplementationIdentity {
+                CandidateFamilyIdentity {
                     factory: FactoryIdentity {
                         name: "finite-oracle",
                         revision: "1",
@@ -1166,5 +1613,177 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn exact_rational_affine_objective_orders_assignments_by_direct_duration() {
+        let mut arena = ExprArena::default();
+        let decision = arena.decision(FiniteDomain::new(vec![0, 1, 2, 3]).unwrap());
+        let value = arena.decision_value(decision);
+        let two = arena.int(2);
+        let scaled = arena.int_mul(two, value);
+        let ten = arena.int(10);
+        let descending = arena.int_sub(ten, scaled);
+        let demand = arena.nat_from_int(descending);
+        let objective = arena.duration(&[DurationTerm {
+            demand,
+            lower_numerator: 1,
+            upper_numerator: 1,
+            denominator: 3,
+        }]);
+        let predicate = arena.bool(true);
+        let planning = PlanningExpr::new(&arena, predicate).unwrap();
+        let mut feasibility_builder = SolverModelBuilder::new(&mut arena);
+        feasibility_builder.implementation(
+            1,
+            CandidateFamilyIdentity {
+                factory: FactoryIdentity {
+                    name: "affine-objective-feasibility-order",
+                    revision: "1",
+                },
+                structure: [3; 32],
+            },
+            &[decision],
+            planning,
+        );
+        let feasibility_model = feasibility_builder.build();
+        let mut feasibility_cursor = feasibility_model.assignments(SolverAllowance {
+            work: 1_000_000,
+            memory_bytes: None,
+        });
+        let AssignmentStep::Assignment(first_feasible) = feasibility_cursor.next() else {
+            panic!("tiny feasibility fixture has no first assignment");
+        };
+        assert_eq!(first_feasible.value(decision), Some(0));
+
+        let predicate = arena.bool(true);
+        let planning = PlanningExpr::new(&arena, predicate).unwrap();
+        let mut builder = SolverModelBuilder::new(&mut arena);
+        builder
+            .implementation_with_objective(
+                1,
+                CandidateFamilyIdentity {
+                    factory: FactoryIdentity {
+                        name: "affine-objective",
+                        revision: "1",
+                    },
+                    structure: [4; 32],
+                },
+                &[decision],
+                planning,
+                objective,
+            )
+            .unwrap();
+        let model = builder.build();
+        let mut cursor = model.assignments(SolverAllowance {
+            work: 1_000_000,
+            memory_bytes: None,
+        });
+        let mut ordered = Vec::new();
+        loop {
+            match cursor.next() {
+                AssignmentStep::Assignment(assignment) => {
+                    let selected = assignment.value(decision).unwrap();
+                    let mut values = Assignment::new();
+                    values.bind(arena.decision_symbol(decision), SymbolValue::Int(selected));
+                    let direct = arena.eval_duration(objective, &values).unwrap().upper();
+                    ordered.push((selected, direct));
+                }
+                AssignmentStep::Complete(_) => break,
+                AssignmentStep::BudgetExhausted(report) => {
+                    panic!("tiny objective fixture exhausted: {report:?}")
+                }
+            }
+        }
+        assert_eq!(
+            ordered.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+            vec![3, 2, 1, 0]
+        );
+        assert!(ordered.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+    }
+
+    #[test]
+    fn unsupported_objectives_are_typed_and_never_become_zero_cost() {
+        let mut arena = ExprArena::default();
+        let decision = arena.decision(FiniteDomain::new(vec![0, 1]).unwrap());
+        let value = arena.decision_value(decision);
+        let squared = arena.int_mul(value, value);
+        let demand = arena.nat_from_int(squared);
+        let nonlinear = arena.duration(&[DurationTerm {
+            demand,
+            lower_numerator: 1,
+            upper_numerator: 1,
+            denominator: 1,
+        }]);
+        let predicate = arena.bool(true);
+        let planning = PlanningExpr::new(&arena, predicate).unwrap();
+        let mut builder = SolverModelBuilder::new(&mut arena);
+        let error = builder
+            .implementation_with_objective(
+                1,
+                CandidateFamilyIdentity {
+                    factory: FactoryIdentity {
+                        name: "nonlinear-objective",
+                        revision: "1",
+                    },
+                    structure: [5; 32],
+                },
+                &[decision],
+                planning,
+                nonlinear,
+            )
+            .unwrap_err();
+        assert_eq!(error, UnsupportedObjective::NonAffine);
+        drop(builder);
+
+        let one = arena.nat(1);
+        let first = arena.duration(&[DurationTerm {
+            demand: one,
+            lower_numerator: 1,
+            upper_numerator: 1,
+            denominator: u64::MAX,
+        }]);
+        let second = arena.duration(&[DurationTerm {
+            demand: one,
+            lower_numerator: 1,
+            upper_numerator: 1,
+            denominator: u64::MAX - 1,
+        }]);
+        let first_predicate = arena.bool(true);
+        let first_planning = PlanningExpr::new(&arena, first_predicate).unwrap();
+        let second_predicate = arena.bool(true);
+        let second_planning = PlanningExpr::new(&arena, second_predicate).unwrap();
+        let mut builder = SolverModelBuilder::new(&mut arena);
+        builder
+            .implementation_with_objective(
+                1,
+                CandidateFamilyIdentity {
+                    factory: FactoryIdentity {
+                        name: "rational-a",
+                        revision: "1",
+                    },
+                    structure: [6; 32],
+                },
+                &[],
+                first_planning,
+                first,
+            )
+            .unwrap();
+        let error = builder
+            .implementation_with_objective(
+                2,
+                CandidateFamilyIdentity {
+                    factory: FactoryIdentity {
+                        name: "rational-b",
+                        revision: "1",
+                    },
+                    structure: [7; 32],
+                },
+                &[],
+                second_planning,
+                second,
+            )
+            .unwrap_err();
+        assert_eq!(error, UnsupportedObjective::RationalOverflow);
     }
 }

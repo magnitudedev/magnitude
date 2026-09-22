@@ -7,7 +7,7 @@
 //! schedule mirrors.
 //!
 //! An `ExecutableVariant<T, H>` contains exactly: identity, exact guard
-//! evaluator, duration evaluator, allocation/layout evaluators, one structured
+//! evaluator, allocation/layout evaluators, one structured
 //! native schedule, the call-schema binding table, numerical assessment,
 //! and provenance. It retains no frozen plan.
 //!
@@ -21,11 +21,9 @@ use crate::frozen::{FrozenPlan, VariantIdentity};
 use crate::numerics::NumericalAssessment;
 use seismic_ir::schedule::AnyScalarSlot;
 use seismic_ir::storage::GlobalBufferKind;
-use seismic_lang::expr::compiled::{
-    Compiled, CompiledDuration, CompiledNat, CompiledPredicate, InvocationValues,
-};
+use seismic_lang::expr::compiled::{Compiled, CompiledNat, CompiledPredicate, InvocationValues};
+use seismic_lang::expr::LoopBinderId;
 use seismic_lang::expr::SymbolValue;
-use seismic_lang::expr::{AnyExpr, ExprArena, LoopBinderId, PartialAssignment, SymbolKind};
 use std::fmt;
 
 /// Structured control over commands `C`, predicates `P`, ranges `R`.
@@ -322,7 +320,6 @@ struct CompiledVariantBody<B: seismic_target::TargetFamily> {
     evaluation: crate::evaluation::EvaluationIdentity,
     identity: VariantIdentity,
     guard: RuntimePredicate,
-    duration: CompiledDuration,
     allocations: Vec<AllocationPlan>,
     slots: Vec<AnyScalarSlot>,
     schedule: Box<[NativeStep<B>]>,
@@ -332,7 +329,7 @@ struct CompiledVariantBody<B: seismic_target::TargetFamily> {
 }
 
 /// One selected, fully lowered variant before native handles are attached.
-pub struct PlannedVariant<B: seismic_target::TargetFamily> {
+pub struct RetainedCandidate<B: seismic_target::TargetFamily> {
     body: CompiledVariantBody<B>,
     native_artifacts: Vec<seismic_target::NativeKernelIdentity>,
 }
@@ -356,9 +353,6 @@ impl<T: seismic_target::TargetFamily, H> ExecutableVariant<T, H> {
     pub fn guard(&self) -> &RuntimePredicate {
         &self.body.guard
     }
-    pub fn duration(&self) -> &CompiledDuration {
-        &self.body.duration
-    }
     pub fn allocations(&self) -> &[AllocationPlan] {
         &self.body.allocations
     }
@@ -373,112 +367,6 @@ impl<T: seismic_target::TargetFamily, H> ExecutableVariant<T, H> {
     }
     pub fn provenance(&self) -> &crate::refinement::ImplementationProvenance {
         &self.body.provenance
-    }
-    pub(crate) fn retained_metadata_bytes(&self) -> u64 {
-        fn vec_storage<T>(value: &Vec<T>) -> usize {
-            value.capacity().saturating_mul(std::mem::size_of::<T>())
-        }
-        fn view(value: &CompiledBufferView) -> usize {
-            vec_storage(&value.extents).saturating_add(vec_storage(&value.strides))
-        }
-        fn command<B: seismic_target::TargetFamily>(value: &ExecutableCommand<B>) -> usize {
-            match value {
-                ExecutableCommand::Launch {
-                    bindings,
-                    nat_args,
-                    scalar_args,
-                    locals,
-                    addressable_resources,
-                    abi,
-                    ..
-                } => {
-                    let binding_nested = bindings.iter().map(view).sum::<usize>();
-                    let local_nested = locals
-                        .iter()
-                        .map(|local| {
-                            vec_storage(&local.extents).saturating_add(vec_storage(&local.strides))
-                        })
-                        .sum::<usize>();
-                    vec_storage(bindings)
-                        .saturating_add(binding_nested)
-                        .saturating_add(vec_storage(nat_args))
-                        .saturating_add(vec_storage(scalar_args))
-                        .saturating_add(vec_storage(locals))
-                        .saturating_add(local_nested)
-                        .saturating_add(vec_storage(addressable_resources))
-                        .saturating_add(abi.allocations.len().saturating_mul(std::mem::size_of::<(
-                            seismic_ir::target::KernelAbiAllocationRole,
-                            ExecutableAllocationId,
-                        )>(
-                        )))
-                }
-                ExecutableCommand::Copy {
-                    source,
-                    destination,
-                    ..
-                } => view(source).saturating_add(view(destination)),
-                ExecutableCommand::Fill { destination, .. } => view(destination),
-                ExecutableCommand::ScalarRead { source, bounds, .. } => {
-                    view(source).saturating_add(vec_storage(bounds))
-                }
-                ExecutableCommand::ScalarMove { .. } => 0,
-            }
-        }
-        fn steps<B: seismic_target::TargetFamily>(values: &[NativeStep<B>]) -> usize {
-            values
-                .len()
-                .saturating_mul(std::mem::size_of::<NativeStep<B>>())
-                .saturating_add(values.iter().fold(0usize, |bytes, step| {
-                    bytes.saturating_add(match step {
-                        ExecutableStep::Command(command_value) => command(command_value),
-                        ExecutableStep::If {
-                            then_steps,
-                            else_steps,
-                            ..
-                        } => steps(then_steps).saturating_add(steps(else_steps)),
-                        ExecutableStep::Repeat { body, .. } => steps(body),
-                        ExecutableStep::Check { .. } => 0,
-                    })
-                }))
-        }
-        fn result(value: &ExecutableResultBinding) -> usize {
-            match value {
-                ExecutableResultBinding::Buffer { view: buffer, .. } => view(buffer),
-                ExecutableResultBinding::Scalar { .. } | ExecutableResultBinding::Range { .. } => 0,
-            }
-        }
-        let body = &self.body;
-        let bytes =
-            std::mem::size_of_val(self)
-                .saturating_add(vec_storage(&body.allocations))
-                .saturating_add(body.allocations.iter().fold(0usize, |bytes, allocation| {
-                    bytes.saturating_add(
-                        allocation.byte_candidates.rest.len() * std::mem::size_of::<CompiledNat>(),
-                    )
-                }))
-                .saturating_add(vec_storage(&body.slots))
-                .saturating_add(vec_storage(&self.kernels))
-                .saturating_add(steps(&body.schedule))
-                .saturating_add(vec_storage(&body.bindings.arguments))
-                .saturating_add(
-                    body.bindings
-                        .arguments
-                        .iter()
-                        .flatten()
-                        .map(view)
-                        .sum::<usize>(),
-                )
-                .saturating_add(vec_storage(&body.bindings.results))
-                .saturating_add(body.bindings.results.iter().fold(
-                    0usize,
-                    |bytes, (path, binding)| {
-                        bytes
-                            .saturating_add(vec_storage(path))
-                            .saturating_add(result(binding))
-                    },
-                ))
-                .saturating_add(vec_storage(&body.provenance.callees));
-        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 }
 
@@ -496,7 +384,7 @@ impl<T: seismic_target::TargetFamily, H> fmt::Debug for ExecutableVariant<T, H> 
 /// native kernels owned by the implementation.
 pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
     plan: FrozenPlan<B>,
-) -> PlannedVariant<B> {
+) -> RetainedCandidate<B> {
     let parts = plan.into_exact_parts();
     let arena = &*parts.arena;
     let implementation = &*parts.implementation;
@@ -507,8 +395,7 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
         .iter()
         .map(|description| description.identity.clone())
         .collect::<Vec<_>>();
-    let (allocation_remap, mut allocations) =
-        compile_allocations(arena, &parts.fixed, topology, &parts.assignment);
+    let (allocation_remap, mut allocations) = compile_allocations(arena, &parts.fixed, topology);
     let scratch_bindings = compile_launch_scratch(
         arena,
         &parts.fixed,
@@ -526,6 +413,7 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
     };
     let schedule = compile_steps(
         implementation.native_launch_modes(),
+        implementation.native_kernel_remap(),
         arena,
         &parts.fixed,
         topology,
@@ -536,7 +424,6 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
         &scratch_bindings,
         &abi_bindings,
         implementation.schedule().steps(),
-        &parts.assignment,
     )
     .into_boxed_slice();
     let mut arguments = Vec::with_capacity(parts.schema.parameters().len());
@@ -578,36 +465,13 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
         })
         .collect();
     let bindings = CallBindingTable { arguments, results };
-    let duration = parts.performance.estimate();
-    let mut duration_symbols = arena.free_symbols(AnyExpr::Duration(duration));
-    duration_symbols.sort();
-    duration_symbols.dedup();
-    let duration_invocation_evaluable =
-        invocation_evaluable(arena, AnyExpr::Duration(duration), &parts.fixed);
-    assert!(
-        duration_invocation_evaluable,
-        "closed implementation duration retained a non-invocation symbol: {}",
-        duration_symbols
-            .iter()
-            .filter(|symbol| {
-                parts.fixed.get(**symbol).is_none()
-                    && !matches!(
-                        arena.symbol_kind(**symbol),
-                        SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_)
-                    )
-            })
-            .map(|symbol| format!("{symbol:?}:{:?}", arena.symbol_kind(*symbol)))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    PlannedVariant {
+    RetainedCandidate {
         native_artifacts,
         body: CompiledVariantBody {
             device: parts.device,
             evaluation: parts.evaluation,
             identity: parts.identity,
             guard: arena.compile_bool_with(parts.guard.node(), parts.guard.fixed()),
-            duration: arena.compile_duration_with(duration, &parts.fixed),
             allocations,
             slots: implementation.schedule().slots().to_vec(),
             schedule,
@@ -618,15 +482,12 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
     }
 }
 
-impl<B: seismic_target::TargetFamily> PlannedVariant<B> {
+impl<B: seismic_target::TargetFamily> RetainedCandidate<B> {
     pub fn identity(&self) -> &VariantIdentity {
         &self.body.identity
     }
     pub fn guard(&self) -> &RuntimePredicate {
         &self.body.guard
-    }
-    pub fn duration(&self) -> &CompiledDuration {
-        &self.body.duration
     }
 
     pub(crate) fn retained_metadata_bytes(&self) -> u64 {
@@ -647,38 +508,25 @@ impl<B: seismic_target::TargetFamily> PlannedVariant<B> {
 }
 
 pub(crate) trait EvaluatedVariant {
-    fn selection_identity(&self) -> &VariantIdentity;
     fn selection_guard(&self) -> &RuntimePredicate;
-    fn selection_duration(&self) -> &CompiledDuration;
 }
 
-impl<B: seismic_target::TargetFamily> EvaluatedVariant for PlannedVariant<B> {
-    fn selection_identity(&self) -> &VariantIdentity {
-        self.identity()
-    }
+impl<B: seismic_target::TargetFamily> EvaluatedVariant for RetainedCandidate<B> {
     fn selection_guard(&self) -> &RuntimePredicate {
         self.guard()
-    }
-    fn selection_duration(&self) -> &CompiledDuration {
-        self.duration()
     }
 }
 
 impl<T: seismic_target::TargetFamily, H> EvaluatedVariant for ExecutableVariant<T, H> {
-    fn selection_identity(&self) -> &VariantIdentity {
-        self.identity()
-    }
     fn selection_guard(&self) -> &RuntimePredicate {
         self.guard()
-    }
-    fn selection_duration(&self) -> &CompiledDuration {
-        self.duration()
     }
 }
 
 /// The single invocation-selection policy shared before and after exact
 /// native materialization.
-pub(crate) fn select_variant_index<V: EvaluatedVariant>(
+pub(crate) fn select_candidate_index<V: EvaluatedVariant>(
+    selection: &crate::prepared::SelectionFunction,
     variants: &[V],
     values: &InvocationValues,
 ) -> usize {
@@ -694,41 +542,22 @@ pub(crate) fn select_variant_index<V: EvaluatedVariant>(
             }),
         "validated invocation escaped the constructionally total universal variant"
     );
-    variants
-        .iter()
-        .enumerate()
-        .filter_map(|(index, variant)| {
-            variant
-                .selection_guard()
-                .evaluate(values)
-                .unwrap_or_else(|error| {
-                    panic!("validated invocation could not evaluate a variant guard: {error:?}")
-                })
-                .then(|| {
-                    let duration = variant
-                        .selection_duration()
-                        .evaluate(values)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "validated invocation could not evaluate a variant duration: {error:?}"
-                            )
-                        });
-                    let identity = variant.selection_identity();
-                    (
-                        index,
-                        duration.upper(),
-                        (
-                            identity.implementation.factory.name,
-                            identity.implementation.factory.revision,
-                            &identity.implementation.structure,
-                            &identity.assignment,
-                        ),
-                    )
-                })
-        })
-        .min_by(|left, right| left.1.cmp(&right.1).then(left.2.cmp(&right.2)))
-        .map(|selected| selected.0)
-        .expect("validated invocation has no applicable evaluated variant")
+    let selected = selection.apply(values).as_usize();
+    let candidate = variants
+        .get(selected)
+        .unwrap_or_else(|| panic!("selection function names an absent retained candidate"));
+    assert!(
+        candidate
+            .selection_guard()
+            .evaluate(values)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "validated invocation could not evaluate selected candidate guard: {error:?}"
+                )
+            }),
+        "selection function chose a candidate outside its applicability guard"
+    );
+    selected
 }
 
 impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
@@ -839,7 +668,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
 }
 
 pub(crate) fn materialize_variant<T: seismic_target::TargetFamily, H>(
-    planned: PlannedVariant<T>,
+    planned: RetainedCandidate<T>,
     registry: &crate::realization::RealizationRegistry<T, H>,
 ) -> ExecutableVariant<T, H> {
     let kernels = registry.resolve(
@@ -853,21 +682,10 @@ pub(crate) fn materialize_variant<T: seismic_target::TargetFamily, H>(
     }
 }
 
-fn invocation_evaluable(arena: &ExprArena, expression: AnyExpr, fixed: &PartialAssignment) -> bool {
-    arena.free_symbols(expression).iter().all(|symbol| {
-        fixed.get(*symbol).is_some()
-            || matches!(
-                arena.symbol_kind(*symbol),
-                SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_)
-            )
-    })
-}
-
 fn compile_allocations(
     arena: &seismic_lang::expr::ExprArena,
     fixed: &seismic_lang::expr::PartialAssignment,
     topology: &seismic_ir::storage::GlobalAllocationTopology,
-    assignment: &crate::solve::FeasibleAssignment,
 ) -> (Vec<u32>, Vec<AllocationPlan>) {
     use std::collections::BTreeMap;
     let mut arena_groups: BTreeMap<i64, (usize, Vec<usize>)> = BTreeMap::new();
@@ -879,9 +697,10 @@ fn compile_allocations(
         }
         if matches!(allocation.kind, GlobalBufferKind::Arena) {
             let slot = match allocation.slot {
-                Some(decision) => assignment.value(decision).unwrap_or_else(|| {
-                    panic!("arena reuse decision is absent from exact assignment")
-                }),
+                Some(decision) => match fixed.get(arena.decision_symbol(decision)) {
+                    Some(SymbolValue::Int(value)) => value,
+                    _ => panic!("arena reuse decision is absent from exact assignment"),
+                },
                 None => {
                     let value = next_universal_slot;
                     next_universal_slot -= 1;
@@ -1071,7 +890,8 @@ fn compile_view(
 }
 
 fn compile_steps<B: seismic_target::TargetFamily>(
-    native_launch_modes: &[B::NativeLaunchMode],
+    native_launch_modes: &[Option<B::NativeLaunchMode>],
+    native_kernel_remap: &[Option<u32>],
     arena: &seismic_lang::expr::ExprArena,
     fixed: &seismic_lang::expr::PartialAssignment,
     topology: &seismic_ir::storage::GlobalAllocationTopology,
@@ -1082,7 +902,6 @@ fn compile_steps<B: seismic_target::TargetFamily>(
     scratch_bindings: &[LaunchScratchBindings],
     abi_bindings: &[KernelAbiBindings],
     steps: &[seismic_ir::schedule::ScheduleStep],
-    assignment: &crate::solve::FeasibleAssignment,
 ) -> Vec<NativeStep<B>> {
     let view = |value| compile_view(arena, fixed, topology, allocation_remap, value);
     let mut out = Vec::new();
@@ -1109,8 +928,17 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     );
                 }
                 ExecutableStep::Command(ExecutableCommand::Launch {
-                    kernel: ExecutableKernelId(launch.kernel.ordinal()),
-                    mode: native_launch_modes[id.index() as usize].clone(),
+                    kernel: ExecutableKernelId(
+                        // Coordinate-exact reconciliation supplies a dense
+                        // table containing only kernels reachable after
+                        // compile-time choices are eliminated.
+                        native_kernel_remap[launch.kernel.ordinal() as usize].unwrap_or_else(
+                            || panic!("inactive kernel reached executable lowering"),
+                        ),
+                    ),
+                    mode: native_launch_modes[id.index() as usize]
+                        .clone()
+                        .unwrap_or_else(|| panic!("inactive launch reached executable lowering")),
                     grid: launch
                         .grid
                         .map(|value| arena.compile_nat_with(value, fixed)),
@@ -1241,6 +1069,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 condition: arena.compile_bool_with(*condition, fixed),
                 then_steps: compile_steps(
                     native_launch_modes,
+                    native_kernel_remap,
                     arena,
                     fixed,
                     topology,
@@ -1251,11 +1080,11 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     scratch_bindings,
                     abi_bindings,
                     then_steps,
-                    assignment,
                 )
                 .into_boxed_slice(),
                 else_steps: compile_steps(
                     native_launch_modes,
+                    native_kernel_remap,
                     arena,
                     fixed,
                     topology,
@@ -1266,7 +1095,6 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     scratch_bindings,
                     abi_bindings,
                     else_steps,
-                    assignment,
                 )
                 .into_boxed_slice(),
             },
@@ -1287,6 +1115,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 },
                 body: compile_steps(
                     native_launch_modes,
+                    native_kernel_remap,
                     arena,
                     fixed,
                     topology,
@@ -1297,14 +1126,14 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     scratch_bindings,
                     abi_bindings,
                     body,
-                    assignment,
                 )
                 .into_boxed_slice(),
             },
             seismic_ir::schedule::ScheduleStep::Choose { decision, options } => {
-                let selected = assignment
-                    .value(*decision)
-                    .unwrap_or_else(|| panic!("schedule choice is absent from exact assignment"));
+                let selected = match fixed.get(arena.decision_symbol(*decision)) {
+                    Some(SymbolValue::Int(value)) => value,
+                    _ => panic!("schedule choice is absent from exact assignment"),
+                };
                 let body = options
                     .iter()
                     .find_map(|(value, body)| (*value == selected).then_some(body))
@@ -1313,6 +1142,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     });
                 out.extend(compile_steps(
                     native_launch_modes,
+                    native_kernel_remap,
                     arena,
                     fixed,
                     topology,
@@ -1323,7 +1153,6 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     scratch_bindings,
                     abi_bindings,
                     body,
-                    assignment,
                 ));
                 continue;
             }

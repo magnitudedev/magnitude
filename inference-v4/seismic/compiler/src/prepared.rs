@@ -1,20 +1,127 @@
 //! `PreparedKernel<T, H>` and invocation validation/selection (spec §10.4,
 //! §12).
 //!
-//! Fields and constructor are private; only the portfolio builder creates
-//! one, after proving coverage. Selection evaluates variant guards and
-//! chooses the applicable variant with minimum `(cost, identity)`. Zero
-//! matches after validation is an internal panic (§13.3.6).
+//! Fields and constructor are private; only completed candidate evaluation
+//! creates one. Invocation selection applies the evaluator-produced function
+//! and verifies the returned candidate remains applicable. A bad index or
+//! false guard after validation is an internal bug.
 
 use crate::candidate_domain::NonEmpty;
 use crate::errors::InvocationError;
+use crate::evaluation_session::PreparedPortfolio;
 use crate::executable::ExecutableVariant;
 use seismic_lang::entry::ParameterKind;
 use seismic_lang::entry::{CallSchema, CompiledDimensionInferencePlan, SemanticEventManifest};
-use seismic_lang::expr::compiled::{CompiledNat, CompiledPredicate, InvocationValues};
+use seismic_lang::expr::compiled::{
+    CompiledDuration, CompiledNat, CompiledPredicate, InvocationValues,
+};
 use seismic_lang::expr::{ExprArena, PartialAssignment, SymbolValue};
 use seismic_lang::ids::{ModuleHash, RepresentationId, StableEntryId};
 use std::sync::Arc;
+
+/// Opaque, immutable invocation-to-candidate function. Evaluators may derive
+/// it by any method; runtime only applies the completed mapping.
+pub struct SelectionFunction {
+    program: Box<dyn Fn(&InvocationValues) -> CandidateIndex + Send + Sync>,
+}
+
+impl std::fmt::Debug for SelectionFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectionFunction").finish_non_exhaustive()
+    }
+}
+
+impl SelectionFunction {
+    /// Applies the completed evaluator policy to one validated invocation.
+    pub fn apply(&self, values: &InvocationValues) -> CandidateIndex {
+        (self.program)(values)
+    }
+
+    pub(crate) fn analytical_minimum(candidates: PreparedPortfolio<CompiledDuration>) -> Self {
+        let candidates = candidates.into_guards_and_payloads().into_vec();
+        Self {
+            program: Box::new(move |values| {
+                let index = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (guard, score))| {
+                        guard
+                            .evaluate(values)
+                            .unwrap_or_else(|error| {
+                                panic!("validated invocation could not evaluate candidate guard: {error:?}")
+                            })
+                            .then(|| {
+                                let score = score.evaluate(values).unwrap_or_else(|error| {
+                                    panic!("validated invocation could not evaluate analytical decision: {error:?}")
+                                });
+                                (index, score.upper())
+                            })
+                    })
+                    .min_by_key(|(index, score)| (*score, *index))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                CandidateIndex(index)
+            }),
+        }
+    }
+
+    /// Builds a total decision from ordered invocation predicates. The first
+    /// true predicate whose candidate is applicable wins; candidate zero is
+    /// the constructionally universal default. Ordinals are checked against
+    /// the admitted portfolio at construction.
+    pub(crate) fn ordered_decision<P>(
+        candidates: PreparedPortfolio<P>,
+        cases: Vec<(CompiledPredicate, CandidateIndex)>,
+    ) -> Self {
+        let candidate_guards = candidates
+            .into_guards_and_payloads()
+            .into_vec()
+            .into_iter()
+            .map(|(guard, _)| guard)
+            .collect::<Vec<_>>();
+        let candidate_count = candidate_guards.len();
+        assert!(
+            cases
+                .iter()
+                .all(|(_, index)| index.as_usize() < candidate_count),
+            "selection case is out of range"
+        );
+        Self {
+            program: Box::new(move |values| {
+                cases
+                    .iter()
+                    .find_map(|(predicate, candidate)| {
+                        let requested = predicate
+                            .evaluate(values)
+                            .unwrap_or_else(|error| {
+                                panic!("validated invocation could not evaluate selection decision: {error:?}")
+                            });
+                        let applicable = candidate_guards[candidate.as_usize()]
+                            .evaluate(values)
+                            .unwrap_or_else(|error| {
+                                panic!("validated invocation could not evaluate candidate guard: {error:?}")
+                            });
+                        (requested && applicable).then_some(*candidate)
+                    })
+                    .unwrap_or(CandidateIndex(0))
+            }),
+        }
+    }
+}
+
+/// An ordinal into the candidate list owned by the same selection policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CandidateIndex(usize);
+
+impl CandidateIndex {
+    pub(crate) const fn from_usize(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+}
 
 #[derive(Debug)]
 pub struct PreparedKernel<T: seismic_target::TargetFamily, H> {
@@ -25,6 +132,7 @@ pub struct PreparedKernel<T: seismic_target::TargetFamily, H> {
     device: seismic_target::DeviceDescriptionIdentity,
     evaluation: crate::evaluation::EvaluationIdentity,
     invocation: InvocationContract,
+    selection: SelectionFunction,
     variants: NonEmpty<ExecutableVariant<T, H>>,
     coverage: crate::planning::PlanningCoverage,
 }
@@ -39,6 +147,7 @@ impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
         device: seismic_target::DeviceDescriptionIdentity,
         evaluation: crate::evaluation::EvaluationIdentity,
         invocation: InvocationContract,
+        selection: SelectionFunction,
         variants: NonEmpty<ExecutableVariant<T, H>>,
         coverage: crate::planning::PlanningCoverage,
     ) -> Self {
@@ -50,6 +159,7 @@ impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
             device,
             evaluation,
             invocation,
+            selection,
             variants,
             coverage,
         }
@@ -246,23 +356,11 @@ mod internals {
         kernel: &PreparedKernel<T, H>,
         values: &InvocationValues,
     ) -> VariantIndex {
-        VariantIndex(crate::executable::select_variant_index(
+        VariantIndex(crate::executable::select_candidate_index(
+            &kernel.selection,
             kernel.variants.as_slice(),
             values,
         ))
-    }
-
-    /// Pure selection over already evaluated applicability/cost data. Its
-    /// type has no solver, backend service, or compilation capability.
-    pub(super) fn choose_best<T, D: Ord, K: Ord>(
-        candidates: impl IntoIterator<Item = (T, D, K)>,
-    ) -> Option<T> {
-        candidates
-            .into_iter()
-            .min_by(|(_, left_cost, left_key), (_, right_cost, right_key)| {
-                left_cost.cmp(right_cost).then(left_key.cmp(right_key))
-            })
-            .map(|(candidate, _, _)| candidate)
     }
 
     pub(super) fn validate_invocation(
@@ -537,16 +635,70 @@ mod internals {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::internals::choose_best;
+    use super::*;
+    use seismic_lang::expr::ExprArena;
 
     #[test]
-    fn invocation_selection_uses_only_evaluated_cost_and_identity() {
-        let evaluated = [
-            ("universal", 10_u64, "z"),
-            ("fast", 9, "z"),
-            ("tie", 9, "a"),
-        ];
-        assert_eq!(choose_best(evaluated), Some("tie"));
-        assert_eq!(choose_best(Vec::<(&str, u64, &str)>::new()), None);
+    fn selection_function_is_a_total_invocation_to_candidate_mapping() {
+        let mut arena = ExprArena::default();
+        let always = arena.bool(true);
+        let never = arena.bool(false);
+        let guard0 = arena.bool(true);
+        let guard1 = arena.bool(true);
+        let guard2 = arena.bool(true);
+        let selection = SelectionFunction::ordered_decision(
+            PreparedPortfolio::<()>::from_test_guards(
+                NonEmpty::new(vec![
+                    arena.compile_bool(guard0),
+                    arena.compile_bool(guard1),
+                    arena.compile_bool(guard2),
+                ])
+                .unwrap(),
+            ),
+            vec![
+                (arena.compile_bool(never), CandidateIndex::from_usize(2)),
+                (arena.compile_bool(always), CandidateIndex::from_usize(1)),
+            ],
+        );
+        assert_eq!(
+            selection.apply(&InvocationValues::new()),
+            CandidateIndex::from_usize(1)
+        );
+    }
+
+    #[test]
+    fn selection_function_uses_its_structural_default() {
+        let mut arena = ExprArena::default();
+        let requested = arena.bool(true);
+        let universal = arena.bool(true);
+        let optional = arena.bool(false);
+        let selection = SelectionFunction::ordered_decision(
+            PreparedPortfolio::<()>::from_test_guards(
+                NonEmpty::new(vec![
+                    arena.compile_bool(universal),
+                    arena.compile_bool(optional),
+                ])
+                .unwrap(),
+            ),
+            vec![(arena.compile_bool(requested), CandidateIndex::from_usize(1))],
+        );
+        assert_eq!(
+            selection.apply(&InvocationValues::new()),
+            CandidateIndex::from_usize(0)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "selection case is out of range")]
+    fn selection_function_rejects_a_foreign_candidate_index() {
+        let mut arena = ExprArena::default();
+        let always = arena.bool(true);
+        let guard = arena.bool(true);
+        let _ = SelectionFunction::ordered_decision(
+            PreparedPortfolio::<()>::from_test_guards(
+                NonEmpty::new(vec![arena.compile_bool(guard)]).unwrap(),
+            ),
+            vec![(arena.compile_bool(always), CandidateIndex::from_usize(1))],
+        );
     }
 }

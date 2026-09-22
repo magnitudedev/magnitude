@@ -1,101 +1,37 @@
-//! `CandidateDomain<B>`: the sealed symbolic domain of selectable candidates.
+//! The sealed structural search space produced before native realization.
 //!
-//! `candidate_domain` consumes the logical entry, binds the opened machine into
-//! the entry's arena, asks every registered factory (and the universal
-//! portable factory) for closed implementations of the root function, and
-//! seals their finite choice axes and one authoritative constraint relation.
-//! Every member already owns reconciled native kernels; planning derives a
-//! transient solver adapter later, after evaluation.
-//!
-//! W6 owns the internals.
+//! A domain owns refined [`CandidateFamily`] values and the one authoritative
+//! expression arena in which their choices and constraints were constructed.
+//! It contains no native compiler, artifact registry, reflected description,
+//! executor, or analytical profile.
 
 use crate::errors::PreparationError;
 use crate::expression::PlanningExpr;
-use crate::implementation::{OptimizedImplementation, UniversalImplementation};
-use crate::numerics::EvidenceCatalog;
-use crate::preparation_budget::{PreparationBudget, PreparationBudgetTracker};
+use crate::numerics::{EvidenceCatalog, StructuralNumericalObligation};
+use crate::preparation_budget::PreparationBudget;
+use crate::refinement::{
+    CandidateFamily, CandidateFamilyIdentity, ChoiceDeclaration, ConstructionAuthority,
+    RefinementCompletion, RefinementLimits, RefinementRequest, RefinementSession,
+};
 use crate::target::{CompilerRegistry, TargetConstants};
 use seismic_lang::entry::{CallSchema, LogicalEntry, SemanticEventManifest};
 use seismic_lang::expr::{
     compiled::{CompiledPredicate, InvocationValues},
-    BoolExpr, DecisionId, EntryPredicate, ExprArena, PartialAssignment, SymbolValue,
+    AnyExpr, BoolExpr, DecisionId, EntryPredicate, ExprArena, PartialAssignment, SymbolValue,
 };
 use seismic_lang::ids::{ModuleHash, StableEntryId};
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::NumericalEnvironmentIdentity;
-use seismic_target::{DeviceDescription, DeviceDescriptionIdentity};
+use seismic_target::{DeviceDescription, DeviceDescriptionIdentity, NumericalEnvironmentIdentity};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The target domain (§10.1): entry domain intersected with target integer
-/// and address representability and backend call-schema representability.
+static NEXT_DOMAIN_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TargetDomain {
     predicate: EntryPredicate,
     identity: [u8; 32],
-}
-
-#[cfg(test)]
-mod candidate_domain_tests {
-    use super::*;
-    use seismic_lang::expr::FiniteDomain;
-
-    fn fixture() -> (ExprArena, ChoiceAxis, DecisionId, DecisionId) {
-        let mut arena = ExprArena::new();
-        let decision = arena.decision(FiniteDomain::new(vec![1, 2]).unwrap());
-        let foreign = arena.decision(FiniteDomain::new(vec![7]).unwrap());
-        (
-            arena,
-            ChoiceAxis {
-                decision,
-                meaning: "tile",
-                values: vec![1, 2],
-            },
-            decision,
-            foreign,
-        )
-    }
-
-    #[test]
-    fn coordinate_binding_is_exact_and_checked() {
-        let (arena, axis, decision, foreign) = fixture();
-        assert!(matches!(
-            exact_choice_binding(&arena, std::slice::from_ref(&axis), &[]),
-            Err(CoordinateError::MissingChoice(id)) if id == decision
-        ));
-        assert!(matches!(
-            exact_choice_binding(
-                &arena,
-                std::slice::from_ref(&axis),
-                &[(decision, 1), (decision, 1)]
-            ),
-            Err(CoordinateError::DuplicateChoice(id)) if id == decision
-        ));
-        assert!(matches!(
-            exact_choice_binding(&arena, std::slice::from_ref(&axis), &[(foreign, 7)]),
-            Err(CoordinateError::ForeignChoice(id)) if id == foreign
-        ));
-        assert!(matches!(
-            exact_choice_binding(&arena, std::slice::from_ref(&axis), &[(decision, 3)]),
-            Err(CoordinateError::ValueOutsideAxis { decision: id, value: 3 }) if id == decision
-        ));
-    }
-
-    #[test]
-    fn authoritative_constraint_decides_membership_after_binding() {
-        let (mut arena, axis, decision, _) = fixture();
-        let predicate = arena.decision_is(decision, 2);
-        for (value, expected) in [(1, false), (2, true)] {
-            let fixed =
-                exact_choice_binding(&arena, std::slice::from_ref(&axis), &[(decision, value)])
-                    .unwrap();
-            let compiled = arena.compile_bool_with(predicate, &fixed);
-            assert!(compiled.reads().is_empty());
-            assert_eq!(
-                compiled.evaluate(&InvocationValues::new()).unwrap(),
-                expected
-            );
-        }
-    }
 }
 
 impl TargetDomain {
@@ -113,7 +49,6 @@ impl TargetDomain {
     }
 }
 
-/// Non-empty vector with a private constructor.
 #[derive(Debug)]
 pub struct NonEmpty<T> {
     items: Vec<T>,
@@ -143,10 +78,31 @@ impl<T> NonEmpty<T> {
     }
 }
 
+/// Unchecked search input. Only a [`CandidateDomain`] can construct one, so a
+/// proposal is always associated with the domain API that will check it.
+#[derive(Clone, Debug)]
+pub struct CandidateProposal {
+    domain: u64,
+    family: CandidateFamilyIdentity,
+    choices: Vec<(DecisionId, i64)>,
+}
+
+/// Canonical structural candidate name. Choices are in declaration order and
+/// contain exactly the active choices; there is no public constructor.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CandidateCoordinate {
-    family: crate::implementation::ImplementationIdentity,
+    domain: u64,
+    family: CandidateFamilyIdentity,
     choices: Vec<(DecisionId, i64)>,
+}
+
+impl CandidateCoordinate {
+    pub fn family(&self) -> &CandidateFamilyIdentity {
+        &self.family
+    }
+    pub fn choices(&self) -> &[(DecisionId, i64)] {
+        &self.choices
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -164,26 +120,11 @@ impl CandidatePoint {
     }
 }
 
-impl CandidateCoordinate {
-    pub fn new(
-        family: crate::implementation::ImplementationIdentity,
-        choices: Vec<(DecisionId, i64)>,
-    ) -> Self {
-        Self { family, choices }
-    }
-    pub fn family(&self) -> &crate::implementation::ImplementationIdentity {
-        &self.family
-    }
-    pub fn choices(&self) -> &[(DecisionId, i64)] {
-        &self.choices
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConstraintOrigin {
     Invocation,
     SemanticApplicability,
-    NativeLegality,
+    StructuralLegality,
     NumericalAdmissibility,
 }
 
@@ -191,6 +132,15 @@ pub enum ConstraintOrigin {
 pub struct DomainConstraint {
     origin: ConstraintOrigin,
     predicate: BoolExpr,
+}
+
+impl DomainConstraint {
+    pub fn origin(&self) -> ConstraintOrigin {
+        self.origin
+    }
+    pub fn predicate(&self) -> BoolExpr {
+        self.predicate
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -208,41 +158,16 @@ impl ConstraintSet {
     }
 }
 
-impl DomainConstraint {
-    pub fn origin(&self) -> ConstraintOrigin {
-        self.origin
-    }
-    pub fn predicate(&self) -> BoolExpr {
-        self.predicate
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ChoiceAxis {
-    decision: DecisionId,
-    meaning: &'static str,
-    values: Vec<i64>,
-}
-
-impl ChoiceAxis {
-    pub fn decision(&self) -> DecisionId {
-        self.decision
-    }
-    pub fn meaning(&self) -> &'static str {
-        self.meaning
-    }
-    pub fn values(&self) -> &[i64] {
-        &self.values
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoordinateError {
+    ForeignDomain,
     UnknownFamily,
     MissingChoice(DecisionId),
     DuplicateChoice(DecisionId),
     ForeignChoice(DecisionId),
     ValueOutsideAxis { decision: DecisionId, value: i64 },
+    InactiveChoice(DecisionId),
+    IndeterminateActivation(DecisionId),
     EmptyRegion,
 }
 
@@ -269,8 +194,17 @@ impl InvocationRegion {
 #[derive(Debug)]
 pub struct CandidateSlice<'a, B: seismic_target::TargetFamily> {
     coordinate: CandidateCoordinate,
-    implementation: &'a crate::implementation::Implementation<B>,
+    family: &'a Arc<CandidateFamily<B>>,
+    constraints: &'a ConstraintSet,
     applicability: InvocationRegion,
+    numerical: StructuralNumericalObligation,
+}
+
+pub(crate) struct CheckedPreparationCandidate<B: seismic_target::TargetFamily> {
+    pub(crate) coordinate: CandidateCoordinate,
+    pub(crate) family: Arc<CandidateFamily<B>>,
+    pub(crate) constraint: BoolExpr,
+    pub(crate) is_universal: bool,
 }
 
 impl<'a, B: seismic_target::TargetFamily> CandidateSlice<'a, B> {
@@ -280,14 +214,20 @@ impl<'a, B: seismic_target::TargetFamily> CandidateSlice<'a, B> {
     pub fn applicability(&self) -> &InvocationRegion {
         &self.applicability
     }
+    pub fn numerical_requirement(&self) -> StructuralNumericalObligation {
+        self.numerical
+    }
     pub fn executable(&self) -> crate::evaluation::TargetClosedExecutableView<'a, B> {
-        crate::evaluation::TargetClosedExecutableView::new(self.implementation, &[], &[])
+        crate::evaluation::TargetClosedExecutableView::new(
+            self.family.as_ref(),
+            self.constraints.conjuncts(),
+        )
     }
 }
 
-/// The candidate domain of one entry on one target under one precision policy.
 #[derive(Debug)]
 pub struct CandidateDomain<B: seismic_target::TargetFamily> {
+    domain_token: u64,
     entry: StableEntryId,
     module: ModuleHash,
     schema: Arc<CallSchema>,
@@ -298,7 +238,7 @@ pub struct CandidateDomain<B: seismic_target::TargetFamily> {
     target: NumericalEnvironmentIdentity,
     evidence: Arc<EvidenceCatalog>,
     arena: ExprArena,
-    universal: UniversalImplementation<B>,
+    universal: DomainCandidate<B>,
     optimized: Vec<DomainCandidate<B>>,
     precision: PrecisionPolicy,
     optimization_exhausted: bool,
@@ -333,8 +273,173 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
         &self.device
     }
 
+    pub fn families(&self) -> impl Iterator<Item = CandidateFamilyView<'_, B>> {
+        std::iter::once(CandidateFamilyView {
+            candidate: &self.universal,
+        })
+        .chain(
+            self.optimized
+                .iter()
+                .map(|candidate| CandidateFamilyView { candidate }),
+        )
+    }
+
+    pub fn proposal(
+        &self,
+        family: CandidateFamilyIdentity,
+        choices: Vec<(DecisionId, i64)>,
+    ) -> CandidateProposal {
+        CandidateProposal {
+            domain: self.domain_token,
+            family,
+            choices,
+        }
+    }
+
+    pub fn universal_proposal(&self) -> CandidateProposal {
+        CandidateProposal {
+            domain: self.domain_token,
+            family: self.universal.family.identity().clone(),
+            choices: Vec::new(),
+        }
+    }
+
+    /// Validates a raw proposal and removes inactive choices and input-order
+    /// differences, producing the one canonical coordinate.
+    pub fn canonicalize(
+        &self,
+        proposal: CandidateProposal,
+    ) -> Result<CandidateCoordinate, CoordinateError> {
+        if proposal.domain != self.domain_token {
+            return Err(CoordinateError::ForeignDomain);
+        }
+        let candidate = self.family(&proposal.family)?;
+        let (_, choices) =
+            canonical_choice_binding(&self.arena, candidate.family.choices(), &proposal.choices)?;
+        Ok(CandidateCoordinate {
+            domain: self.domain_token,
+            family: proposal.family,
+            choices,
+        })
+    }
+
+    /// Checks the coordinate against the authoritative family and constraint
+    /// relation. Since coordinates have no public constructor, failure here
+    /// indicates stale data from a different domain snapshot.
+    pub fn check(
+        &self,
+        coordinate: &CandidateCoordinate,
+    ) -> Result<CandidateSlice<'_, B>, CoordinateError> {
+        if coordinate.domain != self.domain_token {
+            return Err(CoordinateError::ForeignDomain);
+        }
+        let candidate = self.family(&coordinate.family)?;
+        let (mut fixed, canonical) =
+            canonical_choice_binding(&self.arena, candidate.family.choices(), &coordinate.choices)?;
+        if canonical != coordinate.choices {
+            if let Some((decision, _)) = coordinate
+                .choices
+                .iter()
+                .find(|choice| !canonical.contains(choice))
+            {
+                return Err(CoordinateError::InactiveChoice(*decision));
+            }
+            return Err(CoordinateError::MissingChoice(
+                candidate
+                    .family
+                    .choices()
+                    .iter()
+                    .find(|choice| !canonical.iter().any(|(id, _)| *id == choice.decision()))
+                    .map(ChoiceDeclaration::decision)
+                    .unwrap_or_else(|| candidate.family.choices()[0].decision()),
+            ));
+        }
+        for (symbol, value) in self.constants.bindings() {
+            fixed.bind(*symbol, *value);
+        }
+        let applicability = self
+            .arena
+            .compile_bool_with(candidate.constraints.predicate(), &fixed);
+        if applicability.reads().is_empty()
+            && !applicability
+                .evaluate(&InvocationValues::new())
+                .unwrap_or(false)
+        {
+            return Err(CoordinateError::EmptyRegion);
+        }
+        Ok(CandidateSlice {
+            coordinate: coordinate.clone(),
+            family: &candidate.family,
+            constraints: &candidate.constraints,
+            applicability: InvocationRegion {
+                predicate: applicability,
+            },
+            numerical: candidate.numerical,
+        })
+    }
+
+    pub fn contains(&self, point: &CandidatePoint) -> Result<bool, MembershipError> {
+        let slice = self
+            .check(&point.coordinate)
+            .map_err(MembershipError::Coordinate)?;
+        slice
+            .applicability
+            .contains(&point.invocation)
+            .map_err(MembershipError::Invocation)
+    }
+
+    pub(crate) fn checked_preparation_candidate(
+        &self,
+        coordinate: &CandidateCoordinate,
+    ) -> Result<CheckedPreparationCandidate<B>, CoordinateError> {
+        self.check(coordinate)?;
+        let candidate = self.family(coordinate.family())?;
+        Ok(CheckedPreparationCandidate {
+            coordinate: coordinate.clone(),
+            family: candidate.family.clone(),
+            constraint: candidate.constraints.predicate(),
+            is_universal: candidate.family.identity() == self.universal.family.identity(),
+        })
+    }
+
+    pub(crate) fn arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.arena
+    }
+
+    pub(crate) fn numerical_context(
+        &self,
+    ) -> (
+        PrecisionPolicy,
+        Arc<EvidenceCatalog>,
+        NumericalEnvironmentIdentity,
+        TargetDomain,
+        TargetConstants,
+    ) {
+        (
+            self.precision.clone(),
+            self.evidence.clone(),
+            self.target.clone(),
+            self.target_domain,
+            self.constants.clone(),
+        )
+    }
+
+    fn family(
+        &self,
+        identity: &CandidateFamilyIdentity,
+    ) -> Result<&DomainCandidate<B>, CoordinateError> {
+        if self.universal.family.identity() == identity {
+            return Ok(&self.universal);
+        }
+        self.optimized
+            .iter()
+            .find(|candidate| candidate.family.identity() == identity)
+            .ok_or(CoordinateError::UnknownFamily)
+    }
+
     pub(crate) fn from_parts(parts: CandidateDomainParts<B>) -> Self {
         Self {
+            domain_token: parts.domain_token,
             entry: parts.entry,
             module: parts.module,
             schema: parts.schema,
@@ -352,10 +457,9 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
         }
     }
 
-    /// Consumes the space for freezing: the arena becomes shared and
-    /// immutable.
     pub(crate) fn into_parts(self) -> CandidateDomainParts<B> {
         CandidateDomainParts {
+            domain_token: self.domain_token,
             entry: self.entry,
             module: self.module,
             schema: self.schema,
@@ -372,114 +476,35 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<B> {
             optimization_exhausted: self.optimization_exhausted,
         }
     }
-
-    pub fn families(&self) -> impl Iterator<Item = CandidateFamilyView<'_, B>> {
-        std::iter::once(CandidateFamilyView {
-            implementation: self.universal.as_inner(),
-            constraints: None,
-            axes: &[],
-        })
-        .chain(self.optimized.iter().map(|candidate| CandidateFamilyView {
-            implementation: candidate.implementation.as_inner(),
-            constraints: Some(&candidate.constraints),
-            axes: &candidate.axes,
-        }))
-    }
-
-    pub fn bind(
-        &self,
-        coordinate: CandidateCoordinate,
-    ) -> Result<CandidateSlice<'_, B>, CoordinateError> {
-        let (implementation, axes, predicate) = self.family_parts(&coordinate.family)?;
-        let mut fixed = exact_choice_binding(&self.arena, axes, &coordinate.choices)?;
-        for (symbol, value) in self.constants.bindings() {
-            fixed.bind(*symbol, *value);
-        }
-        let applicability = self.arena.compile_bool_with(predicate, &fixed);
-        if applicability.reads().is_empty()
-            && !applicability
-                .evaluate(&InvocationValues::new())
-                .unwrap_or(false)
-        {
-            return Err(CoordinateError::EmptyRegion);
-        }
-        Ok(CandidateSlice {
-            coordinate,
-            implementation,
-            applicability: InvocationRegion {
-                predicate: applicability,
-            },
-        })
-    }
-
-    pub fn contains(&self, point: &CandidatePoint) -> Result<bool, MembershipError> {
-        let slice = self
-            .bind(point.coordinate.clone())
-            .map_err(MembershipError::Coordinate)?;
-        slice
-            .applicability
-            .contains(&point.invocation)
-            .map_err(MembershipError::Invocation)
-    }
-
-    fn family_parts(
-        &self,
-        identity: &crate::implementation::ImplementationIdentity,
-    ) -> Result<
-        (
-            &crate::implementation::Implementation<B>,
-            &[ChoiceAxis],
-            BoolExpr,
-        ),
-        CoordinateError,
-    > {
-        if self.universal.as_inner().identity() == identity {
-            return Ok((
-                self.universal.as_inner(),
-                &[],
-                self.target_domain.predicate().node(),
-            ));
-        }
-        self.optimized
-            .iter()
-            .find(|candidate| candidate.implementation.as_inner().identity() == identity)
-            .map(|candidate| {
-                (
-                    candidate.implementation.as_inner(),
-                    candidate.axes.as_slice(),
-                    candidate.constraints.predicate(),
-                )
-            })
-            .ok_or(CoordinateError::UnknownFamily)
-    }
 }
 
 pub struct CandidateFamilyView<'a, B: seismic_target::TargetFamily> {
-    implementation: &'a crate::implementation::Implementation<B>,
-    constraints: Option<&'a ConstraintSet>,
-    axes: &'a [ChoiceAxis],
+    candidate: &'a DomainCandidate<B>,
 }
 
 impl<'a, B: seismic_target::TargetFamily> CandidateFamilyView<'a, B> {
-    pub fn identity(&self) -> &crate::implementation::ImplementationIdentity {
-        self.implementation.identity()
+    pub fn identity(&self) -> &CandidateFamilyIdentity {
+        self.candidate.family.identity()
     }
-    pub fn choices(&self) -> &'a [ChoiceAxis] {
-        self.axes
+    pub fn choices(&self) -> &'a [ChoiceDeclaration] {
+        self.candidate.family.choices()
     }
     pub fn constraints(&self) -> &'a [DomainConstraint] {
-        self.constraints.map_or(&[], ConstraintSet::conjuncts)
+        self.candidate.constraints.conjuncts()
+    }
+    pub fn numerical_requirement(&self) -> StructuralNumericalObligation {
+        self.candidate.numerical
     }
     pub fn executable(&self) -> crate::evaluation::TargetClosedExecutableView<'a, B> {
         crate::evaluation::TargetClosedExecutableView::new(
-            self.implementation,
-            self.axes,
-            self.constraints.map_or(&[], ConstraintSet::conjuncts),
+            &self.candidate.family,
+            self.candidate.constraints.conjuncts(),
         )
     }
 }
 
 pub(crate) struct CandidateDomainParts<B: seismic_target::TargetFamily> {
+    pub domain_token: u64,
     pub entry: StableEntryId,
     pub module: ModuleHash,
     pub schema: Arc<CallSchema>,
@@ -490,121 +515,114 @@ pub(crate) struct CandidateDomainParts<B: seismic_target::TargetFamily> {
     pub target: NumericalEnvironmentIdentity,
     pub evidence: Arc<EvidenceCatalog>,
     pub arena: ExprArena,
-    pub universal: UniversalImplementation<B>,
+    pub universal: DomainCandidate<B>,
     pub optimized: Vec<DomainCandidate<B>>,
     pub precision: PrecisionPolicy,
     pub optimization_exhausted: bool,
 }
 
-/// One closed implementation together with the complete planning predicate
-/// that admits it.  Keeping these facts in one object prevents the solver,
-/// freezer and coverage builder from joining parallel tables by index.
 #[derive(Debug)]
 pub(crate) struct DomainCandidate<B: seismic_target::TargetFamily> {
-    pub(crate) implementation: OptimizedImplementation<B>,
-    pub(crate) axes: Vec<ChoiceAxis>,
+    pub(crate) family: Arc<CandidateFamily<B>>,
     pub(crate) constraints: ConstraintSet,
+    pub(crate) numerical: StructuralNumericalObligation,
 }
 
-fn exact_choice_binding(
+pub(crate) fn canonical_choice_binding(
     arena: &ExprArena,
-    axes: &[ChoiceAxis],
+    declarations: &[ChoiceDeclaration],
     choices: &[(DecisionId, i64)],
-) -> Result<PartialAssignment, CoordinateError> {
-    let mut assignment = PartialAssignment::new();
+) -> Result<(PartialAssignment, Vec<(DecisionId, i64)>), CoordinateError> {
+    let declared = declarations
+        .iter()
+        .map(ChoiceDeclaration::decision)
+        .collect::<HashSet<_>>();
+    let mut supplied = HashMap::new();
     for (decision, value) in choices {
-        let Some(axis) = axes.iter().find(|axis| axis.decision == *decision) else {
+        if !declared.contains(decision) {
             return Err(CoordinateError::ForeignChoice(*decision));
-        };
-        if assignment.get(arena.decision_symbol(*decision)).is_some() {
+        }
+        if supplied.insert(*decision, *value).is_some() {
             return Err(CoordinateError::DuplicateChoice(*decision));
         }
-        if !axis.values.contains(value) {
+        if !arena.decision_domain(*decision).values().contains(value) {
             return Err(CoordinateError::ValueOutsideAxis {
                 decision: *decision,
                 value: *value,
             });
         }
-        assignment.bind(arena.decision_symbol(*decision), SymbolValue::Int(*value));
     }
-    if let Some(axis) = axes.iter().find(|axis| {
-        assignment
-            .get(arena.decision_symbol(axis.decision))
-            .is_none()
-    }) {
-        return Err(CoordinateError::MissingChoice(axis.decision));
+
+    let mut assignment = PartialAssignment::new();
+    let mut canonical = Vec::new();
+    for declaration in declarations {
+        let active = arena.compile_bool_with(declaration.active_when(), &assignment);
+        if !active.reads().is_empty() {
+            return Err(CoordinateError::IndeterminateActivation(
+                declaration.decision(),
+            ));
+        }
+        let active = active
+            .evaluate(&InvocationValues::new())
+            .map_err(|_| CoordinateError::IndeterminateActivation(declaration.decision()))?;
+        if !active {
+            continue;
+        }
+        let decision = declaration.decision();
+        let value = supplied
+            .get(&decision)
+            .copied()
+            .ok_or(CoordinateError::MissingChoice(decision))?;
+        assignment.bind(arena.decision_symbol(decision), SymbolValue::Int(value));
+        canonical.push((decision, value));
     }
-    Ok(assignment)
+    Ok((assignment, canonical))
 }
 
-/// The consuming transition from a checked logical entry to the one sealed
-/// candidate domain. Native reconciliation precedes sealing; performance
-/// evaluation does not.
-pub(crate) fn construct_candidate_domain<T, C>(
+pub(crate) fn canonical_coordinate<B: seismic_target::TargetFamily>(
+    domain: u64,
+    arena: &ExprArena,
+    family: &CandidateFamily<B>,
+    choices: &[(DecisionId, i64)],
+) -> Result<CandidateCoordinate, CoordinateError> {
+    let (_, choices) = canonical_choice_binding(arena, family.choices(), choices)?;
+    Ok(CandidateCoordinate {
+        domain,
+        family: family.identity().clone(),
+        choices,
+    })
+}
+
+pub(crate) fn construct_candidate_domain<T>(
     entry: LogicalEntry,
     device: &DeviceDescription<T>,
     registry: &CompilerRegistry<T>,
-    compiler: &C,
-    native_context: &C::Context,
     precision: &PrecisionPolicy,
     evidence: &EvidenceCatalog,
     budget: &PreparationBudget,
-) -> Result<
-    (
-        CandidateDomain<T>,
-        crate::realization::RealizationRegistry<T, C::Handle>,
-    ),
-    PreparationError,
->
+) -> Result<CandidateDomain<T>, PreparationError>
 where
     T: seismic_target::TargetFamily,
-    C: seismic_target::NativeCompiler<T>,
 {
-    internals::candidate_domain(
-        entry,
-        device,
-        registry,
-        compiler,
-        native_context,
-        precision,
-        evidence,
-        budget,
-    )
+    internals::candidate_domain(entry, device, registry, precision, evidence, budget)
 }
 
 pub(crate) mod internals {
     use super::*;
-    use crate::implementation::candidate_native_template_identities;
-    use crate::numerics;
-    use crate::realization::realize_candidate;
-    use crate::refinement::{
-        RefinementCompletion, RefinementLimits, RefinementRequest, RefinementSession,
-    };
     use seismic_lang::entry::{ParameterKind, ResultKind};
-    use seismic_lang::expr::{AnyExpr, CmpOp, NodeView, RootName};
+    use seismic_lang::expr::{CmpOp, NodeView, RootName};
 
-    pub(super) fn candidate_domain<T, C>(
+    pub(super) fn candidate_domain<T>(
         entry: LogicalEntry,
         target: &DeviceDescription<T>,
         registry: &CompilerRegistry<T>,
-        compiler: &C,
-        native_context: &C::Context,
         precision: &PrecisionPolicy,
         evidence: &EvidenceCatalog,
         budget: &PreparationBudget,
-    ) -> Result<
-        (
-            CandidateDomain<T>,
-            crate::realization::RealizationRegistry<T, C::Handle>,
-        ),
-        PreparationError,
-    >
+    ) -> Result<CandidateDomain<T>, PreparationError>
     where
         T: seismic_target::TargetFamily,
-        C: seismic_target::NativeCompiler<T>,
     {
-        let mut realizations =
-            crate::realization::RealizationRegistry::new(target.identity().clone());
         let semantic_events = Arc::new(entry.semantic_event_manifest());
         let seismic_lang::entry::LogicalEntryParts {
             identity,
@@ -614,10 +632,6 @@ pub(crate) mod internals {
             mut arena,
             program,
         } = entry.into_parts();
-
-        // Target facts enter the arena exactly once, before any
-        // implementation is constructed. Every later physical constraint
-        // therefore refers to this single set of symbols and bindings.
         let constants = crate::target::bind_target_constants(target, &mut arena);
         let target_domain = self::target_domain(&mut arena, &schema, domain, target)?;
         let refined = RefinementSession::new(RefinementLimits::from(budget)).refine(
@@ -633,133 +647,41 @@ pub(crate) mod internals {
         )?;
         let (mut arena, universal_family, optimized_families, refinement_report) =
             refined.into_parts();
-        let refinement_exhausted =
+        // The universal schedule is made total from the declared target
+        // contract before it enters the immutable structural domain. Native
+        // reflection may later validate this contract, but it must never
+        // rewrite a family after a coordinate has been selected.
+        let universal_family =
+            chunk_structural_universal(&mut arena, universal_family, target.limits().max_grid[0])?;
+        let optimization_exhausted =
             !matches!(refinement_report.completion, RefinementCompletion::Complete)
                 || !refinement_report.registered_factory_traversal_complete;
 
-        // Refinement has its own narrow budget.  Native/artifact/metadata and
-        // later solver charges begin here, at the consuming realization seam.
-        let mut tracker = PreparationBudgetTracker::new(budget.clone());
-        let templates = candidate_native_template_identities(&universal_family, target);
-        let within_templates = tracker.record_required_native_templates(&templates)?;
-        let (universal, universal_realization, metrics) = realize_candidate(
-            universal_family,
-            compiler,
-            native_context,
-            &mut arena,
-            target,
-            registry,
-            &constants,
-        )?;
-        realizations.insert(universal.identity().clone(), universal_realization)?;
-        let retained_bytes = universal.retained_metadata_bytes();
-        let within_artifact = tracker.record_required_native_artifact(metrics)?;
-        let within_metadata = tracker.record_required_metadata(retained_bytes)?;
-        let mut realization_open = within_templates && within_artifact && within_metadata;
-
-        let mut closed_optimized = Vec::new();
-        for family in optimized_families {
-            if !realization_open {
-                break;
-            }
-            let templates = candidate_native_template_identities(&family, target);
-            let within_templates = tracker.record_native_templates(&templates);
-            let (implementation, realization, metrics) = realize_candidate(
-                family,
-                compiler,
-                native_context,
-                &mut arena,
-                target,
-                registry,
-                &constants,
-            )?;
-            realizations.insert(implementation.identity().clone(), realization)?;
-            let retained_bytes = implementation.retained_metadata_bytes();
-            let within_artifact = tracker.record_native_artifact(metrics);
-            let within_metadata = tracker.charge_metadata(retained_bytes);
-            // A family whose exact charge crosses a ceiling remains retained;
-            // the ceiling only suppresses later realization.
-            closed_optimized.push(OptimizedImplementation::from_closed(implementation));
-            realization_open = within_templates && within_artifact && within_metadata;
+        if universal_family.authority != ConstructionAuthority::UniversalPortable
+            || universal_family.numerical_role != seismic_lang::entry::NumericalRole::Reference
+            || !universal_family.choices().is_empty()
+            || !universal_family.numerical_transfer().is_exact()
+        {
+            return Err(PreparationError::UniversalClosure(
+                "structural universal member lacks checked exact reference provenance".into(),
+            ));
         }
-        let optimization_exhausted = refinement_exhausted || !realization_open;
-        let universal = UniversalImplementation::from_closed_reference(
-            universal,
+        validate_structural_universal(
             &mut arena,
+            &universal_family,
             target_domain.predicate().node(),
             &constants,
         )?;
 
         let target_node = target_domain.predicate().node();
-        let mut optimized = Vec::with_capacity(closed_optimized.len());
-        for implementation in closed_optimized {
-            let numerical = numerics::admissibility(
-                &mut arena,
-                implementation.as_inner().numerical_transfer(),
-                precision,
-                evidence,
-                implementation.as_inner().identity(),
-                implementation.as_inner().decisions(),
-                target.numerical_environment_identity(),
-                implementation.as_inner().native_numerical_identity(),
-                target_domain.identity(),
-            );
-            let semantic = implementation.as_inner().semantic_coverage().node();
-            // TargetDomain may contain scalar preconditions. Those are
-            // invocation facts, not compile-time decisions, and are
-            // validated before selection. Keep them in the executable
-            // guard while exporting only target/decision/shape facts to
-            // the finite solver.
-            // The solver must choose only a physically admissible
-            // implementation. Keeping hard constraints solely in the
-            // runtime guard recreates the forbidden split-brain path in
-            // which search selects a plan that execution must reject.
-            let hard = implementation.as_inner().hard_constraints();
-            let constraints = vec![
-                DomainConstraint {
-                    origin: ConstraintOrigin::Invocation,
-                    predicate: target_node,
-                },
-                DomainConstraint {
-                    origin: ConstraintOrigin::SemanticApplicability,
-                    predicate: semantic,
-                },
-                DomainConstraint {
-                    origin: ConstraintOrigin::NumericalAdmissibility,
-                    predicate: numerical,
-                },
-                DomainConstraint {
-                    origin: ConstraintOrigin::NativeLegality,
-                    predicate: hard,
-                },
-            ];
-            let combined = arena.all(
-                &constraints
-                    .iter()
-                    .map(|constraint| constraint.predicate)
-                    .collect::<Vec<_>>(),
-            );
-            let axes = implementation
-                .as_inner()
-                .decisions()
-                .iter()
-                .map(|(decision, meaning)| ChoiceAxis {
-                    decision: *decision,
-                    meaning,
-                    values: arena.decision_domain(*decision).values().to_vec(),
-                })
-                .collect();
-            optimized.push(DomainCandidate {
-                implementation,
-                axes,
-                constraints: ConstraintSet {
-                    conjuncts: constraints,
-                    combined,
-                },
-            });
-        }
+        let universal = structural_candidate(&mut arena, universal_family, target_node, precision);
+        let optimized = optimized_families
+            .into_iter()
+            .map(|family| structural_candidate(&mut arena, family, target_node, precision))
+            .collect();
 
-        let domain = CandidateDomain::from_parts(CandidateDomainParts {
+        Ok(CandidateDomain::from_parts(CandidateDomainParts {
+            domain_token: NEXT_DOMAIN_TOKEN.fetch_add(1, Ordering::Relaxed),
             entry: identity,
             module,
             schema: Arc::new(schema),
@@ -774,8 +696,104 @@ pub(crate) mod internals {
             optimized,
             precision: precision.clone(),
             optimization_exhausted,
+        }))
+    }
+
+    fn chunk_structural_universal<T: seismic_target::TargetFamily>(
+        arena: &mut ExprArena,
+        family: CandidateFamily<T>,
+        maximum_grid_x: u64,
+    ) -> Result<CandidateFamily<T>, PreparationError> {
+        if maximum_grid_x == 0 {
+            return Err(PreparationError::UniversalClosure(
+                "target contract has zero one-dimensional grid capacity".into(),
+            ));
+        }
+        let mut parts = family.into_parts();
+        let chunks = parts
+            .executable
+            .schedule()
+            .launches()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, launch)| {
+                launch.parallel_extent.map(|_| {
+                    (
+                        parts.executable.schedule().launch_id(ordinal as u32),
+                        arena.nat(maximum_grid_x),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        parts.executable = parts.executable.chunk_semantic_launches(arena, chunks);
+        Ok(CandidateFamily::from_parts(parts))
+    }
+
+    fn validate_structural_universal<T: seismic_target::TargetFamily>(
+        arena: &mut ExprArena,
+        family: &CandidateFamily<T>,
+        target_domain: BoolExpr,
+        constants: &TargetConstants,
+    ) -> Result<(), PreparationError> {
+        let mut fixed = PartialAssignment::new();
+        for (symbol, value) in constants.bindings() {
+            fixed.bind(*symbol, *value);
+        }
+        let target_domain = arena.partial(target_domain, &fixed);
+        let semantic = arena.partial(family.semantic_coverage().node(), &fixed);
+        let structural = arena.partial(family.hard_constraints(), &fixed);
+        let coverage = arena.all(&[semantic, structural]);
+        let total = arena.implies(target_domain, coverage);
+        if !matches!(arena.view(AnyExpr::Bool(total)), NodeView::BoolConst(true)) {
+            return Err(PreparationError::UniversalClosure(
+                "structural universal member is not total over TargetDomain".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn structural_candidate<T: seismic_target::TargetFamily>(
+        arena: &mut ExprArena,
+        family: CandidateFamily<T>,
+        target: BoolExpr,
+        precision: &PrecisionPolicy,
+    ) -> DomainCandidate<T> {
+        let semantic = family.semantic_coverage().node();
+        let hard = family.hard_constraints();
+        let numerical =
+            crate::numerics::structural_obligation(arena, family.numerical_transfer(), precision);
+        let mut conjuncts = vec![
+            DomainConstraint {
+                origin: ConstraintOrigin::Invocation,
+                predicate: target,
+            },
+            DomainConstraint {
+                origin: ConstraintOrigin::SemanticApplicability,
+                predicate: semantic,
+            },
+            DomainConstraint {
+                origin: ConstraintOrigin::StructuralLegality,
+                predicate: hard,
+            },
+        ];
+        conjuncts.push(DomainConstraint {
+            origin: ConstraintOrigin::NumericalAdmissibility,
+            predicate: numerical.search_predicate(arena),
         });
-        Ok((domain, realizations))
+        let combined = arena.all(
+            &conjuncts
+                .iter()
+                .map(DomainConstraint::predicate)
+                .collect::<Vec<_>>(),
+        );
+        DomainCandidate {
+            family: Arc::new(family),
+            constraints: ConstraintSet {
+                conjuncts,
+                combined,
+            },
+            numerical,
+        }
     }
 
     pub(crate) fn planning_projection(
@@ -829,7 +847,6 @@ pub(crate) mod internals {
         let max_index = arena.nat(max_index);
         let max_allocation = arena.nat(target.limits().max_allocation_bytes);
         let mut terms = vec![entry.predicate().node()];
-
         let mut tensor = |representation,
                           axes: &[seismic_lang::expr::NatExpr]|
          -> Result<(), PreparationError> {
@@ -875,5 +892,81 @@ pub(crate) mod internals {
         let root = arena.root(RootName::Guard, AnyExpr::Bool(predicate.node()));
         let identity = arena.canonical_digest(&[root]).bytes();
         Ok(TargetDomain::new(predicate, identity))
+    }
+}
+
+#[cfg(test)]
+mod candidate_domain_tests {
+    use super::*;
+    use seismic_lang::expr::FiniteDomain;
+
+    fn declarations() -> (
+        ExprArena,
+        Vec<ChoiceDeclaration>,
+        DecisionId,
+        DecisionId,
+        DecisionId,
+    ) {
+        let mut arena = ExprArena::new();
+        let parent = arena.decision(FiniteDomain::new(vec![0, 1]).unwrap());
+        let child = arena.decision(FiniteDomain::new(vec![4, 8]).unwrap());
+        let foreign = arena.decision(FiniteDomain::new(vec![7]).unwrap());
+        let parent_active = arena.bool(true);
+        let child_active = arena.decision_is(parent, 1);
+        (
+            arena,
+            vec![
+                ChoiceDeclaration {
+                    decision: parent,
+                    meaning: "algorithm",
+                    active_when: parent_active,
+                },
+                ChoiceDeclaration {
+                    decision: child,
+                    meaning: "tile",
+                    active_when: child_active,
+                },
+            ],
+            parent,
+            child,
+            foreign,
+        )
+    }
+
+    #[test]
+    fn canonical_binding_omits_inactive_nested_choices() {
+        let (arena, declarations, parent, child, _) = declarations();
+        let (_, canonical) =
+            canonical_choice_binding(&arena, &declarations, &[(child, 8), (parent, 0)]).unwrap();
+        assert_eq!(canonical, vec![(parent, 0)]);
+    }
+
+    #[test]
+    fn active_nested_choice_is_required_and_canonically_ordered() {
+        let (arena, declarations, parent, child, _) = declarations();
+        assert!(matches!(
+            canonical_choice_binding(&arena, &declarations, &[(parent, 1)]),
+            Err(CoordinateError::MissingChoice(id)) if id == child
+        ));
+        let (_, canonical) =
+            canonical_choice_binding(&arena, &declarations, &[(child, 4), (parent, 1)]).unwrap();
+        assert_eq!(canonical, vec![(parent, 1), (child, 4)]);
+    }
+
+    #[test]
+    fn malformed_choice_sets_are_rejected() {
+        let (arena, declarations, parent, child, foreign) = declarations();
+        assert!(matches!(
+            canonical_choice_binding(&arena, &declarations, &[(parent, 0), (parent, 0)]),
+            Err(CoordinateError::DuplicateChoice(id)) if id == parent
+        ));
+        assert!(matches!(
+            canonical_choice_binding(&arena, &declarations, &[(foreign, 7)]),
+            Err(CoordinateError::ForeignChoice(id)) if id == foreign
+        ));
+        assert!(matches!(
+            canonical_choice_binding(&arena, &declarations, &[(parent, 1), (child, 5)]),
+            Err(CoordinateError::ValueOutsideAxis { decision: id, value: 5 }) if id == child
+        ));
     }
 }

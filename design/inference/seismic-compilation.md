@@ -11,8 +11,9 @@ The ordinary compiler artifact progression is:
 
 ```text
 CheckedModule -> LogicalEntry -> RefinedCandidateFamilies<T>
-             -> CandidateDomain<T> + private RealizationRegistry<T, H>
-             -> EvaluatedCandidateDomain<T> -> PlannedPolicy<T>
+             -> CandidateDomain<T>
+             -> CandidateEvaluator<T, C> -> SelectionPolicy<T>
+             + private EvaluationCompletion<T, H>
              -> exact materialization -> PreparedKernel<T, H>
              -> WorkflowGraphDraft<T, E> -> BoundWorkflowGraph<T, E>
              -> AdmittedRun<T, E> -> SubmittedRun<T, E> -> Completion
@@ -36,7 +37,7 @@ CheckedModule -> LogicalEntry -> InvocationContract
 ```
 
 This route reuses the checked entry contract and public tensor runtime but constructs none of
-`RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `PlannedPolicy`, `ExecutableVariant`,
+`RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or workflow artifacts. It has no tuning, solving, duration model, candidate
 selection, retry, or fallback. The distinct public handle makes direct-only use structural.
 
@@ -52,12 +53,14 @@ selection, retry, or fallback. The distinct public handle makes direct-only use 
 3. Alternatives are closed: an implementation contains its schedule, kernels,
    transfers, storage topology, constraints, and numerical transfer. Prediction is
    derived from that closed structure; factories do not own timing estimates.
-4. Candidate evaluation uses one declared method and returns a complete model
-   for the entire sealed domain or fails without a partial result. Planning
-   consumes only `EvaluatedCandidateDomain` and cannot observe the method.
-5. Native compilation and reconciliation happen before plan-space admission.
-   They consume kernel-affecting choices, do not redesign, and cannot reject a
-   later selected plan for a planning fact.
+4. Candidate evaluation owns search, realization requests, retention, and
+   selection. Its only semantic output is a non-empty retained candidate set
+   plus a total deterministic invocation-to-candidate function. The output
+   does not reveal whether evaluation was analytical or measurement-based.
+5. Native compilation and reconciliation are demand-driven after the domain
+   is sealed and before a coordinate is retained. They consume kernel-affecting
+   choices, do not redesign, and cannot reject a retained candidate later for
+   a planning fact.
 6. Runtime executes; it does not prove. It never discovers an inconsistency
    between compiler artifacts.
 7. Errors model reality; panics model bugs. A large family of panic sites is
@@ -73,10 +76,10 @@ selection, retry, or fallback. The distinct public handle makes direct-only use 
 | `CompilerRegistry<T>` | compiler policy: structural factories, lowering registrations, launch rules and emitted-intrinsic coverage | device observations, native contexts, analytical coefficients, executor state |
 | `RealizationRegistry<T, H>` | opaque native handles keyed by reconciled implementation and artifact identity, retained privately by preparation until materialization | domain membership, performance models, planning decisions |
 | `RefinedCandidateFamilies<T>` | one universal structural family, optional optimized families, finite axes, construction report and one `ClosedExecutableIr<T>` per family | native handles, performance models, solver state |
-| `CandidateDomain<T>` | invocation domain, every reconciled family, immutable native descriptions and identities, finite axes, and one authoritative constraint relation | native handles, evaluator identity, partial scores, planner search policy |
-| `EvaluatedCandidateDomain<T>` | exactly one objective/model for every family, correlated uncertainty, provenance and evaluator-neutral evaluation identity | gaps, unassessed regions, method-specific planner behavior |
-| `PlannedPolicy<T>` | non-empty handle-free portfolio, exact guards, evaluated costs, layouts, structured commands, numerical assessments, coverage and deterministic selection | native handles, evaluator or solver services, uncovered regions |
-| `ExecutableVariant<T, H>` | one materialized structured schedule, opaque native kernels, guard/duration/layout evaluators, binding table, identity and assessment | candidate alternatives, logical program, solver state, public kernel enumeration |
+| `CandidateDomain<T>` | invocation domain, every structural family, finite hierarchical choices, canonical coordinates, and one authoritative constraint relation | native descriptions or handles, evaluator identity, scores, search policy |
+| `SelectionPolicy<T>` | a non-empty handle-free set of retained, reconciled candidates and one total deterministic `SelectionFunction: Invocation -> CandidateIndex` | entry metadata, diagnostics, native handles, evaluator method, estimates, measurements, solver services |
+| private `EvaluationCompletion<T, H>` | entry and invocation context, coverage/accounting diagnostics, and the exact `RealizationRegistry` needed for materialization | candidate-selection semantics |
+| `ExecutableVariant<T, H>` | one materialized structured schedule, opaque native kernels, guard/layout evaluators, binding table, identity and assessment | candidate alternatives, performance estimates, logical program, solver state, public kernel enumeration |
 | `PreparedKernel<T, H>` | call schema, target domain, non-empty covered portfolio, deterministic selector | compilation logic, uncovered domain, inter-call scheduling |
 | `BoundWorkflowGraph<T, E>` | selected variants, closed output descriptors, dependency topology, access hazards, lifetimes and complete symbolic resource requirements | reservations, allocations, submission |
 | `AdmittedRun<T, E>` | one whole-graph reservation transaction, physical bindings, persistent leases, access permits and opaque submission ownership | binding, selection, replanning |
@@ -93,8 +96,24 @@ orchestrator retains the native-before-planning order above.
 
 Only the checker and the validated bundle decoder construct a checked
 module. Only the module constructs a logical entry. Only preparation owns the
-paired realization registry; planning constructs a handle-free policy after
-proving coverage, and exact materialization alone constructs a prepared kernel.
+evaluation session. Its raw compiler, native context, registry, budgets, and
+artifact store are private to the mechanical preparation module. An evaluator
+can submit checked coordinates with evaluator-private payloads and compile its
+final invocation decision from the admitted prefix; it cannot reconcile native
+artifacts, admit numerics, charge budgets, freeze variants, bind handles, or
+publish completion itself. The session constructs a handle-free policy after
+coverage is established and deposits mechanical preparation state separately; exact
+materialization alone combines them into a prepared kernel.
+Checked realization is incremental: the evaluator receives an opaque admission
+or rejection for each requested coordinate and may use that result to choose
+its next request. The universal coordinate is admitted first. The shared
+session charges native work even when reconciliation rejects a candidate,
+stops optional compilation once its native allowance closes, and binds
+publication to unique admissions from that one session. A session opens and
+publishes at most once; selector construction consumes an opaque, ordered
+portfolio of the retained prefix after metadata limits are applied. Candidate
+guards in that portfolio come from shared admission and cannot be replaced by
+the evaluator.
 
 ## Identities and expressions
 
@@ -130,7 +149,7 @@ device legality description. Hardware characterization is a separate,
 analytical-evaluator dependency: a fixed, versioned probe manifest is compiled
 once by a narrow native adapter, acquired as one aggregate raw-observation
 bundle, and interpreted by a pure certifier. Candidate-domain construction,
-generic evaluation, planning, direct native calls, and runtime execution do not
+non-analytical evaluation, direct native calls, and runtime execution do not
 depend on characterization.
 
 The device description is assembled once from backend revision, hardware identity
@@ -165,15 +184,16 @@ profile exists. The production profile boundary is structurally closed for the
 built-in service vocabularies, but its physical formulas and evidence remain
 unqualified until the independent estimator and characterization gates pass.
 
-Kernel-affecting decisions are fixed before native formation. Compilation
+Kernel-affecting decisions are fixed before native formation. Demand-driven compilation
 produces an unusable `NativeKernelCandidate`; reconciliation consumes it and
 authoritative reflection to construct `NativeKernel`. Its contract records
 the actual ABI, launch domain, pipeline/function limits, static local memory,
 register and spill usage where exposed, cooperative requirements, numerical
 mode, service footprint, and compatibility identity. Unknown legality or
 selection facts are not represented as zero and prevent admission of that
-native implementation. Native compilation is complete before
-`CandidateDomain` is sealed and is absent from evaluation and planning.
+native implementation. The active evaluator requests formation only for exact
+canonical coordinates, and reconciliation completes before any such coordinate
+enters `SelectionPolicy`.
 
 Every emitted command, physical primitive, memory relation, synchronization
 operation, and intrinsic is visible in the target-closed cost program or in the
@@ -275,22 +295,28 @@ otherwise.
 Coverage is constructional. `CandidateDomain` requires one universal family
 whose type admits no residual choice, whose numerical transfer is admissible,
 and whose legality is total over the independently derived invocation domain.
-Optimized families have a different type and cannot impersonate it. Refinement,
-evaluation, and planning own distinct budgets and typed coverage reports.
+Optimized families have a different type and cannot impersonate it. Refinement
+and candidate evaluation own distinct budgets and typed coverage diagnostics.
 Budget exhaustion preserves the complete domain already constructed and the
 universal prepared policy, while reporting exactly which search scope was not
 exhausted. It never turns a partially evaluated domain into success. Consumers
 supply no envelopes, buckets, classes, or expected shapes.
 
 Selection at invocation validates the call against the schema and target
-domain, evaluates guards, and picks the minimum `(upper_duration, identity)`.
-Non-overlapping intervals establish measured separation; overlap is recorded
-honestly rather than treated as proof that future wall-clock time is ordered. Zero
-matches after validation contradicts the private constructor and is a panic.
+domain, applies the evaluator-produced `SelectionFunction`, and verifies that
+its `CandidateIndex` names an applicable retained candidate. The common
+function is an opaque immutable `Invocation -> CandidateIndex` program: its
+representation contains no score, duration, measurement, evaluator name,
+report, or feedback scope. The analytical evaluator privately compiles its
+minimum modeled-duration decision into that program; another evaluator may
+construct the program differently without changing the policy or runtime
+contract. Retained and materialized candidates contain no performance model.
+An invalid index or false selected
+guard after validation contradicts private construction and is a panic.
 
 ## Native formation and runtime
 
-Each backend forms and reconciles native kernels before plan-space admission.
+Each backend forms and reconciles native kernels on demand before candidate retention.
 A frozen plan selects only closed kernels and binds one native schedule over
 the shared structured step type; there are no backend schedule mirrors and no
 late physical/native comparison. Native errors are toolchain, malformed

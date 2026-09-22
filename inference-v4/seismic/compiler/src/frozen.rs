@@ -1,28 +1,14 @@
-//! One exact, transient view of a closed implementation (spec §11.1).
+//! Coordinate-exact lowering input.
 //!
-//! A `FrozenPlan` does not copy or move the parametric implementation. It
-//! owns an `Arc` to that immutable object and fixes every compile-time symbol
-//! with one exact assignment. Native formation and reflection have already
-//! completed before the implementation entered `CandidateDomain`; freezing only
-//! resolves every `Choose` and arena-reuse decision and compiles evaluators
-//! with these fixed bindings. The executable retains neither object.
-//!
-//! Raw solver witnesses cannot cross this boundary. Both the raw assignment
-//! representation and the freezing transition are crate-private:
-//!
-//! ```compile_fail
-//! use seismic_compiler::frozen::freeze;
-//! use seismic_compiler::solve::RawAssignment;
-//! ```
+//! A `FrozenPlan` is created only after a structural coordinate has been
+//! natively realized and numerically admitted. It fixes target constants and
+//! active choices, but makes no search or selection decision. Both analytical
+//! and feedback evaluators use this same lowering boundary.
 
-use crate::evaluation::CandidatePerformanceModel;
 use crate::implementation::{Implementation, ImplementationIdentity};
 use crate::numerics::NumericalAssessment;
-use crate::planning::{AssessedAssignment, PlanningState};
-use crate::solve::FeasibleAssignment;
 use seismic_lang::entry::CallSchema;
-use seismic_lang::expr::{BoolExpr, PartialAssignment, SymbolKind, SymbolValue};
-use sha2::{Digest, Sha256};
+use seismic_lang::expr::{BoolExpr, ExprArena, PartialAssignment, SymbolKind};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -31,7 +17,6 @@ pub struct VariantIdentity {
     pub assignment: [u8; 32],
 }
 
-/// A complete executable guard whose target and decision symbols are fixed.
 #[derive(Clone, Debug)]
 pub(crate) struct FrozenGuard {
     node: BoolExpr,
@@ -39,11 +24,7 @@ pub(crate) struct FrozenGuard {
 }
 
 impl FrozenGuard {
-    fn new(
-        arena: &seismic_lang::expr::ExprArena,
-        node: BoolExpr,
-        fixed: PartialAssignment,
-    ) -> Self {
+    fn new(arena: &ExprArena, node: BoolExpr, fixed: PartialAssignment) -> Self {
         for symbol in arena.free_symbols(node.into()) {
             match arena.symbol_kind(symbol) {
                 SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_) => {}
@@ -63,19 +44,25 @@ impl FrozenGuard {
     }
 }
 
+pub(crate) struct FinalizationContext {
+    pub(crate) schema: Arc<CallSchema>,
+    pub(crate) device: seismic_target::DeviceDescriptionIdentity,
+    pub(crate) evaluation: crate::evaluation::EvaluationIdentity,
+    pub(crate) arena: Arc<ExprArena>,
+    pub(crate) constants: crate::target::TargetConstants,
+}
+
 #[derive(Debug)]
 pub(crate) struct FrozenPlan<B: seismic_target::TargetFamily> {
     schema: Arc<CallSchema>,
     device: seismic_target::DeviceDescriptionIdentity,
     evaluation: crate::evaluation::EvaluationIdentity,
     identity: VariantIdentity,
-    arena: Arc<seismic_lang::expr::ExprArena>,
+    arena: Arc<ExprArena>,
     implementation: Arc<Implementation<B>>,
-    assignment: FeasibleAssignment,
     fixed: PartialAssignment,
     guard: FrozenGuard,
     numerical: NumericalAssessment,
-    performance: CandidatePerformanceModel,
 }
 
 impl<B: seismic_target::TargetFamily> FrozenPlan<B> {
@@ -87,11 +74,9 @@ impl<B: seismic_target::TargetFamily> FrozenPlan<B> {
             identity: self.identity,
             arena: self.arena,
             implementation: self.implementation,
-            assignment: self.assignment,
             fixed: self.fixed,
             guard: self.guard,
             numerical: self.numerical,
-            performance: self.performance,
         }
     }
 }
@@ -101,86 +86,43 @@ pub(crate) struct FrozenPlanParts<B: seismic_target::TargetFamily> {
     pub device: seismic_target::DeviceDescriptionIdentity,
     pub evaluation: crate::evaluation::EvaluationIdentity,
     pub identity: VariantIdentity,
-    pub arena: Arc<seismic_lang::expr::ExprArena>,
+    pub arena: Arc<ExprArena>,
     pub implementation: Arc<Implementation<B>>,
-    pub assignment: FeasibleAssignment,
     pub fixed: PartialAssignment,
     pub guard: FrozenGuard,
     pub numerical: NumericalAssessment,
-    pub performance: CandidatePerformanceModel,
 }
 
-/// Infallible for a solver-produced assignment. Any failure below is a
-/// private compiler-construction bug.
 pub(crate) fn freeze<B: seismic_target::TargetFamily>(
-    space: &PlanningState<B>,
-    planned: AssessedAssignment,
+    context: &FinalizationContext,
+    implementation: Arc<Implementation<B>>,
+    guard_node: BoolExpr,
+    numerical: NumericalAssessment,
 ) -> FrozenPlan<B> {
-    let AssessedAssignment {
-        assignment,
-        numerical,
-    } = planned;
-    let index = assignment.implementation() as usize;
-    let (implementation, guard_node, performance) = if index == 0 {
-        (
-            space.universal.implementation.shared(),
-            space.target_domain.predicate().node(),
-            space.universal.performance.clone(),
-        )
-    } else {
-        let candidate = space
-            .optimized
-            .get(index - 1)
-            .unwrap_or_else(|| panic!("solver selected a family outside its planning state"));
-        (
-            candidate.candidate.implementation.shared(),
-            candidate.candidate.constraints.predicate(),
-            candidate.performance.clone(),
-        )
-    };
-    let declared = implementation.decisions();
-    if declared.len() != assignment.decisions().len()
-        || declared
-            .iter()
-            .zip(assignment.decisions())
-            .any(|((expected, _), (actual, _))| expected != actual)
-    {
-        panic!("solver assignment does not exactly bind the selected implementation decisions");
-    }
-
     let mut fixed = PartialAssignment::new();
-    for (symbol, value) in space.constants.bindings() {
+    for (symbol, value) in context.constants.bindings() {
         fixed.bind(*symbol, *value);
     }
-    for (decision, value) in assignment.decisions() {
-        fixed.bind(
-            space.arena.decision_symbol(*decision),
-            SymbolValue::Int(*value),
-        );
+    for (decision, _) in implementation.decisions() {
+        let symbol = context.arena.decision_symbol(decision);
+        if let Some(value) = implementation.assignment().get(symbol) {
+            fixed.bind(symbol, value);
+        }
     }
-    let guard = FrozenGuard::new(&space.arena, guard_node, fixed.clone());
-
-    let mut digest = Sha256::new();
-    digest.update(b"seismic-variant-assignment-v1");
-    for (ordinal, (_, value)) in assignment.decisions().iter().enumerate() {
-        digest.update((ordinal as u64).to_le_bytes());
-        digest.update(value.to_le_bytes());
-    }
+    let guard = FrozenGuard::new(&context.arena, guard_node, fixed.clone());
     let identity = VariantIdentity {
         implementation: implementation.identity().clone(),
-        assignment: digest.finalize().into(),
+        assignment: implementation.assignment_identity(),
     };
     FrozenPlan {
-        schema: space.schema.clone(),
-        device: space.device.clone(),
-        evaluation: space.evaluation.clone(),
+        schema: context.schema.clone(),
+        device: context.device.clone(),
+        evaluation: context.evaluation.clone(),
         identity,
-        arena: space.arena.clone(),
+        arena: context.arena.clone(),
         implementation,
-        assignment,
         fixed,
         guard,
         numerical,
-        performance,
     }
 }

@@ -7,12 +7,13 @@
 mod candidate;
 mod enumerate;
 
-pub use candidate::{
-    CandidateFamily, CandidateFamilyIdentity, FactoryIdentity, ImplementationProvenance,
-};
 pub(crate) use candidate::{
-    CandidateFamilyParts, ConstructionAuthority, PublishedResult, PublishedScalarKind,
-    ResultPublication,
+    activate_choices, validate_choice_declarations, CandidateFamilyParts, ConstructionAuthority,
+    PublishedResult, PublishedScalarKind, ResultPublication,
+};
+pub use candidate::{
+    CandidateFamily, CandidateFamilyIdentity, ChoiceDeclaration, FactoryIdentity,
+    ImplementationProvenance,
 };
 
 use crate::{
