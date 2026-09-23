@@ -55,6 +55,7 @@ pub enum PreparationError {
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
+    Feedback(crate::feedback::FeedbackError),
     /// A supposedly sealed candidate set violated a structural identity
     /// invariant and therefore was not published.
     InvalidCandidateDomain(String),
@@ -62,12 +63,14 @@ pub enum PreparationError {
     /// The checked reference implementation could not establish total
     /// post-native legality and duration coverage over the target domain.
     UniversalClosure(String),
+    /// Mandatory source construction awaits an implemented semantic/storage requirement.
+    UnfinishedConstruction(crate::candidate_domain::ConstructionPending),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoApplicableReport {
     pub entry: String,
-    /// Per factory, why it declined.
+    /// Selected implementation and its established incompatibility.
     pub declined: Vec<(String, String)>,
 }
 
@@ -96,6 +99,9 @@ pub enum InvocationError {
         parameter: String,
         axis: u32,
     },
+    InvalidTensorDescriptor {
+        parameter: String,
+    },
     ScalarOutOfDomain {
         parameter: String,
     },
@@ -106,7 +112,7 @@ pub enum InvocationError {
     /// The invocation is outside the prepared target domain.
     OutsideTargetDomain,
     AllocationCapacity {
-        required: u64,
+        required: seismic_lang::expr::BigUint,
         available: u64,
     },
 }
@@ -116,6 +122,10 @@ pub enum InvocationError {
 pub enum ExecutionError {
     DataCheckFailed(CheckFailure),
     AllocationFailed(String),
+    /// Resource refusal after the invocation's source prefix may have executed.
+    AllocationCapacity { required: seismic_lang::expr::BigUint, available: u64 },
+    /// A closed executable violated a compiler-owned construction premise.
+    ConstructionContradiction(String),
     SubmissionFailed(String),
     SynchronizationFailed(String),
     DeviceLost(String),
@@ -128,10 +138,10 @@ pub enum ExecutionError {
     },
 }
 
-/// A source-authored data-dependent check that failed (§12.4).
+/// A checked source operation that stopped execution, with display location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckFailure {
-    pub reason: String,
+    pub failure: seismic_lang::failure::SourceFailure,
     /// Source location of the check.
     pub path: String,
     pub line: u32,
@@ -162,8 +172,8 @@ impl fmt::Display for PreparationError {
         match self {
             Self::NoApplicableImplementation(r) => {
                 write!(f, "no applicable implementation for `{}`", r.entry)?;
-                for (factory, reason) in &r.declined {
-                    write!(f, "; {factory}: {reason}")?;
+                for (implementation, reason) in &r.declined {
+                    write!(f, "; {implementation}: {reason}")?;
                 }
                 Ok(())
             }
@@ -183,8 +193,10 @@ impl fmt::Display for PreparationError {
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
+            Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
             Self::InvalidCandidateDomain(s) => write!(f, "invalid candidate domain: {s}"),
             Self::Planning(e) => write!(f, "planning failed: {e}"),
+            Self::UnfinishedConstruction(reason) => write!(f, "source reservation construction is unfinished: {reason:?}"),
             Self::UniversalClosure(s) => write!(f, "universal implementation is not total: {s}"),
         }
     }
@@ -208,6 +220,9 @@ impl fmt::Display for InvocationError {
                     f,
                     "parameter `{parameter}` axis {axis} does not satisfy the call schema"
                 )
+            }
+            Self::InvalidTensorDescriptor { parameter } => {
+                write!(f, "parameter `{parameter}` has an invalid tensor descriptor")
             }
             Self::ScalarOutOfDomain { parameter } => {
                 write!(f, "scalar `{parameter}` is outside its domain")
@@ -236,9 +251,11 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DataCheckFailed(c) => {
-                write!(f, "check failed at {}:{}: {}", c.path, c.line, c.reason)
+                write!(f, "check failed at {}:{}: {}", c.path, c.line, c.failure)
             }
             Self::AllocationFailed(s) => write!(f, "allocation failed: {s}"),
+            Self::AllocationCapacity { required, available } => write!(f, "allocation requires {required} bytes; {available} bytes available"),
+            Self::ConstructionContradiction(detail) => write!(f, "closed executable construction contradiction: {detail}"),
             Self::SubmissionFailed(s) => write!(f, "submission failed: {s}"),
             Self::SynchronizationFailed(s) => write!(f, "synchronization failed: {s}"),
             Self::DeviceLost(s) => write!(f, "device lost: {s}"),

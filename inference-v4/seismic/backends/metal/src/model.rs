@@ -12,12 +12,12 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
     type Service = seismic_estimator_metal::MetalService;
 
     fn model_revision(&self) -> &'static str {
-        "seismic-metal-analytical-model-v1"
+        "seismic-metal-analytical-model-v2"
     }
 
     fn service_state(
         &self,
-        facts: &<Metal as seismic_ir::target::KernelDialect>::Facts,
+        facts: &<Metal as seismic_ir::target::PhysicalDialect>::Facts,
         supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         service: Self::Service,
     ) -> seismic_estimator::AnalyticalServiceState {
@@ -36,15 +36,15 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Metal as seismic_ir::target::KernelDialect>::Facts,
+        _facts: &<Metal as seismic_ir::target::PhysicalDialect>::Facts,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
-        _kernel: &Kernel<Metal>,
+        kernel: &Kernel<Metal>,
         _emission: &KernelEmissionLayout,
-        _launch: &Launch,
+        _launch: &Launch<Metal>,
         _locals: &LaunchLocalLayout,
         op: ClosedOpView<'_, Metal>,
-    ) -> OperationCost<Self::Service> {
-        seismic_estimator_metal::operation_cost(arena, op)
+    ) -> Result<OperationCost<Self::Service>, seismic_estimator::ModelLimitation> {
+        seismic_estimator_metal::operation_cost(arena, kernel, op)
     }
 }

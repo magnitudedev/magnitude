@@ -22,7 +22,6 @@ pub mod model;
 pub mod device;
 pub mod direct;
 pub mod executor;
-pub mod factories;
 pub mod facts;
 pub mod intrinsic;
 pub mod profile;
@@ -31,6 +30,9 @@ mod command;
 mod compile;
 mod render;
 mod services;
+
+#[cfg(test)]
+mod native_arithmetic_tests;
 
 use objc2_metal::MTLComputePipelineState;
 use seismic_ir::target::IntrinsicIdentityBuilder;
@@ -54,7 +56,7 @@ use seismic_ir::metal::MetalIntrinsic;
 /// Revision of this backend's implementation: every change to a lowering,
 /// an emission rule, a factory, a resource rule, or an execution-service rule
 /// changes this string and with it every cache identity (§15.1).
-pub const BACKEND_REVISION: &str = "seismic-metal-v5";
+pub const BACKEND_REVISION: &str = "seismic-metal-v10";
 
 /// The Metal backend.
 #[derive(Debug)]
@@ -68,7 +70,12 @@ pub struct MetalLaunchMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MetalNumericalMode;
 
-impl seismic_ir::target::KernelDialect for Metal {
+impl seismic_ir::target::PhysicalDialect for Metal {
+    type LaunchDescriptor = MetalLaunchMode;
+    fn ordinary_launch() -> Self::LaunchDescriptor {
+        MetalLaunchMode
+    }
+
     const NAME: BackendName = BackendName::Metal;
 
     type Intrinsic = MetalIntrinsic;
@@ -98,7 +105,6 @@ impl seismic_ir::target::KernelDialect for Metal {
 
 impl seismic_target::TargetFamily for Metal {
     type KernelAbi = profile::MetalKernelAbi;
-    type NativeLaunchMode = MetalLaunchMode;
     type NativeNumericalMode = MetalNumericalMode;
     type NativeProperties = ();
 }
@@ -113,7 +119,7 @@ pub fn native_compiler() -> &'static MetalNativeCompiler {
 pub(crate) fn native_launch_constraints(
     _target: &DeviceDescription<Metal>,
     arena: &mut seismic_lang::expr::ExprArena,
-    launch: &seismic_ir::schedule::Launch,
+    launch: &seismic_ir::schedule::Launch<Metal>,
     _locals: &seismic_ir::storage::LaunchLocalLayout,
     kernel: &seismic_ir::kernel::Kernel<Metal>,
     native: &seismic_target::NativeKernelDescription<Metal>,
@@ -261,3 +267,15 @@ impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
 
 #[cfg(test)]
 mod isolation;
+
+impl seismic_ir::identity::CanonicalIdentity for MetalLaunchMode {
+    fn encode_identity(&self, out: &mut seismic_ir::identity::StructureDigest) {
+        out.bytes(b"ordinary");
+    }
+}
+
+#[cfg(test)]
+mod plane_tests;
+
+#[cfg(test)]
+mod intrinsic_plane_tests;

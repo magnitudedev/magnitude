@@ -16,10 +16,10 @@ use crate::api::{
 use crate::driver::{self, Opened, PreparedHandle};
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::NativeExecutor;
+use seismic_compiler::feedback::PreparationOptions;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
-use seismic_lang::precision::PrecisionPolicy;
 use seismic_target::TargetFamily;
 use std::sync::Arc;
 
@@ -80,6 +80,51 @@ pub(crate) enum PreparedKind {
     Cuda(Arc<CudaPrepared>),
 }
 
+pub(crate) enum FeedbackKind<'a> {
+    Cpu(
+        driver::FeedbackCampaign<'a, seismic_cpu::Cpu, CpuExecutor, seismic_cpu::CpuNativeCompiler>,
+    ),
+    #[cfg(target_os = "macos")]
+    Metal(
+        driver::FeedbackCampaign<
+            'a,
+            seismic_metal::Metal,
+            MetalExecutor,
+            seismic_metal::MetalNativeCompiler,
+        >,
+    ),
+    Cuda(
+        driver::FeedbackCampaign<
+            'a,
+            seismic_cuda::Cuda,
+            CudaExecutor,
+            seismic_cuda::CudaNativeCompiler,
+        >,
+    ),
+}
+
+impl FeedbackKind<'_> {
+    pub(crate) fn continue_for(
+        &mut self,
+        additional: std::time::Duration,
+    ) -> Result<PreparedKind, crate::api::kernel::PrepareError> {
+        match self {
+            Self::Cpu(campaign) => campaign.continue_for(additional).map(PreparedKind::Cpu),
+            #[cfg(target_os = "macos")]
+            Self::Metal(campaign) => campaign.continue_for(additional).map(PreparedKind::Metal),
+            Self::Cuda(campaign) => campaign.continue_for(additional).map(PreparedKind::Cuda),
+        }
+    }
+    pub(crate) fn report(&self) -> &seismic_compiler::feedback::FeedbackReport {
+        match self {
+            Self::Cpu(campaign) => campaign.report(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(campaign) => campaign.report(),
+            Self::Cuda(campaign) => campaign.report(),
+        }
+    }
+}
+
 pub(crate) enum NativePreparedKind {
     #[cfg(target_os = "macos")]
     Metal(Arc<driver::NativePreparedMetal>),
@@ -89,9 +134,12 @@ pub(crate) enum NativePreparedKind {
 
 impl NativePreparedKind {
     pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        self.call_with_commit(args, || {})
+    }
+    pub(crate) fn call_with_commit(&self, args: EncodedArgs, commit: impl FnOnce()) -> Result<DecodedResults, CallError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.call(args),
+            Self::Metal(kernel) => kernel.call_with_commit(args, commit),
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
         }
@@ -99,6 +147,15 @@ impl NativePreparedKind {
 }
 
 impl PreparedKind {
+    pub(crate) fn feedback_report(&self) -> Option<&seismic_compiler::feedback::FeedbackReport> {
+        match self {
+            Self::Cpu(kernel) => kernel.prepared.feedback_report.as_ref(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.prepared.feedback_report.as_ref(),
+            Self::Cuda(kernel) => kernel.prepared.feedback_report.as_ref(),
+        }
+    }
+
     pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
         match self {
             Self::Cpu(kernel) => kernel.call(args),
@@ -162,6 +219,20 @@ impl WorkflowDraftKind {
 }
 
 impl BoundWorkflowKind {
+    pub(crate) fn set_allocation_limit(&mut self, limit: u64) {
+        match self {
+            Self::Cpu(workflow) => workflow.set_allocation_limit(limit),
+            #[cfg(target_os = "macos")]
+            Self::Metal(workflow) => workflow.set_allocation_limit(limit),
+            Self::Cuda(workflow) => workflow.set_allocation_limit(limit),
+        }
+    }
+    pub(crate) fn initial_allocation_bytes(&self)->u64 {match self {
+        Self::Cpu(w)=>w.initial_allocation_bytes(),
+        #[cfg(target_os="macos")] Self::Metal(w)=>w.initial_allocation_bytes(),
+        Self::Cuda(w)=>w.initial_allocation_bytes(),
+    }}
+
     pub(crate) fn admit(self) -> Result<AdmittedWorkflowKind, CallError> {
         match self {
             Self::Cpu(workflow) => workflow.admit().map(AdmittedWorkflowKind::Cpu),
@@ -257,14 +328,13 @@ pub(crate) fn open(infos: &[DeviceInfo], id: DeviceId) -> Result<Arc<DeviceInner
                 service,
                 executor,
                 device,
-                analytical,
             } = seismic_cpu::open_host()?;
             DeviceKind::Cpu(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_cpu::registry(),
                 device,
-                analytical,
+                |_, executor, device| executor.analytical(device),
             )))
         }
         #[cfg(target_os = "macos")]
@@ -272,27 +342,24 @@ pub(crate) fn open(infos: &[DeviceInfo], id: DeviceId) -> Result<Arc<DeviceInner
             let service = seismic_metal::MetalDevice::open(handle.clone())?;
             let device = seismic_metal::profile::open_device(&service)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
-            DeviceKind::Metal(Arc::new(Opened::new_lazy(
+            DeviceKind::Metal(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_metal::profile::registry(),
                 device,
-                seismic_metal::profile::open_analytical,
+                |service, _, device| seismic_metal::profile::open_analytical(service, device),
             )))
         }
         Descriptor::Cuda { ordinal } => {
-            let seismic_cuda::OpenedCuda {
-                service,
-                device,
-                analytical,
-            } = seismic_cuda::open(*ordinal).map_err(open_error)?;
+            let seismic_cuda::OpenedCuda { service, device } =
+                seismic_cuda::open(*ordinal).map_err(open_error)?;
             let executor = seismic_cuda::Executor::new(service.clone());
             DeviceKind::Cuda(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_cuda::registry(),
                 device,
-                analytical,
+                |service, _, device| seismic_cuda::open_analytical(service, device),
             )))
         }
     };
@@ -404,7 +471,7 @@ impl DeviceKind {
         entry: EntryId,
         bindings: ElementBindings,
         public_device: &Arc<DeviceInner>,
-        precision: PrecisionPolicy,
+        options: PreparationOptions,
     ) -> Result<PreparedKind, crate::api::kernel::PrepareError> {
         match self {
             Self::Cpu(device) => prepare(
@@ -415,7 +482,7 @@ impl DeviceKind {
                 entry,
                 bindings,
                 public_device,
-                precision,
+                options,
             )
             .map(PreparedKind::Cpu),
             #[cfg(target_os = "macos")]
@@ -429,7 +496,7 @@ impl DeviceKind {
                     entry,
                     bindings,
                     public_device,
-                    precision,
+                    options,
                 )
                 .map(PreparedKind::Metal)
             }
@@ -441,9 +508,59 @@ impl DeviceKind {
                 entry,
                 bindings,
                 public_device,
-                precision,
+                options,
             )
             .map(PreparedKind::Cuda),
+        }
+    }
+
+    pub(crate) fn start_feedback<'a>(
+        &'a self,
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        public_device: &Arc<DeviceInner>,
+        precision: seismic_lang::precision::PrecisionPolicy,
+        options: seismic_compiler::feedback::FeedbackOptions,
+    ) -> Result<(FeedbackKind<'a>, PreparedKind), crate::api::kernel::PrepareError> {
+        match self {
+            Self::Cpu(device) => driver::FeedbackCampaign::start(
+                device,
+                seismic_cpu::native_compiler(),
+                &(),
+                module,
+                entry,
+                bindings,
+                public_device,
+                precision,
+                options,
+            )
+            .map(|(campaign, kernel)| (FeedbackKind::Cpu(campaign), PreparedKind::Cpu(kernel))),
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => driver::FeedbackCampaign::start(
+                device,
+                seismic_metal::native_compiler(),
+                device.service().handle(),
+                module,
+                entry,
+                bindings,
+                public_device,
+                precision,
+                options,
+            )
+            .map(|(campaign, kernel)| (FeedbackKind::Metal(campaign), PreparedKind::Metal(kernel))),
+            Self::Cuda(device) => driver::FeedbackCampaign::start(
+                device,
+                seismic_cuda::native_compiler(),
+                &(),
+                module,
+                entry,
+                bindings,
+                public_device,
+                precision,
+                options,
+            )
+            .map(|(campaign, kernel)| (FeedbackKind::Cuda(campaign), PreparedKind::Cuda(kernel))),
         }
     }
 
@@ -469,7 +586,7 @@ impl DeviceKind {
             Self::Cpu(_) | Self::Cuda(_) => Err(crate::api::kernel::PrepareError::Preparation(
                 seismic_compiler::errors::PreparationError::NoApplicableImplementation(
                     seismic_compiler::errors::NoApplicableReport {
-                        entry: definition.entry.to_owned(),
+                        entry: definition.entry.into_owned(),
                         declined: vec![(
                             "native.metal".to_owned(),
                             "the selected device is not a Metal device".to_owned(),
@@ -489,7 +606,7 @@ fn prepare<T, E, C>(
     entry: EntryId,
     bindings: ElementBindings,
     public_device: &Arc<DeviceInner>,
-    precision: PrecisionPolicy,
+    options: PreparationOptions,
 ) -> Result<Arc<PreparedHandle<T, E>>, crate::api::kernel::PrepareError>
 where
     T: TargetFamily,
@@ -503,7 +620,8 @@ where
         module,
         entry,
         bindings,
-        precision,
+        public_device,
+        options,
     )?;
     Ok(Arc::new(PreparedHandle {
         prepared,

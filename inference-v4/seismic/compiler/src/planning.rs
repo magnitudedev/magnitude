@@ -6,7 +6,7 @@
 //! services are absent from this boundary.
 
 use crate::candidate_domain::{canonical_coordinate, CandidateCoordinate, NonEmpty};
-use crate::evaluation::{AnalyticalDomainModel, AnalyticalDomainModelParts};
+use crate::evaluation::AnalyticalDomainModel;
 use crate::numerics::StructuralNumericalObligation;
 use crate::preparation_budget::PlanningBudget;
 use crate::solve::{
@@ -16,24 +16,23 @@ use crate::target::TargetConstants;
 use seismic_lang::expr::ExprArena;
 use seismic_lang::ids::StableEntryId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetCoverage {
-    Exhaustive,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanningLimit {
     CandidateConstruction,
+    FeedbackSearch,
     Solver(CursorBudgetReport),
     OptimizedAssignments,
     ExecutableVariants,
     NativeArtifacts,
+    NumericalAnalysis,
     RetainedMetadata,
     UnsupportedObjective(crate::solve::UnsupportedObjective),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OptimizationCompletion {
+    /// The evaluator exhausted its modeled search without an optimization limit.
+    /// This does not assert that every target implementation has been modeled.
     Complete,
     Limited(PlanningLimit),
 }
@@ -48,17 +47,19 @@ pub struct PlanningBudgetReport {
     pub retained_metadata_bytes: u64,
 }
 
-/// Target-domain coverage and optional optimization completion are separate
-/// facts. A returned kernel is always exhaustively covered.
+/// Completion and resource accounting for the evaluator's actual search.
+/// This report establishes neither invocation validity nor exhaustion of the
+/// target's full implementation domain.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanningCoverage {
-    pub target: TargetCoverage,
+pub struct PlanningReport {
     pub optimization: OptimizationCompletion,
     pub budget: PlanningBudgetReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanningBudgetResource {
+    RetainedMetadata,
+    ExecutableVariants,
     RequiredRetainedMetadata,
 }
 
@@ -69,7 +70,7 @@ pub struct PlanningInfeasibleReport {
 }
 
 /// Mandatory infeasibility/failure is distinct from optional search limits,
-/// which are returned in [`PlanningCoverage`].
+/// which are returned in [`PlanningReport`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanningError {
     Infeasible(PlanningInfeasibleReport),
@@ -103,10 +104,11 @@ impl std::fmt::Display for PlanningError {
 impl std::error::Error for PlanningError {}
 
 pub(crate) fn plan<B: seismic_target::TargetFamily>(
-    domain: AnalyticalDomainModel<B>,
+    domain: &mut crate::candidate_domain::CandidateDomain<'_, B>,
+    model: AnalyticalDomainModel<B>,
     budget: &PlanningBudget,
-) -> Result<AnalyticalSearchResult<B>, PlanningError> {
-    internals::plan(domain, budget)
+) -> Result<AnalyticalSearchResult, PlanningError> {
+    internals::plan(domain, model, budget)
 }
 
 /// One checked structural selection and the analytical evidence that caused
@@ -127,106 +129,65 @@ impl AnalyticalCandidate {
     }
 }
 
-/// Pre-realization analytical planning result. The evaluated structural
-/// domain remains owned here so later realization can consume selected
-/// coordinates without reconstructing family or arena ownership. Symbolic
+/// Analytical proposals and completion evidence. Preparation retains ownership
+/// of the domain and its arena throughout analytical search. Symbolic
 /// costs may vary over the invocation domain, so this stage prunes only when
 /// fixed applicability and cost expressions prove one coordinate redundant.
 /// It retains every incomparable coordinate admitted by the explicit search
 /// budget and performs no representative-shape ranking.
-pub(crate) struct AnalyticalSearchResult<B: seismic_target::TargetFamily> {
-    domain: AnalyticalDomainModel<B>,
+pub(crate) struct AnalyticalSearchResult {
+    evaluation: crate::evaluation::EvaluationIdentity,
     selections: NonEmpty<AnalyticalCandidate>,
-    coverage: PlanningCoverage,
+    report: PlanningReport,
 }
 
-impl<B: seismic_target::TargetFamily> AnalyticalSearchResult<B> {
+impl AnalyticalSearchResult {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        crate::candidate_domain::CandidateDomain<B>,
         crate::evaluation::EvaluationIdentity,
         NonEmpty<AnalyticalCandidate>,
-        PlanningCoverage,
+        PlanningReport,
     ) {
-        let (domain, evaluation) = self.domain.into_candidate_domain();
-        (domain, evaluation, self.selections, self.coverage)
+        (self.evaluation, self.selections, self.report)
     }
 }
 
-/// The method-independent result of candidate evaluation: the retained
-/// candidates and a total deterministic function selecting one of them for
-/// every valid invocation. Preparation context, diagnostics, and native
-/// artifacts are deliberately absent.
-pub struct SelectionPolicy<B: seismic_target::TargetFamily> {
-    pub(crate) candidates: NonEmpty<crate::executable::RetainedCandidate<B>>,
+/// The evaluator's selection function. Its operands are the sole ordered
+/// candidate identities; preparation retains and resolves their executable data.
+pub struct SelectionPolicy {
     pub(crate) selection_function: crate::prepared::SelectionFunction,
 }
 
-impl<B: seismic_target::TargetFamily> SelectionPolicy<B> {
-    pub fn candidates(&self) -> &NonEmpty<crate::executable::RetainedCandidate<B>> {
-        &self.candidates
+impl SelectionPolicy {
+    pub fn candidate_ids(&self) -> &[crate::evaluation_session::PreparedCandidateId] {
+        self.selection_function.candidate_operands()
     }
 
     pub fn selection_function(&self) -> &crate::prepared::SelectionFunction {
         &self.selection_function
     }
-
-    pub fn candidate_identities(&self) -> impl Iterator<Item = &crate::frozen::VariantIdentity> {
-        self.candidates
-            .iter()
-            .map(crate::executable::RetainedCandidate::identity)
-    }
-
-    /// Applies the evaluator-produced function without native handles or
-    /// evaluator-specific state.
-    pub fn select(
-        &self,
-        values: &seismic_lang::expr::compiled::InvocationValues,
-    ) -> SelectedCandidate<'_, B> {
-        let index = crate::executable::select_candidate_index(
-            &self.selection_function,
-            self.candidates.as_slice(),
-            values,
-        );
-        SelectedCandidate {
-            index: crate::prepared::CandidateIndex::from_usize(index),
-            candidate: &self.candidates.as_slice()[index],
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct SelectedCandidate<'a, B: seismic_target::TargetFamily> {
-    pub index: crate::prepared::CandidateIndex,
-    pub candidate: &'a crate::executable::RetainedCandidate<B>,
 }
 
 mod internals {
     use super::*;
 
     pub(super) fn plan<B: seismic_target::TargetFamily>(
-        domain: AnalyticalDomainModel<B>,
+        domain: &mut crate::candidate_domain::CandidateDomain<'_, B>,
+        analytical: AnalyticalDomainModel<B>,
         budget: &PlanningBudget,
-    ) -> Result<AnalyticalSearchResult<B>, PlanningError> {
-        let AnalyticalDomainModelParts {
-            domain_token,
-            entry,
-            module,
-            schema,
-            semantic_events,
-            target_domain,
-            constants,
-            device,
+    ) -> Result<AnalyticalSearchResult, PlanningError> {
+        let domain_token = domain.domain_token();
+        let entry = domain.entry();
+        let constants = domain.constants().clone();
+        let mut arena = domain.arena_mut();
+        let AnalyticalDomainModel {
             evaluation,
-            target,
-            evidence,
-            mut arena,
             universal,
             optimized,
-            precision,
-            optimization_exhausted,
-        } = domain.into_parts();
+            construction_complete,
+        } = analytical;
+        let optimization_exhausted = !construction_complete;
         let predicates = optimized
             .iter()
             .map(|candidate| {
@@ -239,7 +200,7 @@ mod internals {
         let objective_model = {
             let mut builder = SolverModelBuilder::new(&mut arena);
             for (symbol, value) in constants.bindings() {
-                builder.bind_target(*symbol, *value);
+                builder.bind_target(*symbol, value.clone());
             }
             let mut unsupported = None;
             for (index, (candidate, predicate)) in optimized.iter().zip(&predicates).enumerate() {
@@ -267,7 +228,7 @@ mod internals {
             Err(error) => {
                 let mut builder = SolverModelBuilder::new(&mut arena);
                 for (symbol, value) in constants.bindings() {
-                    builder.bind_target(*symbol, *value);
+                    builder.bind_target(*symbol, value.clone());
                 }
                 for (index, (candidate, predicate)) in optimized.iter().zip(predicates).enumerate()
                 {
@@ -290,9 +251,13 @@ mod internals {
         let mut accounting = PlanningAccounting::new(budget);
         accounting.record_required_variant(0)?;
 
-        let universal_coordinate =
-            canonical_coordinate(domain_token, &arena, &universal.candidate.family, &[])
-                .unwrap_or_else(|error| panic!("universal coordinate is not closed: {error:?}"));
+        let universal_coordinate = canonical_coordinate(
+            domain_token,
+            &arena,
+            &universal.candidate,
+            &crate::candidate_domain::general_choices(&arena, &universal.candidate.family),
+        )
+        .unwrap_or_else(|error| panic!("universal coordinate is not closed: {error:?}"));
         let mut seen = std::collections::HashSet::new();
         seen.insert(universal_coordinate.clone());
         let mut selections = vec![AnalyticalCandidate {
@@ -305,7 +270,7 @@ mod internals {
             .then_some(PlanningLimit::CandidateConstruction)
             .or_else(|| unsupported_objective.map(PlanningLimit::UnsupportedObjective))
             .or_else(|| accounting.optional_limit());
-        if !optimization_exhausted {
+        {
             let prior_limit = completion.take();
             completion = enumerate_optional(&model, &mut accounting, |assignment| {
                 let candidate = optimized
@@ -314,7 +279,7 @@ mod internals {
                 let coordinate = canonical_coordinate(
                     domain_token,
                     &arena,
-                    &candidate.candidate.family,
+                    &candidate.candidate,
                     assignment.decisions(),
                 )
                 .unwrap_or_else(|error| {
@@ -347,36 +312,17 @@ mod internals {
                 reason: "evaluated domain omitted its mandatory universal member",
             },
         ))?;
-        let coverage = PlanningCoverage {
-            target: TargetCoverage::Exhaustive,
+        let report = PlanningReport {
             optimization: completion.map_or(
                 OptimizationCompletion::Complete,
                 OptimizationCompletion::Limited,
             ),
             budget: accounting.report(),
         };
-        let domain = AnalyticalDomainModel::from_parts(AnalyticalDomainModelParts {
-            domain_token,
-            entry,
-            module,
-            schema,
-            semantic_events,
-            target_domain,
-            constants,
-            device,
-            evaluation,
-            target,
-            evidence,
-            arena,
-            universal,
-            optimized,
-            precision,
-            optimization_exhausted,
-        });
         Ok(AnalyticalSearchResult {
-            domain,
+            evaluation,
             selections,
-            coverage,
+            report,
         })
     }
 
@@ -386,42 +332,44 @@ mod internals {
         pub(super) duration: seismic_lang::expr::DurationExpr,
         pub(super) constant_upper: Option<seismic_lang::expr::RationalDuration>,
         pub(super) numerical_analytic: seismic_lang::expr::BoolExpr,
-        pub(super) qualification_allowed: bool,
     }
 
     fn exact_prune_and_order<B: seismic_target::TargetFamily>(
         arena: &mut ExprArena,
         constants: &TargetConstants,
-        universal: &crate::evaluation::EvaluatedUniversal<B>,
+        universal: &crate::evaluation::EvaluatedCandidate<B>,
         optimized: &[crate::evaluation::EvaluatedCandidate<B>],
         selections: Vec<AnalyticalCandidate>,
     ) -> Vec<AnalyticalCandidate> {
         let facts = selections
             .iter()
             .map(|selection| {
-                let candidate = if selection.coordinate.family()
-                    == universal.candidate.family.identity()
-                {
-                    &universal.candidate
-                } else {
-                    &optimized
-                        .iter()
-                        .find(|candidate| {
-                            candidate.candidate.family.identity() == selection.coordinate.family()
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("analytical selection references a foreign family")
-                        })
-                        .candidate
-                };
+                let candidate =
+                    if selection.coordinate.family() == &universal.candidate.construction {
+                        &universal.candidate
+                    } else {
+                        &optimized
+                            .iter()
+                            .find(|candidate| {
+                                &candidate.candidate.construction == selection.coordinate.family()
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("analytical selection references a foreign family")
+                            })
+                            .candidate
+                    };
                 let mut fixed = seismic_lang::expr::PartialAssignment::new();
                 for (symbol, value) in constants.bindings() {
-                    fixed.bind(*symbol, *value);
+                    fixed.bind(*symbol, value.clone());
                 }
-                for (decision, value) in selection.coordinate.choices() {
+                for (decision, value) in selection
+                    .coordinate
+                    .decision_choices(candidate.family.choices())
+                    .unwrap()
+                {
                     fixed.bind(
-                        arena.decision_symbol(*decision),
-                        seismic_lang::expr::SymbolValue::Int(*value),
+                        arena.decision_symbol(decision),
+                        seismic_lang::expr::SymbolValue::Int((value).into()),
                     );
                 }
                 let guard = arena.partial(candidate.constraints.predicate(), &fixed);
@@ -441,7 +389,6 @@ mod internals {
                     duration,
                     constant_upper,
                     numerical_analytic: selection.numerical.analytic_predicate(),
-                    qualification_allowed: selection.numerical.qualification_allowed(),
                 }
             })
             .collect::<Vec<_>>();
@@ -501,10 +448,7 @@ mod internals {
         right: ExactSelectionFacts,
         stable_order: std::cmp::Ordering,
     ) -> bool {
-        if left.guard != right.guard
-            || left.numerical_analytic != right.numerical_analytic
-            || left.qualification_allowed != right.qualification_allowed
-        {
+        if left.guard != right.guard || left.numerical_analytic != right.numerical_analytic {
             return false;
         }
         if left.duration == right.duration {
@@ -523,16 +467,8 @@ mod internals {
         let left_family = left.family();
         let right_family = right.family();
         left_family
-            .factory
-            .name
-            .cmp(right_family.factory.name)
-            .then_with(|| {
-                left_family
-                    .factory
-                    .revision
-                    .cmp(right_family.factory.revision)
-            })
-            .then_with(|| left_family.structure.cmp(&right_family.structure))
+            .digest()
+            .cmp(&right_family.digest())
             .then_with(|| {
                 left.choices()
                     .iter()
@@ -658,13 +594,12 @@ mod internals {
 mod planning_oracle_tests {
     use super::*;
     use crate::expression::PlanningExpr;
-    use crate::refinement::CandidateFamilyIdentity;
-    use crate::refinement::FactoryIdentity;
+    use crate::refinement::ConstructedCandidateIdentity;
     use seismic_lang::expr::{AnyExpr, Assignment, CmpOp, DurationTerm, FiniteDomain, SymbolSort};
     use std::collections::BTreeSet;
 
     #[test]
-    fn complete_planning_enumeration_matches_cartesian_oracle_and_reports_coverage() {
+    fn complete_planning_enumeration_matches_cartesian_oracle_and_reports_completion() {
         for bound in 0..10 {
             let mut arena = ExprArena::default();
             let a = arena.decision(FiniteDomain::new(vec![0, 1, 2, 3]).unwrap());
@@ -678,13 +613,7 @@ mod planning_oracle_tests {
             let mut builder = SolverModelBuilder::new(&mut arena);
             builder.implementation(
                 1,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "planning-oracle",
-                        revision: "1",
-                    },
-                    structure: [0; 32],
-                },
+                ConstructedCandidateIdentity { structure: [0; 32] },
                 &[a, b],
                 planning,
             );
@@ -714,18 +643,16 @@ mod planning_oracle_tests {
             let report = accounting.report();
             assert_eq!(report.optimized_assignments, expected.len() as u64);
             assert_eq!(report.executable_variants, expected.len() as u64 + 1);
-            let coverage = PlanningCoverage {
-                target: TargetCoverage::Exhaustive,
+            let report = PlanningReport {
                 optimization: OptimizationCompletion::Complete,
                 budget: report,
             };
-            assert_eq!(coverage.target, TargetCoverage::Exhaustive);
-            assert_eq!(coverage.optimization, OptimizationCompletion::Complete);
+            assert_eq!(report.optimization, OptimizationCompletion::Complete);
         }
     }
 
     #[test]
-    fn planning_limit_is_explicit_and_never_weakens_target_coverage() {
+    fn planning_limit_reports_unvisited_work_and_retained_general_variant() {
         let budget = PlanningBudget {
             optimized_assignments: 0,
             ..PlanningBudget::default()
@@ -737,13 +664,7 @@ mod planning_oracle_tests {
         let mut builder = SolverModelBuilder::new(&mut arena);
         builder.implementation(
             1,
-            CandidateFamilyIdentity {
-                factory: FactoryIdentity {
-                    name: "planning-limit",
-                    revision: "1",
-                },
-                structure: [1; 32],
-            },
+            ConstructedCandidateIdentity { structure: [1; 32] },
             &[decision],
             planning,
         );
@@ -752,12 +673,16 @@ mod planning_oracle_tests {
         accounting.record_required_variant(0).unwrap();
         let limit = internals::enumerate_optional(&model, &mut accounting, |_| 0);
         assert_eq!(limit, Some(PlanningLimit::OptimizedAssignments));
-        let coverage = PlanningCoverage {
-            target: TargetCoverage::Exhaustive,
+        let report = PlanningReport {
             optimization: OptimizationCompletion::Limited(limit.unwrap()),
             budget: accounting.report(),
         };
-        assert_eq!(coverage.target, TargetCoverage::Exhaustive);
+        assert_eq!(
+            report.optimization,
+            OptimizationCompletion::Limited(PlanningLimit::OptimizedAssignments)
+        );
+        assert_eq!(report.budget.optimized_assignments, 0);
+        assert_eq!(report.budget.executable_variants, 1);
     }
 
     #[test]
@@ -791,21 +716,18 @@ mod planning_oracle_tests {
                 duration: fast,
                 constant_upper: Some(value(fast)),
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
             internals::ExactSelectionFacts {
                 guard: always,
                 duration: fast,
                 constant_upper: Some(value(fast)),
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
             internals::ExactSelectionFacts {
                 guard: always,
                 duration: slow,
                 constant_upper: Some(value(slow)),
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
         ];
 
@@ -846,21 +768,18 @@ mod planning_oracle_tests {
                 duration: fixed,
                 constant_upper: None,
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
             internals::ExactSelectionFacts {
                 guard: always,
                 duration: scaled,
                 constant_upper: None,
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
             internals::ExactSelectionFacts {
                 guard: always,
                 duration: fixed,
                 constant_upper: None,
                 numerical_analytic: numerical,
-                qualification_allowed: false,
             },
         ];
 

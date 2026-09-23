@@ -3,7 +3,7 @@
 //! tensors at the call boundary; the engine owns no compiler envelope.
 
 use crate::{kernels, models::qwen35::inputs::Assembled, Error};
-use seismic::{Device, Kernel, PrecisionPolicy, Tensor, WorkflowDraft, WorkflowTensor};
+use seismic::{Device, Kernel, PreparationOptions, Tensor, WorkflowDraft, WorkflowTensor};
 
 pub(super) struct Overlay {
     pub(super) source: Tensor,
@@ -19,11 +19,11 @@ pub(super) struct Conditioning {
 impl Conditioning {
     pub(super) fn new(
         device: &Device,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         hidden: u64,
     ) -> Result<Self, Error> {
         Ok(Self {
-            kernel: kernels::qwen_conditioning_overlay::for_device(device, precision)?,
+            kernel: kernels::qwen_conditioning_overlay::for_device(device, preparation)?,
             hidden,
         })
     }

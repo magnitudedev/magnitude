@@ -15,7 +15,7 @@ use seismic_ir::target::{
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneInfo, PlaneRepackRecipe,
-    RepackExpr, RepresentationKind,
+    RepackExpr,
 };
 use seismic_lang::types::DType;
 use seismic_target::{DeviceDescription, NativeCompilationError};
@@ -281,48 +281,17 @@ impl<'a> Emitter<'a> {
 
     fn operation_temp_bound(&self, op: &Op<Cuda>) -> u64 {
         match op {
-            Op::Read { place, index, .. } => {
-                let geometry = self.geometry_of(*place);
-                let decode = match &geometry.info.kind {
-                    RepresentationKind::Packed(_) => {
-                        geometry
-                            .decode
-                            .as_ref()
-                            .expect("packed CUDA geometry has no decode recipe")
-                            .steps()
-                            .len() as u64
-                            * 8
-                    }
-                    RepresentationKind::Dense(_) => 4,
-                    RepresentationKind::External(_) => 4,
-                };
-                24 + index.len() as u64 * 4 + decode
-            }
-            Op::ReadPlane { index, .. } | Op::Write { index, .. } | Op::Atomic { index, .. } => {
-                32 + index.len() as u64 * 4
-            }
+            Op::Read { index, .. } => 28 + index.len() as u64 * 4,
+            Op::ReadPlaneField { index, .. }
+            | Op::ReadPlane { index, .. }
+            | Op::Write { index, .. }
+            | Op::Atomic { index, .. } => 64 + index.len() as u64 * 4,
             Op::VectorRead { out, index, .. } => {
                 let lanes = match self.kernel.value_type(*out) {
                     ValueType::Vector { lanes, .. } => u64::from(lanes),
                     _ => panic!("typed CUDA vector read has a scalar result"),
                 };
-                let geometry = self.geometry_of(match op {
-                    Op::VectorRead { place, .. } => *place,
-                    _ => unreachable!(),
-                });
-                let decode = match &geometry.info.kind {
-                    RepresentationKind::Packed(_) => {
-                        geometry
-                            .decode
-                            .as_ref()
-                            .expect("packed CUDA geometry has no decode recipe")
-                            .steps()
-                            .len() as u64
-                            * 8
-                    }
-                    RepresentationKind::Dense(_) | RepresentationKind::External(_) => 4,
-                };
-                lanes * (32 + index.len() as u64 * 4 + decode)
+                lanes * (36 + index.len() as u64 * 4)
             }
             Op::VectorWrite { value, index, .. } => {
                 let lanes = match self.kernel.value_type(*value) {
@@ -331,6 +300,25 @@ impl<'a> Emitter<'a> {
                 };
                 lanes * (32 + index.len() as u64 * 4)
             }
+            Op::VectorBinary { out, .. }
+            | Op::VectorUnary { out, .. }
+            | Op::VectorFma { out, .. }
+            | Op::VectorCast { out, .. } => {
+                let ValueType::Vector { lanes, .. } = self.kernel.value_type(*out) else {
+                    unreachable!()
+                };
+                u64::from(lanes) * 24
+            }
+            Op::VectorReduceAdd { vector, .. } => {
+                let ValueType::Vector { lanes, .. } = self.kernel.value_type(*vector) else {
+                    unreachable!()
+                };
+                u64::from(lanes) * 24
+            }
+            Op::Intrinsic {
+                op: CudaIntrinsic::SubgroupReduce { .. },
+                ..
+            } => 128,
             Op::RepresentationConvertPacket { conversion, .. } => {
                 let conversion =
                     seismic_lang::registry::representation_conversion_info(*conversion);
@@ -356,13 +344,18 @@ impl<'a> Emitter<'a> {
                 op: CudaIntrinsic::NvFp4Matmul { .. } | CudaIntrinsic::NvFp4MatmulAdd { .. },
                 ..
             } => 512,
-            Op::Branch { .. } | Op::Repeat { .. } => 16,
+            Op::Repeat { carry_params, .. } => carry_params.iter().fold(16u64, |count, value| {
+                let lanes = match self.kernel.value_type(*value) {
+                    ValueType::Vector { lanes, .. } => u64::from(lanes),
+                    _ => 1,
+                };
+                count
+                    .checked_add(lanes)
+                    .expect("typed CUDA carry temporary inventory overflows u64")
+            }),
+            Op::Branch { .. } => 16,
             _ => 24,
         }
-    }
-
-    fn geometry_of(&self, place: PlaceRef) -> RepresentationGeometry {
-        self.kernel.closed_place(place, self.layout).geometry
     }
 
     fn word(&mut self, index: u32) -> String {
@@ -388,18 +381,26 @@ impl<'a> Emitter<'a> {
                     self.bit(op, out.value, out.ty, a.value, b.value)
                 }
                 ClosedOpView::Fma { out, a, b, c } => {
-                    self.line(format!(
-                        "fma.rn.f32 {}, {}, {}, {};",
-                        self.v(out.value),
-                        self.v(a.value),
-                        self.v(b.value),
-                        self.v(c.value)
-                    ));
-                    // Kernel values use f32 registers for all floating
-                    // dtypes. A narrow FMA result therefore needs the same
-                    // explicit publication rounding boundary as every other
-                    // narrow arithmetic operation.
-                    self.round(out.value, out.ty);
+                    let ValueType::Scalar(dtype) = out.ty else {
+                        unreachable!()
+                    };
+                    self.fma_named(
+                        dtype,
+                        &self.v(out.value),
+                        &self.v(a.value),
+                        &self.v(b.value),
+                        &self.v(c.value),
+                    );
+                }
+                ClosedOpView::VectorFromLanes { out, lanes } => {
+                    for (index, lane) in lanes.iter().enumerate() {
+                        self.line(format!(
+                            "mov{} {}, {};",
+                            suffix(lane.ty),
+                            self.vector_lane(out.value, index as u16),
+                            self.v(lane.value)
+                        ));
+                    }
                 }
                 ClosedOpView::VectorSplat { out, value } => {
                     let (_, lanes) = vector_shape(out.ty);
@@ -433,6 +434,16 @@ impl<'a> Emitter<'a> {
                 ClosedOpView::Bitcast { out, a, to } => self.line(format!(
                     "mov.b{} {}, {};",
                     if to == ValueType::Index { 64 } else { 32 },
+                    self.v(out.value),
+                    self.v(a.value)
+                )),
+                ClosedOpView::ScalarBits { out, a } => self.line(format!(
+                    "mov.b32 {}, {};",
+                    self.v(out.value),
+                    self.v(a.value)
+                )),
+                ClosedOpView::ScalarFromBits { out, a } => self.line(format!(
+                    "and.b32 {}, {}, 65535;",
                     self.v(out.value),
                     self.v(a.value)
                 )),
@@ -475,8 +486,8 @@ impl<'a> Emitter<'a> {
                     self.line(format!("mov.u64 {}, {value};", self.v(out.value())));
                 }
                 ClosedOpView::ScalarArg {
-                    out, index, dtype, ..
-                } => self.scalar_arg(out.value, index, dtype),
+                    out, index, kind, ..
+                } => self.scalar_arg(out.value, index, kind),
                 ClosedOpView::Read {
                     out,
                     place,
@@ -504,10 +515,38 @@ impl<'a> Emitter<'a> {
                     active,
                     value,
                 } => self.vector_write(&place, &indices, axis, active, value),
+                ClosedOpView::ReadPlaneField {
+                    out,
+                    place,
+                    plane_info,
+                    field,
+                    indices,
+                    ..
+                } => {
+                    let index = indices.iter().map(|v| v.value()).collect::<Vec<_>>();
+                    let (address, geometry, logical) = self.address(&place, &index);
+                    let ValueType::Scalar(dtype) = out.ty else {
+                        unreachable!("typed packed field result")
+                    };
+                    let value = self.plane_field(
+                        &address,
+                        &logical,
+                        geometry.layout.group,
+                        &plane_info,
+                        field,
+                        dtype,
+                    );
+                    self.line(format!(
+                        "mov{} {}, {value};",
+                        suffix(out.ty),
+                        self.v(out.value)
+                    ));
+                }
                 ClosedOpView::ReadPlane {
                     out,
                     place,
                     plane_info,
+                    element,
                     indices,
                     ..
                 } => self.read_plane(
@@ -515,6 +554,7 @@ impl<'a> Emitter<'a> {
                     out.ty,
                     &place,
                     &plane_info,
+                    element.value(),
                     &indices
                         .iter()
                         .map(|value| value.value())
@@ -560,10 +600,10 @@ impl<'a> Emitter<'a> {
                 ),
                 ClosedOpView::StoreSlot {
                     slot,
-                    dtype,
+                    kind,
                     value,
                     election: StoreElection::GlobalLeader,
-                } => self.store_slot(slot, dtype, value),
+                } => self.store_slot(slot, kind, value),
                 ClosedOpView::Barrier(BarrierScope::Workgroup) => self.line("bar.sync 0;"),
                 ClosedOpView::Barrier(BarrierScope::Subgroup) => {
                     self.line("bar.warp.sync 0xffffffff;")
@@ -610,10 +650,7 @@ impl<'a> Emitter<'a> {
     fn constant(&mut self, out: ErasedValue, out_type: ValueType, value: ConstantValue) {
         let value = match value {
             ConstantValue::F32(v) => format!("0f{:08x}", v.to_bits()),
-            ConstantValue::F16(v) => {
-                format!("0f{:08x}", seismic_lang::registry::f16_to_f32(v).to_bits())
-            }
-            ConstantValue::BF16(v) => format!("0f{:08x}", u32::from(v) << 16),
+            ConstantValue::F16(v) | ConstantValue::BF16(v) => v.to_string(),
             ConstantValue::I32(v) => v.to_string(),
             ConstantValue::U32(v) => v.to_string(),
             ConstantValue::Bool(v) => u8::from(v).to_string(),
@@ -692,17 +729,25 @@ impl<'a> Emitter<'a> {
             }
             (BinaryOp::Rem, true, _) => panic!("floating remainder entered typed kernel IR"),
         };
-        self.line(format!(
-            "{mnemonic} {}, {}, {};",
-            self.v(out),
-            self.v(a),
-            self.v(b)
-        ));
-        if matches!(op, BinaryOp::Div | BinaryOp::Rem) && ty == ValueType::Scalar(DType::I32) {
-            self.euclidean_fix(op, out, a, b);
+        if let ValueType::Scalar(dtype) = ty {
+            let left = self.numeric_operand(dtype, &self.v(a));
+            let right = self.numeric_operand(dtype, &self.v(b));
+            let destination = self.numeric_destination(dtype, &self.v(out));
+            self.line(format!("{mnemonic} {destination}, {left}, {right};"));
+            if matches!(op, BinaryOp::Div | BinaryOp::Rem) && dtype == DType::I32 {
+                self.euclidean_fix(op, out, a, b);
+            }
+            self.publish_numeric(dtype, &self.v(out), &destination);
+        } else {
+            self.line(format!(
+                "{mnemonic} {}, {}, {};",
+                self.v(out),
+                self.v(a),
+                self.v(b)
+            ));
         }
-        self.round(out, ty);
     }
+
     fn euclidean_fix(
         &mut self,
         wanted: BinaryOp,
@@ -735,18 +780,32 @@ impl<'a> Emitter<'a> {
         }
     }
     fn unary(&mut self, op: UnaryOp, out: ErasedValue, ty: ValueType, a: ErasedValue) {
-        let float = matches!(ty,ValueType::Scalar(d) if d.is_float());
-        self.line(format!(
-            "{}{} {}, {};",
-            match op {
-                UnaryOp::Neg => "neg",
-                UnaryOp::Abs => "abs",
-            },
-            if float { ".f32" } else { ".s32" },
-            self.v(out),
-            self.v(a)
-        ));
-        self.round(out, ty);
+        let ValueType::Scalar(dtype) = ty else {
+            panic!("scalar unary type")
+        };
+        self.unary_named(op, dtype, &self.v(out), &self.v(a));
+    }
+    fn unary_named(&mut self, op: UnaryOp, dtype: DType, out: &str, value: &str) {
+        if dtype.is_float() {
+            let bits = self.t32();
+            self.line(format!("mov.b32 {bits}, {value};"));
+            let (instruction, mask) = match (op, dtype == DType::F32) {
+                (UnaryOp::Neg, true) => ("xor.b32", 0x80000000u32),
+                (UnaryOp::Neg, false) => ("xor.b32", 0x8000),
+                (UnaryOp::Abs, true) => ("and.b32", 0x7fffffff),
+                (UnaryOp::Abs, false) => ("and.b32", 0x7fff),
+            };
+            self.line(format!("{instruction} {bits}, {bits}, {mask};"));
+            self.line(format!("mov.b32 {out}, {bits};"));
+        } else {
+            self.line(format!(
+                "{}.s32 {out}, {value};",
+                match op {
+                    UnaryOp::Neg => "neg",
+                    UnaryOp::Abs => "abs",
+                }
+            ));
+        }
     }
     fn bit(&mut self, op: BitOp, out: ErasedValue, ty: ValueType, a: ErasedValue, b: ErasedValue) {
         let m = match op {
@@ -806,31 +865,30 @@ impl<'a> Emitter<'a> {
                     panic!("floating vector remainder entered typed kernel IR")
                 }
             };
-            self.line(format!("{mnemonic} {destination}, {left}, {right};"));
+            let physical_left = self.numeric_operand(dtype, &left);
+            let physical_right = self.numeric_operand(dtype, &right);
+            let physical_out = self.numeric_destination(dtype, &destination);
+            self.line(format!(
+                "{mnemonic} {physical_out}, {physical_left}, {physical_right};"
+            ));
             if matches!(op, BinaryOp::Div | BinaryOp::Rem) && dtype == DType::I32 {
                 self.euclidean_fix_named(op, &destination, &left, &right);
             }
-            self.round_named(&destination, dtype);
+            self.publish_numeric(dtype, &destination, &physical_out);
         }
     }
 
     fn vector_unary(&mut self, op: UnaryOp, out: ClosedValue, a: ClosedValue) {
         let (dtype, lanes) = vector_shape(out.ty);
         for lane in 0..lanes {
-            let destination = self.vector_lane(out.value, lane);
-            self.line(format!(
-                "{}{} {destination}, {};",
-                match op {
-                    UnaryOp::Neg => "neg",
-                    UnaryOp::Abs => "abs",
-                },
-                if dtype.is_float() { ".f32" } else { ".s32" },
-                self.vector_lane(a.value, lane)
-            ));
-            self.round_named(&destination, dtype);
+            self.unary_named(
+                op,
+                dtype,
+                &self.vector_lane(out.value, lane),
+                &self.vector_lane(a.value, lane),
+            );
         }
     }
-
     fn vector_bit(&mut self, op: BitOp, out: ClosedValue, a: ClosedValue, b: ClosedValue) {
         let (dtype, lanes) = vector_shape(out.ty);
         let mnemonic = match op {
@@ -851,20 +909,26 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn fma_named(&mut self, dtype: DType, out: &str, a: &str, b: &str, c: &str) {
+        let a = self.numeric_operand(dtype, a);
+        let b = self.numeric_operand(dtype, b);
+        let c = self.numeric_operand(dtype, c);
+        let destination = self.numeric_destination(dtype, out);
+        self.line(format!("fma.rn.f32 {destination}, {a}, {b}, {c};"));
+        self.publish_numeric(dtype, out, &destination);
+    }
     fn vector_fma(&mut self, out: ClosedValue, a: ClosedValue, b: ClosedValue, c: ClosedValue) {
         let (dtype, lanes) = vector_shape(out.ty);
         for lane in 0..lanes {
-            let destination = self.vector_lane(out.value, lane);
-            self.line(format!(
-                "fma.rn.f32 {destination}, {}, {}, {};",
-                self.vector_lane(a.value, lane),
-                self.vector_lane(b.value, lane),
-                self.vector_lane(c.value, lane)
-            ));
-            self.round_named(&destination, dtype);
+            self.fma_named(
+                dtype,
+                &self.vector_lane(out.value, lane),
+                &self.vector_lane(a.value, lane),
+                &self.vector_lane(b.value, lane),
+                &self.vector_lane(c.value, lane),
+            );
         }
     }
-
     fn vector_cast(&mut self, out: ClosedValue, a: ClosedValue, to: ValueType) {
         let (from_dtype, lanes) = vector_shape(a.ty);
         let (to_dtype, to_lanes) = vector_shape(to);
@@ -885,16 +949,18 @@ impl<'a> Emitter<'a> {
             self.vector_lane(vector.value, 0)
         ));
         for lane in 1..lanes {
+            let left = self.numeric_operand(dtype, &destination);
+            let right = self.numeric_operand(dtype, &self.vector_lane(vector.value, lane));
+            let physical_out = self.numeric_destination(dtype, &destination);
             self.line(format!(
-                "{} {destination}, {destination}, {};",
+                "{} {physical_out}, {left}, {right};",
                 if dtype.is_float() {
                     "add.rn.f32"
                 } else {
                     "add.u32"
-                },
-                self.vector_lane(vector.value, lane)
+                }
             ));
-            self.round_named(&destination, dtype);
+            self.publish_numeric(dtype, &destination, &physical_out);
         }
     }
 
@@ -927,47 +993,68 @@ impl<'a> Emitter<'a> {
     fn cast_named(&mut self, out: &str, value: &str, from: DType, to: DType) {
         if from == to {
             self.line(format!("mov{} {out}, {value};", scalar_suffix(to)));
-        } else if from.is_float() && to.is_float() {
-            self.line(format!("mov.f32 {out}, {value};"));
+            return;
+        }
+        let value = self.numeric_operand(from, value);
+        let destination = self.numeric_destination(to, out);
+        if from.is_float() && to.is_float() {
+            self.line(format!("mov.f32 {destination}, {value};"));
         } else if from.is_float() {
             self.line(format!(
-                "cvt.rzi{}.f32 {out}, {value};",
+                "cvt.rzi{}.f32 {destination}, {value};",
                 if to == DType::I32 { ".s32" } else { ".u32" }
             ));
         } else if to.is_float() {
             self.line(format!(
-                "cvt.rn.f32{} {out}, {value};",
+                "cvt.rn.f32{} {destination}, {value};",
                 if from == DType::I32 { ".s32" } else { ".u32" }
             ));
         } else {
-            self.line(format!("mov.b32 {out}, {value};"));
+            self.line(format!("mov.b32 {destination}, {value};"));
         }
-        self.round_named(out, to);
+        self.publish_numeric(to, out, &destination);
     }
     fn math(&mut self, op: MathOp, out: ErasedValue, out_type: ValueType, a: ErasedValue) {
+        let ValueType::Scalar(dtype) = out_type else {
+            unreachable!()
+        };
+        if op == MathOp::Abs {
+            self.unary_named(UnaryOp::Abs, dtype, &self.v(out), &self.v(a));
+            return;
+        }
+        let argument = self.numeric_operand(dtype, &self.v(a));
+        let destination = self.numeric_destination(dtype, &self.v(out));
         match op {
-            MathOp::Sqrt => self.line(format!("sqrt.rn.f32 {}, {};", self.v(out), self.v(a))),
-            MathOp::Rsqrt => self.line(format!("rsqrt.approx.f32 {}, {};", self.v(out), self.v(a))),
-            MathOp::Abs => self.line(format!("abs.f32 {}, {};", self.v(out), self.v(a))),
-            MathOp::ExpFast | MathOp::Exp => {
+            MathOp::Sqrt => self.line(format!("sqrt.rn.f32 {}, {};", destination, argument)),
+            MathOp::Rsqrt => self.line(format!("rsqrt.approx.f32 {}, {};", destination, argument)),
+            MathOp::Abs => self.line(format!("abs.f32 {}, {};", destination, argument)),
+            MathOp::Exp => {
                 let scaled = self.f32();
-                self.line(format!("mul.rn.f32 {scaled}, {}, 0f3fb8aa3b;", self.v(a)));
-                self.line(format!("ex2.approx.f32 {}, {scaled};", self.v(out)));
+                self.line(format!("mul.rn.f32 {scaled}, {}, 0f3fb8aa3b;", argument));
+                self.line(format!("ex2.approx.f32 {}, {scaled};", destination));
             }
-            MathOp::Log => self.line(format!("lg2.approx.f32 {}, {};", self.v(out), self.v(a))),
-            MathOp::Sin => self.line(format!("sin.approx.f32 {}, {};", self.v(out), self.v(a))),
-            MathOp::Cos => self.line(format!("cos.approx.f32 {}, {};", self.v(out), self.v(a))),
+            MathOp::Log => self.line(format!("lg2.approx.f32 {}, {};", destination, argument)),
+            MathOp::Sin => self.line(format!("sin.approx.f32 {}, {};", destination, argument)),
+            MathOp::Cos => self.line(format!("cos.approx.f32 {}, {};", destination, argument)),
             MathOp::Max | MathOp::Min | MathOp::Fma => {
                 panic!("multi-operand math op encoded as unary IR")
             }
         }
-        self.round(out, out_type);
+        self.publish_numeric(dtype, &self.v(out), &destination);
     }
     fn cast(&mut self, out: ErasedValue, a: ErasedValue, from: ValueType, to: ValueType) {
         if from == to {
             self.line(format!("mov{} {}, {};", suffix(to), self.v(out), self.v(a)));
             return;
         }
+        let source = match from {
+            ValueType::Scalar(dtype) => self.numeric_operand(dtype, &self.v(a)),
+            _ => self.v(a),
+        };
+        let destination = match to {
+            ValueType::Scalar(dtype) => self.numeric_destination(dtype, &self.v(out)),
+            _ => self.v(out),
+        };
         let ff = matches!(from,ValueType::Scalar(d)if d.is_float());
         let tf = matches!(to,ValueType::Scalar(d)if d.is_float());
         let fb = matches!(from, ValueType::Bool | ValueType::Scalar(DType::Bool));
@@ -983,12 +1070,12 @@ impl<'a> Emitter<'a> {
                 } else {
                     ".u32"
                 },
-                self.v(a),
+                source,
                 if ff { "0f00000000" } else { "0" }
             ));
-            self.line(format!("selp.u32 {}, 1, 0, {p};", self.v(out)));
+            self.line(format!("selp.u32 {}, 1, 0, {p};", destination));
         } else if ff && tf {
-            self.line(format!("mov.f32 {}, {};", self.v(out), self.v(a)));
+            self.line(format!("mov.f32 {}, {};", destination, source));
         } else if ff {
             self.line(format!(
                 "cvt.rzi{}{}.f32 {}, {};",
@@ -1000,8 +1087,8 @@ impl<'a> Emitter<'a> {
                     ".u32"
                 },
                 "",
-                self.v(out),
-                self.v(a)
+                destination,
+                source
             ));
         } else if tf {
             self.line(format!(
@@ -1013,21 +1100,23 @@ impl<'a> Emitter<'a> {
                 } else {
                     ".u32"
                 },
-                self.v(out),
-                self.v(a)
+                destination,
+                source
             ));
         } else if fb || to == ValueType::Index || from == ValueType::Index {
             self.line(format!(
                 "cvt{}{} {}, {};",
                 suffix(to),
                 suffix(from),
-                self.v(out),
-                self.v(a)
+                destination,
+                source
             ));
         } else {
-            self.line(format!("mov.b32 {}, {};", self.v(out), self.v(a)));
+            self.line(format!("mov.b32 {}, {};", destination, source));
         }
-        self.round(out, to);
+        if let ValueType::Scalar(dtype) = to {
+            self.publish_numeric(dtype, &self.v(out), &destination);
+        }
     }
     fn compare(
         &mut self,
@@ -1037,6 +1126,14 @@ impl<'a> Emitter<'a> {
         ty: ValueType,
         b: ErasedValue,
     ) {
+        let left = match ty {
+            ValueType::Scalar(dtype) => self.numeric_operand(dtype, &self.v(a)),
+            _ => self.v(a),
+        };
+        let right = match ty {
+            ValueType::Scalar(dtype) => self.numeric_operand(dtype, &self.v(b)),
+            _ => self.v(b),
+        };
         let p = self.pred();
         let cmp = match op {
             CmpOp::Eq => "eq",
@@ -1052,11 +1149,7 @@ impl<'a> Emitter<'a> {
             ValueType::Index => "u64",
             _ => "u32",
         };
-        self.line(format!(
-            "setp.{cmp}.{class} {p}, {}, {};",
-            self.v(a),
-            self.v(b)
-        ));
+        self.line(format!("setp.{cmp}.{class} {p}, {}, {};", left, right));
         self.line(format!("selp.u32 {}, 1, 0, {p};", self.v(out)));
     }
     fn truth_bool(&mut self, value: ErasedValue) -> String {
@@ -1071,6 +1164,10 @@ impl<'a> Emitter<'a> {
             GeometryValue::WorkgroupSize(a) => format!("mov.u32 %t31, %ntid.{};", axis(a)),
             GeometryValue::GridSize(a) => format!("mov.u32 %t31, %nctaid.{};", axis(a)),
             GeometryValue::SubgroupLane => "mov.u32 %t31, %laneid;".into(),
+            // %t13 is the stable flattened thread index formed in the launch
+            // prologue; %warpid is a scheduling identity and is unsuitable.
+            GeometryValue::SubgroupOrdinal => "shr.u32 %t31, %t13, 5;".into(),
+            GeometryValue::SubgroupSize => "mov.u32 %t31, %warpsize;".into(),
             GeometryValue::GlobalId(a) => {
                 let x = self.t32();
                 self.line(format!("mov.u32 {x}, %ctaid.{};", axis(a)));
@@ -1087,25 +1184,23 @@ impl<'a> Emitter<'a> {
         }
         self.line(format!("cvt.u64.u32 {}, %t31;", self.v(out)));
     }
-    fn scalar_arg(&mut self, out: ErasedValue, index: u32, dtype: DType) {
+    fn scalar_arg(&mut self, out: ErasedValue, index: u32, kind: seismic_ir::repr::ScalarKind) {
         let raw = self.word(self.layout.words.scalar_first + index);
-        match dtype {
-            DType::F32 => {
+        match kind {
+            seismic_ir::repr::ScalarKind::Nat64 => {
+                self.line(format!("mov.u64 {}, {raw};", self.v(out)))
+            }
+            seismic_ir::repr::ScalarKind::Scalar(DType::F32) => {
                 let bits = self.t32();
                 self.line(format!("cvt.u32.u64 {bits}, {raw};"));
                 self.line(format!("mov.b32 {}, {bits};", self.v(out)));
             }
-            DType::F16 => {
-                let bits = self.h16();
-                self.line(format!("cvt.u16.u64 {bits}, {raw};"));
-                self.line(format!("cvt.f32.f16 {}, {bits};", self.v(out)));
+            seismic_ir::repr::ScalarKind::Scalar(DType::F16 | DType::BF16) => {
+                let bits = self.t32();
+                self.line(format!("cvt.u32.u64 {bits}, {raw};"));
+                self.line(format!("and.b32 {}, {bits}, 65535;", self.v(out)));
             }
-            DType::BF16 => {
-                let bits = self.h16();
-                self.line(format!("cvt.u16.u64 {bits}, {raw};"));
-                self.line(format!("cvt.f32.bf16 {}, {bits};", self.v(out)));
-            }
-            DType::I32 | DType::U32 | DType::Bool => {
+            seismic_ir::repr::ScalarKind::Scalar(DType::I32 | DType::U32 | DType::Bool) => {
                 self.line(format!("cvt.u32.u64 {}, {raw};", self.v(out)))
             }
         }
@@ -1167,20 +1262,59 @@ impl<'a> Emitter<'a> {
         self.kernel.closed_readable_place(place, self.layout)
     }
 
-    fn logical_coords(&self, tensor: &LogicalTensorMap, coordinates: &[String]) -> Vec<String> {
+    fn index_binary(&mut self, op: &str, left: &str, right: &str) -> String {
+        let out = self.t64();
+        self.line(format!("{op}.u64 {out}, {left}, {right};"));
+        out
+    }
+
+    fn logical_coords(&mut self, tensor: &LogicalTensorMap, coordinates: &[String]) -> Vec<String> {
+        let (coordinates, projection) = self.logical_storage_coords(tensor, coordinates);
+        assert!(
+            projection.is_none(),
+            "packed numerical operand cannot be a dense plane projection"
+        );
+        coordinates
+    }
+
+    fn logical_storage_coords(
+        &mut self,
+        tensor: &LogicalTensorMap,
+        coordinates: &[String],
+    ) -> (Vec<String>, Option<(u32, String)>) {
         let mut coordinates = coordinates.to_vec();
+        let mut projection = None;
         for step in tensor.steps.iter().rev() {
             coordinates = match step {
+                LogicalViewStep::Plane { plane, axis } => {
+                    let backing = self.readable_place(tensor.base);
+                    let ReadableRepresentationGeometry::Packed(geometry) = backing.geometry else {
+                        unreachable!("closed plane backing")
+                    };
+                    let elements = geometry.layout.planes[*plane as usize]
+                        .storage_elements_per_packet()
+                        .to_string();
+                    let coordinate = &coordinates[*axis as usize];
+                    let element = self.index_binary("rem", coordinate, &elements);
+                    let packet = self.index_binary("div", coordinate, &elements);
+                    coordinates[*axis as usize] =
+                        self.index_binary("mul.lo", &packet, &geometry.layout.group.to_string());
+                    projection = Some((*plane, element));
+                    coordinates
+                }
                 LogicalViewStep::Slice(axes) => {
                     let mut logical = coordinates.iter();
                     axes.iter()
                         .map(|axis| match axis {
                             LogicalSliceAxis::Point(value) => self.v(*value),
-                            LogicalSliceAxis::Range { start, .. } => format!(
-                                "({} + {})",
-                                self.v(*start),
-                                logical.next().expect("closed slice-map rank")
-                            ),
+                            LogicalSliceAxis::Range { start, .. } => {
+                                let start = self.v(*start);
+                                self.index_binary(
+                                    "add",
+                                    &start,
+                                    logical.next().expect("closed slice-map rank"),
+                                )
+                            }
                             LogicalSliceAxis::Full => {
                                 logical.next().expect("closed slice-map rank").clone()
                             }
@@ -1197,18 +1331,19 @@ impl<'a> Emitter<'a> {
                 LogicalViewStep::Reshape { from, to } => {
                     let mut linear = "0".to_string();
                     for (coordinate, extent) in coordinates.iter().zip(to) {
-                        linear = format!("(({linear}) * {} + ({coordinate}))", self.v(*extent));
+                        linear = self.index_binary("mul.lo", &linear, &self.v(*extent));
+                        linear = self.index_binary("add", &linear, coordinate);
                     }
                     let mut physical = vec![String::new(); from.len()];
                     for axis in (0..from.len()).rev() {
-                        physical[axis] = format!("(({linear}) % {})", self.v(from[axis]));
-                        linear = format!("(({linear}) / {})", self.v(from[axis]));
+                        physical[axis] = self.index_binary("rem", &linear, &self.v(from[axis]));
+                        linear = self.index_binary("div", &linear, &self.v(from[axis]));
                     }
                     physical
                 }
             };
         }
-        coordinates
+        (coordinates, projection)
     }
     fn address<G: AddressGeometry>(
         &mut self,
@@ -1258,143 +1393,18 @@ impl<'a> Emitter<'a> {
         &mut self,
         out: ErasedValue,
         out_type: ValueType,
-        place: &ClosedReadablePlace,
+        place: &ClosedDensePlace,
         index: &[ErasedValue],
     ) {
         let destination = self.v(out);
-        self.read_to(&destination, out_type, place, index);
-    }
-
-    fn read_to(
-        &mut self,
-        destination: &str,
-        out_type: ValueType,
-        place: &ClosedReadablePlace,
-        index: &[ErasedValue],
-    ) {
-        let (address, geometry, logical) = self.address(place, index);
-        match &geometry {
-            ReadableRepresentationGeometry::Dense(dense) => {
-                self.load_to(destination, out_type, &address, dense.dtype)
-            }
-            ReadableRepresentationGeometry::Packed(packed) => {
-                let layout = &packed.layout;
-                let recipe = &packed.decode;
-                let mut temps: Vec<String> = Vec::with_capacity(recipe.temporary_count());
-                for step in recipe.steps() {
-                    let value = match step {
-                        DecodeStep::ReadPlaneField { into, plane, field } => {
-                            let _ = into;
-                            self.plane_field(
-                                &address,
-                                &logical,
-                                layout.group,
-                                &layout.planes[*plane as usize],
-                                *field,
-                                recipe.dtype(*into),
-                            )
-                        }
-                        DecodeStep::InterpretCode {
-                            into,
-                            raw,
-                            bits,
-                            interpretation,
-                        } => {
-                            let _ = into;
-                            self.interpret(&temps[recipe.ordinal(*raw)], *bits, interpretation)
-                        }
-                        DecodeStep::DecodeFloatCode { into, raw, format } => {
-                            let _ = into;
-                            self.decode_float_code(&temps[recipe.ordinal(*raw)], *format)
-                        }
-                        DecodeStep::ConvertToF32 { into, from } => {
-                            let _ = into;
-                            let value = self.f32();
-                            let from_dtype = recipe.dtype(*from);
-                            if from_dtype.is_float() {
-                                self.line(format!(
-                                    "mov.f32 {value}, {};",
-                                    temps[recipe.ordinal(*from)]
-                                ));
-                            } else {
-                                self.line(format!(
-                                    "cvt.rn.f32{} {value}, {};",
-                                    dtype_suffix(from_dtype),
-                                    temps[recipe.ordinal(*from)]
-                                ));
-                            }
-                            value
-                        }
-                        DecodeStep::Multiply { into, left, right } => {
-                            let _ = into;
-                            let value = self.f32();
-                            self.line(format!(
-                                "mul.rn.f32 {value}, {}, {};",
-                                temps[recipe.ordinal(*left)],
-                                temps[recipe.ordinal(*right)]
-                            ));
-                            value
-                        }
-                        DecodeStep::Negate { into, from } => {
-                            let _ = into;
-                            let value = self.f32();
-                            self.line(format!(
-                                "neg.f32 {value}, {};",
-                                temps[recipe.ordinal(*from)]
-                            ));
-                            value
-                        }
-                        DecodeStep::MultiplyAdd {
-                            into,
-                            factor,
-                            multiplicand,
-                            addend,
-                        } => {
-                            let _ = into;
-                            let value = self.f32();
-                            self.line(format!(
-                                "fma.rn.f32 {value}, {}, {}, {};",
-                                temps[recipe.ordinal(*factor)],
-                                temps[recipe.ordinal(*multiplicand)],
-                                temps[recipe.ordinal(*addend)]
-                            ));
-                            value
-                        }
-                        DecodeStep::Cast { into, from, to } => {
-                            let _ = into;
-                            let value = if to.is_float() {
-                                self.f32()
-                            } else {
-                                self.t32()
-                            };
-                            self.line(format!(
-                                "cvt{}{} {value}, {};",
-                                dtype_suffix(*to),
-                                dtype_suffix(recipe.dtype(*from)),
-                                temps[recipe.ordinal(*from)]
-                            ));
-                            value
-                        }
-                    };
-                    temps.push(value);
-                }
-                self.line(format!(
-                    "mov{} {}, {};",
-                    suffix(out_type),
-                    destination,
-                    temps[recipe.ordinal(recipe.output())]
-                ));
-                if let ValueType::Scalar(dtype) = out_type {
-                    self.round_named(destination, dtype);
-                }
-            }
-        }
+        let (address, geometry, _) = self.address(place, index);
+        self.load_to(&destination, out_type, &address, geometry.dtype);
     }
 
     fn vector_read(
         &mut self,
         out: ClosedValue,
-        place: &ClosedReadablePlace,
+        place: &ClosedDensePlace,
         indices: &[ClosedIndexValue],
         axis: u32,
         active: ClosedIndexValue,
@@ -1430,7 +1440,13 @@ impl<'a> Emitter<'a> {
                 ));
                 coordinates[axis as usize] = coordinate;
             }
-            self.read_to_names(&destination, ValueType::Scalar(dtype), place, &coordinates);
+            let (address, geometry, _) = self.address_names(place, &coordinates);
+            self.load_to(
+                &destination,
+                ValueType::Scalar(dtype),
+                &address,
+                geometry.dtype,
+            );
             self.raw(format!("{done}:"));
         }
     }
@@ -1453,14 +1469,15 @@ impl<'a> Emitter<'a> {
                 let mut temps: Vec<String> = Vec::with_capacity(recipe.temporary_count());
                 for step in recipe.steps() {
                     let value = match step {
-                        DecodeStep::ReadPlaneField { into, plane, field } => self.plane_field(
-                            &address,
-                            &logical,
-                            layout.group,
-                            &layout.planes[*plane as usize],
-                            *field,
-                            recipe.dtype(*into),
-                        ),
+                        DecodeStep::ReadPlaneField { into, plane, field } => self
+                            .numeric_plane_field(
+                                &address,
+                                &logical,
+                                layout.group,
+                                &layout.planes[*plane as usize],
+                                *field,
+                                recipe.dtype(*into),
+                            ),
                         DecodeStep::InterpretCode {
                             raw,
                             bits,
@@ -1536,35 +1553,64 @@ impl<'a> Emitter<'a> {
                     };
                     temps.push(value);
                 }
-                self.line(format!(
-                    "mov{} {destination}, {};",
-                    suffix(out_type),
-                    temps[recipe.ordinal(recipe.output())]
-                ));
-                if let ValueType::Scalar(dtype) = out_type {
-                    self.round_named(destination, dtype);
-                }
+                let ValueType::Scalar(dtype) = out_type else {
+                    unreachable!("decoder result is scalar")
+                };
+                self.publish_numeric(dtype, destination, &temps[recipe.ordinal(recipe.output())]);
             }
         }
     }
     fn read_plane(
         &mut self,
         out: ErasedValue,
-        _out_type: ValueType,
+        out_type: ValueType,
         place: &ClosedPackedPlace,
         plane_info: &PlaneInfo,
+        element: ErasedValue,
         index: &[ErasedValue],
     ) {
-        let (address, geometry, logical) = self.address(place, index);
-        let value = self.plane_field(
-            &address,
-            &logical,
-            geometry.layout.group,
-            plane_info,
-            0,
-            plane_info.storage_dtype,
-        );
-        self.line(format!("mov.b32 {}, {value};", self.v(out)));
+        let (address, _, _) = self.address(place, index);
+        let value = self.plane_storage(&address, plane_info, &self.v(element));
+        self.line(format!("mov{} {}, {value};", suffix(out_type), self.v(out)));
+    }
+    fn plane_storage(&mut self, packet: &str, plane: &PlaneInfo, element: &str) -> String {
+        let base = self.t64();
+        self.line(format!("add.u64 {base}, {packet}, {};", plane.offset));
+        let offset = self.t64();
+        self.line(format!(
+            "mul.lo.u64 {offset}, {element}, {};",
+            plane.storage_element_bytes()
+        ));
+        if let PlaneEncoding::Dense(dtype) = plane.encoding {
+            let address = self.t64();
+            self.line(format!("add.u64 {address}, {base}, {offset};"));
+            let out = if dtype == DType::F32 {
+                self.f32()
+            } else {
+                self.t32()
+            };
+            self.load_to(&out, ValueType::Scalar(dtype), &address, dtype);
+            return out;
+        }
+        let result = self.t32();
+        self.line(format!("mov.u32 {result}, 0;"));
+        for byte in 0..plane.storage_element_bytes() {
+            let position = self.t64();
+            self.line(format!("add.u64 {position}, {offset}, {byte};"));
+            let within = self.pred();
+            self.line(format!(
+                "setp.lt.u64 {within}, {position}, {};",
+                plane.bytes_per_group
+            ));
+            let address = self.t64();
+            self.line(format!("add.u64 {address}, {base}, {position};"));
+            let raw = self.t32();
+            self.line(format!("mov.u32 {raw}, 0;"));
+            self.line(format!("@{within} ld.global.u8 {raw}, [{address}];"));
+            self.line(format!("shl.b32 {raw}, {raw}, {};", byte * 8));
+            self.line(format!("or.b32 {result}, {result}, {raw};"));
+        }
+        result
     }
 
     fn convert_packet(
@@ -1748,7 +1794,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn plane_field(
+    fn numeric_plane_field(
         &mut self,
         packet: &str,
         logical: &str,
@@ -1756,6 +1802,18 @@ impl<'a> Emitter<'a> {
         plane: &PlaneInfo,
         field: u32,
         dtype: DType,
+    ) -> String {
+        let value = self.plane_field(packet, logical, packet_group, plane, field, dtype);
+        self.numeric_operand(dtype, &value)
+    }
+    fn plane_field(
+        &mut self,
+        packet: &str,
+        logical: &str,
+        packet_group: u32,
+        plane: &PlaneInfo,
+        field: u32,
+        _dtype: DType,
     ) -> String {
         let base = self.t64();
         self.line(format!("add.u64 {base}, {packet}, {};", plane.offset));
@@ -1775,64 +1833,52 @@ impl<'a> Emitter<'a> {
                     "mad.lo.u64 {address}, {entry}, {}, {base};",
                     storage.bytes()
                 ));
-                self.load_temp(&address, *storage)
-            }
-            PlaneEncoding::Packed { bits, .. } => {
-                let bit = self.t64();
-                self.line(format!("mul.lo.u64 {bit}, {entry}, {bits};"));
-                let word = self.t64();
-                self.line(format!("shr.u64 {word}, {bit}, 5;"));
-                let address = self.t64();
-                self.line(format!("mad.lo.u64 {address}, {word}, 4, {base};"));
-                let raw = self.t32();
-                self.line(format!("ld.global.u32 {raw}, [{address}];"));
-                let bit32 = self.t32();
-                self.line(format!("cvt.u32.u64 {bit32}, {bit};"));
-                let shift = self.t32();
-                self.line(format!("and.b32 {shift}, {bit32}, 31;"));
-                let fits = self.pred();
-                self.line(format!("setp.le.u32 {fits}, {shift}, {};", 32 - *bits));
-                let joined = self.t32();
-                self.line(format!("shr.u32 {joined}, {raw}, {shift};"));
-                let complete = self.label("packed_entry");
-                self.line(format!("@{fits} bra {complete};"));
-                let high = self.t32();
-                self.line(format!("ld.global.u32 {high}, [{address}+4];"));
-                self.line(format!("shf.r.wrap.b32 {joined}, {high}, {raw}, {shift};"));
-                self.raw(format!("{complete}:"));
-                let mask = if *bits == 32 {
-                    u32::MAX
+                if matches!(storage, DType::F16 | DType::BF16) {
+                    let value = self.t32();
+                    self.load_to(&value, ValueType::Scalar(*storage), &address, *storage);
+                    value
                 } else {
-                    (1u32 << *bits) - 1
-                };
-                self.line(format!("and.b32 {joined}, {joined}, {mask};"));
-                let _ = dtype;
-                joined
+                    self.load_temp(&address, *storage)
+                }
             }
-            PlaneEncoding::FloatCode { format } => {
-                let bits = format.bits();
-                let bit = self.t64();
-                self.line(format!("mul.lo.u64 {bit}, {entry}, {bits};"));
-                let byte = self.t64();
-                self.line(format!("shr.u64 {byte}, {bit}, 3;"));
-                let address = self.t64();
-                self.line(format!("add.u64 {address}, {base}, {byte};"));
-                let raw = self.t32();
-                self.line(format!("ld.global.u8 {raw}, [{address}];"));
-                let bit32 = self.t32();
-                self.line(format!("cvt.u32.u64 {bit32}, {bit};"));
-                let shift = self.t32();
-                self.line(format!("and.b32 {shift}, {bit32}, 7;"));
-                let shifted = self.t32();
-                self.line(format!("shr.u32 {shifted}, {raw}, {shift};"));
-                let output = self.t32();
-                self.line(format!(
-                    "and.b32 {output}, {shifted}, {};",
-                    (1u32 << bits) - 1
-                ));
-                output
-            }
+            PlaneEncoding::Packed { bits, .. } => self.packed_field(&base, &entry, *bits),
+            PlaneEncoding::FloatCode { format } => self.packed_field(&base, &entry, format.bits()),
         }
+    }
+    fn packed_field(&mut self, base: &str, entry: &str, bits: u32) -> String {
+        let bit = self.t64();
+        self.line(format!("mul.lo.u64 {bit}, {entry}, {bits};"));
+        let byte = self.t64();
+        self.line(format!("shr.u64 {byte}, {bit}, 3;"));
+        let address = self.t64();
+        self.line(format!("add.u64 {address}, {base}, {byte};"));
+        let bit32 = self.t32();
+        self.line(format!("cvt.u32.u64 {bit32}, {bit};"));
+        let shift = self.t32();
+        self.line(format!("and.b32 {shift}, {bit32}, 7;"));
+        let count = self.t32();
+        self.line(format!("add.u32 {count}, {shift}, {bits};"));
+        let assembled = self.t64();
+        self.line(format!("mov.u64 {assembled}, 0;"));
+        for i in 0..(bits + 7).div_ceil(8) {
+            let raw = self.t32();
+            let enabled = self.pred();
+            self.line(format!("mov.u32 {raw}, 0;"));
+            self.line(format!("setp.gt.u32 {enabled}, {count}, {};", i * 8));
+            self.line(format!("@{enabled} ld.global.u8 {raw}, [{address}+{i}];"));
+            let wide = self.t64();
+            self.line(format!("cvt.u64.u32 {wide}, {raw};"));
+            self.line(format!("shl.b64 {wide}, {wide}, {};", i * 8));
+            self.line(format!("or.b64 {assembled}, {assembled}, {wide};"));
+        }
+        self.line(format!("shr.u64 {assembled}, {assembled}, {shift};"));
+        let out = self.t32();
+        self.line(format!("cvt.u32.u64 {out}, {assembled};"));
+        self.line(format!(
+            "and.b32 {out}, {out}, {};",
+            u32::MAX >> (32 - bits)
+        ));
+        out
     }
     fn interpret(&mut self, raw: &str, bits: u32, interpretation: &CodeInterpretation) -> String {
         let out = self.t32();
@@ -1955,20 +2001,7 @@ impl<'a> Emitter<'a> {
                 self.line(format!("ld.global.f32 {v}, [{address}];"));
                 v
             }
-            DType::F16 => {
-                let b = self.h16();
-                let v = self.f32();
-                self.line(format!("ld.global.u16 {b}, [{address}];"));
-                self.line(format!("cvt.f32.f16 {v}, {b};"));
-                v
-            }
-            DType::BF16 => {
-                let b = self.h16();
-                let v = self.f32();
-                self.line(format!("ld.global.u16 {b}, [{address}];"));
-                self.line(format!("cvt.f32.bf16 {v}, {b};"));
-                v
-            }
+            DType::F16 | DType::BF16 => unreachable!("narrow storage uses raw payload loads"),
             DType::I32 | DType::U32 => {
                 let v = self.t32();
                 self.line(format!(
@@ -1989,8 +2022,14 @@ impl<'a> Emitter<'a> {
         self.load_to(&destination, out_type, address, dtype);
     }
     fn load_to(&mut self, destination: &str, out_type: ValueType, address: &str, dtype: DType) {
-        let temp = self.load_temp(address, dtype);
-        self.line(format!("mov{} {destination}, {temp};", suffix(out_type)));
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            let bits = self.h16();
+            self.line(format!("ld.global.u16 {bits}, [{address}];"));
+            self.line(format!("cvt.u32.u16 {destination}, {bits};"));
+        } else {
+            let temp = self.load_temp(address, dtype);
+            self.line(format!("mov{} {destination}, {temp};", suffix(out_type)));
+        }
     }
     fn load_bits(&mut self, out: ErasedValue, address: &str, dtype: DType) {
         self.line(format!(
@@ -2020,11 +2059,7 @@ impl<'a> Emitter<'a> {
             DType::Bool => self.line(format!("st.global.u8 [{address}], {value};")),
             DType::F16 | DType::BF16 => {
                 let bits = self.h16();
-                self.line(format!(
-                    "cvt.rn{}{}.f32 {bits}, {value};",
-                    dtype_suffix(geometry.dtype),
-                    "",
-                ));
+                self.line(format!("cvt.u16.u32 {bits}, {value};"));
                 self.line(format!("st.global.u16 [{address}], {bits};"));
             }
         }
@@ -2130,33 +2165,34 @@ impl<'a> Emitter<'a> {
             self.v(value)
         ));
     }
-    fn store_slot(&mut self, slot: u32, dtype: DType, value: ClosedValue) {
+    fn store_slot(&mut self, slot: u32, kind: seismic_ir::repr::ScalarKind, value: ClosedValue) {
         let p = self.pred();
         self.line(format!("setp.eq.u64 {p}, %linear_thread, 0;"));
-        match dtype {
-            DType::F32 => self.line(format!(
+        match kind {
+            seismic_ir::repr::ScalarKind::Nat64 => self.line(format!(
+                "@{p} st.global.u64 [%results+{}], {};",
+                slot * 8,
+                self.v(value.value)
+            )),
+            seismic_ir::repr::ScalarKind::Scalar(DType::F32) => self.line(format!(
                 "@{p} st.global.f32 [%results+{}], {};",
                 slot * 8,
                 self.v(value.value)
             )),
-            DType::F16 | DType::BF16 => {
+            seismic_ir::repr::ScalarKind::Scalar(DType::F16 | DType::BF16) => {
                 let bits = self.h16();
-                self.line(format!(
-                    "cvt.rn{}{}.f32 {bits}, {};",
-                    dtype_suffix(dtype),
-                    "",
-                    self.v(value.value)
-                ));
+                self.line(format!("cvt.u16.u32 {bits}, {};", self.v(value.value)));
                 self.line(format!(
                     "@{p} st.global.u16 [%results+{}], {bits};",
                     slot * 8
                 ));
             }
-            DType::I32 | DType::U32 | DType::Bool => self.line(format!(
-                "@{p} st.global.u32 [%results+{}], {};",
-                slot * 8,
-                self.v(value.value)
-            )),
+            seismic_ir::repr::ScalarKind::Scalar(DType::I32 | DType::U32 | DType::Bool) => self
+                .line(format!(
+                    "@{p} st.global.u32 [%results+{}], {};",
+                    slot * 8,
+                    self.v(value.value)
+                )),
         }
     }
 
@@ -2219,18 +2255,18 @@ impl<'a> Emitter<'a> {
                         (ReduceOp::Max, _) => "max.u32",
                         (ReduceOp::Min, _) => "min.u32",
                     };
-                    self.line(format!(
-                        "{instruction} {}, {}, {shuffled};",
-                        self.v(out.value),
-                        self.v(out.value)
-                    ));
-                    if *op == ReduceOp::Sum && matches!(*dtype, DType::F16 | DType::BF16) {
-                        // Registry numerics declare the reduction's
-                        // accumulator dtype. Narrow accumulators therefore
-                        // round at every reassociated butterfly edge, not
-                        // only after the final f32-register operation.
-                        self.round(out.value, ValueType::Scalar(*dtype));
-                    }
+                    let destination = self.v(out.value);
+                    let left = self.numeric_operand(*dtype, &destination);
+                    let right = if *dtype == DType::F32 {
+                        let value = self.f32();
+                        self.line(format!("mov.b32 {value}, {shuffled};"));
+                        value
+                    } else {
+                        self.numeric_operand(*dtype, &shuffled)
+                    };
+                    let physical_out = self.numeric_destination(*dtype, &destination);
+                    self.line(format!("{instruction} {physical_out}, {left}, {right};"));
+                    self.publish_numeric(*dtype, &destination, &physical_out);
                 }
             }
             CudaIntrinsic::MatrixMatmul {
@@ -2277,10 +2313,10 @@ impl<'a> Emitter<'a> {
         let b_map = b;
         let destination_map = destination;
         let c_map = c;
-        let a = self.dense_place(a.base);
-        let b = self.dense_place(b.base);
-        let destination = self.dense_place(destination.base);
-        let c = c.map(|map| self.dense_place(map.base));
+        let a = self.readable_place(a.base);
+        let b = self.readable_place(b.base);
+        let destination = self.readable_place(destination.base);
+        let c = c.map(|map| self.readable_place(map.base));
         let ar = a_map.extents.len();
         let br = b_map.extents.len();
         let dr = destination_map.extents.len();
@@ -2290,8 +2326,8 @@ impl<'a> Emitter<'a> {
         if !matches!(elem, DType::F16 | DType::BF16) {
             panic!("CUDA matrix intrinsic entered PTX emission with an unimplemented element type")
         }
-        for place in [&a, &b] {
-            if place.geometry.dtype != elem {
+        for map in [a_map, b_map] {
+            if seismic_lang::registry::representation_info(map.representation).decoded != elem {
                 panic!("CUDA matrix intrinsic operand type disagrees with its registered signature")
             }
         }
@@ -2473,14 +2509,17 @@ impl<'a> Emitter<'a> {
         let b_map = b;
         let destination_map = destination;
         let c_map = c;
-        let a = self.dense_place(a.base);
+        let a = self.readable_place(a.base);
         let b = self.readable_place(b.base);
-        let destination = self.dense_place(destination.base);
-        let c = c.map(|map| self.dense_place(map.base));
+        let destination = self.readable_place(destination.base);
+        let c = c.map(|map| self.readable_place(map.base));
         let ReadableRepresentationGeometry::Packed(_) = &b.geometry else {
             panic!("registry-selected CUDA packed matrix row has a dense right operand")
         };
-        if a.geometry.dtype != DType::F32 || destination.geometry.dtype != DType::F32 {
+        if seismic_lang::registry::representation_info(a_map.representation).decoded != DType::F32
+            || seismic_lang::registry::representation_info(destination_map.representation).decoded
+                != DType::F32
+        {
             panic!("registry-selected CUDA packed matrix row has a non-f32 dense operand")
         }
         let ar = a_map.extents.len();
@@ -2544,11 +2583,12 @@ impl<'a> Emitter<'a> {
         let left = self.f32();
         self.line(format!("ld.global.f32 {left}, [{a_address}];"));
         let right = self.f32();
+        let right_coordinates = self.logical_coords(b_map, &[k.clone(), column.clone()]);
         self.read_to_names(
             &right,
             ValueType::Scalar(DType::F32),
             &b,
-            &self.logical_coords(b_map, &[k.clone(), column.clone()]),
+            &right_coordinates,
         );
         self.line(format!(
             "fma.rn.f32 {accumulator}, {left}, {right}, {accumulator};"
@@ -2596,11 +2636,12 @@ impl<'a> Emitter<'a> {
         );
         let a = self.readable_place(a_map.base);
         let b = self.readable_place(b_map.base);
-        let destination = self.dense_place(destination_map.base);
-        let c = c_map.map(|map| self.dense_place(map.base));
+        let destination = self.readable_place(destination_map.base);
+        let c = c_map.map(|map| self.readable_place(map.base));
         if !matches!(a.geometry, ReadableRepresentationGeometry::Packed(_))
             || !matches!(b.geometry, ReadableRepresentationGeometry::Packed(_))
-            || destination.geometry.dtype != DType::F32
+            || seismic_lang::registry::representation_info(destination_map.representation).decoded
+                != DType::F32
         {
             panic!("NVFP4 matrix intrinsic has non-NVFP4 input or non-f32 output geometry")
         }
@@ -3089,7 +3130,7 @@ impl<'a> Emitter<'a> {
     fn matrix_load_u16(
         &mut self,
         map: &LogicalTensorMap,
-        place: &ClosedDensePlace,
+        place: &ClosedReadablePlace,
         row: &str,
         column: &str,
         rows: &str,
@@ -3124,7 +3165,7 @@ impl<'a> Emitter<'a> {
     fn matrix_load_f32(
         &mut self,
         map: &LogicalTensorMap,
-        place: &ClosedDensePlace,
+        place: &ClosedReadablePlace,
         row: &str,
         column: &str,
         rows: &str,
@@ -3158,7 +3199,7 @@ impl<'a> Emitter<'a> {
     fn matrix_store_f32(
         &mut self,
         map: &LogicalTensorMap,
-        place: &ClosedDensePlace,
+        place: &ClosedReadablePlace,
         row: &str,
         column: &str,
         rows: &str,
@@ -3190,13 +3231,28 @@ impl<'a> Emitter<'a> {
     fn matrix_address(
         &mut self,
         map: &LogicalTensorMap,
-        place: &ClosedDensePlace,
+        place: &ClosedReadablePlace,
         row: &str,
         column: &str,
     ) -> (DType, String) {
-        let coordinates = self.logical_coords(map, &[row.to_owned(), column.to_owned()]);
+        let (coordinates, projection) =
+            self.logical_storage_coords(map, &[row.to_owned(), column.to_owned()]);
         let (address, geometry, _) = self.address_names(place, &coordinates);
-        (geometry.dtype, address)
+        match (geometry, projection) {
+            (ReadableRepresentationGeometry::Dense(geometry), None) => (geometry.dtype, address),
+            (ReadableRepresentationGeometry::Packed(geometry), Some((plane, element))) => {
+                let plane = &geometry.layout.planes[plane as usize];
+                let offset = self.index_binary(
+                    "mul.lo",
+                    &element,
+                    &plane.storage_element_bytes().to_string(),
+                );
+                let offset = self.index_binary("add", &offset, &plane.offset.to_string());
+                let address = self.index_binary("add", &address, &offset);
+                (plane.storage_dtype, address)
+            }
+            _ => panic!("dense intrinsic operand lacks its physical storage projection"),
+        }
     }
     fn branch(
         &mut self,
@@ -3250,9 +3306,7 @@ impl<'a> Emitter<'a> {
         ));
         self.line(format!("@{p} bra {done};"));
         let yielded = self.emit_block(body).expect("typed repeat body yields");
-        for (param, value) in params.iter().zip(yielded) {
-            self.copy_value(*param, value);
-        }
+        self.copy_carries(params, &yielded);
         self.line(format!(
             "add.u64 {}, {}, 1;",
             self.v(binder),
@@ -3262,6 +3316,42 @@ impl<'a> Emitter<'a> {
         self.raw(format!("{done}:"));
         for (out, param) in outs.iter().zip(params) {
             self.copy_value(*out, param.value);
+        }
+    }
+
+    fn copy_carries(&mut self, destinations: &[ClosedValue], sources: &[ErasedValue]) {
+        // Snapshot every source before modifying a carry register. In particular,
+        // a yielded permutation must not observe an earlier destination write.
+        let mut snapshots = Vec::new();
+        for (destination, source) in destinations.iter().zip(sources) {
+            match destination.ty {
+                ValueType::Vector { lanes, .. } => {
+                    for lane in 0..lanes {
+                        let snapshot = self.t32();
+                        self.line(format!(
+                            "mov.b32 {snapshot}, {};",
+                            self.vector_lane(*source, lane)
+                        ));
+                        snapshots.push((
+                            ".b32",
+                            self.vector_lane(destination.value, lane),
+                            snapshot,
+                        ));
+                    }
+                }
+                ty => {
+                    let (suffix, snapshot) = if ty == ValueType::Index {
+                        (".b64", self.t64())
+                    } else {
+                        (".b32", self.t32())
+                    };
+                    self.line(format!("mov{suffix} {snapshot}, {};", self.v(*source)));
+                    snapshots.push((suffix, self.v(destination.value), snapshot));
+                }
+            }
+        }
+        for (suffix, destination, snapshot) in snapshots {
+            self.line(format!("mov{suffix} {destination}, {snapshot};"));
         }
     }
 
@@ -3285,33 +3375,42 @@ impl<'a> Emitter<'a> {
             )),
         }
     }
-    fn round(&mut self, out: ErasedValue, out_type: ValueType) {
-        let ValueType::Scalar(dtype) = out_type else {
-            return;
-        };
-        let out = self.v(out);
-        self.round_named(&out, dtype);
+    /// Decode a semantic payload only at a physical arithmetic boundary.
+    fn numeric_operand(&mut self, dtype: DType, value: &str) -> String {
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            let bits = self.h16();
+            let result = self.f32();
+            self.line(format!("cvt.u16.u32 {bits}, {value};"));
+            self.line(format!("cvt.f32{} {result}, {bits};", dtype_suffix(dtype)));
+            result
+        } else {
+            value.to_owned()
+        }
     }
-    fn round_named(&mut self, out: &str, dtype: DType) {
-        match dtype {
-            DType::F16 => {
-                let bits = self.h16();
-                self.line(format!("cvt.rn.f16.f32 {bits}, {out};"));
-                self.line(format!("cvt.f32.f16 {out}, {bits};"));
-            }
-            DType::BF16 => {
-                let bits = self.h16();
-                self.line(format!("cvt.rn.bf16.f32 {bits}, {out};"));
-                self.line(format!("cvt.f32.bf16 {out}, {bits};"));
-            }
-            _ => {}
+    fn numeric_destination(&mut self, dtype: DType, out: &str) -> String {
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            self.f32()
+        } else {
+            out.to_owned()
+        }
+    }
+    fn publish_numeric(&mut self, dtype: DType, out: &str, value: &str) {
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            let bits = self.h16();
+            self.line(format!(
+                "cvt.rn{}.f32 {bits}, {value};",
+                dtype_suffix(dtype)
+            ));
+            self.line(format!("cvt.u32.u16 {out}, {bits};"));
+        } else if out != value {
+            self.line(format!("mov{} {out}, {value};", scalar_suffix(dtype)));
         }
     }
 }
 
 fn ptx_type(ty: ValueType) -> &'static str {
     match ty {
-        ValueType::Scalar(dtype) if dtype.is_float() => ".f32",
+        ValueType::Scalar(DType::F32) => ".f32",
         ValueType::Index => ".u64",
         ValueType::Scalar(DType::I32) => ".s32",
         ValueType::Scalar(_) | ValueType::Bool => ".u32",
@@ -3322,7 +3421,7 @@ fn ptx_type(ty: ValueType) -> &'static str {
     }
 }
 fn scalar_ptx_type(dtype: DType) -> &'static str {
-    if dtype.is_float() {
+    if dtype == DType::F32 {
         ".f32"
     } else if dtype == DType::I32 {
         ".s32"
@@ -3331,7 +3430,7 @@ fn scalar_ptx_type(dtype: DType) -> &'static str {
     }
 }
 fn scalar_suffix(dtype: DType) -> &'static str {
-    if dtype.is_float() {
+    if dtype == DType::F32 {
         ".f32"
     } else if dtype == DType::I32 {
         ".s32"
@@ -3340,7 +3439,7 @@ fn scalar_suffix(dtype: DType) -> &'static str {
     }
 }
 fn scalar_zero(dtype: DType) -> &'static str {
-    if dtype.is_float() {
+    if dtype == DType::F32 {
         "0f00000000"
     } else {
         "0"
@@ -3354,7 +3453,7 @@ fn vector_shape(ty: ValueType) -> (DType, u16) {
 }
 fn suffix(ty: ValueType) -> &'static str {
     match ty {
-        ValueType::Scalar(dtype) if dtype.is_float() => ".f32",
+        ValueType::Scalar(DType::F32) => ".f32",
         ValueType::Index => ".u64",
         ValueType::Scalar(DType::I32) => ".s32",
         _ => ".u32",
@@ -3379,7 +3478,7 @@ fn axis(axis: u8) -> &'static str {
     }
 }
 
-fn op_values<B: seismic_ir::target::KernelDialect>(op: &Op<B>) -> Vec<ErasedValue> {
+fn op_values<B: seismic_ir::target::PhysicalDialect>(op: &Op<B>) -> Vec<ErasedValue> {
     match op {
         Op::Constant { out, .. }
         | Op::Geometry { out, .. }
@@ -3394,8 +3493,15 @@ fn op_values<B: seismic_ir::target::KernelDialect>(op: &Op<B>) -> Vec<ErasedValu
         | Op::Math { out, a, .. }
         | Op::Cast { out, a, .. }
         | Op::Bitcast { out, a, .. }
+        | Op::ScalarBits { out, a }
+        | Op::ScalarFromBits { out, a }
         | Op::Not { out, a } => vec![*out, *a],
         Op::Fma { out, a, b, c } => vec![*out, *a, *b, *c],
+        Op::VectorFromLanes { out, lanes } => {
+            let mut values = vec![*out];
+            values.extend(lanes);
+            values
+        }
         Op::VectorSplat { out, value }
         | Op::VectorLane {
             out, vector: value, ..
@@ -3410,7 +3516,17 @@ fn op_values<B: seismic_ir::target::KernelDialect>(op: &Op<B>) -> Vec<ErasedValu
         | Op::VectorReduceAdd { out, vector: a } => vec![*out, *a],
         Op::VectorFma { out, a, b, c } => vec![*out, *a, *b, *c],
         Op::Select { out, cond, a, b } => vec![*out, *cond, *a, *b],
-        Op::Read { out, index, .. } | Op::ReadPlane { out, index, .. } => {
+        Op::ReadPlane {
+            out,
+            index,
+            element,
+            ..
+        } => {
+            let mut values = vec![*out, *element];
+            values.extend(index);
+            values
+        }
+        Op::Read { out, index, .. } | Op::ReadPlaneField { out, index, .. } => {
             let mut v = vec![*out];
             v.extend(index);
             v
@@ -3465,6 +3581,387 @@ fn op_values<B: seismic_ir::target::KernelDialect>(op: &Op<B>) -> Vec<ErasedValu
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "bitcast requires equal-width numeric scalar payloads")]
+    fn vector_reinterpretation_is_not_a_scalar_bitcast() {
+        use seismic_ir::{construction::Construction, target::VectorSupport};
+
+        let facts = facts();
+        let mut arena = seismic_lang::expr::ExprArena::new();
+        let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+        let word = builder.constant(
+            ConstantValue::U32(0x7c01_8000),
+            ValueType::Scalar(DType::U32),
+        );
+        builder.bitcast(
+            word,
+            ValueType::Vector {
+                dtype: DType::F16,
+                lanes: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn repeat_carry_permutations_read_the_old_state() {
+        use seismic_ir::{
+            construction::Construction,
+            target::{KernelWordLayout, VectorSupport},
+        };
+        use seismic_lang::registry::IntrinsicUniformity;
+
+        for count in [2, 3, 40] {
+            for (constant, ty) in [
+                (ConstantValue::U32(1), ValueType::Scalar(DType::U32)),
+                (ConstantValue::F32(-0.0), ValueType::Scalar(DType::F32)),
+                (ConstantValue::F16(0x7c01), ValueType::Scalar(DType::F16)),
+                (ConstantValue::Index(1), ValueType::Index),
+            ] {
+                let facts = facts();
+                let mut arena = seismic_lang::expr::ExprArena::new();
+                let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
+                let vectors = VectorSupport::default();
+                let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+                let start = builder.index_constant(0);
+                let end = builder.index_constant(1);
+                let initial = (0..count).map(|_| builder.constant(constant, ty)).collect();
+                builder.repeat(
+                    start,
+                    end,
+                    initial,
+                    &vec![IntrinsicUniformity::Workgroup; count],
+                    |_, _, mut values| {
+                        values.rotate_left(1);
+                        values
+                    },
+                );
+                builder.close();
+                let kernel = &construction.kernels()[0];
+                let layout = KernelEmissionLayout {
+                    words: KernelWordLayout::for_kernel(kernel),
+                    bindings: vec![],
+                    locals: vec![],
+                    addressable_resources: vec![],
+                    scalar_args: vec![],
+                    result_types: vec![],
+                };
+                let mut emitter = Emitter::new(&facts, kernel, &layout);
+                emitter.collect(kernel.root());
+                emitter.header("carry_probe");
+                emitter.emit_block(kernel.root());
+                let op = kernel.block(kernel.root()).ops.last().unwrap();
+                let ClosedOpView::Repeat {
+                    carry_parameters, ..
+                } = kernel.closed_op(op, &layout)
+                else {
+                    panic!("expected repeat")
+                };
+                assert!(emitter.operation_temp_bound(op) >= count as u64 + 1);
+                assert!(u64::from(emitter.temp) <= emitter.temp_bound);
+                let registers = carry_parameters
+                    .iter()
+                    .map(|v| emitter.v(v.value))
+                    .collect::<Vec<_>>();
+                let mut state = registers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.clone(), i as u64 + 1))
+                    .collect::<HashMap<_, _>>();
+                // Interpret only the loop's data moves, with distinct old payloads.
+                // This fails for the original sequential backedge copies.
+                let body = emitter
+                    .text
+                    .split("L_repeat_0:\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("add.u64")
+                    .next()
+                    .unwrap();
+                for line in body
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| line.starts_with("mov."))
+                {
+                    let operands = line.split_once(' ').unwrap().1.trim_end_matches(';');
+                    let (destination, source) = operands.split_once(", ").unwrap();
+                    let value = state[source];
+                    state.insert(destination.to_string(), value);
+                }
+                for (i, register) in registers.iter().enumerate() {
+                    assert_eq!(
+                        state[register],
+                        ((i + 1) % count + 1) as u64,
+                        "{ty:?}: {body}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn facts() -> CudaFacts {
+        use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
+        CudaFacts {
+            device_ordinal: 0,
+            compute_capability: ComputeCapability::SM80,
+            driver_api: DriverApiVersion::PTX_71_MINIMUM,
+            ptx: PtxTarget::BASELINE,
+            tensor_memory: TensorMemory::Unavailable,
+            warp_size: 32,
+            multiprocessors: 1,
+            max_threads_per_multiprocessor: 2048,
+            max_blocks_per_multiprocessor: 32,
+            registers_per_block: 65536,
+            registers_per_multiprocessor: 65536,
+            max_registers_per_thread: 255,
+            codegen_registers_per_thread: 64,
+            shared_bytes_per_multiprocessor: 65536,
+            shared_bytes_per_block: 49152,
+            l2_cache_bytes: 1024,
+            global_memory_bytes: 1048576,
+            cooperative_launch: true,
+            kernel_parameter_bytes: 4096,
+        }
+    }
+    #[test]
+    fn intrinsic_view_coordinates_emit_ptx_integer_instructions() {
+        let source = fixture(|emitter, values| {
+            let extent = values[3].value;
+            let map = LogicalTensorMap {
+                base: PlaceRef::Local { index: 0 },
+                representation: seismic_lang::registry::dense(DType::F32),
+                extents: vec![extent, extent],
+                steps: vec![
+                    LogicalViewStep::Slice(vec![
+                        LogicalSliceAxis::Range {
+                            start: extent,
+                            end: extent,
+                        },
+                        LogicalSliceAxis::Full,
+                    ]),
+                    LogicalViewStep::Reshape {
+                        from: vec![extent, extent],
+                        to: vec![extent, extent],
+                    },
+                ],
+            };
+            let coordinates = emitter.logical_coords(&map, &["7".into(), "11".into()]);
+            assert!(coordinates.iter().all(|value| value.starts_with("%d")));
+        });
+        assert!(source.contains("mul.lo.u64"));
+        assert!(source.contains("add.u64"));
+        assert!(source.contains("rem.u64"));
+        assert!(source.contains("div.u64"));
+        assert!(
+            !source.contains("(("),
+            "PTX operands cannot contain C-style address expressions"
+        );
+    }
+
+    fn fixture(run: impl FnOnce(&mut Emitter<'_>, &[ClosedValue])) -> String {
+        use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
+        use seismic_ir::{
+            construction::Construction,
+            target::{KernelWordLayout, VectorSupport},
+        };
+        let facts = facts();
+        let mut arena = seismic_lang::expr::ExprArena::new();
+        let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+        let half = builder.constant(ConstantValue::F16(0xfc01), ValueType::Scalar(DType::F16));
+        let bf = builder.constant(ConstantValue::BF16(0xff81), ValueType::Scalar(DType::BF16));
+        builder.constant(
+            ConstantValue::F32(f32::from_bits(0xff800001)),
+            ValueType::Scalar(DType::F32),
+        );
+        builder.constant(ConstantValue::Index((1u64 << 54) + 1), ValueType::Index);
+        let bits = builder.scalar_bits(half.clone());
+        let restored = builder.scalar_from_bits(bits, DType::F16);
+        let condition = builder.constant(ConstantValue::Bool(true), ValueType::Bool);
+        builder.select(condition, half, restored);
+        builder.scalar_bits(bf);
+        builder.close();
+        let kernel = &construction.kernels()[0];
+        let layout = KernelEmissionLayout {
+            words: KernelWordLayout::for_kernel(kernel),
+            bindings: vec![],
+            locals: vec![],
+            addressable_resources: vec![],
+            scalar_args: vec![],
+            result_types: vec![],
+        };
+        let mut emitter = Emitter::new(&facts, kernel, &layout);
+        emitter.collect(kernel.root());
+        emitter.header("payload_probe");
+        emitter.emit_block(kernel.root());
+        let values = kernel
+            .block(kernel.root())
+            .ops
+            .iter()
+            .filter_map(|op| match kernel.closed_op(op, &layout) {
+                ClosedOpView::Constant { out, .. } => Some(out),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        run(&mut emitter, &values);
+        emitter.text
+    }
+    #[test]
+    fn source_float_cast_recipe_emits_word_operations_not_native_conversions() {
+        use seismic_ir::{construction::Construction, target::{KernelWordLayout, VectorSupport}};
+        let facts = facts();
+        for (from, to) in [(DType::F16,DType::F32),(DType::BF16,DType::F32),(DType::F32,DType::F16),(DType::F32,DType::BF16)] {
+            let mut arena = seismic_lang::expr::ExprArena::new();
+            let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
+            let vectors = VectorSupport::default();
+            let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+            let constant = match from {
+                DType::F16 => ConstantValue::F16(0xfc01),
+                DType::BF16 => ConstantValue::BF16(0xff81),
+                DType::F32 => ConstantValue::F32(f32::from_bits(0xff800001)),
+                _ => unreachable!(),
+            };
+            let input = builder.constant(constant,ValueType::Scalar(from));
+            builder.cast(input,ValueType::Scalar(to));
+            builder.close();
+            let kernel = &construction.kernels()[0];
+            let layout = KernelEmissionLayout {
+                words: KernelWordLayout::for_kernel(kernel), bindings: vec![], locals: vec![],
+                addressable_resources: vec![], scalar_args: vec![], result_types: vec![],
+            };
+            assert!(kernel.block(kernel.root()).ops.iter().all(|op| !matches!(kernel.closed_op(op,&layout),ClosedOpView::Cast { .. })), "source scalar conversion must expand its recipe");
+            let mut emitter = Emitter::new(&facts,kernel,&layout);
+            emitter.collect(kernel.root());
+            emitter.header("source_cast");
+            emitter.emit_block(kernel.root());
+            assert!(emitter.text.contains("and.b32"));
+            for forbidden in ["cvt.f32.f16","cvt.f32.bf16","cvt.rn.f16.f32","cvt.rn.bf16.f32"] {
+                assert!(!emitter.text.contains(forbidden), "{from:?}->{to:?}: {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_launch_descriptor_survives_closure_and_normalization() {
+        use seismic_ir::{
+            construction::{AllocationPlan, Construction},
+            schedule::{Launch, LaunchParticipation},
+            target::{LocalRealization, LocalRealizationPolicy, PhysicalDialect, VectorSupport},
+        };
+        let mut facts = facts();
+        facts.cooperative_launch = false;
+        assert_eq!(
+            Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid),
+            None
+        );
+        assert_eq!(Cuda::ordinary_launch(), crate::CudaLaunchMode::Independent);
+        facts.cooperative_launch = true;
+        let cooperative =
+            Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid).unwrap();
+        let mut arena = seismic_lang::expr::ExprArena::new();
+        let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let kernel = construction
+            .portable_kernel(&mut arena, &facts, &[], &vectors)
+            .close();
+        let one = arena.nat(1);
+        let empty = arena.bool(false);
+        let mut schedule = construction.schedule(&mut arena, 0);
+        for descriptor in [Cuda::ordinary_launch(), cooperative] {
+            let id = schedule.launch(Launch {
+                kernel,
+                descriptor,
+                grid: [one; 3],
+                workgroup: [one; 3],
+                empty,
+                parallel_extent: None,
+                logical_base: None,
+            });
+            schedule.step_launch(id);
+        }
+        let schedule = schedule.close();
+        let executable = construction
+            .close(schedule)
+            .normalize_launches(&mut arena, 65535, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .close_execution(
+                &mut arena,
+                LocalRealizationPolicy {
+                    workgroup: LocalRealization::NativeDynamic,
+                    participant: LocalRealization::NativeStatic,
+                    register: LocalRealization::NativeStatic,
+                },
+                &crate::profile::CudaKernelAbi,
+            );
+        let launches = executable.schedule().launches();
+        assert_eq!(launches[0].descriptor, crate::CudaLaunchMode::Independent);
+        assert_eq!(
+            launches[1].descriptor,
+            crate::CudaLaunchMode::CooperativeGrid
+        );
+        assert_eq!(launches[0].kernel, launches[1].kernel);
+        let mut ordinary = seismic_ir::identity::StructureDigest::new("launch-test");
+        ordinary.hashed(&launches[0].descriptor);
+        let mut cooperative = seismic_ir::identity::StructureDigest::new("launch-test");
+        cooperative.hashed(&launches[1].descriptor);
+        assert_ne!(ordinary.finish(), cooperative.finish());
+    }
+
+    #[test]
+    fn narrow_payload_constants_select_and_bits_never_convert() {
+        let text = fixture(|_, _| {});
+        assert!(text.contains("mov.u32 %v0, 64513;"));
+        assert!(text.contains("mov.u32 %v1, 65409;"));
+        assert!(text.contains("0fff800001"));
+        assert!(text.contains("18014398509481985"));
+        assert!(text.contains("selp.u32"));
+        assert!(text.contains("and.b32"));
+        assert!(!text.contains("cvt.f32.f16"));
+        assert!(!text.contains("cvt.f32.bf16"));
+        assert!(!text.contains("cvt.rn.f16.f32"));
+    }
+    #[test]
+    fn narrow_load_abi_copy_and_publication_are_integer_transport() {
+        let text = fixture(|emitter, values| {
+            for (value, dtype) in values.iter().zip([DType::F16, DType::BF16]) {
+                let name = emitter.v(value.value);
+                emitter.load_to(&name, value.ty, "%address", dtype);
+                emitter.scalar_arg(value.value, 0, seismic_ir::repr::ScalarKind::Scalar(dtype));
+                emitter.copy_value(*value, value.value);
+                let geometry =
+                    RepresentationGeometry::of(seismic_lang::registry::dense(dtype)).dense();
+                emitter.write_address("%address", &geometry, &name);
+                emitter.store_slot(0, seismic_ir::repr::ScalarKind::Scalar(dtype), *value);
+            }
+        });
+        assert!(text.contains("ld.global.u16"));
+        assert!(text.contains("cvt.u32.u16"));
+        assert!(text.contains("cvt.u16.u32"));
+        assert!(text.contains("st.global.u16"));
+        assert!(!text.contains("cvt.f32.f16"));
+        assert!(!text.contains("cvt.f32.bf16"));
+        assert!(!text.contains("cvt.rn.f16.f32"));
+        assert!(!text.contains("cvt.rn.bf16.f32"));
+    }
+    #[test]
+    fn native_arithmetic_decodes_only_at_the_operation_boundary() {
+        let text = fixture(|emitter, values| {
+            let half = values[0];
+            emitter.binary(BinaryOp::Add, half.value, half.ty, half.value, half.value);
+        });
+        assert_eq!(text.matches("cvt.f32.f16").count(), 2);
+        assert_eq!(text.matches("cvt.rn.f16.f32").count(), 1);
+        assert!(text.contains("add.rn.f32 %f"));
+        assert!(text.contains("cvt.u32.u16 %v0"));
+    }
+
     #[test]
     fn nvfp4_emitter_contains_complete_tcgen05_lifecycle() {
         let source = include_str!("ptx.rs");

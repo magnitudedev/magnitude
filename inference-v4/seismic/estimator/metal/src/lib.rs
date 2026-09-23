@@ -169,10 +169,11 @@ macro_rules! cost {
 /// renderer consumes. Unsupported vector operations still have semantics so
 /// adding vector support cannot create a late hole; the empty profile vector
 /// matrix prevents them from entering a Metal kernel today.
-pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntrinsic>>(
+pub fn operation_cost<B: seismic_ir::target::PhysicalDialect<Intrinsic = MetalIntrinsic>>(
     arena: &mut ExprArena,
+    kernel: &seismic_ir::kernel::Kernel<B>,
     op: ClosedOpView<'_, B>,
-) -> OperationCost<MetalService> {
+) -> Result<OperationCost<MetalService>, ModelLimitation> {
     use DemandMode::{DependencyLatency as Latency, SaturatedCapacity as Capacity};
     use MetalService::{
         ApproximateMath as APPROXIMATE_MATH, Atomic as ATOMIC, Barrier as BARRIER,
@@ -181,8 +182,11 @@ pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntr
         Integer as INTEGER, Matrix as MATRIX, Representation as REPRESENTATION,
         Subgroup as SUBGROUP, WorkgroupMemory as WORKGROUP_MEMORY,
     };
-    match op {
+    Ok(match op {
         ClosedOpView::Constant { .. } => cost![one(arena, CONTROL, Latency)],
+        ClosedOpView::ScalarBits { .. } | ClosedOpView::ScalarFromBits { .. } => {
+            cost![one(arena, INTEGER, Latency)]
+        }
         ClosedOpView::Unary { out, .. } | ClosedOpView::Bitcast { out, .. } => {
             let class = if matches!(out.ty, ValueType::Scalar(DType::F32)) {
                 INTEGER
@@ -238,7 +242,9 @@ pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntr
                 .unwrap_or_else(|| arithmetic_class(out.ty));
             cost![demand(class, lanes(arena, out.ty), Latency)]
         }
-        ClosedOpView::VectorSplat { out, .. } | ClosedOpView::VectorLane { out, .. } => {
+        ClosedOpView::VectorFromLanes { out, .. }
+        | ClosedOpView::VectorSplat { out, .. }
+        | ClosedOpView::VectorLane { out, .. } => {
             cost![demand(CONTROL, lanes(arena, out.ty), Latency)]
         }
         ClosedOpView::VectorUnary { out, .. }
@@ -322,31 +328,29 @@ pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntr
         | ClosedOpView::Branch { .. }
         | ClosedOpView::Repeat { .. }
         | ClosedOpView::Yield { .. } => cost![one(arena, CONTROL, Latency)],
-        ClosedOpView::Read { place, .. } => {
-            let mut result = OperationDemands::one(one(arena, memory_class(place.kind), Capacity));
-            if matches!(
-                place.geometry,
-                seismic_ir::target::ReadableRepresentationGeometry::Packed(_)
+        ClosedOpView::Read { place, .. } => cost![one(arena, memory_class(place.kind), Capacity)],
+        ClosedOpView::ReadPlaneField {
+            place, plane_info, ..
+        } => {
+            let mut demands = OperationDemands::one(one(arena, memory_class(place.kind), Capacity));
+            if !matches!(
+                plane_info.encoding,
+                seismic_lang::registry::PlaneEncoding::Dense(_)
             ) {
-                result.push(one(arena, REPRESENTATION, Latency));
+                demands.push(one(arena, REPRESENTATION, Latency));
             }
-            OperationCost::Demands(result)
+            OperationCost::Demands(demands)
         }
         ClosedOpView::ReadPlane { place, .. } => cost![
             one(arena, memory_class(place.kind), Capacity),
             one(arena, REPRESENTATION, Latency),
         ],
         ClosedOpView::VectorRead { out, place, .. } => {
-            let units = lanes(arena, out.ty);
-            let mut result =
-                OperationDemands::one(demand(memory_class(place.kind), units, Capacity));
-            if matches!(
-                place.geometry,
-                seismic_ir::target::ReadableRepresentationGeometry::Packed(_)
-            ) {
-                result.push(demand(REPRESENTATION, units, Latency));
-            }
-            OperationCost::Demands(result)
+            cost![demand(
+                memory_class(place.kind),
+                lanes(arena, out.ty),
+                Capacity
+            )]
         }
         ClosedOpView::Write { place, .. } => {
             cost![one(arena, memory_class(place.kind), Capacity)]
@@ -383,9 +387,11 @@ pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntr
                 // the cooperative instruction and staging traffic once for
                 // the complete launch; core must not multiply it by the
                 // reflected SIMD width or by the chosen grid.
-                let rows = left.logical_extents[0];
-                let inner = left.logical_extents[1];
-                let columns = right.logical_extents[1];
+                let exact = |value| kernel.exact_nat(value)
+                    .ok_or(ModelLimitation::DeviceExtent { value });
+                let rows = exact(left.extents[0])?;
+                let inner = exact(left.extents[1])?;
+                let columns = exact(right.extents[1])?;
                 let eight = arena.nat(8);
                 let row_tiles = arena.nat_ceil_div(rows, eight);
                 let column_tiles = arena.nat_ceil_div(columns, eight);
@@ -451,7 +457,7 @@ pub fn operation_cost<B: seismic_ir::target::KernelDialect<Intrinsic = MetalIntr
                 OperationCost::Demands(result)
             }
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -464,7 +470,12 @@ mod tests {
     };
     #[derive(Debug)]
     struct Dialect;
-    impl KernelDialect for Dialect {
+    impl PhysicalDialect for Dialect {
+        type LaunchDescriptor = ();
+        fn ordinary_launch() -> Self::LaunchDescriptor {
+            ()
+        }
+
         const NAME: seismic_lang::registry::BackendName =
             seismic_lang::registry::BackendName::Metal;
         type Intrinsic = MetalIntrinsic;
@@ -486,19 +497,66 @@ mod tests {
         }
     }
     #[test]
+    fn matrix_demand_uses_actual_value_extents_and_reports_device_extents() {
+        use seismic_ir::kernel::{KernelValues, ops::{LogicalTensorMap, PlaceRef}};
+        use seismic_ir::repr::{DenseF32, Idx};
+        use seismic_ir::storage::LaunchLocalKind;
+        use seismic_lang::{registry, expr::Assignment};
+        let capability = registry::capability(registry::BackendName::Metal, "matrix").unwrap();
+        let signature = registry::intrinsics(capability).iter().find(|s| s.name == "matmul").unwrap();
+        let mut arena = ExprArena::default();
+        let capacity = arena.nat(32);
+        let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let mut builder = construction.kernel(&mut arena, &(), &[], &vectors);
+        builder.local::<DenseF32>(LaunchLocalKind::Workgroup, vec![capacity, capacity]);
+        let rows = builder.constant::<Idx>(9).erase()[0];
+        let inner = builder.constant::<Idx>(8).erase()[0];
+        let columns = builder.constant::<Idx>(16).erase()[0];
+        let device_rows = builder.local_id(0).erase()[0];
+        builder.close();
+        let kernel = &construction.kernels()[0];
+        let map = |extents| LogicalTensorMap {
+            base: PlaceRef::Local { index: 0 },
+            representation: registry::dense(DType::F32), extents, steps: vec![],
+        };
+        for (actual_rows, unavailable) in [(rows, false), (device_rows, true)] {
+            let left = map(vec![actual_rows, inner]);
+            let right = map(vec![inner, columns]);
+            let into = map(vec![actual_rows, columns]);
+            let operation = MetalIntrinsic::Matrix {
+                scratch_left: left.clone(), scratch_right: right.clone(),
+                scratch_accumulator: into.clone(), left, right, into,
+                addend: None, element: DType::F32, accumulator: DType::F32, output: DType::F32,
+            };
+            let cost = operation_cost(&mut arena, kernel, ClosedOpView::Intrinsic {
+                intrinsic: signature.id, signature, op: &operation,
+                outputs: vec![], arguments: vec![], mapping_dependencies: vec![],
+            });
+            if unavailable {
+                assert!(matches!(cost, Err(ModelLimitation::DeviceExtent { value }) if value == device_rows));
+            } else {
+                let OperationCost::Demands(cost) = cost.unwrap() else { panic!("matrix work cannot be elided") };
+                let matrix = cost.iter().find(|d| d.class == MetalService::Matrix).unwrap();
+                assert_eq!(arena.eval_nat(matrix.units, &Assignment::new()).unwrap(), 4);
+            }
+        }
+    }
+
+    #[test]
     fn bf16_widen_is_integer_service() {
-        assert_eq!(emission_class(ScalarEmissionFamily::BF16ToF32), INTEGER);
+        assert!(emission_class(ScalarEmissionFamily::BF16ToF32) == MetalService::Integer);
     }
     #[test]
-    fn real_scalar_kernels_use_the_shared_emission_families() {
-        for (op, class) in [
-            (BinaryOp::Add, F32_ADD_SUB),
-            (BinaryOp::Sub, F32_ADD_SUB),
-            (BinaryOp::Mul, F32_MULTIPLY),
-            (BinaryOp::Div, F32_DIVIDE),
-            (BinaryOp::Rem, F32_REMAINDER),
-            (BinaryOp::Min, F32_MIN_MAX),
-            (BinaryOp::Max, F32_MIN_MAX),
+    fn scalar_recipes_are_modeled_by_their_constructed_integer_operations() {
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Rem,
+            BinaryOp::Min,
+            BinaryOp::Max,
         ] {
             let mut arena = ExprArena::default();
             let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
@@ -515,16 +573,19 @@ mod tests {
                 locals: vec![],
                 addressable_resources: vec![],
                 scalar_args: vec![],
-                result_slots: vec![],
+                result_types: vec![],
             };
             let mut demands = Vec::new();
             for op in kernel.blocks().iter().flat_map(|block| &block.ops) {
-                match operation_cost(&mut arena, kernel.closed_op(op, &emission)) {
+                match operation_cost(&mut arena, kernel, kernel.closed_op(op, &emission)).unwrap() {
                     OperationCost::Demands(operation) => demands.extend(operation.into_iter()),
                     OperationCost::Elided(_) => {}
                 }
             }
-            assert!(demands.iter().any(|d| d.class == class));
+            assert!(demands.iter().any(|d| d.class == MetalService::Integer));
+            assert!(demands
+                .iter()
+                .all(|d| matches!(d.class, MetalService::Integer | MetalService::Control)));
             assert!(demands
                 .iter()
                 .all(|d| service_available(false, &BTreeSet::new(), d.class)));

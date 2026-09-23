@@ -9,7 +9,7 @@
 //!   the branch/repeat call);
 //! - every read/write index has the rank of its place;
 //! - every declared result slot is written on every path;
-//! - every intrinsic's resources and numerical contract are recorded.
+//! - every intrinsic's resources and actual selected operation are retained.
 //!
 //! The only panics are factory authoring bugs against the private builder
 //! (a handle of another kernel, a value used outside its scope, a rank
@@ -19,7 +19,7 @@
 use super::ops::{
     self, BarrierScope, BinaryOp, Binding, BindingAccess, BitOp, Block, CmpOp, ErasedValue,
     GeometryValue, IntrinsicResources, IntrinsicSink, KernelInterface, LogicOp, MathPrecision,
-    NumericalFact, Op, PlaceRef, ResourceFacts, UnaryOp, ValueSchema, ValueType,
+    Op, PlaceRef, ResourceFacts, UnaryOp, ValueSchema, ValueType,
 };
 use super::{
     BindingSlot, BlockId, Kernel, KernelArena, KernelBuilder, KernelId, KernelValues, PlaneId,
@@ -32,14 +32,14 @@ use crate::repr::{
 };
 use crate::schedule::AnyScalarSlot;
 use crate::storage::{
-    BufferViewId, BufferViewLayout, LaunchLocalId, LaunchLocalKind, LocalAllocation,
+    BufferViewId, LaunchLocalId, LaunchLocalKind, LocalAllocation,
 };
-use crate::target::KernelDialect;
+use crate::target::PhysicalDialect;
 use seismic_lang::expr::{ExprArena, NatExpr, SymbolId};
 use seismic_lang::ids::{IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
 use seismic_lang::registry::{
-    self, IntrinsicNumerics, IntrinsicResultType, IntrinsicUniformity, RepresentationKind,
+    self, IntrinsicResultType, IntrinsicUniformity, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::marker::PhantomData;
@@ -48,7 +48,7 @@ use std::marker::PhantomData;
 // Per-kernel construction state
 // ---------------------------------------------------------------------------
 
-struct BlockData<B: KernelDialect> {
+struct BlockData<B: PhysicalDialect> {
     ops: Vec<Op<B>>,
     parent: Option<BlockId>,
     /// Product of the trip counts of the enclosing repeats when every one is
@@ -59,6 +59,7 @@ struct BlockData<B: KernelDialect> {
     control_uniformity: Uniformity,
 }
 
+#[derive(Debug)]
 struct ValueEntry {
     ty: ValueType,
     block: BlockId,
@@ -77,21 +78,28 @@ pub(super) enum Uniformity {
 }
 
 impl Uniformity {
+    fn from_intrinsic(value: IntrinsicUniformity) -> Self {
+        match value {
+            IntrinsicUniformity::Workgroup => Self::Workgroup,
+            IntrinsicUniformity::Subgroup => Self::Subgroup,
+            IntrinsicUniformity::Varying => Self::Varying,
+        }
+    }
     fn combine(self, other: Self) -> Self {
         self.max(other)
     }
 }
 
 #[derive(Clone, Copy)]
-struct PlaceEntry {
+pub(super) struct PlaceEntry {
     place: PlaceRef,
-    representation: RepresentationId,
+    pub(super) representation: RepresentationId,
     rank: u32,
 }
 
 /// The construction state of the one open kernel of an implementation
 /// builder. Reset by `close`.
-pub(crate) struct KernelState<B: KernelDialect> {
+pub(crate) struct KernelState<B: PhysicalDialect> {
     owner: OwnerToken,
     kernel: u32,
     blocks: Vec<BlockData<B>>,
@@ -100,11 +108,9 @@ pub(crate) struct KernelState<B: KernelDialect> {
     planes: Vec<(u32, u32)>,
     bindings: Vec<Binding>,
     nat_args: Vec<NatExpr>,
-    scalar_args: Vec<(SymbolId, DType)>,
-    result_slots: Vec<(AnyScalarSlot, DType)>,
+    scalar_args: Vec<(SymbolId, crate::repr::ScalarKind)>,
+    result_slots: Vec<AnyScalarSlot>,
     locals: Vec<LocalAllocation>,
-    numerical: Vec<NumericalFact>,
-    fact_multiplicity: Vec<Option<NatExpr>>,
     intrinsic_resources: Vec<IntrinsicResources>,
     addressable_resources: Vec<ops::AddressableResourceLease>,
     addressable_resource_cursors: Vec<NatExpr>,
@@ -113,7 +119,14 @@ pub(crate) struct KernelState<B: KernelDialect> {
     uses_subgroup: bool,
 }
 
-impl<B: KernelDialect> KernelState<B> {
+impl<B: PhysicalDialect> KernelState<B> {
+    pub(crate) fn assert_closed(&self) {
+        assert!(
+            self.blocks.is_empty(),
+            "construction still owns an unfinished kernel"
+        );
+    }
+
     pub(crate) fn new(
         owner: OwnerToken,
         kernel: u32,
@@ -132,8 +145,6 @@ impl<B: KernelDialect> KernelState<B> {
             scalar_args: Vec::new(),
             result_slots: Vec::new(),
             locals: Vec::new(),
-            numerical: Vec::new(),
-            fact_multiplicity: Vec::new(),
             intrinsic_resources: Vec::new(),
             addressable_resources: Vec::new(),
             addressable_resource_cursors: vec![zero; resource_classes],
@@ -148,9 +159,10 @@ impl<B: KernelDialect> KernelState<B> {
 // The builder
 // ---------------------------------------------------------------------------
 
-pub(crate) struct Builder<'a, B: KernelDialect> {
+pub(crate) struct Builder<'a, B: PhysicalDialect> {
     expr: &'a mut ExprArena,
-    views: &'a [BufferViewLayout],
+    storage: &'a crate::storage::TopologyBuilder,
+    schedule: &'a crate::schedule::ScheduleConstruction<B>,
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
@@ -161,16 +173,18 @@ pub(crate) struct Builder<'a, B: KernelDialect> {
 
 /// Opens a kernel builder over the implementation builder's tables. The
 /// root block is created here; `close` pushes the kernel onto `kernels`.
-pub(crate) fn open<'a, B: KernelDialect>(
+pub(crate) fn open<'a, B: PhysicalDialect>(
     owner: OwnerToken,
     expr: &'a mut ExprArena,
-    views: &'a [BufferViewLayout],
+    storage: &'a crate::storage::TopologyBuilder,
+    schedule: &'a crate::schedule::ScheduleConstruction<B>,
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
     resource_classes: &'a [crate::target::AddressableResourceClass],
     vector_support: &'a crate::target::VectorSupport,
 ) -> KernelBuilder<'a, B> {
+    state.assert_closed();
     let kernel = kernels.len() as u32;
     let zero = expr.nat(0);
     let one = expr.nat(1);
@@ -184,7 +198,8 @@ pub(crate) fn open<'a, B: KernelDialect>(
     KernelBuilder {
         inner: Builder {
             expr,
-            views,
+            storage,
+            schedule,
             kernels,
             state,
             target_facts,
@@ -198,7 +213,7 @@ pub(crate) fn open<'a, B: KernelDialect>(
 /// Core-only erased construction used by the universal semantic lowering.
 /// It remains inside kernel internals: factories and backends can only use
 /// the typed `KernelBuilder` surface.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PortableValue {
     pub(crate) raw: ErasedValue,
     pub(crate) ty: ValueType,
@@ -218,48 +233,73 @@ enum PortableWriteCapability {
     RepresentationPacket,
 }
 
-#[derive(Clone, Debug)]
-pub struct PortableTensor {
-    place: PortablePlace,
-    extents: Vec<PortableValue>,
-    steps: Vec<PortableViewStep>,
-    plane: Option<u32>,
+pub type PortableTensor = crate::tensor_view::TensorView<PortablePlace, PortableValue>;
+type PortableViewStep = crate::tensor_view::ViewStep<PortableValue>;
+pub type PortableSliceAxis = crate::tensor_view::SliceAxis<PortableValue>;
+
+/// Opaque, kernel-owned structured branch under construction. The builder
+/// enforces lexical arm order and result schemas when this token is consumed.
+#[must_use]
+pub struct PortableBranch {
+    parent: BlockId,
+    then_block: BlockId,
+    else_block: BlockId,
+    condition: ErasedValue,
+    control_uniformity: Uniformity,
 }
 
-#[derive(Clone, Debug)]
-enum PortableViewStep {
-    Slice(Vec<PortableSliceAxis>),
-    Transpose(Vec<u32>),
-    Reshape {
-        from: Vec<PortableValue>,
-        to: Vec<PortableValue>,
-    },
+/// Consuming suspension of the current lexical block. The construction still
+/// owns all values, places, operations and control state. This token cannot be
+/// copied, minted externally, or used with a different open kernel.
+#[derive(Debug)]
+pub struct PortableCursor {
+    block: BlockId,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum PortableSliceAxis {
-    Point(PortableValue),
-    Range {
-        start: PortableValue,
-        end: PortableValue,
-    },
-    Full,
+/// The existing repeat's lexical scope and typed carry schema while its body
+/// is open. Closing consumes it; suspended construction keeps the actual block.
+pub struct PortableRepeat {
+    parent: BlockId,
+    body: BlockId,
+    start: ErasedValue,
+    end: ErasedValue,
+    binder: ErasedValue,
+    initial: Vec<ErasedValue>,
+    parameters: Vec<ErasedValue>,
+    schema: ValueSchema,
+    recurrence: Vec<Uniformity>,
 }
 
-pub struct PortableBuilder<'a, B: KernelDialect> {
+pub struct PortableBuilder<'a, B: PhysicalDialect> {
     inner: Builder<'a, B>,
 }
 
-pub(crate) fn open_portable<'a, B: KernelDialect>(
+/// Authority to bind the logical base of a one-dimensional semantic launch.
+/// Only the kernel operation constructor can issue this handle.
+///
+/// ```compile_fail
+/// use seismic_ir::kernel::dynamic::LogicalIndexBinding;
+/// fn raw_ordinal_is_not_a_binding() -> LogicalIndexBinding { 0u32 }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LogicalIndexBinding {
+    pub(crate) kernel: KernelId,
+    pub(crate) argument: u32,
+    pub(crate) extent: NatExpr,
+}
+
+pub(crate) fn open_portable<'a, B: PhysicalDialect>(
     owner: OwnerToken,
     expr: &'a mut ExprArena,
-    views: &'a [BufferViewLayout],
+    storage: &'a crate::storage::TopologyBuilder,
+    schedule: &'a crate::schedule::ScheduleConstruction<B>,
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
     resource_classes: &'a [crate::target::AddressableResourceClass],
     vector_support: &'a crate::target::VectorSupport,
 ) -> PortableBuilder<'a, B> {
+    state.assert_closed();
     let kernel = kernels.len() as u32;
     let zero = expr.nat(0);
     let one = expr.nat(1);
@@ -273,13 +313,60 @@ pub(crate) fn open_portable<'a, B: KernelDialect>(
     PortableBuilder {
         inner: Builder {
             expr,
-            views,
+            storage,
+            schedule,
             kernels,
             state,
             target_facts,
             resource_classes,
             vector_support,
             block: BlockId::new(owner, kernel, 0),
+        },
+    }
+}
+
+pub(crate) fn resume_portable<'a, B: PhysicalDialect>(
+    owner: OwnerToken,
+    expr: &'a mut ExprArena,
+    storage: &'a crate::storage::TopologyBuilder,
+    schedule: &'a crate::schedule::ScheduleConstruction<B>,
+    kernels: &'a mut Vec<Kernel<B>>,
+    state: &'a mut KernelState<B>,
+    target_facts: &'a B::Facts,
+    resource_classes: &'a [crate::target::AddressableResourceClass],
+    vector_support: &'a crate::target::VectorSupport,
+    cursor: PortableCursor,
+) -> PortableBuilder<'a, B> {
+    assert_eq!(
+        cursor.block.owner(),
+        owner,
+        "kernel cursor belongs to another construction"
+    );
+    assert_eq!(
+        cursor.block.kernel(),
+        state.kernel,
+        "kernel cursor belongs to another open kernel"
+    );
+    assert_eq!(
+        state.kernel as usize,
+        kernels.len(),
+        "kernel cursor refers to a closed kernel"
+    );
+    assert!(
+        (cursor.block.index() as usize) < state.blocks.len(),
+        "kernel cursor has no open lexical block"
+    );
+    PortableBuilder {
+        inner: Builder {
+            expr,
+            storage,
+            schedule,
+            kernels,
+            state,
+            target_facts,
+            resource_classes,
+            vector_support,
+            block: cursor.block,
         },
     }
 }
@@ -292,7 +379,15 @@ fn dtype_value_type(dtype: DType) -> ValueType {
     }
 }
 
-impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
+impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
+    /// End the temporary borrow while retaining the actual current block in
+    /// its construction. Resume through that same construction before close.
+    pub fn suspend(self) -> PortableCursor {
+        PortableCursor {
+            block: self.inner.block,
+        }
+    }
+
     fn checked_place(&self, place: PortablePlace) -> PlaceEntry {
         self.inner.assert_kernel(place.owner, place.kernel);
         *self
@@ -319,6 +414,23 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             uniformity: self.uniformity(value),
         }
     }
+    /// Rebind a capability value after an ordinary same-type SSA join.
+    pub fn opaque_with_value(
+        &mut self,
+        original: ops::SemanticOpaque,
+        value: PortableValue,
+    ) -> ops::SemanticOpaque {
+        assert_eq!(
+            original.value.ty, value.ty,
+            "opaque transport changed its type"
+        );
+        self.used(value);
+        ops::SemanticOpaque {
+            value,
+            uniformity: self.uniformity(value),
+            ..original
+        }
+    }
     pub fn semantic_place(
         &self,
         tensor: PortableTensor,
@@ -326,9 +438,9 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         rank: u32,
         writable: bool,
     ) -> ops::SemanticPlace {
-        let entry = self.checked_place(tensor.place);
         assert_eq!(
-            entry.representation, representation,
+            self.tensor_mapping(&tensor).representation,
+            representation,
             "intrinsic place representation mismatch"
         );
         assert_eq!(
@@ -337,7 +449,8 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             "intrinsic place rank mismatch"
         );
         assert!(
-            !writable || tensor.place.write != PortableWriteCapability::ReadOnly,
+            !writable
+                || (!tensor.has_plane() && tensor.place.write != PortableWriteCapability::ReadOnly),
             "read-only intrinsic place cannot be writable"
         );
         ops::SemanticPlace {
@@ -346,6 +459,17 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             rank,
             writable,
         }
+    }
+
+    /// Exact host expression retained by this actual value's constructor.
+    pub fn exact_nat(&self, value: PortableValue) -> Option<NatExpr> {
+        self.inner.nat_of(value.raw)
+    }
+
+    /// Geometry of the actual schedule-owned tensor argument.
+    pub fn view_extents(&self, view: crate::storage::AnyBufferView) -> &[NatExpr] {
+        assert_eq!(view.owner(), self.inner.owner(), "foreign tensor contract");
+        &self.inner.storage.view_layout(view).extents
     }
 
     pub fn expression_arena(&mut self) -> &mut ExprArena {
@@ -442,10 +566,50 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
     pub fn nat_arg(&mut self, expr: NatExpr) -> PortableValue {
         self.nat_arg_with_ordinal(expr).0
     }
-    /// Adds a compiler-owned natural argument and returns both its kernel value
-    /// and ABI ordinal. Schedule specialization uses the ordinal to rebind a
-    /// portable launch's logical base without changing native kernel code.
-    pub fn nat_arg_with_ordinal(&mut self, expr: NatExpr) -> (PortableValue, u32) {
+    /// Emits the logical coordinate and issues its matching launch binding.
+    /// Padded participants use the representable extent sentinel, avoiding an
+    /// overflowing addition before the caller's active-participant test.
+    pub fn logical_global_id(&mut self, extent: NatExpr) -> (PortableValue, LogicalIndexBinding) {
+        let zero = self.inner.expr.nat(0);
+        let (base, argument) = self.nat_arg_with_ordinal(zero);
+        // The launch supplies this argument after chunk normalization. Its
+        // nominal ABI default is not an exact kernel-owned expression.
+        self.inner.state.values[base.raw.index() as usize].nat = None;
+        let end = self.nat_arg(extent);
+        let remaining = self.binary(BinaryOp::Sub, end, base);
+        let physical = self.global_id(0);
+        let offset = self.binary(BinaryOp::Min, physical, remaining);
+        let logical = self.binary(BinaryOp::Add, base, offset);
+        (
+            logical,
+            LogicalIndexBinding {
+                kernel: KernelId::new(self.inner.owner(), self.inner.state.kernel),
+                argument,
+                extent,
+            },
+        )
+    }
+
+    /// Read this kernel's existing logical-base argument. Cohort membership
+    /// uses the same launch binding as participant coordinates.
+    pub fn logical_base(&mut self, binding: LogicalIndexBinding) -> PortableValue {
+        assert_eq!(
+            binding.kernel,
+            KernelId::new(self.inner.owner(), self.inner.state.kernel)
+        );
+        let out = self
+            .inner
+            .define_with(ValueType::Index, None, Uniformity::Workgroup);
+        self.inner.emit(Op::NatArg {
+            out,
+            index: binding.argument,
+        });
+        PortableValue {
+            raw: out,
+            ty: ValueType::Index,
+        }
+    }
+    fn nat_arg_with_ordinal(&mut self, expr: NatExpr) -> (PortableValue, u32) {
         let index = self.inner.state.nat_args.len() as u32;
         self.inner.state.nat_args.push(expr);
         let out = self
@@ -462,7 +626,10 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
     }
     pub fn scalar_arg(&mut self, symbol: SymbolId, dtype: DType) -> PortableValue {
         let index = self.inner.state.scalar_args.len() as u32;
-        self.inner.state.scalar_args.push((symbol, dtype));
+        self.inner
+            .state
+            .scalar_args
+            .push((symbol, crate::repr::ScalarKind::Scalar(dtype)));
         let ty = dtype_value_type(dtype);
         let out = self
             .inner
@@ -483,6 +650,9 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
     pub fn local_id(&mut self, axis: u8) -> PortableValue {
         self.geometry(GeometryValue::LocalId(axis))
     }
+    pub fn workgroup_id(&mut self, axis: u8) -> PortableValue {
+        self.geometry(GeometryValue::WorkgroupId(axis))
+    }
     pub fn workgroup_size(&mut self, axis: u8) -> PortableValue {
         self.geometry(GeometryValue::WorkgroupSize(axis))
     }
@@ -490,6 +660,47 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         self.inner.state.uses_subgroup = true;
         self.geometry(GeometryValue::SubgroupLane)
     }
+    /// Stable subgroup position within the current workgroup.
+    pub fn subgroup_ordinal(&mut self) -> PortableValue {
+        self.inner.state.uses_subgroup = true;
+        self.geometry(GeometryValue::SubgroupOrdinal)
+    }
+    /// Actual native subgroup width for this compiled kernel.
+    pub fn subgroup_size(&mut self) -> PortableValue {
+        self.inner.state.uses_subgroup = true;
+        self.geometry(GeometryValue::SubgroupSize)
+    }
+    pub fn workgroup_barrier(&mut self) {
+        self.inner.barrier(ops::BarrierScope::Workgroup)
+    }
+    pub fn subgroup_barrier(&mut self) {
+        self.inner.barrier(ops::BarrierScope::Subgroup);
+    }
+
+    /// Rebind a real view product after a structured SSA join. Every supplied
+    /// field must dominate the current block and retain its original type.
+    pub fn tensor_with_scalar_fields(
+        &mut self,
+        tensor: &PortableTensor,
+        fields: &[PortableValue],
+    ) -> PortableTensor {
+        self.checked_place(tensor.place);
+        let original = tensor.scalar_fields();
+        assert_eq!(
+            original.len(),
+            fields.len(),
+            "tensor scalar field arity changed"
+        );
+        for (before, after) in original.iter().zip(fields) {
+            assert_eq!(before.ty, after.ty, "tensor scalar field type changed");
+            self.used(*after);
+        }
+        let mut fields = fields.iter().copied();
+        let out = tensor.map(|place| *place, |_| fields.next().unwrap());
+        assert!(fields.next().is_none());
+        out
+    }
+
     pub fn uniformity(&self, value: PortableValue) -> seismic_lang::registry::IntrinsicUniformity {
         match self.inner.uniformity_of(value.raw) {
             Uniformity::Workgroup => seismic_lang::registry::IntrinsicUniformity::Workgroup,
@@ -504,7 +715,7 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             "result slot belongs to another implementation"
         );
         let index = self.inner.state.result_slots.len() as u32;
-        self.inner.state.result_slots.push((slot, slot.dtype));
+        self.inner.state.result_slots.push(slot);
         index
     }
     pub fn index_constant(&mut self, value: u64) -> PortableValue {
@@ -523,12 +734,6 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
     }
     pub fn constant(&mut self, value: ops::ConstantValue, ty: ValueType) -> PortableValue {
         let value = match (value, &ty) {
-            (ops::ConstantValue::F32(value), ValueType::Scalar(DType::F16)) => {
-                ops::ConstantValue::F16(crate::repr::f16_bits(value))
-            }
-            (ops::ConstantValue::F32(value), ValueType::Scalar(DType::BF16)) => {
-                ops::ConstantValue::BF16(crate::repr::bf16_bits(value))
-            }
             (value @ ops::ConstantValue::F32(_), ValueType::Scalar(DType::F32))
             | (value @ ops::ConstantValue::F16(_), ValueType::Scalar(DType::F16))
             | (value @ ops::ConstantValue::BF16(_), ValueType::Scalar(DType::BF16))
@@ -547,29 +752,94 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
     fn used(&mut self, value: PortableValue) -> ErasedValue {
         self.inner.use_value(value.raw, &value.ty)
     }
+    /// Construct source arithmetic and consume its failures at the current
+    /// continuation before exposing the value and successful liveness. The
+    /// destination resolver only routes typed causes to existing status storage.
+    pub fn source_scalar(
+        &mut self,
+        operation: seismic_lang::reference_math::ScalarOp,
+        operands: &[PortableValue],
+        alive: PortableValue,
+        destination: impl FnMut(seismic_lang::reference_math::ScalarFailure) -> (PortableTensor, PortableValue),
+    ) -> (PortableValue, PortableValue) {
+        super::reference_math::continue_scalar(self, operation, operands, alive, destination)
+    }
     pub fn binary(&mut self, op: BinaryOp, a: PortableValue, b: PortableValue) -> PortableValue {
+        if a.ty == ValueType::Index {
+            return self.binary_terminal(op, a, b);
+        }
+        use seismic_lang::{reference_math::ScalarOp, syntax::ast::BinaryOp as Source};
+        let op = match op {
+            BinaryOp::Add => ScalarOp::Binary(Source::Add),
+            BinaryOp::Sub => ScalarOp::Binary(Source::Sub),
+            BinaryOp::Mul => ScalarOp::Binary(Source::Mul),
+            BinaryOp::Div => ScalarOp::Binary(Source::Div),
+            BinaryOp::Rem => ScalarOp::Binary(Source::Rem),
+            BinaryOp::Min => ScalarOp::Math(MathOp::Min),
+            BinaryOp::Max => ScalarOp::Math(MathOp::Max),
+        };
+        super::reference_math::expand_total(self, op, &[a, b])
+    }
+    pub fn bit(&mut self, op: BitOp, a: PortableValue, b: PortableValue) -> PortableValue {
+        if a.ty == ValueType::Index {
+            return self.bit_terminal(op, a, b);
+        }
+        use seismic_lang::{reference_math::ScalarOp, syntax::ast::BinaryOp as Source};
+        let op = match op {
+            BitOp::And => Source::BitAnd,
+            BitOp::Or => Source::BitOr,
+            BitOp::Xor => Source::BitXor,
+            BitOp::Shl => Source::Shl,
+            BitOp::Shr => Source::Shr,
+        };
+        super::reference_math::expand_total(self, ScalarOp::Binary(op), &[a, b])
+    }
+    pub fn cmp(&mut self, op: CmpOp, a: PortableValue, b: PortableValue) -> PortableValue {
+        if a.ty == ValueType::Index {
+            return self.cmp_terminal(op, a, b);
+        }
+        use seismic_lang::{reference_math::ScalarOp, syntax::ast::BinaryOp as Source};
+        let op = match op {
+            CmpOp::Eq => Source::Eq,
+            CmpOp::Ne => Source::Ne,
+            CmpOp::Lt => Source::Lt,
+            CmpOp::Le => Source::Le,
+            CmpOp::Gt => Source::Gt,
+            CmpOp::Ge => Source::Ge,
+        };
+        super::reference_math::expand_total(self, ScalarOp::Binary(op), &[a, b])
+    }
+    pub(super) fn binary_terminal(
+        &mut self,
+        op: BinaryOp,
+        a: PortableValue,
+        b: PortableValue,
+    ) -> PortableValue {
         assert_eq!(a.ty, b.ty, "portable binary operand types differ");
         assert_ne!(
             a.ty,
             ValueType::Bool,
             "boolean arithmetic is not constructible"
         );
-        let uniformity = self.inner.combined_uniformity([a.raw, b.raw]);
         let (a, b) = (self.used(a), self.used(b));
         let ty = a_type(&self.inner, a);
-        let out = self.inner.define_with(ty.clone(), None, uniformity);
-        self.inner.emit(Op::Binary { op, out, a, b });
+        let out = self.inner.binary_value(op, ty, a, b);
         PortableValue { raw: out, ty }
     }
     pub fn unary(&mut self, op: UnaryOp, a: PortableValue) -> PortableValue {
-        let ty = a.ty.clone();
-        let uniformity = self.inner.uniformity_of(a.raw);
-        let a = self.used(a);
-        let out = self.inner.define_with(ty.clone(), None, uniformity);
-        self.inner.emit(Op::Unary { op, out, a });
-        PortableValue { raw: out, ty }
+        use seismic_lang::{reference_math::ScalarOp, syntax::ast};
+        let op = match op {
+            UnaryOp::Neg => ScalarOp::Unary(ast::UnaryOp::Neg),
+            UnaryOp::Abs => ScalarOp::Math(MathOp::Abs),
+        };
+        super::reference_math::expand_total(self, op, &[a])
     }
-    pub fn bit(&mut self, op: BitOp, a: PortableValue, b: PortableValue) -> PortableValue {
+    pub(super) fn bit_terminal(
+        &mut self,
+        op: BitOp,
+        a: PortableValue,
+        b: PortableValue,
+    ) -> PortableValue {
         assert_eq!(a.ty, b.ty, "portable bit operand types differ");
         let ty = a.ty.clone();
         let uniformity = self.inner.combined_uniformity([a.raw, b.raw]);
@@ -578,7 +848,12 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         self.inner.emit(Op::Bit { op, out, a, b });
         PortableValue { raw: out, ty }
     }
-    pub fn cmp(&mut self, op: CmpOp, a: PortableValue, b: PortableValue) -> PortableValue {
+    pub(super) fn cmp_terminal(
+        &mut self,
+        op: CmpOp,
+        a: PortableValue,
+        b: PortableValue,
+    ) -> PortableValue {
         assert_eq!(a.ty, b.ty, "portable comparison operand types differ");
         let uniformity = self.inner.combined_uniformity([a.raw, b.raw]);
         let (a, b) = (self.used(a), self.used(b));
@@ -636,6 +911,20 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         }
     }
     pub fn cast(&mut self, a: PortableValue, to: ValueType) -> PortableValue {
+        if matches!(a.ty, ValueType::Scalar(_) | ValueType::Bool)
+            && matches!(to, ValueType::Scalar(_) | ValueType::Bool)
+        {
+            let dtype = match to {
+                ValueType::Scalar(dtype) => dtype,
+                ValueType::Bool => DType::Bool,
+                _ => unreachable!(),
+            };
+            return super::reference_math::expand_total(
+                self,
+                seismic_lang::reference_math::ScalarOp::Cast(dtype),
+                &[a],
+            );
+        }
         let uniformity = self.inner.uniformity_of(a.raw);
         let a = self.used(a);
         let out = self.inner.define_with(to.clone(), None, uniformity);
@@ -647,22 +936,21 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         PortableValue { raw: out, ty: to }
     }
     pub fn bitcast(&mut self, a: PortableValue, to: ValueType) -> PortableValue {
-        fn width(ty: &ValueType) -> u32 {
-            match ty {
-                ValueType::Scalar(dtype) => dtype.bytes(),
-                ValueType::Vector { dtype, lanes } => dtype
-                    .bytes()
-                    .checked_mul(u32::from(*lanes))
-                    .expect("vector bit width overflow"),
-                ValueType::Index => 8,
-                ValueType::Bool => 1,
-                ValueType::Opaque { .. } => panic!("opaque values cannot be bitcast"),
+        // Bitcast transports a complete scalar payload. Equal byte counts do
+        // not define vector lane packing or make Boolean carriers bit fields.
+        // The scalar relation and all native emitters agree on these two
+        // numeric payload widths; other reshaping needs an explicit operation.
+        let supported = match (a.ty, to) {
+            (ValueType::Scalar(from), ValueType::Scalar(into))
+                if from != DType::Bool && into != DType::Bool =>
+            {
+                from.bytes() == into.bytes()
             }
-        }
-        assert_eq!(
-            width(&a.ty),
-            width(&to),
-            "bitcast requires equal-width value types"
+            _ => false,
+        };
+        assert!(
+            supported,
+            "bitcast requires equal-width numeric scalar payloads"
         );
         let uniformity = self.inner.uniformity_of(a.raw);
         let a = self.used(a);
@@ -674,6 +962,52 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         });
         PortableValue { raw: out, ty: to }
     }
+    /// Payload transport: scalar representation bits, never a numeric cast.
+    /// Only the genuinely narrower payload needs its own operation; equal-width
+    /// and canonical Boolean cases use the existing ordinary IR operations.
+    pub fn scalar_bits(&mut self, a: PortableValue) -> PortableValue {
+        let to = ValueType::Scalar(DType::U32);
+        match a.ty {
+            ValueType::Scalar(DType::U32) => a,
+            ValueType::Scalar(DType::F32 | DType::I32) => self.bitcast(a, to),
+            ValueType::Bool => {
+                let one = self.constant(ops::ConstantValue::U32(1), to);
+                let zero = self.constant(ops::ConstantValue::U32(0), to);
+                self.select(a, one, zero)
+            }
+            ValueType::Scalar(DType::F16 | DType::BF16) => {
+                let uniformity = self.inner.uniformity_of(a.raw);
+                let a = self.used(a);
+                let out = self.inner.define_with(to, None, uniformity);
+                self.inner.emit(Op::ScalarBits { out, a });
+                PortableValue { raw: out, ty: to }
+            }
+            _ => panic!("scalar payload transport requires a source scalar"),
+        }
+    }
+    pub fn scalar_from_bits(&mut self, a: PortableValue, dtype: DType) -> PortableValue {
+        assert_eq!(a.ty, ValueType::Scalar(DType::U32));
+        let to = if dtype == DType::Bool {
+            ValueType::Bool
+        } else {
+            ValueType::Scalar(dtype)
+        };
+        match dtype {
+            DType::U32 => a,
+            DType::F32 | DType::I32 => self.bitcast(a, to),
+            DType::Bool => {
+                let zero = self.constant(ops::ConstantValue::U32(0), a.ty);
+                self.cmp_terminal(CmpOp::Ne, a, zero)
+            }
+            DType::F16 | DType::BF16 => {
+                let uniformity = self.inner.uniformity_of(a.raw);
+                let a = self.used(a);
+                let out = self.inner.define_with(to, None, uniformity);
+                self.inner.emit(Op::ScalarFromBits { out, a });
+                PortableValue { raw: out, ty: to }
+            }
+        }
+    }
     pub fn math(&mut self, op: MathOp, a: PortableValue) -> PortableValue {
         super::reference_math::expand(self, op, a)
     }
@@ -682,7 +1016,6 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         let uniformity = self.inner.uniformity_of(a.raw);
         let a = self.used(a);
         let out = self.inner.define_with(ty, None, uniformity);
-        self.inner.record_fact(NumericalFact::ApproximateMath(op));
         self.inner.emit(Op::Math {
             op,
             precision: MathPrecision::Approximate,
@@ -692,51 +1025,110 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         PortableValue { raw: out, ty }
     }
     pub fn fma(&mut self, a: PortableValue, b: PortableValue, c: PortableValue) -> PortableValue {
-        assert_eq!(a.ty, b.ty);
-        assert_eq!(a.ty, c.ty);
-        let ty = a.ty.clone();
-        let uniformity = self.inner.combined_uniformity([a.raw, b.raw, c.raw]);
-        let (a, b, c) = (self.used(a), self.used(b), self.used(c));
-        let out = self.inner.define_with(ty.clone(), None, uniformity);
-        self.inner.emit(Op::Fma { out, a, b, c });
-        PortableValue { raw: out, ty }
+        super::reference_math::expand_total(
+            self,
+            seismic_lang::reference_math::ScalarOp::Math(MathOp::Fma),
+            &[a, b, c],
+        )
     }
+
     pub fn read(&mut self, place: PortablePlace, index: &[PortableValue]) -> PortableValue {
         let entry = self.checked_place(place);
+        self.read_entry(entry, index)
+    }
+    fn read_entry(&mut self, entry: PlaceEntry, index: &[PortableValue]) -> PortableValue {
+        match &registry::representation_info(entry.representation).kind {
+            RepresentationKind::Packed(_) => super::representation::read(self, entry, index),
+            RepresentationKind::Dense(dtype) => {
+                let indices = self.read_indices(entry, index);
+                let ty = dtype_value_type(*dtype);
+                let uniformity = self
+                    .inner
+                    .read_uniformity(entry.place, indices.iter().copied());
+                let out = self.inner.define_with(ty, None, uniformity);
+                self.inner.emit(Op::Read {
+                    out,
+                    place: entry.place,
+                    representation: entry.representation,
+                    index: indices,
+                });
+                PortableValue { raw: out, ty }
+            }
+            RepresentationKind::External(_) => {
+                panic!("external packets require a registered conversion")
+            }
+        }
+    }
+    fn read_indices(&mut self, entry: PlaceEntry, index: &[PortableValue]) -> Vec<ErasedValue> {
         assert_eq!(
             entry.rank as usize,
             index.len(),
             "portable read rank mismatch"
         );
-        let uniformity = self
-            .inner
-            .combined_uniformity(index.iter().map(|value| value.raw))
-            .combine(self.inner.state.blocks[self.inner.block.index() as usize].control_uniformity);
-        let indices = index
+        index
             .iter()
             .map(|value| {
                 assert_eq!(value.ty, ValueType::Index);
                 self.inner.use_value(value.raw, &ValueType::Index)
             })
-            .collect();
-        let ty = match registry::representation_info(entry.representation).kind {
-            RepresentationKind::Dense(dtype) => dtype_value_type(dtype),
-            RepresentationKind::Packed(_) => ValueType::Scalar(DType::F32),
-            RepresentationKind::External(_) => {
-                panic!("external packets are readable only through a registered conversion")
+            .collect()
+    }
+    pub(super) fn read_plane_field(
+        &mut self,
+        entry: PlaceEntry,
+        index: &[PortableValue],
+        plane: u32,
+        field: u32,
+    ) -> PortableValue {
+        let RepresentationKind::Packed(layout) =
+            &registry::representation_info(entry.representation).kind
+        else {
+            panic!("field read requires a packed representation")
+        };
+        let schema = &layout.planes[plane as usize];
+        assert!(field < schema.fields, "field is outside its plane group");
+        let dtype = match schema.encoding {
+            registry::PlaneEncoding::Dense(dtype) => dtype,
+            registry::PlaneEncoding::Packed { .. } | registry::PlaneEncoding::FloatCode { .. } => {
+                DType::U32
             }
         };
-        // A deterministic read at the same address on every participant is
-        // uniform. Preserve the index/control uniformity instead of treating
-        // every memory read as varying; this is what permits a scalar tensor
-        // lookup to cross a sequential kernel/schedule cut.
-        let out = self.inner.define_with(ty.clone(), None, uniformity);
-        self.inner.emit(Op::Read {
+        let indices = self.read_indices(entry, index);
+        let ty = dtype_value_type(dtype);
+        let uniformity = self
+            .inner
+            .read_uniformity(entry.place, indices.iter().copied());
+        let out = self.inner.define_with(ty, None, uniformity);
+        self.inner.emit(Op::ReadPlaneField {
             out,
             place: entry.place,
-            representation: entry.representation,
+            plane,
+            field,
             index: indices,
         });
+        PortableValue { raw: out, ty }
+    }
+    fn vector_from_lanes(&mut self, lanes: &[PortableValue]) -> PortableValue {
+        let first = lanes.first().expect("vector has at least one lane");
+        let dtype = match first.ty {
+            ValueType::Scalar(dtype) => dtype,
+            ValueType::Bool => DType::Bool,
+            _ => panic!("vector lanes must be source scalars"),
+        };
+        let raw = lanes
+            .iter()
+            .map(|lane| {
+                assert_eq!(lane.ty, first.ty, "vector lane types differ");
+                self.inner.use_value(lane.raw, &first.ty)
+            })
+            .collect::<Vec<_>>();
+        let ty = ValueType::Vector {
+            dtype,
+            lanes: lanes.len().try_into().expect("vector lane count"),
+        };
+        let uniformity = self.inner.combined_uniformity(raw.iter().copied());
+        let out = self.inner.define_with(ty, None, uniformity);
+        self.inner.emit(Op::VectorFromLanes { out, lanes: raw });
         PortableValue { raw: out, ty }
     }
     pub fn write(&mut self, place: PortablePlace, index: &[PortableValue], value: PortableValue) {
@@ -836,7 +1228,7 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         let nat = match entry.place {
             PlaceRef::Global { slot } => {
                 let view = self.inner.state.bindings[slot.index() as usize].view;
-                Some(self.inner.views[view.index as usize].extents[axis as usize])
+                Some(self.inner.storage.views()[view.index as usize].extents[axis as usize])
             }
             PlaceRef::Local { index } => {
                 Some(self.inner.state.locals[index as usize].extents[axis as usize])
@@ -862,9 +1254,24 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             place,
             extents,
             steps: Vec::new(),
-            plane: None,
         }
     }
+    /// Query the existing storage and region-product owners. A logical view
+    /// keeps the identity of its backing; distinct participant locals are
+    /// disjoint, while external argument aliases follow the entry contract.
+    pub fn tensors_may_overlap(&self, a: &PortableTensor, b: &PortableTensor) -> bool {
+        match (self.checked_place(a.place).place, self.checked_place(b.place).place) {
+            (PlaceRef::Local { index: a }, PlaceRef::Local { index: b }) => a == b,
+            (PlaceRef::Local { .. }, PlaceRef::Global { .. })
+            | (PlaceRef::Global { .. }, PlaceRef::Local { .. }) => false,
+            (PlaceRef::Global { slot: a }, PlaceRef::Global { slot: b }) => {
+                let a = self.inner.state.bindings[a.index() as usize].view;
+                let b = self.inner.state.bindings[b.index() as usize].view;
+                self.inner.storage.may_overlap_views(self.inner.schedule, a, b)
+            }
+        }
+    }
+
     pub fn tensor_extents<'b>(&self, tensor: &'b PortableTensor) -> &'b [PortableValue] {
         &tensor.extents
     }
@@ -892,11 +1299,11 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             "representation conversion requires packet-write authority"
         );
         assert!(
-            source.steps.is_empty() && source.plane.is_none(),
+            source.steps.is_empty() && !source.has_plane(),
             "external conversion source must be the canonical complete packet view"
         );
         assert!(
-            destination.steps.is_empty() && destination.plane.is_none(),
+            destination.steps.is_empty() && !destination.has_plane(),
             "resident conversion destination must be the canonical complete packet view"
         );
         assert_eq!(
@@ -924,6 +1331,10 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             .steps
             .iter()
             .map(|step| match step {
+                PortableViewStep::Plane { plane, axis } => ops::LogicalViewStep::Plane {
+                    plane: *plane,
+                    axis: *axis as u32,
+                },
                 PortableViewStep::Slice(axes) => ops::LogicalViewStep::Slice(
                     axes.iter()
                         .map(|axis| match axis {
@@ -949,145 +1360,247 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
                 },
             })
             .collect();
+        let representation = tensor
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                PortableViewStep::Plane { plane, .. } => {
+                    let RepresentationKind::Packed(layout) =
+                        &registry::representation_info(entry.representation).kind
+                    else {
+                        panic!("plane projection requires packed backing");
+                    };
+                    Some(registry::dense(
+                        layout.planes[*plane as usize].storage_dtype,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap_or(entry.representation);
         ops::LogicalTensorMap {
             base: entry.place,
-            representation: entry.representation,
-            logical_extents: tensor
-                .extents
-                .iter()
-                .map(|value| {
-                    self.inner
-                        .nat_of(value.raw)
-                        .expect("logical tensor extent has no canonical NatExpr")
-                })
-                .collect(),
+            representation,
             extents: tensor.extents.iter().map(|value| value.raw).collect(),
             steps,
         }
     }
-    pub fn tensor_plane(&self, mut tensor: PortableTensor, plane: u32) -> PortableTensor {
-        assert!(
-            tensor.plane.replace(plane).is_none(),
-            "plane view was applied twice"
-        );
+    /// Uniformity of the actual storage address product, including private
+    /// participant storage and the operands of its ordered view transforms.
+    /// This does not assert that mutable memory is stable across observations.
+    pub fn tensor_address_uniformity(&self, tensor: &PortableTensor) -> IntrinsicUniformity {
+        let place = self.checked_place(tensor.place);
+        let mut values = tensor
+            .extents
+            .iter()
+            .map(|value| value.raw)
+            .collect::<Vec<_>>();
+        for step in &tensor.steps {
+            match step {
+                PortableViewStep::Slice(axes) => {
+                    for axis in axes {
+                        match axis {
+                            PortableSliceAxis::Point(value) => values.push(value.raw),
+                            PortableSliceAxis::Range { start, end } => {
+                                values.extend([start.raw, end.raw])
+                            }
+                            PortableSliceAxis::Full => {}
+                        }
+                    }
+                }
+                PortableViewStep::Reshape { from, to } => {
+                    values.extend(from.iter().chain(to).map(|value| value.raw))
+                }
+                PortableViewStep::Plane { .. } | PortableViewStep::Transpose(_) => {}
+            }
+        }
+        match self.inner.read_uniformity(place.place, values) {
+            Uniformity::Workgroup => IntrinsicUniformity::Workgroup,
+            Uniformity::Subgroup => IntrinsicUniformity::Subgroup,
+            Uniformity::Varying => IntrinsicUniformity::Varying,
+        }
+    }
+
+    pub fn tensor_plane(&mut self, mut tensor: PortableTensor, plane: u32) -> PortableTensor {
+        assert!(!tensor.has_plane(), "plane view was applied twice");
+        let entry = self.checked_place(tensor.place);
+        let RepresentationKind::Packed(layout) =
+            &registry::representation_info(entry.representation).kind
+        else {
+            panic!("plane projection requires packed storage")
+        };
+        let schema = &layout.planes[plane as usize];
+        let mut axis = entry.rank.checked_sub(1).expect("packed storage rank") as usize;
+        for step in &tensor.steps {
+            axis = match step {
+                PortableViewStep::Slice(axes) => {
+                    assert!(
+                        !matches!(axes[axis], PortableSliceAxis::Point(_)),
+                        "plane projection has no packing axis"
+                    );
+                    axis - axes[..axis]
+                        .iter()
+                        .filter(|a| matches!(a, PortableSliceAxis::Point(_)))
+                        .count()
+                }
+                PortableViewStep::Transpose(permutation) => permutation
+                    .iter()
+                    .position(|a| *a as usize == axis)
+                    .expect("packing axis permutation"),
+                PortableViewStep::Reshape { .. } => panic!("packed reshape is not a checked view"),
+                PortableViewStep::Plane { .. } => unreachable!(),
+            };
+        }
+        // A raw plane contains the owned storage elements of every packet
+        // touched by this logical row, including the containing packets of an
+        // unaligned slice. The existing ordered view map owns its origin.
+        let zero = self.index_constant(0);
+        let origins = self.tensor_indices(&tensor, &vec![zero; tensor.extents.len()]);
+        let origin = origins[entry.rank as usize - 1];
+        let length = tensor.extents[axis];
+        let group = self.index_constant(u64::from(layout.group));
+        let first_offset = self.binary(BinaryOp::Rem, origin, group);
+        let whole = self.binary(BinaryOp::Div, length, group);
+        let remainder = self.binary(BinaryOp::Rem, length, group);
+        let boundary = self.binary(BinaryOp::Add, first_offset, remainder);
+        let boundary_packets = self.index_ceil_div(boundary, group);
+        let packets = self.binary(BinaryOp::Add, whole, boundary_packets);
+        let one = self.index_constant(1);
+        let nonempty = self.binary(BinaryOp::Min, length, one);
+        let packets = self.binary(BinaryOp::Mul, packets, nonempty);
+        let elements = self.index_constant(u64::from(schema.storage_elements_per_packet()));
+        tensor.extents[axis] = self.binary(BinaryOp::Mul, packets, elements);
+        tensor.steps.push(PortableViewStep::Plane { plane, axis });
         tensor
+    }
+    fn index_ceil_div(
+        &mut self,
+        numerator: PortableValue,
+        denominator: PortableValue,
+    ) -> PortableValue {
+        let quotient = self.binary(BinaryOp::Div, numerator, denominator);
+        let remainder = self.binary(BinaryOp::Rem, numerator, denominator);
+        let one = self.index_constant(1);
+        let extra = self.binary(BinaryOp::Min, remainder, one);
+        self.binary(BinaryOp::Add, quotient, extra)
+    }
+    fn plane_coordinates(
+        &mut self,
+        entry: PlaceEntry,
+        plane: u32,
+        axis: usize,
+        mut index: Vec<PortableValue>,
+    ) -> (Vec<PortableValue>, PortableValue) {
+        let RepresentationKind::Packed(layout) =
+            &registry::representation_info(entry.representation).kind
+        else {
+            panic!("plane projection requires packed storage")
+        };
+        let per_packet = self.index_constant(u64::from(
+            layout.planes[plane as usize].storage_elements_per_packet(),
+        ));
+        let element = self.binary(BinaryOp::Rem, index[axis], per_packet);
+        let packet = self.binary(BinaryOp::Div, index[axis], per_packet);
+        let group = self.index_constant(u64::from(layout.group));
+        index[axis] = self.binary(BinaryOp::Mul, packet, group);
+        (index, element)
+    }
+    fn read_plane_storage(
+        &mut self,
+        entry: PlaceEntry,
+        plane: u32,
+        index: &[PortableValue],
+        element: PortableValue,
+    ) -> PortableValue {
+        let RepresentationKind::Packed(layout) =
+            &registry::representation_info(entry.representation).kind
+        else {
+            panic!("plane storage read requires packed storage")
+        };
+        let ty = dtype_value_type(layout.planes[plane as usize].storage_dtype);
+        let indices = self.read_indices(entry, index);
+        let element = self.inner.use_value(element.raw, &ValueType::Index);
+        let uniformity = self
+            .inner
+            .read_uniformity(entry.place, indices.iter().copied().chain([element]));
+        let out = self.inner.define_with(ty, None, uniformity);
+        self.inner.emit(Op::ReadPlane {
+            out,
+            place: entry.place,
+            plane,
+            index: indices,
+            element,
+        });
+        PortableValue { raw: out, ty }
     }
     pub fn tensor_slice(
         &mut self,
-        mut tensor: PortableTensor,
+        tensor: PortableTensor,
         axes: Vec<PortableSliceAxis>,
     ) -> PortableTensor {
-        assert_eq!(axes.len(), tensor.extents.len(), "slice rank mismatch");
-        let mut extents = Vec::new();
-        for (axis, extent) in axes.iter().zip(&tensor.extents) {
-            match *axis {
-                PortableSliceAxis::Point(_) => {}
-                PortableSliceAxis::Range { start, end } => {
-                    extents.push(self.binary(BinaryOp::Sub, end, start));
-                }
-                PortableSliceAxis::Full => extents.push(*extent),
-            }
-        }
-        tensor.steps.push(PortableViewStep::Slice(axes));
-        tensor.extents = extents;
-        tensor
+        tensor.slice(axes, |end, start| self.binary(BinaryOp::Sub, end, start))
     }
     pub fn tensor_transpose(
         &self,
-        mut tensor: PortableTensor,
+        tensor: PortableTensor,
         permutation: Vec<u32>,
     ) -> PortableTensor {
-        assert_eq!(
-            permutation.len(),
-            tensor.extents.len(),
-            "transpose rank mismatch"
-        );
-        let mut seen = vec![false; permutation.len()];
-        let extents = permutation
-            .iter()
-            .map(|axis| {
-                let axis = *axis as usize;
-                assert!(
-                    axis < seen.len() && !seen[axis],
-                    "invalid transpose permutation"
-                );
-                seen[axis] = true;
-                tensor.extents[axis]
-            })
-            .collect();
-        tensor.steps.push(PortableViewStep::Transpose(permutation));
-        tensor.extents = extents;
-        tensor
+        tensor.transpose(permutation)
     }
     pub fn tensor_reshape(
         &self,
-        mut tensor: PortableTensor,
+        tensor: PortableTensor,
         extents: Vec<PortableValue>,
     ) -> PortableTensor {
         assert!(extents.iter().all(|value| value.ty == ValueType::Index));
-        tensor.steps.push(PortableViewStep::Reshape {
-            from: tensor.extents.clone(),
-            to: extents.clone(),
-        });
-        tensor.extents = extents;
-        tensor
+        tensor.reshape(extents)
     }
-    fn tensor_indices(
+    fn tensor_address(
         &mut self,
         tensor: &PortableTensor,
         index: &[PortableValue],
-    ) -> Vec<PortableValue> {
+    ) -> (Vec<PortableValue>, Option<(u32, PortableValue)>) {
         assert_eq!(
             index.len(),
             tensor.extents.len(),
             "logical tensor index rank mismatch"
         );
         let mut index = index.to_vec();
+        let mut projection = None;
         for step in tensor.steps.iter().rev() {
             index = match step {
-                PortableViewStep::Slice(axes) => {
-                    let mut output = Vec::with_capacity(axes.len());
-                    let mut values = index.iter().copied();
-                    for axis in axes {
-                        output.push(match *axis {
-                            PortableSliceAxis::Point(value) => value,
-                            PortableSliceAxis::Range { start, .. } => self.binary(
-                                BinaryOp::Add,
-                                start,
-                                values.next().expect("slice mapping rank is closed"),
-                            ),
-                            PortableSliceAxis::Full => {
-                                values.next().expect("slice mapping rank is closed")
-                            }
-                        });
-                    }
-                    assert!(values.next().is_none(), "slice mapping left an output axis");
-                    output
+                PortableViewStep::Plane { plane, axis } => {
+                    let (mapped, element) = self.plane_coordinates(
+                        self.checked_place(tensor.place),
+                        *plane,
+                        *axis,
+                        index,
+                    );
+                    assert!(projection.replace((*plane, element)).is_none());
+                    mapped
                 }
-                PortableViewStep::Transpose(permutation) => {
+                step => {
                     let zero = self.index_constant(0);
-                    let mut output = vec![zero; permutation.len()];
-                    for (axis, source) in permutation.iter().zip(&index) {
-                        output[*axis as usize] = *source;
-                    }
-                    output
-                }
-                PortableViewStep::Reshape { from, to } => {
-                    let mut linear = self.index_constant(0);
-                    for (coordinate, extent) in index.iter().zip(to) {
-                        linear = self.binary(BinaryOp::Mul, linear, *extent);
-                        linear = self.binary(BinaryOp::Add, linear, *coordinate);
-                    }
-                    let zero = self.index_constant(0);
-                    let mut output = vec![zero; from.len()];
-                    for axis in (0..from.len()).rev() {
-                        output[axis] = self.binary(BinaryOp::Rem, linear, from[axis]);
-                        linear = self.binary(BinaryOp::Div, linear, from[axis]);
-                    }
-                    output
+                    step.dense_coordinates(&index, zero, |op, a, b| {
+                        use crate::tensor_view::CoordinateOp;
+                        self.binary(match op {
+                            CoordinateOp::Add => BinaryOp::Add,
+                            CoordinateOp::Mul => BinaryOp::Mul,
+                            CoordinateOp::Div => BinaryOp::Div,
+                            CoordinateOp::Rem => BinaryOp::Rem,
+                        }, a, b)
+                    }).expect("plane handled by representation resolver")
                 }
             };
         }
+        (index, projection)
+    }
+    fn tensor_indices(
+        &mut self,
+        tensor: &PortableTensor,
+        index: &[PortableValue],
+    ) -> Vec<PortableValue> {
+        let (index, projection) = self.tensor_address(tensor, index);
+        assert!(projection.is_none(), "plane storage views are read-only");
         index
     }
     pub fn tensor_read(
@@ -1095,36 +1608,11 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         tensor: &PortableTensor,
         index: &[PortableValue],
     ) -> PortableValue {
-        let index = self.tensor_indices(tensor, index);
-        match tensor.plane {
+        let (index, projection) = self.tensor_address(tensor, index);
+        match projection {
             None => self.read(tensor.place, &index),
-            Some(plane) => {
-                let entry = self.checked_place(tensor.place);
-                let RepresentationKind::Packed(layout) =
-                    &registry::representation_info(entry.representation).kind
-                else {
-                    panic!("plane reads require a packed representation")
-                };
-                assert!(
-                    (plane as usize) < layout.planes.len(),
-                    "plane index is outside the packed representation"
-                );
-                let indices = index
-                    .iter()
-                    .map(|value| {
-                        assert_eq!(value.ty, ValueType::Index);
-                        self.inner.use_value(value.raw, &ValueType::Index)
-                    })
-                    .collect();
-                let ty = ValueType::Scalar(DType::U32);
-                let out = self.inner.define(ty.clone());
-                self.inner.emit(Op::ReadPlane {
-                    out,
-                    place: entry.place,
-                    plane,
-                    index: indices,
-                });
-                PortableValue { raw: out, ty }
+            Some((plane, element)) => {
+                self.read_plane_storage(self.checked_place(tensor.place), plane, &index, element)
             }
         }
     }
@@ -1134,7 +1622,7 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         index: &[PortableValue],
         value: PortableValue,
     ) {
-        assert!(tensor.plane.is_none(), "plane views are read-only");
+        assert!(!tensor.has_plane(), "plane views are read-only");
         let index = self.tensor_indices(tensor, index);
         self.write(tensor.place, &index, value);
     }
@@ -1146,40 +1634,45 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         value: PortableValue,
     ) {
         assert!(
-            tensor.plane.is_none(),
+            !tensor.has_plane(),
             "plane views are not atomic destinations"
         );
         let index = self.tensor_indices(tensor, index);
         self.atomic(op, tensor.place, &index, value);
     }
-    /// Publishes one lane's failed preflight predicate into the canonical
-    /// dense-u32 status word. Atomic max is an order-independent all-lanes OR
+    /// Publishes one lane's failed source predicate into the canonical
+    /// indexed dense-u32 status word. Atomic max is an order-independent all-lanes OR
     /// and needs no barrier or elected writer.
-    pub fn preflight_fail(&mut self, status: &PortableTensor, condition: PortableValue) {
+    pub fn record_source_check(
+        &mut self,
+        status: &PortableTensor,
+        index: PortableValue,
+        condition: PortableValue,
+    ) {
         assert_eq!(
             condition.ty,
             ValueType::Bool,
-            "preflight predicate must be boolean"
+            "source check predicate must be boolean"
         );
-        assert_eq!(
-            status.extents.len(),
-            1,
-            "preflight status is one-dimensional"
-        );
+        assert_eq!(status.extents.len(), 1, "source status is one-dimensional");
         assert!(
-            status.steps.is_empty() && status.plane.is_none(),
-            "preflight status is an identity dense view"
+            status.steps.is_empty() && !status.has_plane(),
+            "source status is an identity dense view"
         );
         let entry = self.checked_place(status.place);
         assert_eq!(
             entry.representation,
             registry::dense(DType::U32),
-            "preflight status uses dense u32 storage"
+            "source status uses dense u32 storage"
         );
         let failed = self.not(condition);
         let failed = self.cast(failed, ValueType::Scalar(DType::U32));
-        let zero = self.index_constant(0);
-        self.tensor_atomic(AtomicOp::Max, status, &[zero], failed);
+        assert_eq!(
+            index.ty,
+            ValueType::Index,
+            "source status index must be an index"
+        );
+        self.tensor_atomic(AtomicOp::Max, status, &[index], failed);
     }
     pub fn store_slot(&mut self, slot: u32, value: PortableValue) {
         let expected = self
@@ -1188,10 +1681,10 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             .result_slots
             .get(slot as usize)
             .expect("portable result slot belongs to the open kernel")
-            .1;
+            .kind();
         assert_eq!(
             value.ty,
-            dtype_value_type(expected),
+            expected.value_type(),
             "portable result slot type mismatch"
         );
         assert_eq!(
@@ -1206,17 +1699,13 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             election: ops::StoreElection::GlobalLeader,
         });
     }
-    pub fn repeat(
+    pub fn begin_repeat(
         &mut self,
         start: PortableValue,
         end: PortableValue,
         initial: Vec<PortableValue>,
-        body: impl FnOnce(
-            &mut PortableBuilder<'_, B>,
-            PortableValue,
-            Vec<PortableValue>,
-        ) -> Vec<PortableValue>,
-    ) -> Vec<PortableValue> {
+        recurrence: &[IntrinsicUniformity],
+    ) -> (PortableRepeat, PortableValue, Vec<PortableValue>) {
         assert_eq!(start.ty, ValueType::Index);
         assert_eq!(end.ty, ValueType::Index);
         let (start_raw, end_raw) = (self.used(start), self.used(end));
@@ -1247,117 +1736,155 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
         let control_uniformity = self.inner.state.blocks[self.inner.block.index() as usize]
             .control_uniformity
             .combine(range_uniformity);
+        let recurrence =
+            self.inner
+                .recurrence_uniformities(&carries_in, recurrence, control_uniformity);
         let block = self.inner.new_block(multiplicity, control_uniformity);
-        let (binder, carry_params, next) = {
-            let mut sub = self.inner.in_block(block);
-            let binder = sub.define_with(ValueType::Index, None, range_uniformity);
-            let params = carries_in
-                .iter()
-                .zip(schema.values())
-                .map(|(initial, ty)| {
-                    let uniformity = sub.uniformity_of(*initial).combine(control_uniformity);
-                    sub.define_with(ty.clone(), None, uniformity)
-                })
-                .collect::<Vec<_>>();
-            let carried = params
-                .iter()
-                .copied()
-                .zip(schema.values())
-                .map(|(raw, ty)| PortableValue {
-                    raw,
-                    ty: ty.clone(),
-                })
-                .collect();
-            let mut builder = PortableBuilder { inner: sub };
-            let next = body(
-                &mut builder,
-                PortableValue {
-                    raw: binder,
-                    ty: ValueType::Index,
-                },
-                carried,
-            );
-            assert_eq!(
-                next.len(),
-                schema.len(),
-                "portable repeat body result count differs from its carry schema"
-            );
-            (binder, params, next)
-        };
-        let mut sub = self.inner.in_block(block);
-        let yielded = next
+        let parent = self.inner.block;
+        self.inner.block = block;
+        let binder = self
+            .inner
+            .define_with(ValueType::Index, None, range_uniformity);
+        let parameters = recurrence
             .iter()
             .zip(schema.values())
-            .map(|(value, ty)| {
-                assert_eq!(&value.ty, ty);
-                sub.use_value(value.raw, ty)
-            })
+            .map(|(uniformity, ty)| self.inner.define_with(ty.clone(), None, *uniformity))
             .collect::<Vec<_>>();
-        sub.emit(Op::Yield { values: yielded });
-        drop(sub);
-        let outs = next
+        let carried = parameters
             .iter()
+            .copied()
             .zip(schema.values())
-            .map(|(value, ty)| {
-                let uniformity = self
-                    .inner
-                    .uniformity_of(value.raw)
-                    .combine(control_uniformity);
-                self.inner.define_with(ty.clone(), None, uniformity)
+            .map(|(raw, ty)| PortableValue {
+                raw,
+                ty: ty.clone(),
             })
-            .collect::<Vec<_>>();
-        self.inner.emit(Op::Repeat {
+            .collect();
+        let token = PortableRepeat {
+            parent,
+            body: block,
             start: start_raw,
             end: end_raw,
             binder,
-            carries_in,
-            carry_params,
-            body: block,
+            initial: carries_in,
+            parameters,
+            schema,
+            recurrence,
+        };
+        (
+            token,
+            PortableValue {
+                raw: binder,
+                ty: ValueType::Index,
+            },
+            carried,
+        )
+    }
+
+    pub fn finish_repeat(
+        &mut self,
+        token: PortableRepeat,
+        next: Vec<PortableValue>,
+    ) -> Vec<PortableValue> {
+        assert_eq!(
+            self.inner.block, token.body,
+            "repeat must close its own current body block"
+        );
+        assert_eq!(
+            next.len(),
+            token.schema.len(),
+            "portable repeat body result count differs from its carry schema"
+        );
+        let yielded = next
+            .iter()
+            .zip(token.schema.values())
+            .map(|(value, ty)| {
+                assert_eq!(&value.ty, ty);
+                self.inner.use_value(value.raw, ty)
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .check_recurrence_yields(&yielded, &token.recurrence);
+        self.inner.emit(Op::Yield { values: yielded });
+        self.inner.block = token.parent;
+        let outs = token
+            .recurrence
+            .iter()
+            .zip(token.schema.values())
+            .map(|(uniformity, ty)| self.inner.define_with(ty.clone(), None, *uniformity))
+            .collect::<Vec<_>>();
+        self.inner.emit(Op::Repeat {
+            start: token.start,
+            end: token.end,
+            binder: token.binder,
+            carries_in: token.initial,
+            carry_params: token.parameters,
+            body: token.body,
             outs: outs.clone(),
         });
         outs.into_iter()
-            .zip(schema.values())
+            .zip(token.schema.values())
             .map(|(raw, ty)| PortableValue {
                 raw,
                 ty: ty.clone(),
             })
             .collect()
     }
-    pub fn branch(
+
+    pub fn repeat(
         &mut self,
-        condition: PortableValue,
-        then: impl FnOnce(&mut PortableBuilder<'_, B>) -> Vec<PortableValue>,
-        otherwise: impl FnOnce(&mut PortableBuilder<'_, B>) -> Vec<PortableValue>,
+        start: PortableValue,
+        end: PortableValue,
+        initial: Vec<PortableValue>,
+        recurrence: &[IntrinsicUniformity],
+        body: impl FnOnce(
+            &mut PortableBuilder<'_, B>,
+            PortableValue,
+            Vec<PortableValue>,
+        ) -> Vec<PortableValue>,
     ) -> Vec<PortableValue> {
+        let (repeat, binder, carried) = self.begin_repeat(start, end, initial, recurrence);
+        let next = body(self, binder, carried);
+        self.finish_repeat(repeat, next)
+    }
+    pub fn begin_branch(&mut self, condition: PortableValue) -> PortableBranch {
         assert_eq!(condition.ty, ValueType::Bool);
         let condition = self.used(condition);
-        let multiplicity = self.inner.state.blocks[self.inner.block.index() as usize].multiplicity;
-        let control_uniformity = self.inner.state.blocks[self.inner.block.index() as usize]
+        let parent = self.inner.block;
+        let multiplicity = self.inner.state.blocks[parent.index() as usize].multiplicity;
+        let control_uniformity = self.inner.state.blocks[parent.index() as usize]
             .control_uniformity
             .combine(self.inner.uniformity_of(condition));
         let then_block = self.inner.new_block(multiplicity, control_uniformity);
-        let then_values = {
-            let mut child = PortableBuilder {
-                inner: self.inner.in_block(then_block),
-            };
-            then(&mut child)
-        };
-        let schema = ValueSchema::new(then_values.iter().map(|value| value.ty.clone()).collect());
-        self.inner.yield_values(
-            then_block,
-            &then_values
-                .iter()
-                .map(|value| value.raw)
-                .collect::<Vec<_>>(),
-            &schema,
-        );
         let else_block = self.inner.new_block(multiplicity, control_uniformity);
-        let else_values = {
-            let mut child = PortableBuilder {
-                inner: self.inner.in_block(else_block),
-            };
-            otherwise(&mut child)
-        };
+        self.inner.block = then_block;
+        PortableBranch {
+            parent,
+            then_block,
+            else_block,
+            condition,
+            control_uniformity,
+        }
+    }
+
+    pub fn begin_otherwise(&mut self, branch: &PortableBranch) {
+        assert_eq!(
+            self.inner.block, branch.then_block,
+            "portable branches must close their nested regions first"
+        );
+        self.inner.block = branch.else_block;
+    }
+
+    pub fn finish_branch(
+        &mut self,
+        branch: PortableBranch,
+        then_values: Vec<PortableValue>,
+        else_values: Vec<PortableValue>,
+    ) -> Vec<PortableValue> {
+        assert_eq!(
+            self.inner.block, branch.else_block,
+            "portable branch arms must be closed in order"
+        );
+        let schema = ValueSchema::new(then_values.iter().map(|value| value.ty.clone()).collect());
         assert_eq!(
             else_values
                 .iter()
@@ -1367,28 +1894,41 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             "portable branch result schemas differ"
         );
         self.inner.yield_values(
-            else_block,
+            branch.then_block,
+            &then_values
+                .iter()
+                .map(|value| value.raw)
+                .collect::<Vec<_>>(),
+            &schema,
+        );
+        self.inner.yield_values(
+            branch.else_block,
             &else_values
                 .iter()
                 .map(|value| value.raw)
                 .collect::<Vec<_>>(),
             &schema,
         );
+        self.inner.block = branch.parent;
         let outs = then_values
             .iter()
-            .zip(else_values.iter())
+            .zip(&else_values)
             .zip(schema.values())
             .map(|((a, b), ty)| {
-                let uniformity = control_uniformity
+                let uniformity = branch
+                    .control_uniformity
                     .combine(self.inner.uniformity_of(a.raw))
                     .combine(self.inner.uniformity_of(b.raw));
-                self.inner.define_with(ty.clone(), None, uniformity)
+                let left = self.inner.nat_of(a.raw);
+                let right = self.inner.nat_of(b.raw);
+                let origin = if left == right { left } else { None };
+                self.inner.define_with(ty.clone(), origin, uniformity)
             })
             .collect::<Vec<_>>();
         self.inner.emit(Op::Branch {
-            cond: condition,
-            then: then_block,
-            otherwise: else_block,
+            cond: branch.condition,
+            then: branch.then_block,
+            otherwise: branch.else_block,
             outs: outs.clone(),
         });
         outs.into_iter()
@@ -1399,16 +1939,87 @@ impl<'a, B: KernelDialect> PortableBuilder<'a, B> {
             })
             .collect()
     }
+
+    /// Close a branch whose result is a complete product with arm-specific
+    /// scalar payload. Missing fields belong only to the other arm; their zero
+    /// fillers are transport values, never values of a source expression.
+    /// Opaque values must be yielded by both arms with exactly the same type.
+    pub fn finish_branch_products(
+        &mut self,
+        branch: PortableBranch,
+        fields: Vec<(Option<PortableValue>, Option<PortableValue>)>,
+    ) -> Vec<PortableValue> {
+        use ops::ConstantValue;
+        assert_eq!(
+            self.inner.block, branch.else_block,
+            "branch arms must be closed in order"
+        );
+        let mut then_values = Vec::with_capacity(fields.len());
+        let mut else_values = Vec::with_capacity(fields.len());
+        for (then, otherwise) in fields {
+            let ty = then.or(otherwise).expect("branch field has no producer").ty;
+            if let (Some(a), Some(b)) = (then, otherwise) {
+                assert_eq!(a.ty, b.ty, "branch product field types differ");
+            }
+            let filler = |builder: &mut Self, available: PortableValue| {
+                if builder
+                    .inner
+                    .dominates(available.raw.block, builder.inner.block)
+                {
+                    // An actual pre-branch operand exists in both arms. Reuse
+                    // it; an expression-origin annotation alone is not enough
+                    // to speculate a fresh, potentially partial calculation.
+                    return available;
+                }
+                let value = match ty {
+                    ValueType::Scalar(DType::F32) => ConstantValue::F32(0.0),
+                    ValueType::Scalar(DType::F16) => ConstantValue::F16(0),
+                    ValueType::Scalar(DType::BF16) => ConstantValue::BF16(0),
+                    ValueType::Scalar(DType::I32) => ConstantValue::I32(0),
+                    ValueType::Scalar(DType::U32) => ConstantValue::U32(0),
+                    ValueType::Scalar(DType::Bool) | ValueType::Bool => ConstantValue::Bool(false),
+                    ValueType::Index => ConstantValue::Index(0),
+                    ValueType::Opaque { .. } | ValueType::Vector { .. } => {
+                        panic!("only scalar branch payload fields may be absent")
+                    }
+                };
+                builder.constant(value, ty)
+            };
+            self.inner.block = branch.then_block;
+            then_values.push(then.unwrap_or_else(|| filler(self, otherwise.unwrap())));
+            self.inner.block = branch.else_block;
+            else_values.push(otherwise.unwrap_or_else(|| filler(self, then.unwrap())));
+        }
+        self.finish_branch(branch, then_values, else_values)
+    }
+
+    pub fn branch(
+        &mut self,
+        condition: PortableValue,
+        then: impl FnOnce(&mut PortableBuilder<'_, B>) -> Vec<PortableValue>,
+        otherwise: impl FnOnce(&mut PortableBuilder<'_, B>) -> Vec<PortableValue>,
+    ) -> Vec<PortableValue> {
+        let branch = self.begin_branch(condition);
+        let then_values = then(self);
+        self.begin_otherwise(&branch);
+        let else_values = otherwise(self);
+        self.finish_branch(branch, then_values, else_values)
+    }
     pub fn close(self) -> KernelId {
+        assert_eq!(
+            self.inner.block.index(),
+            0,
+            "portable kernel has an unclosed control region"
+        );
         self.inner.close()
     }
 }
 
-fn a_type<B: KernelDialect>(builder: &Builder<'_, B>, value: ErasedValue) -> ValueType {
+fn a_type<B: PhysicalDialect>(builder: &Builder<'_, B>, value: ErasedValue) -> ValueType {
     builder.entry(value).ty.clone()
 }
 
-impl<'a, B: KernelDialect> Builder<'a, B> {
+impl<'a, B: PhysicalDialect> Builder<'a, B> {
     fn allocate_addressable_resource(
         &mut self,
         class_id: crate::target::ResourceClassId,
@@ -1455,7 +2066,8 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
     fn reborrow(&mut self) -> Builder<'_, B> {
         Builder {
             expr: &mut *self.expr,
-            views: self.views,
+            storage: self.storage,
+            schedule: self.schedule,
             kernels: &mut *self.kernels,
             state: &mut *self.state,
             target_facts: self.target_facts,
@@ -1603,6 +2215,60 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         self.entry(value).uniformity
     }
 
+    fn read_uniformity(
+        &self,
+        place: PlaceRef,
+        indices: impl IntoIterator<Item = ErasedValue>,
+    ) -> Uniformity {
+        let storage = match place {
+            PlaceRef::Global { .. } => Uniformity::Workgroup,
+            PlaceRef::Local { index } => match self.state.locals[index as usize].kind {
+                LaunchLocalKind::Workgroup => Uniformity::Workgroup,
+                LaunchLocalKind::Participant | LaunchLocalKind::Register => Uniformity::Varying,
+            },
+        };
+        storage
+            .combine(self.combined_uniformity(indices))
+            .combine(self.state.blocks[self.block.index() as usize].control_uniformity)
+    }
+    fn recurrence_uniformities(
+        &self,
+        initial: &[ErasedValue],
+        declared: &[IntrinsicUniformity],
+        control: Uniformity,
+    ) -> Vec<Uniformity> {
+        assert_eq!(
+            initial.len(),
+            declared.len(),
+            "loop recurrence uniformity count differs from carry schema"
+        );
+        initial
+            .iter()
+            .zip(declared)
+            .map(|(initial, declared)| {
+                let uniformity = Uniformity::from_intrinsic(*declared).combine(control);
+                assert!(
+                    self.uniformity_of(*initial) <= uniformity,
+                    "loop initial value exceeds its recurrence uniformity"
+                );
+                uniformity
+            })
+            .collect()
+    }
+    fn check_recurrence_yields(&self, values: &[ErasedValue], recurrence: &[Uniformity]) {
+        assert_eq!(
+            values.len(),
+            recurrence.len(),
+            "loop yield count differs from recurrence schema"
+        );
+        for (value, expected) in values.iter().zip(recurrence) {
+            assert!(
+                self.uniformity_of(*value) <= *expected,
+                "loop yielded value exceeds its recurrence uniformity"
+            );
+        }
+    }
+
     fn combined_uniformity(&self, values: impl IntoIterator<Item = ErasedValue>) -> Uniformity {
         values
             .into_iter()
@@ -1693,7 +2359,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             self.owner(),
             "buffer view belongs to another implementation"
         );
-        let extents = match self.views.get(view.index as usize) {
+        let extents = match self.storage.views().get(view.index as usize) {
             Some(layout) => layout.extents.clone(),
             None => panic!(
                 "kernel builder: {view:?} is not a view of the implementation under construction"
@@ -1726,35 +2392,6 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         self.use_index_list(index)
     }
 
-    fn record_fact(&mut self, fact: NumericalFact) {
-        let multiplicity = self.state.blocks[self.block.index() as usize].multiplicity;
-        self.state.numerical.push(fact);
-        self.state.fact_multiplicity.push(multiplicity);
-    }
-
-    fn record_intrinsic_numerics(
-        &mut self,
-        signature: &seismic_lang::registry::IntrinsicSignature,
-        op: &B::Intrinsic,
-    ) {
-        let semantics = B::intrinsic_numerics(self.target_facts, signature, op);
-        match semantics.arithmetic {
-            IntrinsicNumerics::Exact => {}
-            IntrinsicNumerics::Reassociated { accumulator } => {
-                self.record_fact(NumericalFact::ReassociatedIntrinsic(signature.id));
-                if accumulator.is_float() && accumulator != DType::F32 {
-                    self.record_fact(NumericalFact::NarrowAccumulator(accumulator));
-                }
-            }
-            IntrinsicNumerics::Approximate { .. } | IntrinsicNumerics::Unknown => {
-                self.record_fact(NumericalFact::ReassociatedIntrinsic(signature.id));
-            }
-        }
-        if semantics.flush_to_zero {
-            self.record_fact(NumericalFact::FlushToZero);
-        }
-    }
-
     // ----- public-method servers ---------------------------------------------
 
     pub(super) fn arg_readable<R: Representation>(
@@ -1782,7 +2419,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
     }
     pub(super) fn arg_scalar<T: ScalarType>(&mut self, s: SymbolId) -> ScalarId<T> {
         let index = self.state.scalar_args.len() as u32;
-        self.state.scalar_args.push((s, T::DTYPE));
+        self.state.scalar_args.push((s, T::KIND));
         let (out, id) = self.scalar_out_with::<T>(Uniformity::Workgroup);
         self.emit(Op::ScalarArg { out, index });
         id
@@ -1797,7 +2434,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             "result slot belongs to another implementation"
         );
         let index = self.state.result_slots.len() as u32;
-        self.state.result_slots.push((s.erase(), T::DTYPE));
+        self.state.result_slots.push(s.erase());
         WritableScalar {
             owner: self.owner(),
             kernel: self.kernel_index(),
@@ -1850,7 +2487,9 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         let uniformity = match kind {
             GeometryValue::WorkgroupId(_)
             | GeometryValue::WorkgroupSize(_)
-            | GeometryValue::GridSize(_) => Uniformity::Workgroup,
+            | GeometryValue::GridSize(_)
+            | GeometryValue::SubgroupSize => Uniformity::Workgroup,
+            GeometryValue::SubgroupOrdinal => Uniformity::Subgroup,
             GeometryValue::LocalId(_)
             | GeometryValue::GlobalId(_)
             | GeometryValue::SubgroupLane => Uniformity::Varying,
@@ -1878,6 +2517,14 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         self.state.uses_subgroup = true;
         self.geometry(GeometryValue::SubgroupLane)
     }
+    pub(super) fn subgroup_ordinal(&mut self) -> ScalarId<Idx> {
+        self.state.uses_subgroup = true;
+        self.geometry(GeometryValue::SubgroupOrdinal)
+    }
+    pub(super) fn subgroup_size(&mut self) -> ScalarId<Idx> {
+        self.state.uses_subgroup = true;
+        self.geometry(GeometryValue::SubgroupSize)
+    }
 
     pub(super) fn constant<T: ScalarType>(&mut self, v: T::Value) -> ScalarId<T> {
         let value = constant_of::<T>(v);
@@ -1896,14 +2543,37 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         b: ScalarId<T>,
     ) -> ScalarId<T> {
         let (a, b) = (self.use_scalar(a), self.use_scalar(b));
+        let out = self.binary_value(op, value_type_of::<T>(), a, b);
+        ScalarId::new(out.owner, out.kernel, out.block, out.index())
+    }
+    /// One physical binary constructor for typed and portable callers.
+    fn binary_value(
+        &mut self,
+        op: BinaryOp,
+        ty: ValueType,
+        a: ErasedValue,
+        b: ErasedValue,
+    ) -> ErasedValue {
         let nat = match (self.nat_of(a), self.nat_of(b)) {
-            (Some(x), Some(y)) if value_type_of::<T>() == ValueType::Index => Some(match op {
-                BinaryOp::Add => self.expr.nat_add(x, y),
-                BinaryOp::Sub => {
-                    let m = self.expr.nat_max(x, y);
-                    self.expr.nat_sub(m, y)
+            (Some(x), Some(y)) if ty == ValueType::Index => Some(match op {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                    // Index is the selected native u64 word, not an unbounded
+                    // source quantity. Derive its exact modular result with
+                    // mathematical intermediates before projecting back to u64.
+                    let maximum = self.expr.nat(u64::MAX);
+                    let one = self.expr.nat(1);
+                    let modulus = self.expr.nat_add(maximum, one);
+                    let result = match op {
+                        BinaryOp::Add => self.expr.nat_add(x, y),
+                        BinaryOp::Sub => {
+                            let shifted = self.expr.nat_add(x, modulus);
+                            self.expr.nat_sub(shifted, y)
+                        }
+                        BinaryOp::Mul => self.expr.nat_mul(x, y),
+                        _ => unreachable!(),
+                    };
+                    self.expr.nat_rem(result, modulus)
                 }
-                BinaryOp::Mul => self.expr.nat_mul(x, y),
                 BinaryOp::Div => self.expr.nat_div(x, y),
                 BinaryOp::Rem => self.expr.nat_rem(x, y),
                 BinaryOp::Min => self.expr.nat_min(x, y),
@@ -1912,9 +2582,9 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             _ => None,
         };
         let uniformity = self.uniformity_of(a).combine(self.uniformity_of(b));
-        let out = self.define_with(value_type_of::<T>(), nat, uniformity);
+        let out = self.define_with(ty, nat, uniformity);
         self.emit(Op::Binary { op, out, a, b });
-        ScalarId::new(out.owner, out.kernel, out.block, out.index())
+        out
     }
     pub(super) fn unary<T: ScalarType>(&mut self, op: UnaryOp, a: ScalarId<T>) -> ScalarId<T> {
         let a = self.use_scalar(a);
@@ -1938,13 +2608,9 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         a: ScalarId<T>,
         b: ScalarId<T>,
         c: ScalarId<T>,
-        contracted: bool,
     ) -> ScalarId<T> {
         let (a, b, c) = (self.use_scalar(a), self.use_scalar(b), self.use_scalar(c));
         let (out, id) = self.scalar_out_with::<T>(self.combined_uniformity([a, b, c]));
-        if contracted {
-            self.record_fact(NumericalFact::ContractedFma);
-        }
         self.emit(Op::Fma { out, a, b, c });
         id
     }
@@ -1976,9 +2642,6 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         }
         let a = self.use_scalar(a);
         let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(a));
-        if p == MathPrecision::Approximate {
-            self.record_fact(NumericalFact::ApproximateMath(op));
-        }
         self.emit(Op::Math {
             op,
             precision: p,
@@ -2040,7 +2703,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
     ) {
         assert!(
             self.vector_support.supports(T::DTYPE, LANES, operation),
-            "ImplementationFactory constructed a vector operation absent from DeviceDescription vector support"
+            "constructor emitted a vector operation absent from DeviceDescription vector support"
         );
     }
     pub(super) fn vector_splat<T: VectorElement, const LANES: u16>(
@@ -2132,7 +2795,6 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         self.require_vector::<T, LANES>(crate::target::VectorOperationClass::ReduceAdd);
         let vector = self.use_vector(vector);
         let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(vector));
-        self.record_fact(NumericalFact::ReassociatedReduction);
         self.emit(Op::VectorReduceAdd { out, vector });
         id
     }
@@ -2142,15 +2804,25 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         i: &[ScalarId<Idx>],
     ) -> ScalarId<R::Element> {
         let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        let index = self.checked_index(place, i);
-        let (out, id) = self.scalar_out::<R::Element>();
-        self.emit(Op::Read {
-            out,
-            place: place.place,
-            representation: place.representation,
-            index,
-        });
-        id
+        let index = self
+            .checked_index(place, i)
+            .into_iter()
+            .map(|raw| PortableValue {
+                raw,
+                ty: ValueType::Index,
+            })
+            .collect::<Vec<_>>();
+        let mut portable = PortableBuilder {
+            inner: self.reborrow(),
+        };
+        let out = portable.read_entry(place, &index);
+        assert_eq!(out.ty, value_type_of::<R::Element>());
+        ScalarId::new(
+            out.raw.owner,
+            out.raw.kernel,
+            out.raw.block,
+            out.raw.index(),
+        )
     }
     pub(super) fn vector_read<R: Representation, const LANES: u16>(
         &mut self,
@@ -2169,7 +2841,59 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         );
         let index = self.checked_index(place, i);
         let active = self.use_scalar(active);
-        let uniformity = self.combined_uniformity(index.iter().copied().chain([active]));
+        if matches!(
+            registry::representation_info(place.representation).kind,
+            RepresentationKind::Packed(_)
+        ) {
+            let index = index
+                .into_iter()
+                .map(|raw| PortableValue {
+                    raw,
+                    ty: ValueType::Index,
+                })
+                .collect::<Vec<_>>();
+            let active = PortableValue {
+                raw: active,
+                ty: ValueType::Index,
+            };
+            let mut portable = PortableBuilder {
+                inner: self.reborrow(),
+            };
+            let mut lanes = Vec::with_capacity(LANES as usize);
+            for lane in 0..LANES {
+                let lane = portable.index_constant(u64::from(lane));
+                let enabled = portable.cmp(CmpOp::Lt, lane, active);
+                let result = portable.branch(
+                    enabled,
+                    |b| {
+                        let mut coordinates = index.clone();
+                        coordinates[axis as usize] =
+                            b.binary(BinaryOp::Add, coordinates[axis as usize], lane);
+                        vec![b.read_entry(place, &coordinates)]
+                    },
+                    |b| {
+                        vec![b.constant(
+                            ops::ConstantValue::from_scalar(
+                                seismic_lang::reference_math::ReferenceScalar::from_bits(
+                                    registry::representation_info(place.representation).decoded,
+                                    0,
+                                ),
+                            ),
+                            value_type_of::<R::Element>(),
+                        )]
+                    },
+                );
+                lanes.push(result[0]);
+            }
+            let out = portable.vector_from_lanes(&lanes);
+            return VectorId::new(
+                out.raw.owner,
+                out.raw.kernel,
+                out.raw.block,
+                out.raw.index(),
+            );
+        }
+        let uniformity = self.read_uniformity(place.place, index.iter().copied().chain([active]));
         let (out, id) = self.vector_out::<R::Element, LANES>(uniformity);
         self.emit(Op::VectorRead {
             out,
@@ -2239,15 +2963,27 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             None => panic!("kernel builder: {p:?} is not a plane of the open kernel"),
         };
         let place = self.place(p.owner(), p.kernel(), p.block(), place_index);
-        let index = self.checked_index(place, i);
-        let (out, id) = self.scalar_out::<U32>();
-        self.emit(Op::ReadPlane {
-            out,
-            place: place.place,
-            plane,
-            index,
-        });
-        id
+        let index = self
+            .checked_index(place, i)
+            .into_iter()
+            .map(|raw| PortableValue {
+                raw,
+                ty: ValueType::Index,
+            })
+            .collect::<Vec<_>>();
+        let mut portable = PortableBuilder {
+            inner: self.reborrow(),
+        };
+        let (index, element) =
+            portable.plane_coordinates(place, plane, place.rank as usize - 1, index);
+        let value = portable.read_plane_storage(place, plane, &index, element);
+        let out = portable.scalar_bits(value);
+        ScalarId::new(
+            out.raw.owner,
+            out.raw.kernel,
+            out.raw.block,
+            out.raw.index(),
+        )
     }
     pub(super) fn plane<R: Representation>(&mut self, p: ReadablePlaceId<R>, n: u32) -> PlaneId<R> {
         let _ = self.place(p.owner(), p.kernel(), p.block(), p.index());
@@ -2278,7 +3014,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             PlaceRef::Global { slot } => {
                 self.assert_kernel(slot.owner(), slot.kernel());
                 let view = self.state.bindings[slot.index() as usize].view;
-                Some(self.views[view.index as usize].extents[a as usize])
+                Some(self.storage.views()[view.index as usize].extents[a as usize])
             }
             PlaceRef::Local { index } => {
                 Some(self.state.locals[index as usize].extents[a as usize])
@@ -2461,6 +3197,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
         s: ScalarId<Idx>,
         e: ScalarId<Idx>,
         init: V,
+        recurrence: &[IntrinsicUniformity],
         body: impl FnOnce(&mut KernelBuilder<'_, B>, ScalarId<Idx>, V) -> V,
     ) -> V {
         let (start, end) = (self.use_scalar(s), self.use_scalar(e));
@@ -2494,17 +3231,15 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             (Some(m), Some(t)) => Some(self.expr.nat_mul(m, t)),
             _ => None,
         };
+        let recurrence = self.recurrence_uniformities(&carries_in, recurrence, control_uniformity);
         let block = self.new_block(multiplicity, control_uniformity);
         let (binder, params, next) = {
             let mut sub = self.in_block(block);
             let binder = sub.define_with(ValueType::Index, None, range_uniformity);
-            let params = carries_in
+            let params = recurrence
                 .iter()
                 .zip(schema.values())
-                .map(|(initial, ty)| {
-                    let uniformity = sub.uniformity_of(*initial).combine(control_uniformity);
-                    sub.define_with(ty.clone(), None, uniformity)
-                })
+                .map(|(uniformity, ty)| sub.define_with(ty.clone(), None, *uniformity))
                 .collect::<Vec<_>>();
             let carried = V::restore(&params);
             let mut builder = KernelBuilder { inner: sub };
@@ -2516,14 +3251,12 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             .erase();
             (binder, params, next)
         };
+        self.check_recurrence_yields(&next, &recurrence);
         self.yield_values(block, &next, &schema);
-        let outs = next
+        let outs = recurrence
             .iter()
             .zip(schema.values())
-            .map(|(value, ty)| {
-                let uniformity = self.uniformity_of(*value).combine(control_uniformity);
-                self.define_with(ty.clone(), None, uniformity)
-            })
+            .map(|(uniformity, ty)| self.define_with(ty.clone(), None, *uniformity))
             .collect::<Vec<_>>();
         self.emit(Op::Repeat {
             start,
@@ -2599,11 +3332,6 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
             .map(|b| (Block { ops: b.ops }, b.multiplicity))
             .collect::<Vec<_>>();
         let (blocks, block_multiplicity): (Vec<_>, Vec<_>) = blocks.into_iter().unzip();
-        assert_eq!(
-            self.state.numerical.len(),
-            self.state.fact_multiplicity.len(),
-            "every numerical fact must have one multiplicity"
-        );
         let id = KernelId::new(owner, kernel_index);
         self.kernels.push(Kernel {
             inner: KernelData {
@@ -2613,12 +3341,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
                 locals: std::mem::take(&mut self.state.locals),
                 blocks,
                 block_multiplicity,
-                value_types: std::mem::take(&mut self.state.values)
-                    .into_iter()
-                    .map(|v| v.ty)
-                    .collect(),
-                numerical: std::mem::take(&mut self.state.numerical),
-                fact_multiplicity: std::mem::take(&mut self.state.fact_multiplicity),
+                values: std::mem::take(&mut self.state.values),
                 intrinsic_resources: std::mem::take(&mut self.state.intrinsic_resources),
                 addressable_resources: std::mem::take(&mut self.state.addressable_resources),
                 intrinsics_used: std::mem::take(&mut self.state.intrinsics_used),
@@ -2632,7 +3355,7 @@ impl<'a, B: KernelDialect> Builder<'a, B> {
 /// Result slots written on every path through `block` (structural: a
 /// branch writes what both arms write; a repeat writes nothing because it
 /// may run zero times).
-fn definitely_written<B: KernelDialect>(blocks: &[BlockData<B>], block: BlockId) -> Vec<u32> {
+fn definitely_written<B: PhysicalDialect>(blocks: &[BlockData<B>], block: BlockId) -> Vec<u32> {
     let mut written = Vec::new();
     for op in &blocks[block.index() as usize].ops {
         match op {
@@ -2663,7 +3386,7 @@ fn representation_alignment(id: RepresentationId) -> u64 {
 // intrinsic lowering)
 // ---------------------------------------------------------------------------
 
-impl<'a, B: KernelDialect> IntrinsicSink<'a, B> {
+impl<'a, B: PhysicalDialect> IntrinsicSink<'a, B> {
     pub fn addressable_resource(
         &mut self,
         class: crate::target::ResourceClassId,
@@ -2704,8 +3427,6 @@ impl<'a, B: KernelDialect> IntrinsicSink<'a, B> {
         args: Vec<ErasedValue>,
         results: &[ValueType],
     ) -> Vec<ErasedValue> {
-        let signature = registry::intrinsic_signature(self.intrinsic);
-        self.builder.record_intrinsic_numerics(signature, &op);
         let outs: Vec<ErasedValue> = results
             .iter()
             .map(|ty| {
@@ -2733,7 +3454,7 @@ impl<'a, B: KernelDialect> IntrinsicSink<'a, B> {
 // Registry-validated dispatch used only by the core semantic walker for an
 // authored backend lowering/helper. Result shape comes from the registry;
 // the backend cannot invent it.
-impl<'s, 'k, B: KernelDialect> ops::SemanticIntrinsicSink<'s, 'k, B> {
+impl<'s, 'k, B: PhysicalDialect> ops::SemanticIntrinsicSink<'s, 'k, B> {
     /// Allocates compiler-owned workgroup scratch for an authored intrinsic.
     /// The returned logical map is the only addressable path: storage size,
     /// alignment, lifetime and native binding remain in the ordinary local
@@ -2905,9 +3626,6 @@ impl<'s, 'k, B: KernelDialect> ops::SemanticIntrinsicSink<'s, 'k, B> {
             .state
             .intrinsics_used
             .push(self.signature.id);
-        self.builder
-            .inner
-            .record_intrinsic_numerics(&self.signature, &op);
         let uniformity = match self.signature.effects.result_uniformity {
             IntrinsicUniformity::Workgroup => Uniformity::Workgroup,
             IntrinsicUniformity::Subgroup => Uniformity::Subgroup,
@@ -3074,12 +3792,12 @@ tuple_values!(A, C, D, E, F, G, H, I);
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub(crate) struct Arena<B: KernelDialect> {
+pub(crate) struct Arena<B: PhysicalDialect> {
     owner: OwnerToken,
     kernels: Vec<Kernel<B>>,
 }
 
-impl<B: KernelDialect> Arena<B> {
+impl<B: PhysicalDialect> Arena<B> {
     pub(super) fn get(&self, id: KernelId) -> Option<&Kernel<B>> {
         (id.owner() == self.owner)
             .then(|| self.kernels.get(id.index() as usize))
@@ -3115,7 +3833,7 @@ impl<B: KernelDialect> Arena<B> {
     }
 }
 
-pub(crate) fn arena_from_kernels<B: KernelDialect>(
+pub(crate) fn arena_from_kernels<B: PhysicalDialect>(
     owner: OwnerToken,
     kernels: Vec<Kernel<B>>,
 ) -> KernelArena<B> {
@@ -3124,32 +3842,30 @@ pub(crate) fn arena_from_kernels<B: KernelDialect>(
     }
 }
 
-pub(crate) fn arena_into_kernels<B: KernelDialect>(arena: KernelArena<B>) -> Vec<Kernel<B>> {
+pub(crate) fn arena_into_kernels<B: PhysicalDialect>(arena: KernelArena<B>) -> Vec<Kernel<B>> {
     arena.inner.kernels
 }
 
-pub(crate) fn data<B: KernelDialect>(kernel: &Kernel<B>) -> &KernelData<B> {
+pub(crate) fn data<B: PhysicalDialect>(kernel: &Kernel<B>) -> &KernelData<B> {
     &kernel.inner
 }
 
 #[derive(Debug)]
-pub(crate) struct KernelData<B: KernelDialect> {
+pub(crate) struct KernelData<B: PhysicalDialect> {
     pub(super) owner: OwnerToken,
     pub(super) kernel: u32,
     interface: KernelInterface,
     locals: Vec<LocalAllocation>,
     blocks: Vec<Block<B>>,
     block_multiplicity: Vec<Option<NatExpr>>,
-    value_types: Vec<ValueType>,
-    numerical: Vec<NumericalFact>,
-    fact_multiplicity: Vec<Option<NatExpr>>,
+    values: Vec<ValueEntry>,
     intrinsic_resources: Vec<IntrinsicResources>,
     addressable_resources: Vec<ops::AddressableResourceLease>,
     intrinsics_used: Vec<IntrinsicId>,
     resource_facts: ResourceFacts,
 }
 
-impl<B: KernelDialect> KernelData<B> {
+impl<B: PhysicalDialect> KernelData<B> {
     fn retained_bytes(&self) -> usize {
         let interface = &self.interface;
         interface.bindings.capacity() * std::mem::size_of::<ops::Binding>()
@@ -3159,9 +3875,10 @@ impl<B: KernelDialect> KernelData<B> {
                 .map(|binding| binding.extents.capacity() * std::mem::size_of::<NatExpr>())
                 .sum::<usize>()
             + interface.nat_args.capacity() * std::mem::size_of::<NatExpr>()
-            + interface.scalar_args.capacity() * std::mem::size_of::<(SymbolId, DType)>()
+            + interface.scalar_args.capacity()
+                * std::mem::size_of::<(SymbolId, crate::repr::ScalarKind)>()
             + interface.result_slots.capacity()
-                * std::mem::size_of::<(crate::schedule::AnyScalarSlot, DType)>()
+                * std::mem::size_of::<crate::schedule::AnyScalarSlot>()
             + self.locals.capacity() * std::mem::size_of::<LocalAllocation>()
             + self
                 .locals
@@ -3175,9 +3892,7 @@ impl<B: KernelDialect> KernelData<B> {
                 .map(|block| block.ops.capacity() * std::mem::size_of::<Op<B>>())
                 .sum::<usize>()
             + self.block_multiplicity.capacity() * std::mem::size_of::<Option<NatExpr>>()
-            + self.value_types.capacity() * std::mem::size_of::<ValueType>()
-            + self.numerical.capacity() * std::mem::size_of::<NumericalFact>()
-            + self.fact_multiplicity.capacity() * std::mem::size_of::<Option<NatExpr>>()
+            + self.values.capacity() * std::mem::size_of::<ValueEntry>()
             + self.intrinsic_resources.capacity() * std::mem::size_of::<IntrinsicResources>()
             + self.addressable_resources.capacity()
                 * std::mem::size_of::<ops::AddressableResourceLease>()
@@ -3207,22 +3922,28 @@ impl<B: KernelDialect> KernelData<B> {
             ),
         }
     }
-    pub(super) fn value_type(&self, v: ErasedValue) -> ValueType {
+    fn value(&self, v: ErasedValue) -> &ValueEntry {
         assert_eq!(
             v.owner, self.owner,
             "value belongs to another implementation"
         );
         assert_eq!(v.kernel, self.kernel, "value belongs to another kernel");
-        match self.value_types.get(v.index() as usize) {
-            Some(ty) => ty.clone(),
+        match self.values.get(v.index() as usize) {
+            Some(value) => {
+                assert_eq!(v.block, value.block, "value carries the wrong defining block");
+                value
+            },
             None => panic!(
                 "{v:?} is outside its kernel of {} values",
-                self.value_types.len()
+                self.values.len()
             ),
         }
     }
-    pub(super) fn numerical_facts(&self) -> &[NumericalFact] {
-        &self.numerical
+    pub(super) fn value_type(&self, value: ErasedValue) -> ValueType {
+        self.value(value).ty.clone()
+    }
+    pub(super) fn exact_nat(&self, value: ErasedValue) -> Option<NatExpr> {
+        self.value(value).nat
     }
     pub(crate) fn resource_facts(&self) -> &ResourceFacts {
         &self.resource_facts
@@ -3230,15 +3951,6 @@ impl<B: KernelDialect> KernelData<B> {
 
     // ----- crate-private facts for the implementation builder ----------------
 
-    /// Each recorded fact with the product of the trip counts of its
-    /// enclosing repeats (`None` when not an arena expression).
-    pub(crate) fn fact_multiplicities(
-        &self,
-    ) -> impl Iterator<Item = (&NumericalFact, Option<NatExpr>)> + '_ {
-        self.numerical
-            .iter()
-            .zip(self.fact_multiplicity.iter().copied())
-    }
     pub(crate) fn intrinsic_resources(&self) -> &[IntrinsicResources] {
         &self.intrinsic_resources
     }
@@ -3254,8 +3966,8 @@ impl<B: KernelDialect> KernelData<B> {
     pub(crate) fn block_multiplicity(&self) -> &[Option<NatExpr>] {
         &self.block_multiplicity
     }
-    pub(crate) fn value_types(&self) -> &[ValueType] {
-        &self.value_types
+    pub(crate) fn value_types(&self) -> impl ExactSizeIterator<Item = &ValueType> {
+        self.values.iter().map(|value| &value.ty)
     }
     /// Rewrites view indices of every binding (used when a spliced child's
     /// kernels join the parent's arena).
@@ -3304,7 +4016,10 @@ impl<B: KernelDialect> KernelData<B> {
             binding.view = map_view(binding.view);
         }
         for result in &mut self.interface.result_slots {
-            result.0 = map_slot(result.0);
+            *result = map_slot(*result);
+        }
+        for entry in &mut self.values {
+            entry.block = block(entry.block);
         }
         for block_data in &mut self.blocks {
             for op in &mut block_data.ops {
@@ -3316,7 +4031,7 @@ impl<B: KernelDialect> KernelData<B> {
     }
 }
 
-fn rebrand_op<B: KernelDialect>(
+fn rebrand_op<B: PhysicalDialect>(
     op: &mut Op<B>,
     value: impl Fn(ErasedValue) -> ErasedValue + Copy,
     block: impl Fn(BlockId) -> BlockId + Copy,
@@ -3346,6 +4061,8 @@ fn rebrand_op<B: KernelDialect>(
         | Op::Math { out, a, .. }
         | Op::Cast { out, a, .. }
         | Op::Bitcast { out, a, .. }
+        | Op::ScalarBits { out, a }
+        | Op::ScalarFromBits { out, a }
         | Op::VectorSplat { out, value: a }
         | Op::VectorUnary { out, a, .. }
         | Op::VectorCast { out, a, .. }
@@ -3373,7 +4090,7 @@ fn rebrand_op<B: KernelDialect>(
             index,
             ..
         }
-        | Op::ReadPlane {
+        | Op::ReadPlaneField {
             out,
             place: p,
             index,
@@ -3382,6 +4099,22 @@ fn rebrand_op<B: KernelDialect>(
             *out = value(*out);
             *p = place(*p);
             values(index);
+        }
+        Op::ReadPlane {
+            out,
+            place: p,
+            index,
+            element,
+            ..
+        } => {
+            *out = value(*out);
+            *p = place(*p);
+            values(index);
+            *element = value(*element);
+        }
+        Op::VectorFromLanes { out, lanes } => {
+            *out = value(*out);
+            values(lanes);
         }
         Op::VectorRead {
             out,
@@ -3492,7 +4225,7 @@ fn rebrand_op<B: KernelDialect>(
 }
 
 /// Mutable access to a kernel's data for splicing.
-pub(crate) fn data_mut<B: KernelDialect>(kernel: &mut Kernel<B>) -> &mut KernelData<B> {
+pub(crate) fn data_mut<B: PhysicalDialect>(kernel: &mut Kernel<B>) -> &mut KernelData<B> {
     &mut kernel.inner
 }
 
@@ -3505,6 +4238,6 @@ impl PortableValue {
     }
 }
 
-pub(crate) fn arena_owner<B: KernelDialect>(arena: &KernelArena<B>) -> OwnerToken {
+pub(crate) fn arena_owner<B: PhysicalDialect>(arena: &KernelArena<B>) -> OwnerToken {
     arena.inner.owner
 }

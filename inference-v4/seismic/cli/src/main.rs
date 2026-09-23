@@ -5,9 +5,8 @@
 //! public `seismic` API; exposing plan-space, solver, frozen-plan, or native
 //! schedule internals here would recreate the public escape hatch W9 removes.
 
-use seismic_lang::checked::{check_source, CheckedModule, SourceFile, SourceSet};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use seismic_lang::checked::{CheckedModule, SourceSet};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
@@ -62,65 +61,8 @@ fn main() -> ExitCode {
 }
 
 fn load(paths: Vec<PathBuf>, include_std: bool) -> Result<CheckedModule, String> {
-    if paths.is_empty() && !include_std {
-        return Err("no .seismic source was provided".to_owned());
-    }
-    let mut files = Vec::new();
-    for path in paths {
-        collect(&path, &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-
-    let mut sources = if include_std {
-        seismic_std::sources()
-    } else {
-        SourceSet::default()
-    };
-    for path in files {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        sources.push(SourceFile {
-            path: path.to_string_lossy().replace('\\', "/"),
-            text,
-        });
-    }
-    check_source(sources).map_err(|error| error.to_string())
-}
-
-fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.is_file() {
-        if path.extension() != Some(OsStr::new("seismic")) {
-            return Err(format!("{} is not a .seismic file", path.display()));
-        }
-        files.push(path.to_path_buf());
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(format!(
-            "{} is neither a file nor a directory",
-            path.display()
-        ));
-    }
-    let mut children = std::fs::read_dir(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    children.sort_by_key(std::fs::DirEntry::path);
-    for child in children {
-        let child_path = child.path();
-        if child
-            .file_type()
-            .map_err(|error| format!("{}: {error}", child_path.display()))?
-            .is_dir()
-            || child_path.extension() == Some(OsStr::new("seismic"))
-        {
-            collect(&child_path, files)?;
-        }
-    }
-    Ok(())
+    let prelude = if include_std { seismic_std::sources() } else { SourceSet::default() };
+    seismic_lang::source::load(&paths, prelude).map(|(module,_)|module).map_err(|e|e.to_string())
 }
 
 fn print_entries(module: &CheckedModule) {

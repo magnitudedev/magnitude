@@ -276,7 +276,7 @@ impl Plane {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CodeInterpretation {
     Unsigned,
     TwosComplement,
@@ -398,7 +398,7 @@ pub enum DecodeStep {
 
 impl DecodeStep {
     /// The temporary this step defines.
-    pub(crate) fn defines(&self) -> DecodeTemp {
+    pub fn defines(&self) -> DecodeTemp {
         match self {
             DecodeStep::ReadPlaneField { into, .. }
             | DecodeStep::InterpretCode { into, .. }
@@ -748,12 +748,13 @@ pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
 
 impl CodeInterpretation {
     pub(crate) fn decode(&self, raw: u32, bits: u32) -> i32 {
-        match self {
-            Self::Unsigned => raw as i32,
-            Self::TwosComplement => ((raw << (32 - bits)) as i32) >> (32 - bits),
-            Self::Offset(zero) => raw as i32 - zero,
-            Self::Table(table) => table[raw as usize],
-        }
+        let recipe = crate::reference_math::code_recipe(self, bits);
+        let value = crate::reference_math::evaluate(
+            &recipe,
+            &[crate::reference_math::ReferenceScalar::U32(raw)],
+        ).expect("registry code interpretation is total");
+        let crate::reference_math::ReferenceScalar::I32(value) = value else { unreachable!() };
+        value
     }
 }
 

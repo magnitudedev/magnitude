@@ -1,177 +1,65 @@
-//! Numerical precision as a planning dimension (spec §9).
-//!
-//! Every implementation's transfer is derived from its actual operations,
-//! order, data types, reductions, approximations, and intrinsic semantics.
-//! Admissibility under the caller's policy is a predicate over decisions
-//! and invocation symbols, encoded into the solver problem; it is never
-//! checked after selection. Evidence is keyed exactly (§9.3) and its
-//! availability is part of the same predicate.
-//!
-//! W6 owns derivation and encoding internals.
-
-use crate::implementation::ImplementationIdentity;
-use seismic_lang::expr::{BoolExpr, CmpOp, DecisionId, ExprArena, NatExpr};
-use seismic_lang::precision::{
-    EvidenceRequirement, InputRange, PrecisionPolicy, SpecialPolicy, Tolerance,
-};
-use seismic_lang::types::DType;
-use seismic_target::NumericalEnvironmentIdentity;
-use std::collections::BTreeMap;
-
+//! Numerical applicability follows the selected source construction.
+//! A required body executes the checked operations; a replacement needs an
+//! established whole-outcome relation before it can be admitted.
+use seismic_lang::expr::{BoolExpr, ExprArena};
+use seismic_lang::precision::{PrecisionPolicy, Tolerance};
+use crate::portable::outcome_relation::{self, DerivedOutcome};
 pub use seismic_lang::precision;
 
-/// The derived numerical transfer of one implementation: per output, a
-/// conservative outward-rounded bound expression over invocation symbols
-/// and decisions, plus the discrete effects that make the implementation
-/// differ from the reference.
+/// Resolution of the actual selected body and all of its selected callees.
+/// This is produced only by source construction, never by observations.
 #[derive(Clone, Debug)]
-pub struct NumericalTransfer {
-    outputs: Vec<OutputTransfer>,
-    effects: Vec<NumericalEffect>,
-    operations: Vec<NumericalOperation>,
-    /// Input ranges the analytical transfer was derived over. A bounded
-    /// policy must declare an equal or narrower range for each named input.
-    input_assumptions: BTreeMap<String, InputRange>,
-    /// Transfers of inlined callees, guarded by the exact finite choice arm
-    /// that selects them. Keeping the guard with the transfer prevents call
-    /// composition from turning an unselected approximate body into a global
-    /// precision failure.
-    children: Vec<ConditionalNumericalTransfer>,
+pub struct NumericalApplicability {
+    derived: DerivedOutcome,
 }
+impl NumericalApplicability {
+    pub(crate) fn required_source() -> Self {
+        Self { derived: DerivedOutcome::Exact }
+    }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ConditionalNumericalTransfer {
-    pub(crate) selection: Option<(DecisionId, i64)>,
-    pub(crate) role: seismic_lang::entry::NumericalRole,
-    pub(crate) transfer: Box<NumericalTransfer>,
-}
-
-impl NumericalTransfer {
-    pub(crate) fn new(
-        outputs: Vec<OutputTransfer>,
-        effects: Vec<NumericalEffect>,
-        operations: Vec<NumericalOperation>,
-        input_assumptions: BTreeMap<String, InputRange>,
-        children: Vec<ConditionalNumericalTransfer>,
-    ) -> Self {
-        Self {
-            outputs,
-            effects,
-            operations,
-            input_assumptions,
-            children,
+    pub(crate) fn selected_child(&mut self, child: &Self) {
+        if matches!(self.derived, DerivedOutcome::Exact) {
+            self.derived = match child.derived {
+                DerivedOutcome::Exact => DerivedOutcome::Exact,
+                DerivedOutcome::DiscreteProvenFloatingUnbounded =>
+                    DerivedOutcome::Pending("nonexact helper replacement has no composed whole-entry analysis"),
+                DerivedOutcome::Pending(reason) => DerivedOutcome::Pending(reason),
+            };
         }
     }
-    pub fn outputs(&self) -> &[OutputTransfer] {
-        &self.outputs
+
+    pub(crate) fn selected_replacement<B: seismic_target::TargetFamily>(
+        arena: &ExprArena,
+        program: &seismic_lang::entry::SemanticProgram,
+        function: &seismic_lang::entry::SemanticFunction,
+        bindings: &crate::portable::BindingArena,
+        executable: &seismic_ir::execution::ClosedExecutableIr<B>,
+        children: &Self,
+    ) -> Self {
+        if !matches!(children.derived, DerivedOutcome::Exact) {
+            return children.clone();
+        }
+        Self { derived: outcome_relation::derive(arena,program,function,bindings,executable) }
     }
-    pub fn effects(&self) -> &[NumericalEffect] {
-        &self.effects
+    pub fn is_exact(&self) -> bool { matches!(self.derived,DerivedOutcome::Exact) }
+    pub fn pending_reason(&self) -> Option<&'static str> {
+        match self.derived {
+            DerivedOutcome::Pending(reason) => Some(reason),
+            DerivedOutcome::DiscreteProvenFloatingUnbounded => Some("floating numerical bound is not established"),
+            DerivedOutcome::Exact => None,
+        }
     }
-    pub fn operations(&self) -> &[NumericalOperation] {
-        &self.operations
+    pub(crate) fn basis(&self, policy:&PrecisionPolicy) -> Option<NumericalBasis> {
+        match (&self.derived,policy) {
+            (DerivedOutcome::Exact,_) => Some(NumericalBasis::Exact),
+            (DerivedOutcome::DiscreteProvenFloatingUnbounded,PrecisionPolicy::Unconstrained) => Some(NumericalBasis::Unknown),
+            _ => None,
+        }
     }
-    pub fn input_assumptions(&self) -> &BTreeMap<String, InputRange> {
-        &self.input_assumptions
+    #[cfg(test)]
+    pub(crate) fn unresolved_fixture() -> Self {
+        Self { derived:DerivedOutcome::Pending("native-only fixture has no checked outcome") }
     }
-    pub(crate) fn children(&self) -> &[ConditionalNumericalTransfer] {
-        &self.children
-    }
-    /// Heap storage retained by this transfer, including recursively inlined
-    /// callees. Budget accounting deliberately follows owned capacities so a
-    /// transfer cannot hide an unbounded allocation behind its shallow size.
-
-    /// True when the implementation reproduces the reference exactly.
-    pub fn is_exact(&self) -> bool {
-        self.effects.is_empty()
-            && self.operations.is_empty()
-            && self
-                .outputs
-                .iter()
-                .all(|output| matches!(output.bound, ErrorBound::Exact))
-            && self.children.iter().all(|child| {
-                child.role == seismic_lang::entry::NumericalRole::Reference
-                    && child.transfer.is_exact()
-            })
-    }
-}
-
-/// One ordered operation-level numerical fact and its exact dynamic
-/// multiplicity. Kernel and ordinal are stable construction ordinals.
-#[derive(Clone, Debug)]
-pub struct NumericalOperation {
-    pub kernel: u32,
-    pub ordinal: u32,
-    pub effect: NumericalEffect,
-    pub multiplicity: Option<NatExpr>,
-}
-
-#[derive(Clone, Debug)]
-pub struct OutputTransfer {
-    pub path: Vec<u32>,
-    pub dtype: DType,
-    pub bound: ErrorBound,
-    pub specials: SpecialGuarantees,
-}
-
-/// Exceptional-value semantics proved for one published output. These are
-/// explicit transfer facts; policy checking never guesses them from effect
-/// names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SpecialGuarantees {
-    pub nan: bool,
-    pub infinity: bool,
-    pub signed_zero: bool,
-    pub subnormal: bool,
-}
-
-/// A conservative error envelope as arena expressions: absolute and
-/// relative components scaled by shape-dependent rounding counts.
-#[derive(Clone, Debug)]
-pub enum ErrorBound {
-    Exact,
-    /// `abs <= absolute * roundings`, `rel <= relative * roundings` in ulps
-    /// of the published dtype.
-    Analytic {
-        roundings: NatExpr,
-        /// Worst-case absolute error contributed per rounding.
-        absolute: f64,
-        /// Worst-case relative error contributed per rounding.
-        relative: f64,
-        /// Worst-case ULP error contributed per rounding.
-        ulps: u32,
-    },
-    /// No analytic bound is derivable; admissible only with evidence or an
-    /// unconstrained policy.
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NumericalEffect {
-    ReassociatedReduction,
-    Contraction,
-    ApproximateTranscendental(seismic_lang::intrinsics::MathOp),
-    NarrowAccumulator(DType),
-    FlushToZero,
-    BackendIntrinsic(seismic_lang::ids::IntrinsicId),
-    AlternativeBody,
-}
-
-/// Exact key of one piece of empirical evidence (§9.3).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct EvidenceKey {
-    pub implementation: ImplementationIdentity,
-    /// Stable decision ordinal and value. Arena-local `DecisionId` values are
-    /// deliberately absent from persisted evidence identities.
-    pub decisions: Vec<(u32, i64)>,
-    pub target: NumericalEnvironmentIdentity,
-    /// Digest of every selected native kernel's numerical-mode identity.
-    pub native_numerics: [u8; 32],
-    /// Digest of the semantic domain predicate the evidence covers.
-    pub domain: [u8; 32],
-    pub policy: PolicyIdentity,
-    pub corpus: String,
-    pub qualification_version: u32,
 }
 
 /// Content identity of a precision policy (§15.1).
@@ -184,151 +72,36 @@ impl PolicyIdentity {
     }
 }
 
-/// One qualified record.
+/// Explanation of the accepted derived numerical regions of a candidate.
+/// This is descriptive metadata, not an independently attachable admission.
 #[derive(Clone, Debug)]
-pub struct EvidenceRecord {
-    pub key: EvidenceKey,
+pub struct NumericalAssessment {
+    pub regions: Vec<NumericalRegion>,
 }
 
-/// The immutable evidence catalog a preparation receives.
-#[derive(Clone, Debug, Default)]
-pub struct EvidenceCatalog {
-    records: Vec<EvidenceRecord>,
+/// The explanation applies only where this actual compiled predicate holds.
+#[derive(Clone, Debug)]
+pub struct NumericalRegion {
+    pub scope: seismic_lang::expr::compiled::CompiledPredicate,
+    pub basis: NumericalBasis,
 }
 
-impl EvidenceCatalog {
-    pub fn new(records: Vec<EvidenceRecord>) -> Self {
-        Self { records }
-    }
-    pub fn records(&self) -> &[EvidenceRecord] {
-        &self.records
-    }
-}
-
-/// The assessment carried by a frozen plan and its executable variant
-/// (§11.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NumericalAssessment {
+pub enum NumericalBasis {
     Exact,
-    Proven {
-        policy: PolicyIdentity,
-    },
-    Qualified {
-        policy: PolicyIdentity,
-        evidence: Vec<EvidenceKey>,
-    },
-    /// Selectable only under an unconstrained policy.
+    /// Accepted under the explicitly unconstrained policy.
     Unknown,
 }
 
-/// The complete numerical requirement that can be derived before native
-/// realization. It deliberately contains no native or post-compilation
-/// identity. A qualified policy keeps analytically unproved coordinates
-/// searchable, but the obligation remains unresolved until exact evidence is
-/// matched after realization.
+/// Policy projection of construction-owned applicability. An unresolved
+/// alternative remains structural domain membership, never an executable grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StructuralNumericalObligation {
-    analytic: BoolExpr,
-    qualification_allowed: bool,
-}
-
+pub struct StructuralNumericalObligation { analytic: BoolExpr }
 impl StructuralNumericalObligation {
-    pub fn analytic_predicate(self) -> BoolExpr {
-        self.analytic
-    }
-
-    pub fn qualification_allowed(self) -> bool {
-        self.qualification_allowed
-    }
-
-    /// Predicate safe for structural search. When qualification is allowed,
-    /// search may retain an analytically unproved point, but publication still
-    /// requires [`admissibility`] after native identity exists.
-    pub fn search_predicate(self, arena: &mut ExprArena) -> BoolExpr {
-        if self.qualification_allowed {
-            arena.bool(true)
-        } else {
-            self.analytic
-        }
-    }
+    pub fn analytic_predicate(self) -> BoolExpr { self.analytic }
 }
-
-/// Derive everything the numerical policy can establish without native
-/// compilation. This is the sole pre-native numerical boundary.
-pub fn structural_obligation(
-    arena: &mut ExprArena,
-    transfer: &NumericalTransfer,
-    policy: &PrecisionPolicy,
-) -> StructuralNumericalObligation {
-    let analytic = match policy {
-        PrecisionPolicy::Unconstrained => arena.bool(true),
-        PrecisionPolicy::Exact => internals::exact_predicate(arena, transfer),
-        PrecisionPolicy::Bounded { .. } => internals::analytic_predicate(arena, transfer, policy),
-    };
-    let qualification_allowed = matches!(
-        policy,
-        PrecisionPolicy::Bounded {
-            evidence: EvidenceRequirement::Qualified,
-            ..
-        }
-    );
-    StructuralNumericalObligation {
-        analytic,
-        qualification_allowed,
-    }
-}
-
-/// Builds the admissibility predicate of one implementation under a policy:
-/// a `BoolExpr` over decisions and invocation symbols that is true exactly
-/// when the transfer satisfies the policy (analytically or by matching
-/// evidence). Encoded into the solver by `plan_space` (§9.3).
-pub fn admissibility(
-    arena: &mut ExprArena,
-    transfer: &NumericalTransfer,
-    policy: &PrecisionPolicy,
-    evidence: &EvidenceCatalog,
-    implementation: &ImplementationIdentity,
-    decisions: &[(DecisionId, &'static str)],
-    target: &NumericalEnvironmentIdentity,
-    native_numerics: [u8; 32],
-    domain: [u8; 32],
-) -> BoolExpr {
-    internals::admissibility(
-        arena,
-        transfer,
-        policy,
-        evidence,
-        implementation,
-        decisions,
-        target,
-        native_numerics,
-        domain,
-    )
-}
-
-/// The assessment of one frozen selection under its guard.
-pub fn assess(
-    arena: &ExprArena,
-    transfer: &NumericalTransfer,
-    policy: &PrecisionPolicy,
-    evidence: &EvidenceCatalog,
-    implementation: &ImplementationIdentity,
-    target: &NumericalEnvironmentIdentity,
-    native_numerics: [u8; 32],
-    domain: [u8; 32],
-    decisions: &[(DecisionId, i64)],
-) -> NumericalAssessment {
-    internals::assess(
-        arena,
-        transfer,
-        policy,
-        evidence,
-        implementation,
-        target,
-        native_numerics,
-        domain,
-        decisions,
-    )
+pub fn structural_obligation(arena:&mut ExprArena, applicability:&NumericalApplicability, policy:&PrecisionPolicy) -> StructuralNumericalObligation {
+    StructuralNumericalObligation { analytic:arena.bool(applicability.basis(policy).is_some()) }
 }
 
 mod internals {
@@ -337,23 +110,18 @@ mod internals {
 
     pub(super) fn policy_identity(policy: &PrecisionPolicy) -> PolicyIdentity {
         let mut digest = Sha256::new();
-        digest.update(b"seismic-precision-policy-v1");
+        digest.update(b"seismic-precision-policy-v2");
         match policy {
             PrecisionPolicy::Exact => digest.update([0]),
             PrecisionPolicy::Unconstrained => digest.update([1]),
             PrecisionPolicy::Bounded {
                 default,
                 outputs,
-                evidence,
                 specials,
                 inputs,
             } => {
                 digest.update([2]);
                 tolerance(&mut digest, *default);
-                digest.update([match evidence {
-                    EvidenceRequirement::Proven => 0,
-                    EvidenceRequirement::Qualified => 1,
-                }]);
                 digest.update([
                     specials.nan as u8,
                     specials.infinity as u8,
@@ -394,191 +162,7 @@ mod internals {
         }
     }
 
-    pub(super) fn admissibility(
-        arena: &mut ExprArena,
-        transfer: &NumericalTransfer,
-        policy: &PrecisionPolicy,
-        evidence: &EvidenceCatalog,
-        implementation: &ImplementationIdentity,
-        decisions: &[(DecisionId, &'static str)],
-        target: &NumericalEnvironmentIdentity,
-        native_numerics: [u8; 32],
-        domain: [u8; 32],
-    ) -> BoolExpr {
-        let obligation = structural_obligation(arena, transfer, policy);
-        if !obligation.qualification_allowed {
-            return obligation.analytic;
-        }
-        let policy = PolicyIdentity::of(policy);
-        let qualified =
-            evidence
-                .records()
-                .iter()
-                .filter(|record| {
-                    record.key.implementation == *implementation
-                        && record.key.target == *target
-                        && record.key.native_numerics == native_numerics
-                        && record.key.domain == domain
-                        && record.key.policy == policy
-                        && record.key.decisions.len() == decisions.len()
-                        && record.key.decisions.iter().enumerate().all(
-                            |(ordinal, (record_ordinal, _))| *record_ordinal as usize == ordinal,
-                        )
-                })
-                .filter_map(|record| {
-                    let terms = record
-                        .key
-                        .decisions
-                        .iter()
-                        .map(|(ordinal, value)| {
-                            decisions
-                                .get(*ordinal as usize)
-                                .map(|decision| arena.decision_is(decision.0, *value))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    Some(arena.all(&terms))
-                })
-                .collect::<Vec<_>>();
-        let evidence = arena.any(&qualified);
-        arena.or(obligation.analytic, evidence)
-    }
-
-    pub(super) fn analytic_predicate(
-        arena: &mut ExprArena,
-        transfer: &NumericalTransfer,
-        policy: &PrecisionPolicy,
-    ) -> BoolExpr {
-        let PrecisionPolicy::Bounded {
-            specials, inputs, ..
-        } = policy
-        else {
-            return arena.bool(false);
-        };
-        if transfer.input_assumptions().iter().any(|(name, required)| {
-            inputs.get(name).is_none_or(|provided| {
-                provided.minimum.get() < required.minimum.get()
-                    || provided.maximum.get() > required.maximum.get()
-            })
-        }) {
-            return arena.bool(false);
-        }
-        let mut terms = Vec::with_capacity(
-            transfer
-                .outputs()
-                .len()
-                .saturating_add(transfer.children().len()),
-        );
-        for output in transfer.outputs() {
-            let key = output_key(&output.path);
-            let tolerance = policy
-                .tolerance(&key)
-                .expect("bounded policy has a tolerance");
-            let special = special_ok(output.specials, *specials);
-            let error = match output.bound {
-                ErrorBound::Exact => arena.bool(true),
-                ErrorBound::Unknown => arena.bool(false),
-                ErrorBound::Analytic {
-                    roundings,
-                    absolute,
-                    relative,
-                    ulps,
-                } => {
-                    // The hybrid tolerance allows `absolute + relative *
-                    // relative_floor` around zero, while the independent
-                    // relative proof controls larger reference values.
-                    let absolute_limit = tolerance.absolute.get()
-                        + tolerance.relative.get() * tolerance.relative_floor.get();
-                    let absolute_ok = coefficient_bound(arena, roundings, absolute, absolute_limit);
-                    let relative_ok =
-                        coefficient_bound(arena, roundings, relative, tolerance.relative.get());
-                    let ulp_ok = match (ulps, tolerance.ulps) {
-                        (0, _) => arena.bool(true),
-                        (_, Some(limit)) => {
-                            let maximum = limit / u64::from(ulps);
-                            let maximum = arena.nat(maximum);
-                            arena.nat_cmp(CmpOp::Le, roundings, maximum)
-                        }
-                        (_, None) => arena.bool(false),
-                    };
-                    let magnitude_ok = arena.and(absolute_ok, relative_ok);
-                    arena.and(magnitude_ok, ulp_ok)
-                }
-            };
-            let special = arena.bool(special);
-            terms.push(arena.and(error, special));
-        }
-        // Until the operation-level analyser has composed a callee's bound
-        // through the caller's downstream arithmetic, only an exact selected
-        // child can satisfy an analytical parent proof. This is deliberately
-        // conservative and, unlike independently checking both tolerances,
-        // cannot admit two local errors whose sum exceeds the caller policy.
-        for child in transfer.children() {
-            let child_exact = if child.role == seismic_lang::entry::NumericalRole::Reference {
-                exact_predicate(arena, &child.transfer)
-            } else {
-                arena.bool(false)
-            };
-            let condition = match child.selection {
-                Some((decision, value)) => arena.decision_is(decision, value),
-                None => arena.bool(true),
-            };
-            terms.push(arena.implies(condition, child_exact));
-        }
-        arena.all(&terms)
-    }
-
-    pub(super) fn exact_predicate(arena: &mut ExprArena, transfer: &NumericalTransfer) -> BoolExpr {
-        let local = transfer.effects().is_empty()
-            && transfer.operations().is_empty()
-            && transfer
-                .outputs()
-                .iter()
-                .all(|output| matches!(output.bound, ErrorBound::Exact));
-        let mut terms = vec![arena.bool(local)];
-        for child in transfer.children() {
-            let exact = if child.role == seismic_lang::entry::NumericalRole::Reference {
-                exact_predicate(arena, &child.transfer)
-            } else {
-                arena.bool(false)
-            };
-            let condition = match child.selection {
-                Some((decision, value)) => arena.decision_is(decision, value),
-                None => arena.bool(true),
-            };
-            terms.push(arena.implies(condition, exact));
-        }
-        arena.all(&terms)
-    }
-
-    fn coefficient_bound(
-        arena: &mut ExprArena,
-        count: NatExpr,
-        coefficient: f64,
-        limit: f64,
-    ) -> BoolExpr {
-        if coefficient == 0.0 {
-            return arena.bool(true);
-        }
-        if !coefficient.is_finite() || coefficient < 0.0 {
-            return arena.bool(false);
-        }
-        let ratio = (limit / coefficient).floor();
-        if ratio >= u64::MAX as f64 {
-            return arena.bool(true);
-        }
-        let maximum = if ratio <= 0.0 { 0 } else { ratio as u64 };
-        let maximum = arena.nat(maximum);
-        arena.nat_cmp(CmpOp::Le, count, maximum)
-    }
-
-    fn special_ok(guarantee: SpecialGuarantees, requested: SpecialPolicy) -> bool {
-        (!requested.nan || guarantee.nan)
-            && (!requested.infinity || guarantee.infinity)
-            && (!requested.signed_zero || guarantee.signed_zero)
-            && (!requested.subnormal || guarantee.subnormal)
-    }
-
-    fn output_key(path: &[u32]) -> String {
+    pub(super) fn output_key(path: &[u32]) -> String {
         if path.is_empty() {
             "value".to_owned()
         } else {
@@ -591,84 +175,53 @@ mod internals {
             )
         }
     }
+}
+mod comparison;
+pub use comparison::{compare_element, ElementComparison};
+mod outcome_comparison;
+pub use outcome_comparison::{
+    compare_outcome, Comparison, ComparisonError, ComparisonSubject, Difference, ObservedInput,
+    ObservedInvocation, ObservedResult, ObservedTensor, ObservedValue,
+};
 
-    pub(super) fn assess(
-        _arena: &ExprArena,
-        transfer: &NumericalTransfer,
-        policy: &PrecisionPolicy,
-        evidence: &EvidenceCatalog,
-        implementation: &ImplementationIdentity,
-        target: &NumericalEnvironmentIdentity,
-        native_numerics: [u8; 32],
-        domain: [u8; 32],
-        decisions: &[(DecisionId, i64)],
-    ) -> NumericalAssessment {
-        if selected_exact(transfer, decisions) {
-            return NumericalAssessment::Exact;
-        }
-        if matches!(policy, PrecisionPolicy::Unconstrained) {
-            return NumericalAssessment::Unknown;
-        }
+mod validation;
+pub use validation::{ValidationCase, ValidationObservation};
 
-        // The analytical predicate is part of the frozen guard. If it is
-        // not identically false after fixing decisions, every invocation
-        // admitted by that guard satisfies the proof.
-        let mut probe =
-            evidence
-                .records()
-                .iter()
-                .filter(|record| {
-                    record.key.implementation == *implementation
-                        && record.key.target == *target
-                        && record.key.native_numerics == native_numerics
-                        && record.key.domain == domain
-                        && record.key.policy == PolicyIdentity::of(policy)
-                        && record.key.decisions.len() == decisions.len()
-                        && record.key.decisions.iter().enumerate().all(
-                            |(ordinal, (record_ordinal, _))| *record_ordinal as usize == ordinal,
-                        )
-                        && record.key.decisions.iter().all(|(ordinal, expected)| {
-                            decisions
-                                .get(*ordinal as usize)
-                                .is_some_and(|(_, actual)| actual == expected)
-                        })
-                })
-                .map(|record| record.key.clone())
-                .collect::<Vec<_>>();
-        if !probe.is_empty() {
-            probe.sort_by(|a, b| {
-                a.corpus
-                    .cmp(&b.corpus)
-                    .then(a.qualification_version.cmp(&b.qualification_version))
-            });
-            return NumericalAssessment::Qualified {
-                policy: PolicyIdentity::of(policy),
-                evidence: probe,
-            };
-        }
-        NumericalAssessment::Proven {
-            policy: PolicyIdentity::of(policy),
+/// Canonical public numerical subjects. Writable input state currently shares
+/// the owner's `value` policy; individual writable leaves are not separate names.
+pub fn subject_names(entry: &seismic_lang::checked::EntryInfo) -> Vec<String> {
+    let mut names: std::collections::BTreeSet<_> = entry
+        .results
+        .iter()
+        .map(|r| internals::output_key(&r.path))
+        .collect();
+    if entry.parameters.iter().any(|p| {
+        matches!(
+            p.kind,
+            seismic_lang::checked::ParameterSummaryKind::Tensor {
+                access: seismic_lang::checked::TensorAccess::Mutable
+                    | seismic_lang::checked::TensorAccess::Owned,
+                ..
+            }
+        )
+    }) {
+        names.insert("value".into());
+    }
+    names.into_iter().collect()
+}
+pub fn validate_policy_subjects(
+    entry: &seismic_lang::checked::EntryInfo,
+    policy: &PrecisionPolicy,
+) -> Result<(), String> {
+    if let PrecisionPolicy::Bounded { outputs, .. } = policy {
+        let names = subject_names(entry);
+        for name in outputs.keys() {
+            if !names.contains(name) {
+                return Err(format!(
+                    "unknown numerical subject {name}; available subjects: {names:?}"
+                ));
+            }
         }
     }
-
-    fn selected_exact(transfer: &NumericalTransfer, decisions: &[(DecisionId, i64)]) -> bool {
-        let local = transfer.effects().is_empty()
-            && transfer.operations().is_empty()
-            && transfer
-                .outputs()
-                .iter()
-                .all(|output| matches!(output.bound, ErrorBound::Exact));
-        local
-            && transfer.children().iter().all(|child| {
-                let selected = child.selection.is_none_or(|(decision, expected)| {
-                    decisions
-                        .iter()
-                        .find(|(candidate, _)| *candidate == decision)
-                        .is_some_and(|(_, actual)| *actual == expected)
-                });
-                !selected
-                    || (child.role == seismic_lang::entry::NumericalRole::Reference
-                        && selected_exact(&child.transfer, decisions))
-            })
-    }
+    Ok(())
 }

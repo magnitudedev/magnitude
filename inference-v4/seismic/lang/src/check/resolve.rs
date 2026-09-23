@@ -84,7 +84,7 @@ impl Sig {
             .iter()
             .map(|parameter| SigParam {
                 name: parameter.name.clone(),
-                ownership: parameter.ownership,
+                ownership: parameter.ownership.clone(),
                 ty: transfer_type(&self.arena, &parameter.ty, &mut arena, &mut map),
                 span: parameter.span,
             })
@@ -135,6 +135,7 @@ fn transfer_type(
 ) -> ValueType {
     match ty {
         ValueType::Scalar(dtype) => ValueType::Scalar(*dtype),
+        ValueType::Integer => ValueType::Integer,
         ValueType::Index { bound } => ValueType::Index {
             bound: super::xfer::transfer_int(source, *bound, destination, map),
         },
@@ -488,21 +489,25 @@ pub(crate) fn signature_of(
         if ty.is_void() {
             return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
         }
-        let ownership = match &p.ty.kind {
-            TypeKind::Shaped {
-                head: ShapedHead::Tensor,
-                ..
-            } => Ownership::Owned,
-            TypeKind::Shaped {
-                head: ShapedHead::SharedTensor,
-                ..
-            } => Ownership::Shared,
-            TypeKind::Shaped {
-                head: ShapedHead::MutTensor,
-                ..
-            } => Ownership::Exclusive,
-            _ => Ownership::Value,
-        };
+        fn ownership(ty: &ast::TypeExpr) -> Ownership {
+            match &ty.kind {
+                TypeKind::Tuple(parts) => Ownership::Tuple(parts.iter().map(ownership).collect()),
+                TypeKind::Shaped {
+                    head: ShapedHead::Tensor,
+                    ..
+                } => Ownership::Owned,
+                TypeKind::Shaped {
+                    head: ShapedHead::SharedTensor,
+                    ..
+                } => Ownership::Shared,
+                TypeKind::Shaped {
+                    head: ShapedHead::MutTensor,
+                    ..
+                } => Ownership::Exclusive,
+                _ => Ownership::Value,
+            }
+        }
+        let ownership = ownership(&p.ty);
         if ownership == Ownership::Exclusive {
             if let ValueType::Tensor(tensor) = &ty {
                 if let Elem::Repr(representation) = &tensor.elem {
@@ -528,16 +533,18 @@ pub(crate) fn signature_of(
         });
     }
     let aliases = Vec::new();
+    fn borrowed_result(ty: &ast::TypeExpr) -> bool {
+        match &ty.kind {
+            TypeKind::Shaped {
+                head: ShapedHead::SharedTensor | ShapedHead::MutTensor,
+                ..
+            } => true,
+            TypeKind::Tuple(parts) => parts.iter().any(borrowed_result),
+            _ => false,
+        }
+    }
     let result = match &s.result {
-        Some(t)
-            if matches!(
-                t.kind,
-                TypeKind::Shaped {
-                    head: ShapedHead::SharedTensor | ShapedHead::MutTensor,
-                    ..
-                }
-            ) =>
-        {
+        Some(t) if borrowed_result(t) => {
             return Err(Diagnostic::new(
                 t.span,
                 "borrowed tensors cannot be returned; return an owned `tensor`",

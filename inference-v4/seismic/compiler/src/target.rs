@@ -18,7 +18,6 @@ use seismic_target::{
 };
 
 use crate::errors::TargetError;
-use crate::implementation::ImplementationFactory;
 use seismic_estimator::*;
 use seismic_lang::expr::{ExprArena, SymbolId, SymbolSort, SymbolValue, TargetConstantId};
 use seismic_lang::ids::{CapabilityId, IntrinsicId};
@@ -231,13 +230,11 @@ impl<T: seismic_target::TargetFamily> fmt::Debug for CapabilityRegistration<T> {
 /// emitter without a signature are startup panics (§4.2, §13.3.1).
 pub struct CompilerRegistryParts<T: seismic_target::TargetFamily> {
     pub capabilities: Vec<CapabilityRegistration<T>>,
-    pub structural_factories: Vec<Box<dyn ImplementationFactory<T>>>,
-    pub independent_launch_mode: T::NativeLaunchMode,
-    pub cooperative_launch_mode: fn(&T::Facts) -> Option<T::NativeLaunchMode>,
+
     pub native_launch_constraints: fn(
         &DeviceDescription<T>,
         &mut ExprArena,
-        &seismic_ir::schedule::Launch,
+        &seismic_ir::schedule::Launch<T>,
         &seismic_ir::storage::LaunchLocalLayout,
         &seismic_ir::kernel::Kernel<T>,
         &seismic_target::NativeKernelDescription<T>,
@@ -258,12 +255,7 @@ impl<T: seismic_target::TargetFamily> CompilerRegistry<T> {
         }
     }
 
-    /// Every registered factory, capability-bound and structural, in a
-    /// stable order.
-    pub fn factories(&self) -> &[Box<dyn ImplementationFactory<T>>] {
-        self.inner.factories()
-    }
-
+    /// A capability from the backend's sealed intrinsic vocabulary.
     pub fn capability(&self, id: CapabilityId) -> Option<&CapabilityRegistration<T>> {
         self.inner.capability(id)
     }
@@ -272,19 +264,11 @@ impl<T: seismic_target::TargetFamily> CompilerRegistry<T> {
         self.inner.intrinsic(id)
     }
 
-    pub fn independent_launch_mode(&self) -> &T::NativeLaunchMode {
-        &self.inner.independent_launch_mode
-    }
-
-    pub fn cooperative_launch_mode(&self, facts: &T::Facts) -> Option<T::NativeLaunchMode> {
-        (self.inner.cooperative_launch_mode)(facts)
-    }
-
     pub fn native_launch_constraints(
         &self,
         target: &DeviceDescription<T>,
         arena: &mut ExprArena,
-        launch: &seismic_ir::schedule::Launch,
+        launch: &seismic_ir::schedule::Launch<T>,
         locals: &seismic_ir::storage::LaunchLocalLayout,
         kernel: &seismic_ir::kernel::Kernel<T>,
         native: &seismic_target::NativeKernelDescription<T>,
@@ -313,13 +297,11 @@ mod internals {
 
     pub(super) struct Registry<T: seismic_target::TargetFamily> {
         capabilities: Vec<CapabilityRegistration<T>>,
-        factories: Vec<Box<dyn ImplementationFactory<T>>>,
-        pub(super) independent_launch_mode: T::NativeLaunchMode,
-        pub(super) cooperative_launch_mode: fn(&T::Facts) -> Option<T::NativeLaunchMode>,
+
         pub(super) native_launch_constraints: fn(
             &DeviceDescription<T>,
             &mut ExprArena,
-            &seismic_ir::schedule::Launch,
+            &seismic_ir::schedule::Launch<T>,
             &seismic_ir::storage::LaunchLocalLayout,
             &seismic_ir::kernel::Kernel<T>,
             &seismic_target::NativeKernelDescription<T>,
@@ -333,13 +315,11 @@ mod internals {
         /// a capability advertised with no implemented signature; an
         /// implemented signature that is not a registered signature of that
         /// capability (an emitter without a signature); a signature
-        /// implemented twice; two structural factories sharing an identity.
+        /// implemented twice.
         pub(super) fn assemble(parts: CompilerRegistryParts<T>) -> Self {
             let CompilerRegistryParts {
                 capabilities,
-                structural_factories: structural,
-                independent_launch_mode,
-                cooperative_launch_mode,
+
                 native_launch_constraints,
                 addressable_resources,
                 emitted_intrinsics,
@@ -391,20 +371,6 @@ mod internals {
                     }
                 }
             }
-            for (position, factory) in structural.iter().enumerate() {
-                let identity = factory.identity();
-                if structural[..position]
-                    .iter()
-                    .any(|earlier| earlier.identity() == identity)
-                {
-                    panic!(
-                        "CompilerRegistry<{:?}>: structural factory `{}`/`{}` is registered twice",
-                        T::NAME,
-                        identity.name,
-                        identity.revision
-                    );
-                }
-            }
             assert_eq!(
                 registered,
                 emitted_intrinsics,
@@ -413,16 +379,10 @@ mod internals {
             );
             Self {
                 capabilities,
-                factories: structural,
-                independent_launch_mode,
-                cooperative_launch_mode,
+
                 native_launch_constraints,
                 addressable_resources,
             }
-        }
-
-        pub(super) fn factories(&self) -> &[Box<dyn ImplementationFactory<T>>] {
-            &self.factories
         }
 
         pub(super) fn capability(&self, id: CapabilityId) -> Option<&CapabilityRegistration<T>> {
@@ -1205,7 +1165,7 @@ mod internals {
             value: u64,
         ) -> TargetConstantId {
             let (id, symbol) = arena.target_constant(SymbolSort::Nat);
-            bindings.push((symbol, SymbolValue::Nat(value)));
+            bindings.push((symbol, SymbolValue::Nat((value).into())));
             id
         }
         fn optional(

@@ -9,24 +9,26 @@ use crate::api::kernel::{
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
 use crate::memory::{MemoryCharge, MemoryDomain, MemoryReservation, MemoryUsage};
-use crate::resources::{AdmissionDomain, PersistentTable};
+use crate::resources::{AdmissionDomain, AdmittedResources, PersistentTable};
 use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
 use opentelemetry::KeyValue;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_compiler::evaluation::AnalyticalEvaluationContext;
 use seismic_compiler::executable::{
-    execute_variant, DeviceService, ExecutableResultBinding, NativeExecutor, RuntimeBuffer,
+    execute_variant, DeviceService, ExecutableResultBinding, ExecutableVariant, NativeExecutor,
+    RuntimeBuffer,
 };
-use seismic_compiler::executable::{
-    ExecutableAllocationKind, ExecutableGlobalAllocationKind, ExecutableScalarResultKind,
+use seismic_compiler::executable::{ExecutableAllocationKind, ExecutableGlobalAllocationKind};
+use seismic_compiler::feedback::{
+    EvaluationMethod, FeedbackPreparation, FeedbackReport, PreparationOptions,
 };
-use seismic_compiler::numerics::{EvidenceCatalog, PolicyIdentity};
+use seismic_compiler::numerics::PolicyIdentity;
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract, PreparedKernel,
 };
 use seismic_compiler::target::CompilerRegistry;
 use seismic_compiler::{
-    prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget, TargetCoverage,
+    prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget,
 };
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{
@@ -71,13 +73,13 @@ where
     analytical: std::sync::OnceLock<
         Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
     >,
-    analytical_loader: Option<
+    analytical_loader:
         fn(
             &Service<T, E>,
+            &E,
             Arc<DeviceDescription<T>>,
         )
             -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
-    >,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<T, E>>>>,
     memory: Arc<MemoryDomain>,
     admission: AdmissionDomain,
@@ -89,6 +91,7 @@ struct PreparationKey {
     entry: StableEntryId,
     bindings: Vec<(String, RepresentationId)>,
     policy: PolicyIdentity,
+    evaluation: [u8; 32],
 }
 
 impl<T, E> Opened<T, E>
@@ -101,34 +104,9 @@ where
         executor: E,
         compiler_registry: &'static CompilerRegistry<T>,
         device: Arc<DeviceDescription<T>>,
-        analytical: Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
-    ) -> Self {
-        if let Ok(analytical) = &analytical {
-            assert!(
-                analytical.is_bound_to(&device),
-                "runtime composition paired an analytical context with another device description"
-            );
-        }
-        Self {
-            identity: DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)),
-            service: Arc::new(service),
-            device,
-            executor,
-            compiler_registry,
-            analytical: std::sync::OnceLock::from(analytical),
-            analytical_loader: None,
-            cache: Mutex::new(HashMap::new()),
-            memory: MemoryDomain::new(),
-            admission: AdmissionDomain::new(),
-        }
-    }
-    pub(crate) fn new_lazy(
-        service: Service<T, E>,
-        executor: E,
-        compiler_registry: &'static CompilerRegistry<T>,
-        device: Arc<DeviceDescription<T>>,
         analytical_loader: fn(
             &Service<T, E>,
+            &E,
             Arc<DeviceDescription<T>>,
         ) -> Result<
             AnalyticalEvaluationContext<T>,
@@ -142,7 +120,7 @@ where
             executor,
             compiler_registry,
             analytical: std::sync::OnceLock::new(),
-            analytical_loader: Some(analytical_loader),
+            analytical_loader,
             cache: Mutex::new(HashMap::new()),
             memory: MemoryDomain::new(),
             admission: AdmissionDomain::new(),
@@ -153,10 +131,13 @@ where
     ) -> Result<&AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError> {
         self.analytical
             .get_or_init(|| {
-                let loader = self
-                    .analytical_loader
-                    .expect("an unopened device analytical context has no loader");
-                loader(&self.service, self.device.clone())
+                let context =
+                    (self.analytical_loader)(&self.service, &self.executor, self.device.clone())?;
+                assert!(
+                    context.is_bound_to(&self.device),
+                    "analytical context belongs to another device"
+                );
+                Ok(context)
             })
             .as_ref()
             .map_err(Clone::clone)
@@ -169,6 +150,9 @@ where
     }
     pub(crate) fn begin_submission(&self) -> Result<E::Submission, ExecutionError> {
         self.executor.begin_submission()
+    }
+    pub(crate) fn service(&self) -> &Service<T, E> {
+        &self.service
     }
     pub(crate) fn service_arc(&self) -> Arc<Service<T, E>> {
         self.service.clone()
@@ -193,10 +177,7 @@ where
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let mut reservation = self.memory.reserve(bytes).map_err(|capacity| {
-            ExecutionError::AllocationFailed(format!(
-                "allocation requires {} bytes; {} bytes remain in the configured device limit",
-                capacity.required, capacity.available
-            ))
+            ExecutionError::AllocationCapacity { required: capacity.required.into(), available: capacity.available }
         })?;
         self.allocate_reserved(bytes, alignment, &mut reservation)
     }
@@ -207,6 +188,16 @@ where
         alignment: u64,
         reservation: &mut MemoryReservation,
     ) -> Result<Arc<Allocation>, ExecutionError> {
+        let limits = self.device_description().limits();
+        let natural_max = if limits.max_index_bits >= 64 { u64::MAX } else { (1u64 << limits.max_index_bits) - 1 };
+        let maximum = limits.max_allocation_bytes.min(natural_max);
+        if bytes > maximum {
+            return Err(ExecutionError::AllocationCapacity { required: bytes.into(), available: maximum });
+        }
+        if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
+            return Err(ExecutionError::ConstructionContradiction(format!(
+                "allocation alignment {alignment} exceeds target contract {}", limits.max_allocation_alignment)));
+        }
         let buffer = self.service.allocate(bytes, alignment)?;
         Ok(Allocation::new(
             fresh_allocation_identity(),
@@ -357,6 +348,21 @@ pub(crate) struct AllocationPermit {
     write: bool,
 }
 
+impl AllocationPermit {
+    pub(crate) fn allocation(&self) -> &Arc<Allocation> {
+        &self.allocation
+    }
+    pub(crate) fn owns(&self, allocation: &Arc<Allocation>) -> bool {
+        Arc::ptr_eq(&self.allocation, allocation)
+    }
+    pub(crate) fn read(&self, allocation: &Arc<Allocation>, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
+        assert!(self.owns(allocation), "allocation read uses a different allocation's permit");
+        assert!(offset.checked_add(into.len() as u64).is_some_and(|end| end <= allocation.bytes()),
+            "allocation read exceeds its admitted backing");
+        self.allocation.storage().read(offset, into)
+    }
+}
+
 impl Drop for AllocationPermit {
     fn drop(&mut self) {
         let mut state = self
@@ -402,6 +408,7 @@ pub(crate) struct Prepared<T: TargetFamily, E: NativeExecutor<T>> {
     identity: u64,
     device: Arc<Opened<T, E>>,
     kernel: PreparedKernel<T, E::Handle>,
+    pub(crate) feedback_report: Option<FeedbackReport>,
     persistent: Arc<PersistentTable>,
 }
 
@@ -412,20 +419,14 @@ pub(crate) fn prepare<T, E, C>(
     module: &CheckedModule,
     entry: EntryId,
     bindings: ElementBindings,
-    precision: PrecisionPolicy,
+    public_device: &Arc<crate::api::device::DeviceInner>,
+    options: PreparationOptions,
 ) -> Result<Arc<Prepared<T, E>>, PrepareError>
 where
     T: TargetFamily,
     E: NativeExecutor<T>,
     C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
 {
-    let analytical = opened.analytical().map_err(|error| {
-        PrepareError::Preparation(
-            seismic_compiler::errors::PreparationError::NativeCompilation(
-                seismic_target::NativeCompilationError::ToolchainFailure(error.to_string()),
-            ),
-        )
-    })?;
     let logical = module
         .entry(entry, &bindings)
         .map_err(PrepareError::Source)?;
@@ -436,10 +437,31 @@ where
             .iter()
             .map(|(name, representation)| (name.to_owned(), representation))
             .collect(),
-        policy: PolicyIdentity::of(&precision),
+        policy: PolicyIdentity::of(&options.precision),
+        evaluation: options.evaluation.fingerprint(),
     };
     if let Some(hit) = opened.cache().get(&key).and_then(Weak::upgrade) {
-        return Ok(hit);
+        let compatible = match &options.evaluation {
+            EvaluationMethod::Analytical => true,
+            EvaluationMethod::Feedback(_) => {
+                use seismic_compiler::feedback::ControlledObserver;
+                let environment = feedback::Observer::new(opened.clone(), public_device.clone())
+                    .environment()
+                    .map_err(|error| {
+                        PrepareError::Preparation(
+                            seismic_compiler::errors::PreparationError::Feedback(
+                                seismic_compiler::feedback::FeedbackError::Observation(error),
+                            ),
+                        )
+                    })?;
+                hit.feedback_report
+                    .as_ref()
+                    .is_some_and(|report| report.measurement_environment == Some(environment))
+            }
+        };
+        if compatible {
+            return Ok(hit);
+        }
     }
     let attributes = vec![
         key_str("seismic.module", hex(key.module.digest())),
@@ -447,49 +469,75 @@ where
         key_str("seismic.backend", T::NAME.as_str()),
         key_str(
             "seismic.target.hardware",
-            analytical
-                .device()
+            opened
+                .device_description()
                 .compatibility_identity()
                 .hardware
                 .clone(),
         ),
         key_str(
             "seismic.target.fingerprint",
-            hex(&analytical.device().identity().fingerprint),
+            hex(&opened.device_description().identity().fingerprint),
         ),
         key_str("seismic.policy", hex(&key.policy.0)),
     ];
     let mut span = Timed::start("seismic.prepare", attributes.clone());
-    let preparation_budget = PreparationBudget::default();
+    let mut preparation_budget = PreparationBudget::default();
+    if let EvaluationMethod::Feedback(feedback) = &options.evaluation {
+        preparation_budget.construction_wall_time = feedback.search_time;
+        preparation_budget.native_compile_wall_time = feedback.search_time;
+    }
     let planning_budget = PlanningBudget::default();
-    let kernel = prepare_analytically(
-        logical,
-        analytical,
-        opened.compiler_registry,
-        compiler,
-        native_context,
-        &precision,
-        &EvidenceCatalog::default(),
-        &preparation_budget,
-        &planning_budget,
-    )
-    .map_err(PrepareError::Preparation)?;
+    let (kernel, feedback_report) = match options.evaluation {
+        EvaluationMethod::Analytical => {
+            let analytical = opened.analytical().map_err(|error| {
+                PrepareError::Preparation(
+                    seismic_compiler::errors::PreparationError::NativeCompilation(
+                        seismic_target::NativeCompilationError::ToolchainFailure(error.to_string()),
+                    ),
+                )
+            })?;
+            let kernel = prepare_analytically(
+                logical,
+                analytical,
+                opened.compiler_registry,
+                compiler,
+                native_context,
+                &options.precision,
+                &preparation_budget,
+                &planning_budget,
+            )
+            .map_err(PrepareError::Preparation)?;
+            (kernel, None)
+        }
+        EvaluationMethod::Feedback(feedback_options) => {
+            let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+            let (campaign, kernel) = FeedbackPreparation::start(
+                logical,
+                opened.device_description(),
+                opened.compiler_registry,
+                compiler,
+                native_context,
+                &options.precision,
+                &preparation_budget,
+                &planning_budget,
+                observer,
+                feedback_options,
+            )
+            .map_err(PrepareError::Preparation)?;
+            (kernel, Some(campaign.report().clone()))
+        }
+    };
     span.attribute(key_u64("seismic.variants", kernel.variants().len() as u64));
-    let coverage = kernel.planning_coverage();
-    span.attribute(key_str(
-        "seismic.planning.target_coverage",
-        match coverage.target {
-            TargetCoverage::Exhaustive => "exhaustive",
-        },
-    ));
+    let planning_report = kernel.planning_report();
     span.attribute(key_str(
         "seismic.planning.optimization_completion",
-        match &coverage.optimization {
+        match &planning_report.optimization {
             OptimizationCompletion::Complete => "complete",
             OptimizationCompletion::Limited(_) => "limited",
         },
     ));
-    if let OptimizationCompletion::Limited(limit) = &coverage.optimization {
+    if let OptimizationCompletion::Limited(limit) = &planning_report.optimization {
         span.attribute(key_str(
             "seismic.planning.optimization_limit",
             format!("{limit:?}"),
@@ -497,37 +545,127 @@ where
     }
     span.attribute(key_u64(
         "seismic.planning.solver_work_units",
-        coverage.budget.solver_work_units,
+        planning_report.budget.solver_work_units,
     ));
     span.attribute(key_u64(
         "seismic.planning.solver_elapsed_ms",
-        coverage.budget.solver_elapsed_ms,
+        planning_report.budget.solver_elapsed_ms,
     ));
     span.attribute(key_u64(
         "seismic.planning.solver_memory_bytes",
-        coverage.budget.solver_memory_bytes,
+        planning_report.budget.solver_memory_bytes,
     ));
     span.attribute(key_u64(
         "seismic.planning.optimized_assignments",
-        coverage.budget.optimized_assignments,
+        planning_report.budget.optimized_assignments,
     ));
     span.attribute(key_u64(
         "seismic.planning.executable_variants",
-        coverage.budget.executable_variants,
+        planning_report.budget.executable_variants,
     ));
     span.attribute(key_u64(
         "seismic.planning.retained_metadata_bytes",
-        coverage.budget.retained_metadata_bytes,
+        planning_report.budget.retained_metadata_bytes,
     ));
     telemetry::record_preparation(span.elapsed_ms(), &attributes);
     let prepared = Arc::new(Prepared {
         identity: NEXT_PREPARED.fetch_add(1, Ordering::Relaxed),
         device: opened.clone(),
         kernel,
+        feedback_report,
         persistent: Arc::new(PersistentTable::new()),
     });
     opened.cache().insert(key, Arc::downgrade(&prepared));
     Ok(prepared)
+}
+
+/// Explicit mutable search ownership, separate from every returned kernel.
+pub(crate) struct FeedbackCampaign<'a, T, E, C>
+where
+    T: TargetFamily,
+    E: NativeExecutor<T>,
+    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+{
+    opened: Arc<Opened<T, E>>,
+    public_device: Arc<crate::api::device::DeviceInner>,
+    campaign: FeedbackPreparation<'a, T, C, feedback::Observer<T, E>>,
+}
+
+impl<'a, T, E, C> FeedbackCampaign<'a, T, E, C>
+where
+    T: TargetFamily,
+    E: NativeExecutor<T>,
+    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+{
+    pub(crate) fn start(
+        opened: &'a Arc<Opened<T, E>>,
+        compiler: &'a C,
+        native_context: &'a C::Context,
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        public_device: &Arc<crate::api::device::DeviceInner>,
+        precision: PrecisionPolicy,
+        options: seismic_compiler::feedback::FeedbackOptions,
+    ) -> Result<(Self, Arc<PreparedHandle<T, E>>), PrepareError> {
+        let logical = module
+            .entry(entry, &bindings)
+            .map_err(PrepareError::Source)?;
+        let budget = PreparationBudget {
+            construction_wall_time: options.search_time,
+            native_compile_wall_time: options.search_time,
+            ..Default::default()
+        };
+        let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+        let (campaign, kernel) = FeedbackPreparation::start(
+            logical,
+            opened.device_description(),
+            opened.compiler_registry,
+            compiler,
+            native_context,
+            &precision,
+            &budget,
+            &PlanningBudget::default(),
+            observer,
+            options,
+        )
+        .map_err(PrepareError::Preparation)?;
+        let preparation = Self {
+            opened: opened.clone(),
+            public_device: public_device.clone(),
+            campaign,
+        };
+        let kernel = preparation.snapshot(kernel);
+        Ok((preparation, kernel))
+    }
+
+    pub(crate) fn continue_for(
+        &mut self,
+        additional: std::time::Duration,
+    ) -> Result<Arc<PreparedHandle<T, E>>, PrepareError> {
+        let kernel = self
+            .campaign
+            .continue_for(additional)
+            .map_err(PrepareError::Preparation)?;
+        Ok(self.snapshot(kernel))
+    }
+
+    pub(crate) fn report(&self) -> &seismic_compiler::feedback::FeedbackReport {
+        self.campaign.report()
+    }
+
+    fn snapshot(&self, kernel: PreparedKernel<T, E::Handle>) -> Arc<PreparedHandle<T, E>> {
+        Arc::new(PreparedHandle {
+            prepared: Arc::new(Prepared {
+                identity: NEXT_PREPARED.fetch_add(1, Ordering::Relaxed),
+                device: self.opened.clone(),
+                kernel,
+                feedback_report: Some(self.report().clone()),
+                persistent: Arc::new(PersistentTable::new()),
+            }),
+            device: self.public_device.clone(),
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -587,9 +725,9 @@ pub(crate) fn prepare_native_metal(
             ResultKind::Range { .. } => NativeResult::Range,
         })
         .collect();
-    let source = render_native_source(logical.schema(), &bindings, definition.source);
+    let source = render_native_source(logical.schema(), &bindings, &definition.source);
     let pipeline =
-        seismic_metal::DirectPipeline::compile(&opened.service, &source, definition.entry)
+        seismic_metal::DirectPipeline::compile(&opened.service, &source, &definition.entry)
             .map_err(|error| {
                 PrepareError::Preparation(
                     seismic_compiler::errors::PreparationError::NativeCompilation(error),
@@ -608,12 +746,15 @@ pub(crate) fn prepare_native_metal(
 
 #[cfg(target_os = "macos")]
 impl NativePreparedMetal {
-    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+    pub(crate) fn call_with_commit(
+        &self,
+        args: EncodedArgs,
+        commit: impl FnOnce(),
+    ) -> Result<DecodedResults, CallError> {
         let schema = self.logical.schema();
         let arguments = args.values();
-        let values =
-            validate_invocation(schema, &self.invocation, self.opened.identity(), &arguments)
-                .map_err(CallError::Invocation)?;
+        let values = validate_invocation(&self.invocation, self.opened.identity(), &arguments)
+            .map_err(CallError::Invocation)?;
 
         let mut tensor_results = Vec::new();
         for result in &self.results {
@@ -724,6 +865,7 @@ impl NativePreparedMetal {
             .map(|expression| native_eval_launch(expression, schema, &values));
         let threadgroups = collect_native_geometry(threadgroups)?;
         let threads = collect_native_geometry(threads)?;
+        commit();
         self.pipeline
             .dispatch(&self.opened.service, &borrowed, threadgroups, threads)
             .map_err(CallError::Execution)?;
@@ -749,13 +891,13 @@ impl NativePreparedMetal {
                 NativeResult::Index => {
                     let word = read_native_word(&scalar_bytes, scalar_offset);
                     scalar_offset += 1;
-                    final_values.push(DecodedValue::Scalar(ArgumentValue::Index(word)));
+                    final_values.push(DecodedValue::Scalar(ArgumentValue::Index(word.into())));
                 }
                 NativeResult::Range => {
                     let start = read_native_word(&scalar_bytes, scalar_offset);
                     let end = read_native_word(&scalar_bytes, scalar_offset + 1);
                     scalar_offset += 2;
-                    final_values.push(DecodedValue::Scalar(ArgumentValue::Range { start, end }));
+                    final_values.push(DecodedValue::Scalar(ArgumentValue::Range { start: start.into(), end: end.into() }));
                 }
             }
         }
@@ -776,7 +918,7 @@ fn native_eval_compiled(
     expression: &CompiledNat,
     values: &InvocationValues,
 ) -> Result<u64, CallError> {
-    expression.evaluate(values).map_err(|error| {
+    expression.evaluate_u64(values).map_err(|error| {
         CallError::Execution(ExecutionError::SubmissionFailed(format!(
             "native ABI expression failed after invocation validation: {error:?}"
         )))
@@ -807,7 +949,7 @@ fn native_eval_launch(
                 .find(|dimension| dimension.name == *name)
                 .expect("checked native launch expression names an absent dimension");
             match values.get(dimension.symbol) {
-                Some(SymbolValue::Nat(value)) => Ok(value),
+                Some(SymbolValue::Nat(value)) => native_symbol(SymbolValue::Nat(value)),
                 _ => panic!("validated invocation omitted a native launch dimension"),
             }
         }
@@ -847,7 +989,7 @@ fn native_words(
     let mut words = Vec::new();
     for dimension in schema.dimensions() {
         match values.get(dimension.symbol) {
-            Some(SymbolValue::Nat(value)) => words.push(value),
+            Some(SymbolValue::Nat(value)) => words.push(native_symbol(SymbolValue::Nat(value))?),
             _ => panic!("validated invocation omitted a native ABI dimension"),
         }
     }
@@ -861,17 +1003,17 @@ fn native_words(
             ParameterKind::Scalar { symbol, .. } | ParameterKind::Index { symbol, .. } => {
                 words.push(native_symbol(
                     values.get(*symbol).expect("validated scalar disappeared"),
-                ));
+                )?);
             }
             ParameterKind::Range { start, end, .. } => {
                 words.push(native_symbol(
                     values
                         .get(*start)
                         .expect("validated range start disappeared"),
-                ));
+                )?);
                 words.push(native_symbol(
                     values.get(*end).expect("validated range end disappeared"),
-                ));
+                )?);
             }
         }
     }
@@ -883,16 +1025,9 @@ fn native_words(
 }
 
 #[cfg(target_os = "macos")]
-fn native_symbol(value: SymbolValue) -> u64 {
-    match value {
-        SymbolValue::Nat(value) => value,
-        SymbolValue::Int(value) => value as u64,
-        SymbolValue::F32(value) => u64::from(value.to_bits()),
-        SymbolValue::F16(value) | SymbolValue::BF16(value) => u64::from(value),
-        SymbolValue::I32(value) => u64::from(value as u32),
-        SymbolValue::U32(value) => u64::from(value),
-        SymbolValue::Bool(value) => u64::from(value),
-    }
+fn native_symbol(value: SymbolValue) -> Result<u64, CallError> {
+    value.try_word64().map_err(|error| CallError::Execution(ExecutionError::ConstructionContradiction(
+        format!("native ABI quantity does not fit its word: {error:?}"))))
 }
 
 #[cfg(target_os = "macos")]
@@ -1257,14 +1392,62 @@ pub(crate) struct PreparedHandle<T: TargetFamily, E: NativeExecutor<T>> {
     pub(crate) device: Arc<crate::api::device::DeviceInner>,
 }
 
-pub(crate) struct Staged<T: TargetFamily, E: NativeExecutor<T>> {
-    pub(crate) variant: usize,
+/// Executable allocation binding into the run-owned physical resource table.
+/// This carries no backing ownership; aliases share the same admitted slot.
+pub(crate) enum PhysicalBufferBinding {
+    Bound { allocation: u64, base_offset: u64, accessible_bytes: u64, tensor: Option<seismic_compiler::executable::RuntimeTensorGeometry> },
+    Reached { slot: u64, alignment: u64 },
+}
+
+struct IssuedResources<'a, T: TargetFamily, E: NativeExecutor<T>> {
+    owner: &'a mut AdmittedResources,
+    device: &'a Arc<Opened<T, E>>,
+    bindings: &'a [PhysicalBufferBinding],
+    buffers: Vec<Option<RuntimeBuffer<Buffer<T, E>>>>,
+}
+
+impl<T: TargetFamily, E: NativeExecutor<T>> seismic_compiler::executable::ExecutionResources<Buffer<T, E>> for IssuedResources<'_, T, E> {
+    fn buffer(&self, allocation: seismic_compiler::executable::ExecutableAllocationId) -> &RuntimeBuffer<Buffer<T, E>> {
+        self.buffers[allocation.ordinal()].as_ref().expect("planned allocation used before its reached acquisition")
+    }
+    fn retire_completed_instances(&mut self, allocations: &[seismic_compiler::executable::ExecutableAllocationId]) {
+        for allocation in allocations {
+            let index = allocation.ordinal();
+            if let PhysicalBufferBinding::Reached { slot, .. } = self.bindings[index] {
+                // Drop the derived native handle before releasing backing and
+                // its charge from the one run-owned physical slot.
+                self.buffers[index] = None;
+                self.owner.retire_private(slot);
+            }
+        }
+    }
+    fn acquire_instance(&mut self, allocation: seismic_compiler::executable::ExecutableAllocationId, bytes: u64, alignment: u64) -> Result<(), ExecutionError> {
+        let index = allocation.ordinal();
+        let PhysicalBufferBinding::Reached { slot, alignment: planned_alignment } = self.bindings[index] else {
+            assert!(self.buffers[index].as_ref().expect("initial backing absent").accessible_bytes >= bytes,
+                "reached instance exceeds initial backing");
+            return Ok(());
+        };
+        if self.owner.private_backing(slot).is_some_and(|backing| backing.bytes() >= bytes) {
+            return Ok(());
+        }
+        // The schedule has completed all prior users and excluded retained
+        // region products before requesting replacement of this bank.
+        self.buffers[index] = None;
+        self.owner.retire_private(slot);
+        self.owner.check_reached_capacity(bytes)?;
+        let backing = self.device.allocate_storage(bytes, alignment.max(planned_alignment))?;
+        let permit = backing.try_acquire(true).expect("fresh private backing cannot have an access owner");
+        let buffer = RuntimeBuffer { tensor: None, buffer: typed_buffer::<T, E>(&backing), base_offset: 0, accessible_bytes: bytes };
+        self.owner.install_private(slot, permit);
+        self.buffers[index] = Some(buffer);
+        Ok(())
+    }
+}
+
+pub(crate) struct Staged {
     pub(crate) values: InvocationValues,
-    pub(crate) buffers: Vec<RuntimeBuffer<Buffer<T, E>>>,
-    // Keeps every staged allocation alive through native completion, including
-    // non-result scratch and external arguments whose typed buffers borrow the
-    // backend storage.
-    pub(crate) _allocations: Vec<Arc<Allocation>>,
+    pub(crate) buffers: Vec<PhysicalBufferBinding>,
     pub(crate) allocated_bytes: u64,
 }
 
@@ -1273,35 +1456,101 @@ pub(crate) struct Staged<T: TargetFamily, E: NativeExecutor<T>> {
 /// Submission can issue this command and inspect only its completed scalar
 /// slots and output device. It cannot reach the prepared policy, selected
 /// executable, allocation plan, or layout expressions retained inside it.
+/// One already selected executable and its runtime resource namespace.
+/// Both policy dispatch and controlled preparation trials enter admission here.
+pub(crate) struct SelectedExecutable<T: TargetFamily, E: NativeExecutor<T>> {
+    executable: ExecutableVariant<T, E::Handle>,
+    owner: u64,
+    variant: usize,
+    persistent: Arc<PersistentTable>,
+    output_device: Arc<crate::api::device::DeviceInner>,
+}
+
 pub(crate) struct AdmittedCommand<T: TargetFamily, E: NativeExecutor<T>> {
-    kernel: Arc<PreparedHandle<T, E>>,
-    staged: Staged<T, E>,
+    selected: Arc<SelectedExecutable<T, E>>,
+    staged: Staged,
+    published: Vec<seismic_compiler::executable::ExecutedTensorPublication>,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
-    pub(crate) fn new(kernel: Arc<PreparedHandle<T, E>>, staged: Staged<T, E>) -> Self {
-        Self { kernel, staged }
+    pub(crate) fn new(selected: Arc<SelectedExecutable<T, E>>, staged: Staged) -> Self {
+        Self { selected, staged, published: Vec::new() }
     }
-
     pub(crate) fn allocated_bytes(&self) -> u64 {
         self.staged.allocated_bytes
     }
-
     pub(crate) fn values(&self) -> &InvocationValues {
         &self.staged.values
     }
-
     pub(crate) fn output_device(&self) -> &Arc<crate::api::device::DeviceInner> {
-        &self.kernel.device
+        &self.selected.output_device
     }
-
+    pub(crate) fn published_allocation(&self, path: &[u32]) -> Option<usize> {
+        self.published.iter().find(|publication| publication.path == path)
+            .map(|publication| publication.allocation.ordinal())
+    }
+    pub(crate) fn allocation_slot(&self, index: usize) -> u64 {
+        match self.staged.buffers[index] {
+            PhysicalBufferBinding::Bound { allocation, .. } => allocation,
+            PhysicalBufferBinding::Reached { slot, .. } => slot,
+        }
+    }
+    pub(crate) fn published_tensors(
+        &self,
+        resources: &AdmittedResources,
+    ) -> Result<Vec<(Vec<u32>, crate::execution::AdmittedOutput)>, ExecutionError> {
+        self.published.iter().map(|publication| {
+            let key = match self.staged.buffers[publication.allocation.ordinal()] {
+                PhysicalBufferBinding::Bound { allocation, .. } => allocation,
+                PhysicalBufferBinding::Reached { slot, .. } => slot,
+            };
+            let allocation = resources.allocation(key).clone();
+            if !publication.byte_offset.checked_add(publication.bytes)
+                .is_some_and(|end| end <= allocation.bytes()) {
+                return Err(ExecutionError::ConstructionContradiction(
+                    "published tensor exceeds its actual backing".into(),
+                ));
+            }
+            Ok((publication.path.clone(), crate::execution::AdmittedOutput::Tensor {
+                allocation,
+                byte_offset: publication.byte_offset,
+                byte_len: publication.bytes,
+                representation: publication.representation,
+                extents: publication.extents.clone(),
+                strides: publication.strides.clone(),
+            }))
+        }).collect()
+    }
     pub(crate) fn issue(
         &mut self,
         submission: &mut E::Submission,
         device: &Service<T, E>,
+        resources: &mut AdmittedResources,
+        opened: &Arc<Opened<T, E>>,
     ) -> Result<(), ExecutionError> {
-        self.kernel
-            .issue_admitted(submission, device, &mut self.staged)
+        let buffers = self.staged.buffers.iter().map(|binding| match binding {
+            PhysicalBufferBinding::Bound { allocation, base_offset, accessible_bytes, tensor } => {
+                let allocation = resources.allocation(*allocation);
+                assert!(base_offset.checked_add(*accessible_bytes).is_some_and(|end| end <= allocation.bytes()),
+                    "staged binding exceeds its admitted physical slot");
+                Some(RuntimeBuffer { tensor: tensor.clone(), buffer: typed_buffer::<T, E>(allocation), base_offset: *base_offset, accessible_bytes: *accessible_bytes })
+            }
+            PhysicalBufferBinding::Reached { slot, .. } => {
+                resources.declare_private(*slot);
+                resources.private_backing(*slot).map(|allocation| RuntimeBuffer {
+                    tensor: None, buffer: typed_buffer::<T, E>(allocation), base_offset: 0, accessible_bytes: allocation.bytes(),
+                })
+            }
+        }).collect();
+        let mut resources = IssuedResources { owner: resources, device: opened, bindings: &self.staged.buffers, buffers };
+        self.published = execute_variant(
+            &self.selected.executable,
+            submission,
+            device,
+            &mut resources,
+            &mut self.staged.values,
+        )?;
+        Ok(())
     }
 }
 
@@ -1315,29 +1564,13 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Prepared<T, E> {
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> PreparedHandle<T, E> {
-    pub(crate) fn issue_admitted(
-        &self,
-        submission: &mut E::Submission,
-        device: &Service<T, E>,
-        staged: &mut Staged<T, E>,
-    ) -> Result<(), ExecutionError> {
-        let variant = &self.prepared.kernel.variants().as_slice()[staged.variant];
-        execute_variant(
-            variant,
-            submission,
-            device,
-            &staged.buffers,
-            &mut staged.values,
-        )
-    }
-
     pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError>
     where
         T: 'static,
     {
         let attributes = self.prepared.attributes();
         let mut span = Timed::start("seismic.call", attributes.clone());
-        let (results, allocated_bytes) = workflow_native::call_one(self.clone(), args)?;
+        let (results, allocated_bytes) = workflow::native::call_one(self.clone(), args)?;
         span.attribute(key_bool("seismic.ok", true));
         telemetry::record_call(span.elapsed_ms(), allocated_bytes, &attributes);
         Ok(results)
@@ -1385,6 +1618,135 @@ fn copy_between<T: TargetFamily, E: NativeExecutor<T>>(
     Ok(())
 }
 
-#[path = "workflow/native.rs"]
-mod workflow_native;
-pub(crate) use workflow_native::{BoundWorkflowGraph, WorkflowGraphDraft};
+#[path = "workflow/mod.rs"]
+pub(crate) mod workflow;
+pub(crate) use workflow::native::{BoundWorkflowGraph, WorkflowGraphDraft};
+
+#[path = "feedback.rs"]
+mod feedback;
+
+#[cfg(test)]
+mod physical_slot_tests {
+    use super::*;
+
+    struct EmptyStorage;
+    impl Storage for EmptyStorage {
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), ExecutionError> { Ok(()) }
+        fn write(&self, _: u64, _: &[u8]) -> Result<(), ExecutionError> { Ok(()) }
+        fn as_any(&self) -> &dyn Any { self }
+    }
+
+    #[test]
+    fn admitted_slot_owns_backing_charge_and_exclusive_access() {
+        let memory = MemoryDomain::new();
+        let mut reservation = memory.reserve(16).unwrap();
+        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
+        let weak = Arc::downgrade(&allocation);
+        let permit = allocation.acquire(true);
+        let resources = AdmittedResources::new(reservation, vec![permit]);
+        drop(allocation);
+        assert_eq!(memory.usage().charged, 16);
+        assert!(resources.allocation(1).try_acquire(false).is_none());
+        assert!(resources.access(resources.allocation(1)).owns(resources.allocation(1)));
+        drop(resources);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(memory.usage().charged, 0);
+    }
+
+    #[test]
+    fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
+        let catalog = crate::api::catalog::Catalog::discover().unwrap();
+        let info = catalog.devices().iter().find(|device| device.backend == registry::BackendName::Cpu).unwrap();
+        let device = catalog.open(info.id).unwrap();
+        let crate::backends::DeviceKind::Cpu(opened) = &device.kind else { unreachable!() };
+        let baseline = opened.memory_usage().charged;
+        let maximum = opened.device_description().limits().max_allocation_bytes;
+        let error = opened.allocate_storage(maximum.checked_add(1).unwrap(), 4).err().expect("target limit is enforced before allocating");
+        assert!(matches!(error, ExecutionError::AllocationCapacity { required, available } if required == (maximum + 1).into() && available == maximum));
+        assert_eq!(opened.memory_usage().charged, baseline);
+        assert!(matches!(opened.allocate_storage(4, 0), Err(ExecutionError::ConstructionContradiction(_))));
+        assert_eq!(opened.memory_usage().charged, baseline);
+    }
+
+    #[test]
+    fn reached_slots_release_dead_capacity_and_preserve_live_permits_on_refusal() {
+        let memory = MemoryDomain::new();
+        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        resources.set_reached_budget(24);
+        resources.declare_private(100);
+        resources.declare_private(101);
+        let make = |id, bytes| {
+            let mut reservation = memory.reserve(bytes).unwrap();
+            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+        };
+        let first = make(1, 16);
+        resources.check_reached_capacity(16).unwrap();
+        resources.install_private(100, first.acquire(true));
+        drop(first);
+        assert_eq!(resources.check_reached_capacity(16), Err(ExecutionError::AllocationCapacity { required: 16u64.into(), available: 8 }));
+        assert!(resources.private_backing(100).unwrap().try_acquire(false).is_none());
+        resources.retire_private(100);
+        assert_eq!(memory.usage().charged, 0);
+        resources.check_reached_capacity(24).unwrap();
+        let second = make(2, 24);
+        resources.install_private(101, second.acquire(true));
+        drop(second);
+        assert_eq!(memory.usage().charged, 24);
+        assert_eq!(resources.reached_allocated(), 40);
+        drop(resources);
+        assert_eq!(memory.usage().charged, 0);
+    }
+
+    #[test]
+    fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
+        let memory = MemoryDomain::new();
+        memory.set_limit(Some(24)).unwrap();
+        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        resources.set_reached_budget(24);
+        for slot in [100, 101, 102] { resources.declare_private(slot); }
+        let make = |id, bytes| {
+            let mut reservation = memory.reserve(bytes).unwrap();
+            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+        };
+        let dead = make(1, 16);
+        let live = make(2, 8);
+        resources.install_private(100, dead.acquire(true));
+        resources.install_private(101, live.acquire(true));
+        let pending = dead.clone();
+        drop(dead);
+        drop(live);
+        assert!(memory.reserve(16).is_err());
+        assert!(resources.check_reached_capacity(16).is_err());
+        assert_eq!(memory.usage().charged, 24);
+        // The compiler's successful prefix completion precedes this release;
+        // backend references and the slot's permit must both be gone.
+        drop(pending);
+        resources.retire_private(100);
+        assert_eq!(memory.usage().charged, 8);
+        resources.check_reached_capacity(16).unwrap();
+        let replacement = make(3, 16);
+        resources.install_private(102, replacement.acquire(true));
+        drop(replacement);
+        assert_eq!(memory.usage().charged, 24);
+        assert!(resources.private_backing(101).unwrap().try_acquire(false).is_none());
+        assert!(memory.reserve(1).is_err());
+        drop(resources);
+        assert_eq!(memory.usage().charged, 0);
+    }
+
+    #[test]
+    fn published_backing_survives_slot_release_without_retaining_its_permit() {
+        let memory = MemoryDomain::new();
+        let mut reservation = memory.reserve(16).unwrap();
+        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
+        let resources = AdmittedResources::new(reservation, vec![allocation.acquire(true)]);
+        drop(allocation);
+        let published = resources.allocation(1).clone();
+        drop(resources);
+        assert_eq!(memory.usage().charged, 16);
+        let read = published.try_acquire(false).expect("completed run released its exclusive access");
+        drop(read);
+        drop(published);
+        assert_eq!(memory.usage().charged, 0);
+    }
+}

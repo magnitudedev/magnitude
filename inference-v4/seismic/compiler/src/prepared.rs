@@ -8,20 +8,22 @@
 
 use crate::candidate_domain::NonEmpty;
 use crate::errors::InvocationError;
-use crate::evaluation_session::PreparedPortfolio;
+use crate::evaluation_session::{PreparedCandidateId, PreparedPortfolio};
 use crate::executable::ExecutableVariant;
 use seismic_lang::entry::ParameterKind;
 use seismic_lang::entry::{CallSchema, CompiledDimensionInferencePlan, SemanticEventManifest};
 use seismic_lang::expr::compiled::{
     CompiledDuration, CompiledNat, CompiledPredicate, InvocationValues,
 };
-use seismic_lang::expr::{ExprArena, PartialAssignment, SymbolValue};
+use seismic_lang::expr::{PartialAssignment, SymbolValue};
 use seismic_lang::ids::{ModuleHash, RepresentationId, StableEntryId};
 use std::sync::Arc;
 
 /// Opaque, immutable invocation-to-candidate function. Evaluators may derive
 /// it by any method; runtime only applies the completed mapping.
 pub struct SelectionFunction {
+    candidate_operands: Box<[PreparedCandidateId]>,
+    retained_bytes: u64,
     program: Box<dyn Fn(&InvocationValues) -> CandidateIndex + Send + Sync>,
 }
 
@@ -32,14 +34,35 @@ impl std::fmt::Debug for SelectionFunction {
 }
 
 impl SelectionFunction {
+    pub(crate) fn candidate_operands(&self) -> &[PreparedCandidateId] {
+        &self.candidate_operands
+    }
+
+    pub(crate) fn retained_metadata_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
     /// Applies the completed evaluator policy to one validated invocation.
     pub fn apply(&self, values: &InvocationValues) -> CandidateIndex {
         (self.program)(values)
     }
 
-    pub(crate) fn analytical_minimum(candidates: PreparedPortfolio<CompiledDuration>) -> Self {
-        let candidates = candidates.into_guards_and_payloads().into_vec();
+    pub fn analytical_minimum(candidates: PreparedPortfolio<CompiledDuration>) -> Self {
+        let (candidate_operands, candidates) = candidates.into_operands();
+        let candidate_operands = candidate_operands.into_vec().into_boxed_slice();
+        let candidates = candidates.into_vec();
+        let retained_bytes = (std::mem::size_of::<Self>()
+            + candidate_operands.len() * std::mem::size_of::<PreparedCandidateId>()
+            + candidates.capacity() * std::mem::size_of::<(CompiledPredicate, CompiledDuration)>()
+            + candidates
+                .iter()
+                .map(|(guard, score)| {
+                    guard.retained_metadata_bytes() + score.retained_metadata_bytes()
+                })
+                .sum::<usize>()) as u64;
         Self {
+            candidate_operands,
+            retained_bytes,
             program: Box::new(move |values| {
                 let index = candidates
                     .iter()
@@ -69,12 +92,13 @@ impl SelectionFunction {
     /// true predicate whose candidate is applicable wins; candidate zero is
     /// the constructionally universal default. Ordinals are checked against
     /// the admitted portfolio at construction.
-    pub(crate) fn ordered_decision<P>(
+    pub fn ordered_decision<P>(
         candidates: PreparedPortfolio<P>,
         cases: Vec<(CompiledPredicate, CandidateIndex)>,
     ) -> Self {
+        let (candidate_operands, candidates) = candidates.into_operands();
+        let candidate_operands = candidate_operands.into_vec().into_boxed_slice();
         let candidate_guards = candidates
-            .into_guards_and_payloads()
             .into_vec()
             .into_iter()
             .map(|(guard, _)| guard)
@@ -86,7 +110,21 @@ impl SelectionFunction {
                 .all(|(_, index)| index.as_usize() < candidate_count),
             "selection case is out of range"
         );
+        let retained_bytes = (std::mem::size_of::<Self>()
+            + candidate_operands.len() * std::mem::size_of::<PreparedCandidateId>()
+            + candidate_guards.capacity() * std::mem::size_of::<CompiledPredicate>()
+            + cases.capacity() * std::mem::size_of::<(CompiledPredicate, CandidateIndex)>()
+            + candidate_guards
+                .iter()
+                .map(CompiledPredicate::retained_metadata_bytes)
+                .sum::<usize>()
+            + cases
+                .iter()
+                .map(|(predicate, _)| predicate.retained_metadata_bytes())
+                .sum::<usize>()) as u64;
         Self {
+            candidate_operands,
+            retained_bytes,
             program: Box::new(move |values| {
                 cases
                     .iter()
@@ -125,54 +163,45 @@ impl CandidateIndex {
 
 #[derive(Debug)]
 pub struct PreparedKernel<T: seismic_target::TargetFamily, H> {
-    entry: StableEntryId,
-    module: ModuleHash,
-    schema: Arc<CallSchema>,
     semantic_events: Arc<SemanticEventManifest>,
     device: seismic_target::DeviceDescriptionIdentity,
     evaluation: crate::evaluation::EvaluationIdentity,
-    invocation: InvocationContract,
+    invocation: Arc<InvocationContract>,
     selection: SelectionFunction,
     variants: NonEmpty<ExecutableVariant<T, H>>,
-    coverage: crate::planning::PlanningCoverage,
+    planning_report: crate::planning::PlanningReport,
 }
 
 impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
-    /// Private: the coverage builder is the only caller (§2.2).
+    /// Packages the preparation-owned policy and its diagnostic report.
     pub(crate) fn prepare(
-        entry: StableEntryId,
-        module: ModuleHash,
-        schema: Arc<CallSchema>,
         semantic_events: Arc<SemanticEventManifest>,
         device: seismic_target::DeviceDescriptionIdentity,
         evaluation: crate::evaluation::EvaluationIdentity,
-        invocation: InvocationContract,
+        invocation: Arc<InvocationContract>,
         selection: SelectionFunction,
         variants: NonEmpty<ExecutableVariant<T, H>>,
-        coverage: crate::planning::PlanningCoverage,
+        planning_report: crate::planning::PlanningReport,
     ) -> Self {
         Self {
-            entry,
-            module,
-            schema,
             semantic_events,
             device,
             evaluation,
             invocation,
             selection,
             variants,
-            coverage,
+            planning_report,
         }
     }
 
     pub fn entry(&self) -> StableEntryId {
-        self.entry
+        self.invocation.entry
     }
     pub fn module(&self) -> ModuleHash {
-        self.module
+        self.invocation.module
     }
     pub fn schema(&self) -> &CallSchema {
-        &self.schema
+        self.invocation.schema()
     }
     pub fn semantic_event_manifest(&self) -> &SemanticEventManifest {
         &self.semantic_events
@@ -190,8 +219,18 @@ impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
     pub fn variants(&self) -> &NonEmpty<ExecutableVariant<T, H>> {
         &self.variants
     }
-    pub fn planning_coverage(&self) -> &crate::planning::PlanningCoverage {
-        &self.coverage
+    pub fn planning_report(&self) -> &crate::planning::PlanningReport {
+        &self.planning_report
+    }
+
+    /// The preparation-owned candidate selected at this variant position.
+    /// Observation uses the same identity that the selection function retains.
+    pub fn candidate_for_variant(&self, variant: VariantIndex) -> PreparedCandidateId {
+        *self
+            .selection
+            .candidate_operands()
+            .get(variant.as_usize())
+            .expect("selected variant is absent from its preparation")
     }
 
     /// Deterministic selection among applicable variants.
@@ -245,10 +284,10 @@ pub enum ArgumentValue {
     I32(i32),
     U32(u32),
     Bool(bool),
-    Index(u64),
+    Index(seismic_lang::expr::BigUint),
     Range {
-        start: u64,
-        end: u64,
+        start: seismic_lang::expr::BigUint,
+        end: seismic_lang::expr::BigUint,
     },
 }
 
@@ -258,6 +297,9 @@ pub enum ArgumentValue {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct InvocationContract {
+    entry: StableEntryId,
+    module: ModuleHash,
+    schema: Arc<CallSchema>,
     dimension_inference: CompiledDimensionInferencePlan,
     target_domain: CompiledPredicate,
     parameters: Vec<ParameterContract>,
@@ -272,6 +314,16 @@ enum ParameterContract {
 }
 
 impl InvocationContract {
+    pub fn schema(&self) -> &CallSchema {
+        &self.schema
+    }
+    pub fn entry(&self) -> StableEntryId {
+        self.entry
+    }
+    pub fn module(&self) -> ModuleHash {
+        self.module
+    }
+
     /// Compiles the public invocation contract of an entry without creating a
     /// candidate domain. Direct native entry points use this path: they still get
     /// the ordinary Seismic call-boundary validation, but perform no
@@ -298,18 +350,26 @@ impl InvocationContract {
             })
             .collect();
         Self {
+            entry: entry.identity(),
+            module: entry.module_hash(),
+            schema: entry.shared_schema(),
             dimension_inference: schema.compile_dimension_inference(arena, &fixed),
             target_domain: arena.compile_bool(entry.domain().predicate().node()),
             parameters,
         }
     }
 
-    pub(crate) fn compile(
-        arena: &ExprArena,
-        schema: &CallSchema,
-        target_domain: crate::candidate_domain::TargetDomain,
-        fixed: &PartialAssignment,
+    pub(crate) fn compile<T: seismic_target::TargetFamily>(
+        domain: &crate::candidate_domain::CandidateDomain<'_, T>,
     ) -> Self {
+        let arena = domain.arena();
+        let schema = domain.schema();
+        let target_domain = domain.target_domain();
+        let mut fixed_values = PartialAssignment::new();
+        for (symbol, value) in domain.constants().bindings() {
+            fixed_values.bind(*symbol, value.clone());
+        }
+        let fixed = &fixed_values;
         let parameters = schema
             .parameters()
             .iter()
@@ -330,7 +390,10 @@ impl InvocationContract {
             })
             .collect();
         Self {
-            dimension_inference: schema.compile_dimension_inference(arena, fixed),
+            entry: domain.entry(),
+            module: domain.module(),
+            schema: schema.clone(),
+            dimension_inference: schema.compile_dimension_inference(&arena, fixed),
             target_domain: arena.compile_bool_with(target_domain.predicate().node(), fixed),
             parameters,
         }
@@ -341,12 +404,11 @@ impl InvocationContract {
 /// every call dimension and scalar symbol. This is the single validator
 /// generated bindings call; it runs before any allocation (§12.2).
 pub fn validate_invocation(
-    schema: &CallSchema,
     contract: &InvocationContract,
     device: DeviceIdentity,
     arguments: &[ArgumentValue],
 ) -> Result<InvocationValues, InvocationError> {
-    internals::validate_invocation(schema, contract, device, arguments)
+    internals::validate_invocation(contract, device, arguments)
 }
 
 mod internals {
@@ -364,14 +426,12 @@ mod internals {
     }
 
     pub(super) fn validate_invocation(
-        schema: &CallSchema,
         contract: &InvocationContract,
         device: DeviceIdentity,
         arguments: &[ArgumentValue],
     ) -> Result<InvocationValues, InvocationError> {
-        if arguments.len() != schema.parameters().len()
-            || contract.parameters.len() != schema.parameters().len()
-        {
+        let schema = contract.schema();
+        if arguments.len() != schema.parameters().len() {
             panic!("generated argument arity does not match its content-addressed call schema");
         }
 
@@ -425,7 +485,7 @@ mod internals {
                     values.bind(*symbol, value);
                 }
                 (ParameterKind::Index { symbol, .. }, ArgumentValue::Index(value)) => {
-                    values.bind(*symbol, SymbolValue::Nat(*value));
+                    values.bind(*symbol, SymbolValue::Nat(value.clone()));
                 }
                 (
                     ParameterKind::Range { start, end, .. },
@@ -434,8 +494,8 @@ mod internals {
                         end: last,
                     },
                 ) => {
-                    values.bind(*start, SymbolValue::Nat(*first));
-                    values.bind(*end, SymbolValue::Nat(*last));
+                    values.bind(*start, SymbolValue::Nat(first.clone()));
+                    values.bind(*end, SymbolValue::Nat(last.clone()));
                 }
                 _ => panic!("generated argument kind disagrees with its checked schema"),
             }
@@ -472,10 +532,9 @@ mod internals {
                     if expected_axes.len() != axes.len() {
                         panic!("compiled tensor-axis contract disagrees with its call schema");
                     }
-                    if tensor.strides.len() != tensor.extents.len() {
-                        return Err(InvocationError::ShapeMismatch {
+                    if !valid_tensor_descriptor(tensor) {
+                        return Err(InvocationError::InvalidTensorDescriptor {
                             parameter: parameter_label(parameter),
-                            axis: 0,
                         });
                     }
                     for (axis, (actual, expected)) in
@@ -487,7 +546,7 @@ mod internals {
                                 axis: u32::try_from(axis).unwrap_or(u32::MAX),
                             }
                         })?;
-                        if *actual != expected {
+                        if seismic_lang::expr::BigUint::from(*actual) != expected {
                             return Err(InvocationError::ShapeMismatch {
                                 parameter: parameter_label(parameter),
                                 axis: u32::try_from(axis).unwrap_or(u32::MAX),
@@ -504,7 +563,7 @@ mod internals {
                     let bound = bound.evaluate(&values).unwrap_or_else(|error| {
                         panic!("checked index bound is not total after argument binding: {error:?}")
                     });
-                    if *value >= bound {
+                    if value >= &bound {
                         return Err(InvocationError::ScalarOutOfDomain {
                             parameter: parameter_label(parameter),
                         });
@@ -518,7 +577,7 @@ mod internals {
                     let bound = bound.evaluate(&values).unwrap_or_else(|error| {
                         panic!("checked range bound is not total after argument binding: {error:?}")
                     });
-                    if start > end || *end > bound {
+                    if start > end || end > &bound {
                         return Err(InvocationError::ScalarOutOfDomain {
                             parameter: parameter_label(parameter),
                         });
@@ -547,6 +606,19 @@ mod internals {
             Ok(true) => Ok(values),
             Ok(false) | Err(_) => Err(InvocationError::OutsideTargetDomain),
         }
+    }
+
+    /// The public descriptor's range is the exact affine footprint that the
+    /// invocation will bind. This is checked before any reached schedule step;
+    /// execution may then treat its tensor geometry as an admitted value.
+    pub(super) fn valid_tensor_descriptor(tensor: &TensorDescriptor) -> bool {
+        seismic_ir::storage::valid_concrete_view(
+            tensor.representation,
+            &tensor.extents,
+            &tensor.strides,
+            tensor.byte_offset,
+            tensor.byte_len,
+        )
     }
 
     fn parameter_label(parameter: &seismic_lang::entry::Parameter) -> String {
@@ -700,5 +772,36 @@ mod selection_tests {
             ),
             vec![(arena.compile_bool(always), CandidateIndex::from_usize(1))],
         );
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_strided_descriptor_has_an_exact_aligned_footprint() {
+        let descriptor = TensorDescriptor {
+            device: DeviceIdentity(1),
+            representation: seismic_lang::registry::dense(seismic_lang::types::DType::F32),
+            extents: vec![2, 3],
+            strides: vec![1, 2],
+            allocation: 7,
+            byte_offset: 4,
+            byte_len: 24,
+        };
+        assert!(internals::valid_tensor_descriptor(&descriptor));
+        assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
+            byte_len: 20, ..descriptor.clone()
+        }));
+        assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
+            byte_offset: 2, ..descriptor.clone()
+        }));
+        assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
+            strides: vec![u64::MAX, 2], ..descriptor.clone()
+        }));
+        assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
+            byte_offset: u64::MAX - 3, ..descriptor
+        }));
     }
 }

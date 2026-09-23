@@ -67,7 +67,7 @@ pub struct NativeKernelIdentity {
 pub struct NativeKernelDescription<T: TargetFamily> {
     pub identity: NativeKernelIdentity,
     pub abi: KernelAbiLayout,
-    pub launch: NativeLaunchDomain<T::NativeLaunchMode>,
+    pub launch: NativeLaunchDomain<T::LaunchDescriptor>,
     pub resources: NativeResources,
     pub numerics: T::NativeNumericalMode,
     pub numerical_identity: crate::NativeNumericalModeIdentity,
@@ -401,7 +401,12 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct FakeFacts;
 
-    impl seismic_ir::target::KernelDialect for FakeTarget {
+    impl seismic_ir::target::PhysicalDialect for FakeTarget {
+        type LaunchDescriptor = ();
+        fn ordinary_launch() -> Self::LaunchDescriptor {
+            ()
+        }
+
         const NAME: BackendName = BackendName::Cpu;
         type Intrinsic = ();
         type Facts = FakeFacts;
@@ -441,7 +446,6 @@ mod tests {
 
     impl TargetFamily for FakeTarget {
         type KernelAbi = FakeAbi;
-        type NativeLaunchMode = ();
         type NativeNumericalMode = ();
         type NativeProperties = ();
     }

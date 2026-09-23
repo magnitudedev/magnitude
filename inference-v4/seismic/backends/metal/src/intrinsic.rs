@@ -262,8 +262,8 @@ fn matrix_result_dtype(signature: &IntrinsicSignature) -> Option<DType> {
     match signature.result {
         IntrinsicResultType::Owned {
             representation,
-            rank: 2,
-        } => match registry::representation_info(representation).kind {
+            axes,
+        } if axes.len() == 2 => match registry::representation_info(representation).kind {
             registry::RepresentationKind::Dense(dtype) => Some(dtype),
             registry::RepresentationKind::Packed(_) | registry::RepresentationKind::External(_) => {
                 None

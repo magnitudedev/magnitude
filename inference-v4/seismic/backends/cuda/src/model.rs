@@ -23,20 +23,20 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
     type Service = CudaService;
 
     fn model_revision(&self) -> &'static str {
-        "seismic-cuda-analytical-model-v1"
+        "seismic-cuda-analytical-model-v2"
     }
 
     fn operation_cost(
         &self,
-        _facts: &<Cuda as seismic_ir::target::KernelDialect>::Facts,
+        _facts: &<Cuda as seismic_ir::target::PhysicalDialect>::Facts,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
-        _kernel: &seismic_ir::kernel::Kernel<Cuda>,
+        kernel: &seismic_ir::kernel::Kernel<Cuda>,
         _emission: &seismic_ir::target::KernelEmissionLayout,
-        _launch: &seismic_ir::schedule::Launch,
+        _launch: &seismic_ir::schedule::Launch<Cuda>,
         _locals: &seismic_ir::storage::LaunchLocalLayout,
         op: seismic_ir::kernel::ops::ClosedOpView<'_, Cuda>,
-    ) -> OperationCost<Self::Service> {
+    ) -> Result<OperationCost<Self::Service>, ModelLimitation> {
         use seismic_ir::kernel::ops::{ClosedOpView, ClosedPlace, ClosedPlaceKind, ValueType};
         use seismic_ir::target::LocalRealization;
 
@@ -94,6 +94,8 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
             | ClosedOpView::ApproximateMath { .. }
             | ClosedOpView::Cast { .. }
             | ClosedOpView::Bitcast { .. }
+            | ClosedOpView::ScalarBits { .. }
+            | ClosedOpView::ScalarFromBits { .. }
             | ClosedOpView::Cmp { .. }
             | ClosedOpView::Select { .. }
             | ClosedOpView::Logic { .. }
@@ -109,7 +111,8 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                 DemandMode::SaturatedCapacity,
                 participant,
             ),
-            ClosedOpView::VectorSplat { out, .. }
+            ClosedOpView::VectorFromLanes { out, .. }
+            | ClosedOpView::VectorSplat { out, .. }
             | ClosedOpView::VectorBinary { out, .. }
             | ClosedOpView::VectorUnary { out, .. }
             | ClosedOpView::VectorBit { out, .. }
@@ -144,12 +147,14 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                 DemandMode::SaturatedCapacity,
                 participant,
             ),
-            ClosedOpView::ReadPlane { place, .. } => demand(
-                read_service(&place),
-                one,
-                DemandMode::SaturatedCapacity,
-                participant,
-            ),
+            ClosedOpView::ReadPlaneField { place, .. } | ClosedOpView::ReadPlane { place, .. } => {
+                demand(
+                    read_service(&place),
+                    one,
+                    DemandMode::SaturatedCapacity,
+                    participant,
+                )
+            }
             ClosedOpView::VectorRead { out, place, .. } => {
                 let units = arena.nat(vector_lanes(out.ty));
                 demand(
@@ -219,14 +224,17 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                     destination,
                     ..
                 } => {
-                    let [rows, columns] = destination.logical_extents.as_slice() else {
+                    let [rows, columns] = destination.extents.as_slice() else {
                         panic!("closed CUDA matrix destination is not rank two")
                     };
-                    let [_, inner] = a.logical_extents.as_slice() else {
+                    let [_, inner] = a.extents.as_slice() else {
                         panic!("closed CUDA matrix left operand is not rank two")
                     };
+                    let exact = |value| kernel.exact_nat(value)
+                        .ok_or(ModelLimitation::DeviceExtent { value });
+                    let (rows, columns, inner) = (exact(*rows)?, exact(*columns)?, exact(*inner)?);
                     if *elem == seismic_lang::types::DType::F32 {
-                        let units = arena.nat_product(&[*rows, *columns, *inner]);
+                        let units = arena.nat_product(&[rows, columns, inner]);
                         demand(
                             SERVICE_REPACK,
                             units,
@@ -237,9 +245,9 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                         let m_tile = arena.nat(16);
                         let n_tile = arena.nat(8);
                         let k_tile = arena.nat(16);
-                        let m = arena.nat_ceil_div(*rows, m_tile);
-                        let n = arena.nat_ceil_div(*columns, n_tile);
-                        let k = arena.nat_ceil_div(*inner, k_tile);
+                        let m = arena.nat_ceil_div(rows, m_tile);
+                        let n = arena.nat_ceil_div(columns, n_tile);
+                        let k = arena.nat_ceil_div(inner, k_tile);
                         let units = arena.nat_product(&[m, n, k]);
                         demand(
                             SERVICE_MATRIX,
@@ -251,18 +259,21 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                 }
                 CudaIntrinsic::NvFp4Matmul { a, destination, .. }
                 | CudaIntrinsic::NvFp4MatmulAdd { a, destination, .. } => {
-                    let [rows, columns] = destination.logical_extents.as_slice() else {
+                    let [rows, columns] = destination.extents.as_slice() else {
                         panic!("closed CUDA NVFP4 destination is not rank two")
                     };
-                    let [_, inner] = a.logical_extents.as_slice() else {
+                    let [_, inner] = a.extents.as_slice() else {
                         panic!("closed CUDA NVFP4 left operand is not rank two")
                     };
+                    let exact = |value| kernel.exact_nat(value)
+                        .ok_or(ModelLimitation::DeviceExtent { value });
+                    let (rows, columns, inner) = (exact(*rows)?, exact(*columns)?, exact(*inner)?);
                     let m_tile = arena.nat(128);
                     let n_tile = arena.nat(8);
                     let k_tile = arena.nat(64);
-                    let m = arena.nat_ceil_div(*rows, m_tile);
-                    let n = arena.nat_ceil_div(*columns, n_tile);
-                    let k = arena.nat_ceil_div(*inner, k_tile);
+                    let m = arena.nat_ceil_div(rows, m_tile);
+                    let n = arena.nat_ceil_div(columns, n_tile);
+                    let k = arena.nat_ceil_div(inner, k_tile);
                     let units = arena.nat_product(&[m, n, k]);
                     demand(
                         SERVICE_MATRIX,
@@ -274,6 +285,6 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
             },
             ClosedOpView::Yield { .. } => OperationCost::Elided(ProvenElision::CompileTimeOnly),
         };
-        cost
+        Ok(cost)
     }
 }

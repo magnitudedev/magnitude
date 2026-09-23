@@ -7,6 +7,7 @@
 
 use super::{DurationEstimate, EvalError, PartialAssignment, SymbolId, SymbolValue};
 use std::fmt;
+use num_bigint::{BigInt, BigUint};
 
 /// Symbol values supplied by one invocation: call dimensions from tensor
 /// descriptors, call scalars from arguments, target constants from the
@@ -28,32 +29,55 @@ impl InvocationValues {
         self.values
             .iter()
             .find(|(s, _)| *s == symbol)
-            .map(|(_, v)| *v)
+            .map(|(_, v)| v.clone())
     }
 }
 
 /// A compiled evaluator. `Send + Sync` so a prepared kernel can be shared.
 pub struct Compiled<T> {
-    program: Box<dyn Fn(&InvocationValues) -> Result<T, EvalError> + Send + Sync>,
+    program: std::sync::Arc<dyn Fn(&InvocationValues) -> Result<T, EvalError> + Send + Sync>,
+    retained_bytes: usize,
     /// The symbols the evaluator reads, in a fixed order, so a binding table
     /// can be validated against it before any evaluation.
-    reads: Vec<SymbolId>,
+    reads: std::sync::Arc<[SymbolId]>,
 }
 
 impl<T> Compiled<T> {
     pub(crate) fn new(
         reads: Vec<SymbolId>,
+        retained_bytes: usize,
         program: Box<dyn Fn(&InvocationValues) -> Result<T, EvalError> + Send + Sync>,
     ) -> Self {
-        Self { program, reads }
+        let retained_bytes = retained_bytes
+            .saturating_add(reads.len() * std::mem::size_of::<SymbolId>())
+            .saturating_add(std::mem::size_of::<Self>());
+        Self {
+            program: program.into(),
+            reads: reads.into(),
+            retained_bytes,
+        }
     }
 
     pub fn evaluate(&self, values: &InvocationValues) -> Result<T, EvalError> {
         (self.program)(values)
     }
 
+    pub fn retained_metadata_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
     pub fn reads(&self) -> &[SymbolId] {
         &self.reads
+    }
+}
+
+impl<T> Clone for Compiled<T> {
+    fn clone(&self) -> Self {
+        Self {
+            program: self.program.clone(),
+            reads: self.reads.clone(),
+            retained_bytes: self.retained_bytes,
+        }
     }
 }
 
@@ -66,14 +90,32 @@ impl<T> fmt::Debug for Compiled<T> {
 }
 
 pub type CompiledPredicate = Compiled<bool>;
-pub type CompiledNat = Compiled<u64>;
-pub type CompiledInt = Compiled<i64>;
+pub type CompiledNat = Compiled<BigUint>;
+pub type CompiledInt = Compiled<BigInt>;
 pub type CompiledDuration = Compiled<DurationEstimate>;
+
+impl Compiled<BigUint> {
+    /// Explicit finite projection at an address, allocation, launch, or ABI consumer.
+    pub fn evaluate_u64(&self, values: &InvocationValues) -> Result<u64, EvalError> {
+        self.evaluate(values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+    }
+}
+
+impl Compiled<BigInt> {
+    /// Explicit finite projection; mathematical evaluation itself remains exact.
+    pub fn evaluate_i64(&self, values: &InvocationValues) -> Result<i64, EvalError> {
+        self.evaluate(values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+    }
+}
 
 /// Constructs a symbol-free predicate for compiler-side qualification gates.
 #[doc(hidden)]
 pub fn constant_predicate(value: bool) -> CompiledPredicate {
-    Compiled::new(Vec::new(), Box::new(move |_| Ok(value)))
+    Compiled::new(
+        Vec::new(),
+        std::mem::size_of::<bool>(),
+        Box::new(move |_| Ok(value)),
+    )
 }
 
 /// Solver-only evaluator whose remaining reads may be finite decisions.

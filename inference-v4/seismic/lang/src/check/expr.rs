@@ -2,13 +2,12 @@
 //! attributes, tensor allocation and casts — all typed through the intrinsic
 //! registry and emitted as registry primitives.
 
-use super::ir::{
-    Expr as CheckedExpr, ExprKind as CheckedExprKind, Index as CheckedIndex, Literal, LocalId,
-};
+use super::ir::{Expr as CheckedExpr, ExprKind as CheckedExprKind, Index as CheckedIndex, LocalId};
 use super::{Checker, ValueClass};
 use crate::expr::IntExpr;
 use crate::intrinsics::IndexSlot as Slot;
 use crate::intrinsics::{primitive, PrimitiveId};
+use crate::reference_math::{self, ReferenceScalar, ScalarOp};
 use crate::span::Span;
 use crate::syntax::ast::{self, BinaryOp, ExprKind as A, UnaryOp};
 use crate::types::{DType, Elem, TensorType, ValueType};
@@ -43,7 +42,10 @@ fn walk(e: &CheckedExpr, visit: &mut dyn FnMut(&CheckedExpr)) {
         }
         CheckedExprKind::PlaneView { base, .. } => walk(base, visit),
         CheckedExprKind::Intrinsic { args, .. } => args.iter().for_each(|a| walk(a, visit)),
-        CheckedExprKind::Call { args, .. } => args.iter().for_each(|a| walk(a, visit)),
+        CheckedExprKind::Call { call, args } => {
+            for (_, value) in &call.explicit_shapes { walk(value, visit); }
+            args.iter().for_each(|a| walk(a, visit));
+        }
         CheckedExprKind::Literal(_) | CheckedExprKind::Dimension(_) | CheckedExprKind::Local(_) => {
         }
     }
@@ -52,9 +54,6 @@ fn walk(e: &CheckedExpr, visit: &mut dyn FnMut(&CheckedExpr)) {
 /// The same runtime value, wherever it was written.
 fn same_value(a: &CheckedExpr, b: &CheckedExpr) -> bool {
     match (&a.kind, &b.kind) {
-        (CheckedExprKind::Literal(Literal::Int(x)), CheckedExprKind::Literal(Literal::Int(y))) => {
-            x == y
-        }
         (CheckedExprKind::Local(x), CheckedExprKind::Local(y)) => x == y,
         (CheckedExprKind::Dimension(x), CheckedExprKind::Dimension(y)) => x == y,
         (
@@ -145,7 +144,7 @@ impl<'a> Checker<'a> {
         &mut self,
         e: &ast::Expr,
         expected: Option<&ValueType>,
-        allow_unassigned: bool,
+        place_context: bool,
     ) -> Option<CheckedExpr> {
         let span = e.span;
         // A literal adopts the scalar dtype (or tensor element dtype) its context supplies.
@@ -155,6 +154,19 @@ impl<'a> Checker<'a> {
         });
         match &e.kind {
             A::Int(v) => {
+                if matches!(expected, Some(ValueType::Integer | ValueType::Index { .. })) {
+                    let value = self.arena.nat(*v);
+                    let value = self.arena.int_from_nat(value);
+                    return Some(CheckedExpr::new(
+                        CheckedExprKind::Primitive {
+                            id: PrimitiveId::Symbolic(value),
+                            operands: vec![],
+                        },
+                        ValueType::Integer,
+                        Some(value),
+                        span,
+                    ));
+                }
                 let dtype = context.filter(|d| d.is_numeric()).unwrap_or(DType::I32);
                 let limit = if dtype == DType::U32 {
                     u64::from(u32::MAX)
@@ -168,42 +180,38 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                let symbolic = self.arena.int(*v as i64);
-                Some(if dtype.is_float() {
-                    self.scalar_expr(
-                        CheckedExprKind::Literal(Literal::Float(*v as f64)),
+                let symbolic = dtype.is_int().then(|| self.arena.int(*v as i64));
+                Some(self.scalar_expr(
+                    CheckedExprKind::Literal(reference_math::integer_literal(
                         dtype,
-                        None,
-                        span,
-                    )
-                } else {
-                    self.scalar_expr(
-                        CheckedExprKind::Literal(Literal::Int(*v as i64)),
-                        dtype,
-                        Some(symbolic),
-                        span,
-                    )
-                })
+                        i128::from(*v),
+                    )),
+                    dtype,
+                    symbolic,
+                    span,
+                ))
             }
-            A::Float(v) => Some(self.scalar_expr(
-                CheckedExprKind::Literal(Literal::Float(*v)),
-                context.filter(|d| d.is_float()).unwrap_or(DType::F32),
-                None,
-                span,
-            )),
-            A::Inf => Some(self.scalar_expr(
-                CheckedExprKind::Literal(Literal::Float(f64::INFINITY)),
-                context.filter(|d| d.is_float()).unwrap_or(DType::F32),
-                None,
-                span,
-            )),
+            A::Float(_) | A::Inf => {
+                let dtype = context.filter(|d| d.is_float()).unwrap_or(DType::F32);
+                let value = match &e.kind {
+                    A::Float(value) => *value,
+                    A::Inf => f64::INFINITY,
+                    _ => unreachable!(),
+                };
+                Some(self.scalar_expr(
+                    CheckedExprKind::Literal(reference_math::float_literal(dtype, value)),
+                    dtype,
+                    None,
+                    span,
+                ))
+            }
             A::Bool(b) => Some(self.scalar_expr(
-                CheckedExprKind::Literal(Literal::Bool(*b)),
+                CheckedExprKind::Literal(ReferenceScalar::Bool(*b)),
                 DType::Bool,
                 None,
                 span,
             )),
-            A::Name(n) => self.name(n, allow_unassigned),
+            A::Name(n) => self.name(n, place_context),
             A::Tuple(items) => {
                 let hints: Vec<Option<&ValueType>> = match expected {
                     Some(ValueType::Tuple(tys)) if tys.len() == items.len() => {
@@ -244,8 +252,8 @@ impl<'a> Checker<'a> {
                 ))
             }
             A::Range { lo, hi } => {
-                let lo = self.expr(lo, Some(&ValueType::Scalar(DType::I32)))?;
-                let hi = self.expr(hi, Some(&ValueType::Scalar(DType::I32)))?;
+                let lo = self.expr(lo, Some(&ValueType::Integer))?;
+                let hi = self.expr(hi, Some(&ValueType::Integer))?;
                 let (Some(lo_sym), Some(hi_sym)) = (lo.sym, hi.sym) else {
                     self.error(span, "range bounds must be symbolic integers");
                     return None;
@@ -283,7 +291,7 @@ impl<'a> Checker<'a> {
                 args,
             } => self.call(callee, bindings, args, expected, span),
             A::Index { base, indices } => {
-                let base = self.expr_inner(base, None, allow_unassigned)?;
+                let base = self.expr_inner(base, None, place_context)?;
                 self.index(base, indices, span)
             }
             A::Attr { base, name } => {
@@ -295,18 +303,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn name(&mut self, n: &ast::Ident, allow_unassigned: bool) -> Option<CheckedExpr> {
+    fn name(&mut self, n: &ast::Ident, place_context: bool) -> Option<CheckedExpr> {
         if let Some(id) = self.lookup(&n.name) {
-            if self.moved.contains(&id) {
+            if self.locals[id.index()].ownership.has_moved() {
                 self.error(n.span, format!("use of moved owned tensor `{}`", n.name));
                 return None;
             }
-            if !self.borrows.contains_key(&id)
-                && self
-                    .borrows
-                    .values()
-                    .any(|(root, exclusive)| *root == id && *exclusive)
-            {
+            if self.exclusive_borrow_blocks(id) {
                 self.error(
                     n.span,
                     format!(
@@ -316,30 +319,14 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            if self.unassigned.contains(&id) && !allow_unassigned {
-                self.error(n.span, format!("`{}` is read before every element is assigned; an uninitialized tensor cannot be read or returned", n.name));
-                return None;
-            }
             let ty = self.locals[id.index()].ty.clone();
             let sym = self
                 .symbols
                 .get(&id)
                 .map(|symbol| self.arena.int_symbol(*symbol))
                 .or_else(|| self.scalar_symbols.get(&id).copied());
-            if !allow_unassigned {
-                self.reads
-                    .push(self.view_roots.get(&id).copied().unwrap_or(id));
-            }
-            // A `let` of a view freezes the descriptor, not the data it borrows.
-            if let (Some(root), Some(bound)) = (
-                self.view_roots.get(&id).copied(),
-                self.view_bound.get(&id).copied(),
-            ) {
-                if !allow_unassigned && self.mutated[bound..].contains(&root) {
-                    let root = self.locals[root.index()].name.clone();
-                    self.error(n.span, format!("view `{}` borrows `{root}`, which was written after the view was bound; a `let` of a view is not a snapshot: take one with `load`, or select the view again after the write", n.name));
-                    return None;
-                }
+            if !place_context {
+                self.reads.push(self.local_storage_root(id));
             }
             if let ValueType::Index { bound } = &ty {
                 self.numeric_use(*bound);
@@ -360,11 +347,11 @@ impl<'a> Checker<'a> {
                 .expect("shape parameter lookup disagrees with contains");
             let sym = self.arena.int_symbol(self.sig.shape_symbols[ordinal]);
             self.numeric_use(sym);
-            return Some(self.scalar_expr(
+            return Some(CheckedExpr::new(
                 CheckedExprKind::Dimension(
                     u32::try_from(ordinal).expect("definition has more than u32::MAX dimensions"),
                 ),
-                DType::I32,
+                ValueType::Integer,
                 Some(sym),
                 n.span,
             ));
@@ -416,19 +403,14 @@ impl<'a> Checker<'a> {
             self.error(name.span, format!("`{}` is not declared", name.name));
             return None;
         };
-        if self.moved.contains(&id) {
+        if self.locals[id.index()].ownership.has_moved() {
             self.error(
                 name.span,
                 format!("use of moved owned tensor `{}`", name.name),
             );
             return None;
         }
-        if !self.borrows.contains_key(&id)
-            && self
-                .borrows
-                .values()
-                .any(|(root, exclusive)| *root == id && *exclusive)
-        {
+        if self.exclusive_borrow_blocks(id) {
             self.error(
                 name.span,
                 format!(
@@ -486,9 +468,9 @@ impl<'a> Checker<'a> {
             let position = axes.len();
             match index {
                 ast::Index::Expr(e) => {
-                    let i = self.expr(e, Some(&ValueType::Scalar(DType::I32)))?;
-                    if i.ty.scalar_dtype() != Some(DType::I32) {
-                        self.error(i.span, format!("a point index is an `i32`, found {}", i.ty));
+                    let i = self.expr(e, Some(&ValueType::Integer))?;
+                    if !matches!(i.ty, ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(DType::I32 | DType::U32)) {
+                        self.error(i.span, format!("a point index is an integer, found {}", i.ty));
                         return None;
                     }
                     if let Some(s) = i.sym {
@@ -532,11 +514,11 @@ impl<'a> Checker<'a> {
                     let mut bounds = [None, None];
                     for (slot, bound) in bounds.iter_mut().zip([start, end]) {
                         if let Some(b) = bound {
-                            let b = self.expr(b, Some(&ValueType::Scalar(DType::I32)))?;
-                            if b.ty.scalar_dtype() != Some(DType::I32) {
+                            let b = self.expr(b, Some(&ValueType::Integer))?;
+                            if !matches!(b.ty, ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(DType::I32 | DType::U32)) {
                                 self.error(
                                     b.span,
-                                    format!("a range bound is an `i32`, found {}", b.ty),
+                                    format!("a range bound is an integer, found {}", b.ty),
                                 );
                                 return None;
                             }
@@ -549,7 +531,7 @@ impl<'a> Checker<'a> {
                     let hi = end.as_ref().map_or(Some(extent_sym), |b| b.sym);
                     let mut checks = (false, false, false);
                     let kept = match (lo, hi, static_width(&self.arena, &start, &end)) {
-                        (Some(lo), Some(hi), _) => {
+                        (Some(lo), Some(hi), static_width) => {
                             checks.0 =
                                 self.require_in_bounds(lo, span, "range start may be negative");
                             let width = self.arena.int_sub(hi, lo);
@@ -560,7 +542,13 @@ impl<'a> Checker<'a> {
                                 span,
                                 "range end may exceed its axis extent",
                             );
-                            width
+                            // On the successful checked range path, authored
+                            // `start:start+c` has width `c`. Keep that
+                            // source structure even when the word-valued
+                            // endpoints also have symbolic values; the
+                            // checks above still reject wrapping/out-of-range
+                            // endpoints before the view is formed.
+                            static_width.unwrap_or(width)
                         }
                         // A runtime start with a static width: `t:t + c`.
                         (_, _, Some(width)) => width,
@@ -683,10 +671,17 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
+        let sym = if matches!(id, PrimitiveId::ElementRead { .. })
+            && matches!(ty, ValueType::Scalar(DType::I32 | DType::U32)) {
+            let symbol = self.fresh_symbol("element");
+            Some(self.arena.int_symbol(symbol))
+        } else {
+            None
+        };
         Some(CheckedExpr::new(
             CheckedExprKind::Primitive { id, operands },
             ty,
-            None,
+            sym,
             span,
         ))
     }
@@ -704,8 +699,8 @@ impl<'a> Checker<'a> {
         let mut axes = Vec::new();
         let mut operands = Vec::new();
         for dim in shape {
-            let d = self.expr(dim, Some(&ValueType::Scalar(DType::I32)))?;
-            let Some(sym) = d.sym.filter(|_| d.ty.scalar_dtype() == Some(DType::I32)) else {
+            let d = self.expr(dim, Some(&ValueType::Integer))?;
+            let Some(sym) = d.sym.filter(|_| matches!(d.ty, ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(DType::I32 | DType::U32))) else {
                 self.error(d.span, "a tensor extent is a symbolic integer expression");
                 return None;
             };
@@ -855,30 +850,55 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> Option<CheckedExpr> {
         let inner = self.expr(inner, expected)?;
-        let (axes, _) =
-            self.broadcast(&[&inner], &format!("unary `{}`", op.text().trim()), span)?;
-        if let (UnaryOp::Neg, CheckedExprKind::Literal(Literal::Float(v))) = (op, &inner.kind) {
-            let dtype = match inner.ty {
-                ValueType::Scalar(d) => d,
-                _ => DType::F32,
+        if matches!(inner.ty, ValueType::Integer | ValueType::Index { .. }) {
+            let Some(value) = inner.sym else {
+                self.error(span, "quantity negation requires an exact integer value");
+                return None;
             };
-            return Some(self.scalar_expr(
-                CheckedExprKind::Literal(Literal::Float(-*v)),
-                dtype,
-                None,
+            if op != UnaryOp::Neg {
+                self.error(span, format!("`{}` needs a fixed-width scalar", op.text()));
+                return None;
+            }
+            let zero = self.arena.int(0);
+            let result = self.arena.int_sub(zero, value);
+            return Some(CheckedExpr::new(
+                CheckedExprKind::Primitive {
+                    id: PrimitiveId::Unary(op),
+                    operands: vec![inner],
+                },
+                ValueType::Integer,
+                Some(result),
                 span,
             ));
         }
-        let sym = match (op, &inner.sym) {
-            (UnaryOp::Neg, Some(s)) => {
-                let zero = self.arena.int(0);
-                Some(self.arena.int_sub(zero, *s))
+        let (axes, _) =
+            self.broadcast(&[&inner], &format!("unary `{}`", op.text().trim()), span)?;
+        if let (UnaryOp::Neg, CheckedExprKind::Literal(value)) = (op, &inner.kind) {
+            if value.dtype().is_float() {
+                let recipe = reference_math::scalar_recipe(ScalarOp::Unary(op), &[value.dtype()]);
+                return Some(
+                    self.scalar_expr(
+                        CheckedExprKind::Literal(
+                            reference_math::evaluate(&recipe, &[*value])
+                                .expect("floating negation is total"),
+                        ),
+                        value.dtype(),
+                        None,
+                        span,
+                    ),
+                );
             }
-            _ => None,
-        };
+        }
+        let sym = inner.sym.filter(|_| axes.is_none()).and_then(|value| {
+            let dtype = inner.ty.scalar_dtype()?;
+            dtype.is_int().then(|| self.arena.scalar_integer(
+                ScalarOp::Unary(op),
+                &[(dtype, value)],
+            ))
+        });
         let mut out =
             self.elementwise_primitive(PrimitiveId::Unary(op), vec![inner.clone()], axes, span)?;
-        if out.ty.scalar_dtype() == Some(DType::I32) {
+        if out.ty.scalar_dtype().is_some_and(DType::is_int) {
             out.sym = sym;
         }
         Some(out)
@@ -918,10 +938,43 @@ impl<'a> Checker<'a> {
     pub fn binary_exprs(
         &mut self,
         op: BinaryOp,
-        l: CheckedExpr,
-        r: CheckedExpr,
+        mut l: CheckedExpr,
+        mut r: CheckedExpr,
         span: Span,
     ) -> Option<CheckedExpr> {
+        let quantity = |ty: &ValueType| matches!(ty, ValueType::Integer | ValueType::Index { .. });
+        if quantity(&l.ty) || quantity(&r.ty) {
+            if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = l.ty {
+                r = self.quantity_to_word(r, dtype);
+            } else if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = r.ty {
+                l = self.quantity_to_word(l, dtype);
+            } else {
+                let (Some(a), Some(b)) = (l.sym, r.sym) else {
+                    self.error(span, "quantity operation requires exact integer values");
+                    return None;
+                };
+                let comparison = matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge);
+                let sym = match op {
+                    BinaryOp::Add => Some(self.arena.int_add(a, b)),
+                    BinaryOp::Sub => Some(self.arena.int_sub(a, b)),
+                    BinaryOp::Mul => Some(self.arena.int_mul(a, b)),
+                    BinaryOp::Div | BinaryOp::Rem => {
+                        Some(if op == BinaryOp::Div { self.arena.int_div(a, b) } else { self.arena.int_rem(a, b) })
+                    }
+                    BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => None,
+                    _ => {
+                        self.error(span, format!("`{}` needs a fixed-width scalar operand", op.text()));
+                        return None;
+                    }
+                };
+                return Some(CheckedExpr::new(
+                    CheckedExprKind::Primitive { id: PrimitiveId::Binary(op), operands: vec![l, r] },
+                    if comparison { ValueType::Scalar(DType::Bool) } else { ValueType::Integer },
+                    sym,
+                    span,
+                ));
+            }
+        }
         let is_cmp = matches!(
             op,
             BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
@@ -993,57 +1046,35 @@ impl<'a> Checker<'a> {
             }
         }
         let sym = match (l.sym, r.sym) {
-            (Some(x), Some(y))
-                if axes.is_none() && l.ty.scalar_dtype().is_some_and(|d| d.is_int()) && !is_cmp =>
-            {
-                match op {
-                    BinaryOp::Add => Some(self.arena.int_add(x, y)),
-                    BinaryOp::Sub => Some(self.arena.int_sub(x, y)),
-                    BinaryOp::Mul => Some(self.arena.int_mul(x, y)),
-                    BinaryOp::Div | BinaryOp::Rem => {
-                        let one = self.arena.int(1);
-                        let positive = self.arena.int_sub(y, one);
-                        if !super::prove::nonneg(&self.arena, &self.facts, positive) {
-                            self.error(r.span, "divisor is not provably positive");
-                            return None;
-                        }
-                        Some(if op == BinaryOp::Div {
-                            self.arena.int_div(x, y)
-                        } else {
-                            self.arena.int_rem(x, y)
-                        })
-                    }
-                    BinaryOp::Shl => super::prove::constant(&self.arena, y).and_then(|c| {
-                        let scale = 1i64.checked_shl(u32::try_from(c).ok()?)?;
-                        let scale_expr = self.arena.int(scale);
-                        let product = self.arena.int_mul(x, scale_expr);
-                        let (minimum, maximum) = if a == DType::U32 {
-                            (0, i64::from(u32::MAX))
-                        } else {
-                            (i64::from(i32::MIN), i64::from(i32::MAX))
-                        };
-                        let minimum = self.arena.int(minimum);
-                        let maximum = self.arena.int(maximum);
-                        (super::prove::le(&mut self.arena, &self.facts, minimum, product)
-                            && super::prove::le(&mut self.arena, &self.facts, product, maximum))
-                        .then_some(product)
-                    }),
-                    BinaryOp::Shr => super::prove::constant(&self.arena, y).and_then(|c| {
-                        let divisor = 1i64.checked_shl(u32::try_from(c).ok()?)?;
-                        let divisor = self.arena.int(divisor);
-                        Some(self.arena.int_div(x, divisor))
-                    }),
-                    _ => None,
-                }
+            (Some(x), Some(y)) if axes.is_none() && a.is_int() && b.is_int() && !is_cmp => {
+                Some(self.arena.scalar_integer(ScalarOp::Binary(op), &[(a, x), (b, y)]))
             }
             _ => None,
         };
         let mut out =
             self.elementwise_primitive(PrimitiveId::Binary(op), vec![l, r], axes, span)?;
-        if !is_cmp && !is_logic && out.ty.scalar_dtype() == Some(DType::I32) {
+        if !is_cmp && !is_logic && out.ty.scalar_dtype().is_some_and(DType::is_int) {
             out.sym = sym;
         }
         Some(out)
+    }
+
+    fn quantity_to_word(&mut self, value: CheckedExpr, dtype: DType) -> CheckedExpr {
+        if !matches!(value.ty, ValueType::Integer | ValueType::Index { .. }) {
+            return value;
+        }
+        let sym = value.sym.map(|integer| {
+            self.arena.scalar_integer(ScalarOp::Cast(dtype), &[(dtype, integer)])
+        });
+        CheckedExpr::new(
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Cast(dtype),
+                operands: vec![value.clone()],
+            },
+            ValueType::Scalar(dtype),
+            sym,
+            value.span,
+        )
     }
 
     // ---- attributes ----
@@ -1245,6 +1276,13 @@ impl<'a> Checker<'a> {
             let axes = Some(s.axes.clone());
             return self.elementwise_primitive(PrimitiveId::Cast(dtype), vec![inner], axes, span);
         }
+        if matches!(inner.ty, ValueType::Integer | ValueType::Index { .. }) {
+            if !dtype.is_int() {
+                self.error(span, "mathematical quantity conversion to float is not yet supported");
+                return None;
+            }
+            return Some(self.quantity_to_word(inner, dtype));
+        }
         let Some(from) = inner.ty.scalar_dtype() else {
             self.error(
                 span,
@@ -1264,7 +1302,10 @@ impl<'a> Checker<'a> {
             return None;
         }
         let sym = if dtype.is_int() && from.is_int() {
-            inner.sym.clone()
+            inner.sym.map(|value| self.arena.scalar_integer(
+                ScalarOp::Cast(dtype),
+                &[(from, value)],
+            ))
         } else {
             None
         };
@@ -1272,5 +1313,66 @@ impl<'a> Checker<'a> {
             self.elementwise_primitive(PrimitiveId::Cast(dtype), vec![inner], None, span)?;
         out.sym = sym;
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use crate::checked::{check_source, SourceFile, SourceSet};
+    use crate::entry::{ElementBindings, SemanticNodeView};
+    use crate::interp::{Interpreter, OutcomeValue};
+    use crate::intrinsics::PrimitiveId;
+    use crate::reference_math::ReferenceScalar;
+
+    #[test]
+    fn checked_literals_keep_direct_quantization_through_reference_execution() {
+        for (token, expected) in [
+            ("1.0004882812500002", ReferenceScalar::F16(0x3c01)),
+            ("1.0039062500000002", ReferenceScalar::BF16(0x3f81)),
+            // Above the midpoint by one exact integer; conversion through F64
+            // would lose that unit and incorrectly round down to 0x5a000000.
+            ("9007199791611905", ReferenceScalar::F32(0x5a00_0001)),
+            ("18446744073709551615", ReferenceScalar::F32(0x5f80_0000)),
+            ("-0.0", ReferenceScalar::F16(0x8000)),
+            ("-0.0", ReferenceScalar::BF16(0x8000)),
+            ("-0.0", ReferenceScalar::F32(0x8000_0000)),
+            ("-0.0000000000001", ReferenceScalar::F16(0x8000)),
+            ("-inf", ReferenceScalar::F16(0xfc00)),
+            ("inf", ReferenceScalar::BF16(0x7f80)),
+            ("4294967295", ReferenceScalar::U32(u32::MAX)),
+            ("true", ReferenceScalar::Bool(true)),
+        ] {
+            let dtype = expected.dtype();
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "literal-bits.seismic".into(),
+                text: format!("fn probe() -> {dtype}:\n    return {token}\n"),
+            }]))
+            .unwrap_or_else(|error| panic!("{dtype} {token}: {error:?}"));
+            let entry = module
+                .entry(
+                    module.entry_named("probe").unwrap(),
+                    &ElementBindings::default(),
+                )
+                .unwrap();
+            let program = entry.program();
+            let body = program.function(program.family(program.root()).reference().function());
+            let constants: Vec<_> = body
+                .nodes(body.root())
+                .filter_map(|(_, node)| match node.view() {
+                    SemanticNodeView::Primitive {
+                        primitive: PrimitiveId::Constant(value),
+                        ..
+                    } => Some(*value),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(constants, [expected], "checked {dtype} {token}");
+            let outcome = Interpreter::new(&entry).run(&[]).unwrap();
+            let result = outcome.results().next().unwrap();
+            let OutcomeValue::Scalar(actual) = result.value() else {
+                panic!("scalar result")
+            };
+            assert_eq!(actual, expected, "reference {dtype} {token}");
+        }
     }
 }

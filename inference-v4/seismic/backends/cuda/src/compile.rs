@@ -2,8 +2,8 @@
 
 use crate::command::CompiledKernel;
 use crate::driver::{
-    compile_image, function_attribute, load_module, set_function_attribute, Context, JitError,
-    Module,
+    compile_image, function_attribute, load_module, set_function_attribute, Context, Handle,
+    JitError, Module,
 };
 use crate::{ptx, Cuda};
 use seismic_ir::kernel::Kernel;
@@ -15,13 +15,21 @@ use std::time::Instant;
 
 pub struct NativeCandidate {
     pub(crate) module: Arc<Module>,
-    pub(crate) entry: String,
+    /// Function returned by loading `module`, before post-load configuration.
+    pub(crate) function: Handle,
+    pub(crate) image: Box<[u8]>,
+    pub(crate) entry: Box<str>,
     pub(crate) layout: KernelEmissionLayout,
+    pub(crate) configured_dynamic_shared_bytes: i32,
     pub artifact_digest: [u8; 32],
     pub image_bytes: u64,
     pub metadata_bytes: u64,
     pub compilation_ns: u64,
 }
+
+// The function handle is owned by `module`; every driver call enters that
+// module's retained context. Moving the candidate does not change either.
+unsafe impl Send for NativeCandidate {}
 
 pub(crate) fn compile_kernel(
     target: &DeviceDescription<Cuda>,
@@ -80,11 +88,28 @@ pub(crate) fn compile_kernel(
     // remaining device-wide shared-memory domain after reflected static use;
     // reconciliation reads the configured function value back.
     set_function_attribute(&context, function, 8, dynamic_shared).map_err(driver_failure)?;
-    let metadata_bytes = layout_metadata_bytes(layout)?;
+    let image = image.into_boxed_slice();
+    let entry = emitted.entry.into_boxed_str();
+    let entry_bytes = u64::try_from(entry.len()).map_err(|_| {
+        NativeCompilationError::MalformedToolchainOutput(
+            "CUDA native entry name size exceeds u64".into(),
+        )
+    })?;
+    let metadata_bytes = layout_metadata_bytes(layout)?
+        .checked_add(image_bytes)
+        .and_then(|bytes| bytes.checked_add(entry_bytes))
+        .ok_or_else(|| {
+            NativeCompilationError::MalformedToolchainOutput(
+                "CUDA retained native image and metadata exceed u64".into(),
+            )
+        })?;
     Ok(NativeCandidate {
         module: Arc::new(module),
-        entry: emitted.entry,
+        function,
+        image,
+        entry,
         layout: layout.clone(),
+        configured_dynamic_shared_bytes: dynamic_shared,
         artifact_digest,
         image_bytes,
         metadata_bytes,
@@ -115,16 +140,12 @@ fn layout_metadata_bytes(layout: &KernelEmissionLayout) -> Result<u64, NativeCom
         })
         .and_then(|bytes| {
             bytes.checked_add(
-                layout.scalar_args.len() * std::mem::size_of::<seismic_lang::types::DType>(),
+                layout.scalar_args.len() * std::mem::size_of::<seismic_ir::repr::ScalarKind>(),
             )
         })
         .and_then(|bytes| {
             bytes.checked_add(
-                layout.result_slots.len()
-                    * std::mem::size_of::<(
-                        seismic_ir::schedule::AnyScalarSlot,
-                        seismic_lang::types::DType,
-                    )>(),
+                layout.result_types.len() * std::mem::size_of::<seismic_ir::repr::ScalarKind>(),
             )
         })
         .ok_or_else(|| {

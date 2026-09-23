@@ -13,20 +13,16 @@ use cranelift_module::Module;
 use seismic_ir::kernel::ops::{
     BarrierScope, BinaryOp, BitOp, Block, ClosedDensePlace, ClosedExternalGlobalPlace,
     ClosedOpView, ClosedPackedGlobalPlace, ClosedPackedPlace, ClosedPlace, ClosedPlaceKind,
-    ClosedPlaceWords, ClosedReadablePlace, ClosedValue, CmpOp, ConstantValue, ErasedValue,
-    GeometryValue, LogicOp, Op, StoreElection, UnaryOp, ValueType,
+    ClosedPlaceWords, ClosedValue, CmpOp, ConstantValue, ErasedValue, GeometryValue, LogicOp, Op,
+    StoreElection, UnaryOp, ValueType,
 };
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
-    ReadableRepresentationGeometry,
 };
 use seismic_lang::intrinsics::MathOp;
-use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneInfo, PlaneRepackRecipe,
-    RepackExpr, RepresentationKind,
-};
+use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
 use seismic_lang::types::DType;
 use seismic_target::NativeCompilationError;
 use std::collections::{BTreeSet, HashMap};
@@ -54,7 +50,6 @@ enum HostImport {
     F16Load,
     F16Store,
     PackedBits,
-    FloatCode(FloatCodeImport),
     Barrier,
     Atomic(AtomicImport),
 }
@@ -67,13 +62,6 @@ enum RoundImport {
     I32,
     U32,
     Bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum FloatCodeImport {
-    E2M1,
-    E4M3,
-    UE4M3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,11 +103,6 @@ impl HostImport {
             Self::F16Load => "seismic_f16_load",
             Self::F16Store => "seismic_f16_store",
             Self::PackedBits => "seismic_packed_bits",
-            Self::FloatCode(kind) => match kind {
-                FloatCodeImport::E2M1 => "seismic_float_code_e2m1",
-                FloatCodeImport::E4M3 => "seismic_float_code_e4m3",
-                FloatCodeImport::UE4M3 => "seismic_float_code_ue4m3",
-            },
             Self::Barrier => "seismic_cpu_barrier",
             Self::Atomic(kind) => match kind {
                 AtomicImport::AddF32 => "seismic_atomic_add_f32",
@@ -174,10 +157,6 @@ impl HostImport {
                 ]);
                 signature.returns.push(AbiParam::new(types::I32));
             }
-            Self::FloatCode(_) => {
-                signature.params.push(AbiParam::new(types::I32));
-                signature.returns.push(AbiParam::new(types::F32));
-            }
             Self::Barrier => {
                 signature.params.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I32));
@@ -200,14 +179,6 @@ fn round_import(dtype: DType) -> HostImport {
         DType::I32 => RoundImport::I32,
         DType::U32 => RoundImport::U32,
         DType::Bool => RoundImport::Bool,
-    })
-}
-
-fn float_code_import(format: FloatCodeFormat) -> HostImport {
-    HostImport::FloatCode(match format {
-        FloatCodeFormat::E2M1 => FloatCodeImport::E2M1,
-        FloatCodeFormat::E4M3 => FloatCodeImport::E4M3,
-        FloatCodeFormat::UE4M3 => FloatCodeImport::UE4M3,
     })
 }
 
@@ -331,11 +302,6 @@ fn collect_imports(kernel: &Kernel<Cpu>) -> BTreeSet<HostImport> {
     imports.insert(HostImport::F16Load);
     imports.insert(HostImport::F16Store);
     imports.insert(HostImport::PackedBits);
-    imports.extend([
-        float_code_import(FloatCodeFormat::E2M1),
-        float_code_import(FloatCodeFormat::E4M3),
-        float_code_import(FloatCodeFormat::UE4M3),
-    ]);
     for dtype in [DType::F32, DType::F16, DType::BF16, DType::I32, DType::U32] {
         for op in [
             seismic_lang::intrinsics::AtomicOp::Add,
@@ -353,7 +319,7 @@ fn collect_block_imports(kernel: &Kernel<Cpu>, block: BlockId, imports: &mut BTr
     for op in &kernel.block(block).ops {
         match op {
             Op::Math { op, .. } => match op {
-                MathOp::Exp | MathOp::ExpFast => {
+                MathOp::Exp => {
                     imports.insert(HostImport::ApproxExp);
                 }
                 MathOp::Log => {
@@ -439,6 +405,7 @@ impl Emitter<'_, '_> {
                 ClosedOpView::Unary { op, out, a } => {
                     let a = self.value(a.value);
                     let value = match out.ty {
+                        ValueType::Scalar(DType::F16 | DType::BF16) => self.narrow_sign(op, a),
                         ValueType::Scalar(dtype) if dtype.is_float() => match op {
                             UnaryOp::Neg => self.builder.ins().fneg(a),
                             UnaryOp::Abs => self.builder.ins().fabs(a),
@@ -455,7 +422,6 @@ impl Emitter<'_, '_> {
                             }
                         },
                     };
-                    let value = self.round_value(value, out.ty);
                     self.define(out.value, value);
                 }
                 ClosedOpView::Bit { op, out, a, b } => {
@@ -477,9 +443,17 @@ impl Emitter<'_, '_> {
                     let a = self.value(a.value);
                     let b = self.value(b.value);
                     let c = self.value(c.value);
-                    let value = self.builder.ins().fma(a, b, c);
-                    let value = self.round_value(value, out.ty);
+                    let value = self.fma(out.ty, a, b, c);
                     self.define(out.value, value);
+                }
+                ClosedOpView::VectorFromLanes { out, lanes } => {
+                    let first = self.value(lanes[0].value);
+                    let mut vector = self.builder.ins().splat(native_type(out.ty), first);
+                    for (index, lane) in lanes.iter().enumerate().skip(1) {
+                        let scalar = self.value(lane.value);
+                        vector = self.builder.ins().insertlane(vector, scalar, index as u8);
+                    }
+                    self.define(out.value, vector);
                 }
                 ClosedOpView::VectorSplat { out, value } => {
                     let scalar = self.value(value.value);
@@ -514,8 +488,25 @@ impl Emitter<'_, '_> {
                     let a = self.value(a.value);
                     let b = self.value(b.value);
                     let c = self.value(c.value);
-                    let value = self.builder.ins().fma(a, b, c);
-                    let value = self.round_vector(value, out.ty);
+                    let (dtype, lanes) = vector_shape(out.ty);
+                    let value = if matches!(dtype, DType::F16 | DType::BF16) {
+                        let mut result = None;
+                        for lane in 0..lanes {
+                            let a = self.builder.ins().extractlane(a, lane as u8);
+                            let b = self.builder.ins().extractlane(b, lane as u8);
+                            let c = self.builder.ins().extractlane(c, lane as u8);
+                            let value = self.fma(ValueType::Scalar(dtype), a, b, c);
+                            result = Some(match result {
+                                None => self.builder.ins().splat(native_type(out.ty), value),
+                                Some(vector) => {
+                                    self.builder.ins().insertlane(vector, value, lane as u8)
+                                }
+                            });
+                        }
+                        result.expect("nonempty vector")
+                    } else {
+                        self.builder.ins().fma(a, b, c)
+                    };
                     self.define(out.value, value);
                 }
                 ClosedOpView::VectorCast { out, a, to } => {
@@ -533,17 +524,13 @@ impl Emitter<'_, '_> {
                     let mut value = self.builder.ins().extractlane(source, 0);
                     for lane in 1..lanes {
                         let next = self.builder.ins().extractlane(source, lane as u8);
-                        value = if vector_dtype(vector.ty).is_float() {
-                            self.builder.ins().fadd(value, next)
-                        } else {
-                            self.builder.ins().iadd(value, next)
-                        };
-                        value = self.round_value(value, out.ty);
+                        value = self.binary(BinaryOp::Add, out.ty, value, next);
                     }
                     self.define(out.value, value);
                 }
                 ClosedOpView::ApproximateMath { op, out, a } => {
-                    let value = self.math(op, self.value(a.value));
+                    let argument = self.numeric_operand(self.value(a.value), a.ty);
+                    let value = self.math(op, argument);
                     let value = self.round_value(value, out.ty);
                     self.define(out.value, value);
                 }
@@ -558,6 +545,14 @@ impl Emitter<'_, '_> {
                         .ins()
                         .bitcast(native_type(to), MemFlags::new(), a);
                     self.define(out.value, value);
+                }
+                ClosedOpView::ScalarBits { out, a } => {
+                    self.define(out.value, self.value(a.value));
+                }
+                ClosedOpView::ScalarFromBits { out, a } => {
+                    let source = self.value(a.value);
+                    let bits = self.builder.ins().band_imm(source, 0xffff);
+                    self.define(out.value, bits);
                 }
                 ClosedOpView::Cmp { op, out, a, b } => {
                     let value = self.compare(op, a.ty, self.value(a.value), self.value(b.value));
@@ -600,10 +595,13 @@ impl Emitter<'_, '_> {
                     self.define(out.value(), value);
                 }
                 ClosedOpView::ScalarArg {
-                    out, index, dtype, ..
+                    out, index, kind, ..
                 } => {
                     let raw = self.word(self.layout.words.scalar_first + index);
-                    let value = self.decode_word(raw, dtype);
+                    let value = match kind {
+                        seismic_ir::repr::ScalarKind::Nat64 => raw,
+                        seismic_ir::repr::ScalarKind::Scalar(dtype) => self.decode_word(raw, dtype),
+                    };
                     self.define(out.value, value);
                 }
                 ClosedOpView::Read {
@@ -638,10 +636,11 @@ impl Emitter<'_, '_> {
                     );
                     self.define(out.value, value);
                 }
-                ClosedOpView::ReadPlane {
+                ClosedOpView::ReadPlaneField {
                     out,
                     place,
-                    plane,
+                    plane_info,
+                    field,
                     indices,
                     ..
                 } => {
@@ -649,7 +648,29 @@ impl Emitter<'_, '_> {
                         .iter()
                         .map(|value| self.value(value.value()))
                         .collect::<Vec<_>>();
-                    let value = self.read_plane(&place, plane as usize, &coordinates);
+                    let (packet, geometry, logical) = self.address(&place, &coordinates);
+                    let value = self.read_plane_field(
+                        packet,
+                        logical,
+                        geometry.layout.group,
+                        &plane_info,
+                        field,
+                    );
+                    self.define(out.value, value);
+                }
+                ClosedOpView::ReadPlane {
+                    out,
+                    place,
+                    plane,
+                    element,
+                    indices,
+                    ..
+                } => {
+                    let coordinates = indices
+                        .iter()
+                        .map(|value| self.value(value.value()))
+                        .collect::<Vec<_>>();
+                    let value = self.read_plane(&place, plane as usize, &coordinates, self.value(element.value()));
                     self.define(out.value, value);
                 }
                 ClosedOpView::RepresentationConvertPacket {
@@ -708,11 +729,16 @@ impl Emitter<'_, '_> {
                 }
                 ClosedOpView::StoreSlot {
                     slot,
-                    dtype,
+                    kind,
                     value,
                     election: StoreElection::GlobalLeader,
                 } => {
-                    let raw = self.encode_word(self.value(value.value), dtype);
+                    let raw = match kind {
+                        seismic_ir::repr::ScalarKind::Nat64 => self.value(value.value),
+                        seismic_ir::repr::ScalarKind::Scalar(dtype) => {
+                            self.encode_word(self.value(value.value), dtype)
+                        }
+                    };
                     let workgroup_leader =
                         self.builder
                             .ins()
@@ -815,14 +841,9 @@ impl Emitter<'_, '_> {
     fn constant(&mut self, value: ConstantValue) -> Value {
         match value {
             ConstantValue::F32(value) => self.builder.ins().f32const(value),
-            ConstantValue::F16(value) => self
-                .builder
-                .ins()
-                .f32const(seismic_lang::registry::f16_to_f32(value)),
-            ConstantValue::BF16(value) => self
-                .builder
-                .ins()
-                .f32const(f32::from_bits(u32::from(value) << 16)),
+            ConstantValue::F16(value) | ConstantValue::BF16(value) => {
+                self.builder.ins().iconst(types::I32, i64::from(value))
+            }
             ConstantValue::I32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::U32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::Bool(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
@@ -831,6 +852,8 @@ impl Emitter<'_, '_> {
     }
 
     fn binary(&mut self, op: BinaryOp, ty: ValueType, a: Value, b: Value) -> Value {
+        let a = self.numeric_operand(a, ty);
+        let b = self.numeric_operand(b, ty);
         let value = match ty {
             ValueType::Scalar(dtype) if dtype.is_float() => match op {
                 BinaryOp::Add => self.builder.ins().fadd(a, b),
@@ -877,6 +900,11 @@ impl Emitter<'_, '_> {
 
     fn vector_binary(&mut self, op: BinaryOp, ty: ValueType, a: Value, b: Value) -> Value {
         let (dtype, _) = vector_shape(ty);
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            return self.map_vector_binary(ty, a, b, |this, a, b| {
+                this.binary(op, ValueType::Scalar(dtype), a, b)
+            });
+        }
         let value = if dtype.is_float() {
             match op {
                 BinaryOp::Add => self.builder.ins().fadd(a, b),
@@ -934,11 +962,14 @@ impl Emitter<'_, '_> {
                 _ => unreachable!("non-lane-mapped integer vector operation"),
             }
         };
-        self.round_vector(value, ty)
+        value
     }
 
     fn vector_unary(&mut self, op: UnaryOp, ty: ValueType, value: Value) -> Value {
         let dtype = vector_dtype(ty);
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            return self.map_vector_unary(ty, value, |this, lane| this.narrow_sign(op, lane));
+        }
         let value = if dtype.is_float() {
             match op {
                 UnaryOp::Neg => self.builder.ins().fneg(value),
@@ -957,7 +988,7 @@ impl Emitter<'_, '_> {
         } else {
             panic!("unsigned vector reached a signed unary operation")
         };
-        self.round_vector(value, ty)
+        value
     }
 
     fn map_vector_unary(
@@ -1018,19 +1049,9 @@ impl Emitter<'_, '_> {
         result.expect("typed vectors have at least one lane")
     }
 
-    fn round_vector(&mut self, value: Value, ty: ValueType) -> Value {
-        let dtype = vector_dtype(ty);
-        if !dtype.is_float() || dtype == DType::F32 {
-            return value;
-        }
-        self.map_vector_unary(ty, value, |this, lane| {
-            this.round_value(lane, ValueType::Scalar(dtype))
-        })
-    }
-
     fn math(&mut self, op: MathOp, a: Value) -> Value {
         match op {
-            MathOp::Exp | MathOp::ExpFast => self.call_float1(HostImport::ApproxExp, a),
+            MathOp::Exp => self.call_float1(HostImport::ApproxExp, a),
             MathOp::Log => self.call_float1(HostImport::ApproxLog, a),
             MathOp::Sin => self.call_float1(HostImport::ApproxSin, a),
             MathOp::Cos => self.call_float1(HostImport::ApproxCos, a),
@@ -1048,6 +1069,8 @@ impl Emitter<'_, '_> {
     }
 
     fn compare(&mut self, op: CmpOp, operand_type: ValueType, a: Value, b: Value) -> Value {
+        let a = self.numeric_operand(a, operand_type);
+        let b = self.numeric_operand(b, operand_type);
         let condition = match operand_type {
             ValueType::Scalar(dtype) if dtype.is_float() => self.builder.ins().fcmp(
                 match op {
@@ -1097,6 +1120,7 @@ impl Emitter<'_, '_> {
         if from == to {
             return value;
         }
+        let value = self.numeric_operand(value, from);
         let from_float = matches!(from, ValueType::Scalar(dtype) if dtype.is_float());
         let to_float = matches!(to, ValueType::Scalar(dtype) if dtype.is_float());
         let from_bool = matches!(from, ValueType::Bool | ValueType::Scalar(DType::Bool));
@@ -1141,9 +1165,8 @@ impl Emitter<'_, '_> {
                 _ => panic!("typed scalar cast contains a non-scalar source"),
             }
         } else {
-            // Integer-to-integer casts preserve the low 32 bits. `Index`
-            // is represented as I64 natively but is the language's u32
-            // index domain, matching the other native backends.
+            // Source integer conversions preserve the low 32 bits;
+            // an internal natural destination zero-extends that word.
             let word = if from == ValueType::Index {
                 self.builder.ins().ireduce(types::I32, value)
             } else {
@@ -1165,9 +1188,42 @@ impl Emitter<'_, '_> {
         if !dtype.is_float() || dtype == DType::F32 {
             return value;
         }
-        let promoted = self.builder.ins().fpromote(types::F64, value);
-        let rounded = self.call(round_import(dtype), &[promoted]);
-        self.builder.ins().fdemote(types::F32, rounded)
+        match dtype {
+            DType::F16 => self.call(HostImport::F16Store, &[value]),
+            DType::BF16 => {
+                let promoted = self.builder.ins().fpromote(types::F64, value);
+                let rounded = self.call(round_import(dtype), &[promoted]);
+                let rounded = self.builder.ins().fdemote(types::F32, rounded);
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I32, MemFlags::new(), rounded);
+                self.builder.ins().ushr_imm(bits, 16)
+            }
+            _ => unreachable!("narrow floating operation result"),
+        }
+    }
+
+    fn narrow_sign(&mut self, op: UnaryOp, value: Value) -> Value {
+        match op {
+            UnaryOp::Neg => self.builder.ins().bxor_imm(value, 0x8000),
+            UnaryOp::Abs => self.builder.ins().band_imm(value, 0x7fff),
+        }
+    }
+
+    fn numeric_operand(&mut self, value: Value, ty: ValueType) -> Value {
+        match ty {
+            ValueType::Scalar(dtype @ (DType::F16 | DType::BF16)) => self.to_f32(value, dtype),
+            _ => value,
+        }
+    }
+
+    fn fma(&mut self, ty: ValueType, a: Value, b: Value, c: Value) -> Value {
+        let a = self.numeric_operand(a, ty);
+        let b = self.numeric_operand(b, ty);
+        let c = self.numeric_operand(c, ty);
+        let result = self.builder.ins().fma(a, b, c);
+        self.round_value(result, ty)
     }
 
     fn signed_euclid(&mut self, lhs: Value, rhs: Value) -> (Value, Value) {
@@ -1218,6 +1274,9 @@ impl Emitter<'_, '_> {
                 self.word(self.layout.words.grid_first + u32::from(axis))
             }
             GeometryValue::SubgroupLane => self.builder.ins().iconst(types::I64, 0),
+            // CPU subgroups have one physical participant.
+            GeometryValue::SubgroupOrdinal => self.linear_local,
+            GeometryValue::SubgroupSize => self.builder.ins().iconst(types::I64, 1),
         }
     }
 
@@ -1310,87 +1369,14 @@ impl Emitter<'_, '_> {
         )
     }
 
-    fn read(&mut self, place: &ClosedReadablePlace, coordinates: &[Value]) -> Value {
-        let (address, geometry, logical_last) = self.address(place, coordinates);
-        match &geometry {
-            ReadableRepresentationGeometry::Dense(geometry) => {
-                self.load_element(address, geometry.dtype)
-            }
-            ReadableRepresentationGeometry::Packed(geometry) => {
-                let layout = &geometry.layout;
-                let recipe = &geometry.decode;
-                let mut temps = Vec::with_capacity(recipe.temporary_count());
-                for step in recipe.steps() {
-                    let value = match step {
-                        DecodeStep::ReadPlaneField { into, plane, field } => {
-                            let _ = into;
-                            self.read_plane_field(
-                                address,
-                                logical_last,
-                                layout.group,
-                                &layout.planes[*plane as usize],
-                                *field,
-                            )
-                        }
-                        DecodeStep::InterpretCode {
-                            into,
-                            raw,
-                            bits,
-                            interpretation,
-                        } => {
-                            let _ = into;
-                            self.interpret(temps[recipe.ordinal(*raw)], *bits, interpretation)
-                        }
-                        DecodeStep::DecodeFloatCode { into, raw, format } => {
-                            let _ = into;
-                            let raw = temps[recipe.ordinal(*raw)];
-                            self.call(float_code_import(*format), &[raw])
-                        }
-                        DecodeStep::ConvertToF32 { into, from } => {
-                            let _ = into;
-                            let from_ty = recipe.dtype(*from);
-                            let raw = temps[recipe.ordinal(*from)];
-                            self.to_f32(raw, from_ty)
-                        }
-                        DecodeStep::Multiply { into, left, right } => {
-                            let _ = into;
-                            let l = temps[recipe.ordinal(*left)];
-                            let r = temps[recipe.ordinal(*right)];
-                            self.builder.ins().fmul(l, r)
-                        }
-                        DecodeStep::Negate { into, from } => {
-                            let _ = into;
-                            let value = temps[recipe.ordinal(*from)];
-                            self.builder.ins().fneg(value)
-                        }
-                        DecodeStep::MultiplyAdd {
-                            into,
-                            factor,
-                            multiplicand,
-                            addend,
-                        } => {
-                            let _ = into;
-                            let f = temps[recipe.ordinal(*factor)];
-                            let m = temps[recipe.ordinal(*multiplicand)];
-                            let a = temps[recipe.ordinal(*addend)];
-                            self.builder.ins().fma(f, m, a)
-                        }
-                        DecodeStep::Cast { into, from, to } => {
-                            let _ = into;
-                            let value = temps[recipe.ordinal(*from)];
-                            self.round_value(value, ValueType::Scalar(*to))
-                        }
-                    };
-                    temps.push(value);
-                }
-                temps[recipe.ordinal(recipe.output())]
-            }
-        }
+    fn read(&mut self, place: &ClosedDensePlace, coordinates: &[Value]) -> Value {
+        let (address, geometry, _) = self.address(place, coordinates);
+        self.load_element(address, geometry.dtype)
     }
 
     fn vector_read(
         &mut self,
-        place: &ClosedReadablePlace,
+        place: &ClosedDensePlace,
         coordinates: &[Value],
         axis: u32,
         active: Value,
@@ -1442,20 +1428,30 @@ impl Emitter<'_, '_> {
         result.expect("typed vectors have at least one lane")
     }
 
-    fn read_plane(
-        &mut self,
-        place: &ClosedPackedPlace,
-        plane: usize,
-        coordinates: &[Value],
-    ) -> Value {
-        let (packet, geometry, logical_last) = self.address(place, coordinates);
-        self.read_plane_field(
-            packet,
-            logical_last,
-            geometry.layout.group,
-            &geometry.layout.planes[plane],
-            0,
-        )
+    fn read_plane(&mut self, place: &ClosedPackedPlace, plane: usize, coordinates: &[Value], element: Value) -> Value {
+        let (packet, geometry, _) = self.address(place, coordinates);
+        let schema = &geometry.layout.planes[plane];
+        let base = self.builder.ins().iadd_imm(packet, i64::from(schema.offset));
+        let offset = self.builder.ins().imul_imm(element, i64::from(schema.storage_element_bytes()));
+        if let PlaneEncoding::Dense(dtype) = schema.encoding {
+            let address = self.builder.ins().iadd(base, offset);
+            return self.load_element(address, dtype);
+        }
+        let mut output = self.builder.ins().iconst(types::I32, 0);
+        let last = self.builder.ins().iconst(types::I64, i64::from(schema.bytes_per_group - 1));
+        let zero = output;
+        for byte in 0..schema.storage_element_bytes() {
+            let position = self.builder.ins().iadd_imm(offset, i64::from(byte));
+            let within = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, position, last);
+            let safe = self.builder.ins().select(within, position, last);
+            let address = self.builder.ins().iadd(base, safe);
+            let loaded = self.builder.ins().load(types::I8, MemFlags::trusted(), address, 0);
+            let loaded = self.builder.ins().uextend(types::I32, loaded);
+            let loaded = self.builder.ins().select(within, loaded, zero);
+            let shifted = self.builder.ins().ishl_imm(loaded, i64::from(byte * 8));
+            output = self.builder.ins().bor(output, shifted);
+        }
+        output
     }
 
     fn read_plane_field(
@@ -1494,32 +1490,16 @@ impl Emitter<'_, '_> {
         }
     }
 
-    fn interpret(&mut self, raw: Value, bits: u32, interpretation: &CodeInterpretation) -> Value {
-        match interpretation {
-            CodeInterpretation::Unsigned => raw,
-            CodeInterpretation::TwosComplement => {
-                let shift = 32 - bits;
-                let shifted = self.builder.ins().ishl_imm(raw, i64::from(shift));
-                self.builder.ins().sshr_imm(shifted, i64::from(shift))
-            }
-            CodeInterpretation::Offset(offset) => {
-                self.builder.ins().iadd_imm(raw, -i64::from(*offset))
-            }
-            CodeInterpretation::Table(table) => {
-                let mut value = self.builder.ins().iconst(types::I32, i64::from(table[0]));
-                for (index, entry) in table.iter().copied().enumerate().skip(1) {
-                    let matches = self.builder.ins().icmp_imm(IntCC::Equal, raw, index as i64);
-                    let entry = self.builder.ins().iconst(types::I32, i64::from(entry));
-                    value = self.builder.ins().select(matches, entry, value);
-                }
-                value
-            }
-        }
-    }
-
     fn to_f32(&mut self, value: Value, dtype: DType) -> Value {
         match dtype {
-            DType::F32 | DType::F16 | DType::BF16 => value,
+            DType::F32 => value,
+            DType::F16 => self.call(HostImport::F16Load, &[value]),
+            DType::BF16 => {
+                let shifted = self.builder.ins().ishl_imm(value, 16);
+                self.builder
+                    .ins()
+                    .bitcast(types::F32, MemFlags::new(), shifted)
+            }
             DType::I32 => self.builder.ins().fcvt_from_sint(types::F32, value),
             DType::U32 | DType::Bool => self.builder.ins().fcvt_from_uint(types::F32, value),
         }
@@ -1702,24 +1682,12 @@ impl Emitter<'_, '_> {
                     .load(types::I8, MemFlags::trusted(), address, 0);
                 self.builder.ins().uextend(types::I32, value)
             }
-            DType::F16 => {
+            DType::F16 | DType::BF16 => {
                 let bits = self
                     .builder
                     .ins()
                     .load(types::I16, MemFlags::trusted(), address, 0);
-                let bits = self.builder.ins().uextend(types::I32, bits);
-                self.call(HostImport::F16Load, &[bits])
-            }
-            DType::BF16 => {
-                let bits = self
-                    .builder
-                    .ins()
-                    .load(types::I16, MemFlags::trusted(), address, 0);
-                let bits = self.builder.ins().uextend(types::I32, bits);
-                let shifted = self.builder.ins().ishl_imm(bits, 16);
-                self.builder
-                    .ins()
-                    .bitcast(types::F32, MemFlags::new(), shifted)
+                self.builder.ins().uextend(types::I32, bits)
             }
         }
     }
@@ -1728,18 +1696,7 @@ impl Emitter<'_, '_> {
         let stored = match dtype {
             DType::F32 | DType::I32 | DType::U32 => value,
             DType::Bool => self.builder.ins().ireduce(types::I8, value),
-            DType::F16 => {
-                let bits = self.call(HostImport::F16Store, &[value]);
-                self.builder.ins().ireduce(types::I16, bits)
-            }
-            DType::BF16 => {
-                let bits = self
-                    .builder
-                    .ins()
-                    .bitcast(types::I32, MemFlags::new(), value);
-                let shifted = self.builder.ins().ushr_imm(bits, 16);
-                self.builder.ins().ireduce(types::I16, shifted)
-            }
+            DType::F16 | DType::BF16 => self.builder.ins().ireduce(types::I16, value),
         };
         self.builder
             .ins()
@@ -1755,16 +1712,9 @@ impl Emitter<'_, '_> {
                     .bitcast(types::F32, MemFlags::new(), bits)
             }
             DType::I32 | DType::U32 | DType::Bool => self.builder.ins().ireduce(types::I32, word),
-            DType::F16 => {
+            DType::F16 | DType::BF16 => {
                 let bits = self.builder.ins().ireduce(types::I32, word);
-                self.call(HostImport::F16Load, &[bits])
-            }
-            DType::BF16 => {
-                let bits = self.builder.ins().ireduce(types::I32, word);
-                let bits = self.builder.ins().ishl_imm(bits, 16);
-                self.builder
-                    .ins()
-                    .bitcast(types::F32, MemFlags::new(), bits)
+                self.builder.ins().band_imm(bits, 0xffff)
             }
         }
     }
@@ -1776,14 +1726,7 @@ impl Emitter<'_, '_> {
                 .ins()
                 .bitcast(types::I32, MemFlags::new(), value),
             DType::I32 | DType::U32 | DType::Bool => value,
-            DType::F16 => self.call(HostImport::F16Store, &[value]),
-            DType::BF16 => {
-                let bits = self
-                    .builder
-                    .ins()
-                    .bitcast(types::I32, MemFlags::new(), value);
-                self.builder.ins().ushr_imm(bits, 16)
-            }
+            DType::F16 | DType::BF16 => self.builder.ins().band_imm(value, 0xffff),
         };
         self.builder.ins().uextend(types::I64, raw)
     }
@@ -1957,21 +1900,6 @@ impl CpuAddressGeometry for PackedRepresentationGeometry {
     }
 }
 
-impl CpuAddressGeometry for ReadableRepresentationGeometry {
-    fn packet_group(&self) -> Option<u32> {
-        match self {
-            Self::Dense(geometry) => geometry.packet_group(),
-            Self::Packed(geometry) => geometry.packet_group(),
-        }
-    }
-    fn unit_bytes(&self) -> u64 {
-        match self {
-            Self::Dense(geometry) => geometry.unit_bytes(),
-            Self::Packed(geometry) => geometry.unit_bytes(),
-        }
-    }
-}
-
 fn native_type(ty: ValueType) -> ir::Type {
     match ty {
         ValueType::Scalar(dtype) => native_scalar_type(dtype),
@@ -1985,9 +1913,7 @@ fn native_type(ty: ValueType) -> ir::Type {
 }
 
 fn native_scalar_type(dtype: DType) -> ir::Type {
-    if dtype.is_float() {
-        // F16/BF16 values remain widened between explicit registry rounding
-        // boundaries, exactly like scalar kernel values.
+    if dtype == DType::F32 {
         types::F32
     } else {
         types::I32
@@ -2006,7 +1932,7 @@ fn vector_dtype(ty: ValueType) -> DType {
 }
 
 fn scalar_zero(builder: &mut FunctionBuilder<'_>, dtype: DType) -> Value {
-    if dtype.is_float() {
+    if dtype == DType::F32 {
         builder.ins().f32const(0.0)
     } else {
         builder.ins().iconst(types::I32, 0)

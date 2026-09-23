@@ -9,18 +9,26 @@
 mod call;
 mod entry_build;
 mod expr;
+mod initialization;
+#[cfg(test)]
+mod initialization_tests;
+#[cfg(test)]
+mod stable_identity_tests;
 pub(crate) mod ir;
-mod prove;
+mod ownership;
+#[cfg(test)]
+mod ownership_tests;
+pub(crate) mod prove;
 pub(crate) mod resolve;
 mod stmt;
-mod xfer;
+pub(crate) mod xfer;
 
 pub(crate) use entry_build::build_entry;
 
 use self::ir::{
     Block as CheckedBlock, Body as CheckedBody, DefKind, Expr as CheckedExpr,
-    ExprKind as CheckedExprKind, Index as CheckedIndex, Local as CheckedLocal, LocalId,
-    Ownership as ParamOwnership, Predicate,
+    ExprKind as CheckedExprKind, Local as CheckedLocal, LocalId, Ownership as ParamOwnership,
+    Predicate,
 };
 use crate::checked::EntryInfo;
 use crate::expr::{ExprArena, IntExpr, SymbolId};
@@ -68,10 +76,6 @@ pub(crate) struct Summary {
     pub reduces: BTreeSet<String>,
     /// `(callee definition, callee parameter, own parameter)`: passed along unchanged.
     pub passes: Vec<(usize, String, String)>,
-    /// Exclusive tensor parameters definitely initialized on every path before return.
-    pub full_init: BTreeSet<usize>,
-    /// Exclusive own parameter forwarded to every candidate parameter at one call site.
-    pub init_passes: Vec<(Vec<(usize, usize)>, usize)>,
 }
 
 pub(crate) struct Env<'a> {
@@ -79,18 +83,7 @@ pub(crate) struct Env<'a> {
     pub summaries: &'a [Summary],
     /// Second pass: summaries are complete.
     pub enforce: bool,
-}
-
-/// Loop context for the mutation summary and carry analysis.
-pub(crate) struct LoopCtx {
-    /// Locals declared before the loop (captured floor).
-    pub floor: usize,
-    /// Captured storage roots written by the body so far.
-    pub writes: Vec<LocalId>,
-    /// Captured storage roots written whole (not through the binder).
-    pub whole_writes: Vec<LocalId>,
-    /// Storage roots updated atomically.
-    pub atomics: Vec<LocalId>,
+    checked: &'a [Option<CheckedOutcome>],
 }
 
 pub(crate) struct Checker<'a> {
@@ -109,26 +102,14 @@ pub(crate) struct Checker<'a> {
     pub facts: Facts,
     pub symbols: HashMap<LocalId, SymbolId>,
     pub scalar_symbols: HashMap<LocalId, IntExpr>,
-    pub unassigned: HashSet<LocalId>,
-    /// Tiles the current complete-traversal loop assigns by its first write at
-    /// the loop's own coordinates.
-    pub pending_full_assign: Vec<(LocalId, Vec<LocalId>)>,
-    /// Complete logical `0..axis` traversals may collectively initialize
-    /// uninitialized storage.
-    pub init_loop_depth: usize,
     /// Runtime-bounded range views: (start, end, parent extent, realized-length atom).
     pub dyn_views: Vec<(Option<CheckedExpr>, Option<CheckedExpr>, IntExpr, SymbolId)>,
-    /// For each view binding: the storage root it selects.
-    pub view_roots: HashMap<LocalId, LocalId>,
-    /// For each `let`-bound view: how many writes had happened when it was bound.
-    pub view_bound: HashMap<LocalId, usize>,
     pub mutated: Vec<LocalId>,
     /// Storage roots read so far.
     pub reads: Vec<LocalId>,
     /// Active independent (`parallel for`) loops: (captured floor, binder).
     pub logical_parallel: Vec<(usize, LocalId)>,
     /// Active loop contexts (innermost last).
-    pub loops: Vec<LoopCtx>,
     /// Depth of enclosing loops; `return` is invalid inside.
     pub loop_depth: usize,
     pub summary: Summary,
@@ -136,10 +117,6 @@ pub(crate) struct Checker<'a> {
     pub counter: usize,
     /// Names whose binding was rejected; uses of them are not reported again.
     pub poisoned: HashSet<String>,
-    /// Owned tensor bindings consumed by a source-level move.
-    pub moved: HashSet<LocalId>,
-    /// Lexically live view borrows: binding -> (storage root, exclusive).
-    pub borrows: HashMap<LocalId, (LocalId, bool)>,
     pub arena: ExprArena,
 }
 
@@ -162,23 +139,15 @@ impl<'a> Checker<'a> {
             facts: Facts::new(),
             symbols: HashMap::new(),
             scalar_symbols: HashMap::new(),
-            unassigned: HashSet::new(),
-            pending_full_assign: Vec::new(),
-            init_loop_depth: 0,
             dyn_views: Vec::new(),
-            view_roots: HashMap::new(),
-            view_bound: HashMap::new(),
             mutated: Vec::new(),
             reads: Vec::new(),
             logical_parallel: Vec::new(),
-            loops: Vec::new(),
             loop_depth: 0,
             summary: Summary::default(),
             diagnostics: Vec::new(),
             counter: 0,
             poisoned: HashSet::new(),
-            moved: HashSet::new(),
-            borrows: HashMap::new(),
             arena,
         };
         // Shape parameters are positive extents unless a `where` admits zero.
@@ -264,7 +233,9 @@ impl<'a> Checker<'a> {
         let id = LocalId::new(
             u32::try_from(self.locals.len()).expect("definition has more than u32::MAX locals"),
         );
+        let ownership = self.default_ownership(id, &ty, kind);
         self.locals.push(CheckedLocal {
+            ownership,
             name: name.to_string(),
             ty,
             mutable,
@@ -420,7 +391,7 @@ impl<'a> Checker<'a> {
     /// The storage root a place or value expression designates, if any.
     pub fn root_var(&self, e: &CheckedExpr) -> Option<LocalId> {
         match &e.kind {
-            CheckedExprKind::Local(v) => Some(self.view_roots.get(v).copied().unwrap_or(*v)),
+            CheckedExprKind::Local(v) => Some(self.local_storage_root(*v)),
             CheckedExprKind::Primitive { id, operands } => match id {
                 PrimitiveId::SliceView { .. } | PrimitiveId::Transpose | PrimitiveId::Reshape => {
                     operands.first().and_then(|b| self.root_var(b))
@@ -435,97 +406,17 @@ impl<'a> Checker<'a> {
 
     /// How the storage of an expression is reached.
     pub fn class_of(&self, e: &CheckedExpr) -> ValueClass {
-        match &e.kind {
-            CheckedExprKind::Literal(_) => ValueClass::Scalar,
-            CheckedExprKind::Dimension(_) => ValueClass::Scalar,
-            CheckedExprKind::Local(v) => {
-                if self.view_roots.contains_key(v) {
-                    return ValueClass::Borrowed;
-                }
-                match self.kinds[v.index()] {
-                    LocalKind::Param(i) => match self.sig.params[i].ownership {
-                        ParamOwnership::Owned => {
-                            if matches!(self.locals[v.index()].ty, ValueType::Tensor(_)) {
-                                ValueClass::Owned
-                            } else {
-                                ValueClass::Scalar
-                            }
-                        }
-                        ParamOwnership::Shared | ParamOwnership::Exclusive => {
-                            if matches!(self.locals[v.index()].ty, ValueType::Tensor(_)) {
-                                ValueClass::Borrowed
-                            } else {
-                                ValueClass::Scalar
-                            }
-                        }
-                        ParamOwnership::Value => ValueClass::Scalar,
-                    },
-                    LocalKind::State => {
-                        if matches!(self.locals[v.index()].ty, ValueType::Tensor(_)) {
-                            ValueClass::Owned
-                        } else {
-                            ValueClass::Scalar
-                        }
-                    }
-                    LocalKind::Value => ValueClass::Computed,
-                    LocalKind::Binder => ValueClass::Scalar,
-                }
-            }
-            CheckedExprKind::Primitive { id, .. } => match id {
-                PrimitiveId::Constant(_) | PrimitiveId::Symbolic(_) => ValueClass::Scalar,
-                PrimitiveId::ElementRead { .. } => ValueClass::Scalar,
-                PrimitiveId::SliceView { .. } | PrimitiveId::Transpose | PrimitiveId::Reshape => {
-                    ValueClass::Borrowed
-                }
-                PrimitiveId::Load
-                | PrimitiveId::Decode
-                | PrimitiveId::Unary(_)
-                | PrimitiveId::Binary(_)
-                | PrimitiveId::Cast(_)
-                | PrimitiveId::Math(_)
-                | PrimitiveId::Select
-                | PrimitiveId::Reduce { .. }
-                | PrimitiveId::Extent { .. } => {
-                    if e.ty.scalar_dtype().is_some() {
-                        ValueClass::Scalar
-                    } else {
-                        ValueClass::Computed
-                    }
-                }
-                PrimitiveId::TensorAlloc
-                | PrimitiveId::Fill(_)
-                | PrimitiveId::Materialize
-                | PrimitiveId::Clone
-                | PrimitiveId::RepresentationConvert(_) => ValueClass::Owned,
-                PrimitiveId::TuplePack => ValueClass::Computed,
-                PrimitiveId::TupleGet(_)
-                | PrimitiveId::RangeMake
-                | PrimitiveId::RangeStart
-                | PrimitiveId::RangeEnd => ValueClass::Scalar,
-                PrimitiveId::Atomic { .. } => ValueClass::Scalar,
-            },
-            CheckedExprKind::PlaneView { .. } => ValueClass::Borrowed,
-            CheckedExprKind::Atomic { .. } => ValueClass::Scalar,
-            CheckedExprKind::Intrinsic { .. } => ValueClass::Scalar,
-            CheckedExprKind::Call { .. } => match &e.ty {
-                ValueType::Tensor(_) => ValueClass::Owned,
-                ValueType::Tuple(_) => ValueClass::Computed,
-                _ => ValueClass::Scalar,
-            },
-        }
+        self.ownership_class(e)
     }
 
     /// Whether writes may target the storage rooted at `id`.
     pub fn writable_root(&self, id: LocalId) -> bool {
-        match self.kinds[id.index()] {
-            LocalKind::Param(i) => self.sig.params[i].ownership == ParamOwnership::Exclusive,
-            LocalKind::State => true,
-            _ => false,
-        }
+        self.writable_place(&ownership::LocalPlace::root(id))
     }
 
-    /// Recover the exact participant identity whose disjointness proof was
-    /// consumed by `write`. Sequential writes need no parallel authority.
+    /// Carry the captured participant and actual place into the checked
+    /// semantic write. The source-order access walk decides independence for
+    /// the complete body before any checked definition is published.
     pub(crate) fn exclusive_write_authority(
         &self,
         root: LocalId,
@@ -549,66 +440,9 @@ impl<'a> Checker<'a> {
 
     // ---- effects ----
 
-    /// Prove that distinct visits of the enclosing `parallel for` loops in
-    /// `binders` write distinct elements through `indices`.
-    ///
-    /// A binder is proven by a point axis whose index is affine in it with a
-    /// nonzero coefficient once every other binder on that axis is already
-    /// proven; several unproven binders on one axis are proven together when
-    /// their coefficients form a mixed radix over the binders' ranges (each
-    /// coefficient exceeds the reach of the smaller ones). A slice
-    /// `c*v + d : c*v + d + len` proves `v` when `len <= c`. Data-dependent,
-    /// nonlinear, and unbounded indices prove nothing. Returns the first
-    /// binder that stays unproven.
-    fn disjoint_visits(
-        &self,
-        indices: &[CheckedIndex],
-        binders: &[LocalId],
-    ) -> Result<(), LocalId> {
-        let symbols: Vec<_> = binders
-            .iter()
-            .map(|binder| self.symbols.get(binder).copied())
-            .collect();
-        if symbols.iter().any(Option::is_none) {
-            return Err(binders[symbols
-                .iter()
-                .position(Option::is_none)
-                .expect("missing symbol was observed")]);
-        }
-        let axes: Vec<_> = indices
-            .iter()
-            .map(|index| match index {
-                CheckedIndex::Point { value, .. } => value
-                    .sym
-                    .map(prove::WriteAxis::Point)
-                    .unwrap_or(prove::WriteAxis::Opaque),
-                CheckedIndex::Range {
-                    start: Some(start),
-                    end: Some(end),
-                    ..
-                } => match (start.sym, end.sym) {
-                    (Some(start), Some(end)) => prove::WriteAxis::Slice { start, end },
-                    _ => prove::WriteAxis::Opaque,
-                },
-                CheckedIndex::Range { .. } => prove::WriteAxis::Opaque,
-            })
-            .collect();
-        let symbols: Vec<_> = symbols.into_iter().flatten().collect();
-        prove::disjoint_visits(&self.arena, &self.facts, &axes, &symbols)
-            .map_err(|ordinal| binders[ordinal])
-    }
-
-    /// Check and record a write to the storage `place` designates. `whole` is
-    /// an update of the state object itself (assignment, `inout` of the whole
-    /// variable).
-    pub fn write(
-        &mut self,
-        root: LocalId,
-        binding: LocalId,
-        indices: &[CheckedIndex],
-        whole: bool,
-        span: Span,
-    ) -> Option<LocalId> {
+    /// Check that the selected storage can be written. The source-order
+    /// region walk decides independent-loop access legality for the body.
+    pub fn write(&mut self, root: LocalId, binding: LocalId, span: Span) -> Option<LocalId> {
         let binding_name = self.locals[binding.index()].name.clone();
         match &self.kinds[binding.index()] {
             LocalKind::Param(i) if self.sig.params[*i].ownership == ParamOwnership::Owned => {
@@ -619,7 +453,7 @@ impl<'a> Checker<'a> {
                 return None;
             }
             LocalKind::Param(_) | LocalKind::State => {}
-            LocalKind::Value if self.view_roots.contains_key(&binding) => {}
+            LocalKind::Value if self.is_borrowed_local(binding) => {}
             _ => {
                 self.error(
                     span,
@@ -628,7 +462,7 @@ impl<'a> Checker<'a> {
                 return None;
             }
         }
-        if !self.writable_root(root) {
+        if !self.writable_root(binding) || !self.writable_root(root) {
             self.error(
                 span,
                 format!(
@@ -655,9 +489,9 @@ impl<'a> Checker<'a> {
             }
         }
         if self
-            .borrows
+            .live_borrows()
             .iter()
-            .any(|(borrow, (borrowed, _))| *borrowed == root && *borrow != binding)
+            .any(|(borrow, borrowed, _)| borrowed.local == root && borrow.local != binding)
         {
             self.error(
                 span,
@@ -668,41 +502,10 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let capturing: Vec<LocalId> = self
-            .logical_parallel
-            .iter()
-            .filter(|(floor, _)| root.index() < *floor)
-            .map(|(_, binder)| *binder)
-            .collect();
-        if !capturing.is_empty() {
-            if whole {
-                self.error(
-                    span,
-                    "a `parallel for` body may mutate captured tensor storage only through an index that depends on its loop variable; a whole-value update is shared by every visit",
-                );
-                return None;
-            }
-            if let Err(binder) = self.disjoint_visits(indices, &capturing) {
-                let binder_name = self.locals[binder.index()].name.clone();
-                let root_name = self.locals[root.index()].name.clone();
-                self.error(
-                    span,
-                    format!(
-                        "a `parallel for` body may mutate captured tensor storage only through an index that depends on its loop variable injectively: distinct visits of `{binder_name}` are not proved to write distinct elements of `{root_name}`; index with `{binder_name}`, `c*{binder_name} + d` or `{binder_name}*c : ({binder_name}+1)*c`, or update with `atomic(add|max|min, place, value)`"
-                    ),
-                );
-                return None;
-            }
-        }
-        // Record the write in the enclosing loop contexts (carry/disjointness).
-        for ctx in self.loops.iter_mut() {
-            if root.index() < ctx.floor {
-                ctx.writes.push(root);
-                if whole {
-                    ctx.whole_writes.push(root);
-                }
-            }
-        }
+        // The source-order region walk checks every ordinary read/write and
+        // write/write pair across distinct visits, including effects of calls
+        // and views. A single-site index test would both miss collisions and
+        // reject safe helper calls whose actual footprint is disjoint.
         self.mutated.push(root);
         self.scalar_symbols.remove(&root);
         let tensor_effect = matches!(self.locals[root.index()].ty, ValueType::Tensor(_));
@@ -774,221 +577,28 @@ struct CheckedOutcome {
     diagnostics: Vec<Diagnostic>,
     arena: ExprArena,
     signature: BodySig,
+    initialization: initialization::Contract,
 }
 
 fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
     let declared = &env.resolved.declared[def];
     let mut c = Checker::new(env, def);
-    let root = c.block(declared.body);
-    let facts = c.facts.clone();
-    let (body, signature, mut summary, diagnostics, mut arena) = c.finish(root, declared.name_span);
-    for (parameter, declared_param) in declared.sig.params.iter().enumerate() {
-        if declared_param.ownership == ParamOwnership::Exclusive {
-            if let ValueType::Tensor(shaped) = &body.locals[parameter].ty {
-                if definitely_initializes(&mut arena, &body, parameter, shaped, &facts) {
-                    summary.full_init.insert(parameter);
-                }
-            }
-        }
-    }
+    let initialization_facts = c.facts.clone();
+    let mut root = c.block(declared.body);
+    let initialization = if env.enforce {
+        initialization::check(&mut c, &mut root, initialization_facts)
+    } else {
+        initialization::Contract::empty()
+    };
+    let (body, signature, summary, diagnostics, arena) = c.finish(root, declared.name_span);
     CheckedOutcome {
         body,
         summary,
         diagnostics,
         arena,
         signature,
+        initialization,
     }
-}
-
-/// Whether a body definitely initializes every element of `parameter`.
-/// Parameters are the first locals of a checked body, in parameter order.
-fn definitely_initializes(
-    arena: &mut ExprArena,
-    body: &CheckedBody,
-    parameter: usize,
-    shaped: &TensorType,
-    facts: &Facts,
-) -> bool {
-    writes_cover(
-        arena,
-        &body.locals,
-        &body.root,
-        LocalId::new(u32::try_from(parameter).expect("parameter ordinal exceeds u32::MAX")),
-        &shaped.axes,
-        &[],
-        facts,
-    )
-}
-
-/// Whether the block writes every element of `local` on every path, under the
-/// complete traversals in `loops` (binder, bound).
-pub(crate) fn writes_cover(
-    arena: &mut ExprArena,
-    locals: &[CheckedLocal],
-    block: &CheckedBlock,
-    local: LocalId,
-    extents: &[IntExpr],
-    loops: &[(LocalId, IntExpr)],
-    facts: &Facts,
-) -> bool {
-    fn point_covers(
-        arena: &mut ExprArena,
-        locals: &[CheckedLocal],
-        point: &CheckedExpr,
-        extent: IntExpr,
-        loops: &[(LocalId, IntExpr)],
-    ) -> bool {
-        match &point.kind {
-            CheckedExprKind::Local(var) => loops
-                .iter()
-                .any(|(loop_var, bound)| loop_var == var && prove::same(arena, *bound, extent)),
-            _ => {
-                if prove::constant(arena, extent) == Some(1)
-                    && point.sym.is_some_and(|value| prove::is_zero(arena, value))
-                {
-                    return true;
-                }
-                let mut total = arena.int(1);
-                let mut linear = arena.int(0);
-                for (var, bound) in loops {
-                    let Some(symbol) = locals[var.index()].symbol else {
-                        return false;
-                    };
-                    let coordinate = arena.int_symbol(symbol);
-                    let scaled = arena.int_mul(linear, *bound);
-                    linear = arena.int_add(scaled, coordinate);
-                    total = arena.int_mul(total, *bound);
-                }
-                prove::same(arena, total, extent)
-                    && point
-                        .sym
-                        .is_some_and(|value| prove::same(arena, value, linear))
-            }
-        }
-    }
-    fn index_covers(
-        arena: &mut ExprArena,
-        locals: &[CheckedLocal],
-        index: &CheckedIndex,
-        extent: IntExpr,
-        loops: &[(LocalId, IntExpr)],
-        facts: &Facts,
-    ) -> bool {
-        match index {
-            CheckedIndex::Point { value, .. } => point_covers(arena, locals, value, extent, loops),
-            CheckedIndex::Range { start, end, .. } => {
-                let full = start.as_ref().is_none_or(|start| {
-                    start.sym.is_some_and(|value| prove::is_zero(arena, value))
-                }) && end.as_ref().is_none_or(|end| {
-                    end.sym
-                        .is_some_and(|value| prove::same(arena, value, extent))
-                });
-                full || loops.iter().any(|(var, partitions)| {
-                    let width = arena.int_div(extent, *partitions);
-                    let covered = arena.int_mul(width, *partitions);
-                    let difference = arena.int_sub(covered, extent);
-                    if !prove::zero(arena, facts, difference) {
-                        return false;
-                    }
-                    let Some(symbol) = locals[var.index()].symbol else {
-                        return false;
-                    };
-                    let coordinate = arena.int_symbol(symbol);
-                    let expected_start = arena.int_mul(coordinate, width);
-                    let one = arena.int(1);
-                    let next = arena.int_add(coordinate, one);
-                    let expected_end = arena.int_mul(next, width);
-                    start
-                        .as_ref()
-                        .and_then(|value| value.sym)
-                        .is_some_and(|value| prove::same(arena, value, expected_start))
-                        && end
-                            .as_ref()
-                            .and_then(|value| value.sym)
-                            .is_some_and(|value| prove::same(arena, value, expected_end))
-                })
-            }
-        }
-    }
-    fn place_covers(
-        arena: &mut ExprArena,
-        locals: &[CheckedLocal],
-        place: &ir::Place,
-        local: LocalId,
-        extents: &[IntExpr],
-        loops: &[(LocalId, IntExpr)],
-        facts: &Facts,
-    ) -> bool {
-        let (root, indices) = match place {
-            ir::Place::Local(root) => return *root == local,
-            ir::Place::Element { root, indices } => (root, indices),
-            ir::Place::Tuple(_) => return false,
-        };
-        if *root != local {
-            return false;
-        }
-        if indices.len() > extents.len() {
-            return false;
-        }
-        indices
-            .iter()
-            .zip(extents)
-            .all(|(index, extent)| index_covers(arena, locals, index, *extent, loops, facts))
-        // Omitted trailing indices denote the complete remaining tensor slice.
-    }
-    fn block_writes(
-        arena: &mut ExprArena,
-        locals: &[CheckedLocal],
-        block: &CheckedBlock,
-        local: LocalId,
-        extents: &[IntExpr],
-        loops: &[(LocalId, IntExpr)],
-        facts: &Facts,
-    ) -> bool {
-        // Every path must write: an `if` covers only when both arms cover.
-        for statement in &block.statements {
-            match statement {
-                ir::Stmt::Assign { place, .. } => {
-                    if place_covers(arena, locals, place, local, extents, loops, facts) {
-                        return true;
-                    }
-                }
-                ir::Stmt::If {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    if block_writes(arena, locals, then_body, local, extents, loops, facts)
-                        && block_writes(arena, locals, else_body, local, extents, loops, facts)
-                    {
-                        return true;
-                    }
-                }
-                ir::Stmt::Loop {
-                    binder,
-                    start,
-                    end,
-                    body,
-                    ..
-                } => {
-                    let (Some(start), Some(end)) = (start.sym, end.sym) else {
-                        continue;
-                    };
-                    if !prove::is_zero(arena, start) {
-                        continue;
-                    }
-                    let mut nested = loops.to_vec();
-                    nested.push((*binder, end));
-                    if block_writes(arena, locals, body, local, extents, &nested, facts) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-    block_writes(arena, locals, block, local, extents, loops, facts)
 }
 
 /// Close numeric and reduction uses over parameters passed along unchanged to callees.
@@ -1004,16 +614,6 @@ fn close_summaries(summaries: &mut [Summary]) {
                 }
                 if summaries[callee].reduces.contains(&callee_param)
                     && summaries[i].reduces.insert(own)
-                {
-                    changed = true;
-                }
-            }
-            for (candidates, own) in summaries[i].init_passes.clone() {
-                if !candidates.is_empty()
-                    && candidates
-                        .iter()
-                        .all(|(callee, parameter)| summaries[*callee].full_init.contains(parameter))
-                    && summaries[i].full_init.insert(own)
                 {
                     changed = true;
                 }
@@ -1084,35 +684,59 @@ fn reject_cycles(definitions: &[ir::Definition], diagnostics: &mut Vec<Located>)
 /// Check every declared body of the closed program. Returns the definitions and families.
 pub(crate) fn check_program(
     files: &[(usize, ast::File)],
-    sources: &crate::checked::SourceSet,
     program: ProgramId,
+    semantic_hash: ModuleHash,
     diagnostics: &mut Vec<Located>,
 ) -> (Vec<ir::Definition>, Vec<ir::Family>) {
     let resolved = resolve::resolve(files, program, diagnostics);
     let count = resolved.declared.len();
 
-    // First pass: usage summaries only. Second pass: the checked bodies and diagnostics.
-    let mut summaries = vec![Summary::default(); count];
-    {
-        let empty = vec![Summary::default(); count];
+    // Discover type-level calls and numeric/reduction usage. Initialization is
+    // checked once, bottom-up, before any definition is published.
+    let empty = vec![Summary::default(); count];
+    let discovery = Env {
+        resolved: &resolved,
+        summaries: &empty,
+        enforce: false,
+        checked: &[],
+    };
+    let prototypes: Vec<_> = (0..count)
+        .map(|def| check_definition(&discovery, def))
+        .collect();
+    let mut summaries: Vec<_> = prototypes.iter().map(|body| body.summary.clone()).collect();
+    close_summaries(&mut summaries);
+    fn visit(def: usize, prototypes: &[CheckedOutcome], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[def] != 0 {
+            return;
+        }
+        state[def] = 1;
+        for callee in prototypes[def].body.callees() {
+            visit(callee.index(), prototypes, state, order);
+        }
+        state[def] = 2;
+        order.push(def);
+    }
+    let mut order = Vec::new();
+    let mut state = vec![0; count];
+    for def in 0..count {
+        visit(def, &prototypes, &mut state, &mut order);
+    }
+    let mut outcomes: Vec<Option<CheckedOutcome>> = (0..count).map(|_| None).collect();
+    for def in order {
         let env = Env {
             resolved: &resolved,
-            summaries: &empty,
-            enforce: false,
+            summaries: &summaries,
+            enforce: true,
+            checked: &outcomes,
         };
-        for (def, summary) in summaries.iter_mut().enumerate() {
-            *summary = check_definition(&env, def).summary;
-        }
+        let checked = check_definition(&env, def);
+        outcomes[def] = Some(checked);
     }
-    close_summaries(&mut summaries);
-    let env = Env {
-        resolved: &resolved,
-        summaries: &summaries,
-        enforce: true,
-    };
     let mut definitions = Vec::with_capacity(count);
     for (def, declared) in resolved.declared.iter().enumerate() {
-        let mut checked = check_definition(&env, def);
+        let mut checked = outcomes[def]
+            .take()
+            .expect("definition checking order omitted a body");
         diagnostics.extend(checked.diagnostics.into_iter().map(|diagnostic| Located {
             file: declared.file,
             diagnostic,
@@ -1124,7 +748,7 @@ pub(crate) fn check_program(
             .enumerate()
             .map(|(i, p)| ir::Param {
                 name: p.name.clone(),
-                ownership: p.ownership,
+                ownership: p.ownership.clone(),
                 ty: p.ty.clone(),
                 local: LocalId::new(
                     u32::try_from(i).expect("definition has more than u32::MAX parameters"),
@@ -1134,10 +758,8 @@ pub(crate) fn check_program(
             .collect();
         let mut stable_hasher = sha2::Sha256::new();
         use sha2::Digest as _;
-        stable_hasher.update(crate::registry::REGISTRY_REVISION.as_bytes());
-        let source = &sources.files()[declared.file];
-        stable_hasher.update(source.path.as_bytes());
-        stable_hasher.update(source.text.as_bytes());
+        stable_hasher.update(b"seismic-stable-function-v3");
+        stable_hasher.update(semantic_hash.digest());
         stable_hasher.update((def as u64).to_le_bytes());
         let stable = StableFunctionId::new(stable_hasher.finalize().into());
         let dimensions = checked.signature.shape_params.iter().enumerate().map(|(ordinal, name)| {
@@ -1165,6 +787,7 @@ pub(crate) fn check_program(
             aliases: checked.signature.aliases,
             result: checked.signature.result,
             predicates: checked.signature.predicates,
+            initialization: checked.initialization,
             body: checked.body,
             arena: checked.arena,
             file: declared.file,
@@ -1199,8 +822,20 @@ pub(crate) fn check_closed(
         return Err(SourceError::Parse(diagnostics));
     }
 
+    use sha2::Digest as _;
+    let mut module_hasher = sha2::Sha256::new();
+    module_hasher.update(crate::bundle::COMPILER_SEMANTIC_VERSION.as_bytes());
+    module_hasher.update(crate::registry::REGISTRY_REVISION.as_bytes());
+    for source in sources.files() {
+        module_hasher.update((source.path.len() as u64).to_le_bytes());
+        module_hasher.update(source.path.as_bytes());
+        module_hasher.update((source.text.len() as u64).to_le_bytes());
+        module_hasher.update(source.text.as_bytes());
+    }
+    let semantic_hash = ModuleHash::new(module_hasher.finalize().into());
+
     let mut located = Vec::new();
-    let (definitions, families) = check_program(&parsed, &sources, program, &mut located);
+    let (definitions, families) = check_program(&parsed, program, semantic_hash, &mut located);
     if !located.is_empty() {
         located.sort_by_key(|item| (item.file, item.diagnostic.span.start));
         located
@@ -1218,17 +853,6 @@ pub(crate) fn check_closed(
         ));
     }
 
-    use sha2::Digest as _;
-    let mut module_hasher = sha2::Sha256::new();
-    module_hasher.update(crate::bundle::COMPILER_SEMANTIC_VERSION.as_bytes());
-    module_hasher.update(crate::registry::REGISTRY_REVISION.as_bytes());
-    for source in sources.files() {
-        module_hasher.update((source.path.len() as u64).to_le_bytes());
-        module_hasher.update(source.path.as_bytes());
-        module_hasher.update((source.text.len() as u64).to_le_bytes());
-        module_hasher.update(source.text.as_bytes());
-    }
-    let semantic_hash = ModuleHash::new(module_hasher.finalize().into());
     let mut entries = Vec::new();
     let mut entry_families = Vec::new();
     let mut entry_diagnostics = Vec::new();
@@ -1429,6 +1053,33 @@ fn element_summary(element: &Elem) -> crate::checked::ElementSummary {
     }
 }
 
+/// Source-declared result leaves retain their tuple paths after semantic
+/// lowering flattens the corresponding producer values into one ordered list.
+pub(super) fn result_leaves(ty: &ValueType) -> Vec<(Vec<u32>, &ValueType)> {
+    fn walk<'a>(
+        ty: &'a ValueType,
+        path: &mut Vec<u32>,
+        leaves: &mut Vec<(Vec<u32>, &'a ValueType)>,
+    ) {
+        match ty {
+            ValueType::Tuple(items) => {
+                for (ordinal, item) in items.iter().enumerate() {
+                    path.push(u32::try_from(ordinal).expect("tuple has more than u32::MAX elements"));
+                    walk(item, path, leaves);
+                    path.pop();
+                }
+            }
+            ValueType::Void => {}
+            ValueType::Integer => unreachable!("mathematical integer has no source result spelling"),
+            ValueType::Opaque { .. } => panic!("backend-opaque result escaped an exported portable entry"),
+            _ => leaves.push((path.clone(), ty)),
+        }
+    }
+    let mut leaves = Vec::new();
+    walk(ty, &mut Vec::new(), &mut leaves);
+    leaves
+}
+
 fn entry_info(
     id: crate::ids::EntryId,
     stable: crate::ids::StableEntryId,
@@ -1440,7 +1091,7 @@ fn entry_info(
     fn flatten_parameter(
         source: u32,
         name: &str,
-        ownership: ParamOwnership,
+        ownership: &ParamOwnership,
         ty: &ValueType,
         path: &mut Vec<u32>,
         output: &mut Vec<ParameterSummary>,
@@ -1448,7 +1099,10 @@ fn entry_info(
         if let ValueType::Tuple(items) = ty {
             for (ordinal, item) in items.iter().enumerate() {
                 path.push(u32::try_from(ordinal).expect("tuple has more than u32::MAX elements"));
-                flatten_parameter(source, name, ownership, item, path, output);
+                let ParamOwnership::Tuple(parts) = ownership else {
+                    panic!("checked tuple parameter lost ownership product")
+                };
+                flatten_parameter(source, name, &parts[ordinal], item, path, output);
                 path.pop();
             }
             return;
@@ -1459,11 +1113,15 @@ fn entry_info(
                     ParamOwnership::Owned | ParamOwnership::Value => TensorAccess::Owned,
                     ParamOwnership::Shared => TensorAccess::Shared,
                     ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    ParamOwnership::Tuple(_) => {
+                        unreachable!("tensor leaf ownership is not a tuple")
+                    }
                 },
                 rank: u32::try_from(tensor.rank()).expect("tensor rank exceeds u32::MAX"),
                 element: element_summary(&tensor.elem),
             },
             ValueType::Scalar(dtype) => ParameterSummaryKind::Scalar(*dtype),
+            ValueType::Integer => unreachable!("mathematical integer has no source parameter spelling"),
             ValueType::Index { .. } => ParameterSummaryKind::Index,
             ValueType::Range { .. } => ParameterSummaryKind::Range,
             ValueType::Void => return,
@@ -1484,50 +1142,64 @@ fn entry_info(
         flatten_parameter(
             u32::try_from(ordinal).expect("parameter count exceeds u32::MAX"),
             &parameter.name,
-            parameter.ownership,
+            &parameter.ownership,
             &parameter.ty,
             &mut Vec::new(),
             &mut parameters,
         );
     }
-    fn flatten(ty: &ValueType, path: &mut Vec<u32>, output: &mut Vec<ResultSummary>) {
+    fn signature(ty: &ValueType, ownership: &ParamOwnership) -> crate::checked::SignatureType {
+        use crate::checked::SignatureType as S;
         match ty {
-            ValueType::Tuple(items) => {
-                for (ordinal, item) in items.iter().enumerate() {
-                    path.push(
-                        u32::try_from(ordinal).expect("tuple has more than u32::MAX elements"),
-                    );
-                    flatten(item, path, output);
-                    path.pop();
-                }
-            }
-            ValueType::Tensor(tensor) => output.push(ResultSummary {
-                path: path.clone(),
-                kind: ResultSummaryKind::Tensor {
+            ValueType::Void => S::Unit,
+            ValueType::Tuple(items) => match ownership {
+                ParamOwnership::Tuple(parts) => S::Tuple(
+                    items
+                        .iter()
+                        .zip(parts)
+                        .map(|(t, o)| signature(t, o))
+                        .collect(),
+                ),
+                ParamOwnership::Owned => S::Tuple(
+                    items
+                        .iter()
+                        .map(|t| signature(t, &ParamOwnership::Owned))
+                        .collect(),
+                ),
+                _ => panic!("signature tuple lost ownership product"),
+            },
+            ValueType::Tensor(t) => S::Tensor {
+                access: match ownership {
+                    ParamOwnership::Shared => TensorAccess::Shared,
+                    ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    _ => TensorAccess::Owned,
+                },
+                rank: t.rank() as u32,
+                element: element_summary(&t.elem),
+            },
+            ValueType::Scalar(d) => S::Scalar(*d),
+            ValueType::Integer => unreachable!("mathematical integer has no source signature spelling"),
+            ValueType::Index { .. } => S::Index,
+            ValueType::Range { .. } => S::Range,
+            ValueType::Opaque { .. } => unreachable!("opaque portable signature"),
+        }
+    }
+    let results = result_leaves(&definition.result)
+        .into_iter()
+        .map(|(path, ty)| ResultSummary {
+            path,
+            kind: match ty {
+                ValueType::Tensor(tensor) => ResultSummaryKind::Tensor {
                     rank: u32::try_from(tensor.rank()).expect("tensor rank exceeds u32::MAX"),
                     element: element_summary(&tensor.elem),
                 },
-            }),
-            ValueType::Scalar(dtype) => output.push(ResultSummary {
-                path: path.clone(),
-                kind: ResultSummaryKind::Scalar(*dtype),
-            }),
-            ValueType::Index { .. } => output.push(ResultSummary {
-                path: path.clone(),
-                kind: ResultSummaryKind::Index,
-            }),
-            ValueType::Range { .. } => output.push(ResultSummary {
-                path: path.clone(),
-                kind: ResultSummaryKind::Range,
-            }),
-            ValueType::Void => {}
-            ValueType::Opaque { .. } => {
-                panic!("backend-opaque result escaped an exported portable entry")
-            }
-        }
-    }
-    let mut results = Vec::new();
-    flatten(&definition.result, &mut Vec::new(), &mut results);
+                ValueType::Scalar(dtype) => ResultSummaryKind::Scalar(*dtype),
+                ValueType::Index { .. } => ResultSummaryKind::Index,
+                ValueType::Range { .. } => ResultSummaryKind::Range,
+                _ => unreachable!("result leaves contain only exported values"),
+            },
+        })
+        .collect();
     EntryInfo {
         id,
         stable,
@@ -1538,6 +1210,12 @@ fn entry_info(
             .map(|dimension| dimension.name.clone())
             .collect(),
         element_parameters: definition.elem_params.clone(),
+        parameter_types: definition
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), signature(&p.ty, &p.ownership)))
+            .collect(),
+        result_type: signature(&definition.result, &ParamOwnership::Owned),
         parameters,
         results,
     }

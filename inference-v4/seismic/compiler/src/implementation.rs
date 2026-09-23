@@ -3,45 +3,34 @@
 //! An `Implementation<B>` owns, together: identity, semantic coverage,
 //! parametric schedule, kernels, global and local allocation topology, finite
 //! decisions, hard constraints, numerical transfer, and provenance.
-//! All fields are private. Refinement creates `ImplementationBuilder`s and
-//! hands them to structural factories; builders close into pure
-//! `CandidateFamily` values. Native realization is coordinated by
-//! [`crate::realization`]; an `Implementation` retains only immutable reflected
-//! descriptions, never executable handles.
+//! All fields are private. Source construction closes the actual checked
+//! computation into pure `ConstructedCandidate` data. Native realization is
+//! coordinated by [`crate::realization`]; a realized implementation retains
+//! immutable reflected descriptions, never executable handles.
 //!
-//! Factories receive a request and a builder. Before construction they may
-//! decline; once construction begins they return a closed implementation or
-//! a real preparation error. They cannot return a graph, proposal, label,
-//! partial placement, side table, or callback.
-//!
-//! Calls are resolved during construction: `splice_call` constructs every
-//! applicable child implementation and splices it under a finite decision,
-//! composing guards, constraints, lifetimes, transfers, provenance,
-//! and effect ordering. After construction no call exists.
-//!
-//! W4 owns the internals.
+//! The source owner constructs calls and regions through their complete bound
+//! products. Owned continuations may pause this construction, but do not expose
+//! arbitrary IR authorship or replay a requested source value out of order.
 
 pub(crate) mod native;
+pub(crate) mod candidate;
+pub(crate) use internals::BuilderState;
 
-use crate::numerics::NumericalTransfer;
-use crate::refinement::{
-    CandidateFamily, CandidateFamilyIdentity, CandidateFamilyParts, ChoiceDeclaration,
-    ConstructionAuthority, FactoryIdentity, ImplementationProvenance, PublishedResult,
-    PublishedScalarKind, RefinementBudget, ResultPublication,
+use crate::numerics::NumericalApplicability;
+use candidate::{
+    ChoiceDeclaration, ConstructedCandidate, ConstructedCandidateIdentity,
+    ConstructedCandidateParts, ImplementationProvenance, PublishedResult, ResultPublication,
 };
 use crate::target::{CompilerRegistry, TargetConstants};
 use seismic_ir::construction::Construction;
-use seismic_ir::kernel::{KernelArena, KernelBuilder};
-use seismic_ir::repr::{Representation, ScalarType};
-use seismic_ir::schedule::{
-    AnyScalarSlot, ClosedSchedule, ParametricSchedule, ScalarSlotId, ScheduleBuilder,
-};
+use seismic_ir::kernel::KernelArena;
+use seismic_ir::repr::ScalarKind;
+use seismic_ir::schedule::{AnyScalarSlot, ClosedSchedule, HostQuantityKind, HostQuantitySlot, ParametricSchedule, ScheduleBuilder};
 use seismic_ir::storage::{
-    AnyBufferView, BufferViewId, GlobalAllocationId, GlobalAllocationTopology,
-    LocalAllocationTopology,
+    AnyBufferView, GlobalAllocationId, GlobalAllocationTopology, LocalAllocationTopology,
 };
 use seismic_lang::entry::{
-    AccessKind, AliasRule, CallSchema, CandidateKind, ParameterAccess, ParameterKind,
+    AliasRule, CallSchema, CandidateKind, ParameterAccess, ParameterKind, SemanticEventKind,
     SemanticFunction, SemanticNodeView, SemanticProgram, SemanticType, TensorStorage,
 };
 use seismic_lang::expr::{
@@ -58,7 +47,6 @@ use std::sync::Arc;
 /// Stable identity of one natively realized implementation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImplementationIdentity {
-    pub factory: FactoryIdentity,
     /// Digest over the candidate structure and reconciled native artifacts.
     pub structure: [u8; 32],
 }
@@ -69,15 +57,14 @@ pub struct ImplementationIdentity {
 /// Performance evaluation is owned by `evaluation` after the whole candidate
 /// domain has been sealed and cannot change executable structure.
 pub(crate) fn reconcile_candidate_with_descriptions<B: seismic_target::TargetFamily>(
-    family: Arc<CandidateFamily<B>>,
+    family: Arc<ConstructedCandidate<B>>,
     assignment: seismic_lang::expr::PartialAssignment,
     arena: &mut ExprArena,
     target: &DeviceDescription<B>,
     registry: &CompilerRegistry<B>,
-    native: &crate::realization::RealizedNativeSet<B>,
+    native: Arc<crate::realization::RealizedNativeSet<B>>,
 ) -> Result<Implementation<B>, crate::errors::PreparationError> {
-    let (reflected, native_launch_modes) =
-        native_hard_constraints(arena, target, registry, &family, native);
+    let reflected = native_hard_constraints(arena, target, registry, &family, &native);
     let combined = arena.and(family.hard_constraints, reflected);
     let side_conditions = arena.side_conditions(AnyExpr::Bool(combined));
     let hard_constraints = arena.and(side_conditions, combined);
@@ -91,23 +78,15 @@ pub(crate) fn reconcile_candidate_with_descriptions<B: seismic_target::TargetFam
         digest.bytes(&description.numerical_identity.fingerprint);
     }
     let identity = ImplementationIdentity {
-        factory: family.identity.factory.clone(),
         structure: digest.finish(),
     };
-    let native_descriptions = native.descriptions().cloned().collect::<Vec<_>>();
-    let mut native_kernel_remap = vec![None; family.kernels().kernels().count()];
-    for original in native.original_kernels() {
-        native_kernel_remap[original.ordinal() as usize] = native.native_kernel_index(original);
-    }
     Ok(Implementation {
         family,
         identity,
         assignment_identity: native.assignment_identity(),
         assignment,
         hard_constraints,
-        native_descriptions,
-        native_kernel_remap,
-        native_launch_modes,
+        native,
     })
 }
 
@@ -189,60 +168,30 @@ mod implementation_invariant_tests {
             NodeView::BoolConst(true)
         ));
     }
-
-    #[test]
-    fn zero_per_unit_scratch_does_not_evaluate_a_partial_launch_count() {
-        let mut arena = ExprArena::default();
-        let (_, start_symbol) = arena.target_constant(SymbolSort::Nat);
-        let (_, end_symbol) = arena.target_constant(SymbolSort::Nat);
-        let start = arena.nat_symbol(start_symbol);
-        let end = arena.nat_symbol(end_symbol);
-        let partial_count = arena.nat_sub(end, start);
-        let zero = arena.nat(0);
-
-        let bytes = internals::scaled_scratch_bytes(&mut arena, zero, partial_count);
-        assert!(matches!(
-            arena.view(AnyExpr::Nat(bytes)),
-            NodeView::NatConst(0)
-        ));
-        let side_conditions = arena.side_conditions(AnyExpr::Nat(bytes));
-        assert!(matches!(
-            arena.view(AnyExpr::Bool(side_conditions)),
-            NodeView::BoolConst(true)
-        ));
-    }
 }
 
 fn native_hard_constraints<B: seismic_target::TargetFamily>(
     arena: &mut ExprArena,
     target: &DeviceDescription<B>,
     registry: &CompilerRegistry<B>,
-    family: &CandidateFamily<B>,
+    family: &ConstructedCandidate<B>,
     native: &crate::realization::RealizedNativeSet<B>,
-) -> (BoolExpr, Vec<Option<B::NativeLaunchMode>>) {
-    let mut constraints = Vec::new();
+) -> BoolExpr {
+    let mut launch_requirements = vec![arena.bool(true); family.schedule().launches().len()];
     let schedule = family.schedule();
-    let mut native_launch_modes = vec![None; schedule.launches().len()];
     for id in native.active_launches() {
+        let mut constraints = Vec::new();
         let launch = schedule.launch(*id);
-        let local_layout = &family.launch_layouts()[id.index() as usize];
+        let local_layout = family.launch_resources()[id.index() as usize].layout();
         let description = native
             .description(launch.kernel)
             .unwrap_or_else(|| panic!("active launch has no realized native kernel"));
         let kernel = family.kernels().kernel(launch.kernel);
         let domain = &description.launch;
-        let required_mode = match launch.mode {
-            seismic_ir::schedule::LaunchMode::Independent => {
-                registry.independent_launch_mode().clone()
-            }
-            seismic_ir::schedule::LaunchMode::CooperativeGrid => registry
-                .cooperative_launch_mode(target.facts())
-                .expect("cooperative launch was constructed for an unsupported device"),
-        };
-        assert!(
-            domain.modes.contains(&required_mode),
-            "reconciled native kernel does not admit its constructed launch mode"
-        );
+        // Reflection restricts where the selected request is applicable; it
+        // never substitutes a different launch descriptor. The schedule scopes
+        // this requirement to the paths on which this launch actually runs.
+        constraints.push(arena.bool(domain.modes.contains(&launch.descriptor)));
         let threads = arena.nat_product(&launch.workgroup);
         if kernel.interface().uses_subgroup {
             let width =
@@ -280,7 +229,6 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
             local_layout.workgroup_bytes,
             local_max,
         ));
-        native_launch_modes[id.index() as usize] = Some(required_mode);
         constraints.extend(registry.native_launch_constraints(
             target,
             arena,
@@ -289,11 +237,14 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
             kernel,
             description,
         ));
+        let predicate = arena.all(&constraints);
+        let defined = arena.side_conditions(predicate.into());
+        launch_requirements[id.index() as usize] = arena.and(defined, predicate);
     }
-    (arena.all(&constraints), native_launch_modes)
+    schedule.launch_requirements(arena, &launch_requirements)
 }
 
-fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> String {
+pub(crate) fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> String {
     if depth == 0 {
         return format!("{expression:?}");
     }
@@ -302,6 +253,20 @@ fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> St
         NodeView::IntConst(value) => value.to_string(),
         NodeView::BoolConst(value) => value.to_string(),
         NodeView::ScalarConst { dtype, bits } => format!("{dtype:?}(0x{bits:08x})"),
+        NodeView::ScalarInteger {
+            operation,
+            operands,
+        } => format!(
+            "{operation:?}({})",
+            operands
+                .iter()
+                .map(|(dtype, value)| format!(
+                    "{dtype:?}:{}",
+                    expression_detail(arena, (*value).into(), depth - 1)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         NodeView::Symbol(symbol) => format!("{symbol:?}:{:?}", arena.symbol_kind(symbol)),
         NodeView::Unary { op, operand } => {
             format!("{op:?}({})", expression_detail(arena, operand, depth - 1))
@@ -364,14 +329,12 @@ fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> St
 /// already been folded into `hard_constraints`.
 #[derive(Debug)]
 pub struct Implementation<B: seismic_target::TargetFamily> {
-    family: Arc<CandidateFamily<B>>,
+    family: Arc<ConstructedCandidate<B>>,
     identity: ImplementationIdentity,
     assignment_identity: [u8; 32],
     assignment: seismic_lang::expr::PartialAssignment,
     hard_constraints: BoolExpr,
-    native_descriptions: Vec<seismic_target::NativeKernelDescription<B>>,
-    native_kernel_remap: Vec<Option<u32>>,
-    native_launch_modes: Vec<Option<B::NativeLaunchMode>>,
+    native: Arc<crate::realization::RealizedNativeSet<B>>,
 }
 
 impl<B: seismic_target::TargetFamily> Implementation<B> {
@@ -381,54 +344,34 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     pub fn semantic_coverage(&self) -> TargetPredicate {
         self.family.semantic_coverage()
     }
-    pub fn schedule(&self) -> &ParametricSchedule {
+    pub fn schedule(&self) -> &ParametricSchedule<B> {
         self.family.schedule()
     }
     pub fn kernels(&self) -> &KernelArena<B> {
         self.family.kernels()
     }
-    pub(crate) fn native_descriptions(&self) -> &[seismic_target::NativeKernelDescription<B>] {
-        &self.native_descriptions
+    pub(crate) fn native(&self) -> &Arc<crate::realization::RealizedNativeSet<B>> {
+        &self.native
     }
-    pub(crate) fn native_launch_modes(&self) -> &[Option<B::NativeLaunchMode>] {
-        &self.native_launch_modes
-    }
-    pub(crate) fn native_kernel_remap(&self) -> &[Option<u32>] {
-        &self.native_kernel_remap
-    }
+
     pub(crate) fn assignment(&self) -> &seismic_lang::expr::PartialAssignment {
         &self.assignment
     }
     pub(crate) fn assignment_identity(&self) -> [u8; 32] {
         self.assignment_identity
     }
-    pub(crate) fn native_numerical_identity(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        digest.update(b"seismic-native-numerical-set-v1");
-        for kernel in &self.native_descriptions {
-            digest.update(kernel.numerical_identity.fingerprint);
-        }
-        digest.finalize().into()
-    }
+    pub(crate) fn native_index_bits(&self) -> u32 { self.family.native_index_bits }
+
     pub fn global_allocations(&self) -> &GlobalAllocationTopology {
         self.family.global_allocations()
     }
     pub fn local_allocations(&self) -> LocalAllocationTopology {
         self.family.local_allocations()
     }
-    pub fn launch_layouts(&self) -> &[seismic_ir::storage::LaunchLocalLayout] {
-        self.family.launch_layouts()
+    pub fn launch_resources(&self) -> &[seismic_ir::execution::LaunchResources] {
+        self.family.launch_resources()
     }
-    pub fn closed_execution(&self) -> seismic_ir::execution::ClosedExecutionView<'_, B> {
-        self.family.executable.view()
-    }
-    pub fn launch_scratch(&self) -> &[seismic_ir::storage::LaunchScratchRequirements] {
-        self.family.launch_scratch()
-    }
-    pub fn launch_abi(&self) -> &[Vec<seismic_ir::storage::LaunchAbiRequirement>] {
-        self.family.launch_abi()
-    }
+
     pub fn decisions(&self) -> Vec<(DecisionId, &'static str)> {
         self.family
             .choices()
@@ -439,14 +382,8 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     pub fn hard_constraints(&self) -> BoolExpr {
         self.hard_constraints
     }
-    pub fn numerical_transfer(&self) -> &NumericalTransfer {
-        self.family.numerical_transfer()
-    }
-    pub(crate) fn authority(&self) -> ConstructionAuthority {
-        self.family.authority
-    }
-    pub(crate) fn numerical_role(&self) -> seismic_lang::entry::NumericalRole {
-        self.family.numerical_role
+    pub fn numerical_applicability(&self) -> &NumericalApplicability {
+        self.family.numerical_applicability()
     }
     pub fn provenance(&self) -> &ImplementationProvenance {
         self.family.provenance()
@@ -462,26 +399,9 @@ pub(crate) fn validate_universal_implementation<B: seismic_target::TargetFamily>
     target_domain: BoolExpr,
     constants: &TargetConstants,
 ) -> Result<(), crate::errors::PreparationError> {
-    if implementation.authority() != ConstructionAuthority::UniversalPortable
-        || implementation.numerical_role() != seismic_lang::entry::NumericalRole::Reference
-    {
-        return Err(crate::errors::PreparationError::UniversalClosure(
-            "implementation lacks checked reference provenance".into(),
-        ));
-    }
-    if !implementation.decisions().is_empty() {
-        return Err(crate::errors::PreparationError::UniversalClosure(
-            "reference implementation contains finite decisions".into(),
-        ));
-    }
-    if !implementation.numerical_transfer().is_exact() {
-        return Err(crate::errors::PreparationError::UniversalClosure(
-            "reference numerical transfer is not exact".into(),
-        ));
-    }
-    let mut fixed = seismic_lang::expr::PartialAssignment::new();
+    let mut fixed = implementation.assignment().clone();
     for (symbol, value) in constants.bindings() {
-        fixed.bind(*symbol, *value);
+        fixed.bind(*symbol, value.clone());
     }
     let mut close = |expression: BoolExpr| {
         let expression = arena.partial(expression, &fixed);
@@ -520,87 +440,94 @@ pub(crate) fn validate_universal_implementation<B: seismic_target::TargetFamily>
     Ok(())
 }
 
-/// What a factory sees.
-pub struct FactoryRequest<'a, B: seismic_target::TargetFamily> {
-    /// The function body to implement.
-    pub function: &'a SemanticFunction,
-    pub program: &'a SemanticProgram,
-    pub contract: &'a FunctionContract,
-    pub target: &'a DeviceDescription<B>,
-    pub constants: &'a TargetConstants,
-    pub precision: &'a PrecisionPolicy,
-    /// The checked semantic candidate this construction realizes. Authored
-    /// backend lowerings/helpers are not inferred from factory names.
-    pub candidate_kind: CandidateKind,
-    pub numerical_role: seismic_lang::entry::NumericalRole,
-    /// Exact checked source applicability of this semantic candidate.
-    pub semantic_coverage: TargetPredicate,
-    /// Root entry, or a spliced call site with its argument bindings.
-    pub site: CallSite<'a>,
-}
-
 /// The site an implementation is constructed for.
-#[derive(Clone, Copy, Debug)]
-pub enum CallSite<'a> {
+#[derive(Clone, Copy)]
+pub(crate) enum CallSite<'a> {
     Root,
     Spliced {
         /// The call node in the parent function.
         call: NodeId,
         /// Parent values bound to the callee's parameters, in order.
         arguments: &'a [ValueBinding],
-        /// Caller-owned destinations shared by every child alternative.
-        results: &'a [ResultBinding],
+        bindings: &'a crate::portable::BindingArena,
+        contents: &'a crate::portable::initialization::StorageContents,
+        binders: &'a [seismic_lang::expr::SymbolId],
+        storage: &'a seismic_ir::storage::TopologyBuilder,
+        selections: &'a crate::portable::BindingSelections,
     },
 }
 
-/// How a callee parameter is bound at a spliced call.
+impl fmt::Debug for CallSite<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => formatter.write_str("Root"),
+            Self::Spliced {
+                call, arguments, ..
+            } => formatter
+                .debug_struct("Spliced")
+                .field("call", call)
+                .field("arguments", arguments)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// A scalar's actual realization, shared by lowering and call binding.
+/// Index expressions never require a fabricated backing symbol. Published
+/// values derive their type and symbol from the one owning schedule slot.
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarBinding {
+    Value {
+        symbol: seismic_lang::expr::SymbolId,
+        dtype: seismic_lang::types::DType,
+    },
+    /// Immutable mathematical integer expression; no reached slot is needed.
+    Integer(seismic_lang::expr::IntExpr),
+    Index(seismic_lang::expr::NatExpr),
+    Quantity(HostQuantitySlot),
+    Published(AnyScalarSlot),
+}
+
+/// A value in the construction's common binding owner. A physical adapter is
+/// derived from this handle only when a consumer needs its current residence.
+pub use crate::portable::BindingId as ValueBinding;
+
+/// The physical adapter derived from a construction binding.
 #[derive(Clone, Debug)]
-pub enum ValueBinding {
+pub enum PhysicalBinding {
     /// A global view of the parent (argument, result, or arena).
     View {
         view: AnyBufferView,
         layout: seismic_ir::storage::BufferViewLayout,
     },
     /// A scalar slot or symbol of the parent.
-    Scalar(seismic_lang::expr::SymbolId),
+    Scalar(ScalarBinding),
     Range {
-        start: seismic_lang::expr::SymbolId,
-        end: seismic_lang::expr::SymbolId,
-    },
-}
-
-/// Where a callee result is published in the caller. Every alternative
-/// writes the same destination, so no option-dependent value join exists.
-#[derive(Clone, Debug)]
-pub enum ResultBinding {
-    View {
-        view: AnyBufferView,
-        layout: seismic_ir::storage::BufferViewLayout,
-    },
-    Scalar(AnyScalarSlot),
-    Range {
-        start: AnyScalarSlot,
-        end: AnyScalarSlot,
+        start: ScalarBinding,
+        end: ScalarBinding,
     },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum ScalarPublication {
     Scalar(AnyScalarSlot),
+    Quantity(HostQuantitySlot),
     Range {
-        start: AnyScalarSlot,
-        end: AnyScalarSlot,
+        start: HostQuantitySlot,
+        end: HostQuantitySlot,
     },
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PortablePreflightStatus {
+pub(crate) struct PortableSourceStatus {
     pub(crate) view: AnyBufferView,
     pub(crate) slot: AnyScalarSlot,
+    pub(crate) index: u64,
 }
 
-/// Core-derived contract of any semantic function, root or nested. It uses
-/// semantic value identity; entry ABI identities exist only at root binding.
+/// Contract of a semantic function. Result value IDs name actual producers;
+/// at the root, result types describe the checked public declaration. Nested
+/// functions derive their result types from their semantic values.
 #[derive(Clone, Debug)]
 pub struct FunctionContract {
     parameters: Vec<ContractParameter>,
@@ -624,6 +551,7 @@ pub struct ContractParameter {
 #[derive(Clone, Debug)]
 pub struct ContractResult {
     pub value: SemanticValueId,
+    /// Declared public type at root; semantic result type for a nested call.
     pub ty: SemanticType,
     pub paths: Vec<Vec<u32>>,
 }
@@ -664,10 +592,12 @@ impl FunctionContract {
             for (_, node) in function.nodes(region) {
                 for event in node.events() {
                     let Some(value) = event.place() else { continue };
-                    let collection = match event.access() {
-                        AccessKind::Read => &mut effects.reads,
-                        AccessKind::Write(_) | AccessKind::AtomicRmw { .. } => &mut effects.writes,
-                        AccessKind::Barrier(_) => continue,
+                    let collection = match event.kind() {
+                        SemanticEventKind::Read => &mut effects.reads,
+                        SemanticEventKind::Write(_) | SemanticEventKind::AtomicRmw { .. } => {
+                            &mut effects.writes
+                        }
+                        SemanticEventKind::Barrier(_) | SemanticEventKind::MayFail => continue,
                     };
                     if !collection.contains(&value) {
                         collection.push(value);
@@ -694,77 +624,243 @@ impl FunctionContract {
     }
 }
 
-/// Applicability decision before construction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Applicability {
-    Applicable,
-    NotApplicable { reason: String },
+/// Owned call construction progress. Child bodies and physical payloads belong
+/// to this lexical call; no borrowed parent builder survives a pause.
+pub(crate) struct CallConstruction<B: seismic_target::TargetFamily> {
+    call: NodeId,
+    location: crate::candidate_domain::CallLocation,
+    arguments: Vec<ValueBinding>,
+    bodies: Vec<CallBody>,
+    selected: Option<usize>,
+    begun: bool,
+    child: Option<ConstructedCandidate<B>>,
 }
 
-/// The factory boundary (§6.2). Implemented by the core's universal portable
-/// factory and by backend structural factories (W5).
-pub trait ImplementationFactory<B: seismic_target::TargetFamily>: Send + Sync {
-    fn identity(&self) -> FactoryIdentity;
+struct CallBody {
+    candidate: seismic_lang::entry::Candidate,
+    selection: crate::candidate_domain::BodySelection,
+    initialization: Result<(), seismic_lang::initialization::InitializationFailure>,
+}
 
-    /// Structural preconditions, decided without constructing anything.
-    fn applicable(&self, request: &FactoryRequest<'_, B>) -> Applicability;
-
-    /// Constructs exactly one closed implementation for an applicable
-    /// request. Construction is infallible after applicability; violating
-    /// checked semantics or the factory contract is a compiler-author panic.
-    /// A factory may construct several alternatives
-    /// by being registered several times with different identities, or by
-    /// exposing finite decisions inside one implementation.
-    fn construct(
+impl<B: seismic_target::TargetFamily> CallConstruction<B> {
+    pub(crate) fn location(&self) -> &crate::candidate_domain::CallLocation {
+        &self.location
+    }
+    pub(crate) fn choice(&self) -> Option<crate::candidate_domain::BodyChoice> {
+        self.selected
+            .is_none()
+            .then(|| crate::candidate_domain::BodyChoice {
+                path: crate::candidate_domain::CallPath(vec![self.location.clone()]),
+                alternatives: self.bodies.iter().map(|body| body.selection.clone()).collect(),
+            })
+    }
+    pub(crate) fn select(&mut self, selection: crate::candidate_domain::BodySelection) {
+        assert!(self.selected.is_none(), "call body was already selected");
+        self.selected = Some(
+            self.bodies
+                .iter()
+                .position(|body| body.selection == selection)
+                .expect("selected body is absent from this checked call"),
+        );
+    }
+    pub(crate) fn initialization_pending(
         &self,
-        request: &FactoryRequest<'_, B>,
-        builder: ImplementationBuilder<'_, B>,
-    ) -> CandidateFamily<B>;
+    ) -> Option<seismic_lang::initialization::InitializationFailure> {
+        self.bodies[self.selected.expect("call body must be selected")]
+            .initialization
+            .as_ref()
+            .err()
+            .cloned()
+    }
+}
+
+fn source_node_path(function: &SemanticFunction, target: NodeId) -> Vec<u32> {
+    fn find(
+        function: &SemanticFunction,
+        region: seismic_lang::ids::RegionId,
+        target: NodeId,
+        path: &mut Vec<u32>,
+    ) -> bool {
+        for (ordinal, (id, node)) in function.nodes(region).enumerate() {
+            path.push(u32::try_from(ordinal).expect("source node ordinal exceeds u32"));
+            if id == target {
+                return true;
+            }
+            let children = match node.view() {
+                SemanticNodeView::If {
+                    then, otherwise, ..
+                } => vec![then, otherwise],
+                SemanticNodeView::Loop { body, .. } => vec![body],
+                _ => Vec::new(),
+            };
+            for (arm, child) in children.into_iter().enumerate() {
+                path.push(arm as u32);
+                if find(function, child, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    assert!(
+        find(function, function.root(), target, &mut path),
+        "source call is absent from its function"
+    );
+    path
+}
+
+/// A lexical schedule branch while its source bodies are being constructed.
+/// Its physical environment is restored at each arm boundary by this owner.
+pub(crate) struct ScheduleBranch {
+    parent: u32,
+    first_region: u32,
+    remaining: std::vec::IntoIter<(i64, u32)>,
+    inherited: internals::PhysicalEnvironment,
+}
+
+/// The existing construction owns the complete loop transport and its lexical region.
+pub(crate) struct ScheduleRepeat {
+    parent: u32,
+    product: seismic_ir::construction::RepeatConstruction,
+}
+impl ScheduleRepeat {
+    pub(crate) fn binding(&self) -> seismic_ir::schedule::LoopBinding {
+        self.product.binding()
+    }
+    pub(crate) fn header(
+        &self,
+    ) -> &seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
+        self.product.header()
+    }
 }
 
 /// The one way to build an implementation. Created while closing a candidate
 /// domain.
-pub struct ImplementationBuilder<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct ImplementationBuilder<'a, B: seismic_target::TargetFamily> {
     inner: internals::Builder<'a, B>,
 }
 
-impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
-    pub(crate) fn new(
-        arena: &'a mut ExprArena,
-        program: &'a SemanticProgram,
-        function: &'a SemanticFunction,
+/// A temporary borrow of the immutable construction inputs and the domain's
+/// expression owner. Suspended physical state contains none of these borrows.
+pub(crate) struct ConstructionContext<'a, B: seismic_target::TargetFamily> {
+    arena: &'a mut ExprArena,
+    program: &'a SemanticProgram,
+    target: &'a DeviceDescription<B>,
+    registry: &'a CompilerRegistry<B>,
+    constants: &'a TargetConstants,
+    precision: &'a PrecisionPolicy,
+}
+
+impl<'a, B: seismic_target::TargetFamily> ConstructionContext<'a, B> {
+    /// Resume only against the checked entry retained by the candidate domain.
+    pub(crate) fn for_resume(
+        entry: crate::candidate_domain::SourceEntryBorrow<'a>,
         target: &'a DeviceDescription<B>,
         registry: &'a CompilerRegistry<B>,
         constants: &'a TargetConstants,
         precision: &'a PrecisionPolicy,
-        semantic_coverage: TargetPredicate,
-        factory: FactoryIdentity,
-        authority: ConstructionAuthority,
-        numerical_role: seismic_lang::entry::NumericalRole,
-        site: CallSite<'a>,
-        root_schema: Option<&'a CallSchema>,
-        budget: RefinementBudget,
+    ) -> Self {
+        let (arena, program, _) = entry.into_parts();
+        Self { arena, program, target, registry, constants, precision }
+    }
+
+    pub(crate) fn program(&self) -> &'a SemanticProgram {
+        self.program
+    }
+}
+
+/// The candidate domain can start source construction, but cannot acquire an
+/// unrestricted physical builder. Only the source cursor owns that builder.
+pub(crate) fn begin_source_construction<'a, B: seismic_target::TargetFamily>(
+    entry: crate::candidate_domain::SourceEntryBorrow<'a>,
+    selection: crate::candidate_domain::BodySelection,
+    target: &'a DeviceDescription<B>,
+    registry: &'a CompilerRegistry<B>,
+    constants: &'a TargetConstants,
+    precision: &'a PrecisionPolicy,
+) -> (
+    crate::portable::construction::SourceConstruction<B>,
+    ConstructionContext<'a, B>,
+) {
+    let (arena, program, root_schema) = entry.into_parts();
+    let candidate = program
+        .family(program.root())
+        .candidates()
+        .iter()
+        .find(|candidate| {
+            let function = program.function(candidate.function);
+            function.stable() == selection.body
+                && function.source_definition() == selection.source_definition
+                && program.subject() == &selection.subject
+        })
+        .expect("root source selection names a checked body");
+    let mode = selection.mode();
+    match candidate.kind {
+        CandidateKind::Portable => assert!(
+            mode != crate::portable::SemanticMode::AuthoredBackend,
+            "portable body requires a source-owned mapping"
+        ),
+        CandidateKind::Lowering { backend } | CandidateKind::Helper { backend } => {
+            assert_eq!(backend, B::NAME, "authored body targets a different backend");
+            assert_eq!(
+                mode,
+                crate::portable::SemanticMode::AuthoredBackend,
+                "authored body requires its checked backend mapping"
+            );
+        }
+    }
+    assert!(
+        candidate
+            .requires
+            .iter()
+            .all(|capability| target.supports_capability(*capability)),
+        "selected body requires an unavailable target capability"
+    );
+    let builder = ImplementationBuilder::new(
+        arena,
+        program,
+        program.function(candidate.function),
+        target,
+        registry,
+        constants,
+        precision,
+        candidate.applicability,
+        CallSite::Root,
+        Some(root_schema),
+    );
+    crate::portable::construction::SourceConstruction::begin(builder, mode)
+}
+
+impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
+    pub(crate) fn suspend(self) -> BuilderState<B> {
+        self.inner.state
+    }
+
+    pub(crate) fn into_parts(self) -> (BuilderState<B>, ConstructionContext<'a, B>) {
+        self.inner.into_parts()
+    }
+
+    pub(crate) fn resume(
+        context: &'a mut ConstructionContext<'_, B>,
+        state: BuilderState<B>,
     ) -> Self {
         Self {
-            inner: internals::Builder::new(
-                arena,
-                program,
-                function,
-                target,
-                registry,
-                constants,
-                precision,
-                semantic_coverage,
-                factory,
-                authority,
-                numerical_role,
-                site,
-                root_schema,
-                budget,
+            inner: internals::Builder::resume(
+                context.arena,
+                context.program,
+                context.target,
+                context.registry,
+                context.constants,
+                context.precision,
+                state,
             ),
         }
     }
-    pub(crate) fn new_universal(
+
+    fn new(
         arena: &'a mut ExprArena,
         program: &'a SemanticProgram,
         function: &'a SemanticFunction,
@@ -773,11 +869,8 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
         constants: &'a TargetConstants,
         precision: &'a PrecisionPolicy,
         semantic_coverage: TargetPredicate,
-        factory: FactoryIdentity,
-        numerical_role: seismic_lang::entry::NumericalRole,
-        site: CallSite<'a>,
-        root_schema: Option<&'a CallSchema>,
-        budget: RefinementBudget,
+        site: CallSite<'_>,
+        root_schema: Option<&CallSchema>,
     ) -> Self {
         Self {
             inner: internals::Builder::new(
@@ -789,17 +882,24 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
                 constants,
                 precision,
                 semantic_coverage,
-                factory,
-                ConstructionAuthority::UniversalPortable,
-                numerical_role,
                 site,
                 root_schema,
-                budget,
             ),
         }
     }
     pub fn arena(&mut self) -> &mut ExprArena {
         self.inner.arena()
+    }
+    pub(crate) fn bindings(&self) -> &crate::portable::BindingArena {
+        &self.inner.state.bindings
+    }
+    pub(crate) fn bindings_mut(&mut self) -> &mut crate::portable::BindingArena {
+        &mut self.inner.state.bindings
+    }
+    pub(crate) fn expressions_and_bindings(
+        &mut self,
+    ) -> (&mut ExprArena, &crate::portable::BindingArena) {
+        (self.inner.arena, &self.inner.state.bindings)
     }
     pub fn target(&self) -> &DeviceDescription<B> {
         self.inner.target()
@@ -810,15 +910,34 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
     pub(crate) fn portable_registry_ref(&self) -> &'a CompilerRegistry<B> {
         self.inner.registry
     }
-    /// Resolves the unique authored helper body that may be inlined into the
-    /// current kernel segment. Helpers crossing a kernel cut still use normal
-    /// call splicing; this surface exists specifically so lane/subgroup-local
-    /// values never acquire a schedule ABI.
-    pub(crate) fn authored_helper(
+    /// Resolve a call whose values remain within one participant segment.
+    /// Portable families use their sealed reference body; backend-only helpers
+    /// require a unique capability-supported body. Neither acquires a schedule
+    /// ABI for participant-local values. Alternative bodies remain explicit
+    /// implementation choices at ordinary call-splicing boundaries.
+    pub(crate) fn segment_callee(
         &self,
         family: FamilyId,
         backend: BackendName,
     ) -> &'a SemanticFunction {
+        let semantic_family = self.inner.program.family(family);
+        if semantic_family
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.kind == CandidateKind::Portable)
+        {
+            let reference = semantic_family.reference().candidate();
+            assert!(
+                matches!(
+                    self.inner
+                        .arena
+                        .view(AnyExpr::Bool(reference.applicability.node())),
+                    NodeView::BoolConst(true)
+                ),
+                "participant-local portable call lacks checked applicability"
+            );
+            return self.inner.program.function(reference.function);
+        }
         let mut matching = self
             .inner
             .program
@@ -838,17 +957,31 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
                         NodeView::BoolConst(true)
                     )
             });
-        let candidate = matching
-            .next()
-            .expect("checked authored helper has no unconditionally applicable backend body");
+        let candidate = matching.next().unwrap_or_else(|| {
+            panic!(
+                "checked authored helper `{}` has no unconditionally applicable {backend:?} body",
+                self.inner.program.family(family).name()
+            )
+        });
         assert!(
             matching.next().is_none(),
             "checked authored helper resolution is ambiguous"
         );
         self.inner.program.function(candidate.function)
     }
-    pub fn constants(&self) -> &TargetConstants {
-        self.inner.constants()
+    pub(crate) fn call_can_write(&self, family: FamilyId) -> bool {
+        let reference = self.inner.program.family(family).reference().candidate();
+        self.inner
+            .program
+            .function(reference.function)
+            .parameters()
+            .iter()
+            .any(|parameter| {
+                matches!(
+                    parameter.access,
+                    ParameterAccess::Mutable | ParameterAccess::Owned
+                )
+            })
     }
 
     /// Declares a finite decision. The domain must be non-empty.
@@ -864,64 +997,8 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
 
     // ----- storage -------------------------------------------------------------
 
-    /// The view of a call argument tensor, typed by its representation. A
-    /// A representation mismatch after `applicable` is a factory invariant
-    /// violation; runtime representation dispatch happens before construction.
-    pub fn argument_view<R: Representation>(
-        &mut self,
-        parameter: SemanticValueId,
-    ) -> BufferViewId<R> {
-        self.inner.argument_view::<R>(parameter)
-    }
-    /// The view of a result leaf, allocated by the runtime.
-    pub fn result_view<R: Representation>(&mut self, value: SemanticValueId) -> BufferViewId<R> {
-        self.inner.result_view::<R>(value)
-    }
-    /// A new arena allocation.
-    pub fn arena_allocation(&mut self, bytes: NatExpr, alignment: u64) -> GlobalAllocationId {
-        self.inner.arena_allocation(bytes, alignment)
-    }
-    /// A typed dense view over an allocation.
-    pub fn view<R: Representation>(
-        &mut self,
-        allocation: GlobalAllocationId,
-        offset: NatExpr,
-        extents: Vec<NatExpr>,
-    ) -> BufferViewId<R> {
-        self.inner.view::<R>(allocation, offset, extents)
-    }
-    /// A strided sub-view of an existing view.
-    pub fn subview<R: Representation>(
-        &mut self,
-        base: BufferViewId<R>,
-        offset: NatExpr,
-        extents: Vec<NatExpr>,
-        strides: Vec<NatExpr>,
-    ) -> BufferViewId<R> {
-        self.inner.subview::<R>(base, offset, extents, strides)
-    }
-    /// The view a semantic place value denotes (parameter, owned allocation,
-    /// or already-materialized value).
-    pub fn place_view<R: Representation>(&mut self, value: SemanticValueId) -> BufferViewId<R> {
-        if !self.inner.has_view(value) {
-            self.materialize_tensor(value, R::id());
-        }
-        self.inner.typed_view::<R>(value)
-    }
-    pub fn bind_view<R: Representation>(&self, view: BufferViewId<R>) -> ValueBinding {
-        self.inner.bind_view(view.erase())
-    }
-    /// The caller-owned publication slot of one scalar result. All spliced
-    /// alternatives for the call receive this same destination.
-    pub fn result_slot<T: ScalarType>(&mut self, value: SemanticValueId) -> ScalarSlotId<T> {
-        self.inner.result_slot::<T>(value)
-    }
-
     // ----- kernels and schedule ----------------------------------------------
 
-    pub fn kernel(&mut self) -> KernelBuilder<'_, B> {
-        self.inner.kernel()
-    }
     pub fn schedule(&mut self) -> ScheduleBuilder<'_, B> {
         self.inner.schedule()
     }
@@ -931,188 +1008,243 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
     ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
         self.inner.portable_kernel()
     }
-    pub(crate) fn portable_function(&self) -> &SemanticFunction {
-        self.inner.function
+    pub(crate) fn resume_portable_kernel(
+        &mut self,
+        cursor: seismic_ir::kernel::dynamic::PortableCursor,
+    ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
+        self.inner.resume_portable_kernel(cursor)
     }
+    pub(crate) fn portable_kernel_with_bindings(
+        &mut self,
+    ) -> (
+        seismic_ir::kernel::dynamic::PortableBuilder<'_, B>,
+        &crate::portable::BindingArena,
+    ) {
+        self.inner.portable_kernel_with_bindings()
+    }
+    pub(crate) fn portable_is_root(&self) -> bool {
+        self.inner.state.root
+    }
+
     /// The checked function reference has the builder's construction
     /// lifetime rather than the borrow of `self`, so a portable lowerer may
     /// inspect it while mutating the builder without an aliasing workaround.
+    pub(crate) fn portable_program_ref(&self) -> &'a SemanticProgram {
+        self.inner.program
+    }
     pub(crate) fn portable_function_ref(&self) -> &'a SemanticFunction {
         self.inner.function
     }
-    pub(crate) fn portable_view(&mut self, value: SemanticValueId) -> AnyBufferView {
-        if !self.inner.has_view(value) {
-            let representation = self.inner.tensor_representation(value);
-            self.materialize_tensor(value, representation);
-        }
-        self.inner.any_view(value)
+
+    pub(crate) fn portable_allocate_tensor_axes(&mut self, value: SemanticValueId, axes: Vec<NatExpr>) -> AnyBufferView {
+        self.inner.portable_allocate_tensor_axes(value,axes)
     }
-    pub(crate) fn portable_existing_binding(&self, value: SemanticValueId) -> Option<ValueBinding> {
-        self.inner.portable_existing_binding(value)
+    pub(crate) fn portable_relocate_tensor(&mut self, source: &crate::portable::initialization::StoredView, destination: AnyBufferView) {
+        self.inner.portable_relocate_tensor(source, destination)
     }
-    pub(crate) fn portable_allocate_tensor(&mut self, value: SemanticValueId) -> AnyBufferView {
-        self.inner.portable_allocate_tensor(value)
+    pub(crate) fn portable_publish_tensor(&mut self, value: SemanticValueId, view: AnyBufferView) {
+        self.inner.portable_publish_tensor(value, view)
     }
-    pub(crate) fn portable_binding(&self, value: SemanticValueId) -> ValueBinding {
+    pub(crate) fn portable_views_may_overlap(&self, left: AnyBufferView, right: AnyBufferView) -> bool {
+        self.inner.portable_views_may_overlap(left,right)
+    }
+    pub(crate) fn allocate_tensor_product(
+        &mut self,
+        tensor: &seismic_lang::entry::TensorSemantics,
+    ) -> AnyBufferView {
+        self.inner.allocate_tensor_product(tensor)
+    }
+    pub(crate) fn portable_binding(&self, value: SemanticValueId) -> PhysicalBinding {
         self.inner.portable_binding(value)
     }
     pub(crate) fn portable_publish(&mut self, value: SemanticValueId) -> ScalarPublication {
         self.inner.portable_publish(value)
     }
-    pub(crate) fn portable_define_view(
-        &mut self,
-        value: SemanticValueId,
-        base: AnyBufferView,
-        offset: NatExpr,
-        extents: Vec<NatExpr>,
-        strides: Vec<NatExpr>,
-    ) -> AnyBufferView {
-        self.inner
-            .portable_define_view(value, base, offset, extents, strides)
+    pub(crate) fn portable_affine_view(&mut self, view: &crate::portable::initialization::StoredView) -> Option<AnyBufferView> {
+        self.inner.portable_affine_view(view)
     }
-    pub(crate) fn portable_define_represented_view(
-        &mut self,
-        value: SemanticValueId,
-        base: AnyBufferView,
-        offset: NatExpr,
-        extents: Vec<NatExpr>,
-        strides: Vec<NatExpr>,
-    ) -> AnyBufferView {
-        self.inner
-            .portable_define_represented_view(value, base, offset, extents, strides)
-    }
+
     pub(crate) fn portable_layout(
         &self,
         view: AnyBufferView,
     ) -> seismic_ir::storage::BufferViewLayout {
         self.inner.portable_layout(view)
     }
-    pub(crate) fn portable_preflight_status(&mut self) -> PortablePreflightStatus {
-        self.inner.portable_preflight_status()
+    pub(crate) fn portable_source_statuses(&mut self, count: usize) -> Vec<PortableSourceStatus> {
+        self.inner.portable_source_statuses(count)
     }
-    pub(crate) fn portable_finish_preflight(
+    pub(crate) fn portable_finish_source_check(
         &mut self,
-        status: PortablePreflightStatus,
+        status: PortableSourceStatus,
         site: seismic_ir::kernel::ops::CheckSite,
     ) {
-        self.inner.portable_finish_preflight(status, site)
+        self.inner.portable_finish_source_check(status, site)
     }
-    pub(crate) fn portable_branch<T, E>(
+    pub(crate) fn begin_source_selection(
         &mut self,
-        condition: BoolExpr,
-        then: impl FnOnce(&mut Self) -> Result<T, E>,
-        otherwise: impl FnOnce(&mut Self) -> Result<T, E>,
-    ) -> Result<(T, T), E> {
-        let parent = self.inner.schedule_region;
-        let (then_region, else_region) = self.inner.portable_begin_branch(condition);
-        self.inner.schedule_region = then_region;
-        let then_value = match then(self) {
-            Ok(value) => value,
-            Err(error) => {
-                self.inner.schedule_region = parent;
-                return Err(error);
-            }
-        };
-        self.inner.schedule_region = else_region;
-        let else_value = match otherwise(self) {
-            Ok(value) => value,
-            Err(error) => {
-                self.inner.schedule_region = parent;
-                return Err(error);
-            }
-        };
-        self.inner.schedule_region = parent;
-        Ok((then_value, else_value))
+        selector: crate::portable::BindingSelector,
+    ) -> (i64, ScheduleBranch) {
+        let parent = self.inner.state.schedule_region;
+        let inherited = self.inner.physical_environment();
+        let (then, otherwise) = self.inner.portable_begin_branch(selector);
+        let mut regions = vec![(1, then), (0, otherwise)].into_iter();
+        let (selected, region) = regions.next().expect("a selection has at least one arm");
+        self.inner.state.schedule_region = region;
+        (
+            selected,
+            ScheduleBranch {
+                parent,
+                first_region: then,
+                remaining: regions,
+                inherited,
+            },
+        )
     }
-    pub(crate) fn portable_repeat<T, E>(
+
+    pub(crate) fn begin_source_branch(&mut self, condition: BoolExpr) -> ScheduleBranch {
+        self.begin_source_selection(condition).1
+    }
+
+    pub(crate) fn next_source_branch(&mut self, branch: &mut ScheduleBranch) -> Option<i64> {
+        let (selected, region) = branch.remaining.next()?;
+        self.inner
+            .restore_physical_environment(branch.inherited.clone());
+        self.inner.state.schedule_region = region;
+        Some(selected)
+    }
+
+    pub(crate) fn finish_source_branch(&mut self, branch: ScheduleBranch) {
+        self.inner.state.schedule_region = branch.parent;
+        self.inner.restore_physical_environment(branch.inherited);
+    }
+
+    pub(crate) fn finish_value_branch(
+        &mut self, branch: ScheduleBranch,
+        then_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+        else_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+    ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
+        let destination = self.inner.finish_value_branch(branch.parent, branch.first_region, then_values, else_values);
+        self.finish_source_branch(branch);
+        destination
+    }
+
+    pub(crate) fn begin_value_repeat(
         &mut self,
         start: NatExpr,
         end: NatExpr,
-        body: impl FnOnce(&mut Self, seismic_ir::schedule::LoopBinding) -> Result<T, E>,
-    ) -> Result<T, E> {
-        let parent = self.inner.schedule_region;
-        let (body_region, binding) = self.inner.portable_begin_repeat(start, end);
-        self.inner.schedule_region = body_region;
-        let value = match body(self, binding) {
-            Ok(value) => value,
-            Err(error) => {
-                self.inner.schedule_region = parent;
-                return Err(error);
-            }
-        };
-        self.inner.schedule_region = parent;
-        Ok(value)
+        initial: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+    ) -> ScheduleRepeat {
+        self.inner.begin_value_repeat(start, end, initial)
     }
-    pub(crate) fn materialize_tensor(
+    pub(crate) fn finish_value_repeat(
         &mut self,
-        value: SemanticValueId,
-        required: seismic_lang::ids::RepresentationId,
+        repeat: ScheduleRepeat,
+        backedge: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+    ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
+        self.inner.finish_value_repeat(repeat, backedge)
+    }
+    pub(crate) fn begin_call(
+        &mut self,
+        call: NodeId,
+        arguments: &[ValueBinding],
+        selections: &crate::portable::BindingSelections,
+        contents: &crate::portable::initialization::StorageContents,
+        initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
+        binders: &[seismic_lang::expr::SymbolId],
+    ) -> CallConstruction<B> {
+        self.inner.begin_call(
+            call,
+            arguments,
+            selections,
+            contents,
+            initialized_arguments,
+            binders,
+        )
+    }
+
+    pub(crate) fn begin_call_child(
+        &mut self,
+        progress: &mut CallConstruction<B>,
+        selections: &crate::portable::BindingSelections,
+        contents: &crate::portable::initialization::StorageContents,
+        binders: &[seismic_lang::expr::SymbolId],
+    ) -> Option<crate::portable::construction::SourceConstruction<B>> {
+        self.inner
+            .begin_call_child(progress, selections, contents, binders)
+    }
+
+    pub(crate) fn complete_call_child(
+        &mut self,
+        progress: &mut CallConstruction<B>,
+        child: ConstructedCandidate<B>,
     ) {
-        let tensor = self.inner.tensor_semantics(value);
-        assert_eq!(
-            tensor.representation, required,
-            "materialization representation differs from the checked semantic tensor"
-        );
-        crate::portable::realize_tensor(self, value, tensor)
+        self.inner.complete_call_child(progress, child)
     }
 
-    /// Resolves a call node: constructs every applicable child alternative
-    /// for the callee family through the registry and splices them under a
-    /// new finite decision, composing all facts (§6.4). Returns the decision
-    /// so the schedule can `choose` on it, and the spliced results' views.
-    pub fn splice_call(&mut self, call: NodeId, arguments: &[ValueBinding]) -> SplicedCall<B> {
-        self.inner.splice_call(call, arguments)
+    pub(crate) fn finish_call(
+        &mut self,
+        progress: CallConstruction<B>,
+        selections: &crate::portable::BindingSelections,
+        contents: &mut crate::portable::initialization::StorageContents,
+        initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
+        binders: &[seismic_lang::expr::SymbolId],
+    ) -> Vec<(SemanticValueId, ValueBinding)> {
+        self.inner.finish_call(
+            progress,
+            selections,
+            contents,
+            initialized_arguments,
+            binders,
+        )
     }
 
-    /// Closes the implementation. Requires the closed schedule and the
-    /// semantic coverage predicate; numerical transfer, resource
-    /// constraints, lifetimes, and identity are derived here.
-    pub fn close(self, schedule: ClosedSchedule) -> CandidateFamily<B> {
-        self.inner.close(schedule)
-    }
-}
-
-/// The result of splicing a call.
-#[derive(Debug)]
-pub struct SplicedCall<B: seismic_target::TargetFamily> {
-    pub decision: Option<DecisionId>,
-    /// Caller-owned tensor or scalar result destinations.
-    pub results: Vec<(SemanticValueId, ResultBinding)>,
-    alternatives: Vec<(i64, seismic_ir::schedule::ImportedSchedule)>,
-    marker: std::marker::PhantomData<B>,
-}
-
-impl<B: seismic_target::TargetFamily> SplicedCall<B> {
-    /// Inserts the already-closed child alternatives at this exact lexical
-    /// schedule region. Consumes the token, so a call is scheduled once.
-    pub fn schedule(self, schedule: &mut ScheduleBuilder<'_, B>) {
-        schedule.splice(self.decision, self.alternatives)
-    }
-}
-
-impl<B: seismic_target::TargetFamily> fmt::Debug for ImplementationBuilder<'_, B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ImplementationBuilder").finish()
+    /// Closes the source construction's own schedule and implementation in
+    /// one consuming operation. No caller supplies an execution body.
+    pub(crate) fn close(mut self, mode: crate::portable::SemanticMode) -> ConstructedCandidate<B> {
+        let schedule = self.inner.schedule().close();
+        self.inner.close(schedule, mode)
     }
 }
 
 mod internals {
     use super::*;
-    use crate::numerics::{
-        ConditionalNumericalTransfer, ErrorBound, NumericalEffect, OutputTransfer,
-    };
     use seismic_ir::schedule::ScheduleStep;
-    use seismic_ir::storage::{AllocationLiveness, GlobalBufferKind};
+    use seismic_ir::storage::GlobalBufferKind;
     use seismic_lang::expr::{AnyExpr, CmpOp, RootName, SymbolSort};
     use seismic_lang::registry;
     use std::collections::HashMap;
 
-    struct ConstructedChild<B: seismic_target::TargetFamily> {
-        implementation: CandidateFamily<B>,
-        /// Result identities belong to the child's semantic program owner and
-        /// therefore cannot be compared with the caller's result identities.
-        /// Publication is an ordinal contract.
-        results: Vec<SemanticValueId>,
+    /// Each authored body owns distinct semantic values. The checked source
+    /// parameter coordinates, not those local IDs, bind its common entry ABI.
+    fn entry_parameter<'a>(
+        schema: &'a CallSchema,
+        function: &SemanticFunction,
+        parameter: &ContractParameter,
+    ) -> &'a seismic_lang::entry::Parameter {
+        let formal = function.parameters().iter().find(|formal| formal.value == parameter.value)
+            .expect("contract parameter belongs to the selected body");
+        let seismic_lang::entry::FunctionParameterOrigin::Source { ordinal, path } = &formal.origin else {
+            panic!("public entry schema contains a captured helper dimension")
+        };
+        let actual = schema.parameters().iter().find(|actual|
+            actual.source == *ordinal && actual.path == *path)
+            .expect("checked body parameter has its entry ABI coordinate");
+        use seismic_lang::entry::TensorAccess;
+        match (&parameter.ty, &actual.kind) {
+            (SemanticType::Tensor(tensor), ParameterKind::Tensor { access, representation, axes }) => {
+                assert_eq!(tensor.representation, *representation);
+                assert_eq!(&tensor.axes, axes);
+                assert!(matches!((parameter.access, access),
+                    (ParameterAccess::Owned, TensorAccess::Owned)
+                    | (ParameterAccess::Shared, TensorAccess::Shared)
+                    | (ParameterAccess::Mutable, TensorAccess::Mutable)));
+            }
+            (SemanticType::Scalar(expected), ParameterKind::Scalar { dtype, .. }) => assert_eq!(expected, dtype),
+            (SemanticType::Index { bound: expected }, ParameterKind::Index { bound, .. })
+            | (SemanticType::Range { bound: expected }, ParameterKind::Range { bound, .. }) => assert_eq!(expected, bound),
+            _ => panic!("checked body parameter differs from the entry ABI type"),
+        }
+        actual
     }
 
     /// Private move slot for the open construction. Builder closure consumes
@@ -1146,33 +1278,152 @@ mod internals {
         }
     }
 
-    pub(super) struct Builder<'a, B: seismic_target::TargetFamily> {
+    struct CaptureBindings<'a, B: seismic_target::TargetFamily> {
+        construction: &'a mut Construction<B>,
+        arena: &'a mut ExprArena,
+        storage: &'a seismic_ir::storage::TopologyBuilder,
+        parameter: Option<SemanticValueId>,
+        views: HashMap<AnyBufferView, AnyBufferView>,
+        slots: HashMap<AnyScalarSlot, AnyScalarSlot>,
+        quantities: HashMap<HostQuantitySlot, HostQuantitySlot>,
+    }
+    impl<B: seismic_target::TargetFamily> crate::portable::BindingPhysicalImport
+        for CaptureBindings<'_, B>
+    {
+        fn remap_tensor(
+            &mut self,
+            value: &crate::portable::initialization::StoredTensor,
+            _: &crate::portable::BindingPath,
+        ) -> crate::portable::initialization::StoredTensor {
+            let view = value.view.map(|view| self.remap_view(*view), |value| *value);
+            crate::portable::initialization::StoredTensor {
+                view,
+                ..value.clone()
+            }
+        }
+        fn remap_slot(&mut self, source: AnyScalarSlot, _: &crate::portable::BindingPath) -> AnyScalarSlot {
+            *self
+                .slots
+                .entry(source)
+                .or_insert_with(|| self.construction.schedule_state().capture_slot(source))
+        }
+        fn remap_quantity_slot(&mut self, source: HostQuantitySlot, _: &crate::portable::BindingPath) -> HostQuantitySlot {
+            *self
+                .quantities
+                .entry(source)
+                .or_insert_with(|| self.construction.schedule_state().capture_quantity_slot(source))
+        }
+        fn remap_prepared(&mut self, value: crate::portable::PreparedArg, _: &crate::portable::BindingPath) -> crate::portable::PreparedArg { value }
+        fn remap_axis(&mut self, value: NatExpr, _: &crate::portable::BindingPath) -> NatExpr { value }
+        fn remap_selector(&mut self, value: crate::portable::BindingSelector, _: &crate::portable::BindingPath) -> crate::portable::BindingSelector { value }
+    }
+    impl<B: seismic_target::TargetFamily> CaptureBindings<'_, B> {
+        fn remap_view(&mut self, source: AnyBufferView) -> AnyBufferView {
+            if let Some(view) = self.views.get(&source) {
+                return *view;
+            }
+            let view = self.construction.storage_mut().capture_view(
+                self.arena,
+                self.storage,
+                source,
+                self.parameter.expect("captured storage has a parameter"),
+            );
+            self.views.insert(source, view);
+            view
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct PhysicalEnvironment {
+        value_views: HashMap<SemanticValueId, AnyBufferView>,
+        scalar_symbols: HashMap<SemanticValueId, PhysicalBinding>,
+        result_slots: HashMap<SemanticValueId, ScalarPublication>,
+    }
+
+    /// All mutable physical construction state. No borrowed arena, source body
+    /// or target context survives when construction is suspended.
+    pub(crate) struct BuilderState<B: seismic_target::TargetFamily> {
+        function: seismic_lang::ids::FunctionId,
         construction: OpenConstruction<B>,
+        contract: FunctionContract,
+        semantic_coverage: TargetPredicate,
+        pub(super) bindings: crate::portable::BindingArena,
+        pub(super) root: bool,
+        physical: PhysicalEnvironment,
+        pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>>,
+        pub(super) schedule_region: u32,
+        choices: Vec<ChoiceDeclaration>,
+        constraints: Vec<BoolExpr>,
+        numerical_children: NumericalApplicability,
+        callees: Vec<StableFunctionId>,
+        call_occurrences: HashMap<NodeId, u32>,
+    }
+
+    impl<B: seismic_target::TargetFamily> BuilderState<B> {
+        pub(crate) fn function(&self) -> seismic_lang::ids::FunctionId {
+            self.function
+        }
+    }
+
+    pub(super) struct Builder<'a, B: seismic_target::TargetFamily> {
+        pub(super) state: BuilderState<B>,
         pub(super) arena: &'a mut ExprArena,
         pub(super) program: &'a SemanticProgram,
         pub(super) function: &'a SemanticFunction,
-        contract: FunctionContract,
         pub(super) target: &'a DeviceDescription<B>,
         pub(super) registry: &'a CompilerRegistry<B>,
         constants: &'a TargetConstants,
         precision: &'a PrecisionPolicy,
-        semantic_coverage: TargetPredicate,
-        factory: FactoryIdentity,
-        authority: ConstructionAuthority,
-        numerical_role: seismic_lang::entry::NumericalRole,
-        value_views: HashMap<SemanticValueId, AnyBufferView>,
-        scalar_symbols: HashMap<SemanticValueId, ValueBinding>,
-        result_slots: HashMap<SemanticValueId, ScalarPublication>,
-        pending_result_paths: HashMap<SemanticValueId, Vec<Vec<u32>>>,
-        pub(super) schedule_region: u32,
-        choices: Vec<ChoiceDeclaration>,
-        constraints: Vec<BoolExpr>,
-        callees: Vec<StableFunctionId>,
-        conditional_child_transfers: Vec<ConditionalNumericalTransfer>,
-        budget: RefinementBudget,
     }
 
     impl<'a, B: seismic_target::TargetFamily> Builder<'a, B> {
+        pub(super) fn context(&mut self) -> ConstructionContext<'_, B> {
+            ConstructionContext {
+                arena: self.arena,
+                program: self.program,
+                target: self.target,
+                registry: self.registry,
+                constants: self.constants,
+                precision: self.precision,
+            }
+        }
+
+        pub(super) fn into_parts(self) -> (BuilderState<B>, ConstructionContext<'a, B>) {
+            (
+                self.state,
+                ConstructionContext {
+                    arena: self.arena,
+                    program: self.program,
+                    target: self.target,
+                    registry: self.registry,
+                    constants: self.constants,
+                    precision: self.precision,
+                },
+            )
+        }
+
+        pub(super) fn resume(
+            arena: &'a mut ExprArena,
+            program: &'a SemanticProgram,
+            target: &'a DeviceDescription<B>,
+            registry: &'a CompilerRegistry<B>,
+            constants: &'a TargetConstants,
+            precision: &'a PrecisionPolicy,
+            state: BuilderState<B>,
+        ) -> Self {
+            let function = program.function(state.function);
+            Self {
+                state,
+                arena,
+                program,
+                function,
+                target,
+                registry,
+                constants,
+                precision,
+            }
+        }
+
         pub(super) fn new(
             arena: &'a mut ExprArena,
             program: &'a SemanticProgram,
@@ -1182,31 +1433,33 @@ mod internals {
             constants: &'a TargetConstants,
             precision: &'a PrecisionPolicy,
             semantic_coverage: TargetPredicate,
-            factory: FactoryIdentity,
-            authority: ConstructionAuthority,
-            numerical_role: seismic_lang::entry::NumericalRole,
-            site: CallSite<'a>,
-            root_schema: Option<&'a CallSchema>,
-            budget: RefinementBudget,
+            site: CallSite<'_>,
+            root_schema: Option<&CallSchema>,
         ) -> Self {
             let mut contract = FunctionContract::derive(function);
             if let Some(schema) = root_schema {
-                for result in &mut contract.results {
-                    result.paths = schema
-                        .results()
-                        .iter()
-                        .filter_map(|schema| {
-                            (schema.value == result.value).then_some(schema.path.clone())
-                        })
-                        .collect();
+                assert_eq!(contract.parameters.len(), schema.parameters().len(), "checked root parameter arity");
+                assert_eq!(contract.results.len(), schema.results().len(), "checked root result arity");
+                for (result, leaf) in contract.results.iter_mut().zip(schema.results()) {
+                    use seismic_lang::entry::ResultKind;
+                    match (&result.ty, &leaf.kind) {
+                        (SemanticType::Tensor(tensor), ResultKind::Tensor { representation, axes }) => {
+                            assert_eq!(tensor.representation, *representation);
+                            assert_eq!(tensor.axes.len(), axes.len());
+                        }
+                        (SemanticType::Scalar(expected), ResultKind::Scalar(actual)) => assert_eq!(expected, actual),
+                        (SemanticType::Index { .. }, ResultKind::Index { .. })
+                        | (SemanticType::Range { .. }, ResultKind::Range { .. }) => {},
+                        _ => panic!("checked body result differs from the entry ABI type"),
+                    }
+                    match (&mut result.ty, &leaf.kind) {
+                        (SemanticType::Tensor(tensor), ResultKind::Tensor { axes, .. }) => tensor.axes.clone_from(axes),
+                        (SemanticType::Index { bound: actual }, ResultKind::Index { bound })
+                        | (SemanticType::Range { bound: actual }, ResultKind::Range { bound }) => *actual = *bound,
+                        _ => {}
+                    }
+                    result.paths = vec![leaf.path.clone()];
                 }
-                assert!(
-                    schema.results().iter().all(|schema| contract
-                        .results
-                        .iter()
-                        .any(|result| result.value == schema.value)),
-                    "call schema publishes a value absent from the root function results"
-                );
             }
             let disjoint = root_schema
                 .map(|schema| {
@@ -1228,162 +1481,67 @@ mod internals {
             );
             let mut value_views = HashMap::new();
             let mut scalar_symbols = HashMap::new();
-            let mut pending_result_paths: HashMap<SemanticValueId, Vec<Vec<u32>>> = HashMap::new();
+            let mut pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>> = HashMap::new();
             for parameter in &contract.parameters {
+                if matches!(site, CallSite::Spliced { .. }) {
+                    continue;
+                }
                 match &parameter.ty {
                     SemanticType::Tensor(tensor) => {
                         let abi = root_schema
-                            .and_then(|schema| {
-                                schema
-                                    .parameters()
-                                    .iter()
-                                    .find(|p| p.value == parameter.value)
-                            })
-                            .map(|p| p.id);
-                        if let Some(schema) = root_schema {
-                            let p = schema
-                                .parameters()
-                                .iter()
-                                .find(|p| p.value == parameter.value)
-                                .unwrap_or_else(|| {
-                                    panic!("root function parameter is absent from CallSchema")
-                                });
-                            match &p.kind {
-                                ParameterKind::Tensor {
-                                    representation,
-                                    axes,
-                                    ..
-                                } => {
-                                    assert_eq!(
-                                        *representation, tensor.representation,
-                                        "root parameter representation differs from semantic contract"
-                                    );
-                                    assert_eq!(
-                                        axes, &tensor.axes,
-                                        "root parameter axes differ from semantic contract"
-                                    );
-                                }
-                                _ => {
-                                    panic!("tensor semantic parameter is non-tensor in CallSchema")
-                                }
-                            }
-                        }
-                        let (kind, imported_layout) = match site {
-                            CallSite::Root => (
-                                GlobalBufferKind::Argument {
-                                    value: parameter.value,
-                                    abi,
-                                },
-                                None,
-                            ),
-                            CallSite::Spliced { arguments, .. } => {
-                                let ordinal = contract
-                                    .parameters
-                                    .iter()
-                                    .position(|p| p.value == parameter.value)
-                                    .expect("contract parameter exists");
-                                match arguments.get(ordinal) {
-                                    Some(ValueBinding::View { view, layout }) => {
-                                        assert_eq!(
-                                            view.representation(),
-                                            tensor.representation,
-                                            "spliced tensor argument representation mismatch"
-                                        );
-                                        (
-                                            GlobalBufferKind::Imported {
-                                                value: parameter.value,
-                                                source: *view,
-                                            },
-                                            Some(layout.clone()),
-                                        )
-                                    }
-                                    _ => panic!("spliced tensor parameter has no view binding"),
-                                }
-                            }
+                            .map(|schema| entry_parameter(schema, function, parameter).id);
+                        let kind = GlobalBufferKind::Argument {
+                            value: parameter.value,
+                            abi,
                         };
-                        let bytes = seismic_ir::storage::tensor_bytes(
-                            arena,
-                            tensor.representation,
-                            &tensor.axes,
-                        );
-                        let allocation = construction.storage_mut().allocate(
-                            kind,
-                            bytes,
-                            seismic_ir::storage::representation_alignment(tensor.representation),
-                        );
+                        let bytes = seismic_ir::storage::tensor_bytes(arena, tensor.representation, &tensor.axes);
+                        let allocation = construction.storage_mut().allocate(kind, bytes,
+                            seismic_ir::storage::representation_alignment(tensor.representation));
                         let zero = arena.nat(0);
-                        let view = match imported_layout {
-                            Some(layout) => construction.storage_mut().strided_view(
-                                allocation,
-                                tensor.representation,
-                                zero,
-                                tensor.axes.clone(),
-                                layout.strides,
-                            ),
-                            None => construction.storage_mut().dense_view(
-                                arena,
-                                allocation,
-                                tensor.representation,
-                                zero,
-                                tensor.axes.clone(),
-                            ),
-                        };
-                        value_views.insert(
-                            parameter.value,
-                            construction.view(view, tensor.representation),
-                        );
+                        let view = construction.storage_mut().dense_view(arena, allocation,
+                            tensor.representation, zero, tensor.axes.clone());
+                        let source = construction.view(view, tensor.representation);
+                        let actual = construction.bind_argument_tensor(arena, source);
+                        value_views.insert(parameter.value, actual);
                     }
                     SemanticType::Scalar(_) | SemanticType::Index { .. } => {
                         let symbol = match site {
                             CallSite::Root => {
                                 let schema =
                                     root_schema.expect("root builder requires its CallSchema");
-                                let p = schema
-                                    .parameters()
-                                    .iter()
-                                    .find(|p| p.value == parameter.value)
-                                    .unwrap_or_else(|| {
-                                        panic!("root scalar parameter is absent from CallSchema")
-                                    });
+                                let p = entry_parameter(schema, function, parameter);
                                 match &p.kind {
-                                    ParameterKind::Scalar { symbol, .. }
-                                    | ParameterKind::Index { symbol, .. } => *symbol,
+                                    ParameterKind::Scalar { symbol, dtype } => {
+                                        ScalarBinding::Value {
+                                            symbol: *symbol,
+                                            dtype: *dtype,
+                                        }
+                                    }
+                                    ParameterKind::Index { symbol, .. } => {
+                                        ScalarBinding::Index(arena.nat_symbol(*symbol))
+                                    }
                                     _ => panic!(
                                         "scalar semantic parameter has a non-scalar ABI kind"
                                     ),
                                 }
                             }
-                            CallSite::Spliced { arguments, .. } => {
-                                let ordinal = contract
-                                    .parameters
-                                    .iter()
-                                    .position(|p| p.value == parameter.value)
-                                    .expect("contract parameter exists");
-                                match arguments.get(ordinal) {
-                                    Some(ValueBinding::Scalar(symbol)) => *symbol,
-                                    _ => panic!("spliced scalar parameter has no scalar binding"),
-                                }
+                            CallSite::Spliced { .. } => {
+                                unreachable!("complete call bindings are imported below")
                             }
                         };
-                        scalar_symbols.insert(parameter.value, ValueBinding::Scalar(symbol));
+                        scalar_symbols.insert(parameter.value, PhysicalBinding::Scalar(symbol));
                     }
                     SemanticType::Range { .. } => {
                         let binding = match site {
                             CallSite::Root => {
                                 let schema =
                                     root_schema.expect("root builder requires its CallSchema");
-                                let parameter = schema
-                                    .parameters()
-                                    .iter()
-                                    .find(|candidate| candidate.value == parameter.value)
-                                    .unwrap_or_else(|| {
-                                        panic!("root range parameter is absent from CallSchema")
-                                    });
+                                let parameter = entry_parameter(schema, function, parameter);
                                 match &parameter.kind {
                                     ParameterKind::Range { start, end, .. } => {
-                                        ValueBinding::Range {
-                                            start: *start,
-                                            end: *end,
+                                        PhysicalBinding::Range {
+                                            start: ScalarBinding::Index(arena.nat_symbol(*start)),
+                                            end: ScalarBinding::Index(arena.nat_symbol(*end)),
                                         }
                                     }
                                     _ => {
@@ -1391,144 +1549,101 @@ mod internals {
                                     }
                                 }
                             }
-                            CallSite::Spliced { arguments, .. } => {
-                                let ordinal = contract
-                                    .parameters
-                                    .iter()
-                                    .position(|candidate| candidate.value == parameter.value)
-                                    .expect("contract parameter exists");
-                                match arguments.get(ordinal) {
-                                    Some(ValueBinding::Range { start, end }) => {
-                                        ValueBinding::Range {
-                                            start: *start,
-                                            end: *end,
-                                        }
-                                    }
-                                    _ => panic!("spliced range parameter has no range binding"),
-                                }
+                            CallSite::Spliced { .. } => {
+                                unreachable!("complete call bindings are imported below")
                             }
                         };
                         scalar_symbols.insert(parameter.value, binding);
                     }
+                    SemanticType::Integer => {
+                        panic!("root parameter ABI does not expose unbounded signed Integer")
+                    }
                     SemanticType::Tuple(_) | SemanticType::Opaque { .. } | SemanticType::Void => {}
                 }
             }
-            for result in &contract.results {
-                if let SemanticType::Tensor(tensor) = &result.ty {
-                    let abi_path = root_schema
-                        .and_then(|schema| {
-                            schema.results().iter().find(|r| r.value == result.value)
-                        })
-                        .map(|r| r.path.clone());
-                    if matches!(site, CallSite::Root) {
-                        if let Some(view) = value_views.get(&result.value).copied() {
-                            if let Some(path) = abi_path {
-                                construction.storage_mut().publish_result(arena, view, path);
+            let mut bindings = crate::portable::BindingArena::default();
+            if let CallSite::Spliced {
+                arguments,
+                bindings: caller,
+                contents,
+                binders,
+                storage,
+                selections,
+                ..
+            } = site
+            {
+                let mut capture = CaptureBindings {
+                    construction: &mut construction,
+                    arena,
+                    storage,
+                    parameter: contract.parameters.first().map(|parameter| parameter.value),
+                    views: HashMap::new(),
+                    slots: HashMap::new(),
+                    quantities: HashMap::new(),
+                };
+                bindings.import_parameters(
+                    caller,
+                    arguments,
+                    selections,
+                    contents,
+                    binders,
+                    &mut capture,
+                );
+                for (parameter, binding) in
+                    contract.parameters.iter().zip(bindings.parameter_handles())
+                {
+                    if let Some(adapter) = bindings.physical_binding(*binding, |view| {
+                        construction.storage().view_layout(view).clone()
+                    }) {
+                        match adapter {
+                            PhysicalBinding::View { view, .. } => {
+                                value_views.insert(parameter.value, view);
                             }
-                            continue;
-                        }
-                        if matches!(tensor.storage, TensorStorage::View { .. }) {
-                            if let Some(path) = abi_path {
-                                pending_result_paths
-                                    .entry(result.value)
-                                    .or_default()
-                                    .push(path);
+                            other => {
+                                scalar_symbols.insert(parameter.value, other);
                             }
-                            continue;
                         }
                     }
-                    let (kind, imported_layout) = match site {
-                        CallSite::Root => (
-                            GlobalBufferKind::Result {
-                                value: result.value,
-                            },
-                            None,
-                        ),
-                        CallSite::Spliced { results, .. } => {
-                            let ordinal = contract
-                                .results
-                                .iter()
-                                .position(|r| r.value == result.value)
-                                .expect("contract result exists");
-                            match results.get(ordinal) {
-                                Some(ResultBinding::View { view, layout }) => {
-                                    assert_eq!(
-                                        view.representation(),
-                                        tensor.representation,
-                                        "spliced tensor result representation mismatch"
-                                    );
-                                    (
-                                        GlobalBufferKind::Imported {
-                                            value: result.value,
-                                            source: *view,
-                                        },
-                                        Some(layout.clone()),
-                                    )
-                                }
-                                _ => panic!(
-                                    "spliced tensor result has no caller-owned view destination"
-                                ),
-                            }
-                        }
-                    };
-                    let bytes = seismic_ir::storage::tensor_bytes(
-                        arena,
-                        tensor.representation,
-                        &tensor.axes,
-                    );
-                    let allocation = construction.storage_mut().allocate(
-                        kind,
-                        bytes,
-                        seismic_ir::storage::representation_alignment(tensor.representation),
-                    );
-                    let zero = arena.nat(0);
-                    let view = match imported_layout {
-                        Some(layout) => construction.storage_mut().strided_view(
-                            allocation,
-                            tensor.representation,
-                            zero,
-                            tensor.axes.clone(),
-                            layout.strides,
-                        ),
-                        None => construction.storage_mut().dense_view(
-                            arena,
-                            allocation,
-                            tensor.representation,
-                            zero,
-                            tensor.axes.clone(),
-                        ),
-                    };
-                    let view = construction.view(view, tensor.representation);
-                    value_views.insert(result.value, view);
-                    if let (CallSite::Root, Some(path)) = (site, abi_path) {
-                        construction.storage_mut().publish_result(arena, view, path);
+                }
+            }
+            let result_slots = HashMap::new();
+            if matches!(site, CallSite::Root) {
+                for result in &contract.results {
+                    if let SemanticType::Tensor(tensor) = &result.ty {
+                        pending_result_paths.entry(result.value).or_default().extend(
+                            result.paths.iter().cloned().map(|path| (path, tensor.axes.clone()))
+                        );
                     }
                 }
             }
             Self {
-                construction: OpenConstruction::new(construction),
                 arena,
                 program,
                 function,
-                contract,
                 target,
                 registry,
                 constants,
                 precision,
-                semantic_coverage,
-                factory,
-                authority,
-                numerical_role,
-                value_views,
-                scalar_symbols,
-                result_slots: HashMap::new(),
-                pending_result_paths,
-                schedule_region: 0,
-                choices: Vec::new(),
-                constraints: Vec::new(),
-                callees: Vec::new(),
-                conditional_child_transfers: Vec::new(),
-                budget,
+                state: BuilderState {
+                    function: function.id(),
+                    construction: OpenConstruction::new(construction),
+                    contract,
+                    semantic_coverage,
+                    bindings,
+                    root: matches!(site, CallSite::Root),
+                    physical: PhysicalEnvironment {
+                        value_views,
+                        scalar_symbols,
+                        result_slots,
+                    },
+                    pending_result_paths,
+                    schedule_region: 0,
+                    choices: Vec::new(),
+                    constraints: Vec::new(),
+                    numerical_children: NumericalApplicability::required_source(),
+                    callees: Vec::new(),
+                    call_occurrences: HashMap::new(),
+                },
             }
         }
 
@@ -1538,13 +1653,12 @@ mod internals {
         pub(super) fn target(&self) -> &DeviceDescription<B> {
             self.target
         }
-        pub(super) fn constants(&self) -> &TargetConstants {
-            self.constants
-        }
+
         pub(super) fn decision(&mut self, name: &'static str, domain: FiniteDomain) -> DecisionId {
             let decision = self.arena.decision(domain);
             let active_when = self.arena.bool(true);
-            self.choices.push(ChoiceDeclaration {
+            self.state.choices.push(ChoiceDeclaration {
+                kind: crate::refinement::ChoiceKind::WorkgroupSize,
                 decision,
                 meaning: name,
                 active_when,
@@ -1552,479 +1666,340 @@ mod internals {
             decision
         }
         pub(super) fn constrain(&mut self, predicate: BoolExpr) {
-            self.constraints.push(predicate)
+            self.state.constraints.push(predicate)
         }
-        pub(super) fn argument_view<R: Representation>(
-            &mut self,
-            value: SemanticValueId,
-        ) -> BufferViewId<R> {
-            assert!(
-                self.contract.parameters.iter().any(|p| p.value == value),
-                "factory requested a value that is not a function parameter"
-            );
-            self.typed_view::<R>(value)
-        }
-        pub(super) fn result_view<R: Representation>(
-            &mut self,
-            value: SemanticValueId,
-        ) -> BufferViewId<R> {
-            assert!(
-                self.contract.results.iter().any(|r| r.value == value),
-                "factory requested a value that is not a function result"
-            );
-            self.typed_view::<R>(value)
-        }
-        pub(super) fn arena_allocation(
-            &mut self,
-            bytes: NatExpr,
-            alignment: u64,
-        ) -> GlobalAllocationId {
-            self.construction
-                .storage_mut()
-                .allocate(GlobalBufferKind::Arena, bytes, alignment)
-        }
-        pub(super) fn view<R: Representation>(
-            &mut self,
-            allocation: GlobalAllocationId,
-            offset: NatExpr,
-            extents: Vec<NatExpr>,
-        ) -> BufferViewId<R> {
-            let index = self.construction.storage_mut().dense_view(
-                self.arena,
-                allocation,
-                R::id(),
-                offset,
-                extents,
-            );
-            self.construction
-                .typed_view(self.construction.view(index, R::id()))
-        }
-        pub(super) fn subview<R: Representation>(
-            &mut self,
-            base: BufferViewId<R>,
-            offset: NatExpr,
-            extents: Vec<NatExpr>,
-            strides: Vec<NatExpr>,
-        ) -> BufferViewId<R> {
-            self.construction.assert_view(base.erase());
-            let index = self.construction.storage_mut().subview(
-                self.arena,
-                base.index(),
-                offset,
-                extents,
-                strides,
-            );
-            self.construction
-                .typed_view(self.construction.view(index, R::id()))
-        }
-        pub(super) fn has_view(&self, value: SemanticValueId) -> bool {
-            self.value_views.contains_key(&value)
-        }
-        pub(super) fn any_view(&self, value: SemanticValueId) -> AnyBufferView {
-            self.value_views
-                .get(&value)
-                .copied()
-                .unwrap_or_else(|| panic!("semantic tensor has no realized view"))
-        }
-        pub(super) fn tensor_semantics(
-            &self,
-            value: SemanticValueId,
-        ) -> seismic_lang::entry::TensorSemantics {
-            match &self.function.value(value).ty {
-                SemanticType::Tensor(tensor) => tensor.clone(),
-                _ => panic!("materialization requested for a non-tensor semantic value"),
-            }
-        }
-        pub(super) fn tensor_representation(
-            &self,
-            value: SemanticValueId,
-        ) -> seismic_lang::ids::RepresentationId {
-            self.tensor_semantics(value).representation
-        }
-        pub(super) fn bind_view(&self, view: AnyBufferView) -> ValueBinding {
-            ValueBinding::View {
+
+        pub(super) fn bind_view(&self, view: AnyBufferView) -> PhysicalBinding {
+            PhysicalBinding::View {
                 view,
-                layout: self.construction.storage().view_layout(view).clone(),
+                layout: self.state.construction.storage().view_layout(view).clone(),
             }
         }
-        pub(super) fn result_slot<T: ScalarType>(
-            &mut self,
-            value: SemanticValueId,
-        ) -> ScalarSlotId<T> {
-            let result = self
-                .contract
-                .results
-                .iter()
-                .find(|result| result.value == value)
-                .unwrap_or_else(|| {
-                    panic!("factory requested a scalar that is not a function result")
-                });
-            let dtype = match result.ty {
-                SemanticType::Scalar(dtype) => dtype,
-                SemanticType::Index { .. } if T::SYMBOL_SORT == SymbolSort::Nat => T::DTYPE,
-                _ => panic!("factory requested a non-scalar result as a scalar slot"),
-            };
-            assert_eq!(dtype, T::DTYPE, "factory scalar result dtype mismatch");
-            let publication = *self.result_slots.entry(value).or_insert_with(|| {
-                ScalarPublication::Scalar(self.construction.schedule_state().slot_any(
-                    self.arena,
-                    dtype,
-                    T::SYMBOL_SORT,
-                ))
-            });
-            let ScalarPublication::Scalar(slot) = publication else {
-                panic!("factory requested a range publication as a scalar slot")
-            };
-            ScalarSlotId::from_any(slot)
-        }
-        pub(super) fn kernel(&mut self) -> KernelBuilder<'_, B> {
-            self.construction.kernel(
-                self.arena,
-                self.target.facts(),
-                self.target.addressable_resources(),
-                self.target.vectors(),
-            )
-        }
+
         pub(super) fn schedule(&mut self) -> ScheduleBuilder<'_, B> {
-            self.construction.schedule(self.arena, self.schedule_region)
+            self.state
+                .construction
+                .schedule(self.arena, self.state.schedule_region)
         }
         pub(crate) fn portable_kernel(
             &mut self,
         ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
-            self.construction.portable_kernel(
+            self.state.construction.portable_kernel(
                 self.arena,
                 self.target.facts(),
                 self.target.addressable_resources(),
                 self.target.vectors(),
             )
         }
-        pub(crate) fn portable_allocate_tensor(&mut self, value: SemanticValueId) -> AnyBufferView {
-            if let Some(view) = self.value_views.get(&value).copied() {
-                return view;
-            }
-            let tensor = match &self.function.value(value).ty {
-                SemanticType::Tensor(tensor) => tensor.clone(),
-                _ => panic!("portable allocation requested for a non-tensor value"),
-            };
-            let bytes =
-                seismic_ir::storage::tensor_bytes(self.arena, tensor.representation, &tensor.axes);
-            let allocation = self.construction.storage_mut().allocate(
-                GlobalBufferKind::Arena,
-                bytes,
-                seismic_ir::storage::representation_alignment(tensor.representation),
-            );
-            let zero = self.arena.nat(0);
-            let index = self.construction.storage_mut().dense_view(
+        pub(super) fn resume_portable_kernel(
+            &mut self,
+            cursor: seismic_ir::kernel::dynamic::PortableCursor,
+        ) -> seismic_ir::kernel::dynamic::PortableBuilder<'_, B> {
+            self.state.construction.resume_portable_kernel(
                 self.arena,
-                allocation,
-                tensor.representation,
-                zero,
-                tensor.axes,
+                self.target.facts(),
+                self.target.addressable_resources(),
+                self.target.vectors(),
+                cursor,
+            )
+        }
+        pub(crate) fn portable_kernel_with_bindings(
+            &mut self,
+        ) -> (
+            seismic_ir::kernel::dynamic::PortableBuilder<'_, B>,
+            &crate::portable::BindingArena,
+        ) {
+            let kernel = self.state.construction.portable_kernel(
+                self.arena,
+                self.target.facts(),
+                self.target.addressable_resources(),
+                self.target.vectors(),
             );
-            let view = self.construction.view(index, tensor.representation);
-            self.value_views.insert(value, view);
+            (kernel, &self.state.bindings)
+        }
+        pub(crate) fn portable_allocate_tensor_axes(&mut self, value: SemanticValueId, axes: Vec<NatExpr>) -> AnyBufferView {
+            if let Some(view)=self.state.physical.value_views.get(&value).copied() { return view; }
+            let SemanticType::Tensor(mut tensor)=self.function.value(value).ty.clone() else { panic!("tensor allocation has scalar type") };
+            tensor.axes=axes;
+            let view=self.allocate_tensor_product(&tensor);
+            self.state.physical.value_views.insert(value,view);
             view
         }
-        pub(crate) fn portable_binding(&self, value: SemanticValueId) -> ValueBinding {
+        /// Relocate dense storage without interpreting unspecified elements as
+        /// source values. The same logical map used by kernel accesses derives
+        /// byte addresses; the reached Copy owns their physical validity.
+        pub(crate) fn portable_relocate_tensor(&mut self, source: &crate::portable::initialization::StoredView, destination: AnyBufferView) {
+            use seismic_ir::{region::Product, tensor_view::CoordinateOp};
+            let backing = *source.backing();
+            let source_layout = self.state.construction.storage().view_layout(backing).clone();
+            let destination_layout = self.state.construction.storage().view_layout(destination).clone();
+            let seismic_lang::registry::RepresentationKind::Dense(dtype) = seismic_lang::registry::representation_info(backing.representation()).kind else {
+                panic!("raw logical relocation requires dense storage")
+            };
+            assert_eq!(backing.representation(), destination.representation());
+            assert!(destination_layout.contiguous);
+            assert_eq!(source.extents(), destination_layout.extents);
+            let zero = self.arena.nat(0);
+            let count = self.arena.nat_product(source.extents());
+            // No coordinate exists for an empty tensor. Avoid constructing
+            // division by a statically zero axis even inside an unvisited body.
+            if count == zero { return; }
+            let repeat = self.begin_value_repeat(zero, count, Product::Unit);
+            let linear = repeat.binding().index;
+            let mut remaining = linear;
+            let mut indices = vec![zero; source.extents().len()];
+            for axis in (0..indices.len()).rev() {
+                indices[axis] = self.arena.nat_rem(remaining, source.extents()[axis]);
+                remaining = self.arena.nat_div(remaining, source.extents()[axis]);
+            }
+            let indices = source.dense_coordinates(&indices, zero, |op, a, b| match op {
+                CoordinateOp::Add => self.arena.nat_add(a,b),
+                CoordinateOp::Mul => self.arena.nat_mul(a,b),
+                CoordinateOp::Div => self.arena.nat_div(a,b),
+                CoordinateOp::Rem => self.arena.nat_rem(a,b),
+            }).expect("dense relocation cannot contain plane projection");
+            let mut source_element = zero;
+            for (index, stride) in indices.iter().zip(&source_layout.strides) {
+                let offset = self.arena.nat_mul(*index,*stride);
+                source_element = self.arena.nat_add(source_element,offset);
+            }
+            let width = self.arena.nat(u64::from(dtype.bytes()));
+            let source_offset = self.arena.nat_mul(source_element,width);
+            let destination_offset = self.arena.nat_mul(linear,width);
+            let source_index = self.state.construction.storage_mut().subview(self.arena,backing.index(),source_offset,vec![],vec![]);
+            let destination_index = self.state.construction.storage_mut().subview(self.arena,destination.index(),destination_offset,vec![],vec![]);
+            let source_element = self.state.construction.view(source_index,backing.representation());
+            let destination_element = self.state.construction.view(destination_index,destination.representation());
+            self.schedule().copy_any(source_element,destination_element);
+            self.finish_value_repeat(repeat,Product::Unit);
+        }
+        pub(crate) fn portable_publish_tensor(&mut self, value: SemanticValueId, view: AnyBufferView) {
+            let paths = self.state.pending_result_paths.get(&value)
+                .expect("root tensor publication has no declared result path").clone();
+            for (path, declared_axes) in paths {
+                self.state.construction.schedule(self.arena, self.state.schedule_region)
+                    .publish_tensor(view, path, declared_axes);
+            }
+        }
+        pub(crate) fn portable_views_may_overlap(&self, left: AnyBufferView, right: AnyBufferView) -> bool {
+            self.state.construction.may_overlap_views(left,right)
+        }
+        pub(crate) fn allocate_tensor_product(
+            &mut self,
+            tensor: &seismic_lang::entry::TensorSemantics,
+        ) -> AnyBufferView {
+            let (_, index) = self.state.construction.storage_mut().tensor(
+                self.arena, GlobalBufferKind::Arena, tensor.representation, tensor.axes.clone(),
+            );
+            let view = self.state.construction.view(index, tensor.representation);
+            self.state.construction.begin_tensor_instance(self.arena, self.state.schedule_region, view)
+        }
+        pub(crate) fn portable_binding(&self, value: SemanticValueId) -> PhysicalBinding {
             self.portable_existing_binding(value)
                 .unwrap_or_else(|| panic!("semantic value has no portable binding"))
         }
         pub(crate) fn portable_existing_binding(
             &self,
             value: SemanticValueId,
-        ) -> Option<ValueBinding> {
-            if let Some(view) = self.value_views.get(&value).copied() {
+        ) -> Option<PhysicalBinding> {
+            if let Some(view) = self.state.physical.value_views.get(&value).copied() {
                 return Some(self.bind_view(view));
             }
-            if let Some(binding) = self.scalar_symbols.get(&value) {
+            if let Some(binding) = self.state.physical.scalar_symbols.get(&value) {
                 return Some(binding.clone());
             }
-            match self.result_slots.get(&value).copied() {
-                Some(ScalarPublication::Scalar(slot)) => Some(ValueBinding::Scalar(slot.symbol())),
-                Some(ScalarPublication::Range { start, end }) => Some(ValueBinding::Range {
-                    start: start.symbol(),
-                    end: end.symbol(),
+            match self.state.physical.result_slots.get(&value).copied() {
+                Some(ScalarPublication::Scalar(slot)) => {
+                    Some(PhysicalBinding::Scalar(ScalarBinding::Published(slot)))
+                }
+                Some(ScalarPublication::Quantity(slot)) => {
+                    Some(PhysicalBinding::Scalar(ScalarBinding::Quantity(slot)))
+                }
+                Some(ScalarPublication::Range { start, end }) => Some(PhysicalBinding::Range {
+                    start: ScalarBinding::Quantity(start),
+                    end: ScalarBinding::Quantity(end),
                 }),
                 None => None,
             }
         }
         pub(crate) fn portable_publish(&mut self, value: SemanticValueId) -> ScalarPublication {
-            if let Some(publication) = self.result_slots.get(&value).copied() {
+            if let Some(publication) = self.state.physical.result_slots.get(&value).copied() {
                 return publication;
             }
             let publication = match self.function.value(value).ty {
-                SemanticType::Scalar(dtype) => {
-                    ScalarPublication::Scalar(self.construction.schedule_state().slot_any(
-                        self.arena,
-                        dtype,
-                        SymbolSort::Scalar(dtype),
-                    ))
-                }
-                SemanticType::Index { .. } => {
-                    ScalarPublication::Scalar(self.construction.schedule_state().slot_any(
-                        self.arena,
-                        DType::U32,
-                        SymbolSort::Nat,
-                    ))
-                }
+                SemanticType::Scalar(dtype) => ScalarPublication::Scalar(
+                    self.state
+                        .construction
+                        .schedule_state()
+                        .slot_any(self.arena, ScalarKind::Scalar(dtype)),
+                ),
+                SemanticType::Index { .. } => ScalarPublication::Quantity(
+                    self.state
+                        .construction
+                        .schedule_state()
+                        .quantity_slot(self.arena, HostQuantityKind::Natural),
+                ),
+                SemanticType::Integer => ScalarPublication::Quantity(
+                    self.state
+                        .construction
+                        .schedule_state()
+                        .quantity_slot(self.arena, HostQuantityKind::Integer),
+                ),
                 SemanticType::Range { .. } => ScalarPublication::Range {
-                    start: self.construction.schedule_state().slot_any(
-                        self.arena,
-                        DType::U32,
-                        SymbolSort::Nat,
-                    ),
-                    end: self.construction.schedule_state().slot_any(
-                        self.arena,
-                        DType::U32,
-                        SymbolSort::Nat,
-                    ),
+                    start: self
+                        .state
+                        .construction
+                        .schedule_state()
+                        .quantity_slot(self.arena, HostQuantityKind::Natural),
+                    end: self
+                        .state
+                        .construction
+                        .schedule_state()
+                        .quantity_slot(self.arena, HostQuantityKind::Natural),
                 },
                 _ => panic!("portable scalar publication requested for a non-scalar value"),
             };
-            self.result_slots.insert(value, publication);
+            self.state.physical.result_slots.insert(value, publication);
             publication
         }
-        pub(crate) fn portable_define_view(
-            &mut self,
-            value: SemanticValueId,
-            base: AnyBufferView,
-            offset: NatExpr,
-            extents: Vec<NatExpr>,
-            strides: Vec<NatExpr>,
-        ) -> AnyBufferView {
-            assert!(
-                !self.value_views.contains_key(&value),
-                "semantic tensor value was realized twice"
-            );
-            let representation = match &self.function.value(value).ty {
-                SemanticType::Tensor(tensor) => tensor.representation,
-                _ => panic!("view value is not a tensor"),
-            };
-            assert_eq!(
-                representation,
-                base.representation(),
-                "view transform changed representation without an explicit plane/decode operation"
-            );
-            let index = self.construction.storage_mut().subview(
-                self.arena,
-                base.index(),
-                offset,
-                extents,
-                strides,
-            );
-            let view = self.construction.view(index, representation);
-            self.value_views.insert(value, view);
-            view
-        }
-        pub(crate) fn portable_define_represented_view(
-            &mut self,
-            value: SemanticValueId,
-            base: AnyBufferView,
-            offset: NatExpr,
-            extents: Vec<NatExpr>,
-            strides: Vec<NatExpr>,
-        ) -> AnyBufferView {
-            assert!(
-                !self.value_views.contains_key(&value),
-                "semantic tensor value was realized twice"
-            );
-            let representation = match &self.function.value(value).ty {
-                SemanticType::Tensor(tensor) => tensor.representation,
-                _ => panic!("view value is not a tensor"),
-            };
-            let base_layout = self.construction.storage().view_layout(base).clone();
-            let absolute = self.arena.nat_add(base_layout.offset, offset);
-            let index = self.construction.storage_mut().strided_view(
-                base_layout.allocation,
-                representation,
-                absolute,
-                extents,
-                strides,
-            );
-            let view = self.construction.view(index, representation);
-            self.value_views.insert(value, view);
-            view
+        pub(crate) fn portable_affine_view(&mut self, view: &crate::portable::initialization::StoredView) -> Option<AnyBufferView> {
+            self.state.construction.storage_mut().affine_view(self.arena,view)
         }
         pub(crate) fn portable_layout(
             &self,
             view: AnyBufferView,
         ) -> seismic_ir::storage::BufferViewLayout {
-            self.construction.storage().view_layout(view).clone()
+            self.state.construction.storage().view_layout(view).clone()
         }
-        pub(crate) fn portable_preflight_status(&mut self) -> PortablePreflightStatus {
+        pub(crate) fn portable_source_statuses(
+            &mut self,
+            count: usize,
+        ) -> Vec<PortableSourceStatus> {
+            if count == 0 {
+                return Vec::new();
+            }
+            let count = u64::try_from(count).expect("source check count exceeds address domain");
             let representation = registry::dense(DType::U32);
-            let bytes = self.arena.nat(u64::from(DType::U32.bytes()));
-            let allocation = self.construction.storage_mut().allocate(
+            let bytes = self.arena.nat(
+                count
+                    .checked_mul(u64::from(DType::U32.bytes()))
+                    .expect("source status byte count overflow"),
+            );
+            let allocation = self.state.construction.storage_mut().allocate(
                 GlobalBufferKind::Arena,
                 bytes,
                 seismic_ir::storage::representation_alignment(representation),
             );
             let zero = self.arena.nat(0);
-            let one = self.arena.nat(1);
-            let index = self.construction.storage_mut().dense_view(
+            let extent = self.arena.nat(count);
+            let index = self.state.construction.storage_mut().dense_view(
                 self.arena,
                 allocation,
                 representation,
                 zero,
-                vec![one],
+                vec![extent],
             );
-            let view = self.construction.view(index, representation);
+            let view = self.state.construction.view(index, representation);
             let mut schedule = self.schedule();
-            let slot = schedule.slot_any(DType::U32, SymbolSort::Scalar(DType::U32));
             schedule.fill_constant_any(view, seismic_lang::intrinsics::FillConstant::Zero);
-            PortablePreflightStatus { view, slot }
+            (0..count)
+                .map(|index| PortableSourceStatus {
+                    view,
+                    slot: schedule.slot_any(ScalarKind::Scalar(DType::U32)),
+                    index,
+                })
+                .collect()
         }
-        pub(crate) fn portable_finish_preflight(
+        pub(crate) fn portable_finish_source_check(
             &mut self,
-            status: PortablePreflightStatus,
+            status: PortableSourceStatus,
             site: seismic_ir::kernel::ops::CheckSite,
         ) {
-            self.construction.assert_view(status.view);
-            self.construction.assert_slot(status.slot);
-            let zero = self.arena.nat(0);
+            self.state.construction.assert_view(status.view);
+            self.state.construction.assert_slot(status.slot);
+            let index = self.arena.nat(status.index);
             let mut schedule = self.schedule();
-            schedule.scalar_read_any(status.view, vec![zero], status.slot);
+            schedule.scalar_read_any(status.view, vec![index], status.slot);
             schedule.check_zero_any(status.slot, site);
         }
-        pub(crate) fn portable_begin_branch(&mut self, condition: BoolExpr) -> (u32, u32) {
-            self.construction
-                .schedule_state()
-                .begin_branch(self.schedule_region, condition)
+        pub(super) fn physical_environment(&self) -> PhysicalEnvironment {
+            self.state.physical.clone()
         }
-        pub(crate) fn portable_begin_repeat(
+        pub(super) fn restore_physical_environment(&mut self, environment: PhysicalEnvironment) {
+            self.state.physical = environment;
+        }
+        pub(crate) fn portable_begin_branch(&mut self, condition: BoolExpr) -> (u32, u32) {
+            self.state
+                .construction
+                .schedule_state()
+                .begin_branch(self.state.schedule_region, condition)
+        }
+        pub(crate) fn finish_value_branch(
+            &mut self, parent: u32, then_region: u32,
+            then_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+            else_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+        ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
+            self.state.construction.finish_value_branch(self.arena, parent, then_region, then_values, else_values)
+        }
+        pub(crate) fn begin_value_repeat(
             &mut self,
             start: NatExpr,
             end: NatExpr,
-        ) -> (u32, seismic_ir::schedule::LoopBinding) {
-            self.construction.schedule_state().begin_repeat(
-                self.arena,
-                self.schedule_region,
-                start,
-                end,
-            )
+            initial: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+        ) -> ScheduleRepeat {
+            let parent = self.state.schedule_region;
+            let product = self
+                .state
+                .construction
+                .begin_value_repeat(self.arena, parent, start, end, initial);
+            self.state.schedule_region = product.body();
+            ScheduleRepeat { parent, product }
         }
-        pub(super) fn splice_call(
+        pub(crate) fn finish_value_repeat(
+            &mut self,
+            repeat: ScheduleRepeat,
+            backedge: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
+        ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
+            self.state.schedule_region = repeat.parent;
+            self.state
+                .construction
+                .finish_value_repeat(repeat.product, backedge)
+        }
+        pub(super) fn begin_call(
             &mut self,
             call: NodeId,
             arguments: &[ValueBinding],
-        ) -> SplicedCall<B> {
-            let node = self.function.node(call);
-            let (family_id, call_inputs, call_outputs) = match node.view() {
+            selections: &crate::portable::BindingSelections,
+            contents: &crate::portable::initialization::StorageContents,
+            initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
+            binders: &[seismic_lang::expr::SymbolId],
+        ) -> CallConstruction<B> {
+            let (family_id, call_inputs, call_outputs) = match self.function.node(call).view() {
                 SemanticNodeView::Call {
                     family,
                     inputs,
                     outputs,
                 } => (family, inputs, outputs),
-                _ => panic!("splice_call requires a semantic Call node"),
+                _ => panic!("call construction requires a semantic Call node"),
             };
             assert_eq!(
                 arguments.len(),
                 call_inputs.len(),
-                "call argument binding count differs from semantic call inputs"
+                "call argument arity differs"
             );
-            let mut results = Vec::with_capacity(call_outputs.len());
-            for output in call_outputs {
-                let binding = match &self.function.value(*output).ty {
-                    SemanticType::Tensor(tensor) => {
-                        if !self.value_views.contains_key(output) {
-                            let bytes = seismic_ir::storage::tensor_bytes(
-                                self.arena,
-                                tensor.representation,
-                                &tensor.axes,
-                            );
-                            let allocation = self.construction.storage_mut().allocate(
-                                GlobalBufferKind::Arena,
-                                bytes,
-                                seismic_ir::storage::representation_alignment(
-                                    tensor.representation,
-                                ),
-                            );
-                            let zero = self.arena.nat(0);
-                            let index = self.construction.storage_mut().dense_view(
-                                self.arena,
-                                allocation,
-                                tensor.representation,
-                                zero,
-                                tensor.axes.clone(),
-                            );
-                            self.value_views.insert(
-                                *output,
-                                self.construction.view(index, tensor.representation),
-                            );
-                        }
-                        let view = self.value_views[output];
-                        ResultBinding::View {
-                            view,
-                            layout: self.construction.storage().view_layout(view).clone(),
-                        }
-                    }
-                    SemanticType::Scalar(dtype) => {
-                        let publication = *self.result_slots.entry(*output).or_insert_with(|| {
-                            ScalarPublication::Scalar(self.construction.schedule_state().slot_any(
-                                self.arena,
-                                *dtype,
-                                SymbolSort::Scalar(*dtype),
-                            ))
-                        });
-                        let ScalarPublication::Scalar(slot) = publication else {
-                            panic!("scalar call result has a range publication")
-                        };
-                        ResultBinding::Scalar(slot)
-                    }
-                    SemanticType::Index { .. } => {
-                        let publication = *self.result_slots.entry(*output).or_insert_with(|| {
-                            ScalarPublication::Scalar(self.construction.schedule_state().slot_any(
-                                self.arena,
-                                DType::U32,
-                                SymbolSort::Nat,
-                            ))
-                        });
-                        let ScalarPublication::Scalar(slot) = publication else {
-                            panic!("index call result has a range publication")
-                        };
-                        ResultBinding::Scalar(slot)
-                    }
-                    SemanticType::Range { .. } => {
-                        let publication = *self.result_slots.entry(*output).or_insert_with(|| {
-                            ScalarPublication::Range {
-                                start: self.construction.schedule_state().slot_any(
-                                    self.arena,
-                                    DType::U32,
-                                    SymbolSort::Nat,
-                                ),
-                                end: self.construction.schedule_state().slot_any(
-                                    self.arena,
-                                    DType::U32,
-                                    SymbolSort::Nat,
-                                ),
-                            }
-                        });
-                        let ScalarPublication::Range { start, end } = publication else {
-                            panic!("range call result has a scalar publication")
-                        };
-                        ResultBinding::Range { start, end }
-                    }
-                    other => {
-                        panic!("call result {output:?} has unsupported publication type {other:?}")
-                    }
-                };
-                results.push((*output, binding));
-            }
-            let result_bindings: Vec<ResultBinding> =
-                results.iter().map(|(_, binding)| binding.clone()).collect();
             let family = self.program.family(family_id);
             let reference = family.reference().candidate();
-            let target = self.target;
-            let mut children = Vec::new();
+            let reference_function = self.program.function(reference.function);
+            let mut bodies = Vec::new();
             for candidate in std::iter::once(reference).chain(family.alternatives()) {
                 let is_reference = std::ptr::eq(candidate, reference);
-                let backend_match = match candidate.kind {
+                let backend_matches = match candidate.kind {
                     CandidateKind::Portable => true,
                     CandidateKind::Lowering { backend } | CandidateKind::Helper { backend } => {
                         backend == B::NAME
                     }
                 };
-                if !backend_match
+                if !backend_matches
                     || candidate
                         .requires
                         .iter()
@@ -2033,443 +2008,276 @@ mod internals {
                     continue;
                 }
                 let function = self.program.function(candidate.function);
-                let contract = FunctionContract::derive(function);
-                if contract.parameters.len() != arguments.len()
-                    || contract.results.len() != result_bindings.len()
-                {
-                    panic!("semantic call family candidate contract arity differs from call node");
-                }
-                let site = CallSite::Spliced {
-                    call,
-                    arguments,
-                    results: &result_bindings,
-                };
-                if candidate.kind == CandidateKind::Portable {
-                    let factory = crate::portable::PortableFactory;
-                    let request = FactoryRequest {
-                        function,
-                        program: self.program,
-                        contract: &contract,
-                        target,
-                        constants: self.constants,
-                        precision: self.precision,
-                        candidate_kind: candidate.kind,
-                        numerical_role: candidate.numerical,
-                        semantic_coverage: candidate.applicability,
-                        site,
-                    };
-                    if factory.applicable(&request) == Applicability::Applicable {
-                        if self.authority == ConstructionAuthority::UniversalPortable
-                            && !is_reference
-                        {
-                            continue;
-                        }
-                        let construction_started = if is_reference {
-                            None
-                        } else {
-                            if !self.budget.borrow_mut().admit_optional_implementation() {
-                                continue;
-                            }
-                            Some(std::time::Instant::now())
-                        };
-                        let builder = if self.authority == ConstructionAuthority::UniversalPortable
-                        {
-                            ImplementationBuilder::new_universal(
-                                self.arena,
-                                self.program,
-                                function,
-                                target,
-                                self.registry,
-                                self.constants,
-                                self.precision,
-                                candidate.applicability,
-                                <crate::portable::PortableFactory as ImplementationFactory<B>>::identity(&factory),
-                                candidate.numerical,
-                                site,
-                                None,
-                                self.budget.clone(),
-                            )
-                        } else {
-                            ImplementationBuilder::new(
-                                self.arena,
-                                self.program,
-                                function,
-                                target,
-                                self.registry,
-                                self.constants,
-                                self.precision,
-                                candidate.applicability,
-                                <crate::portable::PortableFactory as ImplementationFactory<B>>::identity(&factory),
-                                ConstructionAuthority::Optimized,
-                                candidate.numerical,
-                                site,
-                                None,
-                                self.budget.clone(),
-                            )
-                        };
-                        children.push(ConstructedChild {
-                            implementation: factory.construct(&request, builder),
-                            results: contract.results.iter().map(|result| result.value).collect(),
-                        });
-                        if let Some(started) = construction_started {
-                            self.budget
-                                .borrow_mut()
-                                .record_implementation_construction(started.elapsed());
-                        }
-                        if self.authority != ConstructionAuthority::UniversalPortable {
-                            if !self.budget.borrow_mut().admit_optional_implementation() {
-                                continue;
-                            }
-                            let factory = crate::portable::PortableParallelFactory;
-                            let started = std::time::Instant::now();
-                            let builder = ImplementationBuilder::new(
-                                self.arena,
-                                self.program,
-                                function,
-                                target,
-                                self.registry,
-                                self.constants,
-                                self.precision,
-                                candidate.applicability,
-                                <crate::portable::PortableParallelFactory as ImplementationFactory<B>>::identity(&factory),
-                                ConstructionAuthority::Optimized,
-                                candidate.numerical,
-                                site,
-                                None,
-                                self.budget.clone(),
-                            );
-                            children.push(ConstructedChild {
-                                implementation: factory.construct(&request, builder),
-                                results: contract
-                                    .results
-                                    .iter()
-                                    .map(|result| result.value)
-                                    .collect(),
-                            });
-                            self.budget
-                                .borrow_mut()
-                                .record_implementation_construction(started.elapsed());
-                        }
-                    }
-                } else if self.authority != ConstructionAuthority::UniversalPortable {
-                    let factory = crate::portable::AuthoredSemanticFactory;
-                    let request = FactoryRequest {
-                        function,
-                        program: self.program,
-                        contract: &contract,
-                        target,
-                        constants: self.constants,
-                        precision: self.precision,
-                        candidate_kind: candidate.kind,
-                        numerical_role: candidate.numerical,
-                        semantic_coverage: candidate.applicability,
-                        site,
-                    };
-                    match factory.applicable(&request) {
-                        Applicability::Applicable => {
-                            if !self.budget.borrow_mut().admit_optional_implementation() {
-                                continue;
-                            }
-                            let started = std::time::Instant::now();
-                            let builder = ImplementationBuilder::new(
-                                self.arena,
-                                self.program,
-                                function,
-                                target,
-                                self.registry,
-                                self.constants,
-                                self.precision,
-                                candidate.applicability,
-                                <crate::portable::AuthoredSemanticFactory as ImplementationFactory<B>>::identity(&factory),
-                                ConstructionAuthority::Optimized,
-                                candidate.numerical,
-                                site,
-                                None,
-                                self.budget.clone(),
-                            );
-                            children.push(ConstructedChild {
-                                implementation: factory.construct(&request, builder),
-                                results: contract
-                                    .results
-                                    .iter()
-                                    .map(|result| result.value)
-                                    .collect(),
-                            });
-                            self.budget
-                                .borrow_mut()
-                                .record_implementation_construction(started.elapsed());
-                        }
-                        Applicability::NotApplicable { reason } => panic!(
-                            "checked authored backend candidate declined construction: {reason}"
+                let initialization = if is_reference {
+                    Ok(())
+                } else {
+                    contents.applicable(
+                        &mut crate::portable::initialization_context(
+                            self.arena, selections, binders,
                         ),
-                    }
-                }
-                if self.authority != ConstructionAuthority::UniversalPortable
-                    && candidate.kind == CandidateKind::Portable
-                {
-                    for factory in self.registry.factories() {
-                        let request = FactoryRequest {
+                        function.initialization(),
+                        reference_function.initialization(),
+                        initialized_arguments,
+                    )
+                };
+                let contract = FunctionContract::derive(function);
+                assert_eq!(
+                    contract.parameters.len(),
+                    arguments.len(),
+                    "child parameter arity differs"
+                );
+                assert_eq!(
+                    contract.results.len(),
+                    call_outputs.len(),
+                    "child result arity differs"
+                );
+                let mode = match candidate.kind {
+                    CandidateKind::Portable => crate::portable::SemanticMode::Portable,
+                    _ => crate::portable::SemanticMode::AuthoredBackend,
+                };
+                bodies.push(CallBody {
+                    candidate: candidate.clone(),
+                    selection: crate::candidate_domain::BodySelection::new(self.program, function, mode),
+                    initialization: initialization.clone(),
+                });
+                if candidate.kind == CandidateKind::Portable {
+                    bodies.push(CallBody {
+                        candidate: candidate.clone(),
+                        selection: crate::candidate_domain::BodySelection::new(
+                            self.program,
                             function,
-                            program: self.program,
-                            contract: &contract,
-                            target,
-                            constants: self.constants,
-                            precision: self.precision,
-                            candidate_kind: candidate.kind,
-                            numerical_role: candidate.numerical,
-                            semantic_coverage: candidate.applicability,
-                            site,
-                        };
-                        if factory.applicable(&request) == Applicability::Applicable {
-                            if !self.budget.borrow_mut().admit_optional_implementation() {
-                                break;
-                            }
-                            let started = std::time::Instant::now();
-                            let builder = ImplementationBuilder::new(
-                                self.arena,
-                                self.program,
-                                function,
-                                target,
-                                self.registry,
-                                self.constants,
-                                self.precision,
-                                candidate.applicability,
-                                factory.identity(),
-                                ConstructionAuthority::Optimized,
-                                candidate.numerical,
-                                site,
-                                None,
-                                self.budget.clone(),
-                            );
-                            children.push(ConstructedChild {
-                                implementation: factory.construct(&request, builder),
-                                results: contract
-                                    .results
-                                    .iter()
-                                    .map(|result| result.value)
-                                    .collect(),
-                            });
-                            self.budget
-                                .borrow_mut()
-                                .record_implementation_construction(started.elapsed());
-                        }
-                    }
+                            crate::portable::SemanticMode::PortableParallel,
+                        ),
+                        initialization,
+                    });
                 }
             }
             assert!(
-                !children.is_empty(),
-                "checked call family has no applicable portable child implementation"
+                !bodies.is_empty(),
+                "checked call has no source-compatible body"
             );
-            if self.authority == ConstructionAuthority::UniversalPortable {
-                assert_eq!(
-                    children.len(),
-                    1,
-                    "universal portable call splicing admits exactly the reference portable child"
-                );
-            }
-            let decision = if children.len() == 1 {
-                None
-            } else {
-                let domain = FiniteDomain::new((0..children.len() as i64).collect())
-                    .expect("child alternatives are nonempty");
-                Some(self.decision("call implementation", domain))
+            let selected = (bodies.len() == 1).then_some(0);
+            let occurrence = self.state.call_occurrences.entry(call).or_default();
+            let location = crate::candidate_domain::CallLocation {
+                body: self.function.stable(),
+                source_definition: self.function.source_definition(),
+                node: source_node_path(self.function, call),
+                occurrence: *occurrence,
             };
-            let mut alternatives = Vec::with_capacity(children.len());
-            for (ordinal, child) in children.into_iter().enumerate() {
-                let child_results = child.results;
-                let parts = child.implementation.into_parts();
-                let child_role = parts.numerical_role;
-                let child_transfer = parts.numerical_transfer;
-                let mut forced_slots = Vec::new();
-                for (result_ordinal, _child_value) in child_results.iter().enumerate() {
-                    let Some((_, parent)) = results.get(result_ordinal) else {
-                        continue;
-                    };
-                    let child_publication = parts
-                        .result_publications
-                        .get(result_ordinal)
-                        .map(|publication| publication.binding);
-                    match (parent, child_publication) {
-                        (
-                            ResultBinding::Scalar(parent),
-                            Some(PublishedResult::Scalar { slot: child, .. }),
-                        ) => forced_slots.push((child.index(), *parent)),
-                        (
-                            ResultBinding::Range {
-                                start: parent_start,
-                                end: parent_end,
-                            },
-                            Some(PublishedResult::Range { start, end }),
-                        ) => {
-                            forced_slots.push((start.index(), *parent_start));
-                            forced_slots.push((end.index(), *parent_end));
-                        }
-                        (ResultBinding::View { .. }, Some(PublishedResult::Buffer { .. })) => {}
-                        _ => panic!(
-                            "child result #{result_ordinal} publication does not match the caller destination"
-                        ),
-                    }
-                }
-                let child_ir =
-                    parts
-                        .executable
-                        .into_ir()
-                        .into_importable()
-                        .unwrap_or_else(|error| {
-                            panic!("spliced child produced a root-only executable: {error:?}")
-                        });
-                let imported = self
-                    .construction
-                    .import(self.arena, child_ir, &forced_slots);
-                let child_choices = if let Some(decision) = decision {
-                    let selected = self.arena.decision_is(decision, ordinal as i64);
-                    crate::refinement::activate_choices(self.arena, selected, parts.choices)
-                } else {
-                    parts.choices
-                };
-                self.choices.extend(child_choices);
-                self.callees.push(parts.provenance.root);
-                self.callees.extend(parts.provenance.callees);
-                if let Some(decision) = decision {
-                    let selected = self.arena.decision_is(decision, ordinal as i64);
-                    self.constraints
-                        .push(self.arena.implies(selected, parts.semantic_coverage.node()));
-                    self.constraints
-                        .push(self.arena.implies(selected, parts.hard_constraints));
-                } else {
-                    self.constraints.push(parts.semantic_coverage.node());
-                    self.constraints.push(parts.hard_constraints);
-                }
-                self.conditional_child_transfers
-                    .push(ConditionalNumericalTransfer {
-                        selection: decision.map(|decision| (decision, ordinal as i64)),
-                        role: child_role,
-                        transfer: Box::new(child_transfer),
-                    });
-                alternatives.push((ordinal as i64, imported));
-            }
-            SplicedCall {
-                decision,
-                results,
-                alternatives,
-                marker: std::marker::PhantomData,
+            *occurrence += 1;
+            CallConstruction {
+                call,
+                location,
+                arguments: arguments.to_vec(),
+                bodies,
+                selected,
+                begun: false,
+                child: None,
             }
         }
-        pub(super) fn close(mut self, closed: ClosedSchedule) -> CandidateFamily<B> {
-            let coverage = self.semantic_coverage;
-            if self.authority == ConstructionAuthority::UniversalPortable {
-                assert!(
-                    self.choices.is_empty(),
-                    "universal portable implementation cannot contain finite decisions"
-                );
+
+        pub(super) fn begin_call_child(
+            &mut self,
+            progress: &mut CallConstruction<B>,
+            selections: &crate::portable::BindingSelections,
+            contents: &crate::portable::initialization::StorageContents,
+            binders: &[seismic_lang::expr::SymbolId],
+        ) -> Option<crate::portable::construction::SourceConstruction<B>> {
+            if progress.begun {
+                return None;
             }
-            for (value, paths) in std::mem::take(&mut self.pending_result_paths) {
-                let view = self
-                    .value_views
-                    .get(&value)
-                    .copied()
-                    .unwrap_or_else(|| panic!("returned tensor view was never realized"));
-                for path in paths {
-                    self.construction
-                        .storage_mut()
-                        .publish_result(self.arena, view, path);
-                }
-            }
-            let allocation_ids = (0..self.construction.storage().allocation_count())
-                .map(|ordinal| self.construction.allocation(ordinal))
-                .collect::<Vec<_>>();
-            let construction = self.construction.take();
-            let analyzed = construction.close(closed).analyze_allocations();
-            self.validate_schedule(analyzed.schedule(), analyzed.storage());
-            let reuse_policy = if self.authority == ConstructionAuthority::UniversalPortable {
-                crate::refinement::AllocationReusePolicy::Distinct
-            } else {
-                crate::refinement::AllocationReusePolicy::Explore
+            assert!(
+                progress.initialization_pending().is_none(),
+                "unresolved initialization must remain a suspended construction"
+            );
+            let body = &progress.bodies[progress
+                .selected
+                .expect("select a child before constructing it")];
+            progress.begun = true;
+            let site = CallSite::Spliced {
+                call: progress.call,
+                arguments: &progress.arguments,
+                bindings: &self.state.bindings,
+                contents,
+                binders,
+                storage: self.state.construction.storage(),
+                selections,
             };
+            let builder = ImplementationBuilder::new(
+                self.arena,
+                self.program,
+                self.program.function(body.candidate.function),
+                self.target,
+                self.registry,
+                self.constants,
+                self.precision,
+                body.candidate.applicability,
+                site,
+                None,
+            );
+            let (child, _) = crate::portable::construction::SourceConstruction::begin(
+                builder,
+                body.selection.mode(),
+            );
+            Some(child)
+        }
+
+        pub(super) fn complete_call_child(
+            &mut self,
+            progress: &mut CallConstruction<B>,
+            child: ConstructedCandidate<B>,
+        ) {
+            assert!(
+                progress.child.replace(child).is_none(),
+                "selected child completed twice"
+            );
+        }
+
+        pub(super) fn finish_call(
+            &mut self,
+            progress: CallConstruction<B>,
+            selections: &crate::portable::BindingSelections,
+            contents: &mut crate::portable::initialization::StorageContents,
+            initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
+            binders: &[seismic_lang::expr::SymbolId],
+        ) -> Vec<(SemanticValueId, ValueBinding)> {
+            let CallConstruction {
+                call,
+                arguments: parameter_bindings,
+                child,
+                ..
+            } = progress;
+            let (family_id, call_outputs) = match self.function.node(call).view() {
+                SemanticNodeView::Call {
+                    family, outputs, ..
+                } => (family, outputs),
+                _ => unreachable!("call progress has a checked call owner"),
+            };
+            let reference_function = self
+                .program
+                .function(self.program.family(family_id).reference().function());
+            let child = child.expect("selected call child has not completed");
+            contents
+                .call(
+                    &mut crate::portable::initialization_context(self.arena, selections, binders),
+                    reference_function.initialization(),
+                    initialized_arguments,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("checked reference call lost its actual initialized input: {error:?}")
+                });
+            let parts = child.into_parts();
+            let child_ir = parts
+                .executable
+                .into_ir()
+                .into_importable()
+                .unwrap_or_else(|error| {
+                    panic!("spliced child produced a root-only executable: {error:?}")
+                });
+            let imported = self.state.construction.import(
+                self.arena,
+                self.state.schedule_region,
+                child_ir,
+                &[],
+            );
+            let results = parts.bindings.import_into(
+                &mut self.state.bindings,
+                &parameter_bindings,
+                &imported,
+                self.state.construction.storage(),
+                contents,
+            );
+            assert_eq!(
+                results.len(),
+                call_outputs.len(),
+                "child complete result arity differs"
+            );
+            self.state.choices.extend(parts.choices);
+            self.state.numerical_children.selected_child(&parts.numerical_applicability);
+            self.state.callees.push(parts.provenance.root);
+            self.state.callees.extend(parts.provenance.callees);
+            self.state.constraints.push(parts.semantic_coverage.node());
+            self.state.constraints.push(parts.hard_constraints);
+            call_outputs.iter().copied().zip(results).collect()
+        }
+        pub(super) fn close(mut self, closed: ClosedSchedule, mode: crate::portable::SemanticMode) -> ConstructedCandidate<B> {
+            let coverage = self.state.semantic_coverage;
+            let allocation_ids = (0..self.state.construction.storage().allocation_count())
+                .map(|ordinal| self.state.construction.allocation(ordinal))
+                .collect::<Vec<_>>();
+            let construction = self.state.construction.take();
+            let analyzed = construction
+                .close(closed)
+                .normalize_launches(
+                    self.arena,
+                    self.target.limits().max_grid[0],
+                    self.target.limits().max_index_bits,
+                )
+                .expect("one implementation and its imported children share an immutable target")
+                .analyze_allocations();
+            self.validate_schedule(analyzed.schedule(), analyzed.storage());
+            let reuse_policy = crate::refinement::AllocationReusePolicy::Explore;
             let (planned, reuse_decisions, reuse_constraints) =
                 crate::refinement::refine_allocation_choices(self.arena, analyzed, reuse_policy)
                     .into_parts();
             for (decision, meaning) in reuse_decisions {
                 let active_when = self.arena.bool(true);
-                self.choices.push(ChoiceDeclaration {
+                self.state.choices.push(ChoiceDeclaration {
+                    kind: crate::refinement::ChoiceKind::AllocationSlot,
                     decision,
                     meaning,
                     active_when,
                 });
             }
-            self.constraints.extend(reuse_constraints);
-            crate::refinement::validate_choice_declarations(self.arena, &self.choices);
-            let liveness = planned.liveness();
-            let slots = planned.slots();
-            let launch_layouts: Vec<_> = planned
-                .schedule()
-                .launches()
-                .iter()
-                .map(|launch| {
-                    let kernel = planned
-                        .kernels()
-                        .get(launch.kernel.index() as usize)
-                        .expect("launch kernel belongs to this implementation");
-                    seismic_ir::storage::derive_launch_local_layout(
-                        self.arena,
-                        kernel.locals(),
-                        kernel.intrinsic_resources(),
-                    )
-                })
-                .collect();
-            let launch_abi: Vec<_> = planned
-                .schedule()
-                .launches()
-                .iter()
-                .map(|launch| {
-                    let kernel = planned
-                        .kernels()
-                        .get(launch.kernel.index() as usize)
-                        .expect("launch kernel belongs to this implementation");
-                    self.target
-                        .kernel_abi_layout(kernel)
-                        .allocations
-                        .into_iter()
-                        .map(|allocation| seismic_ir::storage::LaunchAbiRequirement {
-                            role: allocation.role,
-                            bytes: self.arena.nat(allocation.bytes),
-                            alignment: allocation.alignment,
-                        })
-                        .collect()
-                })
-                .collect();
-            let launch_scratch =
-                self.derive_launch_scratch(planned.schedule(), planned.kernels(), &launch_layouts);
-            self.derive_constraints(
-                planned.storage(),
-                &allocation_ids,
-                planned.schedule(),
-                planned.kernels(),
-                &launch_layouts,
-                &launch_scratch,
-                &launch_abi,
+            self.state.constraints.extend(reuse_constraints);
+            crate::refinement::validate_choice_declarations(self.arena, &self.state.choices);
+            let executable = planned.finish().close_execution(
+                self.arena,
+                self.target.local_realization(),
+                self.target.kernel_abi(),
             );
-            let raw_constraints = self.arena.all(&self.constraints);
+            let kernels = executable
+                .kernels()
+                .kernels()
+                .map(|(_, kernel)| kernel)
+                .collect::<Vec<_>>();
+            self.derive_constraints(
+                executable.storage(),
+                &allocation_ids,
+                executable.schedule(),
+                &kernels,
+                executable.launch_resources(),
+            );
+            let raw_constraints = self.arena.all(&self.state.constraints);
             let side_conditions = self.arena.side_conditions(AnyExpr::Bool(raw_constraints));
             let hard_constraints = self.arena.and(side_conditions, raw_constraints);
-            let numerical_transfer = self.derive_numerics(planned.kernels());
+            let required = self.program.families().any(|(_, family)| {
+                family.reference().function() == self.function.id()
+            });
+            let numerical_applicability = if required && mode == crate::portable::SemanticMode::Portable {
+                self.state.numerical_children.clone()
+            } else {
+                NumericalApplicability::selected_replacement(
+                    self.arena,
+                    self.program,
+                    self.function,
+                    &self.state.bindings,
+                    &executable,
+                    &self.state.numerical_children,
+                )
+            };
             let roots = self.register_roots(
-                planned.storage(),
+                executable.storage(),
                 &allocation_ids,
-                planned.kernels(),
-                planned.schedule(),
-                &launch_layouts,
-                &launch_scratch,
-                &launch_abi,
+                &kernels,
+                executable.schedule(),
+                executable.launch_resources(),
                 hard_constraints,
                 coverage,
-                &numerical_transfer,
             );
             let expression_digest = self.arena.canonical_digest(&roots).bytes();
             let mut digest =
-                seismic_ir::identity::StructureDigest::new("seismic-implementation-v3");
-            digest.bytes(self.factory.name.as_bytes());
-            digest.bytes(self.factory.revision.as_bytes());
+                seismic_ir::identity::StructureDigest::new("seismic-implementation-v7");
             let (reference_math_version, reference_math_digest) =
                 seismic_ir::kernel::reference_math_identity();
             digest.bytes(reference_math_version.as_bytes());
@@ -2478,36 +2286,35 @@ mod internals {
             digest_structure(
                 &mut digest,
                 &self,
-                planned.storage(),
+                executable.storage(),
                 &allocation_ids,
-                planned.kernels(),
-                planned.schedule(),
-                liveness,
-                slots,
+                &kernels,
+                executable.schedule(),
             );
-            digest_numerical(&mut digest, &self, &numerical_transfer);
-            let identity = CandidateFamilyIdentity {
-                factory: self.factory.clone(),
+            let identity = ConstructedCandidateIdentity {
                 structure: digest.finish(),
             };
             let mut result_publications = Vec::new();
-            for result in &self.contract.results {
+            for result in &self.state.contract.results {
+                if !self.state.root {
+                    continue;
+                }
                 for path in &result.paths {
                     let binding = match &result.ty {
-                        SemanticType::Tensor(_) => {
-                            let publication = planned
-                                .storage()
-                                .result_views()
-                                .iter()
-                                .find(|publication| &publication.path == path)
-                                .expect("closed result tensor path has no published view");
-                            PublishedResult::Buffer {
-                                view: publication.view,
-                                bytes: publication.bytes,
-                            }
+                        SemanticType::Tensor(tensor) => {
+                            let publications = executable.storage().result_views().iter()
+                                .filter(|publication| &publication.path == path).collect::<Vec<_>>();
+                            assert!(!publications.is_empty(), "closed result tensor path has no publication operation");
+                            assert!(publications.iter().all(|publication| {
+                                let view = executable.storage().view(publication.view);
+                                view.representation == tensor.representation && view.extents.len() == tensor.axes.len()
+                            }), "source result publication changed its declared tensor type");
+                            PublishedResult::Buffer { representation: tensor.representation, rank: tensor.axes.len() }
                         }
-                        SemanticType::Scalar(dtype) => {
+                        SemanticType::Scalar(_) => {
                             let ScalarPublication::Scalar(slot) = self
+                                .state
+                                .physical
                                 .result_slots
                                 .get(&result.value)
                                 .copied()
@@ -2515,27 +2322,28 @@ mod internals {
                             else {
                                 panic!("closed scalar result has a range publication")
                             };
-                            PublishedResult::Scalar {
-                                slot,
-                                kind: PublishedScalarKind::Value(*dtype),
-                            }
+                            PublishedResult::Scalar { slot }
                         }
                         SemanticType::Index { .. } => {
-                            let ScalarPublication::Scalar(slot) = self
+                            let ScalarPublication::Quantity(slot) = self
+                                .state
+                                .physical
                                 .result_slots
                                 .get(&result.value)
                                 .copied()
                                 .expect("closed index result has no publication")
                             else {
-                                panic!("closed index result has a range publication")
+                                panic!("closed index result has a non-natural publication")
                             };
-                            PublishedResult::Scalar {
-                                slot,
-                                kind: PublishedScalarKind::Index,
-                            }
+                            PublishedResult::Quantity { slot }
+                        }
+                        SemanticType::Integer => {
+                            panic!("root result ABI does not expose unbounded signed Integer")
                         }
                         SemanticType::Range { .. } => {
                             let ScalarPublication::Range { start, end } = self
+                                .state
+                                .physical
                                 .result_slots
                                 .get(&result.value)
                                 .copied()
@@ -2559,168 +2367,86 @@ mod internals {
                     });
                 }
             }
-            let executable = planned.finish().close_execution(self.arena);
-            CandidateFamily::from_parts(CandidateFamilyParts {
-                authority: self.authority,
-                numerical_role: self.numerical_role,
+            ConstructedCandidate::from_parts(ConstructedCandidateParts {
                 identity,
                 semantic_coverage: coverage,
+                native_index_bits: self.target.limits().max_index_bits,
                 executable,
-                launch_scratch,
-                launch_abi,
-                choices: self.choices,
+                choices: self.state.choices,
                 hard_constraints,
-                numerical_transfer,
+                numerical_applicability,
                 provenance: ImplementationProvenance {
                     root: self.function.stable(),
-                    callees: self.callees,
+                    callees: self.state.callees,
                 },
                 result_publications,
+                bindings: self.state.bindings.freeze(),
             })
-        }
-
-        pub(super) fn typed_view<R: Representation>(
-            &self,
-            value: SemanticValueId,
-        ) -> BufferViewId<R> {
-            let view = self.value_views.get(&value).copied().unwrap_or_else(|| {
-                panic!("factory requested a semantic tensor with no realized view")
-            });
-            assert_eq!(
-                view.representation(),
-                R::id(),
-                "factory requested a semantic tensor through the wrong representation type"
-            );
-            self.construction.typed_view(view)
-        }
-
-        fn derive_launch_scratch(
-            &mut self,
-            schedule: &ParametricSchedule,
-            kernels: &[seismic_ir::kernel::Kernel<B>],
-            launch_layouts: &[seismic_ir::storage::LaunchLocalLayout],
-        ) -> Vec<seismic_ir::storage::LaunchScratchRequirements> {
-            use seismic_ir::storage::{LaunchLocalKind, ScratchRequirement};
-            use seismic_ir::target::LocalRealization;
-            assert_eq!(
-                schedule.launches().len(),
-                launch_layouts.len(),
-                "one local layout per launch"
-            );
-            schedule
-                .launches()
-                .iter()
-                .zip(launch_layouts)
-                .map(|(launch, layout)| {
-                    let groups = self.arena.nat_product(&launch.grid);
-                    let threads = self.arena.nat_product(&launch.workgroup);
-                    let participants = self.arena.nat_mul(groups, threads);
-                    let kernel = kernels
-                        .get(launch.kernel.index() as usize)
-                        .expect("launch kernel belongs to this implementation");
-                    let alignment = |kind| {
-                        kernel
-                            .locals()
-                            .iter()
-                            .filter(|local| local.kind == kind)
-                            .map(|local| local.alignment)
-                            .max()
-                            .unwrap_or(1)
-                    };
-                    let workgroup_alignment = alignment(LaunchLocalKind::Workgroup);
-                    let participant_alignment = alignment(LaunchLocalKind::Participant);
-                    let register_alignment = alignment(LaunchLocalKind::Register);
-                    let requirement =
-                        |this: &mut Self, kind: LaunchLocalKind, per_unit: NatExpr, alignment| {
-                            let count = match this.target.local_realization().for_kind(kind) {
-                                LocalRealization::NativeDynamic
-                                | LocalRealization::NativeStatic => return None,
-                                LocalRealization::InvocationScratchPerWorkgroup => groups,
-                                LocalRealization::InvocationScratchPerParticipant => participants,
-                            };
-                            Some(ScratchRequirement {
-                                bytes: scaled_scratch_bytes(this.arena, per_unit, count),
-                                alignment,
-                            })
-                        };
-                    seismic_ir::storage::LaunchScratchRequirements {
-                        workgroup: requirement(
-                            self,
-                            LaunchLocalKind::Workgroup,
-                            layout.workgroup_bytes,
-                            workgroup_alignment,
-                        ),
-                        participant: requirement(
-                            self,
-                            LaunchLocalKind::Participant,
-                            layout.participant_bytes,
-                            participant_alignment,
-                        ),
-                        register: requirement(
-                            self,
-                            LaunchLocalKind::Register,
-                            layout.register_bytes,
-                            register_alignment,
-                        ),
-                    }
-                })
-                .collect()
         }
 
         fn derive_constraints(
             &mut self,
-            storage: &seismic_ir::storage::TopologyBuilder,
+            storage: &seismic_ir::storage::GlobalAllocationTopology,
             allocation_ids: &[GlobalAllocationId],
-            schedule: &ParametricSchedule,
-            kernels: &[seismic_ir::kernel::Kernel<B>],
-            launch_layouts: &[seismic_ir::storage::LaunchLocalLayout],
-            launch_scratch: &[seismic_ir::storage::LaunchScratchRequirements],
-            launch_abi: &[Vec<seismic_ir::storage::LaunchAbiRequirement>],
+            schedule: &ParametricSchedule<B>,
+            kernels: &[&seismic_ir::kernel::Kernel<B>],
+            resources: &[seismic_ir::execution::LaunchResources],
         ) {
             let max_allocation = self.arena.nat_symbol(
                 self.arena
                     .target_constant_symbol(self.constants.max_allocation_bytes),
             );
-            // `NatExpr` is already a u64 domain. A `value <= u64::MAX`
-            // predicate is therefore a type tautology, not a target legality
-            // condition, and retaining it leaves spurious call-dimension
-            // obligations in universal closure. Narrower native index domains
-            // still require the explicit bound everywhere below.
-            let max_index = (self.target.limits().max_index_bits < 64).then(|| {
-                self.arena
-                    .nat((1u64 << self.target.limits().max_index_bits) - 1)
-            });
-            assert_eq!(allocation_ids.len(), storage.allocation_count() as usize);
+            // Natural expressions are unbounded, so even a 64-bit native
+            // index limit is a real target constraint. Form the exact bound
+            // for the target's declared width rather than truncating to u64.
+            let index_bits = self.target.limits().max_index_bits;
+            let max_index = if index_bits <= 64 {
+                self.arena.nat(u64::MAX >> (64 - index_bits))
+            } else {
+                self.arena.nat_exact(
+                    (seismic_lang::expr::BigUint::from(1u8) << index_bits)
+                        - seismic_lang::expr::BigUint::from(1u8),
+                )
+            };
+            assert_eq!(allocation_ids.len(), storage.allocations().len());
             for &id in allocation_ids {
-                let bytes = storage.allocation_bytes(id);
-                self.constraints
-                    .push(self.arena.nat_cmp(CmpOp::Le, bytes, max_allocation));
-                if let Some(max_index) = max_index {
-                    self.constraints
+                let allocation = storage.allocation(id);
+                let bytes = allocation.reserved_bytes;
+                if allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Invocation
+                {
+                    self.state.constraints.push(self.arena.nat_cmp(
+                        CmpOp::Le,
+                        bytes,
+                        max_allocation,
+                    ));
+                    self.state
+                        .constraints
                         .push(self.arena.nat_cmp(CmpOp::Le, bytes, max_index));
                 }
-                let required_alignment = storage.allocation_alignment(id);
-                self.constraints.push(
+                let required_alignment = storage.allocation(id).alignment;
+                self.state.constraints.push(
                     self.arena
                         .bool(required_alignment <= self.target.limits().max_allocation_alignment),
                 );
             }
-            for layout in storage.views() {
-                if let Some(max_index) = max_index {
-                    self.constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, layout.offset, max_index));
+            let mut view_requirements = Vec::new();
+            for (view_ordinal, layout) in storage.views().iter().enumerate() {
+                let constraint_start = self.state.constraints.len();
+                // The whole-tensor constructor gives this view its allocation's
+                // exact geometry and byte demand. Rechecking its own span as
+                // `bytes <= bytes` introduces reached tensor slots into an
+                // invocation guard without establishing any new property.
+                if matches!(layout.mapping, seismic_ir::storage::ViewMapping::WholeAllocation) {
+                    view_requirements.push(self.arena.bool(true));
+                    continue;
                 }
-                for extent in &layout.extents {
-                    if let Some(max_index) = max_index {
-                        self.constraints
-                            .push(self.arena.nat_cmp(CmpOp::Le, *extent, max_index));
-                    }
+                if let seismic_ir::storage::ViewMapping::Transpose { source, .. } = &layout.mapping {
+                    view_requirements.push(view_requirements[source.index() as usize]);
+                    continue;
                 }
-                for stride in &layout.strides {
-                    if let Some(max_index) = max_index {
-                        self.constraints
-                            .push(self.arena.nat_cmp(CmpOp::Le, *stride, max_index));
-                    }
+                if matches!(layout.base, seismic_ir::storage::ViewBase::TensorValue(id) if id.index() as usize == view_ordinal) {
+                    view_requirements.push(self.arena.bool(true));
+                    continue;
                 }
                 // Whole canonical views must use the same tensor-byte
                 // expression as allocation and TargetDomain construction.
@@ -2742,20 +2468,28 @@ mod internals {
                 } else {
                     addressed_bytes(self.arena, layout)
                 };
-                let allocation_bytes = storage.allocation_bytes(layout.allocation);
-                self.constraints
-                    .push(self.arena.nat_cmp(CmpOp::Le, addressed, allocation_bytes));
-                if let Some(max_index) = max_index {
-                    self.constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, addressed, max_index));
-                }
+                let allocation_bytes = match layout.base {
+                    seismic_ir::storage::ViewBase::Allocation(id) => storage.allocation(id).bytes,
+                    seismic_ir::storage::ViewBase::TensorValue(id) => {
+                        let source = &storage.views()[id.index() as usize];
+                        addressed_bytes(self.arena, source)
+                    }
+                };
+                self.state.constraints.push(self.arena.nat_cmp(
+                    CmpOp::Le,
+                    addressed,
+                    allocation_bytes,
+                ));
                 let view_alignment =
                     seismic_ir::storage::representation_alignment(layout.representation);
                 let alignment = self.arena.nat(view_alignment);
                 let remainder = self.arena.nat_rem(layout.offset, alignment);
                 let zero = self.arena.nat(0);
-                self.constraints
+                self.state
+                    .constraints
                     .push(self.arena.nat_cmp(CmpOp::Eq, remainder, zero));
+                let terms = self.state.constraints.split_off(constraint_start);
+                view_requirements.push(self.arena.all(&terms));
             }
             let max_bindings = self.arena.nat_symbol(
                 self.arena
@@ -2765,60 +2499,41 @@ mod internals {
                 self.arena
                     .target_constant_symbol(self.constants.max_argument_bytes),
             );
-            assert_eq!(
-                schedule.launches().len(),
-                launch_layouts.len(),
-                "one canonical local layout per launch"
-            );
-            assert_eq!(
-                schedule.launches().len(),
-                launch_scratch.len(),
-                "one scratch realization per launch"
-            );
-            assert_eq!(
-                schedule.launches().len(),
-                launch_abi.len(),
-                "one ABI allocation set per launch"
-            );
-            for (((launch, local_layout), scratch), abi_allocations) in schedule
-                .launches()
-                .iter()
-                .zip(launch_layouts)
-                .zip(launch_scratch)
-                .zip(launch_abi)
-            {
+            let mut launch_constraints = Vec::new();
+            for (launch, resources) in schedule.launches().iter().zip(resources) {
+                let local_layout = resources.layout();
+                let scratch = resources.scratch();
+                let abi_allocations = resources.abi();
+                let constraint_start = self.state.constraints.len();
                 let threads = self.arena.nat_product(&launch.workgroup);
                 let max_threads = self.arena.nat(self.target.limits().max_workgroup_threads);
-                self.constraints
+                self.state
+                    .constraints
                     .push(self.arena.nat_cmp(CmpOp::Le, threads, max_threads));
+                let grid_envelope = schedule.launch_grid_envelope(self.arena, launch);
                 for axis in 0..3 {
                     let max_workgroup_axis = self
                         .arena
                         .nat(self.target.limits().max_workgroup_size[axis]);
-                    self.constraints.push(self.arena.nat_cmp(
+                    self.state.constraints.push(self.arena.nat_cmp(
                         CmpOp::Le,
                         launch.workgroup[axis],
                         max_workgroup_axis,
                     ));
-                    let certificate_owns_grid_x = axis == 0
-                        && self.authority == ConstructionAuthority::UniversalPortable
-                        && launch.parallel_extent.is_some()
-                        && launch.logical_base.is_some();
-                    if !certificate_owns_grid_x {
-                        let max = self.arena.nat(self.target.limits().max_grid[axis]);
-                        self.constraints.push(self.arena.nat_cmp(
-                            CmpOp::Le,
-                            launch.grid[axis],
-                            max,
-                        ));
-                        if let Some(max_index) = max_index {
-                            self.constraints.push(self.arena.nat_cmp(
-                                CmpOp::Le,
-                                launch.grid[axis],
-                                max_index,
-                            ));
-                        }
-                    }
+                    let max_grid = self.arena.nat(self.target.limits().max_grid[axis]);
+                    self.state.constraints.push(self.arena.nat_cmp(
+                        CmpOp::Le,
+                        grid_envelope[axis],
+                        max_grid,
+                    ));
+                    let physical_participants = self
+                        .arena
+                        .nat_mul(grid_envelope[axis], launch.workgroup[axis]);
+                    self.state.constraints.push(self.arena.nat_cmp(
+                        CmpOp::Le,
+                        physical_participants,
+                        max_index,
+                    ));
                 }
 
                 let kernel = kernels
@@ -2830,10 +2545,9 @@ mod internals {
                         .chain(local.strides.iter().copied())
                         .chain(std::iter::once(local.bytes))
                     {
-                        if let Some(max_index) = max_index {
-                            self.constraints
-                                .push(self.arena.nat_cmp(CmpOp::Le, value, max_index));
-                        }
+                        self.state
+                            .constraints
+                            .push(self.arena.nat_cmp(CmpOp::Le, value, max_index));
                     }
                 }
                 for total in [
@@ -2841,28 +2555,25 @@ mod internals {
                     local_layout.participant_bytes,
                     local_layout.register_bytes,
                 ] {
-                    if let Some(max_index) = max_index {
-                        self.constraints
-                            .push(self.arena.nat_cmp(CmpOp::Le, total, max_index));
-                    }
+                    self.state
+                        .constraints
+                        .push(self.arena.nat_cmp(CmpOp::Le, total, max_index));
                 }
                 for requirement in [&scratch.workgroup, &scratch.participant, &scratch.register]
                     .into_iter()
                     .flatten()
                 {
-                    self.constraints.push(self.arena.nat_cmp(
+                    self.state.constraints.push(self.arena.nat_cmp(
                         CmpOp::Le,
                         requirement.bytes,
                         max_allocation,
                     ));
-                    if let Some(max_index) = max_index {
-                        self.constraints.push(self.arena.nat_cmp(
-                            CmpOp::Le,
-                            requirement.bytes,
-                            max_index,
-                        ));
-                    }
-                    self.constraints.push(self.arena.bool(
+                    self.state.constraints.push(self.arena.nat_cmp(
+                        CmpOp::Le,
+                        requirement.bytes,
+                        max_index,
+                    ));
+                    self.state.constraints.push(self.arena.bool(
                         requirement.alignment.is_power_of_two()
                             && requirement.alignment
                                 <= self.target.limits().max_allocation_alignment,
@@ -2874,16 +2585,19 @@ mod internals {
                         self.constants.addressable_resource_capacity(lease.class_id),
                     ));
                     let end = self.arena.nat_add(lease.offset_units, lease.units);
-                    self.constraints
+                    self.state
+                        .constraints
                         .push(self.arena.nat_cmp(CmpOp::Le, end, capacity));
-                    if let Some(max_index) = max_index {
-                        self.constraints
-                            .push(self.arena.nat_cmp(CmpOp::Le, end, max_index));
-                    }
+                    self.state
+                        .constraints
+                        .push(self.arena.nat_cmp(CmpOp::Le, end, max_index));
                 }
                 let binding_count = self.arena.nat(data.interface().bindings.len() as u64);
-                self.constraints
-                    .push(self.arena.nat_cmp(CmpOp::Le, binding_count, max_bindings));
+                self.state.constraints.push(self.arena.nat_cmp(
+                    CmpOp::Le,
+                    binding_count,
+                    max_bindings,
+                ));
                 // Core ABI metadata size, not bytes reachable through bound
                 // tensors. Buffer/result slots are encoded as machine-width
                 // addresses, Nat arguments as u64, and scalar arguments at
@@ -2894,25 +2608,23 @@ mod internals {
                     "backend kernel ABI footprint alignment is a nonzero power of two"
                 );
                 let argument_bytes = self.arena.nat(footprint.bytes);
-                self.constraints.push(self.arena.nat_cmp(
+                self.state.constraints.push(self.arena.nat_cmp(
                     CmpOp::Le,
                     argument_bytes,
                     max_argument_bytes,
                 ));
                 for allocation in abi_allocations {
-                    self.constraints.push(self.arena.nat_cmp(
+                    self.state.constraints.push(self.arena.nat_cmp(
                         CmpOp::Le,
                         allocation.bytes,
                         max_allocation,
                     ));
-                    if let Some(max_index) = max_index {
-                        self.constraints.push(self.arena.nat_cmp(
-                            CmpOp::Le,
-                            allocation.bytes,
-                            max_index,
-                        ));
-                    }
-                    self.constraints.push(self.arena.bool(
+                    self.state.constraints.push(self.arena.nat_cmp(
+                        CmpOp::Le,
+                        allocation.bytes,
+                        max_index,
+                    ));
+                    self.state.constraints.push(self.arena.bool(
                         allocation.alignment.is_power_of_two()
                             && allocation.alignment
                                 <= self.target.limits().max_allocation_alignment,
@@ -2928,7 +2640,7 @@ mod internals {
                     }
                 }
                 let dynamic_local_limit = self.arena.nat(self.target.limits().max_workgroup_bytes);
-                self.constraints.push(self.arena.nat_cmp(
+                self.state.constraints.push(self.arena.nat_cmp(
                     CmpOp::Le,
                     local_layout.workgroup_bytes,
                     dynamic_local_limit,
@@ -2937,207 +2649,126 @@ mod internals {
                     let participant_limit = self
                         .arena
                         .nat_symbol(self.arena.target_constant_symbol(participant_limit));
-                    self.constraints.push(self.arena.nat_cmp(
+                    self.state.constraints.push(self.arena.nat_cmp(
                         CmpOp::Le,
                         local_layout.participant_bytes,
                         participant_limit,
                     ));
                 }
+                let terms = self.state.constraints.split_off(constraint_start);
+                let predicate = self.arena.all(&terms);
+                let defined = self.arena.side_conditions(predicate.into());
+                launch_constraints.push(self.arena.and(defined, predicate));
             }
+            let scoped = schedule.scoped_requirements(self.arena, &mut |arena, point| {
+                use seismic_ir::schedule::RequirementPoint;
+                let mut terms = Vec::new();
+                match point {
+                    RequirementPoint::Step(ScheduleStep::Launch(id)) => {
+                        terms.push(launch_constraints[id.index() as usize]);
+                        let mut views = Vec::new();
+                        for binding in &kernels[schedule.launch(*id).kernel.index() as usize].interface().bindings {
+                            views.push(view_requirements[binding.view.index() as usize]);
+                        }
+                        let views = arena.all(&views);
+                        let reached = arena.not(schedule.launch(*id).empty);
+                        terms.push(arena.implies(reached, views));
+                    }
+                    RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
+                        terms.push(view_requirements[copy.source.index() as usize]);
+                        terms.push(view_requirements[copy.destination.index() as usize]);
+                    }
+                    RequirementPoint::Step(ScheduleStep::Fill(fill)) => terms.push(view_requirements[fill.destination.index() as usize]),
+                    RequirementPoint::Step(ScheduleStep::ScalarRead(read)) => terms.push(view_requirements[read.source.index() as usize]),
+                    RequirementPoint::Step(ScheduleStep::PublishTensor { view, .. }) => terms.push(view_requirements[view.index() as usize]),
+                    RequirementPoint::BranchResult(results, then) => results.visit(&mut |result| {
+                        if let seismic_ir::region::ValueOperand::Tensor(view) = if then { result.then_value() } else { result.else_value() } { terms.push(view_requirements[view.index() as usize]); }
+                    }),
+                    RequirementPoint::RepeatInitial(carries) => carries.visit(&mut |carry| {
+                        if let seismic_ir::region::ValueOperand::Tensor(view) = carry.initial() { terms.push(view_requirements[view.index() as usize]); }
+                    }),
+                    RequirementPoint::RepeatBackedge(carries) => carries.visit(&mut |carry| {
+                        if let seismic_ir::region::ValueOperand::Tensor(view) = carry.backedge() { terms.push(view_requirements[view.index() as usize]); }
+                    }),
+                    _ => {}
+                }
+                arena.all(&terms)
+            }, &mut |arena, step| {
+                if let ScheduleStep::BeginAllocationInstance { source: view, .. } = step {
+                    if let seismic_ir::storage::ViewBase::Allocation(id) = storage.views()[view.index() as usize].base {
+                        return arena.side_conditions(storage.allocation(id).bytes.into());
+                    }
+                }
+                arena.bool(true)
+            });
+            self.state.constraints.push(scoped);
         }
 
         fn validate_schedule(
             &mut self,
-            schedule: &ParametricSchedule,
+            schedule: &ParametricSchedule<B>,
             storage: &seismic_ir::storage::TopologyBuilder,
         ) {
-            fn visit<B: seismic_target::TargetFamily>(
-                builder: &mut Builder<'_, B>,
-                storage: &seismic_ir::storage::TopologyBuilder,
-                steps: &[ScheduleStep],
-            ) {
-                for step in steps {
-                    match step {
-                        ScheduleStep::Launch(_)
-                        | ScheduleStep::ScalarMove(_)
-                        | ScheduleStep::Check(_) => {}
-                        ScheduleStep::Copy(copy) => {
-                            let source = storage.view_layout(copy.source).clone();
-                            let destination = storage.view_layout(copy.destination).clone();
-                            assert_eq!(
-                                source.representation, destination.representation,
-                                "copy representation mismatch"
-                            );
-                            assert_eq!(
-                                source.extents.len(),
-                                destination.extents.len(),
-                                "copy rank mismatch"
-                            );
-                            for (a, b) in source
-                                .extents
-                                .iter()
-                                .copied()
-                                .zip(destination.extents.iter().copied())
-                            {
-                                builder
-                                    .constraints
-                                    .push(builder.arena.nat_cmp(CmpOp::Eq, a, b));
-                            }
-                            let source_bytes = seismic_ir::storage::tensor_bytes(
-                                builder.arena,
-                                source.representation,
-                                &source.extents,
-                            );
-                            let destination_bytes = seismic_ir::storage::tensor_bytes(
-                                builder.arena,
-                                destination.representation,
-                                &destination.extents,
-                            );
-                            builder.constraints.push(builder.arena.nat_cmp(
-                                CmpOp::Eq,
-                                source_bytes,
-                                destination_bytes,
-                            ));
+            let scoped = schedule.scoped_requirements(self.arena, &mut |arena, point| {
+                use seismic_ir::schedule::RequirementPoint;
+                let mut terms = Vec::new();
+                let (views, bytes) = match point {
+                    RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
+                        let source = storage.view_layout(copy.source);
+                        let destination = storage.view_layout(copy.destination);
+                        assert_eq!(source.representation, destination.representation, "copy representation mismatch");
+                        assert_eq!(source.extents.len(), destination.extents.len(), "copy rank mismatch");
+                        for (left, right) in source.extents.iter().zip(&destination.extents) {
+                            terms.push(arena.nat_cmp(CmpOp::Eq, *left, *right));
                         }
-                        ScheduleStep::Fill(_) => {}
-                        ScheduleStep::ScalarRead(_) => {}
-                        ScheduleStep::If {
-                            then_steps,
-                            else_steps,
-                            ..
-                        } => {
-                            visit(builder, storage, then_steps);
-                            visit(builder, storage, else_steps);
+                        (vec![copy.source, copy.destination], copy.bytes)
+                    }
+                    RequirementPoint::Step(ScheduleStep::Fill(fill)) => (vec![fill.destination], fill.bytes),
+                    RequirementPoint::Step(ScheduleStep::PublishTensor { view, declared_axes, .. }) => {
+                        let actual = storage.view_layout(*view);
+                        assert_eq!(actual.extents.len(), declared_axes.len(), "published result rank changed");
+                        for (reached, declared) in actual.extents.iter().zip(declared_axes) {
+                            terms.push(arena.nat_cmp(CmpOp::Eq, *reached, *declared));
                         }
-                        ScheduleStep::Repeat { body, .. } => visit(builder, storage, body),
-                        ScheduleStep::Choose { options, .. } => {
-                            for (_, body) in options {
-                                visit(builder, storage, body);
-                            }
-                        }
+                        return arena.all(&terms);
+                    }
+                    _ => return arena.bool(true),
+                };
+                terms.extend(views.into_iter().map(|view| {
+                    let layout = storage.view_layout(view);
+                    let payload = seismic_ir::storage::tensor_bytes(arena, layout.representation, &layout.extents);
+                    arena.nat_cmp(CmpOp::Le, bytes, payload)
+                }).collect::<Vec<_>>());
+                arena.all(&terms)
+            }, &mut |arena, step| {
+                if let ScheduleStep::BeginAllocationInstance { source: view, .. } = step {
+                    if let seismic_ir::storage::ViewBase::Allocation(id) = storage.view_layout(*view).base {
+                        return arena.side_conditions(storage.allocation_bytes(id).into());
                     }
                 }
-            }
-            visit(self, storage, schedule.steps());
-        }
-
-        fn derive_numerics(
-            &mut self,
-            kernels: &[seismic_ir::kernel::Kernel<B>],
-        ) -> NumericalTransfer {
-            let mut effects = Vec::new();
-            let mut operations = Vec::new();
-            if self.numerical_role == seismic_lang::entry::NumericalRole::Alternative {
-                // A distinct authored body is not reference-equivalent merely
-                // because it happened to contain no individually approximate
-                // primitive. Whole-body equivalence requires operation-level
-                // analysis or qualified evidence.
-                effects.push(NumericalEffect::AlternativeBody);
-            }
-            for (kernel_ordinal, kernel) in kernels.iter().enumerate() {
-                for (ordinal, (fact, multiplicity)) in kernel.fact_multiplicities().enumerate() {
-                    let effect = match fact {
-                        seismic_ir::kernel::ops::NumericalFact::ContractedFma => {
-                            NumericalEffect::Contraction
-                        }
-                        seismic_ir::kernel::ops::NumericalFact::ApproximateMath(op) => {
-                            NumericalEffect::ApproximateTranscendental(*op)
-                        }
-                        seismic_ir::kernel::ops::NumericalFact::ReassociatedIntrinsic(id) => {
-                            NumericalEffect::BackendIntrinsic(*id)
-                        }
-                        seismic_ir::kernel::ops::NumericalFact::NarrowAccumulator(dtype) => {
-                            NumericalEffect::NarrowAccumulator(*dtype)
-                        }
-                        seismic_ir::kernel::ops::NumericalFact::FlushToZero => {
-                            NumericalEffect::FlushToZero
-                        }
-                        seismic_ir::kernel::ops::NumericalFact::ReassociatedReduction => {
-                            NumericalEffect::ReassociatedReduction
-                        }
-                    };
-                    if !effects.contains(&effect) {
-                        effects.push(effect.clone());
-                    }
-                    operations.push(crate::numerics::NumericalOperation {
-                        kernel: kernel_ordinal as u32,
-                        ordinal: ordinal as u32,
-                        effect,
-                        multiplicity,
-                    });
-                }
-            }
-            let exact = effects.is_empty();
-            let outputs = self
-                .contract
-                .results
-                .iter()
-                .flat_map(|result| {
-                    let dtype = match &result.ty {
-                        SemanticType::Tensor(tensor) => {
-                            match &registry::representation_info(tensor.representation).kind {
-                                registry::RepresentationKind::Dense(dtype) => *dtype,
-                                registry::RepresentationKind::Packed(_) => DType::F32,
-                                registry::RepresentationKind::External(_) => {
-                                    panic!("external representation cannot be a generic semantic result")
-                                }
-                            }
-                        }
-                        SemanticType::Scalar(dtype) => *dtype,
-                        SemanticType::Index { .. } | SemanticType::Range { .. } => DType::U32,
-                        _ => DType::F32,
-                    };
-                    result
-                        .paths
-                        .iter()
-                        .cloned()
-                        .map(move |path| OutputTransfer {
-                            path,
-                            dtype,
-                            bound: if exact {
-                                ErrorBound::Exact
-                            } else {
-                                ErrorBound::Unknown
-                            },
-                            specials: crate::numerics::SpecialGuarantees {
-                                nan: exact,
-                                infinity: exact,
-                                signed_zero: exact,
-                                subnormal: exact,
-                            },
-                        })
-                })
-                .collect();
-            NumericalTransfer::new(
-                outputs,
-                effects,
-                operations,
-                std::collections::BTreeMap::new(),
-                std::mem::take(&mut self.conditional_child_transfers),
-            )
+                arena.bool(true)
+            });
+            self.state.constraints.push(scoped);
         }
 
         fn register_roots(
             &mut self,
-            storage: &seismic_ir::storage::TopologyBuilder,
+            storage: &seismic_ir::storage::GlobalAllocationTopology,
             allocation_ids: &[GlobalAllocationId],
-            kernels: &[seismic_ir::kernel::Kernel<B>],
-            schedule: &ParametricSchedule,
-            launch_layouts: &[seismic_ir::storage::LaunchLocalLayout],
-            launch_scratch: &[seismic_ir::storage::LaunchScratchRequirements],
-            launch_abi: &[Vec<seismic_ir::storage::LaunchAbiRequirement>],
+            kernels: &[&seismic_ir::kernel::Kernel<B>],
+            schedule: &ParametricSchedule<B>,
+            resources: &[seismic_ir::execution::LaunchResources],
             hard_constraints: BoolExpr,
             coverage: TargetPredicate,
-            transfer: &NumericalTransfer,
         ) -> Vec<seismic_lang::expr::RootId> {
             let mut roots = Vec::new();
-            assert_eq!(allocation_ids.len(), storage.allocation_count() as usize);
+            assert_eq!(allocation_ids.len(), storage.allocations().len());
             for (allocation, &id) in allocation_ids.iter().enumerate() {
                 roots.push(self.arena.root(
                     RootName::AllocationBytes {
                         allocation: allocation as u32,
                     },
-                    AnyExpr::Nat(storage.allocation_bytes(id)),
+                    AnyExpr::Nat(storage.allocation(id).bytes),
                 ));
             }
             for (view, layout) in storage.views().iter().enumerate() {
@@ -3189,7 +2820,7 @@ mod internals {
                     },
                     AnyExpr::Bool(launch.empty),
                 ));
-                let layout = &launch_layouts[launch_id];
+                let layout = resources[launch_id].layout();
                 for (local, value) in layout.locals.iter().enumerate() {
                     roots.push(self.arena.root(
                         RootName::LocalOffset {
@@ -3225,7 +2856,7 @@ mod internals {
                         AnyExpr::Nat(bytes),
                     ));
                 }
-                let scratch = &launch_scratch[launch_id];
+                let scratch = resources[launch_id].scratch();
                 for (class, requirement) in
                     [&scratch.workgroup, &scratch.participant, &scratch.register]
                         .into_iter()
@@ -3241,7 +2872,7 @@ mod internals {
                         ));
                     }
                 }
-                for (allocation, requirement) in launch_abi[launch_id].iter().enumerate() {
+                for (allocation, requirement) in resources[launch_id].abi().iter().enumerate() {
                     roots.push(self.arena.root(
                         RootName::LaunchAbiBytes {
                             launch: launch_id as u32,
@@ -3262,25 +2893,27 @@ mod internals {
                         AnyExpr::Nat(*value),
                     ));
                 }
-                for (argument, (symbol, dtype)) in data.interface().scalar_args.iter().enumerate() {
-                    let expression = match dtype {
-                        DType::F32 => AnyExpr::from(
+                for (argument, (symbol, _)) in data.interface().scalar_args.iter().enumerate() {
+                    let expression = match self.arena.symbol_sort(*symbol) {
+                        SymbolSort::Nat => AnyExpr::Nat(self.arena.nat_symbol(*symbol)),
+                        SymbolSort::Int => AnyExpr::Int(self.arena.int_symbol(*symbol)),
+                        SymbolSort::Scalar(DType::F32) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::F32>(*symbol),
                         ),
-                        DType::F16 => AnyExpr::from(
+                        SymbolSort::Scalar(DType::F16) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::F16>(*symbol),
                         ),
-                        DType::BF16 => AnyExpr::from(
+                        SymbolSort::Scalar(DType::BF16) => AnyExpr::from(
                             self.arena
                                 .scalar_symbol::<seismic_lang::expr::BF16>(*symbol),
                         ),
-                        DType::I32 => AnyExpr::from(
+                        SymbolSort::Scalar(DType::I32) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::I32>(*symbol),
                         ),
-                        DType::U32 => AnyExpr::from(
+                        SymbolSort::Scalar(DType::U32) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::U32>(*symbol),
                         ),
-                        DType::Bool => AnyExpr::from(
+                        SymbolSort::Scalar(DType::Bool) => AnyExpr::from(
                             self.arena
                                 .scalar_symbol::<seismic_lang::expr::BoolScalar>(*symbol),
                         ),
@@ -3350,17 +2983,6 @@ mod internals {
                         ));
                     }
                 }
-                for (fact, (_, multiplicity)) in data.fact_multiplicities().enumerate() {
-                    if let Some(value) = multiplicity {
-                        roots.push(self.arena.root(
-                            RootName::NumericalMultiplicity {
-                                kernel: kernel_index as u32,
-                                fact: fact as u32,
-                            },
-                            AnyExpr::Nat(value),
-                        ));
-                    }
-                }
             }
             fn schedule_roots(
                 arena: &mut ExprArena,
@@ -3369,14 +2991,58 @@ mod internals {
                 control: &mut u32,
                 repeat: &mut u32,
                 scalar_read: &mut u32,
+                host_eval: &mut u32,
+                publication: &mut u32,
             ) {
+                fn operand_root(arena: &mut ExprArena, value: seismic_ir::region::ValueOperand, roots: &mut Vec<seismic_lang::expr::RootId>, ordinal: &mut u32) {
+                    use seismic_ir::region::{ValueOperand,ScalarOperand,QuantityOperand};
+                    let expression = match value {
+                        ValueOperand::Tensor(_) => return,
+                        ValueOperand::Scalar(ScalarOperand::Natural(value)) | ValueOperand::Quantity(QuantityOperand::Natural(value)) => AnyExpr::Nat(value),
+                        ValueOperand::Quantity(QuantityOperand::Integer(value)) => AnyExpr::Int(value),
+                        ValueOperand::Scalar(ScalarOperand::Word { symbol, dtype }) => match dtype {
+                            DType::F32 => arena.scalar_symbol::<seismic_lang::expr::F32>(symbol).into(),
+                            DType::F16 => arena.scalar_symbol::<seismic_lang::expr::F16>(symbol).into(),
+                            DType::BF16 => arena.scalar_symbol::<seismic_lang::expr::BF16>(symbol).into(),
+                            DType::I32 => arena.scalar_symbol::<seismic_lang::expr::I32>(symbol).into(),
+                            DType::U32 => arena.scalar_symbol::<seismic_lang::expr::U32>(symbol).into(),
+                            DType::Bool => arena.scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol).into(),
+                        },
+                    };
+                    roots.push(arena.root(RootName::RegionOperand { operand: *ordinal }, expression));
+                    *ordinal = ordinal.checked_add(1).expect("region operand identity space exhausted");
+                }
                 for step in steps {
                     match step {
-                        ScheduleStep::Launch(_)
+                        ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
+                        | ScheduleStep::Launch(_)
                         | ScheduleStep::Copy(_)
                         | ScheduleStep::Fill(_)
                         | ScheduleStep::ScalarMove(_)
                         | ScheduleStep::Check(_) => {}
+                        ScheduleStep::PublishTensor { declared_axes, .. } => {
+                            let step = *publication;
+                            *publication = publication.checked_add(1).expect("publication root ordinal space exhausted");
+                            for (axis, value) in declared_axes.iter().enumerate() {
+                                roots.push(arena.root(RootName::PublishedExtent { step, axis: axis as u32 }, AnyExpr::Nat(*value)));
+                            }
+                        }
+                        ScheduleStep::Imported { body, .. } => {
+                            schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication)
+                        }
+                        ScheduleStep::EvaluateHost(evaluation) => {
+                            let step = *host_eval;
+                            *host_eval = (*host_eval)
+                                .checked_add(1)
+                                .expect("host-evaluation root ordinal space exhausted");
+                            let value = match evaluation.value {
+                                seismic_ir::schedule::HostValueExpr::Integer(value)
+                                | seismic_ir::schedule::HostValueExpr::Word { value, .. } => AnyExpr::Int(value),
+                                seismic_ir::schedule::HostValueExpr::Natural(value) => AnyExpr::Nat(value),
+                                seismic_ir::schedule::HostValueExpr::Bool(value) => AnyExpr::Bool(value),
+                            };
+                            roots.push(arena.root(RootName::HostEvaluation { step }, value));
+                        }
                         ScheduleStep::ScalarRead(read) => {
                             let step = *scalar_read;
                             *scalar_read = (*scalar_read)
@@ -3396,7 +3062,9 @@ mod internals {
                             condition,
                             then_steps,
                             else_steps,
+                            results,
                         } => {
+                            results.visit(&mut |result| for operand in [result.then_value(),result.else_value()] { operand_root(arena,operand,roots,host_eval); });
                             let id = *control;
                             *control = (*control)
                                 .checked_add(1)
@@ -3405,12 +3073,13 @@ mod internals {
                                 RootName::ScheduleCondition { control: id },
                                 AnyExpr::Bool(*condition),
                             ));
-                            schedule_roots(arena, then_steps, roots, control, repeat, scalar_read);
-                            schedule_roots(arena, else_steps, roots, control, repeat, scalar_read);
+                            schedule_roots(arena, then_steps, roots, control, repeat, scalar_read, host_eval, publication);
+                            schedule_roots(arena, else_steps, roots, control, repeat, scalar_read, host_eval, publication);
                         }
                         ScheduleStep::Repeat {
-                            start, end, body, ..
+                            start, end, body, carries, ..
                         } => {
+                            carries.visit(&mut |carry| for operand in [carry.initial(),carry.backedge()] { operand_root(arena,operand,roots,host_eval); });
                             let id = *repeat;
                             *repeat = (*repeat)
                                 .checked_add(1)
@@ -3424,7 +3093,7 @@ mod internals {
                             roots.push(
                                 arena.root(RootName::RepeatEnd { repeat: id }, AnyExpr::Nat(*end)),
                             );
-                            schedule_roots(arena, body, roots, control, repeat, scalar_read);
+                            schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication);
                         }
                         ScheduleStep::Choose { decision, options } => {
                             let id = *control;
@@ -3437,13 +3106,13 @@ mod internals {
                                 AnyExpr::Int(value),
                             ));
                             for (_, body) in options {
-                                schedule_roots(arena, body, roots, control, repeat, scalar_read);
+                                schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication);
                             }
                         }
                     }
                 }
             }
-            let (mut control, mut repeat, mut scalar_read) = (0, 0, 0);
+            let (mut control, mut repeat, mut scalar_read, mut host_eval, mut publication) = (0, 0, 0, 0, 0);
             schedule_roots(
                 self.arena,
                 schedule.steps(),
@@ -3451,6 +3120,8 @@ mod internals {
                 &mut control,
                 &mut repeat,
                 &mut scalar_read,
+                &mut host_eval,
+                &mut publication,
             );
             roots.push(
                 self.arena
@@ -3459,61 +3130,6 @@ mod internals {
             roots.push(
                 self.arena
                     .root(RootName::Guard, AnyExpr::Bool(coverage.node())),
-            );
-            fn numerical_roots(
-                arena: &mut ExprArena,
-                transfer: &NumericalTransfer,
-                roots: &mut Vec<seismic_lang::expr::RootId>,
-                output: &mut u32,
-                child: &mut u32,
-                operation: &mut u32,
-            ) {
-                for value in transfer.outputs() {
-                    if let ErrorBound::Analytic { roundings, .. } = &value.bound {
-                        roots.push(arena.root(
-                            RootName::ErrorBound { output: *output },
-                            AnyExpr::Nat(*roundings),
-                        ));
-                    }
-                    *output = output
-                        .checked_add(1)
-                        .expect("numerical-output root ordinal space exhausted");
-                }
-                for value in transfer.operations() {
-                    if let Some(multiplicity) = value.multiplicity {
-                        roots.push(arena.root(
-                            RootName::NumericalOperationMultiplicity {
-                                operation: *operation,
-                            },
-                            AnyExpr::Nat(multiplicity),
-                        ));
-                    }
-                    *operation = operation
-                        .checked_add(1)
-                        .expect("numerical-operation root ordinal space exhausted");
-                }
-                for value in transfer.children() {
-                    if let Some((decision, expected)) = value.selection {
-                        let condition = arena.decision_is(decision, expected);
-                        roots.push(arena.root(
-                            RootName::NumericalCondition { child: *child },
-                            AnyExpr::Bool(condition),
-                        ));
-                    }
-                    *child = child
-                        .checked_add(1)
-                        .expect("numerical-child root ordinal space exhausted");
-                    numerical_roots(arena, &value.transfer, roots, output, child, operation);
-                }
-            }
-            let (mut output, mut child, mut operation) = (0, 0, 0);
-            numerical_roots(
-                self.arena,
-                transfer,
-                &mut roots,
-                &mut output,
-                &mut child,
-                &mut operation,
             );
             roots
         }
@@ -3525,119 +3141,32 @@ mod internals {
     /// Do not construct or evaluate `(max(extent, 1) - 1)` in that case: the
     /// extent can itself be a partial range subtraction, but its definedness
     /// is irrelevant to this axis's address contribution.
-    pub(super) fn addressed_axis_span(
-        arena: &mut ExprArena,
-        extent: NatExpr,
-        stride: NatExpr,
-    ) -> NatExpr {
-        if matches!(arena.view(AnyExpr::Nat(stride)), NodeView::NatConst(0)) {
-            return stride;
-        }
-        let one = arena.nat(1);
-        let nonzero_extent = arena.nat_max(extent, one);
-        let last = arena.nat_sub(nonzero_extent, one);
-        arena.nat_mul(last, stride)
-    }
-
-    /// Scale a per-unit scratch requirement without introducing launch-count
-    /// definedness when the implementation requires no scratch bytes at all.
-    /// This is a property of scratch realization, not a global relaxation of
-    /// strict expression evaluation.
-    pub(super) fn scaled_scratch_bytes(
-        arena: &mut ExprArena,
-        per_unit: NatExpr,
-        count: NatExpr,
-    ) -> NatExpr {
-        if matches!(arena.view(AnyExpr::Nat(per_unit)), NodeView::NatConst(0)) {
-            per_unit
-        } else {
-            arena.nat_mul(per_unit, count)
-        }
-    }
-
-    /// Exclusive byte end of the furthest element reachable through a view.
-    /// A zero-extent view addresses no bytes and therefore ends at its offset.
-    fn addressed_bytes(
-        arena: &mut ExprArena,
-        layout: &seismic_ir::storage::BufferViewLayout,
-    ) -> NatExpr {
-        assert_eq!(
-            layout.extents.len(),
-            layout.strides.len(),
-            "closed view rank and stride count differ"
-        );
-        let (unit_bytes, logical_extents) =
-            match &registry::representation_info(layout.representation).kind {
-                registry::RepresentationKind::Dense(dtype) => {
-                    (dtype.bytes() as u64, layout.extents.clone())
-                }
-                registry::RepresentationKind::Packed(packet) => {
-                    let mut extents = layout.extents.clone();
-                    if let Some(last) = extents.last_mut() {
-                        let group = arena.nat(u64::from(packet.group));
-                        *last = arena.nat_ceil_div(*last, group);
-                    }
-                    (u64::from(packet.packet_size), extents)
-                }
-                registry::RepresentationKind::External(packet) => {
-                    let mut extents = layout.extents.clone();
-                    if let Some(last) = extents.last_mut() {
-                        let group = arena.nat(u64::from(packet.logical_group));
-                        *last = arena.nat_ceil_div(*last, group);
-                    }
-                    (u64::from(packet.packet_size), extents)
-                }
-            };
-        let zero = arena.nat(0);
-        let one = arena.nat(1);
-        let mut span = zero;
-        let mut empty_terms = Vec::with_capacity(logical_extents.len());
-        for (extent, stride) in logical_extents
-            .iter()
-            .copied()
-            .zip(layout.strides.iter().copied())
-        {
-            empty_terms.push(arena.nat_cmp(CmpOp::Eq, extent, zero));
-            let axis = addressed_axis_span(arena, extent, stride);
-            span = arena.nat_add(span, axis);
-        }
-        let element_bytes = arena.nat(unit_bytes);
-        let span_with_element = arena.nat_add(span, one);
-        let payload_end = arena.nat_mul(span_with_element, element_bytes);
-        let end = arena.nat_add(layout.offset, payload_end);
-        let empty = arena.any(&empty_terms);
-        arena.nat_select(empty, layout.offset, end)
-    }
+    pub(super) use seismic_ir::storage::{addressed_axis_span, addressed_bytes};
 
     fn digest_structure<B: seismic_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,
         builder: &Builder<'_, B>,
-        storage: &seismic_ir::storage::TopologyBuilder,
+        storage: &seismic_ir::storage::GlobalAllocationTopology,
         allocation_ids: &[GlobalAllocationId],
-        kernels: &[seismic_ir::kernel::Kernel<B>],
-        schedule: &ParametricSchedule,
-        liveness: &[AllocationLiveness],
-        slots: &[Option<DecisionId>],
+        kernels: &[&seismic_ir::kernel::Kernel<B>],
+        schedule: &ParametricSchedule<B>,
     ) {
         digest.bytes(builder.function.stable().digest());
-        digest.bytes(match builder.authority {
-            ConstructionAuthority::UniversalPortable => b"universal",
-            ConstructionAuthority::Optimized => b"optimized",
-        });
-        digest.hashed(&builder.choices.len());
-        for choice in &builder.choices {
+        digest.hashed(&builder.state.choices.len());
+        for choice in &builder.state.choices {
             digest.bytes(choice.meaning.as_bytes());
             digest.hashed(builder.arena.decision_domain(choice.decision).values());
         }
 
-        assert_eq!(allocation_ids.len(), storage.allocation_count() as usize);
-        digest.hashed(&storage.allocation_count());
-        for (index, &id) in allocation_ids.iter().enumerate() {
-            match storage.allocation_kind(id) {
+        assert_eq!(allocation_ids.len(), storage.allocations().len());
+        digest.hashed(&(storage.allocations().len() as u32));
+        for &id in allocation_ids {
+            match &storage.allocation(id).kind {
                 GlobalBufferKind::Argument { value, abi } => {
                     digest.bytes(b"argument");
                     digest.hashed(
                         &builder
+                            .state
                             .contract
                             .parameters
                             .iter()
@@ -3647,6 +3176,7 @@ mod internals {
                         &abi.as_ref()
                             .and_then(|id| {
                                 builder
+                                    .state
                                     .contract
                                     .parameters
                                     .iter()
@@ -3660,6 +3190,7 @@ mod internals {
                     digest.bytes(b"result");
                     digest.hashed(
                         &builder
+                            .state
                             .contract
                             .results
                             .iter()
@@ -3670,6 +3201,7 @@ mod internals {
                     digest.bytes(b"imported");
                     digest.hashed(
                         &builder
+                            .state
                             .contract
                             .parameters
                             .iter()
@@ -3677,6 +3209,7 @@ mod internals {
                     );
                     digest.hashed(
                         &builder
+                            .state
                             .contract
                             .results
                             .iter()
@@ -3691,14 +3224,16 @@ mod internals {
                 GlobalBufferKind::Arena => digest.bytes(b"arena"),
                 GlobalBufferKind::Persistent => digest.bytes(b"persistent"),
             }
-            digest.hashed(&storage.allocation_alignment(id));
-            digest.hashed(&liveness[index].uses().len());
-            for at in liveness[index].uses() {
+            digest.hashed(&storage.allocation(id).alignment);
+            digest.hashed(&storage.allocation(id).instances);
+            digest.hashed(&storage.allocation(id).liveness.uses().len());
+            for at in storage.allocation(id).liveness.uses() {
                 digest.hashed(at.region());
                 digest.hashed(&at.ordinal());
             }
-            digest.hashed(&slots[index].and_then(|decision| {
+            digest.hashed(&storage.allocation(id).slot.and_then(|decision| {
                 builder
+                    .state
                     .choices
                     .iter()
                     .position(|choice| choice.decision == decision)
@@ -3706,7 +3241,16 @@ mod internals {
         }
         digest.hashed(&storage.views().len());
         for view in storage.views() {
-            digest.hashed(&view.allocation.index());
+            match view.base {
+                seismic_ir::storage::ViewBase::Allocation(id) => {
+                    digest.hashed(&0u8);
+                    digest.hashed(&id.index());
+                }
+                seismic_ir::storage::ViewBase::TensorValue(id) => {
+                    digest.hashed(&1u8);
+                    digest.hashed(&id.index());
+                }
+            }
             digest.bytes(
                 seismic_lang::registry::representation_info(view.representation)
                     .name
@@ -3714,6 +3258,7 @@ mod internals {
             );
             digest.hashed(&view.extents.len());
             digest.hashed(&view.contiguous);
+            digest.hashed(&matches!(view.mapping, seismic_ir::storage::ViewMapping::WholeAllocation));
         }
         digest.hashed(&storage.result_views().len());
         for publication in storage.result_views() {
@@ -3729,15 +3274,16 @@ mod internals {
         for launch in schedule.launches() {
             digest.bytes(b"launch-definition");
             digest.hashed(&launch.kernel.index());
-            digest.hashed(&launch.mode);
+            digest.hashed(&launch.descriptor);
         }
         digest_schedule(digest, builder, schedule.steps());
 
-        for result in &builder.contract.results {
-            if let Some(publication) = builder.result_slots.get(&result.value) {
+        for result in &builder.state.contract.results {
+            if let Some(publication) = builder.state.physical.result_slots.get(&result.value) {
                 digest.bytes(b"published-scalar");
                 digest.hashed(
                     &builder
+                        .state
                         .contract
                         .results
                         .iter()
@@ -3747,8 +3293,15 @@ mod internals {
                     ScalarPublication::Scalar(slot) => {
                         digest.bytes(b"one");
                         digest.hashed(&slot.index());
-                        digest.hashed(&slot.dtype());
-                        digest.hashed(&slot.sort());
+                        digest.hashed(&slot.kind());
+                    }
+                    ScalarPublication::Quantity(slot) => {
+                        digest.bytes(b"quantity");
+                        digest.hashed(&slot.index());
+                        digest.bytes(match slot.kind() {
+                            HostQuantityKind::Integer => b"integer",
+                            HostQuantityKind::Natural => b"natural",
+                        });
                     }
                     ScalarPublication::Range { start, end } => {
                         digest.bytes(b"range");
@@ -3758,116 +3311,9 @@ mod internals {
                 }
             }
         }
-        for callee in &builder.callees {
+        for callee in &builder.state.callees {
             digest.bytes(callee.digest());
         }
-    }
-
-    fn digest_numerical<B: seismic_target::TargetFamily>(
-        digest: &mut seismic_ir::identity::StructureDigest,
-        builder: &Builder<'_, B>,
-        numerical: &NumericalTransfer,
-    ) {
-        fn role(
-            digest: &mut seismic_ir::identity::StructureDigest,
-            value: seismic_lang::entry::NumericalRole,
-        ) {
-            digest.bytes(match value {
-                seismic_lang::entry::NumericalRole::Reference => b"reference",
-                seismic_lang::entry::NumericalRole::Alternative => b"alternative",
-            });
-        }
-        fn effect(digest: &mut seismic_ir::identity::StructureDigest, value: &NumericalEffect) {
-            match value {
-                NumericalEffect::ReassociatedReduction => digest.bytes(b"reassociated-reduction"),
-                NumericalEffect::Contraction => digest.bytes(b"contraction"),
-                NumericalEffect::ApproximateTranscendental(op) => {
-                    digest.bytes(b"approximate-transcendental");
-                    digest.hashed(op);
-                }
-                NumericalEffect::NarrowAccumulator(dtype) => {
-                    digest.bytes(b"narrow-accumulator");
-                    digest.hashed(dtype);
-                }
-                NumericalEffect::FlushToZero => digest.bytes(b"flush-to-zero"),
-                NumericalEffect::BackendIntrinsic(id) => {
-                    digest.bytes(b"backend-intrinsic");
-                    let signature = seismic_lang::registry::intrinsic_signature(*id);
-                    let capability = seismic_lang::registry::capability_info(signature.capability);
-                    digest.bytes(capability.backend.as_str().as_bytes());
-                    digest.bytes(capability.name.as_bytes());
-                    digest.bytes(signature.name.as_bytes());
-                }
-                NumericalEffect::AlternativeBody => digest.bytes(b"alternative-body"),
-            }
-        }
-        fn transfer<B: seismic_target::TargetFamily>(
-            digest: &mut seismic_ir::identity::StructureDigest,
-            builder: &Builder<'_, B>,
-            value: &NumericalTransfer,
-        ) {
-            digest.hashed(&value.outputs().len());
-            for output in value.outputs() {
-                digest.hashed(&output.path);
-                digest.hashed(&output.dtype);
-                match &output.bound {
-                    ErrorBound::Exact => digest.bytes(b"exact"),
-                    ErrorBound::Unknown => digest.bytes(b"unknown"),
-                    ErrorBound::Analytic {
-                        absolute,
-                        relative,
-                        ulps,
-                        ..
-                    } => {
-                        digest.bytes(b"analytic");
-                        digest.u64(absolute.to_bits());
-                        digest.u64(relative.to_bits());
-                        digest.u32(*ulps);
-                    }
-                }
-                digest.bool(output.specials.nan);
-                digest.bool(output.specials.infinity);
-                digest.bool(output.specials.signed_zero);
-                digest.bool(output.specials.subnormal);
-            }
-            digest.hashed(&value.effects().len());
-            for item in value.effects() {
-                effect(digest, item);
-            }
-            digest.hashed(&value.operations().len());
-            for operation in value.operations() {
-                digest.u32(operation.kernel);
-                digest.u32(operation.ordinal);
-                effect(digest, &operation.effect);
-                digest.bool(operation.multiplicity.is_some());
-            }
-            digest.hashed(&value.input_assumptions().len());
-            for (name, range) in value.input_assumptions() {
-                digest.bytes(name.as_bytes());
-                digest.u64(range.minimum.get().to_bits());
-                digest.u64(range.maximum.get().to_bits());
-            }
-            digest.hashed(&value.children().len());
-            for child in value.children() {
-                match child.selection {
-                    Some((decision, expected)) => {
-                        digest.bool(true);
-                        let ordinal = builder
-                            .choices
-                            .iter()
-                            .position(|choice| choice.decision == decision)
-                            .expect("numerical transfer references an unowned decision");
-                        digest.hashed(&ordinal);
-                        digest.i64(expected);
-                    }
-                    None => digest.bool(false),
-                }
-                role(digest, child.role);
-                transfer(digest, builder, &child.transfer);
-            }
-        }
-        role(digest, builder.numerical_role);
-        transfer(digest, builder, numerical);
     }
 
     fn digest_kernel<B: seismic_target::TargetFamily>(
@@ -3922,12 +3368,12 @@ mod internals {
                 .map(|(_, dtype)| *dtype)
                 .collect::<Vec<_>>(),
         );
-        for (slot, dtype) in &interface.result_slots {
+        for slot in &interface.result_slots {
             digest.hashed(&slot.index());
-            digest.hashed(dtype);
+            digest.hashed(&slot.kind());
         }
         digest.hashed(&interface.uses_subgroup);
-        digest.hashed(data.value_types());
+        digest.hashed(&data.value_types().copied().collect::<Vec<_>>());
         for local in data.locals() {
             digest.hashed(&local.kind);
             digest.bytes(
@@ -4008,6 +3454,11 @@ mod internals {
                         digest.bytes(b"fma");
                         values(digest, &[*out, *a, *b, *c]);
                     }
+                    Op::VectorFromLanes { out, lanes } => {
+                        digest.bytes(b"vector-from-lanes");
+                        value(digest, *out);
+                        values(digest, lanes);
+                    }
                     Op::VectorSplat { out, value: scalar } => {
                         digest.bytes(b"vector-splat");
                         values(digest, &[*out, *scalar]);
@@ -4064,6 +3515,14 @@ mod internals {
                     Op::Bitcast { out, a, to } => {
                         digest.bytes(b"bitcast");
                         digest.hashed(to);
+                        values(digest, &[*out, *a]);
+                    }
+                    Op::ScalarBits { out, a } => {
+                        digest.bytes(b"scalar-bits");
+                        values(digest, &[*out, *a]);
+                    }
+                    Op::ScalarFromBits { out, a } => {
+                        digest.bytes(b"scalar-from-bits");
                         values(digest, &[*out, *a]);
                     }
                     Op::Cmp { op, out, a, b } => {
@@ -4154,16 +3613,32 @@ mod internals {
                         digest.hashed(axis);
                         values(digest, &[*active, *stored]);
                     }
+                    Op::ReadPlaneField {
+                        out,
+                        place: source,
+                        plane,
+                        field,
+                        index,
+                    } => {
+                        digest.bytes(b"read-plane-field");
+                        value(digest, *out);
+                        place(digest, *source);
+                        digest.hashed(plane);
+                        digest.hashed(field);
+                        values(digest, index);
+                    }
                     Op::ReadPlane {
                         out,
                         place: source,
                         plane,
+                        element,
                         index,
                     } => {
                         digest.bytes(b"read-plane");
                         value(digest, *out);
                         place(digest, *source);
                         digest.hashed(plane);
+                        value(digest, *element);
                         values(digest, index);
                     }
                     Op::RepresentationConvertPacket {
@@ -4316,9 +3791,47 @@ mod internals {
         builder: &Builder<'_, B>,
         steps: &[ScheduleStep],
     ) {
+        fn product<T>(digest: &mut seismic_ir::identity::StructureDigest, value: &seismic_ir::region::Product<T>, leaf: &mut impl FnMut(&mut seismic_ir::identity::StructureDigest,&T)) {
+            use seismic_ir::region::Product;
+            match value {
+                Product::Unit=>digest.bytes(b"unit"),
+                Product::Leaf(value)=>{digest.bytes(b"leaf");leaf(digest,value);},
+                Product::Range(a,b)=>{digest.bytes(b"range");product(digest,a,leaf);product(digest,b,leaf);},
+                Product::Tuple(values)=>{digest.bytes(b"tuple");digest.hashed(&values.len());for value in values {product(digest,value,leaf);}},
+            }
+        }
+        fn operand(digest: &mut seismic_ir::identity::StructureDigest, value: seismic_ir::region::ValueOperand) {
+            use seismic_ir::region::ValueOperand;
+            match value {
+                ValueOperand::Tensor(view)=>{digest.bytes(b"tensor");digest.hashed(&view.index());},
+                ValueOperand::Scalar(value)=>{digest.bytes(b"scalar");digest.hashed(&value.kind());},
+                ValueOperand::Quantity(value)=>{digest.bytes(match value.kind() { seismic_ir::schedule::HostQuantityKind::Natural=>b"natural", seismic_ir::schedule::HostQuantityKind::Integer=>b"integer" });},
+            }
+        }
+        fn destination(digest: &mut seismic_ir::identity::StructureDigest, value: seismic_ir::region::ValueDestination) {
+            use seismic_ir::region::ValueDestination;
+            match value {
+                ValueDestination::Tensor(view)=>{digest.bytes(b"tensor");digest.hashed(&view.index());},
+                ValueDestination::Scalar(slot)=>{digest.bytes(b"scalar");digest.hashed(&slot.index());},
+                ValueDestination::Quantity(slot)=>{digest.bytes(b"quantity");digest.hashed(&slot.index());},
+            }
+        }
         digest.hashed(&steps.len());
         for step in steps {
             match step {
+                ScheduleStep::Imported { body, .. } => {
+                    digest.bytes(b"imported");
+                    digest_schedule(digest, builder, body);
+                }
+                ScheduleStep::BeginAllocationInstance { source, result } | ScheduleStep::BindArgumentTensor { source, result } => {
+                    digest.bytes(if matches!(step, ScheduleStep::BeginAllocationInstance { .. }) { b"begin-tensor" } else { b"argument-tensor" });
+                    digest.hashed(&source.index()); digest.hashed(&result.index());
+                }
+                ScheduleStep::PublishTensor { view, path, .. } => {
+                    digest.bytes(b"publish-tensor");
+                    digest.hashed(&view.index());
+                    digest.hashed(path);
+                }
                 ScheduleStep::Launch(id) => {
                     digest.bytes(b"launch");
                     digest.hashed(&id.index());
@@ -4336,6 +3849,39 @@ mod internals {
                     digest.bytes(b"scalar-move");
                     digest.hashed(&(value.from.index(), value.to.index()));
                 }
+                ScheduleStep::EvaluateHost(evaluation) => {
+                    digest.bytes(b"evaluate-host");
+                    match evaluation.value {
+                        seismic_ir::schedule::HostValueExpr::Integer(_) => digest.bytes(b"integer"),
+                        seismic_ir::schedule::HostValueExpr::Natural(_) => digest.bytes(b"natural"),
+                        seismic_ir::schedule::HostValueExpr::Bool(_) => digest.bytes(b"bool"),
+                        seismic_ir::schedule::HostValueExpr::Word { dtype, .. } => {
+                            digest.bytes(b"word");
+                            digest.hashed(&dtype);
+                        }
+                    }
+                    match evaluation.to {
+                        seismic_ir::schedule::HostValueDestination::Quantity(slot) => {
+                            digest.bytes(b"quantity-slot");
+                            digest.hashed(&slot.index());
+                            digest.bytes(match slot.kind() {
+                                HostQuantityKind::Integer => b"integer",
+                                HostQuantityKind::Natural => b"natural",
+                            });
+                        }
+                        seismic_ir::schedule::HostValueDestination::Native(slot) => {
+                            digest.bytes(b"native-slot");
+                            digest.hashed(&slot.index());
+                            digest.hashed(&slot.kind());
+                        }
+                    }
+                    if let Some(site) = &evaluation.failure {
+                        digest.bytes(b"source-failure");
+                        digest.hashed(&site.failure);
+                        digest.bytes(site.path.as_bytes());
+                        digest.hashed(&site.line);
+                    }
+                }
                 ScheduleStep::ScalarRead(value) => {
                     digest.bytes(b"scalar-read");
                     digest.hashed(&(value.source.index(), value.index.len(), value.to.index()));
@@ -4348,27 +3894,31 @@ mod internals {
                         seismic_ir::schedule::ScalarCheckExpectation::BoolTrue => b"bool-true",
                         seismic_ir::schedule::ScalarCheckExpectation::U32Zero => b"u32-zero",
                     });
-                    digest.bytes(value.site.reason.as_bytes());
+                    digest.hashed(&value.site.failure);
                     digest.bytes(value.site.path.as_bytes());
                     digest.hashed(&value.site.line);
                 }
                 ScheduleStep::If {
                     then_steps,
                     else_steps,
+                    results,
                     ..
                 } => {
                     digest.bytes(b"if");
+                    product(digest,results,&mut |digest,result| {operand(digest,result.then_value());operand(digest,result.else_value());destination(digest,result.result());});
                     digest_schedule(digest, builder, then_steps);
                     digest_schedule(digest, builder, else_steps);
                 }
-                ScheduleStep::Repeat { body, .. } => {
+                ScheduleStep::Repeat { body, carries, .. } => {
                     digest.bytes(b"repeat");
+                    product(digest,carries,&mut |digest,carry| {operand(digest,carry.initial());destination(digest,carry.header());operand(digest,carry.backedge());destination(digest,carry.result());});
                     digest_schedule(digest, builder, body);
                 }
                 ScheduleStep::Choose { decision, options } => {
                     digest.bytes(b"choose");
                     digest.hashed(
                         &builder
+                            .state
                             .choices
                             .iter()
                             .position(|choice| &choice.decision == decision),

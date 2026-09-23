@@ -5,10 +5,12 @@ pub mod construction;
 pub mod execution;
 pub mod identity;
 pub mod kernel;
+pub mod region;
 pub mod repr;
 pub mod schedule;
 pub mod specialization;
 pub mod storage;
 pub mod target;
+pub mod tensor_view;
 
 pub mod metal;

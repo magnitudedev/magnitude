@@ -247,6 +247,9 @@ pub(crate) fn operation_cost(
     let one_demand = seismic_estimator::OperationCost::one;
     let cost = |first, rest| seismic_estimator::OperationCost::demands(first, rest);
     match op {
+        ClosedOpView::ScalarBits { .. } | ClosedOpView::ScalarFromBits { .. } => {
+            one(arena, INTEGER, Latency)
+        }
         ClosedOpView::Constant { out, .. }
         | ClosedOpView::Unary { out, .. }
         | ClosedOpView::Binary { out, .. }
@@ -259,7 +262,8 @@ pub(crate) fn operation_cost(
             lanes(arena, out.ty),
             Latency,
         )),
-        ClosedOpView::VectorSplat { out, .. }
+        ClosedOpView::VectorFromLanes { out, .. }
+        | ClosedOpView::VectorSplat { out, .. }
         | ClosedOpView::VectorUnary { out, .. }
         | ClosedOpView::VectorBinary { out, .. }
         | ClosedOpView::VectorBit { out, .. }
@@ -296,16 +300,17 @@ pub(crate) fn operation_cost(
         | ClosedOpView::Branch { .. }
         | ClosedOpView::Repeat { .. }
         | ClosedOpView::Yield { .. } => one(arena, CONTROL, Latency),
-        ClosedOpView::Read { place, .. } => {
+        ClosedOpView::Read { .. } => one(arena, MEMORY, Capacity),
+        ClosedOpView::ReadPlaneField { plane_info, .. } => {
             let first = demand(MEMORY, arena.nat(1), Capacity);
-            let mut rest = Vec::new();
             if matches!(
-                place.geometry,
-                seismic_ir::target::ReadableRepresentationGeometry::Packed(_)
+                plane_info.encoding,
+                seismic_lang::registry::PlaneEncoding::Dense(_)
             ) {
-                rest.push(demand(REPRESENTATION, arena.nat(1), Latency));
+                one_demand(first)
+            } else {
+                cost(first, vec![demand(REPRESENTATION, arena.nat(1), Latency)])
             }
-            cost(first, rest)
         }
         ClosedOpView::ReadPlane { .. } => {
             let units = arena.nat(1);
@@ -314,17 +319,8 @@ pub(crate) fn operation_cost(
                 vec![demand(REPRESENTATION, units, Latency)],
             )
         }
-        ClosedOpView::VectorRead { out, place, .. } => {
-            let units = lanes(arena, out.ty);
-            let first = demand(MEMORY, units, Capacity);
-            let mut rest = Vec::new();
-            if matches!(
-                place.geometry,
-                seismic_ir::target::ReadableRepresentationGeometry::Packed(_)
-            ) {
-                rest.push(demand(REPRESENTATION, units, Latency));
-            }
-            cost(first, rest)
+        ClosedOpView::VectorRead { out, .. } => {
+            one_demand(demand(MEMORY, lanes(arena, out.ty), Capacity))
         }
         ClosedOpView::Write { .. } => one(arena, MEMORY, Capacity),
         ClosedOpView::VectorWrite { value, .. } => {

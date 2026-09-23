@@ -5,9 +5,10 @@
 use super::ir::{
     Call as CheckedCall, Candidate as CandidateBinding, DefKind, Expr as CheckedExpr,
     ExprKind as CheckedExprKind, Index as CheckedIndex, LocalId, Ownership as ParamOwnership,
+    ShapeBindingPlan, ShapeObservation,
 };
 use super::resolve::Sig;
-use super::{Checker, LocalKind, ValueClass};
+use super::{Checker, ValueClass};
 use crate::expr::{AnyExpr, IntExpr, SymbolId};
 use crate::intrinsics::{
     self, primitive, reduction_result, MathOp, PrimitiveId, RepresentationTarget,
@@ -20,8 +21,9 @@ use std::collections::HashMap;
 fn math_of(name: &str) -> Option<(MathOp, usize)> {
     Some(match name {
         "fma" => (MathOp::Fma, 3),
-        "exp" => (MathOp::Exp, 1),
-        "exp_fast" => (MathOp::ExpFast, 1),
+        // Both accepted spellings have the same source meaning. A physical
+        // approximation is an implementation choice under the caller's policy.
+        "exp" | "exp_fast" => (MathOp::Exp, 1),
         "rsqrt" => (MathOp::Rsqrt, 1),
         "sqrt" => (MathOp::Sqrt, 1),
         "log" => (MathOp::Log, 1),
@@ -41,6 +43,10 @@ struct Binding {
     elems: HashMap<String, Elem>,
     /// Caller element parameters this candidate requires to be a concrete element.
     requires: Vec<(String, Elem)>,
+    /// Actual tensor geometry observed at this call, in argument order.
+    observations: Vec<(IntExpr, ShapeObservation)>,
+    /// A construction order for reached callee dimension values.
+    shape_plan: Vec<(u32, ShapeBindingPlan)>,
 }
 
 fn single_dimension(
@@ -765,7 +771,7 @@ impl<'a> Checker<'a> {
         let mut operands = vec![base];
         let mut target = self.arena.int(1);
         for dimension in dimensions {
-            let d = self.expr(dimension, Some(&ValueType::Scalar(DType::I32)))?;
+            let d = self.expr(dimension, Some(&ValueType::Integer))?;
             let Some(extent) = d.sym else {
                 self.error(d.span, "`reshape` extents are symbolic integer expressions");
                 return None;
@@ -904,9 +910,9 @@ impl<'a> Checker<'a> {
             return None;
         }
         if self
-            .borrows
+            .live_borrows()
             .iter()
-            .any(|(borrow, (borrowed, _))| *borrowed == root && *borrow != binding)
+            .any(|(borrow, borrowed, _)| borrowed.local == root && borrow.local != binding)
         {
             self.error(
                 span,
@@ -917,14 +923,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        // Atomics are the one admitted cross-visit update of an independent
-        // loop; record them for the mutation summary.
         let storage_root = self.root_var_local(binding);
-        for ctx in self.loops.iter_mut() {
-            if storage_root.index() < ctx.floor {
-                ctx.atomics.push(storage_root);
-            }
-        }
         self.mutated.push(storage_root);
         let place = CheckedExpr::new(
             CheckedExprKind::Local(binding),
@@ -957,7 +956,7 @@ impl<'a> Checker<'a> {
         };
         let authority = super::ir::AtomicCapability::checked(
             super::ir::Place::Element {
-                root: storage_root,
+                root: super::ownership::LocalPlace::root(storage_root),
                 indices: indices.clone(),
             },
             participants,
@@ -979,7 +978,7 @@ impl<'a> Checker<'a> {
 
     /// The storage root of a binding local, before following view aliases.
     pub(crate) fn root_var_local(&self, id: LocalId) -> LocalId {
-        self.view_roots.get(&id).copied().unwrap_or(id)
+        self.local_storage_root(id)
     }
 
     // ---- capability intrinsics ----
@@ -1187,17 +1186,24 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
+        let crate::registry::IntrinsicResultType::Owned { axes, .. } = &signature.result else {
+            unreachable!("matrix result is an owned tensor")
+        };
+        let projected_axes = axes.iter().map(|projection| {
+            checked[projection.argument as usize].ty.shaped()
+                .expect("result projection selects a checked tensor argument").axes[projection.axis as usize]
+        }).collect::<Vec<_>>();
         let (element, result_axes) = if matmul {
             (
                 Elem::Dtype(accumulation.expect("checked above")),
-                vec![left.axes[0].clone(), right.axes[1].clone()],
+                projected_axes.clone(),
             )
         } else {
             let accumulator = checked[2]
                 .ty
                 .shaped()
                 .expect("checked rank-two accumulator");
-            let expected_axes = [&left.axes[0], &right.axes[1]];
+            let expected_axes = projected_axes.iter();
             if accumulator
                 .axes
                 .iter()
@@ -1213,7 +1219,7 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            (accumulator.elem.clone(), accumulator.axes.clone())
+            (accumulator.elem.clone(), projected_axes)
         };
         let id = signature.id;
         let result = ValueType::Tensor(TensorType::new(result_axes, element));
@@ -1366,6 +1372,9 @@ impl<'a> Checker<'a> {
         arg_class: ValueClass,
         binding: &mut Binding,
         compound: &mut Vec<(IntExpr, IntExpr)>,
+        argument: usize,
+        parameter: usize,
+        path: &mut Vec<u32>,
     ) -> Result<(), String> {
         let mismatch = || Err(format!("expects {param} but was given {arg}"));
         match (param, arg) {
@@ -1373,7 +1382,22 @@ impl<'a> Checker<'a> {
                 Some(b) if *a == b || (a.is_float() && b.is_float()) => Ok(()),
                 _ => mismatch(),
             },
-            (ValueType::Index { .. }, _) if arg.scalar_dtype() == Some(DType::I32) => Ok(()),
+            (ValueType::Index { bound: p }, ValueType::Index { bound: a }) => {
+                match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *p) {
+                    Some(name) => match binding.shapes.get(&name) {
+                        Some(bound) if !super::prove::same(&self.arena, *bound, *a) => mismatch(),
+                        Some(_) => Ok(()),
+                        None => {
+                            binding.shapes.insert(name, *a);
+                            Ok(())
+                        }
+                    },
+                    None => {
+                        compound.push((*p, *a));
+                        Ok(())
+                    }
+                }
+            }
             (ValueType::Range { bound: p }, ValueType::Range { bound: a }) => {
                 match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *p) {
                     Some(name) => match binding.shapes.get(&name) {
@@ -1396,7 +1420,13 @@ impl<'a> Checker<'a> {
                 if p.rank() != a.rank() {
                     return mismatch();
                 }
-                for (pd, ad) in p.axes.iter().zip(&a.axes) {
+                for (axis, (pd, ad)) in p.axes.iter().zip(&a.axes).enumerate() {
+                    binding.observations.push((*pd, ShapeObservation::TensorAxis {
+                        parameter,
+                        argument,
+                        path: path.clone(),
+                        axis: axis as u32,
+                    }));
                     match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *pd) {
                         Some(name) => match binding.shapes.get(&name) {
                             Some(bound) if !super::prove::same(&self.arena, *bound, *ad) => {
@@ -1446,10 +1476,15 @@ impl<'a> Checker<'a> {
                     mismatch()
                 }
             }
-            (ValueType::Tuple(p), ValueType::Tuple(a)) if p.len() == a.len() => p
-                .iter()
-                .zip(a.iter())
-                .try_for_each(|(p, a)| self.unify(sig, p, a, arg_class, binding, compound)),
+            (ValueType::Tuple(p), ValueType::Tuple(a)) if p.len() == a.len() => {
+                for (index, (p, a)) in p.iter().zip(a.iter()).enumerate() {
+                    path.push(index as u32);
+                    let result = self.unify(sig, p, a, arg_class, binding, compound, argument, parameter, path);
+                    path.pop();
+                    result?;
+                }
+                Ok(())
+            }
             (
                 ValueType::Opaque {
                     capability: pc,
@@ -1482,7 +1517,7 @@ impl<'a> Checker<'a> {
             binding.shapes.insert(name.clone(), *extent);
         }
         let mut compound = Vec::new();
-        for (param, ordinal) in sig.params.iter().zip(&order) {
+        for (parameter, (param, ordinal)) in sig.params.iter().zip(&order).enumerate() {
             let argument = &args[*ordinal];
             let arg_class = self.class_of(argument);
             // Ownership admission before type unification.
@@ -1509,6 +1544,9 @@ impl<'a> Checker<'a> {
                 arg_class,
                 &mut binding,
                 &mut compound,
+                *ordinal,
+                parameter,
+                &mut Vec::new(),
             )
             .map_err(|e| format!("parameter `{}` {e}", param.name))?;
         }
@@ -1592,6 +1630,97 @@ impl<'a> Checker<'a> {
                     "a compound extent does not match under the inferred shape binding".to_owned(),
                 );
             }
+        }
+        if enforce_precondition {
+            // A call instantiates the callee's dimension domain, not merely
+            // the equations in its tensor types. The same implicit lower
+            // bound used to check the callee body must hold for each inferred
+            // or explicitly bound dimension at this source call.
+            for (ordinal, name) in sig.shape_params.iter().enumerate() {
+                let symbol = sig.shape_symbols[ordinal];
+                let admits_zero = sig.predicates.iter().any(|predicate| {
+                    matches!(predicate, super::ir::Predicate::NonNegative(value)
+                        if matches!(sig.arena.view((*value).into()),
+                            crate::expr::NodeView::Symbol(found) if found == symbol))
+                });
+                let lower = self.arena.int(if admits_zero { 0 } else { 1 });
+                let actual = binding.shapes[name];
+                if !super::prove::le(&mut self.arena, &self.facts, lower, actual) {
+                    return Err(format!("shape parameter `{name}` does not prove its required lower bound at this call"));
+                }
+            }
+        }
+        // A dimension is a callee formal value. Construct it from the one
+        // completed argument descriptor observed by the checker, rather than
+        // replaying an expression in the caller's symbolic arena.
+        let mut available = std::collections::HashSet::new();
+        for (index, (name, _)) in explicit.iter().enumerate() {
+            let ordinal = sig.shape_params.iter().position(|parameter| parameter == name)
+                .expect("validated explicit dimension");
+            if available.insert(ordinal) {
+                binding.shape_plan.push((ordinal as u32, ShapeBindingPlan::Explicit { binding: index }));
+            }
+        }
+        for (formal_extent, observation) in &binding.observations {
+            let Some(name) = single_dimension(&sig.arena, &sig.shape_params,
+                &sig.shape_symbols, *formal_extent) else { continue };
+            let ordinal = sig.shape_params.iter().position(|parameter| parameter == &name)
+                .expect("single dimension belongs to signature");
+            if available.insert(ordinal) {
+                binding.shape_plan.push((ordinal as u32, ShapeBindingPlan::Inferred {
+                    observation: observation.clone(),
+                    formal_axis: *formal_extent,
+                    coefficient: 1,
+                    prior_dimensions: Vec::new(),
+                }));
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (formal_extent, observation) in &binding.observations {
+                let missing = super::prove::symbols(&sig.arena, *formal_extent)
+                    .into_iter()
+                    .filter_map(|symbol| sig.shape_symbols.iter().position(|candidate| *candidate == symbol))
+                    .filter(|ordinal| !available.contains(ordinal))
+                    .collect::<Vec<_>>();
+                let [ordinal] = missing.as_slice() else { continue };
+                let mut arena = crate::expr::ExprArena::new();
+                let mapped = sig.shape_symbols.iter().map(|source| {
+                    let (_, symbol, value) = arena.loop_binder();
+                    (*source, symbol, value)
+                }).collect::<Vec<_>>();
+                let mut map = |symbol: SymbolId, _: &mut crate::expr::ExprArena| {
+                    AnyExpr::Int(mapped.iter().find(|(source, _, _)| *source == symbol)
+                        .expect("signature extent contains an undeclared dimension").2)
+                };
+                let expression = super::xfer::transfer_int(&sig.arena, *formal_extent, &mut arena, &mut map);
+                let symbol = mapped[*ordinal].1;
+                let Some((coefficient, rest)) = super::prove::linear_in(&mut arena, expression, symbol)
+                    else { continue };
+                if coefficient == 0 || super::prove::mentions(&arena, rest, symbol) {
+                    continue;
+                }
+                let prior_dimensions = super::prove::symbols(&sig.arena, *formal_extent)
+                    .into_iter()
+                    .filter_map(|symbol| sig.shape_symbols.iter().position(|candidate| *candidate == symbol))
+                    .filter(|other| other != ordinal)
+                    .map(|other| other as u32)
+                    .collect();
+                if available.insert(*ordinal) {
+                    binding.shape_plan.push((*ordinal as u32, ShapeBindingPlan::Inferred {
+                        observation: observation.clone(),
+                        formal_axis: *formal_extent,
+                        coefficient,
+                        prior_dimensions,
+                    }));
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+        if let Some((_, name)) = sig.shape_params.iter().enumerate()
+            .find(|(ordinal, _)| !available.contains(ordinal)) {
+            return Err(format!("shape parameter `{name}` needs an explicit binding or an observed tensor axis"));
         }
         // Index parameters: symbolic arguments are proved inside the bound; data-dependent
         // arguments keep a runtime obligation.
@@ -1686,6 +1815,15 @@ impl<'a> Checker<'a> {
             })
             .collect();
         definitions.sort_unstable();
+        // The semantic call product is defined by a portable reference body.
+        // A target-only family has no such contract, so it cannot be spliced
+        // as a source helper until it owns a complete call contract.
+        definitions.retain(|definition| {
+            let family = &resolved.families[resolved.declared[*definition].family.index()];
+            family.bodies.iter().any(|body| {
+                matches!(resolved.declared[body.index()].kind, DefKind::Body { target: None })
+            })
+        });
         if definitions.is_empty() {
             let available: Vec<&str> = families
                 .iter()
@@ -1697,7 +1835,7 @@ impl<'a> Checker<'a> {
                 .target
                 .map(|target| target.as_str())
                 .unwrap_or("portable");
-            self.error(span, format!("`{}` has no implementation callable from {context} code; backend-specific implementations are available for {}", name.name, available.join(", ")));
+            self.error(span, format!("`{}` has no portable reference contract callable from {context} code; backend-specific implementations are available for {}", name.name, available.join(", ")));
             return None;
         }
         if matches!(self.kind, DefKind::Lower { .. })
@@ -1713,40 +1851,22 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        // Explicit shape bindings: a shape parameter of this definition passed
-        // along as an identity, or a symbolic integer expression.
+        // Explicit shape bindings execute before the value arguments. Retain
+        // their checked producers as well as the symbolic unification values.
         let mut explicit: Vec<(String, IntExpr)> = Vec::new();
+        let mut explicit_shapes = Vec::new();
         for (param, value) in bindings {
-            let extent = match &value.kind {
-                A::Name(n)
-                    if n.name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_uppercase())
-                        && self.sig.shape_params.contains(&n.name) =>
-                {
-                    let ordinal = self
-                        .sig
-                        .shape_params
-                        .iter()
-                        .position(|name| name == &n.name)
-                        .expect("shape parameter lookup disagrees with contains");
-                    self.arena.int_symbol(self.sig.shape_symbols[ordinal])
-                }
-                _ => {
-                    let value = self.expr(value, Some(&ValueType::Scalar(DType::I32)))?;
-                    let Some(sym) = value.sym else {
-                        self.error(
-                            value.span,
-                            "a shape binding is a symbolic integer expression",
-                        );
-                        return None;
-                    };
-                    sym
+            let value = self.expr(value, Some(&ValueType::Scalar(DType::I32)))?;
+            let extent = match value.sym {
+                Some(sym) => sym,
+                None => {
+                    self.error(value.span, "a shape binding is a symbolic integer expression");
+                    return None;
                 }
             };
             self.numeric_use(extent);
             explicit.push((param.name.clone(), extent));
+            explicit_shapes.push((param.name.clone(), value));
         }
 
         // Arguments are checked once, with scalar hints and write positions from
@@ -1808,60 +1928,6 @@ impl<'a> Checker<'a> {
         };
         candidates.retain(|(d, _, _, _)| resolved.declared[*d].family == family);
 
-        for (argument_ordinal, argument) in args.iter().enumerate() {
-            let Some(root) = self.root_var(argument) else {
-                continue;
-            };
-            let LocalKind::Param(own_parameter) = self.kinds[root.index()] else {
-                continue;
-            };
-            if self.sig.params[own_parameter].ownership != ParamOwnership::Exclusive {
-                continue;
-            }
-            let forwarded: Vec<_> = candidates
-                .iter()
-                .filter_map(|(definition, order, _, _)| {
-                    order
-                        .iter()
-                        .position(|ordinal| *ordinal == argument_ordinal)
-                        .filter(|parameter| {
-                            resolved.declared[*definition].sig.params[*parameter].ownership
-                                == ParamOwnership::Exclusive
-                        })
-                        .map(|parameter| (*definition, parameter))
-                })
-                .collect();
-            if forwarded.len() == candidates.len() {
-                self.summary.init_passes.push((forwarded, own_parameter));
-            }
-        }
-
-        // An uninitialized owned tensor may cross an exclusive borrow only when every
-        // applicable implementation definitely initializes the whole parameter on all paths.
-        for (argument_ordinal, argument) in args.iter().enumerate() {
-            let Some(root) = self
-                .root_var(argument)
-                .filter(|root| self.unassigned.contains(root))
-            else {
-                continue;
-            };
-            let full = !self.env.enforce
-                || candidates.iter().all(|(definition, order, _, _)| {
-                    order
-                        .iter()
-                        .position(|ordinal| *ordinal == argument_ordinal)
-                        .is_some_and(|parameter| {
-                            self.env.summaries[*definition]
-                                .full_init
-                                .contains(&parameter)
-                        })
-                });
-            if !full {
-                self.error(argument.span, format!("`{}` is uninitialized and `{}` does not initialize that exclusive tensor on every path", self.locals[root.index()].name, name.name));
-                return None;
-            }
-            self.unassigned.remove(&root);
-        }
         let Some((first, first_order, first_binding, _)) = candidates.first() else {
             self.error(
                 span,
@@ -1890,60 +1956,74 @@ impl<'a> Checker<'a> {
         // Logical ownership is checked at the static call boundary. Borrows end
         // with the call in this foundation; `let`-bound view borrows are tracked
         // separately by the body checker.
-        let mut accesses: HashMap<LocalId, ParamOwnership> = HashMap::new();
-        let mut moved_roots = Vec::new();
+        let mut arguments = Vec::new();
         for (parameter, ordinal) in first_sig.params.iter().zip(first_order) {
-            let ownership = parameter.ownership;
-            if ownership == ParamOwnership::Value {
+            super::ownership::argument_leaves(
+                &parameter.ownership,
+                &args[*ordinal],
+                &mut arguments,
+            );
+        }
+        let mut accesses: Vec<(super::ownership::LocalPlace, ParamOwnership)> = Vec::new();
+        let mut moves = std::collections::BTreeSet::new();
+        for (ownership, argument) in &arguments {
+            if *ownership == ParamOwnership::Value {
                 continue;
             }
-            let argument = &args[*ordinal];
-            let Some(root) = self.root_var(argument) else {
+            if *ownership == ParamOwnership::Owned {
+                let (_, taken) = match self.owned_consumption(argument) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.error(argument.span, error);
+                        return None;
+                    }
+                };
+                for place in taken {
+                    if !moves.insert(place.clone()) {
+                        self.error(
+                            argument.span,
+                            "owned tensor leaf is moved into multiple arguments",
+                        );
+                        return None;
+                    }
+                }
+            }
+            let Some(root) = self.borrow_owner(argument) else {
                 if matches!(ownership, ParamOwnership::Shared | ParamOwnership::Owned)
-                    && matches!(argument.ty, ValueType::Tensor(_))
                     && matches!(
                         self.class_of(argument),
                         ValueClass::Computed | ValueClass::Owned
                     )
                 {
-                    // A fresh logical value (computed, or a rootless owned
-                    // materialization/clone/allocation/call result) may be
-                    // borrowed or moved into this call. It has no
-                    // caller-visible storage root to invalidate or with which
-                    // it could alias.
                     continue;
                 }
                 self.error(
                     argument.span,
-                    format!(
-                        "parameter `{}` requires a tensor place for {:?} access",
-                        parameter.name, ownership
-                    ),
+                    "tensor parameter requires an actual tensor place",
                 );
                 return None;
             };
-            if let Some(previous) = accesses.get(&root) {
-                let compatible =
-                    *previous == ParamOwnership::Shared && ownership == ParamOwnership::Shared;
-                if !compatible {
-                    self.error(
-                        argument.span,
-                        format!(
-                            "overlapping tensor arguments cannot combine {:?} and {:?} access",
-                            previous, ownership
-                        ),
-                    );
-                    return None;
-                }
-            } else {
-                accesses.insert(root, ownership);
+            if *ownership == ParamOwnership::Exclusive && !self.writable_place(&root) {
+                self.error(
+                    argument.span,
+                    "tensor place does not permit exclusive access",
+                );
+                return None;
             }
-            if ownership == ParamOwnership::Owned {
-                moved_roots.push(root);
+            if accesses.iter().any(|(previous, mode)| {
+                previous.overlaps(&root)
+                    && !(*mode == ParamOwnership::Shared && *ownership == ParamOwnership::Shared)
+            }) {
+                self.error(
+                    argument.span,
+                    "overlapping tensor arguments cannot combine owned or exclusive access",
+                );
+                return None;
             }
+            accesses.push((root, ownership.clone()));
         }
-        for root in moved_roots {
-            self.moved.insert(root);
+        for place in moves {
+            self.consume_place(&place);
         }
 
         // Calling a backend-specific helper is itself a use of every capability
@@ -1973,18 +2053,10 @@ impl<'a> Checker<'a> {
         }
 
         // Validate mutations of `inout` parameters.
-        let modes: Vec<(ParamOwnership, usize)> = first_sig
-            .params
-            .iter()
-            .zip(first_order)
-            .map(|(p, o)| (p.ownership, *o))
-            .collect();
-        for (mode, ordinal) in modes {
-            let arg = args[ordinal].clone();
+        for (mode, arg) in arguments {
             if mode != ParamOwnership::Exclusive {
                 continue;
             }
-            let whole = matches!(arg.kind, CheckedExprKind::Local(_));
             let base_local = |operands: &[CheckedExpr]| match operands.first().map(|o| &o.kind) {
                 Some(CheckedExprKind::Local(v)) => Some(*v),
                 _ => None,
@@ -1996,7 +2068,7 @@ impl<'a> Checker<'a> {
                         PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
                     operands,
                 } => base_local(operands),
-                _ => None,
+                _ => self.value_place(&arg).map(|place| place.local),
             };
             let Some(binding_local) = binding_local else {
                 self.error(
@@ -2006,10 +2078,7 @@ impl<'a> Checker<'a> {
                 return None;
             };
             let storage_root = self.root_var_local(binding_local);
-            self.write(storage_root, binding_local, &[], whole, arg.span)?;
-            if whole {
-                self.unassigned.remove(&storage_root);
-            }
+            self.write(storage_root, binding_local, arg.span)?;
         }
 
         let mut site = Vec::new();
@@ -2036,12 +2105,34 @@ impl<'a> Checker<'a> {
                 .iter()
                 .filter_map(|p| binding.elems.get(p).map(|e| (p.clone(), e.clone())))
                 .collect();
+            let mut shape_plan = binding.shape_plan.clone();
+            if let Some(checked) = self.env.checked.get(*d).and_then(Option::as_ref) {
+                for (_, step) in &mut shape_plan {
+                    let ShapeBindingPlan::Inferred { observation, formal_axis, .. } = step else {
+                        continue;
+                    };
+                    let ShapeObservation::TensorAxis { parameter, path, axis, .. } = observation;
+                    let mut ty = &checked.signature.params[*parameter].ty;
+                    for &index in path.iter() {
+                        let ValueType::Tuple(parts) = ty else {
+                            unreachable!("checked shape plan names a non-tuple formal path")
+                        };
+                        ty = parts.iter().nth(index as usize)
+                            .expect("checked shape plan tuple path is in bounds");
+                    }
+                    let ValueType::Tensor(tensor) = ty else {
+                        unreachable!("checked shape plan names a non-tensor formal")
+                    };
+                    *formal_axis = tensor.axes[*axis as usize];
+                }
+            }
             site.push(CandidateBinding {
                 definition: crate::ids::FunctionId::new(
                     resolved.declared[*d].family.program(),
                     u32::try_from(*d).expect("definition ordinal exceeds u32::MAX"),
                 ),
                 shape_args,
+                shape_plan,
                 elem_args,
                 arg_order: order.clone(),
                 requires_elems: binding.requires.clone(),
@@ -2051,6 +2142,7 @@ impl<'a> Checker<'a> {
         }
         let call = CheckedCall {
             family,
+            explicit_shapes,
             candidates: site,
             span,
         };
@@ -2123,6 +2215,102 @@ fn intrinsic_result_type(result: &crate::registry::IntrinsicResultType) -> Value
         },
         crate::registry::IntrinsicResultType::Owned { .. } => {
             panic!("shape-producing intrinsic requires a semantic-specific checker rule")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::checked::{check_source, SourceFile, SourceSet};
+    use crate::entry::{ElementBindings, SemanticNodeView};
+    use crate::interp::{Arg, Interpreter, OutcomeValue, TensorData};
+    use crate::intrinsics::{MathOp, PrimitiveId};
+    use crate::types::DType;
+
+    #[test]
+    fn exp_fast_spelling_has_the_checked_and_reference_meaning_of_exp() {
+        for (dtype, words) in [
+            (
+                DType::F32,
+                vec![
+                    0,
+                    0x8000_0000,
+                    1,
+                    0x8000_0001,
+                    0x3f80_0000,
+                    0xbf80_0000,
+                    0x42aa_0000,
+                    0xc2c8_0000,
+                    0x7f80_0000,
+                    0xff80_0000,
+                    0x7f80_0001,
+                    0xffc0_1234,
+                ],
+            ),
+            (
+                DType::F16,
+                vec![
+                    0, 0x8000, 1, 0x8001, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7c01, 0xfe23,
+                ],
+            ),
+            (
+                DType::BF16,
+                vec![
+                    0, 0x8000, 1, 0x8001, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7f81, 0xffe3,
+                ],
+            ),
+        ] {
+            let bytes: Vec<_> = words
+                .iter()
+                .flat_map(|word: &u32| word.to_le_bytes().into_iter().take(dtype.bytes() as usize))
+                .collect();
+            let mut results = Vec::new();
+            for spelling in ["exp", "exp_fast"] {
+                let module = check_source(SourceSet::new(vec![SourceFile {
+                    path: "exponential.seismic".into(),
+                    text: format!(
+                        "fn probe[N](x: &tensor[N] {dtype}) -> tensor[N] {dtype}:\n    return {spelling}(x)\n"
+                    ),
+                }]))
+                .unwrap();
+                let entry = module
+                    .entry(
+                        module.entry_named("probe").unwrap(),
+                        &ElementBindings::default(),
+                    )
+                    .unwrap();
+                let program = entry.program();
+                let body = program.function(program.family(program.root()).reference().function());
+                let math: Vec<_> = body
+                    .nodes(body.root())
+                    .filter_map(|(_, node)| match node.view() {
+                        SemanticNodeView::Primitive {
+                            primitive: PrimitiveId::Math(op),
+                            ..
+                        }
+                        | SemanticNodeView::Elementwise {
+                            primitive: PrimitiveId::Math(op),
+                            ..
+                        } => Some(*op),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(math, [MathOp::Exp]);
+                let mut interpreter = Interpreter::new(&entry);
+                let input = interpreter.add_tensor(
+                    TensorData::dense_from_bytes(dtype, vec![words.len()], bytes.clone()).unwrap(),
+                );
+                let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
+                let result = outcome.results().next().unwrap();
+                let OutcomeValue::Tensor(value) = result.value() else {
+                    panic!("tensor result")
+                };
+                results.push(value.canonical_bytes().unwrap().unwrap().to_vec());
+            }
+            assert_eq!(
+                results[0], results[1],
+                "{dtype} source spelling changed reference bits"
+            );
         }
     }
 }

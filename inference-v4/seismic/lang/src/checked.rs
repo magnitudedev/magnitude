@@ -16,14 +16,14 @@ use crate::span::Span;
 use crate::types::DType;
 
 /// One source file. Paths are diagnostic labels; they grant nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceFile {
     pub path: String,
     pub text: String,
 }
 
 /// The closed set of sources checked as one module.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SourceSet {
     files: Vec<SourceFile>,
 }
@@ -165,7 +165,7 @@ impl std::error::Error for SourceError {}
 /// constructor of a [`CheckedModule`].
 pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
     let sources = sources.canonicalized().map_err(SourceError::Parse)?;
-    internals::check(sources).map(|inner| CheckedModule { inner })
+    internals::check(sources).map(|inner| CheckedModule { inner, assets: Default::default() })
 }
 
 /// An opaque checked semantic object: source semantics, types, effects,
@@ -175,6 +175,7 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
 #[derive(Debug)]
 pub struct CheckedModule {
     inner: internals::Module,
+    pub(crate) assets: std::collections::BTreeMap<String, String>,
 }
 
 impl CheckedModule {
@@ -221,6 +222,19 @@ impl CheckedModule {
         self.inner.entry(entry, bindings)
     }
 
+    /// Snapshot a native asset for an entry. The checked declaration remains authoritative.
+    pub fn capture_native_asset(&mut self, entry: &str, source: String) -> Result<(), String> {
+        let id = self.entry_named(entry).ok_or_else(|| format!("unknown entry {entry}"))?;
+        if self.native_implementation(id, BackendName::Metal).is_none() {
+            return Err(format!("entry {entry} has no native declaration"));
+        }
+        self.assets.insert(entry.to_owned(), source);
+        Ok(())
+    }
+    pub fn native_asset(&self, entry: &str) -> Option<&str> {
+        self.assets.get(entry).map(String::as_str)
+    }
+
     /// The source set this module was checked from, for diagnostics and
     /// build-script fingerprinting only.
     pub fn sources(&self) -> &SourceSet {
@@ -228,7 +242,7 @@ impl CheckedModule {
     }
 
     pub(crate) fn from_internal(inner: internals::Module) -> Self {
-        Self { inner }
+        Self { inner, assets: Default::default() }
     }
 
     pub(crate) fn internal(&self) -> &internals::Module {
@@ -251,8 +265,22 @@ pub struct EntryInfo {
     pub dimensions: Vec<String>,
     /// Compile-time element parameters (`T`, `U`) an entry is polymorphic in.
     pub element_parameters: Vec<String>,
+    /// Complete source structure, including unit values, for dynamic callers.
+    pub parameter_types: Vec<(String, SignatureType)>,
+    pub result_type: SignatureType,
     pub parameters: Vec<ParameterSummary>,
     pub results: Vec<ResultSummary>,
+}
+
+/// Read-only signature structure projected from checked source types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureType {
+    Unit,
+    Tuple(Vec<SignatureType>),
+    Tensor { access: TensorAccess, rank: u32, element: ElementSummary },
+    Scalar(DType),
+    Index,
+    Range,
 }
 
 /// One direct top-level native implementation attached to a checked entry.
@@ -404,6 +432,60 @@ mod native_tests {
             ),
         });
         sources
+    }
+
+    #[test]
+    fn observed_composed_products_survive_entry_monomorphization() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "shapes.seismic".into(),
+            text: "fn dimensions[NK, GV, W](q: &tensor[(2 * NK + NK * GV) * W] f32, p: &tensor[NK * GV] f32, w: &tensor[W] f32):\n    let value = w[0]\n".into(),
+        });
+        let module = check_source(sources).expect("composed observations determine dimensions");
+        let entry = module
+            .entry(
+                module.entry_named("dimensions").unwrap(),
+                &ElementBindings::default(),
+            )
+            .expect("monomorphization retains the same dimension equations");
+        let plan = entry
+            .schema()
+            .compile_dimension_inference(entry.arena(), &crate::expr::PartialAssignment::new());
+        let mut values = crate::expr::compiled::InvocationValues::new();
+        plan.infer(&[40, 6, 4], &mut values)
+            .expect("all dimensions solve before checking original equations");
+        assert!(plan
+            .infer(
+                &[41, 6, 4],
+                &mut crate::expr::compiled::InvocationValues::new()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn private_parallel_storage_does_not_require_shared_write_authority() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "private.seismic".into(),
+            text: "fn update[N, W](x: &tensor[N, W] f32, output: &mut tensor[N, W] f32):\n    parallel for i in 0..N:\n        let mut row = to_owned(x[i])\n        for j in 0..W:\n            row[j] = row[j] + 1.0\n        output[i] = row\n".into(),
+        });
+        let module = check_source(sources).expect("private writes and disjoint publication check");
+        module
+            .entry(
+                module.entry_named("update").unwrap(),
+                &ElementBindings::default(),
+            )
+            .expect("lowering preserves checked private and shared ownership");
+    }
+
+    #[test]
+    fn shared_parallel_storage_still_requires_disjoint_writes() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "shared.seismic".into(),
+            text: "fn update[N](output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[0] = 1.0\n".into(),
+        });
+        assert!(check_source(sources).is_err());
     }
 
     #[test]

@@ -105,10 +105,24 @@ pub(crate) fn transfer(
                 .erase(),
         }),
         NodeView::Symbol(s) => map(s, dst),
+        NodeView::ScalarInteger {
+            operation,
+            operands,
+        } => {
+            let operands = operands
+                .iter()
+                .map(|(dtype, value)| (*dtype, transfer_int(src, *value, dst, map)))
+                .collect::<Vec<_>>();
+            AnyExpr::Int(dst.scalar_integer(operation, &operands))
+        }
         NodeView::Unary { op, operand } => match op {
             UnaryOp::Not => {
                 let operand = bool_of(src, operand, dst, map);
                 AnyExpr::Bool(dst.not(operand))
+            }
+            UnaryOp::ScalarIntegerDefined => {
+                let operand = int_of(src, operand, dst, map);
+                AnyExpr::Bool(dst.scalar_integer_defined(operand))
             }
             UnaryOp::NatFromInt => {
                 let operand = int_of(src, operand, dst, map);
@@ -117,6 +131,12 @@ pub(crate) fn transfer(
             UnaryOp::IntFromNat => {
                 let operand = nat_of(src, operand, dst, map);
                 AnyExpr::Int(dst.int_from_nat(operand))
+            }
+            UnaryOp::IntFromScalar => {
+                let AnyExpr::Scalar(value) = transfer(src, operand, dst, map) else {
+                    panic!("expression transfer changed an integer scalar's sort");
+                };
+                AnyExpr::Int(dst.int_from_scalar_value(value))
             }
         },
         NodeView::Binary { op, lhs, rhs } => match (node, op) {

@@ -9,7 +9,7 @@ use crate::execution::ClosedExecutableIr;
 use crate::kernel::{Kernel, KernelId};
 use crate::schedule::{Launch, LaunchId, ScheduleStep};
 use crate::storage::LaunchLocalLayout;
-use crate::target::KernelDialect;
+use crate::target::PhysicalDialect;
 use seismic_lang::expr::{DecisionId, ExprArena, PartialAssignment, SymbolValue};
 
 /// Why an exact candidate assignment cannot specialize a closed executable.
@@ -48,9 +48,9 @@ impl std::error::Error for SpecializationError {}
 /// One active launch together with the exact closed kernel and local layout it
 /// references. All values retain their original IR ordinals.
 #[derive(Clone, Copy)]
-pub struct SpecializedLaunch<'a, T: KernelDialect> {
+pub struct SpecializedLaunch<'a, T: PhysicalDialect> {
     pub id: LaunchId,
-    pub launch: &'a Launch,
+    pub launch: &'a Launch<T>,
     pub layout: &'a LaunchLocalLayout,
     pub kernel: &'a Kernel<T>,
 }
@@ -63,18 +63,18 @@ pub struct SpecializedLaunch<'a, T: KernelDialect> {
 /// both arms, loops retain their body, and every compile-time choice retains
 /// exactly its assigned arm. Consequently a native realizer can compile
 /// `kernels()` and cannot observe an inactive kernel through this value.
-pub struct NativeSpecialization<'a, T: KernelDialect> {
+pub struct NativeSpecialization<'a, T: PhysicalDialect> {
     executable: &'a ClosedExecutableIr<T>,
     launches: Vec<LaunchId>,
     kernels: Vec<KernelId>,
 }
 
-impl<'a, T: KernelDialect> NativeSpecialization<'a, T> {
+impl<'a, T: PhysicalDialect> NativeSpecialization<'a, T> {
     /// Active launches in deterministic schedule traversal order.
     pub fn launches(&self) -> impl ExactSizeIterator<Item = SpecializedLaunch<'a, T>> + '_ {
         self.launches.iter().copied().map(|id| {
             let launch = self.executable.schedule().launch(id);
-            let layout = &self.executable.launch_layouts()[id.index() as usize];
+            let layout = self.executable.launch_resources()[id.index() as usize].layout();
             let kernel = self.executable.kernels().kernel(launch.kernel);
             SpecializedLaunch {
                 id,
@@ -102,7 +102,7 @@ impl<'a, T: KernelDialect> NativeSpecialization<'a, T> {
     }
 }
 
-impl<T: KernelDialect> ClosedExecutableIr<T> {
+impl<T: PhysicalDialect> ClosedExecutableIr<T> {
     /// Resolve every compile-time schedule choice before native compilation.
     pub fn specialize_for_native<'a>(
         &'a self,
@@ -133,9 +133,9 @@ impl<T: KernelDialect> ClosedExecutableIr<T> {
     }
 }
 
-fn collect_active_launches(
+fn collect_active_launches<B: PhysicalDialect>(
     steps: &[ScheduleStep],
-    schedule: &crate::schedule::ParametricSchedule,
+    schedule: &crate::schedule::ParametricSchedule<B>,
     arena: &ExprArena,
     assignment: &PartialAssignment,
     launches: &mut Vec<LaunchId>,
@@ -148,9 +148,12 @@ fn collect_active_launches(
                 schedule.launch(*id);
                 launches.push(*id);
             }
-            ScheduleStep::Copy(_)
+            ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
+            | ScheduleStep::PublishTensor { .. }
+            | ScheduleStep::Copy(_)
             | ScheduleStep::Fill(_)
             | ScheduleStep::ScalarMove(_)
+            | ScheduleStep::EvaluateHost(_)
             | ScheduleStep::ScalarRead(_)
             | ScheduleStep::Check(_) => {}
             ScheduleStep::If {
@@ -161,12 +164,12 @@ fn collect_active_launches(
                 collect_active_launches(then_steps, schedule, arena, assignment, launches)?;
                 collect_active_launches(else_steps, schedule, arena, assignment, launches)?;
             }
-            ScheduleStep::Repeat { body, .. } => {
+            ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => {
                 collect_active_launches(body, schedule, arena, assignment, launches)?;
             }
             ScheduleStep::Choose { decision, options } => {
                 let value = match assignment.get(arena.decision_symbol(*decision)) {
-                    Some(SymbolValue::Int(value)) => value,
+                    Some(SymbolValue::Int(value)) => i64::try_from(value).map_err(|_| SpecializationError::NonIntegerDecision(*decision))?,
                     Some(_) => return Err(SpecializationError::NonIntegerDecision(*decision)),
                     None => return Err(SpecializationError::MissingDecision(*decision)),
                 };
@@ -189,16 +192,42 @@ mod tests {
     use super::*;
     use crate::construction::{AllocationPlan, Construction};
     use crate::target::{
-        IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelDialect, VectorSupport,
+        IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect, VectorSupport,
     };
     use seismic_lang::expr::{FiniteDomain, SymbolValue};
 
     #[derive(Debug)]
     struct Dialect;
+    #[derive(Clone, Debug, PartialEq)]
+    struct FixtureAbi;
+    impl crate::target::KernelAbiModel<Dialect> for FixtureAbi {
+        fn layout(&self, _: &crate::kernel::Kernel<Dialect>) -> crate::target::KernelAbiLayout {
+            crate::target::KernelAbiLayout {
+                footprint: crate::target::KernelAbiFootprint {
+                    bytes: 0,
+                    alignment: 1,
+                },
+                allocations: vec![],
+            }
+        }
+    }
+    fn local_policy() -> crate::target::LocalRealizationPolicy {
+        crate::target::LocalRealizationPolicy {
+            workgroup: crate::target::LocalRealization::NativeDynamic,
+            participant: crate::target::LocalRealization::NativeStatic,
+            register: crate::target::LocalRealization::NativeStatic,
+        }
+    }
+
     #[derive(Clone, Debug)]
     enum NoIntrinsic {}
 
-    impl KernelDialect for Dialect {
+    impl PhysicalDialect for Dialect {
+        type LaunchDescriptor = ();
+        fn ordinary_launch() -> Self::LaunchDescriptor {
+            ()
+        }
+
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
         type Facts = ();
         type Intrinsic = NoIntrinsic;
@@ -257,10 +286,12 @@ mod tests {
         let token = schedule.close();
         let executable = construction
             .close(token)
+            .normalize_launches(arena, u64::MAX, 64)
+            .unwrap()
             .analyze_allocations()
             .apply_allocation_plan(arena, AllocationPlan::distinct())
             .finish()
-            .close_execution(arena);
+            .close_execution(arena, local_policy(), &FixtureAbi);
         (executable, decision, [first, second, shared])
     }
 
@@ -270,7 +301,7 @@ mod tests {
         let (executable, decision, [first, second, shared]) = choice_executable(&mut arena);
 
         let mut zero = PartialAssignment::new();
-        zero.bind(arena.decision_symbol(decision), SymbolValue::Int(0));
+        zero.bind(arena.decision_symbol(decision), SymbolValue::Int(0.into()));
         let zero = executable.specialize_for_native(&arena, &zero).unwrap();
         assert_eq!(
             zero.kernels().map(|(id, _)| id).collect::<Vec<_>>(),
@@ -282,7 +313,7 @@ mod tests {
         assert_eq!(zero.native_kernel_index(second), None);
 
         let mut one = PartialAssignment::new();
-        one.bind(arena.decision_symbol(decision), SymbolValue::Int(1));
+        one.bind(arena.decision_symbol(decision), SymbolValue::Int(1.into()));
         let one = executable.specialize_for_native(&arena, &one).unwrap();
         assert_eq!(
             one.kernels().map(|(id, _)| id).collect::<Vec<_>>(),
@@ -310,7 +341,7 @@ mod tests {
         );
 
         let mut absent = PartialAssignment::new();
-        absent.bind(arena.decision_symbol(decision), SymbolValue::Int(7));
+        absent.bind(arena.decision_symbol(decision), SymbolValue::Int(7.into()));
         assert_eq!(
             executable.specialize_for_native(&arena, &absent).err(),
             Some(SpecializationError::AbsentChoiceValue { decision, value: 7 })

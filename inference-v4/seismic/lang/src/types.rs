@@ -215,7 +215,9 @@ impl TensorType {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ValueType {
     Scalar(DType),
-    /// `i32` refined to `0 <= i < bound`.
+    /// Exact signed mathematical quantity.
+    Integer,
+    /// Mathematical quantity refined to `0 <= i < bound`.
     Index {
         bound: IntExpr,
     },
@@ -245,7 +247,6 @@ impl ValueType {
     pub(crate) fn scalar_dtype(&self) -> Option<DType> {
         match self {
             ValueType::Scalar(d) => Some(*d),
-            ValueType::Index { .. } => Some(DType::I32),
             _ => None,
         }
     }
@@ -257,7 +258,7 @@ impl ValueType {
     /// Every extent handle mentioned by this type, in traversal order.
     pub(crate) fn extents(&self, out: &mut Vec<IntExpr>) {
         match self {
-            ValueType::Scalar(_) | ValueType::Opaque { .. } | ValueType::Void => {}
+            ValueType::Scalar(_) | ValueType::Integer | ValueType::Opaque { .. } | ValueType::Void => {}
             ValueType::Index { bound } | ValueType::Range { bound } => out.push(*bound),
             ValueType::Tensor(t) => out.extend(t.axes.iter().copied()),
             ValueType::Tuple(items) => items.iter().for_each(|item| item.extents(out)),
@@ -269,6 +270,7 @@ impl fmt::Display for ValueType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Scalar(dtype) => write!(f, "{dtype}"),
+            Self::Integer => f.write_str("integer"),
             Self::Index { .. } => f.write_str("index"),
             Self::Range { .. } => f.write_str("range"),
             Self::Tensor(tensor) => write!(f, "tensor<{:?}; rank {}>", tensor.elem, tensor.rank()),
@@ -307,6 +309,7 @@ impl ValuePath {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Leaf<'a> {
     Scalar(DType),
+    Integer,
     Index(IntExpr),
     Range(IntExpr),
     Tensor(&'a TensorType),
@@ -322,6 +325,7 @@ pub(crate) fn canonical_leaves(ty: &ValueType) -> Option<Vec<(ValuePath, Leaf<'_
     ) -> Option<()> {
         match ty {
             ValueType::Scalar(d) => out.push((path.clone(), Leaf::Scalar(*d))),
+            ValueType::Integer => out.push((path.clone(), Leaf::Integer)),
             ValueType::Index { bound } => out.push((path.clone(), Leaf::Index(*bound))),
             ValueType::Range { bound } => out.push((path.clone(), Leaf::Range(*bound))),
             ValueType::Tensor(s) => out.push((path.clone(), Leaf::Tensor(s))),

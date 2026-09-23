@@ -19,6 +19,27 @@ members = [
   "seismic/runtime",
   "seismic/api",
   "seismic/build",
+  "seismic/frontends/python",
+]
+default-members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "templates",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/target",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
 ]
 
 [workspace.package]

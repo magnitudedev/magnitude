@@ -47,7 +47,7 @@ impl BackendName {
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
 /// every cache identity.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v12";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v13";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityInfo {
@@ -112,13 +112,21 @@ pub enum OperandCategory {
     Constant(DType),
 }
 
+/// One result axis projected from an actual tensor argument. The ordered
+/// projections define result rank as well as geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntrinsicResultAxis {
+    pub argument: u32,
+    pub axis: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IntrinsicResultType {
     Void,
     Scalar(DType),
     Owned {
         representation: RepresentationId,
-        rank: u32,
+        axes: &'static [IntrinsicResultAxis],
     },
     Opaque {
         capability: CapabilityId,
@@ -272,6 +280,21 @@ pub struct PlaneInfo {
     pub fields: u32,
     pub entry_bits: u32,
     pub storage_dtype: DType,
+}
+
+impl PlaneInfo {
+    /// Storage coordinates differ from logical decoded-value coordinates:
+    /// integer codes expose words, float codes bytes, coefficients typed elements.
+    pub fn storage_element_bytes(&self) -> u32 {
+        match self.encoding {
+            PlaneEncoding::Dense(dtype) => dtype.bytes(),
+            PlaneEncoding::Packed { .. } => 4,
+            PlaneEncoding::FloatCode { .. } => 1,
+        }
+    }
+    pub fn storage_elements_per_packet(&self) -> u32 {
+        self.bytes_per_group.div_ceil(self.storage_element_bytes())
+    }
 }
 
 impl PackedPacketLayout {
@@ -555,11 +578,22 @@ pub(crate) mod internals {
                 let id = IntrinsicId::new(intrinsics.len() as u32);
                 let result = match row.result {
                     RowResult::Scalar(dtype) => IntrinsicResultType::Scalar(dtype),
-                    RowResult::Owned(dtype, rank) => IntrinsicResultType::Owned {
+                    RowResult::Owned(dtype, axes) => IntrinsicResultType::Owned {
                         representation: dense_id(dtype),
-                        rank,
+                        axes,
                     },
                 };
+                if let IntrinsicResultType::Owned { axes, .. } = &result {
+                    for projection in *axes {
+                        let (_, operand) = row.arguments.get(projection.argument as usize)
+                            .expect("result axis selects an actual intrinsic argument");
+                        let rank = match operand {
+                            RowOperand::Readable(_, rank) | RowOperand::ReadableRepresentation(_, rank) => *rank,
+                            RowOperand::Scalar(_) => panic!("result axis cannot select a scalar argument"),
+                        };
+                        assert!(projection.axis < rank, "result axis lies within its argument rank");
+                    }
+                }
                 if let IntrinsicExecution::WholeTensor {
                     result: result_index,
                 } = row.execution

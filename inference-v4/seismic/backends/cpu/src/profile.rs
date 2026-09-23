@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-pub const BACKEND_REVISION: &str = "seismic-cpu-v7";
+pub const BACKEND_REVISION: &str = "seismic-cpu-v10";
 pub(crate) const SCRATCH_ALIGNMENT: u64 = 4096;
 
 /// The heap-backed launch-local policy. These are hard representability

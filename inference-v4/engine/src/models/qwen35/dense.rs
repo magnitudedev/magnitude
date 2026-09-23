@@ -1,7 +1,7 @@
 //! Prepared dense feedforward suffix of a Qwen block.
 
 use crate::{kernels, weights::residency::ResidentWeight};
-use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
+use seismic::{DType, Device, Element, Kernel, PreparationOptions, Tensor};
 
 #[derive(Clone)]
 pub struct DenseWeights {
@@ -30,7 +30,7 @@ impl DenseSuffix {
         device: &Device,
         invocation: DenseInvocation,
         weights: DenseWeights,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
     ) -> Result<Self, String> {
         let DenseInvocation {
             rows,
@@ -65,7 +65,7 @@ impl DenseSuffix {
             .map_err(|_| "dense suffix row count exceeds the Seismic shape domain")?;
         let kernel = kernels::qwen_dense_suffix::for_device_with(
             device,
-            precision,
+            preparation,
             kernels::qwen_dense_suffix::Elements {
                 A: Element::dense(activation),
                 NW: weights.norm.element(),

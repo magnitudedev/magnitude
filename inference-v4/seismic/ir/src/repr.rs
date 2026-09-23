@@ -12,12 +12,53 @@ use seismic_lang::registry;
 use seismic_lang::types::DType;
 use std::fmt;
 
+/// The complete scalar value transported by a kernel/schedule ABI word.
+/// Naturals are unsigned 64-bit values, independent of source storage dtypes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarKind {
+    Scalar(DType),
+    Nat64,
+}
+
+impl ScalarKind {
+    pub const fn sort(self) -> seismic_lang::expr::SymbolSort {
+        match self {
+            Self::Scalar(dtype) => seismic_lang::expr::SymbolSort::Scalar(dtype),
+            Self::Nat64 => seismic_lang::expr::SymbolSort::Nat,
+        }
+    }
+    pub const fn value_type(self) -> crate::kernel::ops::ValueType {
+        match self {
+            Self::Scalar(DType::Bool) => crate::kernel::ops::ValueType::Bool,
+            Self::Scalar(dtype) => crate::kernel::ops::ValueType::Scalar(dtype),
+            Self::Nat64 => crate::kernel::ops::ValueType::Index,
+        }
+    }
+    pub fn bytes(self) -> u32 {
+        match self {
+            Self::Scalar(dtype) => dtype.bytes(),
+            Self::Nat64 => 8,
+        }
+    }
+    pub fn decode_word(self, word: u64) -> seismic_lang::expr::SymbolValue {
+        use seismic_lang::expr::SymbolValue;
+        match self {
+            Self::Nat64 => SymbolValue::Nat((word).into()),
+            Self::Scalar(DType::F32) => SymbolValue::F32(f32::from_bits(word as u32)),
+            Self::Scalar(DType::F16) => SymbolValue::F16(word as u16),
+            Self::Scalar(DType::BF16) => SymbolValue::BF16(word as u16),
+            Self::Scalar(DType::I32) => SymbolValue::I32(word as u32 as i32),
+            Self::Scalar(DType::U32) => SymbolValue::U32(word as u32),
+            Self::Scalar(DType::Bool) => SymbolValue::Bool(word as u8 != 0),
+        }
+    }
+}
+
 /// A scalar type admitted in kernel SSA.
 pub trait ScalarType:
     'static + Copy + fmt::Debug + Send + Sync + sealed::Sealed + sealed::KernelScalar
 {
-    const DTYPE: DType;
-    const SYMBOL_SORT: seismic_lang::expr::SymbolSort;
+    const KIND: ScalarKind;
     /// Host value used for constants.
     type Value: Copy + fmt::Debug + Send + Sync;
 }
@@ -35,23 +76,22 @@ pub trait SignedType: NumericType {}
 /// Scalar storage elements that may occupy fixed-width kernel vectors.
 /// `Idx` is deliberately excluded: it is an address-domain value, not a
 /// registered scalar representation.
-pub trait VectorElement: ScalarType {}
+pub trait VectorElement: ScalarType {
+    const DTYPE: DType;
+}
 
-/// The backend-native index type (unsigned, at least 32 bits).
+/// An unsigned 64-bit natural in kernel SSA and scalar publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Idx {}
 
 pub(crate) mod sealed {
-    use crate::kernel::ops::{ConstantValue, ValueType};
+    use crate::kernel::ops::ConstantValue;
 
     pub trait Sealed {}
 
-    /// Crate-private kernel-side facts of one scalar marker: the erased
-    /// value type of its SSA values and the conversion of a host constant.
-    /// Unnameable outside the crate, so the public `ScalarType` surface is
-    /// unchanged for implementors and callers.
+    /// Crate-private conversion of a marker's host constant into kernel IR.
+    /// The erased SSA type comes from the marker's single `ScalarKind`.
     pub trait KernelScalar {
-        const VALUE_TYPE: ValueType;
         fn kernel_constant(value: <Self as super::ScalarType>::Value) -> ConstantValue
         where
             Self: super::ScalarType;
@@ -59,21 +99,20 @@ pub(crate) mod sealed {
 }
 
 macro_rules! scalar {
-    ($name:ident, $dtype:expr, $value:ty, $value_type:expr, $constant:expr $(, $extra:ident)*) => {
+    ($name:ident, $dtype:expr, $value:ty, $constant:expr $(, $extra:ident)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum $name {}
         impl sealed::Sealed for $name {}
         impl sealed::KernelScalar for $name {
-            const VALUE_TYPE: crate::kernel::ops::ValueType = $value_type;
             fn kernel_constant(value: $value) -> crate::kernel::ops::ConstantValue {
-                $constant(value)
+                ($constant)(value)
             }
         }
         impl ScalarType for $name {
-            const DTYPE: DType = $dtype;
-            const SYMBOL_SORT: seismic_lang::expr::SymbolSort = seismic_lang::expr::SymbolSort::Scalar($dtype);
+            const KIND: ScalarKind = ScalarKind::Scalar($dtype);
             type Value = $value;
         }
+        impl VectorElement for $name { const DTYPE: DType = $dtype; }
         $(impl $extra for $name {})*
     };
 }
@@ -84,7 +123,6 @@ scalar!(
     F32,
     DType::F32,
     f32,
-    ValueType::Scalar(DType::F32),
     ConstantValue::F32,
     FloatType,
     AtomicType
@@ -93,8 +131,10 @@ scalar!(
     F16,
     DType::F16,
     f32,
-    ValueType::Scalar(DType::F16),
-    ConstantValue::F32,
+    |value: f32| ConstantValue::from_scalar(seismic_lang::reference_math::float_literal(
+        DType::F16,
+        f64::from(value)
+    )),
     FloatType,
     AtomicType
 );
@@ -102,8 +142,10 @@ scalar!(
     BF16,
     DType::BF16,
     f32,
-    ValueType::Scalar(DType::BF16),
-    ConstantValue::F32,
+    |value: f32| ConstantValue::from_scalar(seismic_lang::reference_math::float_literal(
+        DType::BF16,
+        f64::from(value)
+    )),
     FloatType,
     AtomicType
 );
@@ -111,7 +153,6 @@ scalar!(
     I32,
     DType::I32,
     i32,
-    ValueType::Scalar(DType::I32),
     ConstantValue::I32,
     IntegerType,
     AtomicType
@@ -120,18 +161,11 @@ scalar!(
     U32,
     DType::U32,
     u32,
-    ValueType::Scalar(DType::U32),
     ConstantValue::U32,
     IntegerType,
     AtomicType
 );
-scalar!(
-    Bool,
-    DType::Bool,
-    bool,
-    ValueType::Bool,
-    ConstantValue::Bool
-);
+scalar!(Bool, DType::Bool, bool, ConstantValue::Bool);
 impl NumericType for F32 {}
 impl NumericType for F16 {}
 impl NumericType for BF16 {}
@@ -141,23 +175,15 @@ impl SignedType for F32 {}
 impl SignedType for F16 {}
 impl SignedType for BF16 {}
 impl SignedType for I32 {}
-impl VectorElement for F32 {}
-impl VectorElement for F16 {}
-impl VectorElement for BF16 {}
-impl VectorElement for I32 {}
-impl VectorElement for U32 {}
-impl VectorElement for Bool {}
 
 impl sealed::Sealed for Idx {}
 impl sealed::KernelScalar for Idx {
-    const VALUE_TYPE: ValueType = ValueType::Index;
     fn kernel_constant(value: u64) -> ConstantValue {
         ConstantValue::Index(value)
     }
 }
 impl ScalarType for Idx {
-    const DTYPE: DType = DType::U32;
-    const SYMBOL_SORT: seismic_lang::expr::SymbolSort = seismic_lang::expr::SymbolSort::Nat;
+    const KIND: ScalarKind = ScalarKind::Nat64;
     type Value = u64;
 }
 impl IntegerType for Idx {}
@@ -165,7 +191,7 @@ impl NumericType for Idx {}
 
 /// The erased value type of one scalar marker.
 pub(crate) fn value_type_of<T: ScalarType>() -> ValueType {
-    <T as sealed::KernelScalar>::VALUE_TYPE
+    T::KIND.value_type()
 }
 
 /// The kernel constant of one host value.
@@ -173,10 +199,8 @@ pub(crate) fn constant_of<T: ScalarType>(value: T::Value) -> ConstantValue {
     <T as sealed::KernelScalar>::kernel_constant(value)
 }
 
-pub(crate) fn fill_value_of<T: ScalarType>(value: T::Value) -> crate::schedule::FillValue {
+pub(crate) fn fill_value_of<T: VectorElement>(value: T::Value) -> crate::schedule::FillValue {
     let (encoded, width) = match constant_of::<T>(value) {
-        ConstantValue::F32(value) if T::DTYPE == DType::F16 => (u32::from(f16_bits(value)), 2),
-        ConstantValue::F32(value) if T::DTYPE == DType::BF16 => (u32::from(bf16_bits(value)), 2),
         ConstantValue::F32(value) => (value.to_bits(), 4),
         ConstantValue::F16(value) | ConstantValue::BF16(value) => (u32::from(value), 2),
         ConstantValue::I32(value) => (value as u32, 4),
@@ -193,60 +217,7 @@ pub(crate) fn fill_value_of<T: ScalarType>(value: T::Value) -> crate::schedule::
     }
 }
 
-/// Canonical round-to-nearest-even IEEE-754 binary16 encoding used by the
-/// compiler's typed constant and fill construction. This belongs to the
-/// representation layer rather than the source-language crate.
-pub(crate) fn f16_bits(value: f32) -> u16 {
-    let rounded = if value.is_nan() || value.is_infinite() || value == 0.0 {
-        value
-    } else {
-        let magnitude = value.abs();
-        if magnitude >= 65_520.0 {
-            f32::INFINITY.copysign(value)
-        } else {
-            let bits = magnitude.to_bits();
-            let exponent = ((bits >> 23) & 0xff) as i32 - 127;
-            if exponent < -14 {
-                let quantum = 2f32.powi(-24);
-                ((magnitude / quantum).round_ties_even() * quantum).copysign(value)
-            } else {
-                let lsb = (bits >> 13) & 1;
-                let bits = bits.wrapping_add((1 << 12) - 1 + lsb) & !((1 << 13) - 1);
-                f32::from_bits(bits).copysign(value)
-            }
-        }
-    };
-    let bits = rounded.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
-    }
-    let exponent = exponent - 127 + 15;
-    if exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if exponent <= 0 {
-        if exponent < -10 {
-            return sign;
-        }
-        return sign | (((mantissa | 0x80_0000) >> (1 - exponent + 13)) as u16);
-    }
-    sign | ((exponent as u16) << 10) | ((mantissa >> 13) as u16)
-}
-
-/// Canonical round-to-nearest-even bfloat16 payload.
-pub(crate) fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    if value.is_nan() {
-        return (((bits | 0x0040_0000) & 0xffff_0000) >> 16) as u16;
-    }
-    let lsb = (bits >> 16) & 1;
-    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
-}
-
-pub(crate) fn zero_fill_of<T: ScalarType>() -> crate::schedule::FillValue {
+pub(crate) fn zero_fill_of<T: VectorElement>() -> crate::schedule::FillValue {
     match T::DTYPE.bytes() {
         1 => crate::schedule::FillValue::U8([0]),
         2 => crate::schedule::FillValue::U16([0; 2]),
@@ -386,5 +357,42 @@ pub fn with_scalar<V: ScalarVisitor>(dtype: DType, visitor: V) -> V::Output {
         DType::I32 => visitor.visit::<I32>(),
         DType::U32 => visitor.visit::<U32>(),
         DType::Bool => visitor.visit::<Bool>(),
+    }
+}
+
+#[cfg(test)]
+mod scalar_kind_tests {
+    use super::*;
+    use seismic_lang::expr::SymbolValue;
+
+    #[test]
+    fn abi_words_preserve_naturals_and_ignore_padding_outside_source_width() {
+        assert_eq!(
+            ScalarKind::Nat64.decode_word(u64::MAX),
+            SymbolValue::Nat((u64::MAX).into())
+        );
+        assert_eq!(ScalarKind::Nat64.value_type(), ValueType::Index);
+        assert_eq!(ScalarKind::Nat64.bytes(), 8);
+        let padded = 0xffff_ffff_0000_0000;
+        assert_eq!(
+            ScalarKind::Scalar(DType::U32).decode_word(padded),
+            SymbolValue::U32(0)
+        );
+        assert_eq!(
+            ScalarKind::Scalar(DType::Bool).decode_word(padded),
+            SymbolValue::Bool(false)
+        );
+        assert_eq!(
+            ScalarKind::Scalar(DType::Bool).decode_word(padded | 1),
+            SymbolValue::Bool(true)
+        );
+        assert_eq!(
+            ScalarKind::Scalar(DType::I32).decode_word(padded | 0x8000_0000),
+            SymbolValue::I32(i32::MIN)
+        );
+        assert_eq!(
+            ScalarKind::Scalar(DType::F16).decode_word(padded | 0x7c01),
+            SymbolValue::F16(0x7c01)
+        );
     }
 }

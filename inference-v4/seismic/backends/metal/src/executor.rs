@@ -16,7 +16,6 @@ use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::target::KernelAbiAllocationRole;
 use seismic_lang::expr::SymbolValue;
-use seismic_lang::types::DType;
 
 pub struct MetalExecutor {
     device: MetalDevice,
@@ -46,11 +45,31 @@ impl NativeExecutor<Metal> for MetalExecutor {
 
 pub struct MetalSubmission {
     device: MetalDevice,
-    pending: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    pending: Vec<PendingCommand>,
 }
 
 pub struct MetalExecution {
-    pending: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    pending: Vec<PendingCommand>,
+}
+
+/// One native command owns the exact host-written input that remains readable
+/// until completion. The same range supplies the encoder's binding below.
+struct PendingCommand {
+    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    words: WordTableRead,
+}
+
+struct WordTableRead {
+    buffer: MetalBuffer,
+    bytes: std::ops::Range<u64>,
+}
+
+impl WordTableRead {
+    fn overlaps(&self, other: &Self) -> bool {
+        std::ptr::eq(self.buffer.raw(), other.buffer.raw())
+            && self.bytes.start < other.bytes.end
+            && other.bytes.start < self.bytes.end
+    }
 }
 
 // Command buffers are Metal synchronization objects and may be completed on
@@ -71,13 +90,14 @@ impl NativeSubmission<Metal> for MetalSubmission {
         match command {
             ExecutableCommand::Launch {
                 kernel,
-                mode,
+                descriptor,
                 grid,
                 workgroup,
                 empty,
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 local_totals,
                 scratch,
@@ -85,13 +105,14 @@ impl NativeSubmission<Metal> for MetalSubmission {
                 addressable_resources: _,
             } => self.launch(
                 *kernel,
-                *mode,
+                *descriptor,
                 grid,
                 workgroup,
                 empty,
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 local_totals,
                 *scratch,
@@ -132,6 +153,10 @@ impl NativeSubmission<Metal> for MetalSubmission {
         }
     }
 
+    fn complete_prefix(&mut self) -> Result<(), ExecutionError> {
+        self.synchronize()
+    }
+
     fn submit(self) -> Self::Execution {
         MetalExecution {
             pending: self.pending,
@@ -150,6 +175,58 @@ impl MetalSubmission {
         complete_pending(&mut self.pending)
     }
 
+    fn write_words(
+        &mut self,
+        buffer: &RuntimeBuffer<MetalBuffer>,
+        words: &[u64],
+    ) -> Result<WordTableRead, ExecutionError> {
+        let bytes = words
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let length = u64::try_from(bytes.len()).expect("native word table length exceeds u64");
+        assert!(
+            length <= buffer.accessible_bytes,
+            "native word table exceeds its ABI allocation"
+        );
+        let end = buffer
+            .base_offset
+            .checked_add(length)
+            .expect("native word table range exceeds u64");
+        let words = WordTableRead {
+            buffer: buffer.buffer.clone(),
+            bytes: buffer.base_offset..end,
+        };
+        // Queue ordering does not order a host write after an earlier GPU read.
+        // Wait only for native readers of these bytes. In particular, logical
+        // allocation ordinals from another variant are not physical identity.
+        let completed = complete_all(
+            self.pending
+                .iter()
+                .filter(|pending| pending.words.overlaps(&words)),
+            |pending| complete_command(&pending.command),
+        );
+        // Preserve every owner if a native wait panics, and preserve unrelated
+        // issued work on an ordinary completion error.
+        self.pending
+            .retain(|pending| !pending.words.overlaps(&words));
+        completed?;
+        words.buffer.write_bytes(words.bytes.start, &bytes);
+        Ok(words)
+    }
+
+    fn commit(
+        &mut self,
+        command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        words: WordTableRead,
+    ) {
+        // All fallible command/encoder formation is already finished. Retain
+        // the input before the infallible native commit; no uncommitted command
+        // can reach a normal failure path between registration and commit.
+        self.pending.push(PendingCommand { command, words });
+        self.pending.last().unwrap().command.commit();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
@@ -161,6 +238,7 @@ impl MetalSubmission {
         bindings: &[CompiledBufferView],
         nat_args: &[seismic_lang::expr::compiled::CompiledNat],
         scalar_args: &[seismic_lang::expr::SymbolId],
+        result_slots: &[seismic_ir::schedule::AnyScalarSlot],
         locals: &[CompiledLocalLayout],
         totals: &CompiledLocalClassTotals,
         scratch: seismic_compiler::executable::LaunchScratchBindings,
@@ -179,7 +257,7 @@ impl MetalSubmission {
         let mut words = vec![0u64; kernel.words.total as usize];
         let mut resolved = Vec::with_capacity(bindings.len());
         for (position, binding) in bindings.iter().enumerate() {
-            let view = env.resolve_view(binding);
+            let view = env.resolve_view(binding)?;
             let layout = kernel.words.bindings[position];
             words[layout.first as usize..layout.first as usize + layout.rank as usize]
                 .copy_from_slice(&view.extents);
@@ -192,7 +270,7 @@ impl MetalSubmission {
             words[kernel.words.nat_first as usize + index] = env.nat(value);
         }
         for (index, symbol) in scalar_args.iter().copied().enumerate() {
-            words[kernel.words.scalar_first as usize + index] = encode_symbol(env.symbol(symbol));
+            words[kernel.words.scalar_first as usize + index] = encode_symbol(env.symbol(symbol))?;
         }
         let total_values = [
             env.nat(&totals.workgroup_bytes),
@@ -216,8 +294,10 @@ impl MetalSubmission {
             .copy_from_slice(&workgroup);
         words[kernel.words.local_total_first as usize..kernel.words.local_total_first as usize + 3]
             .copy_from_slice(&total_values);
-        let word_table = abi_buffer(abi, KernelAbiAllocationRole::WordTable, env);
-        write_words(word_table, &words)?;
+        let word_table = self.write_words(
+            abi_buffer(abi, KernelAbiAllocationRole::WordTable, env),
+            &words,
+        )?;
         let results = abi_buffer(abi, KernelAbiAllocationRole::ScalarResults, env);
         let result_buffer = results.buffer.clone();
         let result_base_offset = results.base_offset;
@@ -238,7 +318,7 @@ impl MetalSubmission {
         unsafe {
             encoder.setBuffer_offset_atIndex(
                 Some(word_table.buffer.raw()),
-                word_table.base_offset as usize,
+                word_table.bytes.start as usize,
                 first_aux,
             );
             encoder.setBuffer_offset_atIndex(
@@ -263,20 +343,18 @@ impl MetalSubmission {
             },
         );
         encoder.endEncoding();
-        command.commit();
-        self.pending.push(command);
-        let result_slots = kernel.result_slots.clone();
+        self.commit(command, word_table);
         if !result_slots.is_empty() {
             self.synchronize()?;
         }
-        for (index, (slot, dtype)) in result_slots.iter().enumerate() {
+        for (index, slot) in result_slots.iter().enumerate() {
             let mut bytes = [0u8; 8];
             self.device.read(
                 &result_buffer,
                 result_base_offset + (index as u64) * 8,
                 &mut bytes,
             )?;
-            env.set_slot(*slot, decode_symbol(u64::from_le_bytes(bytes), *dtype));
+            env.set_slot(*slot, slot.kind().decode_word(u64::from_le_bytes(bytes)));
         }
         Ok(())
     }
@@ -288,8 +366,8 @@ impl MetalSubmission {
         bytes: u64,
         env: &ExecutionEnvironment<'_, Metal, Pipeline, MetalDevice>,
     ) -> Result<(), ExecutionError> {
-        let source = env.resolve_view(source);
-        let destination = env.resolve_view(destination);
+        let source = env.resolve_view(source)?;
+        let destination = env.resolve_view(destination)?;
         let mut data = vec![0u8; bytes as usize];
         self.device
             .read(source.buffer, source.byte_offset, &mut data)?;
@@ -303,7 +381,7 @@ impl MetalSubmission {
         bytes: u64,
         env: &ExecutionEnvironment<'_, Metal, Pipeline, MetalDevice>,
     ) -> Result<(), ExecutionError> {
-        let destination = env.resolve_view(destination);
+        let destination = env.resolve_view(destination)?;
         let mut data = vec![0u8; bytes as usize];
         let pattern = value.pattern();
         for (index, byte) in data.iter_mut().enumerate() {
@@ -319,9 +397,9 @@ impl MetalSubmission {
         to: AnyScalarSlot,
         env: &mut ExecutionEnvironment<'_, Metal, Pipeline, MetalDevice>,
     ) -> Result<(), ExecutionError> {
-        let source = env.resolve_view(source);
-        let mut bytes = [0u8; 4];
-        let width = to.dtype().bytes() as usize;
+        let source = env.resolve_view(source)?;
+        let mut bytes = [0u8; 8];
+        let width = to.kind().bytes() as usize;
         self.device.read(
             source.buffer,
             source
@@ -330,24 +408,24 @@ impl MetalSubmission {
                 .expect("CompiledBufferView violated the MetalBuffer host-range FFI precondition: scalar byte offset overflowed"),
             &mut bytes[..width],
         )?;
-        env.set_slot(to, decode_bytes(bytes, to.dtype()));
+        env.set_slot(to, to.kind().decode_word(u64::from_le_bytes(bytes)));
         Ok(())
     }
 }
 
-fn complete_pending(
-    pending: &mut Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-) -> Result<(), ExecutionError> {
-    let completed = complete_all(pending.iter(), |command| {
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            Err(ExecutionError::SynchronizationFailed(
-                error.localizedDescription().to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    });
+fn complete_command(command: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), ExecutionError> {
+    command.waitUntilCompleted();
+    if let Some(error) = command.error() {
+        Err(ExecutionError::SynchronizationFailed(
+            error.localizedDescription().to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn complete_pending(pending: &mut Vec<PendingCommand>) -> Result<(), ExecutionError> {
+    let completed = complete_all(pending.iter(), |pending| complete_command(&pending.command));
     // Keep every command-buffer owner in `pending` until every wait returns.
     // If a foreign call panics, the runtime leaks the still-populated
     // execution owner and therefore cannot release in-flight ownership.
@@ -376,6 +454,160 @@ fn complete_all<T>(
 #[cfg(test)]
 mod completion_tests {
     use super::*;
+
+    fn capture_pipeline(
+        device: &MetalDevice,
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>> {
+        use objc2_metal::{MTLDevice, MTLLibrary};
+        let source = objc2_foundation::NSString::from_str(
+            "#include <metal_stdlib>\nusing namespace metal;\n\
+             kernel void capture(constant ulong* words [[buffer(0)]], device ulong* output [[buffer(1)]]) {\n\
+                 output[words[0]] = words[1];\n\
+             }",
+        );
+        let library = device
+            .handle()
+            .raw()
+            .newLibraryWithSource_options_error(&source, None)
+            .unwrap();
+        let function = library
+            .newFunctionWithName(&objc2_foundation::NSString::from_str("capture"))
+            .unwrap();
+        device
+            .handle()
+            .raw()
+            .newComputePipelineStateWithFunction_error(&function)
+            .unwrap()
+    }
+
+    fn capture_words(
+        submission: &mut MetalSubmission,
+        pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        table: &RuntimeBuffer<MetalBuffer>,
+        output: &MetalBuffer,
+        words: [u64; 2],
+    ) {
+        let words = submission.write_words(table, &words).unwrap();
+        let command = submission.device.queue().commandBuffer().unwrap();
+        let encoder = command.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(words.buffer.raw()),
+                words.bytes.start as usize,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+        }
+        let one = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+        encoder.endEncoding();
+        submission.commit(command, words);
+    }
+
+    fn captured_words(device: &MetalDevice, buffer: &MetalBuffer) -> Vec<u64> {
+        let mut bytes = vec![0; buffer.len() as usize];
+        device.read(buffer, 0, &mut bytes).unwrap();
+        bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn repeated_launches_preserve_each_word_table_version_until_its_native_read() {
+        let device = MetalDevice::open(crate::DeviceHandle::system_default().unwrap()).unwrap();
+        let pipeline = capture_pipeline(&device);
+        let output = device.allocate_bytes(64 * 8).unwrap();
+        device.write(&output, 0, &vec![0xff; 64 * 8]).unwrap();
+        let table = RuntimeBuffer {
+            tensor: None,
+            buffer: device.allocate_bytes(32).unwrap(),
+            base_offset: 8,
+            accessible_bytes: 16,
+        };
+        let mut submission = MetalExecutor::new(device.clone())
+            .begin_submission()
+            .unwrap();
+        for index in 0..64u64 {
+            capture_words(
+                &mut submission,
+                &pipeline,
+                &table,
+                &output,
+                [index, index * 17 + 3],
+            );
+            assert_eq!(
+                submission.pending.len(),
+                1,
+                "reuse completes only the preceding reader"
+            );
+        }
+        // No scalar-result read or explicit terminal completion occurs between
+        // dispatches. The production input ownership protocol protects reuse.
+        submission.submit().complete().unwrap();
+        assert_eq!(
+            captured_words(&device, &output),
+            (0..64).map(|index| index * 17 + 3).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn host_word_write_completes_overlapping_ranges_and_retains_independent_readers() {
+        let device = MetalDevice::open(crate::DeviceHandle::system_default().unwrap()).unwrap();
+        let pipeline = capture_pipeline(&device);
+        let output = device.allocate_bytes(3 * 8).unwrap();
+        let shared = device.allocate_bytes(32).unwrap();
+        let separate = device.allocate_bytes(16).unwrap();
+        let mut submission = MetalExecutor::new(device.clone())
+            .begin_submission()
+            .unwrap();
+        for (index, buffer, offset) in [(0, &shared, 0), (1, &shared, 16), (2, &separate, 0)] {
+            capture_words(
+                &mut submission,
+                &pipeline,
+                &RuntimeBuffer {
+            tensor: None,
+                    buffer: buffer.clone(),
+                    base_offset: offset,
+                    accessible_bytes: 16,
+                },
+                &output,
+                [index, index + 11],
+            );
+        }
+        assert_eq!(
+            submission.pending.len(),
+            3,
+            "adjacent ranges and other buffers do not conflict"
+        );
+        let middle = RuntimeBuffer {
+            tensor: None,
+            buffer: shared,
+            base_offset: 8,
+            accessible_bytes: 16,
+        };
+        let _next_input = submission
+            .write_words(&middle, &[u64::MAX, u64::MAX])
+            .unwrap();
+        assert_eq!(
+            submission.pending.len(),
+            1,
+            "only the two overlapping readers are completed"
+        );
+        assert!(std::ptr::eq(
+            submission.pending[0].words.buffer.raw(),
+            separate.raw()
+        ));
+        submission.submit().complete().unwrap();
+        assert_eq!(captured_words(&device, &output), vec![11, 12, 13]);
+    }
 
     #[test]
     fn completion_waits_every_pending_operation_before_returning_first_error() {
@@ -422,42 +654,7 @@ fn abi_buffer<'a>(
 ) -> &'a RuntimeBuffer<MetalBuffer> {
     env.buffer(abi.allocation(role))
 }
-fn write_words(buffer: &RuntimeBuffer<MetalBuffer>, words: &[u64]) -> Result<(), ExecutionError> {
-    let bytes = words
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect::<Vec<_>>();
-    buffer.buffer.write_bytes(buffer.base_offset, &bytes);
-    Ok(())
-}
-fn encode_symbol(value: SymbolValue) -> u64 {
-    match value {
-        SymbolValue::Nat(v) => v,
-        SymbolValue::Int(v) => v as u64,
-        SymbolValue::F32(v) => u64::from(v.to_bits()),
-        SymbolValue::F16(v) | SymbolValue::BF16(v) => u64::from(v),
-        SymbolValue::I32(v) => u64::from(v as u32),
-        SymbolValue::U32(v) => u64::from(v),
-        SymbolValue::Bool(v) => u64::from(v),
-    }
-}
-fn decode_symbol(value: u64, dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_bits(value as u32)),
-        DType::F16 => SymbolValue::F16(value as u16),
-        DType::BF16 => SymbolValue::BF16(value as u16),
-        DType::I32 => SymbolValue::I32(value as u32 as i32),
-        DType::U32 => SymbolValue::U32(value as u32),
-        DType::Bool => SymbolValue::Bool(value != 0),
-    }
-}
-fn decode_bytes(value: [u8; 4], dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_le_bytes(value)),
-        DType::F16 => SymbolValue::F16(u16::from_le_bytes([value[0], value[1]])),
-        DType::BF16 => SymbolValue::BF16(u16::from_le_bytes([value[0], value[1]])),
-        DType::I32 => SymbolValue::I32(i32::from_le_bytes(value)),
-        DType::U32 => SymbolValue::U32(u32::from_le_bytes(value)),
-        DType::Bool => SymbolValue::Bool(value[0] != 0),
-    }
+fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
+    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
+        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
 }

@@ -22,7 +22,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "checked_module_literal",
-        diagnostic: "field `inner` of struct `CheckedModule` is private",
+        diagnostic: "cannot construct `CheckedModule` with struct literal syntax",
     },
     Case {
         name: "planning_authority",
@@ -62,7 +62,8 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "selection_function_literal",
-        diagnostic: "field `program` of struct `SelectionFunction` is private",
+        diagnostic:
+            "fields `program` and `retained_bytes` of struct `SelectionFunction` are private",
     },
     Case {
         name: "candidate_index_literal",

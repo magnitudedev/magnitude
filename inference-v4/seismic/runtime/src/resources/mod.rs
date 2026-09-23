@@ -7,28 +7,100 @@
 
 use crate::driver::{Allocation, AllocationPermit};
 use crate::memory::MemoryReservation;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// The opaque ownership token produced by one successful whole-graph
-/// admission. Execution can retain or release it, but cannot inspect or
-/// manufacture its constituent reservation, leases, or access permits.
+/// admission. Execution retains it through terminal completion and borrows
+/// its actual allocation access for observation. It cannot manufacture the
+/// constituent reservation, leases, or access permits.
 pub(crate) struct AdmittedResources {
     _reservation: MemoryReservation,
-    _persistent: Vec<PersistentLease>,
-    _access: Vec<AllocationPermit>,
+    preclaims: BTreeMap<(u64, usize, usize), PersistentGrowth>,
+    // Each permit owns its backing Arc. One slot per physical allocation,
+    // shared by every staged alias in the run.
+    slots: BTreeMap<u64, Option<AllocationPermit>>,
+    reached_live: u64,
+    reached_budget: u64,
+    reached_allocated: u64,
+    reached_peak: u64,
 }
 
 impl AdmittedResources {
+    /// Borrow the actual admission-owned access for terminal observation. No
+    /// reacquisition is needed while that same exclusive access is still held.
+    pub(crate) fn access(&self, allocation: &Arc<Allocation>) -> &AllocationPermit {
+        let permit = self.slots.values().filter_map(Option::as_ref).find(|permit| permit.owns(allocation))
+            .expect("completed observation reads backing outside its admitted resources");
+        assert!(permit.owns(allocation), "physical identity names different backing");
+        permit
+    }
+    pub(crate) fn allocation(&self, identity: u64) -> &Arc<Allocation> {
+        self.slots.get(&identity).and_then(Option::as_ref)
+            .expect("staged allocation has no admitted physical backing")
+            .allocation()
+    }
+    pub(crate) fn slot_for(&self, allocation: &Arc<Allocation>) -> u64 {
+        *self.slots.iter().find(|(_, permit)| permit.as_ref().is_some_and(|permit| permit.owns(allocation)))
+            .map(|(slot, _)| slot).expect("backing has no run-owned physical slot")
+    }
+    pub(crate) fn retain_preclaims(&mut self, claims: BTreeMap<(u64, usize, usize), PersistentGrowth>) {
+        assert!(self.preclaims.is_empty(), "portfolio keys already claimed");
+        self.preclaims = claims;
+    }
+    pub(crate) fn preclaimed_binding(&self, key: (u64, usize, usize)) -> Option<&PersistentBinding> {
+        self.preclaims.get(&key).expect("selected persistent key was not inventoried").old()
+    }
+    pub(crate) fn install_preclaimed(&mut self, key: (u64, usize, usize), binding: PersistentBinding) {
+        self.preclaims.get_mut(&key).expect("selected persistent key was not inventoried").install_reached(binding);
+    }
+    pub(crate) fn set_reached_budget(&mut self, bytes: u64) { self.reached_budget = bytes; }
+    pub(crate) fn reached_allocated(&self) -> u64 { self.reached_allocated }
+    pub(crate) fn check_reached_capacity(&self, bytes: u64) -> Result<(), seismic_compiler::errors::ExecutionError> {
+        let available = self.reached_budget.saturating_sub(self.reached_live);
+        if bytes > available {
+            return Err(seismic_compiler::errors::ExecutionError::AllocationCapacity { required: bytes.into(), available });
+        }
+        Ok(())
+    }
+    pub(crate) fn declare_private(&mut self, slot: u64) {
+        self.slots.entry(slot).or_insert(None);
+    }
+    pub(crate) fn private_backing(&self, slot: u64) -> Option<&Arc<Allocation>> {
+        self.slots.get(&slot).expect("private slot was never declared").as_ref().map(AllocationPermit::allocation)
+    }
+    pub(crate) fn retire_private(&mut self, slot: u64) {
+        if let Some(old) = self.slots.get_mut(&slot).expect("private slot was never declared").take() {
+            self.reached_live -= old.allocation().bytes();
+        }
+    }
+    pub(crate) fn install_private(&mut self, slot: u64, permit: AllocationPermit) {
+        let destination = self.slots.get_mut(&slot).expect("private slot was never declared");
+        assert!(destination.is_none(), "private slot replacement did not retire its old backing");
+        let bytes = permit.allocation().bytes();
+        self.reached_live = self.reached_live.checked_add(bytes).expect("admitted reached bytes overflow");
+        self.reached_allocated = self.reached_allocated.saturating_add(bytes);
+        self.reached_peak = self.reached_peak.max(self.reached_live);
+        *destination = Some(permit);
+    }
     pub(crate) fn new(
         reservation: MemoryReservation,
-        persistent: Vec<PersistentLease>,
         access: Vec<AllocationPermit>,
     ) -> Self {
+        let mut slots = BTreeMap::new();
+        for permit in access {
+            let identity = permit.allocation().identity();
+            assert!(slots.insert(identity, Some(permit)).is_none(),
+                "physical allocation admitted twice");
+        }
         Self {
             _reservation: reservation,
-            _persistent: persistent,
-            _access: access,
+            preclaims: BTreeMap::new(),
+            slots,
+            reached_live: 0,
+            reached_budget: u64::MAX,
+            reached_allocated: 0,
+            reached_peak: 0,
         }
     }
 }
@@ -63,14 +135,12 @@ pub(crate) struct PersistentBinding {
 enum PersistentSlot {
     Ready {
         binding: PersistentBinding,
-        leases: u64,
     },
     Growing,
 }
 
 #[derive(Clone)]
 pub(crate) enum PersistentAvailability {
-    Reuse(PersistentBinding),
     Grow { old: Option<PersistentBinding> },
     Wait,
 }
@@ -94,63 +164,29 @@ impl PersistentTable {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn availability_locked(
+    /// A portfolio claim owns the key independently of whether this run ever
+    /// selects it. No backing or capacity is acquired by this operation.
+    pub(crate) fn preclaim_availability(&self, key: (usize, usize)) -> PersistentAvailability {
+        Self::preclaim_availability_locked(&self.slots(), key)
+    }
+
+    fn preclaim_availability_locked(
         slots: &HashMap<(usize, usize), PersistentSlot>,
         key: (usize, usize),
-        bytes: u64,
     ) -> PersistentAvailability {
         match slots.get(&key) {
             None => PersistentAvailability::Grow { old: None },
-            Some(PersistentSlot::Growing) => PersistentAvailability::Wait,
-            Some(PersistentSlot::Ready { binding, .. }) if binding.capacity >= bytes => {
-                PersistentAvailability::Reuse(binding.clone())
-            }
-            Some(PersistentSlot::Ready { binding, leases: 0 }) => PersistentAvailability::Grow {
-                old: Some(binding.clone()),
-            },
-            Some(PersistentSlot::Ready { .. }) => PersistentAvailability::Wait,
+            Some(PersistentSlot::Ready { binding }) =>
+                PersistentAvailability::Grow { old: Some(binding.clone()) },
+            Some(_) => PersistentAvailability::Wait,
         }
     }
 
-    pub(crate) fn availability(&self, key: (usize, usize), bytes: u64) -> PersistentAvailability {
-        Self::availability_locked(&self.slots(), key, bytes)
-    }
-
-    /// Waits without holding the device admission guard or any reservation,
-    /// persistent claim, or allocation permit. The caller retries the complete
-    /// graph snapshot after this returns.
-    pub(crate) fn wait_until_available(&self, key: (usize, usize), bytes: u64) {
+    pub(crate) fn wait_until_preclaimable(&self, key: (usize, usize)) {
         let mut slots = self.slots();
-        while matches!(
-            Self::availability_locked(&slots, key, bytes),
-            PersistentAvailability::Wait
-        ) {
-            slots = self
-                .changed
-                .wait(slots)
+        while matches!(Self::preclaim_availability_locked(&slots, key), PersistentAvailability::Wait) {
+            slots = self.changed.wait(slots)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    pub(crate) fn claim_reuse(
-        self: &Arc<Self>,
-        key: (usize, usize),
-        expected: &Arc<Allocation>,
-    ) -> PersistentLease {
-        let mut slots = self.slots();
-        let Some(PersistentSlot::Ready { binding, leases }) = slots.get_mut(&key) else {
-            panic!("persistent reuse changed while the admission guard was held")
-        };
-        assert!(
-            Arc::ptr_eq(&binding.allocation, expected),
-            "persistent allocation changed while the admission guard was held"
-        );
-        *leases = leases
-            .checked_add(1)
-            .expect("persistent allocation lease count overflowed");
-        PersistentLease {
-            table: self.clone(),
-            key,
         }
     }
 
@@ -158,8 +194,8 @@ impl PersistentTable {
         let mut slots = self.slots();
         let old = match slots.get(&key) {
             None => None,
-            Some(PersistentSlot::Ready { binding, leases: 0 }) => Some(binding.clone()),
-            Some(PersistentSlot::Ready { .. }) | Some(PersistentSlot::Growing) => {
+            Some(PersistentSlot::Ready { binding }) => Some(binding.clone()),
+            Some(PersistentSlot::Growing) => {
                 panic!("persistent growth became unavailable while admission was serialized")
             }
         };
@@ -168,38 +204,17 @@ impl PersistentTable {
             table: self.clone(),
             key,
             old,
-            active: true,
         }
     }
 }
 
-pub(crate) struct PersistentLease {
-    table: Arc<PersistentTable>,
-    key: (usize, usize),
-}
-
-impl Drop for PersistentLease {
-    fn drop(&mut self) {
-        let mut slots = self.table.slots();
-        let Some(PersistentSlot::Ready { leases, .. }) = slots.get_mut(&self.key) else {
-            panic!("leased persistent allocation is not ready")
-        };
-        *leases = leases
-            .checked_sub(1)
-            .expect("persistent allocation lease count underflow");
-        if *leases == 0 {
-            self.table.changed.notify_all();
-        }
-    }
-}
-
-/// An unpublished persistent replacement. Dropping it restores the exact slot
-/// state observed before the transaction claimed growth.
+/// Exclusive ownership of a portfolio key through terminal completion. An
+/// unused claim restores its original backing; a reached replacement becomes
+/// the next persistent backing when the run releases its claim.
 pub(crate) struct PersistentGrowth {
     table: Arc<PersistentTable>,
     key: (usize, usize),
     old: Option<PersistentBinding>,
-    active: bool,
 }
 
 impl PersistentGrowth {
@@ -207,28 +222,21 @@ impl PersistentGrowth {
         self.old.as_ref()
     }
 
-    pub(crate) fn commit(mut self, binding: PersistentBinding) -> PersistentLease {
-        let mut slots = self.table.slots();
-        assert!(
-            matches!(slots.get(&self.key), Some(PersistentSlot::Growing)),
-            "persistent growth marker disappeared before commit"
-        );
-        slots.insert(self.key, PersistentSlot::Ready { binding, leases: 1 });
-        self.active = false;
-        self.table.changed.notify_all();
-        drop(slots);
-        PersistentLease {
-            table: self.table.clone(),
-            key: self.key,
-        }
+    /// A run that preclaimed a portfolio key may replace its physical backing
+    /// after reaching the corresponding demand. The key remains exclusively
+    /// claimed through terminal completion; dropping the claim publishes this
+    /// latest backing, or restores absence when the key was never selected.
+    pub(crate) fn install_reached(&mut self, binding: PersistentBinding) {
+        assert!(matches!(self.table.slots().get(&self.key), Some(PersistentSlot::Growing)),
+            "persistent key lost its run claim");
+        self.old = Some(binding);
     }
+
+
 }
 
 impl Drop for PersistentGrowth {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
         let mut slots = self.table.slots();
         assert!(
             matches!(slots.get(&self.key), Some(PersistentSlot::Growing)),
@@ -236,7 +244,7 @@ impl Drop for PersistentGrowth {
         );
         match self.old.take() {
             Some(binding) => {
-                slots.insert(self.key, PersistentSlot::Ready { binding, leases: 0 });
+                slots.insert(self.key, PersistentSlot::Ready { binding });
             }
             None => {
                 slots.remove(&self.key);
@@ -248,125 +256,18 @@ impl Drop for PersistentGrowth {
 
 #[cfg(test)]
 mod tests {
-    /// A backend-free model of the production admission phases. The bounded
-    /// enumeration checks every failure boundary and both persistent actions;
-    /// production RAII objects implement the same ownership transitions.
     #[test]
-    fn bounded_transaction_failures_restore_markers_leases_and_capacity() {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum Slot {
-            Absent,
-            Ready { capacity: u64, leases: u64 },
-            Growing,
-        }
-        for initial in [
-            Slot::Absent,
-            Slot::Ready {
-                capacity: 8,
-                leases: 0,
-            },
-            Slot::Ready {
-                capacity: 2,
-                leases: 0,
-            },
-            Slot::Ready {
-                capacity: 2,
-                leases: 1,
-            },
-            Slot::Growing,
-        ] {
-            for failure_boundary in 0..=5 {
-                let waits = matches!(
-                    initial,
-                    Slot::Growing
-                        | Slot::Ready {
-                            capacity: 0..=7,
-                            leases: 1..
-                        }
-                );
-                if waits {
-                    let slot_after_wait_decision = initial;
-                    let transaction_charge = 0;
-                    let access_permits = 0;
-                    assert_eq!(slot_after_wait_decision, initial);
-                    assert_eq!((transaction_charge, access_permits), (0, 0));
-                    continue;
-                }
-                let grows = !matches!(initial, Slot::Ready { capacity: 8.., .. });
-                let reservation = 3 + if grows { 8 } else { 0 };
-                let mut transaction_charge = 0;
-
-                // claim, reserve, allocate temporary, allocate/grow persistent,
-                // copy, and begin-submission. Every injected failure before
-                // publication restores the initial slot and releases the full
-                // reservation, including allocation-failure boundaries 2/3.
-                let mut slot = if grows {
-                    Slot::Growing
-                } else {
-                    Slot::Ready {
-                        capacity: 8,
-                        leases: 1,
-                    }
-                };
-                if failure_boundary == 0 {
-                    rollback(&mut transaction_charge, &mut slot, initial);
-                    assert_eq!((transaction_charge, slot), (0, initial));
-                    continue;
-                }
-                transaction_charge = reservation;
-                if failure_boundary <= 4 {
-                    rollback(&mut transaction_charge, &mut slot, initial);
-                    assert_eq!((transaction_charge, slot), (0, initial));
-                    continue;
-                }
-
-                if grows {
-                    slot = Slot::Ready {
-                        capacity: 8,
-                        leases: 1,
-                    };
-                }
-                assert_eq!(transaction_charge, reservation);
-                assert_eq!(
-                    slot,
-                    Slot::Ready {
-                        capacity: 8,
-                        leases: 1
-                    }
-                );
-
-                // Completion releases the temporary charge and lease. A grown
-                // persistent allocation remains charged and reusable.
-                transaction_charge = if grows { 8 } else { 0 };
-                slot = Slot::Ready {
-                    capacity: 8,
-                    leases: 0,
-                };
-                assert_eq!(transaction_charge, if grows { 8 } else { 0 });
-                assert_eq!(
-                    slot,
-                    Slot::Ready {
-                        capacity: 8,
-                        leases: 0
-                    }
-                );
-            }
-        }
-
-        fn rollback<T: Copy>(charged: &mut u64, state: &mut T, initial: T) {
-            *charged = 0;
-            *state = initial;
-        }
+    fn unused_portfolio_claim_preserves_absence_and_never_acquires_capacity() {
+        use super::*;
+        let table = Arc::new(PersistentTable::new());
+        assert!(matches!(table.preclaim_availability((3, 7)), PersistentAvailability::Grow { old: None }));
+        let claim = table.claim_growth((3, 7));
+        assert!(claim.old().is_none());
+        assert!(matches!(table.preclaim_availability((3, 7)), PersistentAvailability::Wait));
+        // The key claim has no memory-domain handle and cannot allocate or
+        // reserve bytes. An unvisited branch simply drops its unused claim.
+        drop(claim);
+        assert!(table.slots().is_empty());
     }
 
-    #[test]
-    fn same_graph_persistent_uses_collapse_to_one_growth_and_one_charge() {
-        for uses in 1usize..=8 {
-            let requested = (0..uses).map(|index| 4 + index as u64).max().unwrap();
-            let growths = usize::from(requested > 3);
-            let charged = if growths == 1 { requested } else { 0 };
-            assert_eq!(growths, 1);
-            assert_eq!(charged, 3 + uses as u64);
-        }
-    }
 }

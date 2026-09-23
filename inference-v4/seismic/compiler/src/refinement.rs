@@ -1,41 +1,23 @@
-//! Semantic-to-executable refinement without prediction or native realization.
+//! Closed physical candidate data and allocation-choice refinement.
 //!
-//! Refinement owns the finite candidate-family domain.  Its result is a pure,
-//! inspectable value: one universal family, zero or more optimized families,
-//! their shared expression arena, and an explicit completeness report.
+//! Candidate definitions and resumable construction belong to CandidateDomain.
+//! This module supplies the physical storage transition and immutable payload.
 
-mod candidate;
-mod enumerate;
-
-pub(crate) use candidate::{
-    activate_choices, validate_choice_declarations, CandidateFamilyParts, ConstructionAuthority,
-    PublishedResult, PublishedScalarKind, ResultPublication,
+pub(crate) use crate::implementation::candidate::{
+    validate_choice_declarations, PublishedResult,
 };
-pub use candidate::{
-    CandidateFamily, CandidateFamilyIdentity, ChoiceDeclaration, FactoryIdentity,
-    ImplementationProvenance,
+#[cfg(test)]
+pub(crate) use crate::implementation::candidate::ConstructedCandidateParts;
+pub use crate::implementation::candidate::{
+    ChoiceDeclaration, ChoiceKind, ConstructedCandidate, ConstructedCandidateIdentity,
+    ImplementationProvenance, PhysicalChoice,
 };
 
-use crate::{
-    errors::PreparationError,
-    target::{CompilerRegistry, TargetConstants},
-    PreparationBudget,
-};
 use seismic_ir::construction::{
     AllocationPlan, AllocationSlotChoice, AnalyzedConstruction, StoragePlannedConstruction,
 };
-use seismic_ir::target::KernelDialect;
-use seismic_lang::{
-    entry::{CallSchema, SemanticProgram},
-    expr::{BoolExpr, CmpOp, DecisionId, ExprArena, FiniteDomain},
-    precision::PrecisionPolicy,
-};
-use seismic_target::DeviceDescription;
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use seismic_ir::target::PhysicalDialect;
+use seismic_lang::expr::{BoolExpr, CmpOp, DecisionId, ExprArena, FiniteDomain};
 
 /// Whether refinement should expose physical-slot reuse as a finite candidate
 /// choice. Universal construction remains choice-free; optimized construction
@@ -51,12 +33,12 @@ pub(crate) enum AllocationReusePolicy {
 /// finite alternatives exist and how they are named. `constraints` is the
 /// complete validity relation for these axes: canonical-label constraints plus
 /// the mandatory incompatibility constraints returned by IR.
-pub(crate) struct RefinedAllocationChoices<B: KernelDialect> {
+pub(crate) struct RefinedAllocationChoices<B: PhysicalDialect> {
     construction: StoragePlannedConstruction<B>,
     choices: Vec<(DecisionId, &'static str)>,
     constraints: Vec<BoolExpr>,
 }
-impl<B: KernelDialect> RefinedAllocationChoices<B> {
+impl<B: PhysicalDialect> RefinedAllocationChoices<B> {
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -77,7 +59,7 @@ impl<B: KernelDialect> RefinedAllocationChoices<B> {
 /// adding allocation `n` either joins one existing block or starts one new
 /// block. IR independently contributes constraints forbidding structurally
 /// incompatible allocations from selecting the same slot.
-pub(crate) fn refine_allocation_choices<B: KernelDialect>(
+pub(crate) fn refine_allocation_choices<B: PhysicalDialect>(
     arena: &mut ExprArena,
     analyzed: AnalyzedConstruction<B>,
     policy: AllocationReusePolicy,
@@ -133,214 +115,21 @@ fn canonical_slot_constraints(
     constraints
 }
 
-/// Limits that belong exclusively to structural refinement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RefinementLimits {
-    /// Maximum number of non-universal implementation alternatives that may
-    /// be constructed across the whole refinement tree, including nested
-    /// call alternatives. This is deliberately not a root-family count.
-    pub constructed_alternatives: u64,
-    pub construction_wall_time: Duration,
-}
-
-impl From<&PreparationBudget> for RefinementLimits {
-    fn from(budget: &PreparationBudget) -> Self {
-        Self {
-            constructed_alternatives: budget.refinement_constructed_alternatives,
-            construction_wall_time: budget.refinement_construction_wall_time,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefinementLimit {
-    ConstructedAlternativeCount,
-    ConstructionWallTime,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefinementCompletion {
-    Complete,
-    BudgetLimited(RefinementLimit),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefinementReport {
-    pub completion: RefinementCompletion,
-    /// Root optimized families actually present in the returned domain.
-    pub optimized_families: u64,
-    /// All non-universal alternatives constructed, including nested ones.
-    pub constructed_alternatives: u64,
-    /// Monotonic elapsed time for the entire refinement session. Nested work
-    /// is included once because this is measured from one session start.
-    pub construction_wall_time: Duration,
-    /// True only when every registered factory reachable from every eligible
-    /// semantic candidate was considered.  Nested refinement shares the same
-    /// budget, so a nested limit makes this false even if the root loop exits
-    /// normally.
-    pub registered_factory_traversal_complete: bool,
-}
-
-pub struct RefinementRequest<'a, B: seismic_target::TargetFamily> {
-    pub program: &'a SemanticProgram,
-    pub schema: &'a CallSchema,
-    pub target: &'a DeviceDescription<B>,
-    pub registry: &'a CompilerRegistry<B>,
-    pub constants: &'a TargetConstants,
-    pub precision: &'a PrecisionPolicy,
-}
-
-/// The complete structural output of one refinement pass.  This is the only
-/// candidate-domain value; `PlanSpace` consumes it rather than mirroring it.
-pub struct RefinedCandidateFamilies<B: KernelDialect> {
-    arena: ExprArena,
-    universal: CandidateFamily<B>,
-    optimized: Vec<CandidateFamily<B>>,
-    report: RefinementReport,
-}
-
-impl<B: KernelDialect> RefinedCandidateFamilies<B> {
-    pub fn arena(&self) -> &ExprArena {
-        &self.arena
-    }
-
-    pub fn universal(&self) -> &CandidateFamily<B> {
-        &self.universal
-    }
-
-    pub fn optimized(&self) -> &[CandidateFamily<B>] {
-        &self.optimized
-    }
-
-    pub fn report(&self) -> &RefinementReport {
-        &self.report
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ExprArena,
-        CandidateFamily<B>,
-        Vec<CandidateFamily<B>>,
-        RefinementReport,
-    ) {
-        (self.arena, self.universal, self.optimized, self.report)
-    }
-}
-
-pub struct RefinementSession {
-    limits: RefinementLimits,
-}
-
-impl RefinementSession {
-    pub fn new(limits: RefinementLimits) -> Self {
-        Self { limits }
-    }
-
-    pub fn refine<B: seismic_target::TargetFamily>(
-        self,
-        mut arena: ExprArena,
-        request: RefinementRequest<'_, B>,
-    ) -> Result<RefinedCandidateFamilies<B>, PreparationError> {
-        let budget = Rc::new(RefCell::new(RefinementBudgetState::new(self.limits)));
-        let enumerated =
-            enumerate::enumerate_candidate_families(&mut arena, request, budget.clone())?;
-        let report = budget.borrow().report(
-            enumerated.registered_factory_traversal_complete,
-            enumerated.optimized.len() as u64,
-        );
-        Ok(RefinedCandidateFamilies {
-            arena,
-            universal: enumerated.universal,
-            optimized: enumerated.optimized,
-            report,
-        })
-    }
-}
-
-pub(crate) type RefinementBudget = Rc<RefCell<RefinementBudgetState>>;
-
-/// Mutable state shared by nested family construction.  It intentionally has
-/// no solver, native-artifact, executable, or metadata accounting.
-pub(crate) struct RefinementBudgetState {
-    limits: RefinementLimits,
-    constructed_alternatives: u64,
-    started: Instant,
-    limit: Option<RefinementLimit>,
-}
-
-impl RefinementBudgetState {
-    fn new(limits: RefinementLimits) -> Self {
-        Self {
-            limits,
-            constructed_alternatives: 0,
-            started: Instant::now(),
-            limit: None,
-        }
-    }
-
-    /// Reserves one non-universal alternative before its builder exists. Both
-    /// root families and nested call alternatives use the same work-unit
-    /// ceiling.
-    pub(crate) fn admit_optional_implementation(&mut self) -> bool {
-        if self.constructed_alternatives >= self.limits.constructed_alternatives {
-            self.limit
-                .get_or_insert(RefinementLimit::ConstructedAlternativeCount);
-            return false;
-        }
-        if self.started.elapsed() >= self.limits.construction_wall_time {
-            self.limit
-                .get_or_insert(RefinementLimit::ConstructionWallTime);
-            return false;
-        }
-        self.constructed_alternatives += 1;
-        true
-    }
-
-    /// Checks the session deadline after an alternative completes. The
-    /// parameter remains for construction call sites but is deliberately not
-    /// accumulated: nested intervals overlap their parents. An alternative
-    /// that crosses the deadline remains in the domain; the deadline only
-    /// prevents later construction.
-    pub(crate) fn record_implementation_construction(&mut self, _nested_elapsed: Duration) -> bool {
-        if self.started.elapsed() >= self.limits.construction_wall_time {
-            self.limit
-                .get_or_insert(RefinementLimit::ConstructionWallTime);
-            return false;
-        }
-        self.limit.is_none()
-    }
-
-    fn report(&self, root_traversal_complete: bool, optimized_families: u64) -> RefinementReport {
-        RefinementReport {
-            completion: self.limit.map_or(
-                RefinementCompletion::Complete,
-                RefinementCompletion::BudgetLimited,
-            ),
-            optimized_families,
-            constructed_alternatives: self.constructed_alternatives,
-            construction_wall_time: self.started.elapsed(),
-            registered_factory_traversal_complete: root_traversal_complete && self.limit.is_none(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         canonical_slot_constraints, canonical_slot_domain, refine_allocation_choices,
-        AllocationReusePolicy, RefinementBudgetState, RefinementCompletion, RefinementLimit,
-        RefinementLimits,
+        AllocationReusePolicy,
     };
     use seismic_ir::{
         construction::Construction,
         kernel::ops::AddressableResourceHandle,
         repr::{DenseF32, Representation},
         storage::GlobalBufferKind,
-        target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelDialect},
+        target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect},
     };
     use seismic_lang::expr::{Assignment, ExprArena, SymbolValue};
-    use std::{collections::BTreeSet, time::Duration};
+    use std::collections::BTreeSet;
 
     type Partition = Vec<Vec<usize>>;
 
@@ -405,7 +194,7 @@ mod tests {
         for values in assignments(&domains) {
             let mut assignment = Assignment::new();
             for ((choice, _), &value) in choices.iter().zip(&values) {
-                assignment.bind(arena.decision_symbol(*choice), SymbolValue::Int(value));
+                assignment.bind(arena.decision_symbol(*choice), SymbolValue::Int((value).into()));
             }
             if constraints
                 .iter()
@@ -436,14 +225,14 @@ mod tests {
         let choices = [(first, "slot"), (second, "slot"), (third, "slot")];
         let constraints = canonical_slot_constraints(&mut arena, &choices);
 
-        let assignment = |second_value, third_value| {
+        let assignment = |second_value: i64, third_value: i64| {
             let mut assignment = Assignment::new();
-            assignment.bind(arena.decision_symbol(first), SymbolValue::Int(0));
+            assignment.bind(arena.decision_symbol(first), SymbolValue::Int((0).into()));
             assignment.bind(
                 arena.decision_symbol(second),
-                SymbolValue::Int(second_value),
+                SymbolValue::Int((second_value).into()),
             );
-            assignment.bind(arena.decision_symbol(third), SymbolValue::Int(third_value));
+            assignment.bind(arena.decision_symbol(third), SymbolValue::Int((third_value).into()));
             assignment
         };
         assert!(constraints
@@ -479,7 +268,12 @@ mod tests {
     struct TestDialect;
     #[derive(Clone, Debug)]
     enum NoIntrinsic {}
-    impl KernelDialect for TestDialect {
+    impl PhysicalDialect for TestDialect {
+        type LaunchDescriptor = ();
+        fn ordinary_launch() -> Self::LaunchDescriptor {
+            ()
+        }
+
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
         type Facts = ();
         type Intrinsic = NoIntrinsic;
@@ -522,7 +316,11 @@ mod tests {
         schedule.fill_zero(views[0]);
         schedule.fill_zero(views[2]);
         let closed = schedule.close();
-        let analyzed = construction.close(closed).analyze_allocations();
+        let analyzed = construction
+            .close(closed)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations();
         assert_eq!(
             analyzed
                 .allocation_relations()
@@ -546,44 +344,5 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(represented, expected);
         assert_eq!(represented.len(), 3);
-    }
-
-    #[test]
-    fn refinement_budget_reports_incomplete_factory_traversal() {
-        let mut budget = RefinementBudgetState::new(RefinementLimits {
-            constructed_alternatives: 0,
-            construction_wall_time: Duration::from_secs(1),
-        });
-        assert!(!budget.admit_optional_implementation());
-        let report = budget.report(true, 0);
-        assert_eq!(
-            report.completion,
-            RefinementCompletion::BudgetLimited(RefinementLimit::ConstructedAlternativeCount)
-        );
-        assert_eq!(report.optimized_families, 0);
-        assert_eq!(report.constructed_alternatives, 0);
-        assert!(report.construction_wall_time < Duration::from_secs(1));
-        assert!(!report.registered_factory_traversal_complete);
-    }
-
-    #[test]
-    fn completed_alternative_is_retained_when_session_deadline_is_reached() {
-        let mut budget = RefinementBudgetState::new(RefinementLimits {
-            constructed_alternatives: 2,
-            construction_wall_time: Duration::ZERO,
-        });
-        // Simulate an alternative that was admitted just before its deadline.
-        budget.constructed_alternatives = 1;
-        assert!(!budget.record_implementation_construction(Duration::from_secs(99)));
-        let report = budget.report(true, 1);
-        assert_eq!(
-            report.completion,
-            RefinementCompletion::BudgetLimited(RefinementLimit::ConstructionWallTime)
-        );
-        assert_eq!(report.optimized_families, 1);
-        assert_eq!(report.constructed_alternatives, 1);
-        assert!(report.construction_wall_time >= Duration::ZERO);
-        assert!(!report.registered_factory_traversal_complete);
-        assert!(!budget.admit_optional_implementation());
     }
 }

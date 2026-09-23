@@ -14,7 +14,6 @@
 pub mod matrix;
 pub mod subgroup;
 
-use crate::factory;
 use crate::Cuda;
 use seismic_compiler::target::{
     CapabilityRegistration, CompilerRegistry, CompilerRegistryParts, IntrinsicImplementation,
@@ -188,9 +187,7 @@ fn assemble() -> CompilerRegistry<Cuda> {
                 supported: matrix_supported,
             },
         ],
-        structural_factories: factory::structural_factories(),
-        independent_launch_mode: crate::CudaLaunchMode::Independent,
-        cooperative_launch_mode: crate::cooperative_launch_mode,
+
         native_launch_constraints: crate::native_launch_constraints,
         addressable_resources: crate::addressable_resources,
         emitted_intrinsics: emitted_intrinsics(),

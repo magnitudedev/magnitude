@@ -2,7 +2,7 @@ use crate::TargetDescriptionError;
 use seismic_ir::kernel::Kernel;
 use seismic_ir::target::{
     AddressableResourceClass, AddressableResourceEmissionLayout, BindingEmissionLayout,
-    DataTypeSupport, KernelAbiLayout, KernelAbiModel, KernelDialect, KernelEmissionLayout,
+    DataTypeSupport, KernelAbiLayout, KernelAbiModel, PhysicalDialect, KernelEmissionLayout,
     KernelWordLayout, LocalEmissionLayout, LocalRealizationPolicy, NumericalEnvironment,
     RepresentationGeometry, ResourceClassId, TargetLimits, VectorSupport,
 };
@@ -15,16 +15,8 @@ use std::fmt;
 ///
 /// This is deliberately smaller than a backend.  It has no native context,
 /// compiler, executor, cost model, factory catalog, or capability lowering.
-pub trait TargetFamily: KernelDialect {
+pub trait TargetFamily: PhysicalDialect {
     type KernelAbi: KernelAbiModel<Self>;
-    type NativeLaunchMode: Clone
-        + fmt::Debug
-        + PartialEq
-        + Eq
-        + std::hash::Hash
-        + Send
-        + Sync
-        + 'static;
     type NativeNumericalMode: Clone
         + fmt::Debug
         + PartialEq
@@ -314,7 +306,12 @@ impl<T: TargetFamily> DeviceDescription<T> {
                 .iter()
                 .map(|(_, dtype)| *dtype)
                 .collect(),
-            result_slots: kernel.interface().result_slots.clone(),
+            result_types: kernel
+                .interface()
+                .result_slots
+                .iter()
+                .map(|slot| slot.kind())
+                .collect(),
         }
     }
 }

@@ -14,7 +14,6 @@ use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::target::KernelAbiAllocationRole;
 use seismic_lang::expr::compiled::{Compiled, InvocationValues};
 use seismic_lang::expr::SymbolValue;
-use seismic_lang::types::DType;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -128,13 +127,14 @@ impl NativeSubmission<Cuda> for Submission {
         match command {
             ExecutableCommand::Launch {
                 kernel,
-                mode,
+                descriptor,
                 grid,
                 workgroup,
                 empty,
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 addressable_resources,
                 local_totals,
@@ -142,13 +142,14 @@ impl NativeSubmission<Cuda> for Submission {
                 abi,
             } => self.launch(
                 *kernel,
-                *mode,
+                *descriptor,
                 grid,
                 workgroup,
                 empty,
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 addressable_resources,
                 local_totals,
@@ -182,6 +183,10 @@ impl NativeSubmission<Cuda> for Submission {
             } => self.scalar_read(source, evaluate(byte_offset, env.values()), *to, env),
         }
     }
+    fn complete_prefix(&mut self) -> Result<(), ExecutionError> {
+        self.synchronize_pending()
+    }
+
     fn submit(mut self) -> Self::Execution {
         Execution {
             device: self.device.clone(),
@@ -208,6 +213,7 @@ impl Submission {
         bindings: &[CompiledBufferView],
         nat_args: &[seismic_lang::expr::compiled::CompiledNat],
         scalar_args: &[seismic_lang::expr::SymbolId],
+        result_slots: &[seismic_ir::schedule::AnyScalarSlot],
         locals: &[CompiledLocalLayout],
         addressable_resources: &[seismic_compiler::executable::CompiledAddressableResource],
         totals: &CompiledLocalClassTotals,
@@ -215,7 +221,7 @@ impl Submission {
         abi: &KernelAbiBindings,
         env: &mut ExecutionEnvironment<'_, Cuda, CompiledKernel, Device>,
     ) -> Result<(), ExecutionError> {
-        if evaluate(empty, env.values()) {
+        if env.predicate(empty) {
             return Ok(());
         }
         let kernel = env.kernel_handle(kernel_id);
@@ -231,7 +237,7 @@ impl Submission {
         let mut buffer_words = Vec::with_capacity(bindings.len());
         let mut words = vec![0u64; kernel.layout.words.total as usize];
         for (position, binding) in bindings.iter().enumerate() {
-            let resolved = env.resolve_view(binding);
+            let resolved = env.resolve_view(binding)?;
             buffer_words.push(
                 resolved
                     .buffer
@@ -254,7 +260,7 @@ impl Submission {
                 env.values()
                     .get(symbol)
                     .unwrap_or_else(|| panic!("prepared CUDA scalar argument is unbound")),
-            );
+            )?;
         }
         let workgroup_bytes = evaluate(&totals.workgroup_bytes, env.values());
         let participant_bytes = evaluate(&totals.participant_bytes, env.values());
@@ -338,7 +344,6 @@ impl Submission {
         // evaluation, so only a publishing launch synchronizes and reads its
         // canonical result table here. The prepared invocation's final
         // synchronize covers every non-publishing launch.
-        let result_slots = kernel.layout.result_slots.clone();
         if !result_slots.is_empty() {
             self.synchronize_pending()?;
             let mut result_words = vec![0u8; result_slots.len() * 8];
@@ -347,13 +352,13 @@ impl Submission {
                 .allocation
                 .download_at(abi_offset(results), &mut result_words)
                 .map_err(synchronization_error)?;
-            for (index, (slot, dtype)) in result_slots.iter().enumerate() {
+            for (index, slot) in result_slots.iter().enumerate() {
                 let raw = u64::from_le_bytes(
                     result_words[index * 8..index * 8 + 8]
                         .try_into()
                         .expect("fixed result word"),
                 );
-                env.set_slot(*slot, decode_symbol(raw, *dtype));
+                env.set_slot(*slot, slot.kind().decode_word(raw));
             }
         }
         Ok(())
@@ -408,8 +413,8 @@ impl Submission {
         bytes: u64,
         env: &ExecutionEnvironment<'_, Cuda, CompiledKernel, Device>,
     ) -> Result<(), ExecutionError> {
-        let source = env.resolve_view(source);
-        let destination = env.resolve_view(destination);
+        let source = env.resolve_view(source)?;
+        let destination = env.resolve_view(destination)?;
         let count =
             usize::try_from(bytes).unwrap_or_else(|_| panic!("prepared CUDA copy exceeds usize"));
         let _current = self.device.context.enter().map_err(submission_error)?;
@@ -436,7 +441,7 @@ impl Submission {
         bytes: u64,
         env: &ExecutionEnvironment<'_, Cuda, CompiledKernel, Device>,
     ) -> Result<(), ExecutionError> {
-        let destination = env.resolve_view(destination);
+        let destination = env.resolve_view(destination)?;
         let pointer = destination.buffer.pointer() + destination.byte_offset;
         let count = usize::try_from(bytes / value.width())
             .unwrap_or_else(|_| panic!("prepared CUDA fill exceeds usize"));
@@ -484,9 +489,9 @@ impl Submission {
         // production stream before the synchronous host read and release
         // any pinned uploads whose DMA has now completed.
         self.synchronize_pending()?;
-        let source = env.resolve_view(source);
-        let mut bytes = [0u8; 4];
-        let width = to.dtype().bytes() as usize;
+        let source = env.resolve_view(source)?;
+        let mut bytes = [0u8; 8];
+        let width = to.kind().bytes() as usize;
         let absolute = source
             .byte_offset
             .checked_add(offset)
@@ -500,7 +505,7 @@ impl Submission {
                 &mut bytes[..width],
             )
             .map_err(synchronization_error)?;
-        env.set_slot(to, decode_bytes(bytes, to.dtype()));
+        env.set_slot(to, to.kind().decode_word(u64::from_le_bytes(bytes)));
         Ok(())
     }
 }
@@ -604,45 +609,14 @@ fn abi_pointer(buffer: &RuntimeBuffer<Buffer>) -> u64 {
 fn words_bytes(values: &[u64]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
-fn evaluate<T: Copy>(value: &Compiled<T>, values: &InvocationValues) -> T {
+fn evaluate(value: &seismic_lang::expr::compiled::CompiledNat, values: &InvocationValues) -> u64 {
     value
-        .evaluate(values)
+        .evaluate_u64(values)
         .unwrap_or_else(|error| panic!("prepared CUDA expression failed evaluation: {error:?}"))
 }
-fn encode_symbol(value: SymbolValue) -> u64 {
-    match value {
-        SymbolValue::Nat(v) => v,
-        SymbolValue::Int(v) => v as u64,
-        SymbolValue::F32(v) => u64::from(v.to_bits()),
-        SymbolValue::F16(v) | SymbolValue::BF16(v) => u64::from(v),
-        SymbolValue::I32(v) => u64::from(v as u32),
-        SymbolValue::U32(v) => u64::from(v),
-        SymbolValue::Bool(v) => u64::from(v),
-    }
-}
-fn decode_symbol(value: u64, dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_bits(value as u32)),
-        DType::F16 => SymbolValue::F16(value as u16),
-        DType::BF16 => SymbolValue::BF16(value as u16),
-        DType::I32 => SymbolValue::I32(value as u32 as i32),
-        DType::U32 => SymbolValue::U32(value as u32),
-        DType::Bool => SymbolValue::Bool(value != 0),
-    }
-}
-fn decode_bytes(value: [u8; 4], dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_le_bytes(value)),
-        DType::F16 => SymbolValue::F16(u16::from_le_bytes(
-            value[..2].try_into().expect("two bytes"),
-        )),
-        DType::BF16 => SymbolValue::BF16(u16::from_le_bytes(
-            value[..2].try_into().expect("two bytes"),
-        )),
-        DType::I32 => SymbolValue::I32(i32::from_le_bytes(value)),
-        DType::U32 => SymbolValue::U32(u32::from_le_bytes(value)),
-        DType::Bool => SymbolValue::Bool(value[0] != 0),
-    }
+fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
+    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
+        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
 }
 fn allocation_error(error: DriverError) -> ExecutionError {
     if error.is_device_loss() {

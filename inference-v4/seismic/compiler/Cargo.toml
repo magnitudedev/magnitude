@@ -14,3 +14,4 @@ seismic-lang.workspace = true
 seismic-target.workspace = true
 magnitude-solver = { path = "../../solver" }
 sha2 = "=0.11.0"
+

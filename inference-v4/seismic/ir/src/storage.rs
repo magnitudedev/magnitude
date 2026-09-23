@@ -10,7 +10,7 @@
 
 use crate::identity::OwnerToken;
 use crate::repr::Representation;
-use seismic_lang::expr::{AnyExpr, DecisionId, ExprArena, NatExpr, NodeView};
+use seismic_lang::expr::{CmpOp, AnyExpr, DecisionId, ExprArena, NatExpr, NodeView};
 use seismic_lang::ids::{ParameterId, RepresentationId, SemanticValueId};
 use seismic_lang::registry::{self, RepresentationKind};
 use std::fmt;
@@ -40,6 +40,33 @@ impl GlobalAllocationId {
     pub(crate) fn owner(self) -> OwnerToken {
         self.owner
     }
+}
+
+/// One tensor parameter/result of a structured schedule region. Its owner is
+/// the region product itself; it is not an allocation or an alias assertion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TensorValueId {
+    owner: OwnerToken,
+    index: u32,
+}
+impl TensorValueId {
+    pub(crate) fn new(owner: OwnerToken, index: u32) -> Self {
+        Self { owner, index }
+    }
+    pub fn index(self) -> u32 {
+        self.index
+    }
+    pub(crate) fn owner(self) -> OwnerToken {
+        self.owner
+    }
+}
+
+/// The actual base of a view. Region values resolve through their structured
+/// product; only allocation bases refer directly to physical storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ViewBase {
+    Allocation(GlobalAllocationId),
+    TensorValue(TensorValueId),
 }
 
 /// A typed view of one global allocation: `(base allocation, typed layout)`.
@@ -245,9 +272,23 @@ impl AllocationLiveness {
     }
 }
 
+/// Allocation timing derived from the closed schedule's instance transitions
+/// and root publications. It is not supplied by allocation-slot choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationAcquisition {
+    Invocation,
+    Reached,
+}
+
 /// One global allocation's facts.
 #[derive(Clone, Debug)]
 pub struct GlobalAllocation {
+    pub geometry: Option<TensorGeometry>,
+    pub acquisition: AllocationAcquisition,
+    /// Pre-reserved backing instances derived from actual repeat products.
+    pub instances: u32,
+    /// Per-bank reservation lifted through the actual definition occurrence scope.
+    pub reserved_bytes: NatExpr,
     pub kind: GlobalBufferKind,
     pub bytes: NatExpr,
     pub alignment: u64,
@@ -268,10 +309,46 @@ pub struct ResultViewPublication {
     pub bytes: NatExpr,
 }
 
+/// Geometry owned by a tensor allocation. Its whole view shares these exact
+/// operands; arbitrary views cannot manufacture this constructor relationship.
+#[derive(Clone, Debug)]
+pub struct TensorGeometry {
+    pub representation: RepresentationId,
+    pub extents: Vec<NatExpr>,
+    pub strides: Vec<NatExpr>,
+}
+
 /// One typed view's layout.
+/// The actual defining coordinate map. Cached layout fields are derived only
+/// by these constructors; a transpose retains its source view through import.
+#[derive(Clone, Debug)]
+pub enum ViewMapping {
+    /// Issued only together with allocation-owned tensor geometry.
+    WholeAllocation,
+    Direct,
+    Transpose {
+        source: AnyBufferView,
+        permutation: Vec<u32>,
+    },
+    Slice {
+        source: AnyBufferView,
+        selections: Vec<ViewSelection>,
+    },
+}
+
+/// Actual coordinate operands of a view map. These are not a bounds assertion:
+/// closure must establish their range at each use from actual definitions/control.
+#[derive(Clone, Copy, Debug)]
+pub enum ViewSelection {
+    Full,
+    Point(NatExpr),
+    Range { start: NatExpr, end: NatExpr },
+}
+
 #[derive(Clone, Debug)]
 pub struct BufferViewLayout {
-    pub allocation: GlobalAllocationId,
+    pub mapping: ViewMapping,
+    pub base: ViewBase,
     pub representation: RepresentationId,
     /// Byte offset within the allocation.
     pub offset: NatExpr,
@@ -417,7 +494,9 @@ impl GlobalAllocationTopology {
                 .allocations
                 .iter()
                 .map(|allocation| {
-                    allocation.liveness.uses.capacity() * std::mem::size_of::<ScheduleUse>()
+                    allocation.geometry.as_ref().map_or(0, |geometry|
+                        (geometry.extents.capacity() + geometry.strides.capacity()) * std::mem::size_of::<NatExpr>())
+                        + allocation.liveness.uses.capacity() * std::mem::size_of::<ScheduleUse>()
                         + allocation
                             .liveness
                             .uses
@@ -435,6 +514,15 @@ impl GlobalAllocationTopology {
                 .map(|view| {
                     (view.extents.capacity() + view.strides.capacity())
                         * std::mem::size_of::<NatExpr>()
+                        + match &view.mapping {
+                            ViewMapping::Direct | ViewMapping::WholeAllocation => 0,
+                            ViewMapping::Slice { selections, .. } => {
+                                selections.capacity() * std::mem::size_of::<ViewSelection>()
+                            }
+                            ViewMapping::Transpose { permutation, .. } => {
+                                permutation.capacity() * std::mem::size_of::<u32>()
+                            }
+                        }
                 })
                 .sum::<usize>()
             + self.result_views.capacity() * std::mem::size_of::<ResultViewPublication>()
@@ -460,6 +548,16 @@ impl GlobalAllocationTopology {
             disjoint_arguments,
         }
     }
+    pub(crate) fn derive_reservations<B: crate::target::PhysicalDialect>(
+        &mut self,
+        arena: &mut ExprArena,
+        schedule: &crate::schedule::ParametricSchedule<B>,
+    ) {
+        for (ordinal, allocation) in self.allocations.iter_mut().enumerate() {
+            allocation.reserved_bytes =
+                schedule.allocation_reservation(arena, &self.views, ordinal, allocation.bytes);
+        }
+    }
     pub fn allocations(&self) -> &[GlobalAllocation] {
         &self.allocations
     }
@@ -473,6 +571,18 @@ impl GlobalAllocationTopology {
     pub fn view(&self, view: AnyBufferView) -> &BufferViewLayout {
         self.assert_owner(view.owner());
         &self.views[view.index as usize]
+    }
+    /// Closed consumers use the same allocation identity/entry alias law as
+    /// construction. Different IDs alone never establish argument disjointness.
+    pub fn allocations_may_overlap(&self, a: GlobalAllocationId, b: GlobalAllocationId) -> bool {
+        self.assert_owner(a.owner());
+        self.assert_owner(b.owner());
+        a == b
+            || allocation_overlap(
+                &self.allocations[a.index() as usize].kind,
+                &self.allocations[b.index() as usize].kind,
+                &self.disjoint_arguments,
+            )
     }
     pub fn disjoint_arguments(&self) -> &[(ParameterId, ParameterId)] {
         &self.disjoint_arguments
@@ -622,6 +732,67 @@ pub fn representation_alignment(representation: RepresentationId) -> u64 {
     }
 }
 
+/// Concrete per-axis storage units and the byte width of one unit.
+/// Packed/external final axes count packets rather than logical elements.
+pub fn concrete_storage_units(
+    representation: RepresentationId,
+    extents: &[u64],
+) -> Option<(Vec<u64>, u64)> {
+    let mut units = extents.to_vec();
+    let width = match &registry::representation_info(representation).kind {
+        RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
+        RepresentationKind::Packed(packet) => {
+            *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.group));
+            u64::from(packet.packet_size)
+        }
+        RepresentationKind::External(packet) => {
+            *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.logical_group));
+            u64::from(packet.packet_size)
+        }
+    };
+    if width == 0 {
+        return None;
+    }
+    Some((units, width))
+}
+
+/// Exact byte span and unit width for one concrete affine tensor descriptor.
+/// An empty view addresses no storage, regardless of its strides.
+pub fn addressed_span_u64(
+    representation: RepresentationId,
+    extents: &[u64],
+    strides: &[u64],
+) -> Option<(u64, u64)> {
+    if extents.len() != strides.len() {
+        return None;
+    }
+    let (units, width) = concrete_storage_units(representation, extents)?;
+    if units.contains(&0) {
+        return Some((0, width));
+    }
+    let last = units.iter().zip(strides).try_fold(0u64, |offset, (extent, stride)| {
+        offset.checked_add((extent - 1).checked_mul(*stride)?)
+    })?;
+    Some((last.checked_add(1)?.checked_mul(width)?, width))
+}
+
+/// A public concrete view must describe exactly its addressed byte range.
+/// The backing allocation's actual length is checked by its binding owner.
+pub fn valid_concrete_view(
+    representation: RepresentationId,
+    extents: &[u64],
+    strides: &[u64],
+    byte_offset: u64,
+    byte_len: u64,
+) -> bool {
+    let alignment = representation_alignment(representation);
+    alignment != 0
+        && byte_offset % alignment == 0
+        && byte_offset.checked_add(byte_len).is_some()
+        && addressed_span_u64(representation, extents, strides)
+            .is_some_and(|(span, _)| span == byte_len)
+}
+
 /// Builds the allocation topology of one implementation. Lifetimes and reuse
 /// decisions are attached at close from the schedule.
 pub struct TopologyBuilder {
@@ -634,6 +805,7 @@ pub struct TopologyBuilder {
 }
 
 struct PendingAllocation {
+    geometry: Option<TensorGeometry>,
     kind: GlobalBufferKind,
     bytes: NatExpr,
     alignment: u64,
@@ -662,6 +834,37 @@ impl TopologyBuilder {
     pub fn allocation_count(&self) -> u32 {
         self.allocations.len() as u32
     }
+    /// Uses actual construction storage identity and the entry alias contract.
+    /// Unfinished region parameters intentionally cannot prove disjointness.
+    pub fn may_overlap_views<B: crate::target::PhysicalDialect>(
+        &self,
+        schedule: &crate::schedule::ScheduleConstruction<B>,
+        a: AnyBufferView,
+        b: AnyBufferView,
+    ) -> bool {
+        self.assert_owner(a.owner());
+        self.assert_owner(b.owner());
+        let Some(left) = schedule.possible_backing_allocations(&self.views, a) else {
+            return true;
+        };
+        let Some(right) = schedule.possible_backing_allocations(&self.views, b) else {
+            return true;
+        };
+        left.iter()
+            .any(|a| right.iter().any(|b| self.allocations_may_overlap(*a, *b)))
+    }
+
+    fn allocations_may_overlap(&self, a: GlobalAllocationId, b: GlobalAllocationId) -> bool {
+        self.assert_owner(a.owner());
+        self.assert_owner(b.owner());
+        a == b
+            || allocation_overlap(
+                &self.allocations[a.index() as usize].kind,
+                &self.allocations[b.index() as usize].kind,
+                &self.disjoint,
+            )
+    }
+
     pub fn view_count(&self) -> u32 {
         self.views.len() as u32
     }
@@ -708,6 +911,7 @@ impl TopologyBuilder {
         );
         let id = GlobalAllocationId::new(self.owner, self.allocations.len() as u32);
         self.allocations.push(PendingAllocation {
+            geometry: None,
             kind,
             bytes,
             alignment,
@@ -715,18 +919,42 @@ impl TopologyBuilder {
         id
     }
 
-    pub fn publish_result(&mut self, arena: &mut ExprArena, view: AnyBufferView, path: Vec<u32>) {
-        let layout = self.view_layout(view);
-        let bytes = tensor_bytes(arena, layout.representation, &layout.extents);
-        assert!(
-            !self
-                .result_views
-                .iter()
-                .any(|publication| publication.path == path),
-            "result path was published twice"
+    /// Capture the actual caller view as an alias. The proxy's origin is the
+    /// caller view's origin, and its capacity is the reachable span, including
+    /// holes in a strided layout. Import substitutes the exact source handle;
+    /// this does not reserve a new tensor or reconstruct caller provenance.
+    pub fn capture_view(
+        &mut self,
+        arena: &mut ExprArena,
+        caller: &TopologyBuilder,
+        source: AnyBufferView,
+        parameter: SemanticValueId,
+    ) -> AnyBufferView {
+        assert_ne!(self.owner, caller.owner, "capture requires a child owner");
+        let mut layout = caller.view_layout(source).clone();
+        layout.offset = arena.nat(0);
+        let bytes = if layout.contiguous {
+            tensor_bytes(arena, layout.representation, &layout.extents)
+        } else {
+            addressed_bytes(arena, &layout)
+        };
+        let allocation = self.allocate(
+            GlobalBufferKind::Imported { value: parameter, source },
+            bytes,
+            representation_alignment(source.representation()),
         );
-        self.result_views
-            .push(ResultViewPublication { path, view, bytes });
+        layout.base = ViewBase::Allocation(allocation);
+        // The map lives in the caller. Imported.source is its actual alias;
+        // copying parent-owned map handles into this child would be invalid.
+        layout.mapping = ViewMapping::Direct;
+        let index = self.push_view(layout);
+        AnyBufferView::new(self.owner, index, source.representation())
+    }
+
+    /// Derived from reached publication operations by allocation analysis.
+    pub(crate) fn set_result_publications(&mut self, publications: Vec<ResultViewPublication>) {
+        for publication in &publications { self.assert_owner(publication.view.owner()); }
+        self.result_views = publications;
     }
 
     /// An allocation sized for a dense tensor plus its whole-tensor view.
@@ -741,6 +969,11 @@ impl TopologyBuilder {
         let allocation = self.allocate(kind, bytes, representation_alignment(representation));
         let zero = arena.nat(0);
         let view = self.dense_view(arena, allocation, representation, zero, extents);
+        let layout = &mut self.views[view as usize];
+        layout.mapping = ViewMapping::WholeAllocation;
+        self.allocations[allocation.index() as usize].geometry = Some(TensorGeometry {
+            representation, extents: layout.extents.clone(), strides: layout.strides.clone(),
+        });
         (allocation, view)
     }
 
@@ -759,7 +992,8 @@ impl TopologyBuilder {
             .max(representation_alignment(representation));
         let strides = dense_strides(arena, representation, &extents);
         self.push_view(BufferViewLayout {
-            allocation,
+            mapping: ViewMapping::Direct,
+            base: ViewBase::Allocation(allocation),
             representation,
             offset,
             extents,
@@ -768,8 +1002,176 @@ impl TopologyBuilder {
         })
     }
 
+    /// Derive an affine descriptor only when the complete logical map is
+    /// representable. Failure inserts no views; callers must retain the map.
+    pub fn can_project_affine_view(
+        &self,
+        arena: &mut ExprArena,
+        view: &crate::tensor_view::TensorView<AnyBufferView, NatExpr>,
+    ) -> bool {
+        use crate::tensor_view::{SliceAxis, ViewStep};
+        let backing = *view.backing();
+        if !view.steps().is_empty()
+            && !matches!(registry::representation_info(backing.representation()).kind, RepresentationKind::Dense(_))
+        {
+            return false;
+        }
+        let mut extents = self.view_layout(backing).extents.clone();
+        let mut strides = self.view_layout(backing).strides.clone();
+        for step in view.steps() {
+            match step {
+                ViewStep::Transpose(permutation) => {
+                    extents = permutation.iter().map(|axis| extents[*axis as usize]).collect();
+                    strides = permutation.iter().map(|axis| strides[*axis as usize]).collect();
+                }
+                ViewStep::Slice(axes) => {
+                    let mut next_extents = Vec::new();
+                    let mut next_strides = Vec::new();
+                    for (axis, selection) in axes.iter().enumerate() {
+                        match selection {
+                            SliceAxis::Point(_) => continue,
+                            SliceAxis::Range { start, end } => next_extents.push(arena.nat_sub(*end,*start)),
+                            SliceAxis::Full => next_extents.push(extents[axis]),
+                        }
+                        next_strides.push(strides[axis]);
+                    }
+                    extents = next_extents;
+                    strides = next_strides;
+                }
+                ViewStep::Reshape { from, to } if from == to => {}
+                ViewStep::Reshape { from, to } => {
+                    if strides != dense_strides(arena,backing.representation(),from) { return false; }
+                    extents = to.clone();
+                    strides = dense_strides(arena,backing.representation(),to);
+                }
+                ViewStep::Plane { .. } => return false,
+            }
+        }
+        true
+    }
+
+    pub fn affine_view(
+        &mut self,
+        arena: &mut ExprArena,
+        view: &crate::tensor_view::TensorView<AnyBufferView, NatExpr>,
+    ) -> Option<AnyBufferView> {
+        use crate::tensor_view::{SliceAxis, ViewStep};
+        if !self.can_project_affine_view(arena,view) { return None; }
+        let backing=*view.backing();
+        let mut actual = backing;
+        for step in view.steps() {
+            let index = match step {
+                ViewStep::Transpose(permutation) => self.transpose_view(actual,permutation),
+                ViewStep::Slice(axes) => {
+                    let selections = axes.iter().map(|axis| match axis {
+                        SliceAxis::Full => ViewSelection::Full,
+                        SliceAxis::Point(value) => ViewSelection::Point(*value),
+                        SliceAxis::Range { start, end } => ViewSelection::Range { start:*start,end:*end },
+                    }).collect::<Vec<_>>();
+                    self.slice_view(arena,actual,&selections)
+                }
+                ViewStep::Reshape { from, to } if from == to => continue,
+                ViewStep::Reshape { to, .. } => {
+                    let zero=arena.nat(0);
+                    let strides=dense_strides(arena,backing.representation(),to);
+                    self.subview(arena,actual.index(),zero,to.clone(),strides)
+                }
+                ViewStep::Plane { .. } => unreachable!("projection checked before mutation"),
+            };
+            actual=AnyBufferView::new(self.owner,index,backing.representation());
+        }
+        Some(actual)
+    }
+
+    pub fn transpose_view(&mut self, source: AnyBufferView, permutation: &[u32]) -> u32 {
+        self.assert_owner(source.owner());
+        let layout = self.view_layout(source).clone();
+        assert!(
+            matches!(
+                registry::representation_info(layout.representation).kind,
+                RepresentationKind::Dense(_)
+            ),
+            "packed transpose has no direct storage map"
+        );
+        let mut axes = permutation.to_vec();
+        axes.sort_unstable();
+        assert!(
+            axes.iter().copied().eq(0..layout.extents.len() as u32),
+            "transpose must be a complete coordinate permutation"
+        );
+        self.push_view(BufferViewLayout {
+            mapping: ViewMapping::Transpose {
+                source,
+                permutation: permutation.to_vec(),
+            },
+            base: layout.base,
+            representation: layout.representation,
+            offset: layout.offset,
+            extents: permutation
+                .iter()
+                .map(|axis| layout.extents[*axis as usize])
+                .collect(),
+            strides: permutation
+                .iter()
+                .map(|axis| layout.strides[*axis as usize])
+                .collect(),
+            contiguous: false,
+        })
+    }
+
+    /// Derive a slice layout from its source and actual coordinate operands.
+    /// This constructor retains, rather than discharges, the coordinate bounds.
+    pub fn slice_view(
+        &mut self,
+        arena: &mut ExprArena,
+        source: AnyBufferView,
+        selections: &[ViewSelection],
+    ) -> u32 {
+        self.assert_owner(source.owner());
+        let layout = self.view_layout(source).clone();
+        let RepresentationKind::Dense(dtype) =
+            registry::representation_info(layout.representation).kind
+        else {
+            panic!("stored packed slice requires its registered logical-coordinate map");
+        };
+        assert_eq!(
+            selections.len(),
+            layout.extents.len(),
+            "slice must select every source axis"
+        );
+        let mut displacement = arena.nat(0);
+        let mut extents = Vec::new();
+        let mut strides = Vec::new();
+        for (axis, selection) in selections.iter().enumerate() {
+            let start = match *selection {
+                ViewSelection::Full => {
+                    extents.push(layout.extents[axis]);
+                    strides.push(layout.strides[axis]);
+                    continue;
+                }
+                ViewSelection::Point(point) => point,
+                ViewSelection::Range { start, end } => {
+                    extents.push(arena.nat_sub(end, start));
+                    strides.push(layout.strides[axis]);
+                    start
+                }
+            };
+            let term = arena.nat_mul(start, layout.strides[axis]);
+            displacement = arena.nat_add(displacement, term);
+        }
+        let unit = arena.nat(u64::from(dtype.bytes()));
+        let displacement = arena.nat_mul(displacement, unit);
+        let index = self.subview(arena, source.index(), displacement, extents, strides);
+        self.views[index as usize].mapping = ViewMapping::Slice {
+            source,
+            selections: selections.to_vec(),
+        };
+        index
+    }
+
     pub fn strided_view(
         &mut self,
+        arena: &mut ExprArena,
         allocation: GlobalAllocationId,
         representation: RepresentationId,
         offset: NatExpr,
@@ -786,14 +1188,51 @@ impl TopologyBuilder {
             strides.len(),
             "view rank and stride count differ"
         );
+        let contiguous = strides == dense_strides(arena, representation, &extents);
         self.push_view(BufferViewLayout {
-            allocation,
+            mapping: ViewMapping::Direct,
+            base: ViewBase::Allocation(allocation),
+            representation,
+            offset,
+            extents,
+            strides,
+            contiguous,
+        })
+    }
+
+    pub(crate) fn instance_view(
+        &mut self, arena: &mut ExprArena, source: AnyBufferView,
+        extents: Vec<NatExpr>, strides: Vec<NatExpr>,
+    ) -> AnyBufferView {
+        let layout = self.view_layout(source);
+        assert!(matches!(layout.mapping, ViewMapping::WholeAllocation));
+        let representation = layout.representation;
+        let value = self.region_view(arena, representation, extents, strides);
+        // Begin captures precisely the canonical geometry of this allocation.
+        self.views[value.index() as usize].contiguous = true;
+        value
+    }
+
+    pub(crate) fn region_view(
+        &mut self,
+        arena: &mut ExprArena,
+        representation: RepresentationId,
+        extents: Vec<NatExpr>,
+        strides: Vec<NatExpr>,
+    ) -> AnyBufferView {
+        let base = TensorValueId::new(self.owner, self.views.len() as u32);
+        assert_eq!(extents.len(), strides.len(), "region view rank differs");
+        let offset = arena.nat(0);
+        let index = self.push_view(BufferViewLayout {
+            mapping: ViewMapping::Direct,
+            base: ViewBase::TensorValue(base),
             representation,
             offset,
             extents,
             strides,
             contiguous: false,
-        })
+        });
+        AnyBufferView::new(self.owner, index, representation)
     }
 
     /// A strided sub-view: `offset` is a byte offset added to the base's.
@@ -812,14 +1251,16 @@ impl TopologyBuilder {
         );
         let layout = &self.views[base as usize];
         let offset = arena.nat_add(layout.offset, offset);
-        let (allocation, representation) = (layout.allocation, layout.representation);
+        let (base, representation) = (layout.base, layout.representation);
+        let contiguous = strides == dense_strides(arena, representation, &extents);
         self.push_view(BufferViewLayout {
-            allocation,
+            mapping: ViewMapping::Direct,
+            base,
             representation,
             offset,
             extents,
             strides,
-            contiguous: false,
+            contiguous,
         })
     }
 
@@ -872,16 +1313,50 @@ impl TopologyBuilder {
                 self.assert_owner(view.owner());
                 bases.push(Base::External(view));
             } else {
-                bases.push(Base::Imported(self.allocate(
-                    allocation.kind.clone(),
-                    allocation.bytes,
-                    allocation.alignment,
-                )));
+                let imported = self.allocate(allocation.kind.clone(), allocation.bytes, allocation.alignment);
+                self.allocations[imported.index() as usize].geometry = allocation.geometry.clone();
+                bases.push(Base::Imported(imported));
             }
         }
         let mut remap = Vec::with_capacity(child.views.len());
-        for layout in child.views {
-            let base = &bases[layout.allocation.index() as usize];
+        for (ordinal, layout) in child.views.into_iter().enumerate() {
+            if let ViewMapping::Slice { source, selections } = &layout.mapping {
+                let source = remap[source.index() as usize];
+                let index = self.slice_view(arena, source, selections);
+                remap.push(AnyBufferView::new(self.owner, index, layout.representation));
+                continue;
+            }
+            if let ViewMapping::Transpose {
+                source,
+                permutation,
+            } = &layout.mapping
+            {
+                let source = remap[source.index() as usize];
+                let index = self.transpose_view(source, permutation);
+                remap.push(AnyBufferView::new(self.owner, index, layout.representation));
+                continue;
+            }
+            if let ViewBase::TensorValue(region) = layout.base {
+                let view = if region.index() as usize == ordinal {
+                    self.region_view(arena, layout.representation, layout.extents, layout.strides)
+                } else {
+                    let defining: AnyBufferView = remap[region.index() as usize];
+                    let index = self.subview(
+                        arena,
+                        defining.index(),
+                        layout.offset,
+                        layout.extents,
+                        layout.strides,
+                    );
+                    AnyBufferView::new(self.owner, index, layout.representation)
+                };
+                remap.push(view);
+                continue;
+            }
+            let ViewBase::Allocation(allocation) = layout.base else {
+                unreachable!()
+            };
+            let base = &bases[allocation.index() as usize];
             let index = match base {
                 Base::External(view) => {
                     assert_eq!(
@@ -913,13 +1388,16 @@ impl TopologyBuilder {
                         )
                     }
                 }
-                Base::Imported(allocation) => self.strided_view(
-                    *allocation,
-                    layout.representation,
-                    layout.offset,
-                    layout.extents,
-                    layout.strides,
-                ),
+                Base::Imported(allocation) => {
+                    let whole = matches!(layout.mapping, ViewMapping::WholeAllocation);
+                    let index = self.strided_view(arena, *allocation, layout.representation,
+                        layout.offset, layout.extents, layout.strides);
+                    if whole {
+                        assert!(self.allocations[allocation.index() as usize].geometry.is_some());
+                        self.views[index as usize].mapping = ViewMapping::WholeAllocation;
+                    }
+                    index
+                },
             };
             remap.push(AnyBufferView::new(self.owner, index, layout.representation));
         }
@@ -933,6 +1411,8 @@ impl TopologyBuilder {
         self,
         liveness: Vec<AllocationLiveness>,
         slots: Vec<Option<DecisionId>>,
+        instances: Vec<u32>,
+        acquisitions: Vec<AllocationAcquisition>,
     ) -> GlobalAllocationTopology {
         let count = self.allocations.len();
         assert_eq!(
@@ -958,6 +1438,14 @@ impl TopologyBuilder {
                 self.assert_owner(use_site.owner);
             }
         }
+        assert_eq!(
+            instances.len(),
+            count,
+            "one instance capacity per allocation"
+        );
+        assert_eq!(acquisitions.len(), count, "one acquisition timing per allocation");
+        let mut acquisitions = acquisitions.into_iter();
+        let mut instances = instances.into_iter();
         let mut pending = self.allocations.into_iter();
         let mut liveness = liveness.into_iter();
         let mut slots = slots.into_iter();
@@ -965,8 +1453,12 @@ impl TopologyBuilder {
             .map(|_| {
                 let pending = pending.next().expect("allocation count was checked");
                 GlobalAllocation {
+                    geometry: pending.geometry,
+                    acquisition: acquisitions.next().expect("acquisition count checked"),
+                    instances: instances.next().expect("instance count checked"),
                     kind: pending.kind,
                     bytes: pending.bytes,
+                    reserved_bytes: pending.bytes,
                     alignment: pending.alignment,
                     liveness: liveness.next().expect("liveness count was checked"),
                     slot: slots.next().expect("slot count was checked"),
@@ -996,5 +1488,285 @@ impl ScheduleUse {
     }
     pub fn ordinal(&self) -> u32 {
         self.ordinal
+    }
+}
+
+fn allocation_overlap(
+    a: &GlobalBufferKind,
+    b: &GlobalBufferKind,
+    disjoint: &[(ParameterId, ParameterId)],
+) -> bool {
+    match (a, b) {
+        (
+            GlobalBufferKind::Argument { abi: Some(a), .. },
+            GlobalBufferKind::Argument { abi: Some(b), .. },
+        ) => !disjoint
+            .iter()
+            .any(|(x, y)| (x == a && y == b) || (x == b && y == a)),
+        (
+            GlobalBufferKind::Argument { .. } | GlobalBufferKind::Imported { .. },
+            GlobalBufferKind::Argument { .. } | GlobalBufferKind::Imported { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
+pub fn addressed_axis_span(
+    arena: &mut ExprArena,
+    extent: NatExpr,
+    stride: NatExpr,
+) -> NatExpr {
+    if matches!(arena.view(AnyExpr::Nat(stride)), NodeView::NatConst(0)) {
+        return stride;
+    }
+    let one = arena.nat(1);
+    let nonzero_extent = arena.nat_max(extent, one);
+    let last = arena.nat_sub(nonzero_extent, one);
+    arena.nat_mul(last, stride)
+}
+
+/// Exclusive byte end of the furthest element reachable through a view.
+/// A zero-extent view addresses no bytes and therefore ends at its offset.
+pub fn addressed_bytes(
+    arena: &mut ExprArena,
+    layout: &BufferViewLayout,
+) -> NatExpr {
+    assert_eq!(
+        layout.extents.len(),
+        layout.strides.len(),
+        "closed view rank and stride count differ"
+    );
+    let (unit_bytes, logical_extents) =
+        match &registry::representation_info(layout.representation).kind {
+            registry::RepresentationKind::Dense(dtype) => {
+                (dtype.bytes() as u64, layout.extents.clone())
+            }
+            registry::RepresentationKind::Packed(packet) => {
+                let mut extents = layout.extents.clone();
+                if let Some(last) = extents.last_mut() {
+                    let group = arena.nat(u64::from(packet.group));
+                    *last = arena.nat_ceil_div(*last, group);
+                }
+                (u64::from(packet.packet_size), extents)
+            }
+            registry::RepresentationKind::External(packet) => {
+                let mut extents = layout.extents.clone();
+                if let Some(last) = extents.last_mut() {
+                    let group = arena.nat(u64::from(packet.logical_group));
+                    *last = arena.nat_ceil_div(*last, group);
+                }
+                (u64::from(packet.packet_size), extents)
+            }
+        };
+    let zero = arena.nat(0);
+    let one = arena.nat(1);
+    let mut span = zero;
+    let mut empty_terms = Vec::with_capacity(logical_extents.len());
+    for (extent, stride) in logical_extents
+        .iter()
+        .copied()
+        .zip(layout.strides.iter().copied())
+    {
+        empty_terms.push(arena.nat_cmp(CmpOp::Eq, extent, zero));
+        let axis = addressed_axis_span(arena, extent, stride);
+        span = arena.nat_add(span, axis);
+    }
+    let element_bytes = arena.nat(unit_bytes);
+    let span_with_element = arena.nat_add(span, one);
+    let payload_end = arena.nat_mul(span_with_element, element_bytes);
+    let end = arena.nat_add(layout.offset, payload_end);
+    let empty = arena.any(&empty_terms);
+    arena.nat_select(empty, layout.offset, end)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repr::DenseF32;
+
+    #[test]
+    fn concrete_view_footprint_handles_packed_units_and_empty_axes() {
+        let packed = registry::representation("q8g32").unwrap();
+        let (_, packet_bytes) = concrete_storage_units(packed, &[33]).unwrap();
+        assert!(valid_concrete_view(packed, &[33], &[1], 0, 2 * packet_bytes));
+        assert!(!valid_concrete_view(packed, &[33], &[1], 0, packet_bytes));
+        assert!(valid_concrete_view(packed, &[0], &[u64::MAX], 0, 0));
+        assert!(!valid_concrete_view(DenseF32::id(), &[3], &[u64::MAX], 0, 12));
+    }
+
+    #[test]
+    fn only_tensor_constructor_issues_whole_geometry_and_import_preserves_it() {
+        let mut arena = ExprArena::default();
+        let mut child = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let representation = DenseF32::id();
+        let three = arena.nat(3);
+        let zero = arena.nat(0);
+        let (allocation, whole) = child.tensor(&mut arena, GlobalBufferKind::Arena, representation, vec![three]);
+        let arbitrary = child.dense_view(&mut arena, allocation, representation, zero, vec![three]);
+        assert!(matches!(child.views[whole as usize].mapping, ViewMapping::WholeAllocation));
+        assert!(matches!(child.views[arbitrary as usize].mapping, ViewMapping::Direct));
+        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Reached]);
+        let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let remap = parent.import(&mut arena, child, &[]);
+        let layout = parent.view_layout(remap[whole as usize]);
+        assert!(matches!(layout.mapping, ViewMapping::WholeAllocation));
+        let ViewBase::Allocation(id) = layout.base else { panic!("whole view lost allocation"); };
+        let geometry = parent.allocations[id.index() as usize].geometry.as_ref().unwrap();
+        assert_eq!(geometry.extents, layout.extents);
+        assert_eq!(geometry.strides, layout.strides);
+        assert!(matches!(parent.view_layout(remap[arbitrary as usize]).mapping, ViewMapping::Direct));
+    }
+
+    #[test]
+    fn affine_projection_preserves_offset_and_rejects_nonaffine_reshape_atomically() {
+        use crate::tensor_view::{SliceAxis, TensorView};
+        let mut arena = ExprArena::default();
+        let mut storage = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let representation = DenseF32::id();
+        let zero = arena.nat(0);
+        let one = arena.nat(1);
+        let two = arena.nat(2);
+        let three = arena.nat(3);
+        let four = arena.nat(4);
+        let six = arena.nat(6);
+        let (_, index) = storage.tensor(&mut arena, GlobalBufferKind::Persistent, representation, vec![three, four]);
+        let backing = AnyBufferView::new(storage.owner, index, representation);
+        let map = TensorView::new(backing, vec![three, four]).slice(vec![
+            SliceAxis::Range { start: one, end: three },
+            SliceAxis::Range { start: zero, end: three },
+        ], |end, start| arena.nat_sub(end, start)).transpose(vec![1, 0]);
+        let actual = storage.affine_view(&mut arena, &map).unwrap();
+        let layout = storage.view_layout(actual);
+        assert_eq!(layout.offset, arena.nat(16));
+        assert_eq!(layout.extents, vec![three, two]);
+        assert_eq!(layout.strides, vec![one, four]);
+        let nonaffine = map.reshape(vec![six]);
+        let before = storage.views.len();
+        assert!(storage.affine_view(&mut arena, &nonaffine).is_none());
+        assert_eq!(storage.views.len(), before, "failed projection must not partially construct views");
+    }
+
+    #[test]
+    fn captured_strided_view_keeps_span_and_exact_caller_lineage() {
+        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "capture.seismic".into(),
+            text: "fn probe(x: &tensor[2,3] f32):\n    let y = x[0,0]\n".into(),
+        }])).unwrap();
+        let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
+        let parameter = entry.schema().parameters()[0].value;
+        let mut arena = ExprArena::default();
+        let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let representation = DenseF32::id();
+        let one = arena.nat(1);
+        let three = arena.nat(3);
+        let four = arena.nat(4);
+        let (_, whole) = parent.tensor(&mut arena, GlobalBufferKind::Persistent, representation, vec![three, four]);
+        let whole = AnyBufferView::new(parent.owner, whole, representation);
+        let sliced = parent.slice_view(&mut arena, whole, &[
+            ViewSelection::Range { start: one, end: three },
+            ViewSelection::Range { start: one, end: four },
+        ]);
+        let sliced = AnyBufferView::new(parent.owner, sliced, representation);
+        let mut child = TopologyBuilder::new(OwnerToken::fresh(), vec![], true);
+        let proxy = child.capture_view(&mut arena, &parent, sliced, parameter);
+        assert_eq!(child.allocations[0].bytes, arena.nat(28));
+        assert_eq!(child.view_layout(proxy).offset, arena.nat(0));
+        let transposed = child.transpose_view(proxy, &[1, 0]);
+        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let remap = parent.import(&mut arena, child, &[]);
+        assert_eq!(remap[proxy.index() as usize], sliced);
+        let result = parent.view_layout(remap[transposed as usize]);
+        assert_eq!(result.offset, arena.nat(20));
+        assert_eq!(result.strides, vec![one, four]);
+        assert!(matches!(&result.mapping, ViewMapping::Transpose { source, .. } if *source == sliced));
+        assert!(matches!(parent.view_layout(sliced).mapping, ViewMapping::Slice { .. }));
+    }
+
+    #[test]
+    fn slice_map_derives_rectangular_offset_and_survives_import() {
+        let mut arena = ExprArena::default();
+        let mut child = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let representation = DenseF32::id();
+        let one = arena.nat(1);
+        let two = arena.nat(2);
+        let three = arena.nat(3);
+        let four = arena.nat(4);
+        let (_, whole) = child.tensor(
+            &mut arena,
+            GlobalBufferKind::Persistent,
+            representation,
+            vec![three, four],
+        );
+        let source = AnyBufferView::new(child.owner, whole, representation);
+        let sliced = child.slice_view(
+            &mut arena,
+            source,
+            &[
+                ViewSelection::Range {
+                    start: one,
+                    end: three,
+                },
+                ViewSelection::Range {
+                    start: one,
+                    end: four,
+                },
+            ],
+        );
+        let sliced = AnyBufferView::new(child.owner, sliced, representation);
+        let transposed = child.transpose_view(sliced, &[1, 0]);
+        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let remap = parent.import(&mut arena, child, &[]);
+        let layout = parent.view_layout(remap[sliced.index() as usize]);
+        assert_eq!(layout.offset, arena.nat(20));
+        assert_eq!(layout.extents, vec![two, three]);
+        assert_eq!(layout.strides, vec![four, one]);
+        let ViewMapping::Slice { source, .. } = &layout.mapping else {
+            panic!("slice map lost during import")
+        };
+        assert_eq!(*source, remap[whole as usize]);
+        let layout = parent.view_layout(remap[transposed as usize]);
+        assert_eq!(layout.extents, vec![three, two]);
+        assert_eq!(layout.strides, vec![one, four]);
+    }
+
+    #[test]
+    fn imported_views_derive_contiguity_without_losing_offsets_or_strides() {
+        let mut arena = ExprArena::default();
+        let mut child = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let representation = DenseF32::id();
+        let zero = arena.nat(0);
+        let one = arena.nat(1);
+        let two = arena.nat(2);
+        let four = arena.nat(4);
+        let sixteen = arena.nat(16);
+        let (allocation, whole) = child.tensor(
+            &mut arena,
+            GlobalBufferKind::Persistent,
+            representation,
+            vec![two, four],
+        );
+        let row = child.subview(&mut arena, whole, sixteen, vec![four], vec![one]);
+        let transpose = child.strided_view(
+            &mut arena,
+            allocation,
+            representation,
+            zero,
+            vec![four, two],
+            vec![one, four],
+        );
+        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+        let remap = parent.import(&mut arena, child, &[]);
+        assert!(parent.view_layout(remap[whole as usize]).contiguous);
+        let row_layout = parent.view_layout(remap[row as usize]);
+        assert!(row_layout.contiguous);
+        assert_eq!(row_layout.offset, sixteen);
+        assert_eq!(row_layout.extents, vec![four]);
+        let transposed = parent.view_layout(remap[transpose as usize]);
+        assert!(!transposed.contiguous);
+        assert_eq!(transposed.strides, vec![one, four]);
     }
 }

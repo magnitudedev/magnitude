@@ -5,7 +5,7 @@
 use super::{BindingSlot, BlockId};
 use crate::identity::OwnerToken;
 use crate::storage::LaunchLocalKind;
-use crate::target::KernelDialect;
+use crate::target::PhysicalDialect;
 use seismic_lang::expr::{NatExpr, SymbolId};
 use seismic_lang::ids::{CapabilityId, IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
@@ -62,7 +62,6 @@ pub enum MathPrecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryMathOp {
     Exp,
-    ExpFast,
     Rsqrt,
     Sqrt,
     Log,
@@ -74,7 +73,6 @@ impl UnaryMathOp {
     pub(crate) fn primitive(self) -> MathOp {
         match self {
             Self::Exp => MathOp::Exp,
-            Self::ExpFast => MathOp::ExpFast,
             Self::Rsqrt => MathOp::Rsqrt,
             Self::Sqrt => MathOp::Sqrt,
             Self::Log => MathOp::Log,
@@ -94,7 +92,7 @@ pub enum BarrierScope {
 /// Source location of a data-dependent check.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CheckSite {
-    pub reason: String,
+    pub failure: seismic_lang::failure::SourceFailure,
     pub path: String,
     pub line: u32,
 }
@@ -260,7 +258,7 @@ impl ClosedBoolValue {
 /// carries the exact typed operands and resolved places it needs; native
 /// emitters never recover categories, ranks, representations, or intrinsic
 /// signatures from side tables.
-pub enum ClosedOpView<'a, B: KernelDialect> {
+pub enum ClosedOpView<'a, B: PhysicalDialect> {
     Constant {
         out: ClosedValue,
         value: ConstantValue,
@@ -291,6 +289,11 @@ pub enum ClosedOpView<'a, B: KernelDialect> {
     VectorSplat {
         out: ClosedValue,
         value: ClosedValue,
+    },
+    /// Ordered, bit-preserving assembly of scalar lanes.
+    VectorFromLanes {
+        out: ClosedValue,
+        lanes: Vec<ClosedValue>,
     },
     VectorBinary {
         op: BinaryOp,
@@ -344,6 +347,16 @@ pub enum ClosedOpView<'a, B: KernelDialect> {
         a: ClosedValue,
         to: ValueType,
     },
+    /// Narrow scalar payload, zero-extended to U32 without numerical conversion.
+    ScalarBits {
+        out: ClosedValue,
+        a: ClosedValue,
+    },
+    /// The low 16 payload bits interpreted as the declared narrow scalar type.
+    ScalarFromBits {
+        out: ClosedValue,
+        a: ClosedValue,
+    },
     Cmp {
         op: CmpOp,
         out: ClosedBoolValue,
@@ -379,19 +392,19 @@ pub enum ClosedOpView<'a, B: KernelDialect> {
         out: ClosedValue,
         index: u32,
         symbol: SymbolId,
-        dtype: DType,
+        kind: crate::repr::ScalarKind,
     },
     Read {
         out: ClosedValue,
-        place: ClosedReadablePlace,
+        place: ClosedDensePlace,
         indices: Vec<ClosedIndexValue>,
     },
     /// Reads consecutive logical elements on one axis. Lanes greater than or
-    /// equal to `active` are exactly zero. Representation decoding is the
-    /// same registry-owned element recipe as scalar `Read`.
+    /// equal to `active` are exactly zero. Packed vector reads are expanded
+    /// before closure into guarded typed field reads and scalar recipes.
     VectorRead {
         out: ClosedValue,
-        place: ClosedReadablePlace,
+        place: ClosedDensePlace,
         indices: Vec<ClosedIndexValue>,
         axis: u32,
         active: ClosedIndexValue,
@@ -405,12 +418,24 @@ pub enum ClosedOpView<'a, B: KernelDialect> {
         active: ClosedIndexValue,
         value: ClosedValue,
     },
+    /// A typed field of the packet containing the indexed logical element.
+    /// Code fields yield zero-extended U32; dense fields preserve their dtype.
+    ReadPlaneField {
+        out: ClosedValue,
+        place: ClosedPackedPlace,
+        plane: u32,
+        field: u32,
+        plane_info: seismic_lang::registry::PlaneInfo,
+        indices: Vec<ClosedIndexValue>,
+    },
     ReadPlane {
         out: ClosedValue,
         place: ClosedPackedPlace,
         plane: u32,
         plane_info: seismic_lang::registry::PlaneInfo,
         indices: Vec<ClosedIndexValue>,
+        /// Storage element within the named plane of the addressed packet.
+        element: ClosedIndexValue,
     },
     RepresentationConvertPacket {
         source: ClosedExternalGlobalPlace,
@@ -437,7 +462,7 @@ pub enum ClosedOpView<'a, B: KernelDialect> {
     },
     StoreSlot {
         slot: u32,
-        dtype: DType,
+        kind: crate::repr::ScalarKind,
         value: ClosedValue,
         election: StoreElection,
     },
@@ -505,9 +530,9 @@ pub struct KernelInterface {
     /// Scalar arguments bound from arena expressions, in slot order.
     pub nat_args: Vec<NatExpr>,
     /// Scalar arguments bound from call scalar symbols.
-    pub scalar_args: Vec<(SymbolId, DType)>,
+    pub scalar_args: Vec<(SymbolId, crate::repr::ScalarKind)>,
     /// Result slots the kernel writes back.
-    pub result_slots: Vec<(crate::schedule::AnyScalarSlot, DType)>,
+    pub result_slots: Vec<crate::schedule::AnyScalarSlot>,
     pub uses_subgroup: bool,
 }
 
@@ -528,13 +553,13 @@ pub enum BindingAccess {
 
 /// One structured block: a straight-line op sequence with nested control.
 #[derive(Debug)]
-pub struct Block<B: KernelDialect> {
+pub struct Block<B: PhysicalDialect> {
     pub ops: Vec<Op<B>>,
 }
 
 /// The closed operation set.
 #[derive(Debug)]
-pub enum Op<B: KernelDialect> {
+pub enum Op<B: PhysicalDialect> {
     Constant {
         out: ErasedValue,
         value: ConstantValue,
@@ -565,6 +590,10 @@ pub enum Op<B: KernelDialect> {
     VectorSplat {
         out: ErasedValue,
         value: ErasedValue,
+    },
+    VectorFromLanes {
+        out: ErasedValue,
+        lanes: Vec<ErasedValue>,
     },
     VectorBinary {
         op: BinaryOp,
@@ -622,6 +651,16 @@ pub enum Op<B: KernelDialect> {
         a: ErasedValue,
         to: ValueType,
     },
+    /// Raw narrow floating payload transport. 32-bit cases normalize to Bitcast;
+    /// Boolean cases normalize to Select/Cmp in the ordinary constructor.
+    ScalarBits {
+        out: ErasedValue,
+        a: ErasedValue,
+    },
+    ScalarFromBits {
+        out: ErasedValue,
+        a: ErasedValue,
+    },
     Cmp {
         op: CmpOp,
         out: ErasedValue,
@@ -678,11 +717,19 @@ pub enum Op<B: KernelDialect> {
         active: ErasedValue,
         value: ErasedValue,
     },
+    ReadPlaneField {
+        out: ErasedValue,
+        place: PlaceRef,
+        plane: u32,
+        field: u32,
+        index: Vec<ErasedValue>,
+    },
     ReadPlane {
         out: ErasedValue,
         place: PlaceRef,
         plane: u32,
         index: Vec<ErasedValue>,
+        element: ErasedValue,
     },
     /// Sealed one-shot external-packet to resident-packet initialization.
     /// This is the only operation allowed to write a read-only packed
@@ -746,6 +793,56 @@ pub enum Op<B: KernelDialect> {
     },
 }
 
+impl<B: PhysicalDialect> Op<B> {
+    /// Values defined in the containing block by this actual operation.
+    /// Nested repeat parameters belong to the body and are not parent results.
+    pub fn defined_values(&self) -> &[ErasedValue] {
+        match self {
+            Self::Constant { out, .. }
+            | Self::Binary { out, .. }
+            | Self::Unary { out, .. }
+            | Self::Bit { out, .. }
+            | Self::Fma { out, .. }
+            | Self::VectorSplat { out, .. }
+            | Self::VectorFromLanes { out, .. }
+            | Self::VectorBinary { out, .. }
+            | Self::VectorUnary { out, .. }
+            | Self::VectorBit { out, .. }
+            | Self::VectorFma { out, .. }
+            | Self::VectorCast { out, .. }
+            | Self::VectorLane { out, .. }
+            | Self::VectorReduceAdd { out, .. }
+            | Self::Math { out, .. }
+            | Self::Cast { out, .. }
+            | Self::Bitcast { out, .. }
+            | Self::ScalarBits { out, .. }
+            | Self::ScalarFromBits { out, .. }
+            | Self::Cmp { out, .. }
+            | Self::Select { out, .. }
+            | Self::Logic { out, .. }
+            | Self::Not { out, .. }
+            | Self::Geometry { out, .. }
+            | Self::NatArg { out, .. }
+            | Self::ScalarArg { out, .. }
+            | Self::Read { out, .. }
+            | Self::VectorRead { out, .. }
+            | Self::ReadPlaneField { out, .. }
+            | Self::ReadPlane { out, .. }
+            | Self::Extent { out, .. } => std::slice::from_ref(out),
+            Self::Intrinsic { outs, .. }
+            | Self::Branch { outs, .. }
+            | Self::Repeat { outs, .. } => outs,
+            Self::VectorWrite { .. }
+            | Self::RepresentationConvertPacket { .. }
+            | Self::Write { .. }
+            | Self::Atomic { .. }
+            | Self::StoreSlot { .. }
+            | Self::Yield { .. }
+            | Self::Barrier(_) => &[],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StoreElection {
     GlobalLeader,
@@ -764,6 +861,21 @@ pub enum ConstantValue {
     Index(u64),
 }
 
+impl ConstantValue {
+    /// Transport a language scalar payload into native IR without numeric conversion.
+    pub fn from_scalar(value: seismic_lang::reference_math::ReferenceScalar) -> Self {
+        use seismic_lang::reference_math::ReferenceScalar;
+        match value {
+            ReferenceScalar::F32(bits) => Self::F32(f32::from_bits(bits)),
+            ReferenceScalar::F16(bits) => Self::F16(bits),
+            ReferenceScalar::BF16(bits) => Self::BF16(bits),
+            ReferenceScalar::I32(value) => Self::I32(value),
+            ReferenceScalar::U32(value) => Self::U32(value),
+            ReferenceScalar::Bool(value) => Self::Bool(value),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GeometryValue {
     WorkgroupId(u8),
@@ -772,17 +884,10 @@ pub enum GeometryValue {
     WorkgroupSize(u8),
     GridSize(u8),
     SubgroupLane,
-}
-
-/// A numerical fact recorded by the builder during construction (§9.2).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NumericalFact {
-    ContractedFma,
-    ApproximateMath(MathOp),
-    ReassociatedIntrinsic(seismic_lang::ids::IntrinsicId),
-    NarrowAccumulator(DType),
-    FlushToZero,
-    ReassociatedReduction,
+    /// Stable ordinal of the actual subgroup inside the workgroup.
+    SubgroupOrdinal,
+    /// Actual native subgroup width of the compiled kernel.
+    SubgroupSize,
 }
 
 /// Resource facts of one kernel derived at close.
@@ -795,7 +900,7 @@ pub struct ResourceFacts {
 }
 
 /// The sink a typed intrinsic lowers into.
-pub struct IntrinsicSink<'a, B: KernelDialect> {
+pub struct IntrinsicSink<'a, B: PhysicalDialect> {
     pub(crate) builder: &'a mut super::internals::Builder<'a, B>,
     pub(crate) intrinsic: IntrinsicId,
     pub(crate) result_uniformity: super::internals::Uniformity,
@@ -889,6 +994,9 @@ pub struct SemanticOpaque {
     pub(crate) uniformity: seismic_lang::registry::IntrinsicUniformity,
 }
 impl SemanticOpaque {
+    pub fn value(&self) -> super::internals::PortableValue {
+        self.value
+    }
     pub fn capability(&self) -> CapabilityId {
         self.capability
     }
@@ -920,18 +1028,15 @@ impl SemanticPlace {
 }
 
 /// Canonical logical-index map carried by a semantic tensor intrinsic
-/// operand. KernelDialect intrinsic variants may retain this closed map and apply
+/// operand. PhysicalDialect intrinsic variants may retain this closed map and apply
 /// it to their logical element/tile coordinates; they never recover strides
 /// or view transforms from schedule/global topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalTensorMap {
     pub base: PlaceRef,
     pub representation: RepresentationId,
-    /// Canonical arena expressions for the logical view extents. These are
-    /// the same facts carried by `extents` as kernel SSA values, retained so
-    /// planning/duration can reason symbolically without reconstructing view
-    /// transforms from the physical base place.
-    pub logical_extents: Vec<NatExpr>,
+    /// Actual logical extents, including values produced on the device.
+    /// Analytical host expressions, when available, belong to these SSA values.
     pub extents: Vec<ErasedValue>,
     pub steps: Vec<LogicalViewStep>,
 }
@@ -965,7 +1070,7 @@ impl LogicalTensorMap {
                         }
                     }
                 }
-                LogicalViewStep::Transpose(_) => {}
+                LogicalViewStep::Transpose(_) | LogicalViewStep::Plane { .. } => {}
                 LogicalViewStep::Reshape { from, to } => {
                     for value in from.iter().chain(to) {
                         push(*value);
@@ -979,6 +1084,12 @@ impl LogicalTensorMap {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalViewStep {
+    /// Select physical storage elements from a packed representation plane.
+    /// The axis belongs to this exact point in the ordered view composition.
+    Plane {
+        plane: u32,
+        axis: u32,
+    },
     Slice(Vec<LogicalSliceAxis>),
     Transpose(Vec<u32>),
     Reshape {
@@ -1019,7 +1130,7 @@ pub struct SemanticIntrinsicCall<'a> {
 /// their operands (lane-only intrinsics may have no tensor operand at all).
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentLaunchDomain {
-    pub mode: crate::schedule::LaunchMode,
+    pub mode: crate::schedule::LaunchParticipation,
     pub grid: [NatExpr; 3],
     pub workgroup: [NatExpr; 3],
     pub empty: seismic_lang::expr::BoolExpr,
@@ -1033,11 +1144,11 @@ pub struct SegmentLaunchDomain {
 /// exact participation requirement before the segment can close.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SemanticIntrinsicLaunchRequirements {
-    pub required_mode: Option<crate::schedule::LaunchMode>,
+    pub required_mode: Option<crate::schedule::LaunchParticipation>,
     pub required_workgroup: Option<[NatExpr; 3]>,
 }
 
-pub struct SemanticIntrinsicSink<'s, 'k, B: KernelDialect> {
+pub struct SemanticIntrinsicSink<'s, 'k, B: PhysicalDialect> {
     pub(crate) builder: &'s mut super::internals::PortableBuilder<'k, B>,
     pub(crate) signature: seismic_lang::registry::IntrinsicSignature,
     pub(crate) emitted: bool,

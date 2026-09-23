@@ -1,15 +1,22 @@
-use super::TensorData;
+use super::{MemoryReservation, TensorData};
 use crate::ids::RepresentationId;
-use crate::types::DType;
+use crate::reference_math::ReferenceScalar;
+use num_bigint::{BigInt, BigUint, ToBigUint};
+use num_traits::ToPrimitive;
 use std::cell::RefCell;
 use std::rc::Rc;
-
-pub(super) type Scalar = (DType, f64);
 
 #[derive(Clone, Debug)]
 pub(super) enum Backing {
     Argument(usize),
     Owned(Rc<RefCell<TensorData>>),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TensorMemory {
+    pub(super) _backing: Option<Rc<MemoryReservation>>,
+    pub(super) shape: Rc<MemoryReservation>,
+    pub(super) positions: Rc<MemoryReservation>,
 }
 
 /// A logical strided view. Storage representations stay on the backing; a
@@ -18,40 +25,51 @@ pub(super) enum Backing {
 pub struct TensorValue {
     pub(super) backing: Backing,
     pub(super) representation: RepresentationId,
-    pub(super) shape: Vec<usize>,
+    pub(super) shape: Rc<Vec<usize>>,
     /// Backing-flat position of every logical row-major element. Keeping the
     /// logical index map explicit makes arbitrary compositions of
     /// slice/transpose/reshape exact without inventing backend view rules.
-    pub(super) positions: Vec<usize>,
+    pub(super) positions: Rc<Vec<usize>>,
+    pub(super) memory: TensorMemory,
 }
 
 impl TensorValue {
-    pub(super) fn argument(id: usize, representation: RepresentationId, shape: &[usize]) -> Self {
+    pub fn representation(&self) -> RepresentationId {
+        self.representation
+    }
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub(super) fn argument(
+        id: usize,
+        representation: RepresentationId,
+        shape: &[usize],
+        memory: TensorMemory,
+    ) -> Self {
         Self {
             backing: Backing::Argument(id),
             representation,
-            shape: shape.to_vec(),
-            positions: (0..shape.iter().product()).collect(),
+            shape: Rc::new(shape.to_vec()),
+            positions: Rc::new((0..shape.iter().product()).collect()),
+            memory,
         }
     }
 
-    pub(super) fn owned(tensor: TensorData) -> Self {
+    pub(super) fn owned(tensor: TensorData, memory: TensorMemory) -> Self {
         let representation = tensor.representation();
         let shape = tensor.shape().to_vec();
         Self {
             backing: Backing::Owned(Rc::new(RefCell::new(tensor))),
             representation,
-            positions: (0..shape.iter().product()).collect(),
-            shape,
+            positions: Rc::new((0..shape.iter().product()).collect()),
+            memory,
+            shape: Rc::new(shape),
         }
     }
 
     pub fn element_count(&self) -> usize {
         self.shape.iter().product()
-    }
-
-    pub(super) fn flat_positions(&self) -> Vec<usize> {
-        self.positions.clone()
     }
 }
 
@@ -65,22 +83,49 @@ pub(super) fn row_major(shape: &[usize]) -> Vec<usize> {
 
 #[derive(Clone, Debug)]
 pub enum Value {
-    Scalar(DType, f64),
-    Range(i64, i64),
+    Scalar(ReferenceScalar),
+    /// An exact signed mathematical quantity, independent of source word width.
+    Integer(BigInt),
+    Index(BigUint),
+    Range(BigUint, BigUint),
     Tensor(TensorValue),
     Tuple(Vec<Value>),
     Void,
 }
 
 impl Value {
-    pub(super) fn scalar(value: Scalar) -> Self {
-        Self::Scalar(value.0, value.1)
+    pub(super) fn scalar(value: ReferenceScalar) -> Self {
+        Self::Scalar(value)
     }
 
-    pub(super) fn as_scalar(&self) -> Result<Scalar, String> {
+    pub(super) fn as_scalar(&self) -> Result<ReferenceScalar, String> {
         match self {
-            Self::Scalar(dtype, value) => Ok((*dtype, *value)),
+            Self::Scalar(value) => Ok(*value),
             _ => Err("semantic value is not scalar".to_owned()),
+        }
+    }
+
+    pub(super) fn as_nat(&self) -> Result<BigUint, String> {
+        match self {
+            Self::Index(value) => Ok(value.clone()),
+            Self::Integer(value) => value.to_biguint().ok_or_else(|| "negative natural value".to_owned()),
+            Self::Scalar(ReferenceScalar::U32(value)) => Ok((*value).into()),
+            Self::Scalar(ReferenceScalar::I32(value)) => value.to_biguint().ok_or_else(|| "negative natural value".to_owned()),
+            _ => Err("semantic value is not natural".to_owned()),
+        }
+    }
+
+    pub(super) fn as_nat_usize(&self) -> Result<usize, String> {
+        self.as_nat()?.to_usize().ok_or_else(|| "natural value exceeds address width".to_owned())
+    }
+
+    pub(super) fn as_integer(&self) -> Result<BigInt, String> {
+        match self {
+            Self::Integer(value) => Ok(value.clone()),
+            Self::Index(value) => Ok(BigInt::from(value.clone())),
+            Self::Scalar(ReferenceScalar::I32(value)) => Ok((*value).into()),
+            Self::Scalar(ReferenceScalar::U32(value)) => Ok((*value).into()),
+            _ => Err("semantic value is not integer".to_owned()),
         }
     }
 

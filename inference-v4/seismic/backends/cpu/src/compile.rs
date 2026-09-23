@@ -7,7 +7,6 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 use seismic_ir::kernel::Kernel;
 use seismic_ir::target::KernelEmissionLayout;
-use seismic_lang::types::DType;
 use seismic_target::{DeviceDescription, NativeCompilationError};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -119,12 +118,13 @@ fn layout_metadata_bytes(layout: &KernelEmissionLayout) -> Result<u64, NativeCom
             )
         })
         .and_then(|bytes| {
-            bytes.checked_add(layout.scalar_args.len() * std::mem::size_of::<DType>())
+            bytes.checked_add(
+                layout.scalar_args.len() * std::mem::size_of::<seismic_ir::repr::ScalarKind>(),
+            )
         })
         .and_then(|bytes| {
             bytes.checked_add(
-                layout.result_slots.len()
-                    * std::mem::size_of::<(seismic_ir::schedule::AnyScalarSlot, DType)>(),
+                layout.result_types.len() * std::mem::size_of::<seismic_ir::repr::ScalarKind>(),
             )
         })
         .ok_or_else(|| {

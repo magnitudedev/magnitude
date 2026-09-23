@@ -7,8 +7,8 @@
 //! the complete error taxonomy.
 //!
 //! The only artifact progression is
-//! `CheckedModule -> LogicalEntry -> CandidateDomain<B>
-//!  -> CandidateEvaluator -> SelectionPolicy<B> -> PreparedKernel<B, H>`.
+//! `CheckedModule -> LogicalEntry -> CandidateDomain<'_, B>
+//!  -> CandidateEvaluator -> SelectionPolicy -> PreparedKernel<B, H>`.
 //! Evaluator-internal estimation and solver state are not artifact boundaries.
 //!
 //! Planning authority and raw solver witnesses are intentionally absent from
@@ -26,6 +26,7 @@ pub mod candidate_domain;
 pub mod errors;
 pub mod evaluation;
 pub mod executable;
+pub mod feedback;
 pub mod implementation;
 pub mod numerics;
 pub mod planning;
@@ -43,9 +44,9 @@ mod portable;
 mod realization;
 
 pub use planning::{
-    OptimizationCompletion, PlanningBudgetReport, PlanningBudgetResource, PlanningCoverage,
-    PlanningError, PlanningInfeasibleReport, PlanningLimit, SelectionPolicy, TargetCoverage,
+    OptimizationCompletion, PlanningBudgetReport, PlanningBudgetResource, PlanningError,
+    PlanningInfeasibleReport, PlanningLimit, PlanningReport, SelectionPolicy,
 };
 pub use preparation_budget::{PlanningBudget, PreparationBudget};
-pub use prepare::prepare_analytically;
+pub use prepare::{prepare_analytically, prepare_with_evaluator};
 pub use prepared::{CandidateIndex, SelectionFunction};

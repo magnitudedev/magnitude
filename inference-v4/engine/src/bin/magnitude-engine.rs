@@ -12,7 +12,7 @@ use magnitude_engine::{
     serving::{startup::ExecutionLimits, Config},
     telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
-use seismic::{BackendName, Device, DeviceCatalog, PrecisionPolicy};
+use seismic::{BackendName, Device, DeviceCatalog, PreparationOptions};
 use std::{path::PathBuf, time::Duration};
 
 fn value_of(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -188,8 +188,8 @@ fn run() -> Result<(), String> {
         },
     };
     let backend = options.backend.clone();
-    let execution = move || -> Result<(Device, PrecisionPolicy), String> {
-        Ok((backend_device(&backend)?, PrecisionPolicy::default()))
+    let execution = move || -> Result<(Device, PreparationOptions), String> {
+        Ok((backend_device(&backend)?, PreparationOptions::default()))
     };
     let composed = std::time::Instant::now();
     let server =

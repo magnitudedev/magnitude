@@ -121,6 +121,11 @@ impl IntrinsicIdentityBuilder {
         self.digest.len(tensor.steps.len());
         for step in &tensor.steps {
             match step {
+                LogicalViewStep::Plane { plane, axis } => {
+                    self.variant("plane");
+                    self.u32(*plane);
+                    self.u32(*axis);
+                }
                 LogicalViewStep::Slice(axes) => {
                     self.variant("slice");
                     self.digest.len(axes.len());
@@ -288,6 +293,17 @@ impl CanonicalIdentity for DType {
         out.bytes(self.name().as_bytes());
     }
 }
+impl CanonicalIdentity for crate::repr::ScalarKind {
+    fn encode_identity(&self, out: &mut StructureDigest) {
+        match self {
+            Self::Scalar(dtype) => {
+                out.bytes(b"source-scalar");
+                out.hashed(dtype);
+            }
+            Self::Nat64 => out.bytes(b"natural-u64"),
+        }
+    }
+}
 impl CanonicalIdentity for seismic_lang::registry::BackendName {
     fn encode_identity(&self, out: &mut StructureDigest) {
         out.bytes(self.as_str().as_bytes());
@@ -335,9 +351,9 @@ tagged_enum!(crate::kernel::ops::LogicOp, {And=>b"and",Or=>b"or"});
 tagged_enum!(crate::kernel::ops::MathPrecision, {Exact=>b"exact",Approximate=>b"approximate"});
 tagged_enum!(crate::kernel::ops::BarrierScope, {Workgroup=>b"workgroup",Subgroup=>b"subgroup"});
 tagged_enum!(crate::kernel::ops::StoreElection, {GlobalLeader=>b"global-leader"});
-tagged_enum!(crate::schedule::LaunchMode, {Independent=>b"independent",CooperativeGrid=>b"cooperative-grid"});
+tagged_enum!(crate::schedule::LaunchParticipation, {Independent=>b"independent",CooperativeGrid=>b"cooperative-grid"});
 tagged_enum!(seismic_lang::intrinsics::AtomicOp, {Add=>b"add",Max=>b"max",Min=>b"min"});
-tagged_enum!(seismic_lang::intrinsics::MathOp, {Exp=>b"exp",ExpFast=>b"exp-fast",Fma=>b"fma",Rsqrt=>b"rsqrt",Sqrt=>b"sqrt",Log=>b"log",Sin=>b"sin",Cos=>b"cos",Abs=>b"abs",Max=>b"max",Min=>b"min"});
+tagged_enum!(seismic_lang::intrinsics::MathOp, {Exp=>b"exp",Fma=>b"fma",Rsqrt=>b"rsqrt",Sqrt=>b"sqrt",Log=>b"log",Sin=>b"sin",Cos=>b"cos",Abs=>b"abs",Max=>b"max",Min=>b"min"});
 tagged_enum!(crate::target::ResourceOwnershipScope, {Participant=>b"participant",Subgroup=>b"subgroup",Workgroup=>b"workgroup",CooperativeGrid=>b"cooperative-grid"});
 tagged_enum!(crate::target::AddressableResourceRealization, {Native=>b"native"});
 tagged_enum!(crate::target::ResourceLifetime, {Operation=>b"operation",Segment=>b"segment",Launch=>b"launch"});
@@ -367,6 +383,8 @@ impl CanonicalIdentity for crate::kernel::ops::GeometryValue {
                 a.encode_identity(out)
             }
             SubgroupLane => out.bytes(b"subgroup-lane"),
+            SubgroupOrdinal => out.bytes(b"subgroup-ordinal"),
+            SubgroupSize => out.bytes(b"subgroup-size"),
         }
     }
 }
@@ -457,5 +475,30 @@ impl CanonicalIdentity for crate::kernel::ops::ResourceFacts {
         self.barriers.encode_identity(out);
         self.uses_subgroup.encode_identity(out);
         self.binding_count.encode_identity(out);
+    }
+}
+
+impl CanonicalIdentity for () {
+    fn encode_identity(&self, out: &mut StructureDigest) {
+        out.bytes(b"unit");
+    }
+}
+
+impl CanonicalIdentity for seismic_lang::failure::SourceFailure {
+    fn encode_identity(&self, out: &mut StructureDigest) {
+        use seismic_lang::failure::SourceFailureCause;
+        use seismic_lang::reference_math::ScalarFailure;
+        use seismic_lang::entry::CheckReason;
+        out.bytes(b"source-failure");
+        out.bytes(self.event.body().digest());
+        for ordinal in self.event.position() { out.u32(ordinal); }
+        match &self.cause {
+            SourceFailureCause::Scalar(ScalarFailure::IntegerDivisionByZero) => out.bytes(b"division-zero"),
+            SourceFailureCause::Scalar(ScalarFailure::SignedDivisionOverflow) => out.bytes(b"division-overflow"),
+            SourceFailureCause::Scalar(ScalarFailure::ShiftCount) => out.bytes(b"shift-count"),
+            SourceFailureCause::Check(CheckReason::IndexBound) => out.bytes(b"index-bound"),
+            SourceFailureCause::Check(CheckReason::RangeOrder) => out.bytes(b"range-order"),
+            SourceFailureCause::Check(CheckReason::Custom(message)) => { out.bytes(b"custom-check"); out.bytes(message.as_bytes()); }
+        }
     }
 }

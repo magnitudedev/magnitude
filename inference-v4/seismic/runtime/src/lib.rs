@@ -35,5 +35,3 @@ mod layout;
 mod memory;
 mod resources;
 mod telemetry;
-
-mod workflow;

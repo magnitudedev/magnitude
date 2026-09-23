@@ -18,7 +18,7 @@ use crate::repr::{
     SignedType, VectorElement, WritableRepresentation, U32,
 };
 use crate::storage::{BufferViewId, LaunchLocalId, LaunchLocalKind};
-use crate::target::KernelDialect;
+use crate::target::PhysicalDialect;
 use seismic_lang::expr::NatExpr;
 use seismic_lang::ids::IntrinsicId;
 use seismic_lang::intrinsics::AtomicOp;
@@ -26,6 +26,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 pub mod ops;
+mod representation;
 mod vector;
 pub use vector::VectorId;
 
@@ -172,7 +173,7 @@ impl BindingSlot {
 /// backend crate (W5) against a registered signature. The builder accepts
 /// only `Args` and returns only `Result`, so an ill-typed intrinsic call does
 /// not compile.
-pub trait TypedIntrinsic<B: KernelDialect>: 'static {
+pub trait TypedIntrinsic<B: PhysicalDialect>: 'static {
     /// The registered signature this intrinsic realizes.
     fn id() -> IntrinsicId;
     type Args;
@@ -213,7 +214,7 @@ mod values_sealed {
 // ---------------------------------------------------------------------------
 
 /// Builds one kernel. Obtained from `ImplementationBuilder::kernel`.
-pub struct KernelBuilder<'a, B: KernelDialect> {
+pub struct KernelBuilder<'a, B: PhysicalDialect> {
     inner: internals::Builder<'a, B>,
 }
 
@@ -222,7 +223,7 @@ pub struct KernelBuilder<'a, B: KernelDialect> {
 /// of a join/carry. Both are factory authoring bugs and are reported once at
 /// close as a panic with the offending handle (§13.3, local invariant of the
 /// private builder).
-impl<'a, B: KernelDialect> KernelBuilder<'a, B> {
+impl<'a, B: PhysicalDialect> KernelBuilder<'a, B> {
     // ----- interface ---------------------------------------------------------
 
     /// Declares a readable global view argument.
@@ -308,6 +309,14 @@ impl<'a, B: KernelDialect> KernelBuilder<'a, B> {
     pub fn subgroup_lane(&mut self) -> ScalarId<Idx> {
         self.inner.subgroup_lane()
     }
+    /// Stable subgroup position within the workgroup; uniform within that subgroup.
+    pub fn subgroup_ordinal(&mut self) -> ScalarId<Idx> {
+        self.inner.subgroup_ordinal()
+    }
+    /// Actual native subgroup width; uniform throughout the workgroup.
+    pub fn subgroup_size(&mut self) -> ScalarId<Idx> {
+        self.inner.subgroup_size()
+    }
 
     // ----- scalars -------------------------------------------------------------
 
@@ -354,28 +363,12 @@ impl<'a, B: KernelDialect> KernelBuilder<'a, B> {
         b: ScalarId<T>,
         c: ScalarId<T>,
     ) -> ScalarId<T> {
-        self.inner.fma(a, b, c, false)
-    }
-    /// An implementation-selected contraction of separately authored
-    /// multiply and add operations. This explicitly records the numerical
-    /// deviation; factories must not use it for an authored FMA.
-    pub fn contracted_fma<T: FloatType>(
-        &mut self,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-        c: ScalarId<T>,
-    ) -> ScalarId<T> {
-        self.inner.fma(a, b, c, true)
+        self.inner.fma(a, b, c)
     }
     /// Registry math op with exact (reference) semantics.
     pub fn math<T: FloatType>(&mut self, op: ops::UnaryMathOp, a: ScalarId<T>) -> ScalarId<T> {
-        let primitive = op.primitive();
-        let precision = if primitive == seismic_lang::intrinsics::MathOp::ExpFast {
-            ops::MathPrecision::Approximate
-        } else {
-            ops::MathPrecision::Exact
-        };
-        self.inner.math(primitive, a, precision)
+        self.inner
+            .math(op.primitive(), a, ops::MathPrecision::Exact)
     }
     /// Registry math op with an approximate backend sequence; admissible
     /// only when the implementation's numerical transfer records it.
@@ -638,14 +631,17 @@ impl<'a, B: KernelDialect> KernelBuilder<'a, B> {
 
     /// Structured counted loop with typed carries. `body` receives the
     /// binder and the carried values and returns the next carried values.
+    /// Each flattened carry has an inductive uniformity bound: both initial
+    /// and next values must satisfy it, including when the loop executes zero times.
     pub fn repeat<V: KernelValues>(
         &mut self,
         start: ScalarId<Idx>,
         end: ScalarId<Idx>,
         initial: V,
+        recurrence: &[seismic_lang::registry::IntrinsicUniformity],
         body: impl FnOnce(&mut KernelBuilder<'_, B>, ScalarId<Idx>, V) -> V,
     ) -> V {
-        self.inner.repeat(start, end, initial, body)
+        self.inner.repeat(start, end, initial, recurrence, body)
     }
 
     /// Closes the kernel. Requires every declared result slot to be
@@ -681,11 +677,11 @@ impl<T: ScalarType> fmt::Debug for WritableScalar<T> {
 
 /// The arena of every kernel of one implementation (or one frozen plan).
 #[derive(Debug)]
-pub struct KernelArena<B: KernelDialect> {
+pub struct KernelArena<B: PhysicalDialect> {
     inner: internals::Arena<B>,
 }
 
-impl<B: KernelDialect> KernelArena<B> {
+impl<B: PhysicalDialect> KernelArena<B> {
     pub(crate) fn get(&self, id: KernelId) -> Option<&Kernel<B>> {
         self.inner.get(id)
     }
@@ -703,19 +699,25 @@ impl<B: KernelDialect> KernelArena<B> {
 /// One closed kernel, read by native compilers. Every reference inside is
 /// dense and in-bounds by construction.
 #[derive(Debug)]
-pub struct Kernel<B: KernelDialect> {
+pub struct Kernel<B: PhysicalDialect> {
     inner: internals::KernelData<B>,
 }
 
-impl<B: KernelDialect> Kernel<B> {
+impl<B: PhysicalDialect> Kernel<B> {
     pub fn blocks(&self) -> &[ops::Block<B>] {
         self.inner.blocks()
     }
     pub fn block_multiplicity(&self) -> &[Option<seismic_lang::expr::NatExpr>] {
         self.inner.block_multiplicity()
     }
-    pub fn value_types(&self) -> &[ops::ValueType] {
+    pub fn value_types(&self) -> impl ExactSizeIterator<Item = &ops::ValueType> {
         self.inner.value_types()
+    }
+    /// Exact host expression derived for this SSA value during construction.
+    /// A device-produced value can have no such expression; consumers must not
+    /// replace its actual logical extent with backing capacity.
+    pub fn exact_nat(&self, value: ops::ErasedValue) -> Option<seismic_lang::expr::NatExpr> {
+        self.inner.exact_nat(value)
     }
     pub fn intrinsic_resources(&self) -> &[ops::IntrinsicResources] {
         self.inner.intrinsic_resources()
@@ -723,12 +725,6 @@ impl<B: KernelDialect> Kernel<B> {
     pub fn intrinsics_used(&self) -> &[seismic_lang::ids::IntrinsicId] {
         self.inner.intrinsics_used()
     }
-    pub fn fact_multiplicities(
-        &self,
-    ) -> impl Iterator<Item = (&ops::NumericalFact, Option<seismic_lang::expr::NatExpr>)> + '_ {
-        self.inner.fact_multiplicities()
-    }
-
     pub fn interface(&self) -> &ops::KernelInterface {
         self.inner.interface()
     }
@@ -945,6 +941,10 @@ impl<B: KernelDialect> Kernel<B> {
                 b: value(*b),
                 c: value(*c),
             },
+            Op::VectorFromLanes { out, lanes } => Closed::VectorFromLanes {
+                out: value(*out),
+                lanes: lanes.iter().map(|lane| value(*lane)).collect(),
+            },
             Op::VectorSplat { out, value: scalar } => Closed::VectorSplat {
                 out: value(*out),
                 value: value(*scalar),
@@ -1013,6 +1013,14 @@ impl<B: KernelDialect> Kernel<B> {
                 a: value(*a),
                 to: *to,
             },
+            Op::ScalarBits { out, a } => Closed::ScalarBits {
+                out: value(*out),
+                a: value(*a),
+            },
+            Op::ScalarFromBits { out, a } => Closed::ScalarFromBits {
+                out: value(*out),
+                a: value(*a),
+            },
             Op::Cmp { op, out, a, b } => Closed::Cmp {
                 op: *op,
                 out: boolean(*out),
@@ -1051,12 +1059,12 @@ impl<B: KernelDialect> Kernel<B> {
                 out,
                 index: ordinal,
             } => {
-                let (symbol, dtype) = self.interface().scalar_args[*ordinal as usize];
+                let (symbol, kind) = self.interface().scalar_args[*ordinal as usize];
                 Closed::ScalarArg {
                     out: value(*out),
                     index: *ordinal,
                     symbol,
-                    dtype,
+                    kind,
                 }
             }
             Op::Read {
@@ -1070,7 +1078,7 @@ impl<B: KernelDialect> Kernel<B> {
                     place.representation, *representation,
                     "closed read representation differs from its place"
                 );
-                let geometry = place.geometry.readable();
+                let geometry = place.geometry.dense();
                 let place = place.map_geometry(geometry);
                 Closed::Read {
                     out: value(*out),
@@ -1095,7 +1103,7 @@ impl<B: KernelDialect> Kernel<B> {
                     *axis < place.rank,
                     "closed vector read axis is outside rank"
                 );
-                let geometry = place.geometry.readable();
+                let geometry = place.geometry.dense();
                 let place = place.map_geometry(geometry);
                 Closed::VectorRead {
                     out: value(*out),
@@ -1144,10 +1152,31 @@ impl<B: KernelDialect> Kernel<B> {
                     value,
                 }
             }
+            Op::ReadPlaneField {
+                out,
+                place,
+                plane,
+                field,
+                index: raw_indices,
+            } => {
+                let place = self.closed_place(*place, emission);
+                let geometry = place.geometry.packed();
+                let plane_info = geometry.layout.planes[*plane as usize].clone();
+                let place = place.map_geometry(geometry);
+                Closed::ReadPlaneField {
+                    out: value(*out),
+                    place,
+                    plane: *plane,
+                    field: *field,
+                    plane_info,
+                    indices: indices(raw_indices),
+                }
+            }
             Op::ReadPlane {
                 out,
                 place,
                 plane,
+                element,
                 index: raw_indices,
             } => {
                 let place = self.closed_place(*place, emission);
@@ -1158,6 +1187,7 @@ impl<B: KernelDialect> Kernel<B> {
                     out: value(*out),
                     place,
                     plane: *plane,
+                    element: index(*element),
                     plane_info,
                     indices: indices(raw_indices),
                 }
@@ -1242,7 +1272,7 @@ impl<B: KernelDialect> Kernel<B> {
                 election,
             } => Closed::StoreSlot {
                 slot: *slot,
-                dtype: self.interface().result_slots[*slot as usize].1,
+                kind: self.interface().result_slots[*slot as usize].kind(),
                 value: value(*raw_value),
                 election: *election,
             },
@@ -1327,11 +1357,6 @@ impl<B: KernelDialect> Kernel<B> {
     pub fn value_count(&self) -> u32 {
         u32::try_from(self.inner.value_types().len()).expect("kernel value ordinal space exhausted")
     }
-    /// Numerical facts recorded during construction (fma, approximate
-    /// math, reassociated intrinsics), consumed by numerics derivation.
-    pub fn numerical_facts(&self) -> &[ops::NumericalFact] {
-        self.inner.numerical_facts()
-    }
     /// Barriers, subgroup use, and local bytes as declared, for resource
     /// derivation.
     pub fn resource_facts(&self) -> &ops::ResourceFacts {
@@ -1351,6 +1376,7 @@ pub fn reference_math_identity() -> (&'static str, [u8; 32]) {
 /// Checked construction for semantics whose value types are known at runtime.
 pub mod dynamic {
     pub use super::internals::{
-        PortableBuilder, PortablePlace, PortableSliceAxis, PortableTensor, PortableValue,
+        LogicalIndexBinding, PortableBranch, PortableBuilder, PortableCursor, PortablePlace,
+        PortableRepeat, PortableSliceAxis, PortableTensor, PortableValue,
     };
 }

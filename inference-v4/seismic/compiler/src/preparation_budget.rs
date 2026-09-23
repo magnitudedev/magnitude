@@ -10,11 +10,11 @@ use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparationBudget {
-    /// Total non-universal alternatives refinement may construct across root
-    /// families and nested calls.
-    pub refinement_constructed_alternatives: u64,
-    /// Monotonic elapsed-time ceiling for the complete refinement session.
-    pub refinement_construction_wall_time: Duration,
+    /// Source construction steps available to optional evaluator exploration.
+    /// Pausing preserves the actual constructor state; it does not remove definitions.
+    pub construction_work_units: u64,
+    /// Total optional source-construction time available to the evaluator.
+    pub construction_wall_time: Duration,
     pub native_compile_wall_time: Duration,
     pub native_code_bytes: u64,
     pub metadata_bytes: u64,
@@ -26,8 +26,8 @@ pub struct PreparationBudget {
 impl Default for PreparationBudget {
     fn default() -> Self {
         Self {
-            refinement_constructed_alternatives: 256,
-            refinement_construction_wall_time: Duration::from_secs(2),
+            construction_work_units: 100_000,
+            construction_wall_time: Duration::from_secs(2),
             native_compile_wall_time: Duration::from_secs(2),
             native_code_bytes: 256 * 1024 * 1024,
             metadata_bytes: 64 * 1024 * 1024,
@@ -156,19 +156,56 @@ impl PreparationBudgetTracker {
         self.native_compile_wall_time = wall_time;
         self.native_code_bytes = code_bytes;
         self.metadata_bytes = metadata_bytes;
-        if wall_time > self.limit.native_compile_wall_time
-            || code_bytes > self.limit.native_code_bytes
-            || metadata_bytes > self.limit.metadata_bytes
-        {
-            return false;
-        }
-        true
+        self.native_attempt_available()
+    }
+
+    pub(crate) fn native_usage(&self) -> (u64, u64) {
+        (self.native_code_bytes, self.metadata_bytes)
+    }
+
+    pub(crate) fn native_attempt_available(&self) -> bool {
+        self.native_compile_wall_time <= self.limit.native_compile_wall_time
+            && self.native_code_bytes <= self.limit.native_code_bytes
+            && self.metadata_bytes <= self.limit.metadata_bytes
+    }
+
+    pub(crate) fn extend_native_time(&mut self, additional: Duration) {
+        self.limit.native_compile_wall_time = self
+            .limit
+            .native_compile_wall_time
+            .saturating_add(additional);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_extends_time_but_cannot_erase_byte_exhaustion() {
+        let mut timed = PreparationBudgetTracker::new(PreparationBudget {
+            native_compile_wall_time: Duration::ZERO,
+            ..Default::default()
+        });
+        assert!(!timed.record_native_artifact(NativeArtifactMetrics {
+            compilation_ns: 1,
+            code_bytes: 1,
+            metadata_bytes: 1
+        }));
+        timed.extend_native_time(Duration::from_secs(1));
+        assert!(timed.native_attempt_available());
+        let mut full = PreparationBudgetTracker::new(PreparationBudget {
+            native_code_bytes: 0,
+            ..Default::default()
+        });
+        assert!(!full.record_native_artifact(NativeArtifactMetrics {
+            compilation_ns: 1,
+            code_bytes: 1,
+            metadata_bytes: 1
+        }));
+        full.extend_native_time(Duration::from_secs(100));
+        assert!(!full.native_attempt_available());
+    }
 
     #[test]
     fn completed_native_artifact_is_recorded_before_exhaustion() {

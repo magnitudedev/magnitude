@@ -17,11 +17,11 @@ use crate::checked::{check_source, CheckedModule, SourceFile, SourceSet};
 use sha2::{Digest, Sha256};
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+pub const BUNDLE_FORMAT_VERSION: u32 = 2;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
-pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v6";
+pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v8";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckedBundleError {
@@ -47,12 +47,23 @@ impl std::error::Error for CheckedBundleError {}
 /// Serializes a checked module. Deterministic: equal modules yield equal
 /// bytes.
 pub fn encode_checked_bundle(module: &CheckedModule) -> Vec<u8> {
-    internals::encode(module.internal())
+    let mut bytes = internals::encode(module.internal());
+    bytes.extend_from_slice(&(module.assets.len() as u32).to_le_bytes());
+    for (name, source) in &module.assets {
+        internals::string(&mut bytes, name);
+        internals::string(&mut bytes, source);
+    }
+    let digest = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    bytes
 }
 
 /// The bundle-side constructor of a [`CheckedModule`].
 pub fn decode_checked_bundle(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
-    internals::decode(bytes).map(CheckedModule::from_internal)
+    if bytes.len() < 32 { return Err(CheckedBundleError::Corrupt); }
+    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+    if &Sha256::digest(payload)[..] != checksum { return Err(CheckedBundleError::HashMismatch); }
+    internals::decode(payload)
 }
 
 mod internals {
@@ -80,7 +91,7 @@ mod internals {
         out
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> Result<Module, CheckedBundleError> {
+    pub(super) fn decode(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
         let mut reader = Reader { bytes, offset: 0 };
         if reader.take(MAGIC.len())? != MAGIC {
             return Err(CheckedBundleError::Corrupt);
@@ -112,6 +123,16 @@ mod internals {
                 text: reader.string()?.to_owned(),
             });
         }
+        let asset_count = reader.u32()? as usize;
+        if asset_count > bytes.len().saturating_sub(reader.offset) / 8 {
+            return Err(CheckedBundleError::Corrupt);
+        }
+        let mut assets = std::collections::BTreeMap::new();
+        for _ in 0..asset_count {
+            let key = reader.string()?.to_owned();
+            let value = reader.string()?.to_owned();
+            if assets.insert(key, value).is_some() { return Err(CheckedBundleError::Corrupt); }
+        }
         if reader.offset != bytes.len() {
             return Err(CheckedBundleError::Corrupt);
         }
@@ -126,11 +147,14 @@ mod internals {
         if source_hash(&canonical) != expected_source_hash {
             return Err(CheckedBundleError::HashMismatch);
         }
-        let rebuilt = check_source(canonical).map_err(|_| CheckedBundleError::Corrupt)?;
+        let mut rebuilt = check_source(canonical).map_err(|_| CheckedBundleError::Corrupt)?;
         if rebuilt.semantic_hash().digest() != &expected_semantic_hash {
             return Err(CheckedBundleError::HashMismatch);
         }
-        Ok(rebuilt.into_internal())
+        for (name, source) in assets {
+            rebuilt.capture_native_asset(&name, source).map_err(|_| CheckedBundleError::Corrupt)?;
+        }
+        Ok(rebuilt)
     }
 
     fn source_hash(sources: &SourceSet) -> [u8; 32] {
@@ -146,7 +170,7 @@ mod internals {
         hash.finalize().into()
     }
 
-    fn string(out: &mut Vec<u8>, value: &str) {
+    pub(super) fn string(out: &mut Vec<u8>, value: &str) {
         let length =
             u32::try_from(value.len()).expect("checked-bundle string exceeds u32::MAX bytes");
         out.extend_from_slice(&length.to_le_bytes());
@@ -184,5 +208,57 @@ mod internals {
             let length = usize::try_from(self.u32()?).map_err(|_| CheckedBundleError::Corrupt)?;
             std::str::from_utf8(self.take(length)?).map_err(|_| CheckedBundleError::Corrupt)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn checked() -> CheckedModule {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "snapshot.seismic".into(),
+            text: "fn twice(x: f32) -> f32:\n    return x + x\nnative twice for metal from \"twice.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n".into(),
+        }])).unwrap()
+    }
+    #[test]
+    fn snapshot_assets_roundtrip_and_affect_identity() {
+        let mut module=checked();
+        module.capture_native_asset("twice","kernel version one".into()).unwrap();
+        let first=encode_checked_bundle(&module);
+        let restored=decode_checked_bundle(&first).unwrap();
+        assert_eq!(restored.native_asset("twice"),Some("kernel version one"));
+        assert_eq!(restored.entries()[0].stable,module.entries()[0].stable);
+        assert_eq!(restored.entries()[0].parameter_types,module.entries()[0].parameter_types);
+        assert_eq!(encode_checked_bundle(&restored),first);
+        module.capture_native_asset("twice","kernel version two".into()).unwrap();
+        assert_ne!(first,encode_checked_bundle(&module));
+    }
+    #[test]
+    fn corruption_and_incompatible_wire_fail_closed() {
+        let module=checked();
+        let mut encoded=encode_checked_bundle(&module);
+        let end=encoded.len()-1;encoded[end]^=1;
+        assert_eq!(decode_checked_bundle(&encoded).err(),Some(CheckedBundleError::HashMismatch));
+        let mut encoded=encode_checked_bundle(&module);
+        encoded[8..12].copy_from_slice(&0u32.to_le_bytes());
+        let end=encoded.len()-32;
+        let hash=Sha256::digest(&encoded[..end]);encoded[end..].copy_from_slice(&hash);
+        assert_eq!(decode_checked_bundle(&encoded).err(),Some(CheckedBundleError::IncompatibleVersion));
+        assert!(decode_checked_bundle(&[]).is_err());
+    }
+
+    #[test]
+    fn previous_checker_semantic_version_cannot_reuse_a_bundle() {
+        let mut encoded = encode_checked_bundle(&checked());
+        let version_start = 8 + 4 + 4;
+        let version_end = version_start + COMPILER_SEMANTIC_VERSION.len();
+        encoded[version_start..version_end].copy_from_slice(b"seismic-semantics-v7");
+        let checksum_start = encoded.len() - 32;
+        let digest = Sha256::digest(&encoded[..checksum_start]);
+        encoded[checksum_start..].copy_from_slice(&digest);
+        assert_eq!(
+            decode_checked_bundle(&encoded).err(),
+            Some(CheckedBundleError::IncompatibleVersion)
+        );
     }
 }

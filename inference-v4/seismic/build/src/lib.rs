@@ -34,9 +34,9 @@
 //!     }
 //!     pub struct Elements { pub <ELEM>: seismic::Element, .. }   // polymorphic entries only
 //!     pub struct Entry;                   // impl seismic::Entry
-//!     pub fn for_device(device: &seismic::Device, precision: seismic::PrecisionPolicy)
+//!     pub fn for_device(device: &seismic::Device, options: seismic::PreparationOptions)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // monomorphic
-//!     pub fn for_device_with(device: &seismic::Device, precision: seismic::PrecisionPolicy, elements: Elements)
+//!     pub fn for_device_with(device: &seismic::Device, options: seismic::PreparationOptions, elements: Elements)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // polymorphic
 //!     pub fn native_for_device(device: &seismic::Device)
 //!         -> Result<seismic::NativeKernel<Entry>, seismic::LoadError>;           // when declared
@@ -48,8 +48,8 @@
 
 use seismic_lang::checked::SourceError;
 use seismic_lang::checked::{
-    check_source, EntryInfo, NativeImplementation, NativeNatExpr, ParameterSummary,
-    ParameterSummaryKind, ResultSummaryKind, SourceFile, SourceSet, TensorAccess,
+    EntryInfo, NativeImplementation, NativeNatExpr, ParameterSummary,
+    ParameterSummaryKind, ResultSummaryKind, SourceSet, TensorAccess,
 };
 use seismic_lang::types::DType;
 use sha2::{Digest, Sha256};
@@ -140,13 +140,11 @@ pub struct Artifacts {
 
 mod internals {
     use super::*;
-    use std::ffi::OsStr;
     use std::fs;
 
     struct NativeAsset<'a> {
         definition: &'a NativeImplementation,
         path: PathBuf,
-        source: Vec<u8>,
     }
 
     pub(super) fn run(build: Build) -> Result<Artifacts, BuildError> {
@@ -158,48 +156,24 @@ mod internals {
                 .ok_or_else(|| BuildError::Environment("OUT_DIR is not set".to_owned()))?,
         };
         fs::create_dir_all(&output).map_err(BuildError::Io)?;
+        let output=output.canonicalize().map_err(BuildError::Io)?;
 
-        let mut paths = Vec::new();
-        for source in build.sources() {
-            collect(source, &mut paths)?;
-        }
-        paths.sort();
-        paths.dedup();
-        if paths.is_empty() && !build.include_std() {
-            return Err(BuildError::Environment(
-                "no .seismic source was provided".to_owned(),
-            ));
-        }
-
-        let mut sources = if build.include_std() {
-            seismic_std::sources()
-        } else {
-            SourceSet::default()
-        };
-        for path in &paths {
-            println!("cargo:rerun-if-changed={}", path.display());
-            let text = fs::read_to_string(path).map_err(BuildError::Io)?;
-            sources.push(SourceFile {
-                path: source_label(path),
-                text,
-            });
-        }
-
-        let checked = check_source(sources).map_err(BuildError::Source)?;
+        let prelude = if build.include_std() { seismic_std::sources() } else { SourceSet::default() };
+        let (checked, dependencies) = seismic_lang::source::load(build.sources(), prelude).map_err(|e|match e {
+            seismic_lang::source::LoadError::Io(e)=>BuildError::Io(e),
+            seismic_lang::source::LoadError::Source(e)=>BuildError::Source(e),
+            seismic_lang::source::LoadError::Invalid(e)=>BuildError::Environment(e),
+        })?;
+        for path in dependencies { println!("cargo:rerun-if-changed={}",path.display()); }
+        for path in build.sources() { println!("cargo:rerun-if-changed={}",path.display()); }
         let encoded = seismic_lang::bundle::encode_checked_bundle(&checked);
-        let native_assets = resolve_native_assets(&checked, &paths)?;
+        let native_assets = resolve_native_assets(&checked, &output)?;
         // The checked bundle contains the canonical sources, bundle format,
         // checker semantic version, registry revision, and semantic hash.
         // Addressing the emitted bundle therefore cannot accidentally reuse
         // generated bindings across a change in any of those inputs.
         let mut identity_hasher = Sha256::new();
         identity_hasher.update(&encoded);
-        for asset in &native_assets {
-            identity_hasher.update(asset.definition.backend.as_str().as_bytes());
-            identity_hasher.update(asset.definition.source.as_bytes());
-            identity_hasher.update((asset.source.len() as u64).to_le_bytes());
-            identity_hasher.update(&asset.source);
-        }
         let bundle_digest: [u8; 32] = identity_hasher.finalize().into();
         let identity = hex(&bundle_digest);
         let bundle = output.join(format!("{}.seismicbundle", build.module()));
@@ -217,95 +191,16 @@ mod internals {
         })
     }
 
-    fn resolve_native_assets<'a>(
-        module: &'a seismic_lang::checked::CheckedModule,
-        source_paths: &[PathBuf],
-    ) -> Result<Vec<NativeAsset<'a>>, BuildError> {
-        let source_by_label = source_paths
-            .iter()
-            .map(|path| (source_label(path), path))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut assets = Vec::new();
+    fn resolve_native_assets<'a>(module: &'a seismic_lang::checked::CheckedModule, output: &std::path::Path) -> Result<Vec<NativeAsset<'a>>, BuildError> {
+        let mut assets=Vec::new();
         for entry in module.entries() {
-            let Some(definition) =
-                module.native_implementation(entry.id, seismic_lang::registry::BackendName::Metal)
-            else {
-                continue;
-            };
-            let declaring = source_by_label
-                .get(&definition.declared_in)
-                .ok_or_else(|| {
-                    BuildError::Environment(format!(
-                        "native declaration source `{}` is not a filesystem build input",
-                        definition.declared_in
-                    ))
-                })?;
-            let base = declaring
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let path = base.join(&definition.source);
-            let path = path.canonicalize().map_err(BuildError::Io)?;
-            println!("cargo:rerun-if-changed={}", path.display());
-            let source = fs::read(&path).map_err(BuildError::Io)?;
-            std::str::from_utf8(&source).map_err(|_| {
-                BuildError::Environment(format!(
-                    "native Metal source `{}` is not UTF-8",
-                    path.display()
-                ))
-            })?;
-            assets.push(NativeAsset {
-                definition,
-                path,
-                source,
-            });
+            let Some(definition)=module.native_implementation(entry.id,seismic_lang::registry::BackendName::Metal) else {continue};
+            let source=module.native_asset(&entry.name).expect("shared loader captures native assets");
+            let path=output.join(format!("{}.metal",entry.name));
+            fs::write(&path,source).map_err(BuildError::Io)?;
+            assets.push(NativeAsset{definition,path});
         }
         Ok(assets)
-    }
-
-    fn source_label(path: &std::path::Path) -> String {
-        let relative = std::env::current_dir()
-            .ok()
-            .and_then(|directory| {
-                path.strip_prefix(directory)
-                    .ok()
-                    .map(std::path::Path::to_path_buf)
-            })
-            .unwrap_or_else(|| path.to_path_buf());
-        relative.to_string_lossy().replace('\\', "/")
-    }
-
-    fn collect(path: &std::path::Path, output: &mut Vec<PathBuf>) -> Result<(), BuildError> {
-        let metadata = fs::metadata(path).map_err(BuildError::Io)?;
-        if metadata.is_file() {
-            if path.extension() != Some(OsStr::new("seismic")) {
-                return Err(BuildError::Environment(format!(
-                    "source `{}` is not a .seismic file",
-                    path.display()
-                )));
-            }
-            output.push(path.to_path_buf());
-            return Ok(());
-        }
-        if !metadata.is_dir() {
-            return Err(BuildError::Environment(format!(
-                "source `{}` is neither a file nor a directory",
-                path.display()
-            )));
-        }
-        let mut children = fs::read_dir(path)
-            .map_err(BuildError::Io)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BuildError::Io)?;
-        children.sort_by_key(|entry| entry.path());
-        for child in children {
-            let child_path = child.path();
-            if child.file_type().map_err(BuildError::Io)?.is_dir()
-                || child_path.extension() == Some(OsStr::new("seismic"))
-            {
-                collect(&child_path, output)?;
-            }
-        }
-        Ok(())
     }
 
     fn render(
@@ -521,8 +416,8 @@ mod internals {
                 ResultSummaryKind::Scalar(dtype) => {
                     format!("take_workflow_scalar::<{}>", scalar_type(*dtype))
                 }
-                ResultSummaryKind::Index => "take_workflow_scalar::<u64>".to_owned(),
-                ResultSummaryKind::Range => "take_workflow_scalar::<(u64, u64)>".to_owned(),
+                ResultSummaryKind::Index => "take_workflow_scalar::<seismic::BigUint>".to_owned(),
+                ResultSummaryKind::Range => "take_workflow_scalar::<(seismic::BigUint, seismic::BigUint)>".to_owned(),
             };
             out.push_str(&format!(
                 "      {}: seismic::generated::{getter}(&mut results),\n",
@@ -546,11 +441,29 @@ mod internals {
         out.push_str("    ] }\n");
         out.push_str("  }\n");
 
+        render_invocation_scope(out, entry);
+
         if entry.element_parameters.is_empty() {
-            out.push_str("  pub fn for_device(device: &seismic::Device, precision: seismic::PrecisionPolicy) -> Result<seismic::Kernel<Entry>, seismic::LoadError> { seismic::generated::prepare::<Entry>(device, precision, &[]) }\n");
+            out.push_str("  pub fn for_device(device: &seismic::Device, options: seismic::PreparationOptions) -> Result<seismic::Kernel<Entry>, seismic::LoadError> { seismic::generated::prepare::<Entry>(device, options, &[]) }\n");
         } else {
-            out.push_str("  pub fn for_device_with(device: &seismic::Device, precision: seismic::PrecisionPolicy, elements: Elements) -> Result<seismic::Kernel<Entry>, seismic::LoadError> {\n");
-            out.push_str("    seismic::generated::prepare::<Entry>(device, precision, &[\n");
+            out.push_str("  pub fn for_device_with(device: &seismic::Device, options: seismic::PreparationOptions, elements: Elements) -> Result<seismic::Kernel<Entry>, seismic::LoadError> {\n");
+            out.push_str("    seismic::generated::prepare::<Entry>(device, options, &[\n");
+            for parameter in &entry.element_parameters {
+                out.push_str(&format!(
+                    "      ({:?}, elements.{}),\n",
+                    parameter,
+                    ident(parameter)
+                ));
+            }
+            out.push_str("    ])\n  }\n");
+        }
+        if entry.element_parameters.is_empty() {
+            out.push_str("  pub fn start_feedback(device: &seismic::Device, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> { seismic::generated::start_feedback::<Entry>(device, precision, options, &[]) }\n");
+        } else {
+            out.push_str("  pub fn start_feedback_with(device: &seismic::Device, precision: seismic::PrecisionPolicy, options: seismic::FeedbackOptions, elements: Elements) -> Result<(seismic::FeedbackPreparation<'_, Entry>, seismic::Kernel<Entry>), seismic::LoadError> {\n");
+            out.push_str(
+                "    seismic::generated::start_feedback::<Entry>(device, precision, options, &[\n",
+            );
             for parameter in &entry.element_parameters {
                 out.push_str(&format!(
                     "      ({:?}, elements.{}),\n",
@@ -564,7 +477,7 @@ mod internals {
             let path = native.path.to_string_lossy();
             out.push_str("  fn native_definition() -> seismic::generated::NativeDefinition {\n");
             out.push_str(&format!(
-                "    seismic::generated::NativeDefinition {{ source: include_str!({path:?}), entry: {:?}, threadgroups: [\n",
+                "    seismic::generated::NativeDefinition {{ source: include_str!({path:?}).into(), entry: {:?}.into(), threadgroups: [\n",
                 entry.name
             ));
             for expression in &native.definition.threadgroups {
@@ -633,8 +546,8 @@ mod internals {
                 TensorAccess::Mutable => "&'a mut seismic::Tensor".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
-            ParameterSummaryKind::Index => "u64".to_owned(),
-            ParameterSummaryKind::Range => "(u64, u64)".to_owned(),
+            ParameterSummaryKind::Index => "seismic::BigUint".to_owned(),
+            ParameterSummaryKind::Range => "(seismic::BigUint, seismic::BigUint)".to_owned(),
         }
     }
 
@@ -646,8 +559,8 @@ mod internals {
                 TensorAccess::Mutable => "seismic::WorkflowTensorMut<'a>".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
-            ParameterSummaryKind::Index => "u64".to_owned(),
-            ParameterSummaryKind::Range => "(u64, u64)".to_owned(),
+            ParameterSummaryKind::Index => "seismic::BigUint".to_owned(),
+            ParameterSummaryKind::Range => "(seismic::BigUint, seismic::BigUint)".to_owned(),
         }
     }
 
@@ -756,8 +669,8 @@ mod internals {
         match kind {
             ResultSummaryKind::Tensor { .. } => "seismic::Tensor",
             ResultSummaryKind::Scalar(dtype) => scalar_type(*dtype),
-            ResultSummaryKind::Index => "u64",
-            ResultSummaryKind::Range => "(u64, u64)",
+            ResultSummaryKind::Index => "seismic::BigUint",
+            ResultSummaryKind::Range => "(seismic::BigUint, seismic::BigUint)",
         }
     }
 
@@ -767,9 +680,101 @@ mod internals {
             ResultSummaryKind::Scalar(dtype) => {
                 format!("seismic::WorkflowScalar<{}>", scalar_type(*dtype))
             }
-            ResultSummaryKind::Index => "seismic::WorkflowScalar<u64>".to_owned(),
-            ResultSummaryKind::Range => "seismic::WorkflowScalar<(u64, u64)>".to_owned(),
+            ResultSummaryKind::Index => "seismic::WorkflowScalar<seismic::BigUint>".to_owned(),
+            ResultSummaryKind::Range => "seismic::WorkflowScalar<(seismic::BigUint, seismic::BigUint)>".to_owned(),
         }
+    }
+
+    fn render_invocation_scope(out: &mut String, entry: &EntryInfo) {
+        out.push_str("  pub struct OptimizeFor { scope: seismic::InvocationScope }\n");
+        out.push_str("  pub fn optimize_for() -> Result<OptimizeFor, seismic::CheckedBundleError> { Ok(OptimizeFor { scope: seismic::generated::invocation_scope::<Entry>()? }) }\n");
+        out.push_str("  impl OptimizeFor {\n");
+        for (ordinal, name) in entry.dimensions.iter().enumerate() {
+            render_range(
+                out,
+                &format!("dimension_{}", ident(name)),
+                "seismic::BigUint",
+                "Nat",
+                false,
+                "Dimension",
+                ordinal,
+            );
+        }
+        for (ordinal, parameter) in entry.parameters.iter().enumerate() {
+            let suffix = if parameter.path.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "_{}",
+                    parameter
+                        .path
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join("_")
+                )
+            };
+            let name = format!("{}_{}{}", "parameter", ident(&parameter.name), suffix);
+            match parameter.kind {
+                ParameterSummaryKind::Tensor { .. } => {}
+                ParameterSummaryKind::Scalar(dtype) => {
+                    let (variant, bits) = match dtype {
+                        DType::F32 => ("F32", false),
+                        DType::F16 => ("F16", true),
+                        DType::BF16 => ("BF16", true),
+                        DType::I32 => ("I32", false),
+                        DType::U32 => ("U32", false),
+                        DType::Bool => ("Bool", false),
+                    };
+                    render_range(
+                        out,
+                        &name,
+                        scalar_type(dtype),
+                        variant,
+                        bits,
+                        "Scalar",
+                        ordinal,
+                    );
+                }
+                ParameterSummaryKind::Index => {
+                    render_range(out, &name, "seismic::BigUint", "Nat", false, "Scalar", ordinal)
+                }
+                ParameterSummaryKind::Range => {
+                    render_range(
+                        out,
+                        &format!("{name}_start"),
+                        "seismic::BigUint",
+                        "Nat",
+                        false,
+                        "RangeStart",
+                        ordinal,
+                    );
+                    render_range(
+                        out,
+                        &format!("{name}_end"),
+                        "seismic::BigUint",
+                        "Nat",
+                        false,
+                        "RangeEnd",
+                        ordinal,
+                    );
+                }
+            }
+        }
+        out.push_str("    pub fn finish(self) -> seismic::InvocationScope { self.scope }\n  }\n");
+    }
+
+    fn render_range(
+        out: &mut String,
+        name: &str,
+        ty: &str,
+        variant: &str,
+        bits: bool,
+        parameter: &str,
+        ordinal: usize,
+    ) {
+        let bits = if bits { ".to_bits()" } else { "" };
+        out.push_str(&format!("    #[allow(non_snake_case)] pub fn {name}(mut self, values: impl Into<seismic::InvocationRange<{ty}>>) -> Self {{ let values = values.into(); self.scope.constrain(seismic::generated::InvocationParameter::{parameter}({ordinal}), seismic::generated::SymbolValue::{variant}(values.lower{bits}), seismic::generated::SymbolValue::{variant}(values.upper{bits})); self }}\n"));
     }
 
     fn scalar_type(dtype: DType) -> &'static str {

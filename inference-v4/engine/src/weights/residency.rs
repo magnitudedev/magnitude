@@ -7,7 +7,7 @@ use super::{
     Error,
 };
 use crate::kernels;
-use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
+use seismic::{DType, Device, Element, Kernel, PreparationOptions, Tensor};
 use std::{collections::HashMap, rc::Rc};
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -63,17 +63,17 @@ fn resident_element(encoding: super::gguf::Encoding) -> Option<Element> {
 
 pub struct Importer {
     device: Rc<Device>,
-    precision: PrecisionPolicy,
+    preparation: PreparationOptions,
     dense: HashMap<(DType, DType), Kernel<kernels::import_weight::Entry>>,
     negative_exp: HashMap<(DType, DType), Kernel<kernels::import_weight_negative_exp::Entry>>,
     repack: HashMap<(Element, Element), Kernel<kernels::repack_weight::Entry>>,
 }
 
 impl Importer {
-    pub fn new(device: Rc<Device>, precision: PrecisionPolicy) -> Self {
+    pub fn new(device: Rc<Device>, preparation: PreparationOptions) -> Self {
         Self {
             device,
-            precision,
+            preparation,
             dense: HashMap::new(),
             negative_exp: HashMap::new(),
             repack: HashMap::new(),
@@ -162,7 +162,7 @@ impl Importer {
                 if !self.repack.contains_key(&key) {
                     let kernel = kernels::repack_weight::for_device_with(
                         &self.device,
-                        self.precision.clone(),
+                        self.preparation.clone(),
                         kernels::repack_weight::Elements {
                             T: source_element,
                             U: destination_element,
@@ -215,7 +215,7 @@ impl Importer {
                             if !self.dense.contains_key(&key) {
                                 let kernel = kernels::import_weight::for_device_with(
                                     &self.device,
-                                    self.precision.clone(),
+                                    self.preparation.clone(),
                                     kernels::import_weight::Elements {
                                         T: source_element,
                                         U: target_element,
@@ -237,7 +237,7 @@ impl Importer {
                             if !self.negative_exp.contains_key(&key) {
                                 let kernel = kernels::import_weight_negative_exp::for_device_with(
                                     &self.device,
-                                    self.precision.clone(),
+                                    self.preparation.clone(),
                                     kernels::import_weight_negative_exp::Elements {
                                         T: source_element,
                                         U: target_element,

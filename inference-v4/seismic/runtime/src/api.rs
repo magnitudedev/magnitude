@@ -364,28 +364,58 @@ pub mod tensor {
             }
         }
         pub fn read_to_host(&self) -> Result<Vec<u8>, ExecutionError> {
-            let _guard = self.allocation.acquire(false);
-            let length = usize::try_from(self.byte_len).map_err(|_| {
+            let access = self.allocation.acquire(false);
+            self.read_with(&access)
+        }
+        pub(crate) fn read_with(
+            &self,
+            access: &crate::driver::AllocationPermit,
+        ) -> Result<Vec<u8>, ExecutionError> {
+            let canonical = crate::layout::canonical(self.representation, &self.extents)?;
+            let length = usize::try_from(canonical.byte_len).map_err(|_| {
                 ExecutionError::AllocationFailed(
                     "tensor is too large for a host byte vector".to_owned(),
                 )
             })?;
             let mut bytes = vec![0u8; length];
-            self.allocation
-                .storage()
-                .read(self.byte_offset, &mut bytes)?;
+            crate::layout::transfer_ranges(
+                self.representation,
+                &self.extents,
+                &self.strides,
+                |offset, host| {
+                    let offset = self.byte_offset.checked_add(offset).ok_or_else(|| {
+                        ExecutionError::AllocationFailed(
+                            "tensor host transfer address overflow".to_owned(),
+                        )
+                    })?;
+                    access.read(&self.allocation, offset, &mut bytes[host])
+                },
+            )?;
             Ok(bytes)
         }
         pub fn write_from_host(&self, bytes: &[u8]) -> Result<(), TensorError> {
+            let canonical = crate::layout::canonical(self.representation, &self.extents)?;
             let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if actual != self.byte_len {
+            if actual != canonical.byte_len {
                 return Err(TensorError::HostByteLength {
-                    expected: self.byte_len,
+                    expected: canonical.byte_len,
                     actual,
                 });
             }
             let _guard = self.allocation.acquire(true);
-            self.allocation.storage().write(self.byte_offset, bytes)?;
+            crate::layout::transfer_ranges(
+                self.representation,
+                &self.extents,
+                &self.strides,
+                |offset, host| {
+                    let offset = self.byte_offset.checked_add(offset).ok_or_else(|| {
+                        ExecutionError::AllocationFailed(
+                            "tensor host transfer address overflow".to_owned(),
+                        )
+                    })?;
+                    self.allocation.storage().write(offset, &bytes[host])
+                },
+            )?;
             Ok(())
         }
         pub fn device(&self) -> &Arc<DeviceInner> {
@@ -620,7 +650,6 @@ pub mod kernel {
     use seismic_lang::checked::{CheckedModule, SourceError};
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::ids::EntryId;
-    use seismic_lang::precision::PrecisionPolicy;
     use std::collections::VecDeque;
     use std::sync::Arc;
 
@@ -635,7 +664,7 @@ pub mod kernel {
     #[derive(Clone, Debug)]
     pub enum NativeExpr {
         Constant(u64),
-        Dimension(&'static str),
+        Dimension(String),
         Add(Box<Self>, Box<Self>),
         Sub(Box<Self>, Box<Self>),
         Mul(Box<Self>, Box<Self>),
@@ -649,7 +678,7 @@ pub mod kernel {
             Self::Constant(value)
         }
         pub fn dimension(name: &'static str) -> Self {
-            Self::Dimension(name)
+            Self::Dimension(name.to_owned())
         }
         pub fn add(left: Self, right: Self) -> Self {
             Self::Add(Box::new(left), Box::new(right))
@@ -673,8 +702,8 @@ pub mod kernel {
 
     /// Source and launch contract for a generated native entry point.
     pub struct NativeDefinition {
-        pub source: &'static str,
-        pub entry: &'static str,
+        pub source: std::borrow::Cow<'static, str>,
+        pub entry: std::borrow::Cow<'static, str>,
         pub threadgroups: [NativeExpr; 3],
         pub threads_per_threadgroup: [NativeExpr; 3],
     }
@@ -801,10 +830,10 @@ pub mod kernel {
     }
 
     #[doc(hidden)]
-    pub use crate::workflow::ScalarValue as EncodedScalar;
+    pub use crate::driver::workflow::ScalarValue as EncodedScalar;
     impl EncodedScalar {
         fn value(&self) -> ArgumentValue {
-            match *self {
+            match self.clone() {
                 Self::F32Bits(bits) => ArgumentValue::F32(f32::from_bits(bits)),
                 Self::F16(value) => ArgumentValue::F16(value),
                 Self::BF16(value) => ArgumentValue::BF16(value),
@@ -875,7 +904,7 @@ pub mod kernel {
     }
 
     #[derive(Clone)]
-    pub(crate) enum DecodedValue {
+    pub enum DecodedValue {
         Tensor(Arc<TensorInner>),
         Scalar(ArgumentValue),
     }
@@ -883,6 +912,9 @@ pub mod kernel {
         values: VecDeque<DecodedValue>,
     }
     impl DecodedResults {
+        pub fn into_values(self) -> Vec<DecodedValue> {
+            self.values.into_iter().collect()
+        }
         pub(crate) fn new(values: Vec<DecodedValue>) -> Self {
             Self {
                 values: values.into(),
@@ -904,12 +936,17 @@ pub mod kernel {
         }
     }
 
-    type PendingCompletion = Box<dyn FnOnce() -> Result<Vec<Vec<DecodedValue>>, super::CallError>>;
+    type WorkflowOutcome = seismic_lang::failure::SourceTermination<
+        Vec<Vec<DecodedValue>>,
+        seismic_compiler::errors::CheckFailure,
+    >;
+
+    type PendingCompletion = Box<dyn FnOnce() -> Result<WorkflowOutcome, super::CallError>>;
 
     enum CompletionState {
         Pending(PendingCompletion),
         Running,
-        Complete(Result<Vec<Vec<DecodedValue>>, super::CallError>),
+        Complete(Result<WorkflowOutcome, super::CallError>),
         Panicked,
     }
 
@@ -925,7 +962,7 @@ pub mod kernel {
     impl WorkflowCompletionAny {
         pub(crate) fn pending(
             workflow: u64,
-            completion: impl FnOnce() -> Result<Vec<Vec<DecodedValue>>, super::CallError> + 'static,
+            completion: impl FnOnce() -> Result<WorkflowOutcome, super::CallError> + 'static,
         ) -> Self {
             Self {
                 workflow,
@@ -934,7 +971,11 @@ pub mod kernel {
             }
         }
 
-        fn complete(&self) -> Result<Vec<Vec<DecodedValue>>, super::CallError> {
+        /// Complete native work exactly once and inspect its typed source
+        /// termination. A source stop has no returned product; device errors
+        /// remain errors. Caller-owned input storage already contains the
+        /// terminal prefix state when this method returns.
+        pub fn outcome(&self) -> Result<WorkflowOutcome, super::CallError> {
             loop {
                 let mut state = self
                     .state
@@ -991,7 +1032,14 @@ pub mod kernel {
             &self,
             outputs: Vec<WorkflowResultRef>,
         ) -> Result<DecodedResults, super::CallError> {
-            let values = self.complete()?;
+            let values = match self.outcome()? {
+                seismic_lang::failure::SourceTermination::Returned(values) => values,
+                seismic_lang::failure::SourceTermination::Failed(failure) => {
+                    return Err(super::CallError::Execution(
+                        seismic_compiler::errors::ExecutionError::DataCheckFailed(failure),
+                    ))
+                }
+            };
             let values = outputs
                 .into_iter()
                 .map(|output| {
@@ -1034,7 +1082,7 @@ pub mod kernel {
                 // that panic, so swallowing it here cannot strand another
                 // resolver or release resources before synchronization ran.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = self.complete();
+                    let _ = self.outcome();
                 }));
             }
         }
@@ -1044,20 +1092,38 @@ pub mod kernel {
         pub(crate) inner: crate::backends::PreparedKind,
     }
 
+    impl PreparedAny {
+        pub fn feedback_report(&self) -> Option<&seismic_compiler::feedback::FeedbackReport> {
+            self.inner.feedback_report()
+        }
+    }
+
     pub struct WorkflowDraftAny {
         inner: crate::backends::WorkflowDraftKind,
     }
 
-    /// Purely bound workflow: policy selection, output descriptors, hazards,
-    /// lifetimes, and allocation requirements are closed, with no resource
-    /// ownership acquired yet.
+    /// Workflow references and the first invocation are bound without acquiring
+    /// resources. Dependent invocations bind after producer results complete.
     pub struct BoundWorkflowAny {
         inner: crate::backends::BoundWorkflowKind,
     }
 
-    /// Fully admitted workflow. It owns capacity, allocations, persistent
-    /// leases, access permits, and a backend submission, but has issued no
-    /// commands yet.
+    impl BoundWorkflowAny {
+        /// Bounds actual newly acquired backing throughout this run, including
+        /// storage reached after producer completion or inside source control.
+        pub fn with_allocation_limit(mut self, bytes: u64) -> Self {
+            self.inner.set_allocation_limit(bytes);
+            self
+        }
+        /// Initial non-external reservation. Reached private allocations are charged during execution.
+        pub fn initial_allocation_bytes(&self) -> u64 {
+            self.inner.initial_allocation_bytes()
+        }
+    }
+
+    /// Initially admitted workflow. It owns initial capacity, allocations,
+    /// persistent leases, access permits, and a backend submission. Planned
+    /// private acquisitions may still fail after source execution begins.
     pub struct AdmittedWorkflowAny {
         inner: crate::backends::AdmittedWorkflowKind,
     }
@@ -1095,16 +1161,46 @@ pub mod kernel {
     ) -> Result<WorkflowCompletionAny, CallError> {
         workflow.inner.submit()
     }
+    pub struct FeedbackPreparation<'a> {
+        inner: crate::backends::FeedbackKind<'a>,
+    }
+    impl FeedbackPreparation<'_> {
+        pub fn continue_for(
+            &mut self,
+            additional: std::time::Duration,
+        ) -> Result<PreparedAny, PrepareError> {
+            self.inner
+                .continue_for(additional)
+                .map(|inner| PreparedAny { inner })
+        }
+        pub fn report(&self) -> &seismic_compiler::feedback::FeedbackReport {
+            self.inner.report()
+        }
+    }
+    pub fn start_feedback<'a>(
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        device: &'a Arc<DeviceInner>,
+        precision: seismic_lang::precision::PrecisionPolicy,
+        options: seismic_compiler::feedback::FeedbackOptions,
+    ) -> Result<(FeedbackPreparation<'a>, PreparedAny), PrepareError> {
+        device
+            .kind
+            .start_feedback(module, entry, bindings, device, precision, options)
+            .map(|(inner, kernel)| (FeedbackPreparation { inner }, PreparedAny { inner: kernel }))
+    }
+
     pub fn prepare(
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
         device: &Arc<DeviceInner>,
-        precision: PrecisionPolicy,
+        options: seismic_compiler::feedback::PreparationOptions,
     ) -> Result<PreparedAny, PrepareError> {
         device
             .kind
-            .prepare(module, entry, bindings, device, precision)
+            .prepare(module, entry, bindings, device, options)
             .map(|inner| PreparedAny { inner })
     }
     pub fn call(kernel: &Arc<PreparedAny>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
@@ -1131,10 +1227,41 @@ pub mod kernel {
         kernel.inner.call(args)
     }
 
+    pub fn call_native_with_commit(
+        kernel: &Arc<NativePreparedAny>,
+        args: EncodedArgs,
+        commit: impl FnOnce(),
+    ) -> Result<DecodedResults, CallError> {
+        kernel.inner.call_with_commit(args, commit)
+    }
+
     #[cfg(test)]
     mod completion_tests {
         use super::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[test]
+        fn device_completion_failure_never_becomes_a_source_stop() {
+            let completion = WorkflowCompletionAny::pending(3, || {
+                Err(super::super::CallError::Execution(
+                    seismic_compiler::errors::ExecutionError::DeviceLost(
+                        "fixture device failure".into(),
+                    ),
+                ))
+            });
+            assert!(matches!(
+                completion.outcome(),
+                Err(super::super::CallError::Execution(
+                    seismic_compiler::errors::ExecutionError::DeviceLost(_),
+                ))
+            ));
+            assert!(matches!(
+                completion.resolve(Vec::new()),
+                Err(super::super::CallError::Execution(
+                    seismic_compiler::errors::ExecutionError::DeviceLost(_),
+                ))
+            ));
+        }
 
         #[test]
         fn completion_runs_once_and_caches() {
@@ -1142,7 +1269,9 @@ pub mod kernel {
             let observed = runs.clone();
             let completion = WorkflowCompletionAny::pending(7, move || {
                 observed.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(seismic_lang::failure::SourceTermination::Returned(
+                    Vec::new(),
+                ))
             });
             completion.resolve(Vec::new()).unwrap();
             completion.resolve(Vec::new()).unwrap();
@@ -1155,7 +1284,9 @@ pub mod kernel {
             let observed = runs.clone();
             let completion = WorkflowCompletionAny::pending(9, move || {
                 observed.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(seismic_lang::failure::SourceTermination::Returned(
+                    Vec::new(),
+                ))
             });
             drop(completion);
             assert_eq!(runs.load(Ordering::SeqCst), 1);

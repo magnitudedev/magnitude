@@ -11,7 +11,6 @@ use seismic_compiler::executable::{
 use seismic_ir::schedule::FillValue;
 use seismic_lang::expr::compiled::{Compiled, InvocationValues};
 use seismic_lang::expr::SymbolValue;
-use seismic_lang::types::DType;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,6 +43,17 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub fn analytical(
+        &self,
+        device: Arc<seismic_target::DeviceDescription<Cpu>>,
+    ) -> Result<
+        seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>,
+        seismic_compiler::errors::TargetError,
+    > {
+        let mut workers = self.workers.lock().expect("CPU worker pool lock poisoned");
+        crate::profile::profile_for_workers(&mut workers, device)
+    }
+
     pub(crate) fn from_workers(workers: Workers) -> Self {
         Self {
             workers: Arc::new(Mutex::new(workers)),
@@ -82,13 +92,14 @@ impl NativeSubmission<Cpu> for Submission {
         match command {
             ExecutableCommand::Launch {
                 kernel,
-                mode: _,
+                descriptor: _,
                 grid,
                 workgroup,
                 empty,
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 addressable_resources,
                 local_totals,
@@ -102,6 +113,7 @@ impl NativeSubmission<Cpu> for Submission {
                 bindings,
                 nat_args,
                 scalar_args,
+                result_slots,
                 locals,
                 addressable_resources,
                 local_totals,
@@ -115,8 +127,8 @@ impl NativeSubmission<Cpu> for Submission {
                 bytes,
             } => {
                 let bytes = evaluate(bytes, env.values());
-                let source = view_range(source, bytes, env);
-                let destination = view_range(destination, bytes, env);
+                let source = view_range(source, bytes, env)?;
+                let destination = view_range(destination, bytes, env)?;
                 let bytes = usize::try_from(bytes)
                     .unwrap_or_else(|_| panic!("prepared CPU copy byte count exceeds usize"));
                 unsafe { std::ptr::copy(source, destination, bytes) };
@@ -128,7 +140,7 @@ impl NativeSubmission<Cpu> for Submission {
                 bytes,
             } => {
                 let bytes = evaluate(bytes, env.values());
-                let destination = view_range(destination, bytes, env);
+                let destination = view_range(destination, bytes, env)?;
                 fill(destination, bytes, *value);
                 Ok(())
             }
@@ -146,19 +158,27 @@ impl NativeSubmission<Cpu> for Submission {
                 to,
             } => {
                 let offset = evaluate(byte_offset, env.values());
-                let width = u64::from(to.dtype().bytes());
+                let width = u64::from(to.kind().bytes());
                 let base = view_range(
                     source,
                     offset
                         .checked_add(width)
                         .unwrap_or_else(|| panic!("prepared scalar-read range overflows u64")),
                     env,
-                );
+                )?;
                 let pointer = unsafe { base.add(to_usize(offset, "scalar read byte offset")) };
-                env.set_slot(*to, unsafe { read_scalar(pointer, to.dtype()) });
+                let mut bytes = [0u8; 8];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(pointer, bytes.as_mut_ptr(), width as usize);
+                }
+                env.set_slot(*to, to.kind().decode_word(u64::from_le_bytes(bytes)));
                 Ok(())
             }
         }
+    }
+
+    fn complete_prefix(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
     }
 
     fn submit(self) -> Self::Execution {
@@ -183,6 +203,7 @@ impl Submission {
         bindings: &[CompiledBufferView],
         nat_args: &[seismic_lang::expr::compiled::CompiledNat],
         scalar_args: &[seismic_lang::expr::SymbolId],
+        result_slots: &[seismic_ir::schedule::AnyScalarSlot],
         locals: &[CompiledLocalLayout],
         addressable_resources: &[seismic_compiler::executable::CompiledAddressableResource],
         local_totals: &CompiledLocalClassTotals,
@@ -197,7 +218,7 @@ impl Submission {
             addressable_resources.is_empty(),
             "CPU executable contains an addressable resource excluded by its target profile"
         );
-        if evaluate(empty, env.values()) {
+        if env.predicate(empty) {
             return Ok(());
         }
         let kernel = env.kernel_handle(kernel_id);
@@ -219,7 +240,7 @@ impl Submission {
 
         let mut resolved_bindings = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            resolved_bindings.push(env.resolve_view(binding));
+            resolved_bindings.push(env.resolve_view(binding)?);
         }
         let buffer_table = resolved_bindings
             .iter()
@@ -239,7 +260,7 @@ impl Submission {
                 .values()
                 .get(symbol)
                 .unwrap_or_else(|| panic!("prepared kernel scalar argument is unbound"));
-            words[kernel.layout.words.scalar_first as usize + index] = encode_symbol(value);
+            words[kernel.layout.words.scalar_first as usize + index] = encode_symbol(value)?;
         }
         for (position, binding) in resolved_bindings.iter().enumerate() {
             let layout = kernel.layout.words.bindings[position];
@@ -272,7 +293,7 @@ impl Submission {
             ..kernel.layout.words.workgroup_first as usize + 3]
             .copy_from_slice(&workgroup);
 
-        let mut results = vec![0u64; kernel.layout.result_slots.len()];
+        let mut results = vec![0u64; result_slots.len()];
         let frame = LaunchFrame {
             buffers: buffer_table.as_ptr(),
             words: words.as_ptr(),
@@ -291,16 +312,15 @@ impl Submission {
                 register_bytes,
             )
             .map_err(launch_error)?;
-        let result_slots = kernel.layout.result_slots.clone();
-        for ((slot, dtype), word) in result_slots.iter().zip(results) {
-            env.set_slot(*slot, decode_symbol(word, *dtype));
+        for (slot, word) in result_slots.iter().zip(results) {
+            env.set_slot(*slot, slot.kind().decode_word(word));
         }
         Ok(())
     }
 }
 
-fn evaluate<T: Copy>(value: &Compiled<T>, values: &InvocationValues) -> T {
-    value.evaluate(values).unwrap_or_else(|error| {
+fn evaluate(value: &seismic_lang::expr::compiled::CompiledNat, values: &InvocationValues) -> u64 {
+    value.evaluate_u64(values).unwrap_or_else(|error| {
         panic!("prepared CPU command expression failed evaluation: {error:?}")
     })
 }
@@ -309,15 +329,17 @@ fn view_range(
     view: &CompiledBufferView,
     bytes: u64,
     env: &ExecutionEnvironment<'_, Cpu, crate::command::CompiledKernel, Device>,
-) -> *mut u8 {
-    let resolved = env.resolve_view(view);
-    let _ = bytes;
-    unsafe {
+) -> Result<*mut u8, ExecutionError> {
+    let resolved = env.resolve_view(view)?;
+    if bytes > resolved.byte_span {
+        return Err(ExecutionError::ConstructionContradiction("CPU transfer exceeds resolved view".into()));
+    }
+    Ok(unsafe {
         resolved.buffer.data_pointer().add(to_usize(
             resolved.byte_offset,
             "resolved buffer byte offset",
         ))
-    }
+    })
 }
 
 fn checked_product(values: [u64; 3], name: &str) -> u64 {
@@ -347,42 +369,9 @@ fn fill(destination: *mut u8, bytes: u64, value: FillValue) {
     }
 }
 
-fn encode_symbol(value: SymbolValue) -> u64 {
-    match value {
-        SymbolValue::Nat(value) => value,
-        SymbolValue::Int(value) => value as u64,
-        SymbolValue::F32(value) => u64::from(value.to_bits()),
-        SymbolValue::F16(value) | SymbolValue::BF16(value) => u64::from(value),
-        SymbolValue::I32(value) => u64::from(value as u32),
-        SymbolValue::U32(value) => u64::from(value),
-        SymbolValue::Bool(value) => u64::from(value),
-    }
-}
-
-fn decode_symbol(word: u64, dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_bits(word as u32)),
-        DType::F16 => SymbolValue::F16(word as u16),
-        DType::BF16 => SymbolValue::BF16(word as u16),
-        DType::I32 => SymbolValue::I32(word as u32 as i32),
-        DType::U32 => SymbolValue::U32(word as u32),
-        DType::Bool => SymbolValue::Bool(word != 0),
-    }
-}
-
-unsafe fn read_scalar(pointer: *const u8, dtype: DType) -> SymbolValue {
-    match dtype {
-        DType::F32 => SymbolValue::F32(f32::from_bits(unsafe {
-            std::ptr::read_unaligned(pointer.cast::<u32>())
-        })),
-        DType::F16 => SymbolValue::F16(unsafe { std::ptr::read_unaligned(pointer.cast::<u16>()) }),
-        DType::BF16 => {
-            SymbolValue::BF16(unsafe { std::ptr::read_unaligned(pointer.cast::<u16>()) })
-        }
-        DType::I32 => SymbolValue::I32(unsafe { std::ptr::read_unaligned(pointer.cast::<i32>()) }),
-        DType::U32 => SymbolValue::U32(unsafe { std::ptr::read_unaligned(pointer.cast::<u32>()) }),
-        DType::Bool => SymbolValue::Bool(unsafe { std::ptr::read(pointer) } != 0),
-    }
+fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
+    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
+        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
 }
 
 fn allocation_error(error: AllocationFailure) -> ExecutionError {

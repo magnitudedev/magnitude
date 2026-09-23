@@ -8,9 +8,8 @@
 //! module boundary, and every value the checker keeps is re-interned into the
 //! arena through [`intern`].
 //!
-//! Every symbol is a nonnegative integer: dimensions and bounded runtime
-//! integers (index parameters, loop binders, view lengths) are never
-//! negative. The prover establishes `e >= 0` and `e == 0` under facts by
+//! Dimension and Index symbols carry explicit nonnegative bounds. Ordinary
+//! signed Integer/I32 symbols do not. The prover establishes `e >= 0` and `e == 0` under facts by
 //! rewriting quotients and remainders through `x = c * (x / c) + x % c` and
 //! bounding atoms that carry an upper bound. It is sound and incomplete: a
 //! failed proof is a residual the caller reports.
@@ -25,13 +24,11 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Atom {
     Symbol(SymbolId),
-    /// floor(num / den), den > 0 in normalized form
+    /// Euclidean quotient; positive-divisor rules require a proof below.
     Quot(Box<Poly>, Box<Poly>),
-    /// num mod den, den > 0
+    /// Nonnegative Euclidean remainder; the divisor may be signed.
     Rem(Box<Poly>, Box<Poly>),
-    /// A node outside the polynomial fragment, as a nonnegative unknown. An
-    /// integer-sorted foreign node is the difference of its positive and
-    /// negative parts (`negative == true` names the subtracted part).
+    /// A node outside the polynomial fragment, retaining its actual sort.
     Foreign(Foreign),
 }
 
@@ -40,13 +37,12 @@ enum Atom {
 #[derive(Clone, Copy, Debug)]
 struct Foreign {
     key: u64,
-    negative: bool,
     node: AnyExpr,
 }
 
 impl PartialEq for Foreign {
     fn eq(&self, other: &Self) -> bool {
-        self.node == other.node && self.negative == other.negative
+        self.node == other.node
     }
 }
 impl Eq for Foreign {}
@@ -57,8 +53,8 @@ impl PartialOrd for Foreign {
 }
 impl Ord for Foreign {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.key, self.negative)
-            .cmp(&(other.key, other.negative))
+        self.key
+            .cmp(&other.key)
             // A hash is an ordering accelerator, never identity. Arena-owned
             // expression handles have a unique debug form (sort, owner,
             // ordinal), which closes the otherwise-unsound collision case.
@@ -67,17 +63,16 @@ impl Ord for Foreign {
 }
 impl std::hash::Hash for Foreign {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.node, self.negative).hash(state);
+        self.node.hash(state);
     }
 }
 
-fn foreign(node: AnyExpr, negative: bool) -> Atom {
+fn foreign(node: AnyExpr) -> Atom {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     node.hash(&mut hasher);
     Atom::Foreign(Foreign {
         key: hasher.finish(),
-        negative,
         node,
     })
 }
@@ -279,8 +274,8 @@ impl Poly {
         Some(out)
     }
 
-    /// floor(self / den). Requires den to be provably positive; the caller
-    /// checks.
+    /// Euclidean quotient. Sign-dependent rewrites belong to the prover,
+    /// which can establish a divisor's sign on the atom's defined path.
     fn quot(&self, den: &Poly) -> Poly {
         if !self.valid || !den.valid {
             return Poly {
@@ -362,9 +357,6 @@ impl Poly {
                 if rest.is_zero() {
                     return exact;
                 }
-                if rest.as_constant() == Some(-1) {
-                    return exact.sub(&Poly::constant(1));
-                }
                 return exact.add(&Poly::atom(Atom::Quot(
                     Box::new(rest),
                     Box::new(den.clone()),
@@ -433,7 +425,7 @@ impl Poly {
         None
     }
 
-    /// self mod den, in [0, den).
+    /// Euclidean remainder, in [0, abs(den)) for a nonzero divisor.
     fn rem(&self, den: &Poly) -> Poly {
         if !self.valid || !den.valid {
             return Poly {
@@ -601,8 +593,8 @@ fn single_atom_of(s: &Poly) -> Option<Atom> {
 /// nonnegative integers; `Bool` nodes are `1`/`0`), and operations the
 /// polynomial cannot express (min, max, select, alignment, ceiling division,
 /// folds, membership) become opaque atoms through a fresh quotient-free
-/// symbol-less encoding: they are treated as the node's own symbol set, which
-/// keeps every proof sound (an opaque atom is only ever bounded below by 0).
+/// symbol-less encoding. Only sorts with a nonnegative value domain receive
+/// an implicit zero bound.
 fn normalize(arena: &ExprArena, node: AnyExpr) -> Poly {
     match arena.view(node) {
         NodeView::NatConst(c) => match i64::try_from(c) {
@@ -612,10 +604,14 @@ fn normalize(arena: &ExprArena, node: AnyExpr) -> Poly {
         NodeView::IntConst(c) => Poly::constant(c),
         NodeView::BoolConst(b) => Poly::constant(i64::from(b)),
         NodeView::ScalarConst { .. } => opaque(node),
+        NodeView::ScalarInteger { .. } => opaque(node),
         NodeView::Symbol(s) => Poly::symbol(s),
         NodeView::Unary { op, operand } => match op {
-            UnaryOp::NatFromInt | UnaryOp::IntFromNat => normalize(arena, operand),
+            UnaryOp::NatFromInt | UnaryOp::IntFromNat | UnaryOp::IntFromScalar => {
+                normalize(arena, operand)
+            }
             UnaryOp::Not => Poly::constant(1).sub(&normalize(arena, operand)),
+            UnaryOp::ScalarIntegerDefined => opaque(node),
         },
         NodeView::Binary { op, lhs, rhs } => {
             let l = normalize(arena, lhs);
@@ -654,19 +650,11 @@ fn normalize(arena: &ExprArena, node: AnyExpr) -> Poly {
 }
 
 /// An operation outside the polynomial fragment: a nonnegative unknown for
-/// `Nat`/`Bool`/`Cost` sorts, the difference of two nonnegative unknowns for
-/// `Int`/`Scalar` sorts. Sound (nothing is provable about it beyond its
-/// sort) and never produced by the checker's own constructions, which only
-/// build constants, symbols and `+ - * / %`.
+/// `Nat`/`Bool`/`Cost` sorts, and a signed unknown for `Int`/`Scalar` sorts.
+/// The atom re-interns to the identical source node, so proof bounds never
+/// depend on synthetic parts that cannot be represented in the arena.
 fn opaque(node: AnyExpr) -> Poly {
-    match node {
-        AnyExpr::Int(_) | AnyExpr::Scalar(_) => {
-            Poly::atom(foreign(node, false)).sub(&Poly::atom(foreign(node, true)))
-        }
-        AnyExpr::Nat(_) | AnyExpr::Bool(_) | AnyExpr::Duration(_) => {
-            Poly::atom(foreign(node, false))
-        }
-    }
+    Poly::atom(foreign(node))
 }
 
 fn normalize_int(arena: &ExprArena, e: IntExpr) -> Poly {
@@ -698,27 +686,35 @@ fn intern(arena: &mut ExprArena, p: &Poly) -> IntExpr {
 
 fn intern_atom(arena: &mut ExprArena, atom: &Atom) -> IntExpr {
     match atom {
-        Atom::Symbol(s) => arena.int_symbol(*s),
-        Atom::Foreign(f) => {
-            // The positive part re-interns the node itself; the negative part
-            // is the node's subtraction from that (`node - node`), which is
-            // exact because `pos - neg == node` by construction.
-            let node = match f.node {
-                AnyExpr::Int(e) => e,
-                AnyExpr::Nat(n) => arena.int_from_nat(n),
-                AnyExpr::Bool(b) => {
-                    let one = arena.int(1);
-                    let zero = arena.int(0);
-                    arena.int_select(b, one, zero)
-                }
-                AnyExpr::Duration(_) | AnyExpr::Scalar(_) => arena.int(0),
-            };
-            if f.negative {
-                arena.int(0)
-            } else {
-                node
+        Atom::Symbol(s) => match arena.symbol_sort(*s) {
+            crate::expr::SymbolSort::Nat => {
+                let natural = arena.nat_symbol(*s);
+                arena.int_from_nat(natural)
             }
-        }
+            crate::expr::SymbolSort::Int => arena.int_symbol(*s),
+            crate::expr::SymbolSort::Scalar(crate::types::DType::I32) => {
+                let value = arena.scalar_symbol::<crate::expr::I32>(*s);
+                arena.int_from_scalar(value)
+            }
+            crate::expr::SymbolSort::Scalar(crate::types::DType::U32) => {
+                let value = arena.scalar_symbol::<crate::expr::U32>(*s);
+                arena.int_from_scalar(value)
+            }
+            _ => panic!("checked integer algebra contains a non-integer symbol"),
+        },
+        Atom::Foreign(f) => match f.node {
+            AnyExpr::Int(e) => e,
+            AnyExpr::Nat(n) => arena.int_from_nat(n),
+            AnyExpr::Bool(b) => {
+                let one = arena.int(1);
+                let zero = arena.int(0);
+                arena.int_select(b, one, zero)
+            }
+            AnyExpr::Scalar(s) => arena.int_from_scalar_value(s),
+            AnyExpr::Duration(_) => {
+                unreachable!("duration cannot occur in an integer expression")
+            }
+        },
         Atom::Quot(n, d) => {
             let n = intern(arena, n);
             let d = intern(arena, d);
@@ -764,6 +760,26 @@ pub(crate) fn mentions(arena: &ExprArena, e: IntExpr, symbol: SymbolId) -> bool 
 /// equal polynomial meaning canonicalize to the same handle.
 pub(crate) fn canonical(arena: &mut ExprArena, e: IntExpr) -> IntExpr {
     let p = normalize_int(arena, e);
+    if p.valid {
+        intern(arena, &p)
+    } else {
+        e
+    }
+}
+
+/// Recompose a checked logical mixed-radix address. Quotient/remainder
+/// decomposition is lossless: `n % d = n - (n / d) * d`. This reuses the
+/// ordinary exact polynomial owner, so coefficient overflow cannot establish
+/// coverage. Callers supply checked integer addresses, whose divisors are
+/// positive on their execution path.
+pub(crate) fn recompose_address(arena: &mut ExprArena, e: IntExpr) -> IntExpr {
+    let mut p = normalize_int(arena, e);
+    for atom in p.atoms() {
+        if let Atom::Rem(numerator, denominator) = &atom {
+            let quotient = numerator.quot(denominator);
+            p = p.subst(&atom, &numerator.sub(&quotient.mul(denominator)));
+        }
+    }
     if p.valid {
         intern(arena, &p)
     } else {
@@ -922,13 +938,13 @@ fn format_poly(p: &Poly, name: &dyn Fn(SymbolId) -> String) -> String {
 // Facts
 // ---------------------------------------------------------------------------
 
-/// Known bounds on symbols, and equalities that hold. Every symbol is at
-/// least zero; `lower` records a tighter bound.
+/// Known bounds on symbols, and equalities that hold. Signed symbols have no
+/// implicit lower bound; nonnegative origins install an explicit bound.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Facts {
     /// symbol -> inclusive upper bound
     upper: BTreeMap<SymbolId, IntExpr>,
-    /// symbol -> inclusive lower bound (default 0)
+    /// symbol -> inclusive lower bound, when established by its origin
     lower: BTreeMap<SymbolId, IntExpr>,
     /// Further bounds from path conditions; every entry is valid on its own.
     extra_upper: Vec<(SymbolId, IntExpr)>,
@@ -957,11 +973,8 @@ impl Facts {
         }
     }
 
-    pub(crate) fn lower_of(&self, arena: &mut ExprArena, symbol: SymbolId) -> IntExpr {
-        match self.lower.get(&symbol) {
-            Some(lo) => *lo,
-            None => arena.int(0),
-        }
+    pub(crate) fn lower_of(&self, symbol: SymbolId) -> Option<IntExpr> {
+        self.lower.get(&symbol).copied()
     }
 
     pub(crate) fn upper_of(&self, symbol: SymbolId) -> Option<IntExpr> {
@@ -1012,11 +1025,8 @@ impl Facts {
         out
     }
 
-    fn lower_poly(&self, arena: &ExprArena, symbol: SymbolId) -> Poly {
-        self.lower
-            .get(&symbol)
-            .map(|e| normalize_int(arena, *e))
-            .unwrap_or_else(|| Poly::constant(0))
+    fn lower_poly(&self, arena: &ExprArena, symbol: SymbolId) -> Option<Poly> {
+        self.lower.get(&symbol).map(|e| normalize_int(arena, *e))
     }
 
     fn upper_poly(&self, arena: &ExprArena, symbol: SymbolId) -> Option<Poly> {
@@ -1092,280 +1102,6 @@ pub(crate) fn interval_over(
     }
 }
 
-/// Whether the binders in `radix` (magnitude of coefficient, range width)
-/// can be ordered so that each magnitude exceeds `reach`, the largest value
-/// the binders before it can contribute: then `sum(c_k * v_k)` is injective
-/// over the box of ranges, as digits of a mixed radix are. The last binder
-/// needs no width.
-fn mixed_radix(
-    radix: &[(Poly, Option<Poly>)],
-    proves: &dyn Fn(&Poly) -> bool,
-    used: &mut [bool],
-    reach: Poly,
-    one: &Poly,
-) -> bool {
-    let remaining = used.iter().filter(|u| !**u).count();
-    if remaining == 0 {
-        return true;
-    }
-    for i in 0..radix.len() {
-        if used[i] {
-            continue;
-        }
-        let (magnitude, width) = &radix[i];
-        if !proves(&magnitude.sub(one).sub(&reach)) {
-            continue;
-        }
-        used[i] = true;
-        let ok = if remaining == 1 {
-            true
-        } else {
-            match width {
-                Some(width) => {
-                    mixed_radix(radix, proves, used, reach.add(&width.mul(magnitude)), one)
-                }
-                None => false,
-            }
-        };
-        if ok {
-            return true;
-        }
-        used[i] = false;
-    }
-    false
-}
-
-/// One axis of a write, for the disjoint-visit proof.
-pub(crate) enum WriteAxis {
-    Opaque,
-    /// The point index.
-    Point(IntExpr),
-    /// `start .. end`.
-    Slice {
-        start: IntExpr,
-        end: IntExpr,
-    },
-}
-
-/// Prove that distinct visits of the enclosing `parallel for` loops in
-/// `binders` write distinct elements through `axes`.
-///
-/// A binder is proven by a point axis whose index is affine in it with a
-/// nonzero coefficient once every other binder on that axis is already
-/// proven; several unproven binders on one axis are proven together when
-/// their coefficients form a mixed radix over the binders' ranges. A slice
-/// `c*v + d : c*v + d + len` proves `v` when `len <= c`. Data-dependent,
-/// nonlinear, and unbounded indices prove nothing. Returns the first binder
-/// (by position) that stays unproven.
-pub(crate) fn disjoint_visits(
-    arena: &ExprArena,
-    facts: &Facts,
-    axes: &[WriteAxis],
-    binders: &[SymbolId],
-) -> Result<(), usize> {
-    enum Axis {
-        Opaque,
-        Point(Vec<Poly>),
-        Slice {
-            binder: usize,
-            coefficient: Poly,
-            length: Poly,
-        },
-    }
-    let mut normalized = Vec::with_capacity(axes.len());
-    for axis in axes {
-        normalized.push(match axis {
-            WriteAxis::Opaque => Axis::Opaque,
-            WriteAxis::Point(p) => {
-                let p = normalize_int(arena, *p);
-                let mut coefficients = Vec::with_capacity(binders.len());
-                let mut opaque = false;
-                for binder in binders {
-                    match p.linear_coefficient(*binder) {
-                        Some(c) => coefficients.push(c),
-                        None => {
-                            opaque = true;
-                            break;
-                        }
-                    }
-                }
-                if opaque {
-                    Axis::Opaque
-                } else {
-                    Axis::Point(coefficients)
-                }
-            }
-            WriteAxis::Slice { start, end } => {
-                let start = normalize_int(arena, *start);
-                let length = normalize_int(arena, *end).sub(&start);
-                let mut found = None;
-                let mut opaque = false;
-                for (k, binder) in binders.iter().enumerate() {
-                    if length.mentions(*binder) {
-                        opaque = true;
-                        break;
-                    }
-                    match start.linear_coefficient(*binder) {
-                        Some(c) if c.is_zero() => {}
-                        Some(c) if found.is_none() => found = Some((k, c)),
-                        _ => {
-                            opaque = true;
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some((binder, coefficient)) if !opaque => Axis::Slice {
-                        binder,
-                        coefficient,
-                        length,
-                    },
-                    _ => Axis::Opaque,
-                }
-            }
-        });
-    }
-    // A quotient/remainder pair is a lossless mixed-radix decomposition of
-    // its numerator: `(x / d, x % d)` uniquely determines `x` for positive
-    // `d`. Treat the pair as a virtual point axis so flattened row-major
-    // writes retain the same injectivity proof as writing through `x`.
-    for (left_index, left) in axes.iter().enumerate() {
-        let WriteAxis::Point(left) = left else {
-            continue;
-        };
-        let left = normalize_int(arena, *left);
-        let Some(left_atom) = single_atom_of(&left) else {
-            continue;
-        };
-        for right in axes.iter().skip(left_index + 1) {
-            let WriteAxis::Point(right) = right else {
-                continue;
-            };
-            let right = normalize_int(arena, *right);
-            let Some(right_atom) = single_atom_of(&right) else {
-                continue;
-            };
-            let numerator = match (&left_atom, &right_atom) {
-                (Atom::Quot(left_num, left_den), Atom::Rem(right_num, right_den))
-                | (Atom::Rem(left_num, left_den), Atom::Quot(right_num, right_den))
-                    if left_num == right_num && left_den == right_den =>
-                {
-                    let mut engine = Engine::new(arena, facts);
-                    if !engine.nonneg_steps(left_den.sub(&Poly::constant(1)), 24) {
-                        continue;
-                    }
-                    left_num.as_ref()
-                }
-                _ => continue,
-            };
-            let mut coefficients = Vec::with_capacity(binders.len());
-            let mut opaque = false;
-            for binder in binders {
-                match numerator.linear_coefficient(*binder) {
-                    Some(coefficient) => coefficients.push(coefficient),
-                    None => {
-                        opaque = true;
-                        break;
-                    }
-                }
-            }
-            if !opaque {
-                normalized.push(Axis::Point(coefficients));
-            }
-        }
-    }
-    let one = Poly::constant(1);
-    // The write executes inside every capturing loop, so each of their ranges
-    // is nonempty: `upper - lower >= 0` is a fact the goal may spend.
-    let nonempty: Vec<Poly> = binders
-        .iter()
-        .filter_map(|binder| {
-            let upper = facts.upper_poly(arena, *binder)?;
-            Some(upper.sub(&facts.lower_poly(arena, *binder)))
-        })
-        .collect();
-    let proves = |goal: &Poly| -> bool {
-        let mut engine = Engine::new(arena, facts);
-        if engine.nonneg_steps(goal.clone(), 24) {
-            return true;
-        }
-        nonempty.iter().any(|fact| {
-            let mut engine = Engine::new(arena, facts);
-            engine.nonneg_steps(goal.sub(fact), 24)
-        })
-    };
-    let magnitude = |c: &Poly| -> Option<Poly> {
-        if proves(&c.sub(&one)) {
-            Some(c.clone())
-        } else if proves(&c.neg().sub(&one)) {
-            Some(c.neg())
-        } else {
-            None
-        }
-    };
-    let mut proven = vec![false; binders.len()];
-    loop {
-        let mut progress = false;
-        for axis in &normalized {
-            match axis {
-                Axis::Opaque => {}
-                Axis::Slice {
-                    binder,
-                    coefficient,
-                    length,
-                } => {
-                    if !proven[*binder] && proves(&coefficient.sub(length)) {
-                        proven[*binder] = true;
-                        progress = true;
-                    }
-                }
-                Axis::Point(coefficients) => {
-                    let mut pending: Vec<(usize, Poly)> = Vec::new();
-                    let mut usable = true;
-                    for (k, c) in coefficients.iter().enumerate() {
-                        if proven[k] || c.is_zero() {
-                            continue;
-                        }
-                        match magnitude(c) {
-                            Some(m) => pending.push((k, m)),
-                            None => {
-                                usable = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !usable || pending.is_empty() {
-                        continue;
-                    }
-                    let radix: Vec<(Poly, Option<Poly>)> = pending
-                        .iter()
-                        .map(|(k, m)| {
-                            let width = facts
-                                .upper_poly(arena, binders[*k])
-                                .map(|upper| upper.sub(&facts.lower_poly(arena, binders[*k])));
-                            (m.clone(), width)
-                        })
-                        .collect();
-                    let mut used = vec![false; radix.len()];
-                    if mixed_radix(&radix, &proves, &mut used, Poly::constant(0), &one) {
-                        for (k, _) in &pending {
-                            proven[*k] = true;
-                        }
-                        progress = true;
-                    }
-                }
-            }
-        }
-        if !progress {
-            break;
-        }
-    }
-    match proven.iter().position(|p| !p) {
-        Some(k) => Err(k),
-        None => Ok(()),
-    }
-}
-
 impl<'a> Engine<'a> {
     fn new(arena: &'a ExprArena, facts: &'a Facts) -> Engine<'a> {
         Engine {
@@ -1389,9 +1125,9 @@ impl<'a> Engine<'a> {
             return false;
         }
         e = self.apply_zero_facts(e);
-        // Trivially nonnegative: every coefficient nonnegative (atoms are
-        // nonnegative).
-        if e.terms.values().all(|c| *c >= 0) {
+        // A positive coefficient only helps when every factor is known
+        // nonnegative. Signed source values have no such default fact.
+        if self.nonnegative_polynomial(&e, &mut HashSet::new()) {
             return true;
         }
         // For a positive common divisor, floor is monotone and commutes with
@@ -1401,7 +1137,7 @@ impl<'a> Engine<'a> {
             let Atom::Quot(a, d) = &positive else {
                 continue;
             };
-            if d.as_constant().is_none_or(|n| n <= 0) {
+            if !self.positive_denominator_on_defined_atom(d) {
                 continue;
             }
             let positive_term = Poly::atom(positive.clone());
@@ -1452,8 +1188,14 @@ impl<'a> Engine<'a> {
         // A quotient is monotone in its numerator.
         for atom in e.atoms() {
             if let Atom::Quot(n, d) = &atom {
+                if !self.positive_denominator_on_defined_atom(d) {
+                    continue;
+                }
                 let (lo, hi) = self.interval_over(n, &|_| true);
-                for (bound, want_upper) in [(hi.quot(d), true), (lo.quot(d), false)] {
+                for (bound, want_upper) in [
+                    (self.quot_on_positive_denominator(&hi, d), true),
+                    (self.quot_on_positive_denominator(&lo, d), false),
+                ] {
                     let signs: Vec<i64> = e
                         .terms
                         .iter()
@@ -1502,9 +1244,11 @@ impl<'a> Engine<'a> {
         for (atom, upper) in candidates {
             let bounds: Vec<Poly> = if upper {
                 match &atom {
-                    Atom::Rem(_, d) => vec![d.sub(&Poly::constant(1))],
+                    Atom::Rem(_, d) if self.positive_denominator_on_defined_atom(d) => {
+                        vec![d.sub(&Poly::constant(1))]
+                    }
                     Atom::Symbol(s) => self.facts.uppers_of(self.arena, *s),
-                    Atom::Quot(..) | Atom::Foreign(_) => Vec::new(),
+                    Atom::Rem(..) | Atom::Quot(..) | Atom::Foreign(_) => Vec::new(),
                 }
             } else {
                 match &atom {
@@ -1521,10 +1265,7 @@ impl<'a> Engine<'a> {
         }
         // Try every immediate bound before recursively combining bounds.
         if substitutions.iter().any(|s| {
-            self.apply_zero_facts(s.clone())
-                .terms
-                .values()
-                .all(|c| *c >= 0)
+            self.nonnegative_polynomial(&self.apply_zero_facts(s.clone()), &mut HashSet::new())
         }) {
             return true;
         }
@@ -1569,6 +1310,18 @@ impl<'a> Engine<'a> {
         let mut lo = Poly::default();
         let mut hi = Poly::default();
         for (m, c) in &e.terms {
+            // Endpoint multiplication is monotone only when every factor is
+            // nonnegative. Preserve a signed monomial exactly; even bounding
+            // a different nonnegative factor can reverse its inequality.
+            if m.keys()
+                .any(|a| !self.nonnegative_atom(a, &mut HashSet::new()))
+            {
+                let mut exact = Poly::default();
+                exact.insert(m.clone(), *c);
+                lo = lo.add(&exact);
+                hi = hi.add(&exact);
+                continue;
+            }
             let mut lo_term = Poly::constant(*c);
             let mut hi_term = Poly::constant(*c);
             for (a, k) in m {
@@ -1597,27 +1350,192 @@ impl<'a> Engine<'a> {
 
     fn atom_bounds_over(&self, a: &Atom, bound: &dyn Fn(SymbolId) -> bool) -> (Poly, Option<Poly>) {
         match a {
-            Atom::Rem(_, d) => (Poly::constant(0), Some(d.sub(&Poly::constant(1)))),
+            Atom::Rem(_, d) => {
+                let upper = self
+                    .positive_denominator_on_defined_atom(d)
+                    .then(|| d.sub(&Poly::constant(1)));
+                (Poly::constant(0), upper)
+            }
             Atom::Quot(n, d) => {
+                if !self.nonnegative_atom(a, &mut HashSet::new()) {
+                    let exact = Poly::atom(a.clone());
+                    return (exact.clone(), Some(exact));
+                }
                 let (lo, hi) = self.interval_over(n, bound);
                 // Accepted integer division has a positive denominator, so
                 // floor division is monotone even when that denominator is a
                 // symbolic shape extent. Keeping the quotient here is what
                 // proves row-major bounds such as
                 // `(M*N - 1) / N == M - 1`.
-                (lo.quot(d), Some(hi.quot(d)))
+                let lower = self.quot_on_positive_denominator(&lo, d);
+                if !self.nonnegative_polynomial(&lower, &mut HashSet::new()) {
+                    let exact = Poly::atom(a.clone());
+                    return (exact.clone(), Some(exact));
+                }
+                (lower, Some(self.quot_on_positive_denominator(&hi, d)))
             }
             Atom::Symbol(s) => {
                 if bound(*s) {
-                    (
-                        self.facts.lower_poly(self.arena, *s),
-                        self.facts.upper_poly(self.arena, *s),
-                    )
+                    match self.facts.lower_poly(self.arena, *s) {
+                        Some(lower) if self.nonnegative_polynomial(&lower, &mut HashSet::new()) => {
+                            (lower, self.facts.upper_poly(self.arena, *s))
+                        }
+                        None => (Poly::symbol(*s), Some(Poly::symbol(*s))),
+                        Some(_) => (Poly::symbol(*s), Some(Poly::symbol(*s))),
+                    }
                 } else {
                     (Poly::symbol(*s), Some(Poly::symbol(*s)))
                 }
             }
-            Atom::Foreign(_) => (Poly::constant(0), None),
+            Atom::Foreign(f) => {
+                if matches!(
+                    f.node,
+                    AnyExpr::Nat(_) | AnyExpr::Bool(_) | AnyExpr::Duration(_)
+                ) {
+                    (Poly::constant(0), None)
+                } else {
+                    let exact = Poly::atom(a.clone());
+                    (exact.clone(), Some(exact))
+                }
+            }
         }
+    }
+
+    fn nonnegative_polynomial(&self, value: &Poly, visiting: &mut HashSet<SymbolId>) -> bool {
+        value.valid
+            && value.terms.iter().all(|(factors, coefficient)| {
+                *coefficient >= 0
+                    && factors
+                        .keys()
+                        .all(|factor| self.nonnegative_atom(factor, visiting))
+            })
+    }
+
+    /// A quotient/remainder atom is evaluated only when its denominator is
+    /// nonzero. A denominator already known nonnegative is therefore positive
+    /// on every execution where that atom has a value.
+    fn positive_denominator_on_defined_atom(&self, denominator: &Poly) -> bool {
+        self.nonnegative_polynomial(denominator, &mut HashSet::new())
+    }
+
+    /// On a defined quotient with a nonnegative denominator, the denominator
+    /// is positive and Euclidean `-1 / d` equals `-1`. Keep this rewrite in
+    /// the proof engine, where the atom's definedness is available; the
+    /// unconditional polynomial normalizer cannot make it.
+    fn quot_on_positive_denominator(&self, numerator: &Poly, denominator: &Poly) -> Poly {
+        let quotient = numerator.quot(denominator);
+        if !self.positive_denominator_on_defined_atom(denominator) {
+            return quotient;
+        }
+        let minus_one = Poly::constant(-1);
+        let boundary = Atom::Quot(Box::new(minus_one.clone()), Box::new(denominator.clone()));
+        quotient.subst(&boundary, &minus_one)
+    }
+
+    fn nonnegative_atom(&self, atom: &Atom, visiting: &mut HashSet<SymbolId>) -> bool {
+        match atom {
+            Atom::Symbol(symbol) => {
+                if self.arena.symbol_sort(*symbol) == crate::expr::SymbolSort::Nat {
+                    return true;
+                }
+                if !visiting.insert(*symbol) {
+                    return false;
+                }
+                let proved = self
+                    .facts
+                    .lower
+                    .get(symbol)
+                    .into_iter()
+                    .chain(
+                        self.facts
+                            .extra_lower
+                            .iter()
+                            .filter(|(bounded, _)| bounded == symbol)
+                            .map(|(_, lower)| lower),
+                    )
+                    .any(|lower| {
+                        self.nonnegative_polynomial(&normalize_int(self.arena, *lower), visiting)
+                    });
+                visiting.remove(symbol);
+                proved
+            }
+            Atom::Rem(..) => true,
+            Atom::Foreign(f) => {
+                matches!(
+                    f.node,
+                    AnyExpr::Nat(_) | AnyExpr::Bool(_) | AnyExpr::Duration(_)
+                )
+            }
+            Atom::Quot(numerator, denominator) => {
+                self.nonnegative_polynomial(numerator, visiting)
+                    && self.positive_denominator_on_defined_atom(denominator)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_multiplication_preserves_signed_factors() {
+        let mut arena = ExprArena::new();
+        let (_, symbol, value) = arena.loop_binder();
+        let lower = arena.int(-5);
+        let upper = arena.int(3);
+        let square = arena.int_mul(value, value);
+        let mut facts = Facts::new();
+        facts.set_range(symbol, lower, upper);
+        let (lo, hi) = interval_over(&mut arena, &facts, square, &|_| true);
+        assert!(same(&arena, lo, square));
+        assert!(same(&arena, hi, square));
+
+        let (_, natural_symbol, natural) = arena.nat_loop_binder();
+        let natural = arena.int_from_nat(natural);
+        let product = arena.int_mul(value, natural);
+        let zero = arena.int(0);
+        let three = arena.int(3);
+        facts.set_range(natural_symbol, zero, three);
+        let (lo, hi) = interval_over(&mut arena, &facts, product, &|_| true);
+        assert!(same(&arena, lo, product));
+        assert!(same(&arena, hi, product));
+    }
+
+    #[test]
+    fn interval_multiplication_still_bounds_nonnegative_factors() {
+        let mut arena = ExprArena::new();
+        let (_, symbol, value) = arena.nat_loop_binder();
+        let value = arena.int_from_nat(value);
+        let lower = arena.int(0);
+        let upper = arena.int(3);
+        let square = arena.int_mul(value, value);
+        let mut facts = Facts::new();
+        facts.set_range(symbol, lower, upper);
+        let (lo, hi) = interval_over(&mut arena, &facts, square, &|_| true);
+        assert!(is_zero(&arena, lo));
+        let nine = arena.int(9);
+        assert!(same(&arena, hi, nine));
+    }
+
+    #[test]
+    fn signed_opaque_scalar_round_trips_without_a_zero_bound() {
+        let mut arena = ExprArena::new();
+        let (_, _, input) = arena.loop_binder();
+        let one = arena.int(1);
+        let wrapped = arena.scalar_integer(
+            crate::reference_math::ScalarOp::Binary(crate::syntax::ast::BinaryOp::Add),
+            &[
+                (crate::types::DType::I32, input),
+                (crate::types::DType::I32, one),
+            ],
+        );
+        let normalized = normalize_int(&arena, wrapped);
+        let restored = intern(&mut arena, &normalized);
+        assert!(same(&arena, restored, wrapped));
+        assert!(!nonneg(&arena, &Facts::new(), wrapped));
+        let (lo, hi) = interval_over(&mut arena, &Facts::new(), wrapped, &|_| true);
+        assert!(same(&arena, lo, wrapped));
+        assert!(same(&arena, hi, wrapped));
     }
 }

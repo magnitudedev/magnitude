@@ -38,10 +38,6 @@ use std::time::Instant;
 
 pub const PROBE_SUITE_REVISION: &str = "seismic-metal-probes-v2";
 
-fn cooperative_launch_mode(_: &MetalFacts) -> Option<crate::MetalLaunchMode> {
-    None
-}
-
 fn addressable_resources(_: &MetalFacts) -> Vec<seismic_ir::target::AddressableResourceClass> {
     Vec::new()
 }
@@ -52,9 +48,7 @@ pub fn registry() -> &'static CompilerRegistry<Metal> {
     REGISTRY.get_or_init(|| {
         CompilerRegistry::assemble(CompilerRegistryParts {
             capabilities: crate::intrinsic::registrations(),
-            structural_factories: crate::factories::structural_factories(),
-            independent_launch_mode: crate::MetalLaunchMode,
-            cooperative_launch_mode,
+
             native_launch_constraints: crate::native_launch_constraints,
             addressable_resources,
             emitted_intrinsics: crate::intrinsic::emitted_intrinsics(),
@@ -226,7 +220,7 @@ fn limits_of(facts: &MetalFacts) -> TargetLimits {
         max_argument_bytes: u64::from(ARGUMENT_TABLE_ENTRIES) * 8,
         max_allocation_bytes: facts.max_buffer_bytes,
         max_allocation_alignment: facts.buffer_alignment,
-        max_index_bits: 32,
+        max_index_bits: 64,
         // SIMD width is reflected from each concrete pipeline.
         subgroup_width: None,
     }

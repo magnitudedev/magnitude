@@ -6,7 +6,7 @@
 use super::{decoder::Decoder, loading::Model};
 use crate::inputs::{ByteBpeTokenizer, SpecialTokens, TokenId};
 use crate::Error;
-use seismic::{Device, PrecisionPolicy};
+use seismic::{Device, PreparationOptions};
 use serde::Serialize;
 use std::{path::Path, rc::Rc, time::Instant};
 
@@ -70,6 +70,7 @@ pub struct Report {
     pub device: String,
     pub device_memory_bytes: u64,
     pub precision_policy: String,
+    pub preparation_method: String,
     pub engine_version: String,
     pub host_os: String,
     pub host_arch: String,
@@ -104,6 +105,7 @@ pub struct Session {
     device: String,
     device_memory_bytes: u64,
     precision_policy: String,
+    preparation_method: String,
     context_capacity: usize,
     load_seconds: f64,
 }
@@ -157,18 +159,19 @@ impl Session {
     pub fn load(
         path: impl AsRef<Path>,
         device: Rc<Device>,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         context_capacity: usize,
     ) -> Result<Self, Error> {
         let start = Instant::now();
         let backend = device.backend().as_str().to_owned();
         let device_name = device.info().name.clone();
         let device_memory_bytes = device.info().memory_bytes;
-        let precision_policy = format!("{precision:?}");
+        let precision_policy = format!("{:?}", preparation.precision);
+        let preparation_method = format!("{:?}", preparation.evaluation);
         let model = Model::open(path)?;
         let artifact = model.description().artifact_identity.to_string();
         let tokenizer = ByteBpeTokenizer::new(model.tokenizer_config()?)?;
-        let decoder = model.load(device, precision, context_capacity, 1)?;
+        let decoder = model.load(device, preparation, context_capacity, 1)?;
         Ok(Self {
             decoder,
             tokenizer,
@@ -177,6 +180,7 @@ impl Session {
             device: device_name,
             device_memory_bytes,
             precision_policy,
+            preparation_method,
             context_capacity,
             load_seconds: start.elapsed().as_secs_f64(),
         })
@@ -297,6 +301,7 @@ impl Session {
             device: self.device.clone(),
             device_memory_bytes: self.device_memory_bytes,
             precision_policy: self.precision_policy.clone(),
+            preparation_method: self.preparation_method.clone(),
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
             host_os: std::env::consts::OS.to_owned(),
             host_arch: std::env::consts::ARCH.to_owned(),

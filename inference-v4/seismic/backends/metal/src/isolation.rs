@@ -1,6 +1,7 @@
 //! Host-only composition fixture: the production builders, traversal, Metal
 //! transfer and emitter all consume the same kernel, without opening a device.
-use crate::services::{CONTROL, F32_ADD_SUB, SERVICE_SUBMISSION};
+use crate::services::{CONTROL, SERVICE_SUBMISSION};
+const INTEGER: ServiceClassId = ServiceClassId::new("metal.integer");
 use crate::{Metal, MetalFacts};
 use seismic_estimator::*;
 use seismic_ir::{
@@ -9,7 +10,7 @@ use seismic_ir::{
         ops::{BinaryOp, ClosedOpView, ConstantValue, ValueType},
         Kernel,
     },
-    schedule::{Launch, LaunchMode},
+    schedule::{Launch, LaunchParticipation},
     storage::LaunchLocalLayout,
     target::*,
 };
@@ -47,9 +48,82 @@ fn emission(kernel: &Kernel<Metal>) -> KernelEmissionLayout {
         locals: vec![],
         addressable_resources: vec![],
         scalar_args: vec![],
-        result_slots: vec![],
+        result_types: vec![],
     }
 }
+
+#[test]
+fn repeat_carry_permutations_read_the_old_state() {
+    use seismic_lang::registry::IntrinsicUniformity;
+    use std::collections::HashMap;
+
+    for count in [2, 3, 40] {
+        let facts = facts();
+        let mut arena = ExprArena::default();
+        let mut construction = Construction::<Metal>::new(&mut arena, vec![], false, 0);
+        let vectors = VectorSupport::default();
+        let mut builder = construction.portable_kernel(&mut arena, &facts, &[], &vectors);
+        let start = builder.index_constant(0);
+        let end = builder.index_constant(1);
+        let initial = (1..=count)
+            .map(|i| builder.constant(ConstantValue::U32(i as u32), ValueType::Scalar(DType::U32)))
+            .collect();
+        builder.repeat(
+            start,
+            end,
+            initial,
+            &vec![IntrinsicUniformity::Workgroup; count],
+            |_, _, mut values| {
+                values.rotate_left(1);
+                values
+            },
+        );
+        builder.close();
+        let kernel = &construction.kernels()[0];
+        let source = crate::render::render(0, kernel, &emission(kernel)).source;
+        let (prefix, body) = source.split_once("for (").unwrap();
+        let mut state = HashMap::<String, u32>::new();
+        let mut initialized = Vec::new();
+        for line in prefix.lines() {
+            let Some((left, right)) = line.trim().split_once(" = ") else {
+                continue;
+            };
+            let destination = left.split_whitespace().last().unwrap();
+            let right = right.trim_end_matches(';');
+            if let Some(value) = state.get(right).copied().or_else(|| {
+                right
+                    .strip_prefix("uint(")?
+                    .strip_suffix("u)")?
+                    .parse()
+                    .ok()
+            }) {
+                state.insert(destination.to_string(), value);
+                initialized.push(destination.to_string());
+            }
+        }
+        let carries = &initialized[initialized.len() - count..];
+        for line in body
+            .split_once('{')
+            .unwrap()
+            .1
+            .split('}')
+            .next()
+            .unwrap()
+            .lines()
+        {
+            let Some((left, right)) = line.trim().split_once(" = ") else {
+                continue;
+            };
+            let destination = left.split_whitespace().last().unwrap();
+            let value = state[right.trim_end_matches(';')];
+            state.insert(destination.to_string(), value);
+        }
+        for (i, carry) in carries.iter().enumerate() {
+            assert_eq!(state[carry], ((i + 1) % count + 1) as u32, "{source}");
+        }
+    }
+}
+
 struct Model {
     definitions: Vec<ServiceDefinition>,
 }
@@ -68,20 +142,20 @@ impl ExecutionModel<Metal> for Model {
     fn operation_cost(
         &self,
         arena: &mut ExprArena,
-        _: &Kernel<Metal>,
+        kernel: &Kernel<Metal>,
         _: &KernelEmissionLayout,
-        _: &Launch,
+        _: &Launch<Metal>,
         _: &LaunchLocalLayout,
         op: ClosedOpView<'_, Metal>,
-    ) -> OperationCost {
-        seismic_estimator_metal::operation_cost(arena, op)
-            .map_services(|service| ServiceClassId::new(service.stable_name()))
+    ) -> Result<OperationCost, ModelLimitation> {
+        seismic_estimator_metal::operation_cost(arena, kernel, op)
+            .map(|cost| cost.map_services(|service| ServiceClassId::new(service.stable_name())))
     }
 }
 #[test]
 fn same_closed_kernel_reaches_estimation_and_metal_emission_without_a_device() {
     let model = Model {
-        definitions: [SERVICE_SUBMISSION, CONTROL, F32_ADD_SUB]
+        definitions: [SERVICE_SUBMISSION, CONTROL, INTEGER]
             .into_iter()
             .map(|class| ServiceDefinition {
                 class,
@@ -122,7 +196,7 @@ fn same_closed_kernel_reaches_estimation_and_metal_emission_without_a_device() {
     let mut builder = c.schedule(&mut arena, 0);
     let launch = builder.launch(Launch {
         kernel: id,
-        mode: LaunchMode::Independent,
+        descriptor: crate::MetalLaunchMode,
         grid: [one; 3],
         workgroup: [one; 3],
         empty,
@@ -131,27 +205,38 @@ fn same_closed_kernel_reaches_estimation_and_metal_emission_without_a_device() {
     });
     builder.step_launch(launch);
     let token = builder.close();
-    let analyzed = c.close(token).analyze_allocations();
+    let analyzed = c
+        .close(token)
+        .normalize_launches(&mut arena, u64::MAX, 64)
+        .unwrap()
+        .analyze_allocations();
     let planned = analyzed.apply_allocation_plan(
         &mut arena,
         seismic_ir::construction::AllocationPlan::distinct(),
     );
-    let executable = planned.finish().close_execution(&mut arena);
-    let prediction = estimate(&model, &mut arena, executable.view());
+    let executable = planned.finish().close_execution(
+        &mut arena,
+        LocalRealizationPolicy {
+            workgroup: LocalRealization::NativeDynamic,
+            participant: LocalRealization::NativeStatic,
+            register: LocalRealization::NativeStatic,
+        },
+        &crate::profile::MetalKernelAbi,
+    );
+    let prediction = estimate(&model, &mut arena, executable.view()).unwrap();
     let duration = arena
         .eval_duration(prediction.estimate(), &Assignment::new())
         .unwrap();
-    assert_eq!(
-        duration.upper().numerator(),
-        28 * u128::from(duration.upper().denominator())
-    );
+    // Source addition now contributes its actual word recipe; the old
+    // three-scalar-op fixture cost would hide that constructed work.
+    assert!(duration.upper().numerator() > 28 * u128::from(duration.upper().denominator()));
     let kernel = executable.kernels().kernel(id);
     let rendered = crate::render::render(0, kernel, &emission(kernel));
-    assert!(rendered.source.contains("f32_add("));
+    assert!(rendered.source.contains("as_type<float>("));
     assert!(prediction
         .contributions()
         .iter()
-        .any(|term| term.class() == F32_ADD_SUB));
+        .any(|term| term.class() == INTEGER));
 }
 
 #[test]
@@ -167,35 +252,51 @@ fn checked_source_refines_without_a_profile_or_native_context() {
             &seismic_lang::entry::ElementBindings::new(),
         )
         .unwrap();
-    let parts = entry.into_parts();
-    let mut arena = parts.arena;
+    use seismic_compiler::candidate_domain::{
+        construct_candidate_domain, ConstructionAllowance, ConstructionCoordinate, Materialization,
+    };
     let target = crate::profile::device_description_from_facts(facts()).unwrap();
-    let constants = seismic_compiler::target::bind_target_constants(&target, &mut arena);
     let budget = seismic_compiler::preparation_budget::PreparationBudget::default();
     let precision = Default::default();
-    let refined = seismic_compiler::refinement::RefinementSession::new(
-        seismic_compiler::refinement::RefinementLimits::from(&budget),
-    )
-    .refine(
-        arena,
-        seismic_compiler::refinement::RefinementRequest {
-            program: &parts.program,
-            schema: &parts.schema,
-            target: &target,
-            registry: crate::profile::registry(),
-            constants: &constants,
-            precision: &precision,
-        },
+    let mut domain = construct_candidate_domain(
+        entry,
+        &target,
+        crate::profile::registry(),
+        &precision,
+        &budget,
     )
     .unwrap();
-    assert!(refined.universal().kernels().kernels().next().is_some());
-    assert!(!refined.universal().schedule().launches().is_empty());
-    assert!(refined
-        .optimized()
-        .iter()
-        .all(|family| family.kernels().kernels().next().is_some()));
-    assert_eq!(
-        refined.report().completion,
-        seismic_compiler::refinement::RefinementCompletion::Complete
-    );
+    let mut paths = domain
+        .root_selections()
+        .into_iter()
+        .map(ConstructionCoordinate::root)
+        .collect::<Vec<_>>();
+    let mut completed = 0;
+    while let Some(path) = paths.pop() {
+        match domain
+            .advance(
+                &path,
+                ConstructionAllowance {
+                    work_units: 100_000,
+                    wall_time: std::time::Duration::from_secs(30),
+                },
+            )
+            .state
+        {
+            Materialization::Choice(choice) => paths.extend(
+                choice
+                    .alternatives
+                    .iter()
+                    .map(|body| path.select(&choice, *body)),
+            ),
+            Materialization::Ready(identity) => {
+                let read = domain.read_materialized(&identity).unwrap();
+                assert!(read.candidate().kernels().kernels().next().is_some());
+                assert!(!read.candidate().schedule().launches().is_empty());
+                completed += 1;
+            }
+            other => panic!("fixture construction did not finish: {other:?}"),
+        }
+    }
+    assert!(completed > 1);
 }

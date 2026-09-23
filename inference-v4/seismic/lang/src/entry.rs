@@ -28,6 +28,9 @@ use crate::registry::BackendName;
 use crate::span::Span;
 use crate::types::DType;
 use std::collections::BTreeMap;
+use num_bigint::BigUint;
+use num_traits::{CheckedSub, Zero};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Element bindings
@@ -438,7 +441,7 @@ impl CompiledDimensionInferencePlan {
         }
         for step in &self.steps {
             let actual = observations[step.observation];
-            let mut value = actual;
+            let mut value = BigUint::from(actual);
             for operation in &step.operations {
                 let failure = || DimensionInferenceFailure {
                     observation: step.observation,
@@ -447,22 +450,22 @@ impl CompiledDimensionInferencePlan {
                     CompiledDimensionInferenceOp::Add(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
-                        value = value.checked_add(known).ok_or_else(failure)?;
+                        value += known;
                     }
                     CompiledDimensionInferenceOp::Subtract(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
-                        value = value.checked_sub(known).ok_or_else(failure)?;
+                        value = value.checked_sub(&known).ok_or_else(failure)?;
                     }
                     CompiledDimensionInferenceOp::ReverseSubtract(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
-                        value = known.checked_sub(value).ok_or_else(failure)?;
+                        value = known.checked_sub(&value).ok_or_else(failure)?;
                     }
                     CompiledDimensionInferenceOp::DivideExact(known) => {
                         let divisor =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
-                        if divisor == 0 || value % divisor != 0 {
+                        if divisor.is_zero() || (&value % &divisor) != BigUint::zero() {
                             return Err(failure());
                         }
                         value /= divisor;
@@ -470,7 +473,12 @@ impl CompiledDimensionInferencePlan {
                 }
             }
             values.bind(step.dimension, SymbolValue::Nat(value));
-            if step.axis.evaluate(values).ok() != Some(actual) {
+        }
+        // An observed subexpression can eliminate a dimension whose own value
+        // is solved later. Validate the original equations only after the full
+        // triangular solve, retaining their partial-operation checks.
+        for step in &self.steps {
+            if step.axis.evaluate(values).ok() != Some(BigUint::from(observations[step.observation])) {
                 return Err(DimensionInferenceFailure {
                     observation: step.observation,
                 });
@@ -484,16 +492,16 @@ fn evaluate_known(
     known: &CompiledDimensionInferenceKnown,
     observations: &[u64],
     values: &InvocationValues,
-) -> Option<u64> {
+) -> Option<BigUint> {
     match known {
         CompiledDimensionInferenceKnown::Observation(observation) => {
-            observations.get(*observation).copied()
+            observations.get(*observation).copied().map(BigUint::from)
         }
         CompiledDimensionInferenceKnown::Nat(expression) => expression.evaluate(values).ok(),
         CompiledDimensionInferenceKnown::Int(expression) => expression
             .evaluate(values)
             .ok()
-            .and_then(|value| u64::try_from(value).ok()),
+            .and_then(|value| value.to_biguint()),
     }
 }
 
@@ -603,13 +611,57 @@ impl EntryDomain {
 pub struct LogicalEntry {
     identity: StableEntryId,
     module: ModuleHash,
-    schema: CallSchema,
+    schema: Arc<CallSchema>,
     domain: EntryDomain,
     arena: ExprArena,
     program: SemanticProgram,
 }
 
+/// Borrowed checked semantics over the owning expression arena. Preparation
+/// can retain the source program while extending that same arena with compiler
+/// expressions; reference evaluation requires neither an arena copy nor a
+/// second LogicalEntry owner.
+#[derive(Clone, Copy)]
+pub struct LogicalEntryView<'a> {
+    schema: &'a CallSchema,
+    domain: EntryDomain,
+    arena: &'a ExprArena,
+    program: &'a SemanticProgram,
+}
+
+impl<'a> LogicalEntryView<'a> {
+    pub fn from_parts(
+        schema: &'a CallSchema,
+        domain: EntryDomain,
+        arena: &'a ExprArena,
+        program: &'a SemanticProgram,
+    ) -> Self {
+        Self {
+            schema,
+            domain,
+            arena,
+            program,
+        }
+    }
+    pub fn schema(self) -> &'a CallSchema {
+        self.schema
+    }
+    pub fn domain(self) -> EntryDomain {
+        self.domain
+    }
+    pub fn arena(self) -> &'a ExprArena {
+        self.arena
+    }
+    pub fn program(self) -> &'a SemanticProgram {
+        self.program
+    }
+}
+
 impl LogicalEntry {
+    pub fn as_view(&self) -> LogicalEntryView<'_> {
+        LogicalEntryView::from_parts(&self.schema, self.domain, &self.arena, &self.program)
+    }
+
     pub(crate) fn new(
         identity: StableEntryId,
         module: ModuleHash,
@@ -634,11 +686,13 @@ impl LogicalEntry {
                         let _ = arena.view(AnyExpr::Nat(*axis));
                     });
                 }
-                ParameterKind::Scalar { symbol, .. } => {
+                ParameterKind::Scalar { dtype, symbol } => {
                     assert!(matches!(
                         arena.symbol_kind(*symbol),
                         crate::expr::SymbolKind::CallScalar(id) if id == parameter.id
-                    ))
+                    ));
+                    assert_eq!(arena.symbol_sort(*symbol), crate::expr::SymbolSort::Scalar(*dtype),
+                        "call scalar must retain its declared source word sort");
                 }
                 ParameterKind::Index { bound, symbol } => {
                     let _ = arena.view(AnyExpr::Nat(*bound));
@@ -710,7 +764,7 @@ impl LogicalEntry {
         Self {
             identity,
             module,
-            schema,
+            schema: Arc::new(schema),
             domain,
             arena,
             program,
@@ -725,6 +779,9 @@ impl LogicalEntry {
     }
     pub fn schema(&self) -> &CallSchema {
         &self.schema
+    }
+    pub fn shared_schema(&self) -> Arc<CallSchema> {
+        self.schema.clone()
     }
     pub fn domain(&self) -> &EntryDomain {
         &self.domain
@@ -950,19 +1007,20 @@ fn collect_manifest_accesses(
             let Some(public_region) = public_region else {
                 continue;
             };
-            let kind = match event.access() {
-                AccessKind::Read => ManifestAccessKind::Read,
-                AccessKind::Write(authority) => ManifestAccessKind::Write {
+            let kind = match event.kind() {
+                SemanticEventKind::MayFail => continue,
+                SemanticEventKind::Read => ManifestAccessKind::Read,
+                SemanticEventKind::Write(authority) => ManifestAccessKind::Write {
                     exclusive: authority.is_some(),
                 },
-                AccessKind::AtomicRmw { op, capability } => ManifestAccessKind::AtomicRmw {
+                SemanticEventKind::AtomicRmw { op, capability } => ManifestAccessKind::AtomicRmw {
                     op: *op,
                     order: capability.order(),
                     scope: capability.scope().clone(),
                     publication: capability.publication(),
                     outcome: capability.outcome(),
                 },
-                AccessKind::Barrier(capability) => ManifestAccessKind::Barrier {
+                SemanticEventKind::Barrier(capability) => ManifestAccessKind::Barrier {
                     cohort: capability.cohort().clone(),
                 },
             };
@@ -1125,7 +1183,10 @@ fn find_region_capture(
 
 fn validate_type_arena(arena: &ExprArena, ty: &SemanticType) {
     match ty {
-        SemanticType::Scalar(_) | SemanticType::Opaque { .. } | SemanticType::Void => {}
+        SemanticType::Scalar(_)
+        | SemanticType::Integer
+        | SemanticType::Opaque { .. }
+        | SemanticType::Void => {}
         SemanticType::Index { bound } | SemanticType::Range { bound } => {
             let _ = arena.view(AnyExpr::Nat(*bound));
         }
@@ -1156,8 +1217,8 @@ fn validate_view_arena(arena: &ExprArena, transform: &ViewTransform) {
         ViewTransform::Slice { axes } => {
             for axis in axes {
                 match axis {
-                    SliceAxis::Point(value) => validate_scalar(value),
-                    SliceAxis::Range { start, end } => {
+                    SliceAxis::Point { value, .. } => validate_scalar(value),
+                    SliceAxis::Range { start, end, .. } => {
                         start.iter().for_each(|value| validate_scalar(value));
                         end.iter().for_each(|value| validate_scalar(value));
                     }
@@ -1178,7 +1239,7 @@ fn validate_view_arena(arena: &ExprArena, transform: &ViewTransform) {
 pub struct LogicalEntryParts {
     pub identity: StableEntryId,
     pub module: ModuleHash,
-    pub schema: CallSchema,
+    pub schema: Arc<CallSchema>,
     pub domain: EntryDomain,
     pub arena: ExprArena,
     pub program: SemanticProgram,
@@ -1189,6 +1250,89 @@ pub struct LogicalEntryParts {
 #[derive(Debug)]
 pub struct SemanticProgram {
     inner: internals::Program,
+}
+
+/// Exact checked subject shared by independently lowered copies of one entry.
+/// The source set is canonicalized by `check_source`; element bindings are in
+/// declared-key order. Compiler and registry versions are fixed by this build.
+#[derive(Clone, Debug)]
+pub struct CheckedProgramSubject {
+    sources: Arc<crate::checked::SourceSet>,
+    elements: Vec<(String, RepresentationId)>,
+    digest: [u8; 32],
+}
+
+impl PartialEq for CheckedProgramSubject {
+    fn eq(&self, other: &Self) -> bool {
+        (Arc::ptr_eq(&self.sources, &other.sources) && self.elements == other.elements)
+            || (self.digest == other.digest
+                && self.sources == other.sources
+                && self.elements == other.elements)
+    }
+}
+
+impl Eq for CheckedProgramSubject {}
+
+impl CheckedProgramSubject {
+    pub(crate) fn new(
+        sources: Arc<crate::checked::SourceSet>,
+        elements: Vec<(String, RepresentationId)>,
+    ) -> Self {
+        let mut subject = Self {
+            sources,
+            elements,
+            digest: [0; 32],
+        };
+        subject.digest = subject.compute_digest();
+        subject
+    }
+
+    pub fn sources(&self) -> &crate::checked::SourceSet {
+        &self.sources
+    }
+
+    pub fn elements(&self) -> &[(String, RepresentationId)] {
+        &self.elements
+    }
+
+    /// Compact label only; equality must compare the exact subject.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    fn compute_digest(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"seismic-checked-program-subject-v1");
+        for version in [
+            crate::bundle::COMPILER_SEMANTIC_VERSION,
+            crate::registry::REGISTRY_REVISION,
+        ] {
+            hash.update((version.len() as u64).to_le_bytes());
+            hash.update(version.as_bytes());
+        }
+        hash.update((self.sources.files().len() as u64).to_le_bytes());
+        for source in self.sources.files() {
+            hash.update((source.path.len() as u64).to_le_bytes());
+            hash.update(source.path.as_bytes());
+            hash.update((source.text.len() as u64).to_le_bytes());
+            hash.update(source.text.as_bytes());
+        }
+        hash.update((self.elements.len() as u64).to_le_bytes());
+        for (name, representation) in &self.elements {
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update((representation.index() as u64).to_le_bytes());
+        }
+        hash.finalize().into()
+    }
+}
+
+impl std::hash::Hash for CheckedProgramSubject {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // A collision shares a bucket; PartialEq still compares the full subject.
+        std::hash::Hash::hash(&self.digest, state);
+    }
 }
 
 impl SemanticProgram {
@@ -1210,6 +1354,14 @@ impl SemanticProgram {
     }
     pub fn functions(&self) -> impl Iterator<Item = (FunctionId, &SemanticFunction)> + '_ {
         self.inner.functions()
+    }
+    /// Canonical checked sources shared by every function in this program.
+    /// Equality of this value is exact and independent of stable-label digests.
+    pub fn sources(&self) -> &crate::checked::SourceSet {
+        self.inner.subject().sources()
+    }
+    pub fn subject(&self) -> &Arc<CheckedProgramSubject> {
+        self.inner.subject()
     }
 
     fn seal_reference_candidates(&mut self) {
@@ -1348,6 +1500,11 @@ impl SemanticFunction {
     pub fn stable(&self) -> StableFunctionId {
         self.inner.stable()
     }
+    /// Ordinal of the checked source definition instantiated by this function.
+    /// Interpret it only together with the exact checked source module.
+    pub fn source_definition(&self) -> u64 {
+        self.inner.source_definition()
+    }
     pub fn name(&self) -> &str {
         self.inner.name()
     }
@@ -1357,6 +1514,9 @@ impl SemanticFunction {
     /// Parameters as values of the root region.
     pub fn parameters(&self) -> &[FunctionParameter] {
         self.inner.parameters()
+    }
+    pub fn initialization(&self) -> &crate::initialization::InitializationContract {
+        &self.inner.initialization
     }
     /// The values the function returns, in leaf order.
     pub fn results(&self) -> &[SemanticValueId] {
@@ -1375,6 +1535,37 @@ impl SemanticFunction {
     pub fn node(&self, id: NodeId) -> &SemanticNode {
         self.inner.node(id)
     }
+    /// Language scalar meaning of these actual typed operands. Event sealing,
+    /// construction and source scope inference consume this same selection.
+    pub fn scalar_recipe(
+        &self,
+        primitive: &PrimitiveId,
+        operands: &[SemanticValueId],
+    ) -> Option<Arc<crate::reference_math::ReferenceRecipe>> {
+        semantic_scalar_recipe(primitive, operands.iter().map(|id| &self.value(*id).ty))
+    }
+    pub(crate) fn has_failure_events(&self) -> bool {
+        let mut regions = vec![self.root()];
+        while let Some(region) = regions.pop() {
+            for (_, node) in self.nodes(region) {
+                if node
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event.kind(), SemanticEventKind::MayFail))
+                {
+                    return true;
+                }
+                match node.view() {
+                    SemanticNodeView::If {
+                        then, otherwise, ..
+                    } => regions.extend([then, otherwise]),
+                    SemanticNodeView::Loop { body, .. } => regions.push(body),
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
     pub fn value(&self, id: SemanticValueId) -> &ValueInfo {
         self.inner.value(id)
     }
@@ -1383,16 +1574,46 @@ impl SemanticFunction {
     }
 }
 
+/// The checker calls the same operation selection while constructing its
+/// actual typed node, before that node is sealed into a SemanticFunction.
+pub(crate) fn semantic_scalar_recipe<'a>(
+    primitive: &PrimitiveId,
+    operands: impl IntoIterator<Item = &'a SemanticType>,
+) -> Option<Arc<crate::reference_math::ReferenceRecipe>> {
+    let operation = crate::reference_math::scalar_operation(primitive)?;
+    let operands = operands.into_iter().collect::<Vec<_>>();
+    let mixed_index = matches!(primitive, PrimitiveId::Binary(_))
+        && operands
+            .iter()
+            .any(|ty| matches!(ty, SemanticType::Scalar(DType::I32)));
+    let types = operands
+        .into_iter()
+        .map(|ty| match ty {
+            SemanticType::Scalar(dtype) => Some(*dtype),
+            SemanticType::Tensor(tensor) => {
+                Some(crate::registry::representation_info(tensor.representation).decoded)
+            }
+            SemanticType::Index { .. } if mixed_index => Some(DType::I32),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(crate::reference_math::scalar_recipe(operation, &types))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParameter {
-    /// Source parameter ordinal and tuple path. The semantic contract itself
-    /// is leaf-flat; these fields retain only the author-facing grouping used
-    /// by generated call schemas and diagnostics.
-    pub source: u32,
-    pub path: Vec<u32>,
+    /// Source leaves and captured shape dimensions share the function's one
+    /// complete parameter product.
+    pub origin: FunctionParameterOrigin,
     pub name: String,
     pub value: SemanticValueId,
     pub access: ParameterAccess,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunctionParameterOrigin {
+    Source { ordinal: u32, path: Vec<u32> },
+    ShapeDimension { ordinal: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1411,6 +1632,7 @@ pub struct Region {
     /// Values the region yields to its parent node.
     results: Vec<SemanticValueId>,
     nodes: Vec<SemanticNode>,
+    initialization: Option<crate::initialization::LoopInitialization>,
 }
 
 impl Region {
@@ -1419,13 +1641,18 @@ impl Region {
         parameters: Vec<SemanticValueId>,
         results: Vec<SemanticValueId>,
         nodes: Vec<SemanticNode>,
+        initialization: Option<crate::initialization::LoopInitialization>,
     ) -> Self {
         Self {
             kind,
             parameters,
             results,
             nodes,
+            initialization,
         }
+    }
+    pub fn loop_initialization(&self) -> Option<&crate::initialization::LoopInitialization> {
+        self.initialization.as_ref()
     }
     pub fn kind(&self) -> &RegionKind {
         &self.kind
@@ -1467,6 +1694,8 @@ pub struct ValueInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SemanticType {
     Scalar(DType),
+    /// Exact signed mathematical quantity.
+    Integer,
     Index {
         bound: NatExpr,
     },
@@ -1531,11 +1760,21 @@ pub enum ViewTransform {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SliceAxis {
     /// Point index; the axis is removed.
-    Point(ScalarRef),
+    Point {
+        value: ScalarRef,
+        /// The checked source emitted a runtime bound check. When false,
+        /// validity is a checker-owned premise in this source control scope.
+        runtime_check: bool,
+    },
     /// `start..end` on the axis, preserving omitted endpoints.
     Range {
         start: Option<ScalarRef>,
         end: Option<ScalarRef>,
+        /// Existing checked-source decisions, retained with their operands.
+        /// These do not authorize a physical view without correspondence and scope.
+        check_start: bool,
+        check_order: bool,
+        check_end: bool,
     },
     Full,
 }
@@ -1615,15 +1854,18 @@ impl SemanticNode {
                 outputs,
             },
             NodeKind::Alloc => {
-                assert!(inputs.is_empty(), "checked alloc node cannot have inputs");
                 NodeData::Alloc {
+                    extents: inputs,
                     output: one_output(outputs, "alloc"),
                 }
             }
             NodeKind::Fill { value } => {
-                assert!(inputs.is_empty(), "checked fill node cannot have inputs");
+                let [like] = inputs.as_slice() else {
+                    panic!("checked fill node needs its evaluated shape source")
+                };
                 NodeData::Fill {
                     value,
+                    like: *like,
                     output: one_output(outputs, "fill"),
                 }
             }
@@ -1647,11 +1889,19 @@ impl SemanticNode {
                 }
             }
             NodeKind::View(transform) => {
-                let Some(base) = inputs.first() else {
+                let Some((&base, extents)) = inputs.split_first() else {
                     panic!("checked view node has no base")
                 };
+                let extents = if matches!(transform, ViewTransform::Reshape { .. }) {
+                    extents.to_vec()
+                } else {
+                    // Slice coordinates are held as actual ScalarRef::Value
+                    // operands by the typed transform itself.
+                    Vec::new()
+                };
                 NodeData::View {
-                    base: *base,
+                    base,
+                    extents,
                     transform,
                     output: one_output(outputs, "view"),
                 }
@@ -1786,6 +2036,32 @@ impl SemanticNode {
     pub fn dependencies(&self) -> Vec<SemanticValueId> {
         node_dependencies(self.view())
     }
+    /// Complete ordered result projection of the sealed operation. Product
+    /// transport consumers use this instead of reconstructing output arities.
+    pub fn results(&self) -> Vec<SemanticValueId> {
+        match self.view() {
+            SemanticNodeView::Primitive { output, .. }
+            | SemanticNodeView::Intrinsic { output, .. }
+            | SemanticNodeView::Elementwise { output, .. }
+            | SemanticNodeView::Reduce { output, .. }
+            | SemanticNodeView::Alloc { output, .. }
+            | SemanticNodeView::Fill { output, .. }
+            | SemanticNodeView::Copy { output, .. }
+            | SemanticNodeView::RepresentationConvert { output, .. }
+            | SemanticNodeView::View { output, .. }
+            | SemanticNodeView::ElementRead { output, .. }
+            | SemanticNodeView::ElementWrite { output, .. }
+            | SemanticNodeView::Store { output, .. }
+            | SemanticNodeView::Atomic { output, .. }
+            | SemanticNodeView::TuplePack { output, .. }
+            | SemanticNodeView::TupleGet { output, .. }
+            | SemanticNodeView::Extent { output, .. } => vec![output],
+            SemanticNodeView::Call { outputs, .. }
+            | SemanticNodeView::If { outputs, .. }
+            | SemanticNodeView::Loop { outputs, .. } => outputs.to_vec(),
+            SemanticNodeView::Check { .. } => vec![],
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1818,10 +2094,12 @@ enum NodeData {
         outputs: Vec<SemanticValueId>,
     },
     Alloc {
+        extents: Vec<SemanticValueId>,
         output: SemanticValueId,
     },
     Fill {
         value: crate::intrinsics::FillConstant,
+        like: SemanticValueId,
         output: SemanticValueId,
     },
     Copy {
@@ -1835,6 +2113,7 @@ enum NodeData {
     },
     View {
         base: SemanticValueId,
+        extents: Vec<SemanticValueId>,
         transform: ViewTransform,
         output: SemanticValueId,
     },
@@ -1926,10 +2205,12 @@ pub enum SemanticNodeView<'a> {
         outputs: &'a [SemanticValueId],
     },
     Alloc {
+        extents: &'a [SemanticValueId],
         output: SemanticValueId,
     },
     Fill {
         value: crate::intrinsics::FillConstant,
+        like: SemanticValueId,
         output: SemanticValueId,
     },
     Copy {
@@ -1943,6 +2224,7 @@ pub enum SemanticNodeView<'a> {
     },
     View {
         base: SemanticValueId,
+        extents: &'a [SemanticValueId],
         transform: &'a ViewTransform,
         output: SemanticValueId,
     },
@@ -2056,9 +2338,13 @@ impl NodeData {
                 inputs,
                 outputs,
             },
-            Self::Alloc { output } => SemanticNodeView::Alloc { output: *output },
-            Self::Fill { value, output } => SemanticNodeView::Fill {
+            Self::Alloc { extents, output } => SemanticNodeView::Alloc {
+                extents,
+                output: *output,
+            },
+            Self::Fill { value, like, output } => SemanticNodeView::Fill {
                 value: *value,
+                like: *like,
                 output: *output,
             },
             Self::Copy { input, output } => SemanticNodeView::Copy {
@@ -2076,10 +2362,12 @@ impl NodeData {
             },
             Self::View {
                 base,
+                extents,
                 transform,
                 output,
             } => SemanticNodeView::View {
                 base: *base,
+                extents,
                 transform,
                 output: *output,
             },
@@ -2195,14 +2483,18 @@ fn node_dependencies(node: SemanticNodeView<'_>) -> Vec<SemanticValueId> {
         | SemanticNodeView::Copy { input, .. }
         | SemanticNodeView::RepresentationConvert { input, .. } => values.push(input),
         SemanticNodeView::View {
-            base, transform, ..
+            base, extents, transform, ..
         } => {
             values.push(base);
+            values.extend_from_slice(extents);
             if let ViewTransform::Slice { axes } = transform {
                 for axis in axes {
                     match axis {
-                        SliceAxis::Point(ScalarRef::Value(value)) => values.push(*value),
-                        SliceAxis::Range { start, end } => {
+                        SliceAxis::Point {
+                            value: ScalarRef::Value(value),
+                            ..
+                        } => values.push(*value),
+                        SliceAxis::Range { start, end, .. } => {
                             if let Some(ScalarRef::Value(value)) = start {
                                 values.push(*value);
                             }
@@ -2210,7 +2502,11 @@ fn node_dependencies(node: SemanticNodeView<'_>) -> Vec<SemanticValueId> {
                                 values.push(*value);
                             }
                         }
-                        SliceAxis::Point(ScalarRef::Static(_)) | SliceAxis::Full => {}
+                        SliceAxis::Point {
+                            value: ScalarRef::Static(_),
+                            ..
+                        }
+                        | SliceAxis::Full => {}
                     }
                 }
             }
@@ -2258,7 +2554,8 @@ fn node_dependencies(node: SemanticNodeView<'_>) -> Vec<SemanticValueId> {
         SemanticNodeView::Check { condition, .. } => values.push(condition),
         SemanticNodeView::TupleGet { tuple, .. } => values.push(tuple),
         SemanticNodeView::Extent { tensor, .. } => values.push(tensor),
-        SemanticNodeView::Alloc { .. } | SemanticNodeView::Fill { .. } => {}
+        SemanticNodeView::Alloc { extents, .. } => values.extend_from_slice(extents),
+        SemanticNodeView::Fill { like, .. } => values.push(like),
     }
     values
 }
@@ -2269,7 +2566,7 @@ fn node_outputs(node: SemanticNodeView<'_>) -> Vec<SemanticValueId> {
         | SemanticNodeView::Intrinsic { output, .. }
         | SemanticNodeView::Elementwise { output, .. }
         | SemanticNodeView::Reduce { output, .. }
-        | SemanticNodeView::Alloc { output }
+        | SemanticNodeView::Alloc { output, .. }
         | SemanticNodeView::Fill { output, .. }
         | SemanticNodeView::Copy { output, .. }
         | SemanticNodeView::RepresentationConvert { output, .. }
@@ -2458,7 +2755,7 @@ impl BarrierCapability {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AccessKind {
+pub enum SemanticEventKind {
     Read,
     Write(Option<ExclusiveWriteCapability>),
     AtomicRmw {
@@ -2466,16 +2763,19 @@ pub enum AccessKind {
         capability: AtomicCapability,
     },
     Barrier(BarrierCapability),
+    /// Evaluating this source operation can terminate its continuation.
+    MayFail,
 }
 
-/// Complete semantic memory event carried by a checked operation.
+/// Complete source event carried by a checked operation: memory, synchronization
+/// or failure. All share the same source-order predecessor relation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SemanticEvent {
     id: SemanticEventId,
     region: RegionId,
     place: Option<SemanticValueId>,
     indices: Box<[SemanticValueId]>,
-    access: AccessKind,
+    kind: SemanticEventKind,
     representation: Option<RepresentationId>,
     participants: ParticipantDomain,
     ordering_dependencies: Box<[SemanticEventId]>,
@@ -2488,7 +2788,7 @@ impl SemanticEvent {
         id: SemanticEventId,
         place: Option<SemanticValueId>,
         indices: Vec<SemanticValueId>,
-        access: AccessKind,
+        kind: SemanticEventKind,
         representation: Option<RepresentationId>,
         participants: ParticipantDomain,
         ordering_dependencies: Vec<SemanticEventId>,
@@ -2500,7 +2800,7 @@ impl SemanticEvent {
             region: id.node().region(),
             place,
             indices: indices.into_boxed_slice(),
-            access,
+            kind,
             representation,
             participants,
             ordering_dependencies: ordering_dependencies.into_boxed_slice(),
@@ -2520,8 +2820,8 @@ impl SemanticEvent {
     pub fn indices(&self) -> &[SemanticValueId] {
         &self.indices
     }
-    pub fn access(&self) -> &AccessKind {
-        &self.access
+    pub fn kind(&self) -> &SemanticEventKind {
+        &self.kind
     }
     pub fn representation(&self) -> Option<RepresentationId> {
         self.representation
@@ -2625,12 +2925,10 @@ pub struct Carry {
     pub result: SemanticValueId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CheckReason {
     IndexBound,
     RangeOrder,
-    DivideByZero,
-    SignedDivisionOverflow,
     Custom(String),
 }
 
@@ -2652,6 +2950,7 @@ pub(crate) mod internals {
     #[derive(Debug)]
     pub(crate) struct Program {
         id: ProgramId,
+        subject: Arc<CheckedProgramSubject>,
         root: FamilyId,
         families: Vec<Family>,
         functions: Vec<SemanticFunction>,
@@ -2660,6 +2959,7 @@ pub(crate) mod internals {
     impl Program {
         pub(crate) fn new(
             id: ProgramId,
+            subject: Arc<CheckedProgramSubject>,
             root: FamilyId,
             families: Vec<Family>,
             functions: Vec<SemanticFunction>,
@@ -2687,6 +2987,7 @@ pub(crate) mod internals {
             }
             Self {
                 id,
+                subject,
                 root,
                 families,
                 functions,
@@ -2695,6 +2996,9 @@ pub(crate) mod internals {
 
         pub(crate) fn root(&self) -> FamilyId {
             self.root
+        }
+        pub(crate) fn subject(&self) -> &Arc<CheckedProgramSubject> {
+            &self.subject
         }
         pub(crate) fn family(&self, id: FamilyId) -> &Family {
             assert_eq!(
@@ -2741,6 +3045,7 @@ pub(crate) mod internals {
     pub(crate) struct Function {
         id: FunctionId,
         stable: StableFunctionId,
+        source_definition: u64,
         name: String,
         span: Span,
         parameters: Vec<FunctionParameter>,
@@ -2748,6 +3053,7 @@ pub(crate) mod internals {
         root: RegionId,
         regions: Vec<Region>,
         values: Vec<ValueInfo>,
+        pub(super) initialization: crate::initialization::InitializationContract,
     }
 
     impl Function {
@@ -2755,6 +3061,7 @@ pub(crate) mod internals {
         pub(crate) fn new(
             id: FunctionId,
             stable: StableFunctionId,
+            source_definition: u64,
             name: String,
             span: Span,
             parameters: Vec<FunctionParameter>,
@@ -2762,6 +3069,7 @@ pub(crate) mod internals {
             root: RegionId,
             regions: Vec<Region>,
             values: Vec<ValueInfo>,
+            initialization: crate::initialization::InitializationContract,
         ) -> Self {
             assert_eq!(
                 root.function(),
@@ -2845,14 +3153,18 @@ pub(crate) mod internals {
                                 ));
                             }
                         }
-                        match event.access() {
-                            AccessKind::Read | AccessKind::Write(None) => {}
-                            AccessKind::Write(Some(capability)) => {
+                        match event.kind() {
+                            SemanticEventKind::MayFail => {
+                                assert!(event.place().is_none());
+                                assert!(event.representation().is_none());
+                            }
+                            SemanticEventKind::Read | SemanticEventKind::Write(None) => {}
+                            SemanticEventKind::Write(Some(capability)) => {
                                 assert_eq!(event.place(), Some(capability.place()));
                                 assert_eq!(event.indices(), capability.indices());
                                 assert_eq!(event.participants(), capability.participants());
                             }
-                            AccessKind::AtomicRmw { capability, .. } => {
+                            SemanticEventKind::AtomicRmw { capability, .. } => {
                                 assert_eq!(event.place(), Some(capability.place()));
                                 assert_eq!(event.indices(), capability.indices());
                                 assert_eq!(event.participants(), capability.participants());
@@ -2865,7 +3177,7 @@ pub(crate) mod internals {
                                     }
                                 );
                             }
-                            AccessKind::Barrier(capability) => {
+                            SemanticEventKind::Barrier(capability) => {
                                 assert!(event.place().is_none());
                                 assert_eq!(event.participants(), capability.cohort());
                                 assert_eq!(event.visibility(), capability.visibility());
@@ -2928,6 +3240,7 @@ pub(crate) mod internals {
             Self {
                 id,
                 stable,
+                source_definition,
                 name,
                 span,
                 parameters,
@@ -2935,6 +3248,7 @@ pub(crate) mod internals {
                 root,
                 regions,
                 values,
+                initialization,
             }
         }
 
@@ -2943,6 +3257,9 @@ pub(crate) mod internals {
         }
         pub(crate) fn stable(&self) -> StableFunctionId {
             self.stable
+        }
+        pub(crate) fn source_definition(&self) -> u64 {
+            self.source_definition
         }
         pub(crate) fn name(&self) -> &str {
             &self.name
@@ -3033,8 +3350,8 @@ pub(crate) mod internals {
         if let ViewTransform::Slice { axes } = transform {
             for axis in axes {
                 match axis {
-                    SliceAxis::Point(value) => scalar(value),
-                    SliceAxis::Range { start, end } => {
+                    SliceAxis::Point { value, .. } => scalar(value),
+                    SliceAxis::Range { start, end, .. } => {
                         start.iter().for_each(|value| scalar(value));
                         end.iter().for_each(|value| scalar(value));
                     }
@@ -3083,5 +3400,33 @@ mod dimension_inference_tests {
             plan.infer(&[0, 0], &mut values).unwrap_err().observation(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod checked_program_subject_tests {
+    use super::CheckedProgramSubject;
+    use crate::checked::{SourceFile, SourceSet};
+    use std::sync::Arc;
+
+    #[test]
+    fn equal_digest_does_not_make_different_sources_equal() {
+        let subject = |text: &str| {
+            CheckedProgramSubject::new(
+                Arc::new(SourceSet::new(vec![SourceFile {
+                    path: "subject.seismic".into(),
+                    text: text.into(),
+                }])),
+                Vec::new(),
+            )
+        };
+        let left = subject("fn probe() -> f32:\n    return 1.0\n");
+        let mut right = subject("fn probe() -> f32:\n    return 2.0\n");
+        right.digest = left.digest;
+        assert_ne!(left, right);
+        let mut map = std::collections::HashMap::new();
+        map.insert(left, 1);
+        map.insert(right, 2);
+        assert_eq!(map.len(), 2);
     }
 }

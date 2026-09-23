@@ -62,11 +62,7 @@ pub(crate) fn compile_kernel(
         .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
     let metadata_bytes = std::mem::size_of::<Pipeline>()
         .checked_add(
-            layout.result_slots.len()
-                * std::mem::size_of::<(
-                    seismic_ir::schedule::AnyScalarSlot,
-                    seismic_lang::types::DType,
-                )>(),
+            layout.result_types.len() * std::mem::size_of::<seismic_ir::repr::ScalarKind>(),
         )
         .and_then(|bytes| {
             bytes.checked_add(
@@ -86,6 +82,8 @@ pub(crate) fn compile_kernel(
                     * std::mem::size_of::<seismic_ir::target::AddressableResourceWordLayout>(),
             )
         })
+        .and_then(|bytes| bytes.checked_add(source_text.len()))
+        .and_then(|bytes| bytes.checked_add(rendered.name.len()))
         .ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(
                 "Metal artifact metadata footprint exceeds usize".into(),
@@ -95,7 +93,8 @@ pub(crate) fn compile_kernel(
         pipeline: Pipeline {
             state,
             words: layout.words.clone(),
-            result_slots: layout.result_slots.clone(),
+            source: source_text.into_boxed_str(),
+            entry: rendered.name.into_boxed_str(),
         },
         artifact_digest,
         source_bytes,

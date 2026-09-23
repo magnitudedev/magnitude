@@ -11,6 +11,7 @@
 use crate::expr::{ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, IntrinsicId, StableFunctionId};
 use crate::intrinsics::PrimitiveId;
+use crate::reference_math::ReferenceScalar;
 use crate::registry::BackendName;
 use crate::span::Span;
 use crate::syntax::ast::AssignOp;
@@ -64,8 +65,9 @@ impl DefKind {
 }
 
 /// Logical call ownership of a parameter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Ownership {
+    Tuple(Vec<Ownership>),
     /// A plain value (scalar, index, range, tuple, opaque value).
     Value,
     /// An owned tensor that moves into the callee.
@@ -126,6 +128,7 @@ pub(crate) struct Definition {
     /// Applicability: every predicate must hold.
     pub predicates: Vec<Predicate>,
     pub body: Body,
+    pub initialization: crate::initialization::InitializationContract,
     /// The one arena of every extent, bound and symbolic value above.
     pub arena: ExprArena,
     /// Index into the module's source files.
@@ -159,6 +162,7 @@ pub(crate) struct Family {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Local {
+    pub ownership: super::ownership::ValueOwnership,
     pub name: String,
     pub ty: ValueType,
     pub mutable: bool,
@@ -199,6 +203,8 @@ pub(crate) enum Stmt {
         place: Place,
         op: AssignOp,
         value: Expr,
+        /// Fresh exact-value symbols for the installed local SSA versions.
+        value_symbols: Vec<(LocalId, SymbolId)>,
         /// Checker-minted proof for each parallel-captured storage root.
         authorities: Vec<ExclusiveWriteCapability>,
     },
@@ -208,11 +214,18 @@ pub(crate) enum Stmt {
         start: Expr,
         end: Expr,
         body: Block,
+        /// Captured quantity/word locals: body parameter and exit result.
+        value_symbols: Vec<(LocalId, SymbolId, SymbolId)>,
+        initialization: crate::initialization::LoopInitialization,
     },
     If {
         condition: Expr,
         then_body: Block,
         else_body: Block,
+        /// Active source value version mapped to each branch parameter.
+        capture_symbols: Vec<(LocalId, SymbolId)>,
+        /// Fresh source value version mapped to each changed join result.
+        join_symbols: Vec<(LocalId, SymbolId)>,
     },
     Evaluate(Expr),
 }
@@ -363,8 +376,11 @@ pub(crate) enum Pattern {
 /// tuple of places (tuple assignment).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Place {
-    Local(LocalId),
-    Element { root: LocalId, indices: Vec<Index> },
+    Local(super::ownership::LocalPlace),
+    Element {
+        root: super::ownership::LocalPlace,
+        indices: Vec<Index>,
+    },
     Tuple(Vec<Place>),
 }
 
@@ -408,7 +424,7 @@ impl Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExprKind {
-    Literal(Literal),
+    Literal(ReferenceScalar),
     /// A dimension of the definition used as a value; ordinal into
     /// `Definition::dimensions`.
     Dimension(u32),
@@ -440,18 +456,13 @@ pub(crate) enum ExprKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Literal {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-}
-
 /// One static call occurrence: the family it names and, per candidate
 /// definition that unifies with the arguments, how its parameters bind.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Call {
     pub family: FamilyId,
+    /// Authored shape bindings, in source evaluation order before value arguments.
+    pub explicit_shapes: Vec<(String, Expr)>,
     /// Candidates whose unification succeeded, in definition order.
     /// Predicates are *not* evaluated here.
     pub candidates: Vec<Candidate>,
@@ -465,6 +476,8 @@ pub(crate) struct Candidate {
     /// The callee's dimensions, in the callee's declaration order, as
     /// expressions in the caller's arena.
     pub shape_args: Vec<IntExpr>,
+    /// Ordered construction of the same dimensions from reached call inputs.
+    pub shape_plan: Vec<(u32, ShapeBindingPlan)>,
     /// Callee element parameter -> element (possibly a caller parameter).
     pub elem_args: Vec<(String, Elem)>,
     /// Argument expression ordinal for each callee parameter.
@@ -473,6 +486,28 @@ pub(crate) struct Candidate {
     /// elements for this candidate to apply.
     pub requires_elems: Vec<(String, Elem)>,
     pub applicability_proven: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ShapeBindingPlan {
+    Explicit { binding: usize },
+    /// The inverse of the selected formal axis is
+    /// `(observed - formal_axis[dimension := 0]) / coefficient`.
+    /// Every remaining dimension in that offset was captured earlier.
+    Inferred {
+        observation: ShapeObservation,
+        /// This candidate definition's checked formal-axis expression, in
+        /// its own definition arena. Replacing the selected dimension with
+        /// zero yields the checker-selected inverse offset.
+        formal_axis: IntExpr,
+        coefficient: i64,
+        prior_dimensions: Vec<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ShapeObservation {
+    TensorAxis { parameter: usize, argument: usize, path: Vec<u32>, axis: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +541,7 @@ pub(crate) fn walk_stmt<'a>(statement: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)
             condition,
             then_body,
             else_body,
+            ..
         } => {
             walk_expr(condition, visit);
             walk_block(then_body, visit);
@@ -547,8 +583,12 @@ pub(crate) fn walk_expr<'a>(expr: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
             walk_expr(value, visit);
         }
         ExprKind::PlaneView { base, .. } => walk_expr(base, visit),
-        ExprKind::Intrinsic { args, .. } | ExprKind::Call { args, .. } => {
+        ExprKind::Intrinsic { args, .. } => {
             args.iter().for_each(|a| walk_expr(a, visit))
+        }
+        ExprKind::Call { call, args } => {
+            for (_, value) in &call.explicit_shapes { walk_expr(value, visit); }
+            args.iter().for_each(|a| walk_expr(a, visit));
         }
         ExprKind::Literal(_) | ExprKind::Dimension(_) | ExprKind::Local(_) => {}
     }

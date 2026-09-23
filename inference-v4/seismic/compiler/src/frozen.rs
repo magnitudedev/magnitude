@@ -1,13 +1,13 @@
 //! Coordinate-exact lowering input.
 //!
 //! A `FrozenPlan` is created only after a structural coordinate has been
-//! natively realized and numerically admitted. It fixes target constants and
+//! natively realized and execution-safe. Numerical acceptance follows compilation.
+//! It fixes target constants and
 //! active choices, but makes no search or selection decision. Both analytical
 //! and feedback evaluators use this same lowering boundary.
 
 use crate::implementation::{Implementation, ImplementationIdentity};
-use crate::numerics::NumericalAssessment;
-use seismic_lang::entry::CallSchema;
+use crate::prepared::InvocationContract;
 use seismic_lang::expr::{BoolExpr, ExprArena, PartialAssignment, SymbolKind};
 use std::sync::Arc;
 
@@ -44,64 +44,56 @@ impl FrozenGuard {
     }
 }
 
-pub(crate) struct FinalizationContext {
-    pub(crate) schema: Arc<CallSchema>,
+pub(crate) struct CandidateContext<'a> {
+    pub(crate) invocation: Arc<InvocationContract>,
     pub(crate) device: seismic_target::DeviceDescriptionIdentity,
-    pub(crate) evaluation: crate::evaluation::EvaluationIdentity,
-    pub(crate) arena: Arc<ExprArena>,
+    pub(crate) arena: &'a ExprArena,
     pub(crate) constants: crate::target::TargetConstants,
 }
 
 #[derive(Debug)]
-pub(crate) struct FrozenPlan<B: seismic_target::TargetFamily> {
-    schema: Arc<CallSchema>,
+pub(crate) struct FrozenPlan<'a, B: seismic_target::TargetFamily> {
+    invocation: Arc<InvocationContract>,
     device: seismic_target::DeviceDescriptionIdentity,
-    evaluation: crate::evaluation::EvaluationIdentity,
     identity: VariantIdentity,
-    arena: Arc<ExprArena>,
+    arena: &'a ExprArena,
     implementation: Arc<Implementation<B>>,
     fixed: PartialAssignment,
     guard: FrozenGuard,
-    numerical: NumericalAssessment,
 }
 
-impl<B: seismic_target::TargetFamily> FrozenPlan<B> {
-    pub(crate) fn into_exact_parts(self) -> FrozenPlanParts<B> {
+impl<'a, B: seismic_target::TargetFamily> FrozenPlan<'a, B> {
+    pub(crate) fn into_exact_parts(self) -> FrozenPlanParts<'a, B> {
         FrozenPlanParts {
-            schema: self.schema,
+            invocation: self.invocation,
             device: self.device,
-            evaluation: self.evaluation,
             identity: self.identity,
             arena: self.arena,
             implementation: self.implementation,
             fixed: self.fixed,
             guard: self.guard,
-            numerical: self.numerical,
         }
     }
 }
 
-pub(crate) struct FrozenPlanParts<B: seismic_target::TargetFamily> {
-    pub schema: Arc<CallSchema>,
+pub(crate) struct FrozenPlanParts<'a, B: seismic_target::TargetFamily> {
+    pub invocation: Arc<InvocationContract>,
     pub device: seismic_target::DeviceDescriptionIdentity,
-    pub evaluation: crate::evaluation::EvaluationIdentity,
     pub identity: VariantIdentity,
-    pub arena: Arc<ExprArena>,
+    pub arena: &'a ExprArena,
     pub implementation: Arc<Implementation<B>>,
     pub fixed: PartialAssignment,
     pub guard: FrozenGuard,
-    pub numerical: NumericalAssessment,
 }
 
-pub(crate) fn freeze<B: seismic_target::TargetFamily>(
-    context: &FinalizationContext,
+pub(crate) fn freeze<'a, B: seismic_target::TargetFamily>(
+    context: &CandidateContext<'a>,
     implementation: Arc<Implementation<B>>,
     guard_node: BoolExpr,
-    numerical: NumericalAssessment,
-) -> FrozenPlan<B> {
+) -> FrozenPlan<'a, B> {
     let mut fixed = PartialAssignment::new();
     for (symbol, value) in context.constants.bindings() {
-        fixed.bind(*symbol, *value);
+        fixed.bind(*symbol, value.clone());
     }
     for (decision, _) in implementation.decisions() {
         let symbol = context.arena.decision_symbol(decision);
@@ -115,14 +107,12 @@ pub(crate) fn freeze<B: seismic_target::TargetFamily>(
         assignment: implementation.assignment_identity(),
     };
     FrozenPlan {
-        schema: context.schema.clone(),
+        invocation: context.invocation.clone(),
         device: context.device.clone(),
-        evaluation: context.evaluation.clone(),
         identity,
-        arena: context.arena.clone(),
+        arena: context.arena,
         implementation,
         fixed,
         guard,
-        numerical,
     }
 }

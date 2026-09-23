@@ -7,7 +7,7 @@
 //! so it is deterministic, finite, and never repeats an assignment.
 
 use crate::expression::PlanningExpr;
-use crate::refinement::CandidateFamilyIdentity;
+use crate::refinement::ConstructedCandidateIdentity;
 use seismic_lang::expr::{
     BoolExpr, DecisionId, DurationExpr, ExprArena, PartialAssignment, SymbolId, SymbolKind,
     SymbolValue,
@@ -133,7 +133,7 @@ impl<'a> SolverModelBuilder<'a> {
     pub(crate) fn implementation(
         &mut self,
         index: u32,
-        identity: CandidateFamilyIdentity,
+        identity: ConstructedCandidateIdentity,
         decisions: &[DecisionId],
         planning: PlanningExpr<BoolExpr>,
     ) {
@@ -148,7 +148,7 @@ impl<'a> SolverModelBuilder<'a> {
     pub(crate) fn implementation_with_objective(
         &mut self,
         index: u32,
-        identity: CandidateFamilyIdentity,
+        identity: ConstructedCandidateIdentity,
         decisions: &[DecisionId],
         planning: PlanningExpr<BoolExpr>,
         objective: DurationExpr,
@@ -219,7 +219,7 @@ mod internals {
 
     struct PendingImplementation {
         index: u32,
-        identity: CandidateFamilyIdentity,
+        identity: ConstructedCandidateIdentity,
         decisions: Vec<DecisionId>,
         planning: PlanningExpr<BoolExpr>,
         objective: Option<RationalSymbolAffine>,
@@ -227,7 +227,7 @@ mod internals {
 
     struct Implementation {
         index: u32,
-        identity: CandidateFamilyIdentity,
+        identity: ConstructedCandidateIdentity,
         selected: VarId,
         decisions: Vec<(DecisionId, SymbolId, VarId)>,
         exact_filter: Option<CompiledDecisionPredicate>,
@@ -281,7 +281,7 @@ mod internals {
             ) {
                 panic!("SolverModelBuilder::bind_target received a non-target symbol");
             }
-            assert_value_sort(self.arena.symbol_sort(symbol), value);
+            assert_value_sort(self.arena.symbol_sort(symbol), &value);
             if !self.bound_targets.insert(symbol) {
                 panic!("SolverModelBuilder target constant was bound twice");
             }
@@ -291,7 +291,7 @@ mod internals {
         pub(super) fn implementation(
             &mut self,
             index: u32,
-            identity: CandidateFamilyIdentity,
+            identity: ConstructedCandidateIdentity,
             decisions: &[DecisionId],
             planning: PlanningExpr<BoolExpr>,
         ) {
@@ -304,7 +304,7 @@ mod internals {
         pub(super) fn implementation_with_objective(
             &mut self,
             index: u32,
-            identity: CandidateFamilyIdentity,
+            identity: ConstructedCandidateIdentity,
             decisions: &[DecisionId],
             planning: PlanningExpr<BoolExpr>,
             objective: DurationExpr,
@@ -351,7 +351,7 @@ mod internals {
         fn register_implementation(
             &mut self,
             index: u32,
-            identity: CandidateFamilyIdentity,
+            identity: ConstructedCandidateIdentity,
             decisions: &[DecisionId],
             planning: PlanningExpr<BoolExpr>,
             objective: Option<RationalSymbolAffine>,
@@ -362,13 +362,6 @@ mod internals {
                 .any(|implementation| implementation.index == index)
             {
                 panic!("SolverModelBuilder implementation index was registered twice");
-            }
-            if self
-                .implementations
-                .iter()
-                .any(|implementation| implementation.identity == identity)
-            {
-                panic!("SolverModelBuilder implementation identity was registered twice");
             }
             if !self.implementations.is_empty()
                 && self.implementations[0].objective.is_some() != objective.is_some()
@@ -643,7 +636,7 @@ mod internals {
             for ((_, symbol, _), (_, value)) in
                 implementation.decisions.iter().zip(assignment.decisions())
             {
-                values.bind(*symbol, SymbolValue::Int(*value));
+                values.bind(*symbol, SymbolValue::Int((*value).into()));
             }
             implementation.exact_filter.as_ref().is_none_or(|filter| {
                 match filter.evaluate(&values) {
@@ -654,6 +647,7 @@ mod internals {
                     Err(
                         EvalError::DivisionByZero
                         | EvalError::NegativeNat
+                        | EvalError::ScalarFailure(_)
                         | EvalError::Unrepresentable,
                     ) => false,
                 }
@@ -1515,7 +1509,7 @@ mod internals {
         }
     }
 
-    fn assert_value_sort(sort: SymbolSort, value: SymbolValue) {
+    fn assert_value_sort(sort: SymbolSort, value: &SymbolValue) {
         let valid = matches!(
             (sort, value),
             (SymbolSort::Nat, SymbolValue::Nat(_))
@@ -1554,9 +1548,42 @@ mod internals {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::refinement::FactoryIdentity;
     use seismic_lang::expr::{Assignment, CmpOp, DurationTerm, FiniteDomain};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn equal_structural_digests_keep_distinct_solver_entries() {
+        let mut arena = ExprArena::default();
+        let first = arena.decision(FiniteDomain::new(vec![0, 1]).unwrap());
+        let second = arena.decision(FiniteDomain::new(vec![0, 1]).unwrap());
+        let predicate = arena.bool(true);
+        let planning = PlanningExpr::new(&arena, predicate).unwrap();
+        let identity = ConstructedCandidateIdentity { structure: [7; 32] };
+        let mut builder = SolverModelBuilder::new(&mut arena);
+        builder.implementation(1, identity.clone(), &[first], planning);
+        builder.implementation(2, identity, &[second], planning);
+        let model = builder.build();
+        let mut cursor = model.assignments(SolverAllowance {
+            work: 1_000_000,
+            memory_bytes: None,
+        });
+        let mut seen = BTreeSet::new();
+        loop {
+            match cursor.next() {
+                AssignmentStep::Assignment(assignment) => {
+                    let selected = assignment.implementation();
+                    let decision = if selected == 1 { first } else { second };
+                    assert!(matches!(selected, 1 | 2));
+                    seen.insert((selected, assignment.value(decision).unwrap()));
+                }
+                AssignmentStep::Complete(_) => break,
+                AssignmentStep::BudgetExhausted(report) => {
+                    panic!("tiny collision fixture exhausted: {report:?}")
+                }
+            }
+        }
+        assert_eq!(seen, BTreeSet::from([(1, 0), (1, 1), (2, 0), (2, 1)]));
+    }
 
     #[test]
     fn finite_solver_matches_cartesian_oracle_for_nonlinear_candidates() {
@@ -1575,13 +1602,7 @@ mod tests {
             let mut builder = SolverModelBuilder::new(&mut arena);
             builder.implementation(
                 0,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "finite-oracle",
-                        revision: "1",
-                    },
-                    structure: [0; 32],
-                },
+                ConstructedCandidateIdentity { structure: [0; 32] },
                 &[a, b],
                 planning,
             );
@@ -1636,13 +1657,7 @@ mod tests {
         let mut feasibility_builder = SolverModelBuilder::new(&mut arena);
         feasibility_builder.implementation(
             1,
-            CandidateFamilyIdentity {
-                factory: FactoryIdentity {
-                    name: "affine-objective-feasibility-order",
-                    revision: "1",
-                },
-                structure: [3; 32],
-            },
+            ConstructedCandidateIdentity { structure: [3; 32] },
             &[decision],
             planning,
         );
@@ -1662,13 +1677,7 @@ mod tests {
         builder
             .implementation_with_objective(
                 1,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "affine-objective",
-                        revision: "1",
-                    },
-                    structure: [4; 32],
-                },
+                ConstructedCandidateIdentity { structure: [4; 32] },
                 &[decision],
                 planning,
                 objective,
@@ -1685,7 +1694,7 @@ mod tests {
                 AssignmentStep::Assignment(assignment) => {
                     let selected = assignment.value(decision).unwrap();
                     let mut values = Assignment::new();
-                    values.bind(arena.decision_symbol(decision), SymbolValue::Int(selected));
+                    values.bind(arena.decision_symbol(decision), SymbolValue::Int(selected.into()));
                     let direct = arena.eval_duration(objective, &values).unwrap().upper();
                     ordered.push((selected, direct));
                 }
@@ -1721,13 +1730,7 @@ mod tests {
         let error = builder
             .implementation_with_objective(
                 1,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "nonlinear-objective",
-                        revision: "1",
-                    },
-                    structure: [5; 32],
-                },
+                ConstructedCandidateIdentity { structure: [5; 32] },
                 &[decision],
                 planning,
                 nonlinear,
@@ -1757,13 +1760,7 @@ mod tests {
         builder
             .implementation_with_objective(
                 1,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "rational-a",
-                        revision: "1",
-                    },
-                    structure: [6; 32],
-                },
+                ConstructedCandidateIdentity { structure: [6; 32] },
                 &[],
                 first_planning,
                 first,
@@ -1772,13 +1769,7 @@ mod tests {
         let error = builder
             .implementation_with_objective(
                 2,
-                CandidateFamilyIdentity {
-                    factory: FactoryIdentity {
-                        name: "rational-b",
-                        revision: "1",
-                    },
-                    structure: [7; 32],
-                },
+                ConstructedCandidateIdentity { structure: [7; 32] },
                 &[],
                 second_planning,
                 second,

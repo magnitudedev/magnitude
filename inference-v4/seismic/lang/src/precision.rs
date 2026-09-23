@@ -1,5 +1,5 @@
 //! Caller-owned numerical policy types. Compiler assessment, transfer,
-//! qualification and comparison belong outside the language crate.
+//! numerical analysis and comparison belong outside the language crate.
 
 use std::{
     collections::BTreeMap,
@@ -93,13 +93,6 @@ impl Default for Tolerance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EvidenceRequirement {
-    #[default]
-    Proven,
-    Qualified,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SpecialPolicy {
     pub nan: bool,
@@ -150,7 +143,6 @@ pub enum PrecisionPolicy {
     Bounded {
         default: Tolerance,
         outputs: BTreeMap<String, Tolerance>,
-        evidence: EvidenceRequirement,
         specials: SpecialPolicy,
         inputs: BTreeMap<String, InputRange>,
     },
@@ -166,7 +158,6 @@ impl PrecisionPolicy {
         Self::Bounded {
             default,
             outputs: BTreeMap::new(),
-            evidence: EvidenceRequirement::Proven,
             specials: SpecialPolicy::PRESERVE,
             inputs: BTreeMap::new(),
         }

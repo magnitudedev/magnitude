@@ -2,7 +2,7 @@
 //! host. The sampler is prepared with the decoder; sampling never compiles.
 use super::Sampling;
 use crate::{inputs::TokenId, kernels};
-use seismic::{Device, Element, Kernel, PrecisionPolicy, Tensor};
+use seismic::{Device, Element, Kernel, PreparationOptions, Tensor};
 
 use crate::Error;
 
@@ -25,7 +25,7 @@ impl Sampler {
     pub fn compile(
         device: &Device,
         vocabulary: usize,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
     ) -> Result<Self, Error> {
         if vocabulary == 0 || vocabulary > i32::MAX as usize {
             return Err("sampling vocabulary is outside the index domain".into());
@@ -33,7 +33,7 @@ impl Sampler {
         let words = u64::try_from(vocabulary.div_ceil(32))
             .map_err(|_| "sampling mask extent exceeds the Seismic shape domain")?;
         Ok(Self {
-            kernel: kernels::sample_rows::for_device(device, precision)?,
+            kernel: kernels::sample_rows::for_device(device, preparation)?,
             vocabulary,
             mask: Tensor::zeros(device, Element::u32(), &[1, words])?,
             draw: Tensor::zeros(device, Element::u32(), &[1, 6])?,

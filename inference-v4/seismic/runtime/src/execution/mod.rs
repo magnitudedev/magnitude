@@ -1,20 +1,20 @@
 //! Consuming execution ownership for an already-admitted workflow run.
 //!
-//! This module begins after binding and resource admission have completed. It
-//! may issue an admitted schedule, submit it, wait for completion, retain the
-//! admission-owned resources through that wait, and decode concrete outputs.
-//! It has no argument binding, variant selection, expression evaluation,
-//! allocation, reservation, or persistent-state authority.
+//! This module sequences admitted schedules and completed producer publication.
+//! The workflow continuation retains argument binding, variant selection, and
+//! resource admission authority; execution invokes it only after the prior
+//! native prefix is complete. Terminal ownership retains every issued resource.
 
 use crate::api::kernel::{DecodedValue, WorkflowCompletionAny};
 use crate::api::CallError;
-use crate::driver::{AdmittedCommand, Allocation, Service};
+use crate::driver::{AdmittedCommand, Allocation, Opened, Service};
 use crate::resources::AdmittedResources;
-use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::errors::{CheckFailure, ExecutionError};
 use seismic_compiler::executable::{NativeExecution, NativeExecutor, NativeSubmission};
 use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
+use seismic_lang::failure::SourceTermination;
 use seismic_target::TargetFamily;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ type SubmittedExecution<T, E> = <Submission<T, E> as NativeSubmission<T>>::Execu
 /// A result descriptor whose layout and allocation have already been closed
 /// by admission. Decoding cannot consult an executable expression.
 pub(crate) enum AdmittedOutput {
+    PendingTensor { path: Vec<u32> },
     Tensor {
         allocation: Arc<Allocation>,
         byte_offset: u64,
@@ -50,8 +51,8 @@ pub(crate) enum AdmittedScalarOutput {
 }
 
 pub(crate) struct AdmittedNode<T: TargetFamily, E: NativeExecutor<T>> {
-    command: AdmittedCommand<T, E>,
-    outputs: Vec<AdmittedOutput>,
+    pub(crate) command: AdmittedCommand<T, E>,
+    pub(crate) outputs: Vec<AdmittedOutput>,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedNode<T, E> {
@@ -63,10 +64,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedNode<T, E> {
         self.command.allocated_bytes()
     }
 
-    fn decode_values(self) -> Result<Vec<DecodedValue>, CallError> {
+    fn decode_values(&self) -> Result<Vec<DecodedValue>, CallError> {
         let Self { command, outputs } = self;
         outputs
-            .into_iter()
+            .iter()
             .map(|output| output.decode(command.values(), command.output_device()))
             .collect()
     }
@@ -77,15 +78,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedNode<T, E> {
 pub(crate) struct AdmittedRun<T: TargetFamily, E: NativeExecutor<T>> {
     identity: u64,
     device: Arc<Service<T, E>>,
+    opened: Arc<Opened<T, E>>,
     nodes: Vec<AdmittedNode<T, E>>,
     retained: AdmittedResources,
     submission: Submission<T, E>,
+    continuation: Option<crate::driver::workflow::native::WorkflowContinuation<T, E>>,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
     pub(crate) fn new(
         identity: u64,
         device: Arc<Service<T, E>>,
+        opened: Arc<Opened<T, E>>,
         nodes: Vec<AdmittedNode<T, E>>,
         retained: AdmittedResources,
         submission: Submission<T, E>,
@@ -93,26 +97,75 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
         Self {
             identity,
             device,
+            opened,
             nodes,
             retained,
             submission,
+            continuation: None,
         }
+    }
+
+    pub(crate) fn set_continuation(&mut self, continuation: crate::driver::workflow::native::WorkflowContinuation<T, E>) {
+        self.continuation = Some(continuation);
     }
 
     pub(crate) fn allocated_bytes(&self) -> u64 {
         self.nodes
             .iter()
             .map(AdmittedNode::allocated_bytes)
-            .fold(0, u64::saturating_add)
+            .fold(self.retained.reached_allocated(), u64::saturating_add)
+    }
+
+    /// The values produced by ordinary binding for each admitted node.
+    pub(crate) fn invocation_values(&self) -> impl ExactSizeIterator<Item = &InvocationValues> {
+        self.nodes.iter().map(|node| node.command.values())
     }
 
     pub(crate) fn submit(mut self) -> Result<SubmittedRun<T, E>, CallError> {
         let mut issued = Ok(());
-        for node in &mut self.nodes {
-            if let Err(error) = node.command.issue(&mut self.submission, &self.device) {
-                issued = Err(error);
+        let mut termination = SourceTermination::Returned(());
+        let mut deferred_error = None;
+        let mut ordinal = 0usize;
+        while ordinal < self.nodes.len() {
+            let node = &mut self.nodes[ordinal];
+            if let Err(error) = node.command.issue(&mut self.submission, &self.device, &mut self.retained, &self.opened) {
+                match error {
+                    ExecutionError::DataCheckFailed(failure) => {
+                        termination = SourceTermination::Failed(failure)
+                    }
+                    error => issued = Err(error),
+                }
                 break;
             }
+            let published = match node.command.published_tensors(&self.retained) {
+                Ok(published) => published,
+                Err(error) => { issued = Err(error); break; }
+            };
+            let mut published = published.into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            for output in &mut node.outputs {
+                if let AdmittedOutput::PendingTensor { path } = output {
+                    let Some(value) = published.remove(path) else {
+                        issued = Err(ExecutionError::ConstructionContradiction(
+                            "successful command omitted tensor publication".into(),
+                        ));
+                        break;
+                    };
+                    *output = value;
+                }
+            }
+            if issued.is_err() { break; }
+            if let Some(continuation) = &mut self.continuation {
+                if let Err(error) = self.submission.complete_prefix() { issued = Err(error); break; }
+                if let Err(error) = continuation.completed(ordinal as u32, node, self.opened.identity(), &mut self.retained) {
+                    deferred_error = Some(error); break;
+                }
+                match continuation.next(&self.opened, &mut self.retained) {
+                    Ok(Some(next)) => self.nodes.push(next),
+                    Ok(None) => {}
+                    Err(error) => { deferred_error = Some(error); break; }
+                }
+            }
+            ordinal += 1;
         }
 
         // Even a partially issued schedule is submitted and synchronized. The
@@ -123,10 +176,15 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
             BackendCompletion(native),
             SubmittedState {
                 nodes: self.nodes,
-                _retained: self.retained,
+                termination,
+                retained: self.retained,
             },
         );
         let completion = finish_issue(completion, issued).map_err(CallError::Execution)?;
+        if let Some(error) = deferred_error {
+            completion.complete_and_take().map_err(CallError::Execution)?;
+            return Err(error);
+        }
         Ok(SubmittedRun {
             identity: self.identity,
             completion,
@@ -141,18 +199,22 @@ pub(crate) struct SubmittedRun<T: TargetFamily, E: NativeExecutor<T>> {
 
 struct SubmittedState<T: TargetFamily, E: NativeExecutor<T>> {
     nodes: Vec<AdmittedNode<T, E>>,
-    _retained: AdmittedResources,
+    termination: SourceTermination<(), CheckFailure>,
+    retained: AdmittedResources,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> SubmittedRun<T, E> {
-    pub(crate) fn complete_values(self) -> Result<Vec<Vec<DecodedValue>>, CallError> {
-        let SubmittedState { nodes, _retained } = self
-            .completion
+    pub(crate) fn complete(self) -> Result<CompletedRun<T, E>, CallError> {
+        self.completion
             .complete_and_take()
-            .map_err(CallError::Execution)?;
-        let values = nodes.into_iter().map(AdmittedNode::decode_values).collect();
-        drop(_retained);
-        values
+            .map(|state| CompletedRun { state })
+            .map_err(CallError::Execution)
+    }
+
+    pub(crate) fn complete_outcome(
+        self,
+    ) -> Result<SourceTermination<Vec<Vec<DecodedValue>>, CheckFailure>, CallError> {
+        self.complete()?.outcome()
     }
 
     pub(crate) fn into_completion(self) -> WorkflowCompletionAny
@@ -160,7 +222,51 @@ impl<T: TargetFamily, E: NativeExecutor<T>> SubmittedRun<T, E> {
         T: 'static,
     {
         let identity = self.identity;
-        WorkflowCompletionAny::pending(identity, move || self.complete_values())
+        WorkflowCompletionAny::pending(identity, move || self.complete_outcome())
+    }
+}
+
+/// Native completion has finished. Output decoding/checking is outside the
+/// submission-through-completion measurement endpoint.
+pub(crate) struct CompletedRun<T: TargetFamily, E: NativeExecutor<T>> {
+    state: SubmittedState<T, E>,
+}
+impl<T: TargetFamily, E: NativeExecutor<T>> CompletedRun<T, E> {
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.state.nodes.iter().map(AdmittedNode::allocated_bytes).fold(
+            self.state.retained.reached_allocated(), u64::saturating_add)
+    }
+    pub(crate) fn read_tensor(
+        &self,
+        tensor: &crate::api::tensor::TensorInner,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        tensor.read_with(self.state.retained.access(tensor.allocation()))
+    }
+
+    /// Observe the completed outcome while admission permits and backing remain
+    /// owned by this run. Failed source execution has no return product.
+    pub(crate) fn outcome(
+        &self,
+    ) -> Result<SourceTermination<Vec<Vec<DecodedValue>>, CheckFailure>, CallError> {
+        match &self.state.termination {
+            SourceTermination::Returned(()) => self
+                .state
+                .nodes
+                .iter()
+                .map(AdmittedNode::decode_values)
+                .collect::<Result<_, _>>()
+                .map(SourceTermination::Returned),
+            SourceTermination::Failed(failure) => Ok(SourceTermination::Failed(failure.clone())),
+        }
+    }
+
+    pub(crate) fn values(self) -> Result<Vec<Vec<DecodedValue>>, CallError> {
+        match self.outcome()? {
+            SourceTermination::Returned(values) => Ok(values),
+            SourceTermination::Failed(failure) => Err(CallError::Execution(
+                ExecutionError::DataCheckFailed(failure),
+            )),
+        }
     }
 }
 
@@ -285,11 +391,14 @@ fn finish_issue<C: TerminalCompletion<Error = ExecutionError>, R>(
 
 impl AdmittedOutput {
     fn decode(
-        self,
+        &self,
         values: &InvocationValues,
         device: &Arc<crate::api::device::DeviceInner>,
     ) -> Result<DecodedValue, CallError> {
         match self {
+            Self::PendingTensor { .. } => Err(CallError::Execution(
+                ExecutionError::ConstructionContradiction("tensor output was not completed".into()),
+            )),
             Self::Tensor {
                 allocation,
                 byte_offset,
@@ -300,19 +409,19 @@ impl AdmittedOutput {
             } => Ok(DecodedValue::Tensor(Arc::new(
                 crate::api::tensor::TensorInner::new_view(
                     device.clone(),
-                    allocation,
-                    byte_offset,
-                    byte_len,
-                    representation,
-                    extents,
-                    strides,
+                    allocation.clone(),
+                    *byte_offset,
+                    *byte_len,
+                    *representation,
+                    extents.clone(),
+                    strides.clone(),
                 ),
             ))),
             Self::Scalar(AdmittedScalarOutput::Value { dtype, symbol }) => {
-                Ok(DecodedValue::Scalar(scalar_result(dtype, symbol, values)))
+                Ok(DecodedValue::Scalar(scalar_result(*dtype, *symbol, values)))
             }
             Self::Scalar(AdmittedScalarOutput::Index { symbol }) => {
-                let Some(SymbolValue::Nat(value)) = values.get(symbol) else {
+                let Some(SymbolValue::Nat(value)) = values.get(*symbol) else {
                     return Err(CallError::Execution(ExecutionError::SubmissionFailed(
                         "admitted index result slot has the wrong scalar sort".to_owned(),
                     )));
@@ -321,7 +430,7 @@ impl AdmittedOutput {
             }
             Self::Scalar(AdmittedScalarOutput::Range { start, end }) => {
                 let (Some(SymbolValue::Nat(start)), Some(SymbolValue::Nat(end))) =
-                    (values.get(start), values.get(end))
+                    (values.get(*start), values.get(*end))
                 else {
                     return Err(CallError::Execution(ExecutionError::SubmissionFailed(
                         "admitted range result slots have the wrong scalar sort".to_owned(),

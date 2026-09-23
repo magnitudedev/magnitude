@@ -51,7 +51,7 @@ use std::time::Instant;
 
 /// Revision of the CUDA backend implementation: changes whenever emission,
 /// resource rules, or the implemented intrinsic set change (§15.1).
-pub const BACKEND_REVISION: &str = "seismic-cuda-v8";
+pub const BACKEND_REVISION: &str = "seismic-cuda-v12";
 
 /// CUDA kernels receive one pointer to the backend's canonical device-side
 /// launch frame; every interface table is reached through that pointer.
@@ -545,7 +545,6 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         flush_to_zero_available: true,
         approximate_transcendentals: [
             MathOp::Exp,
-            MathOp::ExpFast,
             MathOp::Log,
             MathOp::Sin,
             MathOp::Cos,

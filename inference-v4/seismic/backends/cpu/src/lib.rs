@@ -13,11 +13,12 @@
 //! by the documented scratch policy in the profile. A one-thread workgroup
 //! degenerates to independent workers claiming work items.
 //!
-//! Numerics. Floating arithmetic follows the registry reference model:
-//! every operation is computed exactly enough to round once at the result
-//! dtype; transcendentals go through the versioned host sequences
-//! (`seismic_math`); contraction happens only where the kernel IR names
-//! `Fma`; narrow floats round through the registry rounding.
+//! Numerics. Exact source scalar operations and ordinary packed decoding
+//! expand through the language-owned typed-bit recipes before kernel closure.
+//! This emitter implements the resulting terminal operations and explicitly
+//! selected physical arithmetic. Native numerical helpers describe those
+//! physical operations; they do not define source semantics. Scalar transport
+//! preserves original payload bits, including narrow NaNs and signed zero.
 
 mod buffer;
 mod codegen;
@@ -25,7 +26,6 @@ mod command;
 mod compile;
 mod emit;
 mod executor;
-mod factory;
 pub mod model;
 mod numeric;
 mod open;
@@ -70,7 +70,12 @@ pub struct CpuLaunchMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CpuNumericalMode;
 
-impl seismic_ir::target::KernelDialect for Cpu {
+impl seismic_ir::target::PhysicalDialect for Cpu {
+    type LaunchDescriptor = CpuLaunchMode;
+    fn ordinary_launch() -> Self::LaunchDescriptor {
+        CpuLaunchMode
+    }
+
     const NAME: BackendName = BackendName::Cpu;
     type Intrinsic = CpuIntrinsic;
     type Facts = HostFacts;
@@ -99,7 +104,6 @@ impl seismic_ir::target::KernelDialect for Cpu {
 
 impl seismic_target::TargetFamily for Cpu {
     type KernelAbi = HostKernelAbi;
-    type NativeLaunchMode = CpuLaunchMode;
     type NativeNumericalMode = CpuNumericalMode;
     type NativeProperties = ();
 }
@@ -179,3 +183,12 @@ impl seismic_target::NativeCompiler<Cpu> for CpuNativeCompiler {
         ))
     }
 }
+
+impl seismic_ir::identity::CanonicalIdentity for CpuLaunchMode {
+    fn encode_identity(&self, out: &mut seismic_ir::identity::StructureDigest) {
+        out.bytes(b"ordinary");
+    }
+}
+
+#[cfg(test)]
+mod plane_tests;

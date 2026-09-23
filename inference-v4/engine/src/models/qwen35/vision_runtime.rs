@@ -12,7 +12,7 @@ use crate::{
     weights::{descriptor::WeightDescriptor, residency::ResidentWeight},
     Error,
 };
-use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
+use seismic::{DType, Device, Element, Kernel, PreparationOptions, Tensor};
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -119,7 +119,7 @@ impl Encoder {
     pub fn load(
         device: Rc<Device>,
         description: &Description,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, Error>,
     ) -> Result<Self, Error> {
         let g = &description.geometry;
@@ -161,7 +161,7 @@ impl Encoder {
         let stem = Stem {
             kernel: kernels::qwen_vision_stem::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 kernels::qwen_vision_stem::Elements {
                     A: Element::bf16(),
                     W: stem_weight.element(),
@@ -190,7 +190,7 @@ impl Encoder {
             let down_bias = resident(&device, &source.down.bias, &mut import)?;
             let kernel = kernels::qwen_vision_block::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 kernels::qwen_vision_block::Elements {
                     A: Element::bf16(),
                     NW: norm1_weight.element(),
@@ -232,7 +232,7 @@ impl Encoder {
         let merger = Merger {
             kernel: kernels::qwen_vision_merger::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 kernels::qwen_vision_merger::Elements {
                     A: Element::bf16(),
                     NW: norm_weight.element(),
@@ -253,7 +253,7 @@ impl Encoder {
         };
         let output = kernels::qwen_vision_feature_output::for_device_with(
             &device,
-            precision,
+            preparation,
             kernels::qwen_vision_feature_output::Elements { A: Element::bf16() },
         )
         .map_err(|error| error.to_string())?;

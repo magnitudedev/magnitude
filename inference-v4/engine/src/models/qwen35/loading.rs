@@ -10,7 +10,7 @@ use crate::{
     },
     Error,
 };
-use seismic::{Device, PrecisionPolicy};
+use seismic::{Device, PreparationOptions};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -103,7 +103,7 @@ impl Model {
     pub fn load_vision(
         &self,
         device: Rc<Device>,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
     ) -> Result<super::vision_runtime::Encoder, Error> {
         let description = self.vision_description().map_err(Error::from)?;
         let Artifact::Mlx { artifact, .. } = &self.artifact else {
@@ -111,11 +111,11 @@ impl Model {
                 "GGUF Qwen vision artifacts are not supported".into(),
             ));
         };
-        let mut importer = Importer::new(device.clone(), precision.clone());
+        let mut importer = Importer::new(device.clone(), preparation.clone());
         super::vision_runtime::Encoder::load(
             device,
             &description,
-            precision,
+            preparation,
             |descriptor, dtype| {
                 let stored = artifact.stored(descriptor).map_err(weight_error)?;
                 importer
@@ -127,11 +127,11 @@ impl Model {
     pub fn load(
         self,
         device: Rc<Device>,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         context: usize,
         sequences: usize,
     ) -> Result<Decoder, Error> {
-        let mut importer = Importer::new(device.clone(), precision.clone());
+        let mut importer = Importer::new(device.clone(), preparation.clone());
         let mut resident: HashMap<(String, String, String), ResidentWeight> = HashMap::new();
         let workload = super::decoder::DecoderCapacity {
             context_capacity: context,
@@ -160,7 +160,7 @@ impl Model {
                 resident.insert(key, weight.clone());
                 Ok(weight)
             },
-            precision,
+            preparation,
             workload,
         )
     }

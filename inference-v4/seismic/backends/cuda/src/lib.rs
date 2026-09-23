@@ -7,7 +7,6 @@ mod command;
 mod compile;
 mod driver;
 mod executor;
-mod factory;
 pub mod model;
 mod open;
 mod profile;
@@ -19,7 +18,7 @@ pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
 pub use executor::{Device, Executor};
-pub use open::{open, OpenedCuda};
+pub use open::{open, open_analytical, OpenedCuda};
 pub use profile::{
     describe, device_count, ComputeCapability, CudaFacts, CudaKernelAbi, DeviceDescriptor,
     DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,
@@ -130,7 +129,26 @@ fn active_blocks_expression(
     selected
 }
 
-impl seismic_ir::target::KernelDialect for Cuda {
+impl seismic_ir::target::PhysicalDialect for Cuda {
+    type LaunchDescriptor = CudaLaunchMode;
+    fn launch_for_participation(
+        facts: &CudaFacts,
+        requirement: seismic_ir::schedule::LaunchParticipation,
+    ) -> Option<CudaLaunchMode> {
+        match requirement {
+            seismic_ir::schedule::LaunchParticipation::Independent => {
+                Some(CudaLaunchMode::Independent)
+            }
+            seismic_ir::schedule::LaunchParticipation::CooperativeGrid => facts
+                .cooperative_launch
+                .then_some(CudaLaunchMode::CooperativeGrid),
+        }
+    }
+
+    fn ordinary_launch() -> Self::LaunchDescriptor {
+        CudaLaunchMode::Independent
+    }
+
     const NAME: BackendName = BackendName::Cuda;
     type Intrinsic = CudaIntrinsic;
     type Facts = CudaFacts;
@@ -241,7 +259,6 @@ impl seismic_ir::target::KernelDialect for Cuda {
 
 impl seismic_target::TargetFamily for Cuda {
     type KernelAbi = CudaKernelAbi;
-    type NativeLaunchMode = CudaLaunchMode;
     type NativeNumericalMode = CudaNumericalMode;
     type NativeProperties = OccupancyRelation;
 }
@@ -253,16 +270,10 @@ pub fn native_compiler() -> &'static CudaNativeCompiler {
     &CUDA_NATIVE_COMPILER
 }
 
-pub(crate) fn cooperative_launch_mode(facts: &CudaFacts) -> Option<CudaLaunchMode> {
-    facts
-        .cooperative_launch
-        .then_some(CudaLaunchMode::CooperativeGrid)
-}
-
 pub(crate) fn native_launch_constraints(
     target: &DeviceDescription<Cuda>,
     arena: &mut seismic_lang::expr::ExprArena,
-    launch: &seismic_ir::schedule::Launch,
+    launch: &seismic_ir::schedule::Launch<Cuda>,
     locals: &seismic_ir::storage::LaunchLocalLayout,
     _kernel: &seismic_ir::kernel::Kernel<Cuda>,
     native: &seismic_target::NativeKernelDescription<Cuda>,
@@ -276,7 +287,7 @@ pub(crate) fn native_launch_constraints(
     let multiprocessors = arena.nat(u64::from(facts.multiprocessors));
     let capacity = arena.nat_mul(multiprocessors, resident);
     let mut constraints = vec![arena.nat_cmp(seismic_lang::expr::CmpOp::Ge, resident, one)];
-    if launch.mode == seismic_ir::schedule::LaunchMode::CooperativeGrid {
+    if launch.descriptor == CudaLaunchMode::CooperativeGrid {
         constraints.push(arena.nat_cmp(seismic_lang::expr::CmpOp::Le, blocks, capacity));
     }
     constraints
@@ -476,8 +487,7 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
     ) -> Result<NativeKernelReflection<Cuda, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
         let context = candidate.module.context.clone();
-        let function = crate::driver::module_function(&candidate.module, &candidate.entry)
-            .map_err(compile::jit_failure)?;
+        let function = candidate.function;
         let attribute = |key| {
             crate::driver::function_attribute(&context, function, key)
                 .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))
@@ -575,6 +585,9 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             module: candidate.module,
             function,
             layout: candidate.layout,
+            image: candidate.image,
+            entry: candidate.entry,
+            configured_dynamic_shared_bytes: candidate.configured_dynamic_shared_bytes,
         };
         let description = NativeKernelDescription {
             identity: NativeKernelIdentity {
@@ -598,7 +611,7 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             },
             numerics: CudaNumericalMode,
             numerical_identity: NativeNumericalModeIdentity {
-                fingerprint: Sha256::digest(b"seismic-cuda-ptx-rn-no-ftz-v1").into(),
+                fingerprint: Sha256::digest(b"seismic-cuda-ptx-raw-narrow-rn-no-ftz-v2").into(),
             },
             properties: occupancy,
         };
@@ -620,5 +633,14 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
                 })?,
         };
         Ok(NativeKernelReflection::new(handle, description, metrics))
+    }
+}
+
+impl seismic_ir::identity::CanonicalIdentity for CudaLaunchMode {
+    fn encode_identity(&self, out: &mut seismic_ir::identity::StructureDigest) {
+        out.bytes(match self {
+            Self::Independent => b"independent",
+            Self::CooperativeGrid => b"cooperative-grid",
+        });
     }
 }

@@ -1,14 +1,14 @@
 //! Reproducible single-session Qwen prose benchmark used by W12.
 
 use magnitude_engine::models::qwen35::session::{Report, Session};
-use seismic::{BackendName, DeviceCatalog, PrecisionPolicy};
+use seismic::{BackendName, DeviceCatalog, FeedbackOptions, PrecisionPolicy, PreparationOptions};
 use serde::Serialize;
 use std::{fs, path::PathBuf, rc::Rc, time::Instant};
 
 const USAGE: &str = "usage:
   prose-session-bench --model <GGUF|MLX path> --fixture <Gutenberg text> \
     --backend <metal|cuda|cpu> --context <tokens> [--prefill-chunk <tokens>] \
-    [--decode <tokens>] [--precision <exact|unconstrained>] [--output <json>]";
+    [--decode <tokens>] [--precision <exact|unconstrained>] [--output <json>]\n    [--evaluation <analytical|feedback>] [--tuning-seconds <seconds per entry>] [--tuning-seed <u64>]";
 
 struct Options {
     model: PathBuf,
@@ -17,7 +17,7 @@ struct Options {
     context: usize,
     prefill_chunk: usize,
     decode: usize,
-    precision: PrecisionPolicy,
+    preparation: PreparationOptions,
     output: Option<PathBuf>,
 }
 
@@ -55,6 +55,9 @@ fn options() -> Result<Options, String> {
     let mut decode = 128;
     let mut precision = PrecisionPolicy::Exact;
     let mut output = None;
+    let mut evaluation = "analytical".to_string();
+    let mut tuning_seconds = 60.0f64;
+    let mut tuning_seed = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -76,6 +79,25 @@ fn options() -> Result<Options, String> {
                     other => return Err(format!("unknown precision policy `{other}`")),
                 }
             }
+            "--evaluation" => {
+                evaluation = value(&flag, &mut args)?;
+                if !matches!(evaluation.as_str(), "analytical" | "feedback") {
+                    return Err("--evaluation must be analytical or feedback".into());
+                }
+            }
+            "--tuning-seconds" => {
+                tuning_seconds = value(&flag, &mut args)?
+                    .parse::<f64>()
+                    .map_err(|error| error.to_string())?;
+                if !tuning_seconds.is_finite() || tuning_seconds < 0.0 {
+                    return Err("--tuning-seconds must be finite and nonnegative".into());
+                }
+            }
+            "--tuning-seed" => {
+                tuning_seed = value(&flag, &mut args)?
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())?
+            }
             "--output" => output = Some(PathBuf::from(value(&flag, &mut args)?)),
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -91,7 +113,19 @@ fn options() -> Result<Options, String> {
         context: context.ok_or_else(|| format!("--context is required\n{USAGE}"))?,
         prefill_chunk,
         decode,
-        precision,
+        preparation: if evaluation == "feedback" {
+            PreparationOptions::feedback(
+                precision,
+                FeedbackOptions {
+                    search_time: std::time::Duration::try_from_secs_f64(tuning_seconds)
+                        .map_err(|error| error.to_string())?,
+                    seed: tuning_seed,
+                    ..Default::default()
+                },
+            )
+        } else {
+            PreparationOptions::analytical(precision)
+        },
         output,
     })
 }
@@ -120,7 +154,7 @@ fn run() -> Result<(), String> {
     let mut session = Session::load(
         &options.model,
         Rc::new(device),
-        options.precision,
+        options.preparation,
         options.context,
     )
     .map_err(|error| error.to_string())?;

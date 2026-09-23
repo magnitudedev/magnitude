@@ -9,7 +9,7 @@
 //!   semantics), so a folded node has exactly the side conditions of the
 //!   node it replaces;
 //! - `partial` rebuilds through the same constructors and is interned;
-//! - evaluation is checked mathematical integer arithmetic in `i128`;
+//! - evaluation uses exact mathematical integer arithmetic;
 //!   `and`/`or`/`implies`/`all`/`any` short-circuit left to right and
 //!   `select` evaluates only the taken branch, so a predicate that guards a
 //!   partial operation (`b != 0 and a / b < n`) is total;
@@ -40,7 +40,10 @@ use super::{
     ScalarExpr, ScalarSort, SymbolId, SymbolKind, SymbolSort, SymbolValue, TargetConstantId,
     UnaryOp,
 };
+use crate::reference_math::{self, ReferenceScalar, ScalarOp};
 use crate::types::DType;
+use num_bigint::{BigInt, BigUint};
+use num_traits::{Euclid, One, Signed, Zero};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -92,6 +95,10 @@ enum Node {
     ScalarConst {
         dtype: DType,
         bits: u32,
+    },
+    ScalarInteger {
+        operation: ScalarOp,
+        operands: Box<[(DType, IntExpr)]>,
     },
     Symbol(SymbolId),
     Unary {
@@ -304,6 +311,9 @@ impl Arena {
             Node::Unary { operand, .. } => vec![*operand],
             Node::Binary { lhs, rhs, .. } | Node::Cmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             Node::Nary { operands, .. } => operands.to_vec(),
+            Node::ScalarInteger { operands, .. } => {
+                operands.iter().map(|(_, value)| (*value).into()).collect()
+            }
             Node::Select {
                 cond,
                 then,
@@ -328,6 +338,17 @@ impl Arena {
     }
 
     fn node_total(&self, node: &Node) -> bool {
+        if let Node::Unary {
+            op: UnaryOp::ScalarIntegerDefined,
+            operand,
+        } = node
+        {
+            // Definedness observes this recipe's failure, not a numeric
+            // placeholder. Its operands must still themselves be defined.
+            return Self::children(self.node(self.index(*operand)))
+                .into_iter()
+                .all(|child| self.is_total(self.index(child)));
+        }
         let children_total = Self::children(node)
             .into_iter()
             .all(|c| self.is_total(self.index(c)));
@@ -335,6 +356,15 @@ impl Arena {
             return false;
         }
         match node {
+            Node::ScalarInteger {
+                operation,
+                operands,
+            } => {
+                let types = operands.iter().map(|(dtype, _)| *dtype).collect::<Vec<_>>();
+                reference_math::scalar_recipe(*operation, &types)
+                    .failures()
+                    .is_empty()
+            }
             Node::Unary {
                 op: UnaryOp::NatFromInt,
                 ..
@@ -503,6 +533,12 @@ impl Arena {
     pub(super) fn schedule_slot(&mut self, ordinal: u32, sort: SymbolSort) -> SymbolId {
         self.symbol(SymbolKind::ScheduleSlot(ordinal), sort)
     }
+    pub(super) fn rebase_schedule_slot(&mut self, symbol: SymbolId, ordinal: u32) {
+        let index = self.symbol_index(symbol);
+        let record = self.symbols.get_mut(index).expect(SYMBOL_OUT_OF_ARENA);
+        assert!(matches!(record.kind, SymbolKind::ScheduleSlot(_)), "only a schedule slot may be rebased");
+        record.kind = SymbolKind::ScheduleSlot(ordinal);
+    }
     pub(super) fn symbol_kind(&self, symbol: SymbolId) -> SymbolKind {
         self.record(symbol).kind
     }
@@ -556,6 +592,27 @@ impl Arena {
     }
 
     // ----- Nat -------------------------------------------------------------
+
+    pub(super) fn nat_exact(&mut self, value: BigUint) -> NatExpr {
+        // Constant leaves retain their compact native encoding; arbitrary
+        // constants use the same exact arithmetic DAG, not an auxiliary map.
+        let mut result = self.nat_const(0);
+        let radix = self.nat_const(1_u64 << 32);
+        for digit in value.to_u32_digits().into_iter().rev() {
+            let shifted = self.nat_mul(result, radix);
+            let digit = self.nat_const(u64::from(digit));
+            result = self.nat_add(shifted, digit);
+        }
+        result
+    }
+    pub(super) fn int_exact(&mut self, value: BigInt) -> IntExpr {
+        let magnitude = self.nat_exact(value.magnitude().clone());
+        let magnitude = self.int_from_nat(magnitude);
+        if value.is_negative() {
+            let zero = self.int_const(0);
+            self.int_sub(zero, magnitude)
+        } else { magnitude }
+    }
 
     pub(super) fn nat_const(&mut self, v: u64) -> NatExpr {
         handle(self.id, self.intern(Node::NatConst(v), Sort::Nat))
@@ -653,6 +710,12 @@ impl Arena {
     pub(super) fn nat_max(&mut self, a: NatExpr, b: NatExpr) -> NatExpr {
         self.expr_index(a);
         self.expr_index(b);
+        if self.nat_of(a) == Some(0) {
+            return b;
+        }
+        if self.nat_of(b) == Some(0) {
+            return a;
+        }
         if a == b {
             return a;
         }
@@ -794,7 +857,37 @@ impl Arena {
             ),
         )
     }
+    // Preserve natural shape arithmetic through the signed source-expression
+    // layer. Only operations on independently nonnegative operands qualify;
+    // arbitrary signed expressions retain their checked conversion.
+    fn natural_integer(&mut self, i: IntExpr) -> Option<NatExpr> {
+        match self.node(self.expr_index(i)).clone() {
+            Node::IntConst(value) => u64::try_from(value).ok().map(|n| self.nat_const(n)),
+            Node::Unary {
+                op: UnaryOp::IntFromNat,
+                operand: AnyExpr::Nat(n),
+            } => Some(n),
+            Node::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Mul),
+                lhs: AnyExpr::Int(a),
+                rhs: AnyExpr::Int(b),
+            } => {
+                let a = self.natural_integer(a)?;
+                let b = self.natural_integer(b)?;
+                Some(match op {
+                    BinaryOp::Add => self.nat_add(a, b),
+                    BinaryOp::Mul => self.nat_mul(a, b),
+                    _ => unreachable!(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn nat_from_int(&mut self, i: IntExpr) -> NatExpr {
+        if let Some(natural) = self.natural_integer(i) {
+            return natural;
+        }
         if let Some(v) = self.int_of(i) {
             if let Ok(n) = u64::try_from(v) {
                 return self.nat_const(n);
@@ -860,6 +953,92 @@ impl Arena {
             ),
         )
     }
+    pub(super) fn int_from_scalar(&mut self, value: ErasedScalarExpr) -> IntExpr {
+        let ordinal = self.index(AnyExpr::Scalar(value));
+        assert!(
+            matches!(self.sort(ordinal), Sort::Scalar(DType::I32 | DType::U32)),
+            "mathematical integer injection requires an integer word"
+        );
+        if let Node::ScalarConst { dtype, bits } = *self.node(ordinal) {
+            let integer = match dtype {
+                DType::I32 => i64::from(bits as i32),
+                DType::U32 => i64::from(bits),
+                _ => unreachable!(),
+            };
+            return self.int_const(integer);
+        }
+        handle(
+            self.id,
+            self.intern(
+                Node::Unary {
+                    op: UnaryOp::IntFromScalar,
+                    operand: AnyExpr::Scalar(value),
+                },
+                Sort::Int,
+            ),
+        )
+    }
+    pub(super) fn scalar_integer(
+        &mut self,
+        operation: ScalarOp,
+        operands: &[(DType, IntExpr)],
+    ) -> IntExpr {
+        let types = operands
+            .iter()
+            .map(|(dtype, value)| {
+                self.expr_index(*value);
+                assert!(dtype.is_int(), "scalar integer operand must be I32/U32");
+                *dtype
+            })
+            .collect::<Vec<_>>();
+        let recipe = reference_math::scalar_recipe(operation, &types);
+        assert!(
+            recipe.output().ty().is_int(),
+            "scalar integer result must be I32/U32"
+        );
+        let constants = operands
+            .iter()
+            .map(|(dtype, value)| {
+                self.int_of(*value)
+                    .map(|integer| integer_word(*dtype, &integer.into()))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(inputs) = constants {
+            if let Ok(value) = reference_math::evaluate(&recipe, &inputs) {
+                return self.int_const(scalar_integer_value(value));
+            }
+        }
+        handle(
+            self.id,
+            self.intern(
+                Node::ScalarInteger {
+                    operation,
+                    operands: operands.into(),
+                },
+                Sort::Int,
+            ),
+        )
+    }
+    pub(super) fn scalar_integer_defined(&mut self, value: IntExpr) -> BoolExpr {
+        let index = self.expr_index(value);
+        if self.is_total(index) {
+            return self.bool_const(true);
+        }
+        assert!(
+            matches!(self.node(index), Node::ScalarInteger { .. }),
+            "scalar definedness must refer to its actual recipe node"
+        );
+        handle(
+            self.id,
+            self.intern(
+                Node::Unary {
+                    op: UnaryOp::ScalarIntegerDefined,
+                    operand: value.into(),
+                },
+                Sort::Bool,
+            ),
+        )
+    }
     pub(super) fn int_add(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
         match (self.int_of(a), self.int_of(b)) {
             (Some(x), Some(y)) => {
@@ -903,7 +1082,7 @@ impl Arena {
     pub(super) fn int_div(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
         match (self.int_of(a), self.int_of(b)) {
             (Some(x), Some(y)) if y != 0 => {
-                if let Some(v) = x.checked_div(y) {
+                if let Some(v) = x.checked_div_euclid(y) {
                     return self.int_const(v);
                 }
             }
@@ -915,7 +1094,7 @@ impl Arena {
     pub(super) fn int_rem(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
         match (self.int_of(a), self.int_of(b)) {
             (Some(x), Some(y)) if y != 0 => {
-                if let Some(v) = x.checked_rem(y) {
+                if let Some(v) = x.checked_rem_euclid(y) {
                     return self.int_const(v);
                 }
             }
@@ -1062,6 +1241,12 @@ impl Arena {
         self.bool_binary(BinaryOp::Implies, a, b)
     }
 
+    pub(super) fn entails(&self, antecedent: BoolExpr, consequent: BoolExpr) -> bool {
+        self.bool_of(antecedent) == Some(false)
+            || self.bool_of(consequent) == Some(true)
+            || self.conjunction_contains(antecedent, consequent)
+    }
+
     fn conjunction_contains(&self, antecedent: BoolExpr, consequent: BoolExpr) -> bool {
         fn collect(arena: &Arena, expression: BoolExpr, out: &mut Vec<BoolExpr>) {
             match *arena.node(arena.expr_index(expression)) {
@@ -1085,19 +1270,26 @@ impl Arena {
             available.contains(&term)
                 || available
                     .iter()
-                    .any(|candidate| self.nat_upper_bound_dominates(*candidate, term))
+                    .any(|candidate| self.nat_upper_bound_dominates(*candidate, term, &available))
+                || match self.node(self.expr_index(term)) {
+                    Node::Binary {
+                        op: BinaryOp::Implies,
+                        lhs: AnyExpr::Bool(condition),
+                        rhs: AnyExpr::Bool(body),
+                    } if self.expr_total(*condition) => self.entails(antecedent, *body),
+                    _ => false,
+                }
         })
     }
 
-    /// Recognizes the exact monotone storage-bound relation
-    /// `larger_constant * factors <= limit` =>
-    /// `smaller_constant * same_factors <= limit`.
-    ///
-    /// This is deliberately not a general arithmetic prover. It exists so an
-    /// ABI allocation can certify a same-shaped internal allocation with a
-    /// no-larger byte width, while different factors, limits, or comparisons
-    /// remain ordinary proof obligations.
-    fn nat_upper_bound_dominates(&self, available: BoolExpr, required: BoolExpr) -> bool {
+    /// Exact monotone ordering of total natural expressions. This is a
+    /// structural proof, never a sampled bound or a target-specific assumption.
+    fn nat_upper_bound_dominates(
+        &self,
+        available: BoolExpr,
+        required: BoolExpr,
+        assumptions: &[BoolExpr],
+    ) -> bool {
         let (
             Node::Cmp {
                 op: CmpOp::Le,
@@ -1120,6 +1312,59 @@ impl Arena {
             return false;
         }
 
+        self.nat_no_larger(*required_lhs, *available_lhs, assumptions)
+    }
+
+    fn nat_no_larger(&self, smaller: NatExpr, larger: NatExpr, assumptions: &[BoolExpr]) -> bool {
+        if smaller == larger {
+            return true;
+        }
+        if !self.expr_total(smaller) || !self.expr_total(larger) {
+            return false;
+        }
+        if let (Some(a), Some(b)) = (self.nat_of(smaller), self.nat_of(larger)) {
+            return a <= b;
+        }
+        if self.nat_of(smaller) == Some(0) {
+            return true;
+        }
+        if let Node::Select {
+            then: AnyExpr::Nat(then),
+            otherwise: AnyExpr::Nat(otherwise),
+            ..
+        } = self.node(self.expr_index(smaller))
+        {
+            // Totality above includes the condition and both arms. Either arm
+            // is therefore bounded without discarding a partial evaluation.
+            return self.nat_no_larger(*then, larger, assumptions)
+                && self.nat_no_larger(*otherwise, larger, assumptions);
+        }
+        if let Node::Binary {
+            op: BinaryOp::Min,
+            lhs: AnyExpr::Nat(lhs),
+            rhs: AnyExpr::Nat(rhs),
+        } = self.node(self.expr_index(smaller))
+        {
+            // Both operands are total (checked above), so either operand is
+            // a sound upper bound without suppressing a partial evaluation.
+            if self.nat_no_larger(*lhs, larger, assumptions)
+                || self.nat_no_larger(*rhs, larger, assumptions)
+            {
+                return true;
+            }
+        }
+        if let Node::Binary {
+            op: BinaryOp::Div | BinaryOp::CeilDiv,
+            lhs: AnyExpr::Nat(numerator),
+            rhs: AnyExpr::Nat(divisor),
+        } = self.node(self.expr_index(smaller))
+        {
+            if self.nat_of(*divisor).is_some_and(|divisor| divisor >= 1)
+                && self.nat_no_larger(*numerator, larger, assumptions)
+            {
+                return true;
+            }
+        }
         fn product(
             arena: &Arena,
             expression: NatExpr,
@@ -1136,48 +1381,87 @@ impl Arena {
                 }
                 Node::Binary {
                     op: BinaryOp::Mul,
-                    lhs: AnyExpr::Nat(lhs),
-                    rhs: AnyExpr::Nat(rhs),
+                    lhs: AnyExpr::Nat(a),
+                    rhs: AnyExpr::Nat(b),
                 } => {
-                    product(arena, *lhs, coefficient, factors)
-                        && product(arena, *rhs, coefficient, factors)
+                    product(arena, *a, coefficient, factors)
+                        && product(arena, *b, coefficient, factors)
                 }
+                Node::Nary {
+                    op: NaryOp::Product,
+                    operands,
+                } => operands.iter().all(|operand| {
+                    let AnyExpr::Nat(value) = operand else {
+                        return false;
+                    };
+                    product(arena, *value, coefficient, factors)
+                }),
                 _ => {
                     factors.push(expression);
                     true
                 }
             }
         }
-
-        let mut available_coefficient = 1u64;
-        let mut required_coefficient = 1u64;
-        let mut available_factors = Vec::new();
-        let mut required_factors = Vec::new();
-        if !product(
-            self,
-            *available_lhs,
-            &mut available_coefficient,
-            &mut available_factors,
-        ) || !product(
-            self,
-            *required_lhs,
-            &mut required_coefficient,
-            &mut required_factors,
-        ) || required_coefficient > available_coefficient
-            || available_factors.len() != required_factors.len()
+        let mut ac = 1;
+        let mut bc = 1;
+        let mut af = Vec::new();
+        let mut bf = Vec::new();
+        if !product(self, smaller, &mut ac, &mut af)
+            || !product(self, larger, &mut bc, &mut bf)
+            || ac > bc
+            || af.len() > bf.len()
         {
             return false;
         }
-        for required_factor in required_factors {
-            let Some(index) = available_factors
-                .iter()
-                .position(|factor| *factor == required_factor)
-            else {
+        // Atom pairs without any decomposition cannot yield a new proof.
+        if af.as_slice() == [smaller] && bf.as_slice() == [larger] {
+            return false;
+        }
+        for factor in af {
+            let found = bf.iter().position(|other| factor == *other).or_else(|| {
+                bf.iter()
+                    .position(|other| self.nat_no_larger(factor, *other, assumptions))
+            });
+            let Some(index) = found else {
                 return false;
             };
-            available_factors.swap_remove(index);
+            bf.swap_remove(index);
         }
-        true
+        bf.into_iter()
+            .all(|factor| self.nat_positive_under(factor, assumptions))
+    }
+
+    fn nat_positive_under(&self, value: NatExpr, assumptions: &[BoolExpr]) -> bool {
+        if self.nat_of(value).is_some_and(|n| n > 0) {
+            return true;
+        }
+        assumptions.iter().any(|assumption| {
+            let Node::Cmp { op, lhs, rhs } = self.node(self.expr_index(*assumption)) else {
+                return false;
+            };
+            let natural = match lhs {
+                AnyExpr::Nat(n) => Some(*n),
+                AnyExpr::Int(i) => match self.node(self.expr_index(*i)) {
+                    Node::Unary {
+                        op: UnaryOp::IntFromNat,
+                        operand: AnyExpr::Nat(n),
+                    } => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let bound = match rhs {
+                AnyExpr::Nat(n) => self.nat_of(*n).map(i128::from),
+                AnyExpr::Int(i) => self.int_of(*i).map(i128::from),
+                _ => None,
+            };
+            natural == Some(value)
+                && match (op, bound) {
+                    (CmpOp::Ge, Some(n)) => n >= 1,
+                    (CmpOp::Gt, Some(n)) => n >= 0,
+                    _ => false,
+                }
+        })
     }
     pub(super) fn iff(&mut self, a: BoolExpr, b: BoolExpr) -> BoolExpr {
         match (self.bool_of(a), self.bool_of(b)) {
@@ -1217,8 +1501,57 @@ impl Arena {
         if a == b && self.expr_total(a) {
             return self.bool_const(reflexive(op));
         }
+        if self.expr_total(a) {
+            if let (Some(upper), Some(rhs)) = (self.nat_constant_upper(a), self.nat_of(b)) {
+                match op {
+                    CmpOp::Le if upper <= rhs => return self.bool_const(true),
+                    CmpOp::Lt if upper < rhs => return self.bool_const(true),
+                    CmpOp::Gt if upper <= rhs => return self.bool_const(false),
+                    CmpOp::Ge if upper < rhs => return self.bool_const(false),
+                    _ => {}
+                }
+            }
+        }
         self.cmp_node(op, AnyExpr::Nat(a), AnyExpr::Nat(b))
     }
+    /// A conservative constant upper bound from total expression structure.
+    /// No invocation assumption, sampled value or backend fact enters it.
+    fn nat_constant_upper(&self, expression: NatExpr) -> Option<u64> {
+        match self.node(self.expr_index(expression)) {
+            Node::NatConst(value) => Some(*value),
+            Node::Binary {
+                op: BinaryOp::Rem,
+                rhs: AnyExpr::Nat(divisor),
+                ..
+            } => self.nat_of(*divisor)?.checked_sub(1),
+            Node::Binary {
+                op: BinaryOp::Min,
+                lhs: AnyExpr::Nat(a),
+                rhs: AnyExpr::Nat(b),
+            } => match (self.nat_constant_upper(*a), self.nat_constant_upper(*b)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            Node::Binary {
+                op: BinaryOp::Max,
+                lhs: AnyExpr::Nat(a),
+                rhs: AnyExpr::Nat(b),
+            } => Some(
+                self.nat_constant_upper(*a)?
+                    .max(self.nat_constant_upper(*b)?),
+            ),
+            Node::Select {
+                then: AnyExpr::Nat(a),
+                otherwise: AnyExpr::Nat(b),
+                ..
+            } => Some(
+                self.nat_constant_upper(*a)?
+                    .max(self.nat_constant_upper(*b)?),
+            ),
+            _ => None,
+        }
+    }
+
     pub(super) fn int_cmp(&mut self, op: CmpOp, a: IntExpr, b: IntExpr) -> BoolExpr {
         if let (Some(x), Some(y)) = (self.int_of(a), self.int_of(b)) {
             return self.bool_const(compare(op, x, y));
@@ -1538,7 +1871,7 @@ impl Arena {
     pub(super) fn canonical_digest(&self, roots: &[RootId]) -> ExprDigest {
         let mut memo = HashMap::<u32, [u8; 32]>::new();
         let mut digest = Sha256::new();
-        digest.update(b"seismic-expr-roots-v1");
+        digest.update(b"seismic-expr-roots-v2");
         digest.update((roots.len() as u64).to_le_bytes());
         for root in roots {
             if root.owner != self.id {
@@ -1574,7 +1907,7 @@ impl Arena {
                 continue;
             }
             let mut digest = Sha256::new();
-            digest.update(b"seismic-expr-node-v1");
+            digest.update(b"seismic-expr-node-v2");
             self.hash_node(&mut digest, self.node(index), memo);
             memo.insert(index, digest.finalize().into());
         }
@@ -1602,6 +1935,35 @@ impl Arena {
             Node::ScalarConst { dtype, bits } => {
                 digest.update([3, dtype_tag(*dtype)]);
                 digest.update(bits.to_le_bytes());
+            }
+            Node::ScalarInteger {
+                operation,
+                operands,
+            } => {
+                digest.update([14]);
+                digest.update(reference_math::digest());
+                match operation {
+                    ScalarOp::Binary(op) => {
+                        digest.update([0]);
+                        digest.update(op.text().as_bytes());
+                    }
+                    ScalarOp::Unary(op) => {
+                        digest.update([1]);
+                        digest.update(op.text().as_bytes());
+                    }
+                    ScalarOp::Math(op) => {
+                        digest.update([2]);
+                        digest.update(op.name().as_bytes());
+                    }
+                    ScalarOp::Cast(dtype) => {
+                        digest.update([3, dtype_tag(*dtype)]);
+                    }
+                }
+                digest.update((operands.len() as u64).to_le_bytes());
+                for (dtype, value) in operands.iter() {
+                    digest.update([dtype_tag(*dtype)]);
+                    child!(AnyExpr::Int(*value));
+                }
             }
             Node::Symbol(symbol) => {
                 digest.update([4]);
@@ -1749,6 +2111,15 @@ fn hash_root_name(digest: &mut Sha256, name: &RootName) {
             digest.update(step.to_le_bytes());
             digest.update(axis.to_le_bytes());
         }
+        RootName::HostEvaluation { step } => {
+            digest.update([23]);
+            digest.update(step.to_le_bytes());
+        }
+        RootName::PublishedExtent { step, axis } => {
+            digest.update([33]);
+            digest.update(step.to_le_bytes());
+            digest.update(axis.to_le_bytes());
+        }
         RootName::LocalExtent {
             kernel,
             local,
@@ -1777,11 +2148,6 @@ fn hash_root_name(digest: &mut Sha256, name: &RootName) {
             digest.update([22]);
             digest.update(kernel.to_le_bytes());
             digest.update(resource.to_le_bytes());
-        }
-        RootName::NumericalMultiplicity { kernel, fact } => {
-            digest.update([23]);
-            digest.update(kernel.to_le_bytes());
-            digest.update(fact.to_le_bytes());
         }
         RootName::KernelScalarArgument { kernel, argument } => {
             digest.update([24]);
@@ -1831,6 +2197,10 @@ fn hash_root_name(digest: &mut Sha256, name: &RootName) {
         RootName::NumericalCondition { child } => {
             digest.update([31]);
             digest.update(child.to_le_bytes());
+        }
+        RootName::RegionOperand { operand } => {
+            digest.update([34]);
+            digest.update(operand.to_le_bytes());
         }
         RootName::NumericalOperationMultiplicity { operation } => {
             digest.update([32]);
@@ -1899,6 +2269,8 @@ fn unary_tag(op: UnaryOp) -> u8 {
         UnaryOp::Not => 0,
         UnaryOp::NatFromInt => 1,
         UnaryOp::IntFromNat => 2,
+        UnaryOp::IntFromScalar => 3,
+        UnaryOp::ScalarIntegerDefined => 4,
     }
 }
 fn binary_tag(op: BinaryOp) -> u8 {
@@ -2099,6 +2471,13 @@ impl Arena {
                 dtype: *dtype,
                 bits: *bits,
             },
+            Node::ScalarInteger {
+                operation,
+                operands,
+            } => NodeView::ScalarInteger {
+                operation: *operation,
+                operands,
+            },
             Node::Symbol(s) => NodeView::Symbol(*s),
             Node::Unary { op, operand } => NodeView::Unary {
                 op: *op,
@@ -2181,6 +2560,24 @@ impl Arena {
             | Node::BoolConst(_)
             | Node::ScalarConst { .. }
             | Node::Symbol(_) => self.bool_const(true),
+            Node::ScalarInteger { operands, .. } => {
+                let mut conditions = operands
+                    .iter()
+                    .map(|(_, value)| self.side_conditions_of(self.expr_index(*value), memo))
+                    .collect::<Vec<_>>();
+                conditions.push(self.scalar_integer_defined(self.h(i)));
+                self.all(&conditions)
+            }
+            Node::Unary {
+                op: UnaryOp::ScalarIntegerDefined,
+                operand,
+            } => {
+                let conditions = Self::children(self.node(self.index(operand)))
+                    .into_iter()
+                    .map(|child| self.side_conditions_of(self.index(child), memo))
+                    .collect::<Vec<_>>();
+                self.all(&conditions)
+            }
             Node::Unary { op, operand } => {
                 let inner = self.side_conditions_of(self.index(operand), memo);
                 match (op, operand) {
@@ -2338,18 +2735,51 @@ impl Arena {
         let mut memo = HashMap::new();
         let mut shadow: Vec<SymbolId> = Vec::new();
         let node = self.expr_index(node);
-        handle(self.id, self.partial_of(node, a, &mut shadow, &mut memo))
+        handle(
+            self.id,
+            self.partial_of(node, a, &HashMap::new(), &mut shadow, &mut memo),
+        )
+    }
+
+    pub(super) fn resolve_runtime_values(
+        &mut self,
+        node: IntExpr,
+        values: &[(crate::ids::SemanticValueId, IntExpr)],
+    ) -> IntExpr {
+        let mut expressions = HashMap::new();
+        let node = self.expr_index(node);
+        for symbol in &self.free[node as usize] {
+            if let SymbolKind::RuntimeValue(value) = self.record(*symbol).kind {
+                if let Some((_, expression)) =
+                    values.iter().find(|(candidate, _)| *candidate == value)
+                {
+                    expressions.insert(*symbol, self.expr_index(*expression));
+                }
+            }
+        }
+        let result = self.partial_of(
+            node,
+            &PartialAssignment::new(),
+            &expressions,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+        self.h(result)
     }
 
     fn partial_of(
         &mut self,
         i: u32,
         a: &PartialAssignment,
+        expressions: &HashMap<SymbolId, u32>,
         shadow: &mut Vec<SymbolId>,
         memo: &mut HashMap<u32, u32>,
     ) -> u32 {
         let free = &self.free[i as usize];
-        if !free.iter().any(|s| a.get(*s).is_some()) {
+        if !free
+            .iter()
+            .any(|s| a.get(*s).is_some() || expressions.contains_key(s))
+        {
             return i;
         }
         if shadow.is_empty() {
@@ -2366,10 +2796,12 @@ impl Arena {
             Node::Symbol(s) => {
                 if shadow.contains(&s) {
                     i
+                } else if let Some(&value) = expressions.get(&s) {
+                    value
                 } else {
                     match (self.record(s).sort, a.get(s)) {
-                        (SymbolSort::Nat, Some(SymbolValue::Nat(v))) => self.nat_const(v).index,
-                        (SymbolSort::Int, Some(SymbolValue::Int(v))) => self.int_const(v).index,
+                        (SymbolSort::Nat, Some(SymbolValue::Nat(v))) => self.nat_exact(v).index,
+                        (SymbolSort::Int, Some(SymbolValue::Int(v))) => self.int_exact(v).index,
                         (SymbolSort::Scalar(dtype), Some(value)) => {
                             match ScalarVal::from_value(value) {
                                 Some(scalar) if scalar.matches(dtype) => {
@@ -2387,16 +2819,38 @@ impl Arena {
                 }
             }
             Node::Unary { op, operand } => {
-                let o = self.partial_of(self.index(operand), a, shadow, memo);
+                let o = self.partial_of(self.index(operand), a, expressions, shadow, memo);
                 match op {
                     UnaryOp::Not => self.not(self.h(o)).index,
+                    UnaryOp::ScalarIntegerDefined => self.scalar_integer_defined(self.h(o)).index,
                     UnaryOp::NatFromInt => self.nat_from_int(self.h(o)).index,
                     UnaryOp::IntFromNat => self.int_from_nat(self.h(o)).index,
+                    UnaryOp::IntFromScalar => {
+                        self.int_from_scalar(ErasedScalarExpr {
+                            owner: self.id,
+                            index: o,
+                        })
+                        .index
+                    }
                 }
             }
+            Node::ScalarInteger {
+                operation,
+                operands,
+            } => {
+                let operands = operands
+                    .iter()
+                    .map(|(dtype, value)| {
+                        let node =
+                            self.partial_of(self.expr_index(*value), a, expressions, shadow, memo);
+                        (*dtype, self.h(node))
+                    })
+                    .collect::<Vec<_>>();
+                self.scalar_integer(operation, &operands).index
+            }
             Node::Binary { op, lhs, rhs } => {
-                let l = self.partial_of(self.index(lhs), a, shadow, memo);
-                let r = self.partial_of(self.index(rhs), a, shadow, memo);
+                let l = self.partial_of(self.index(lhs), a, expressions, shadow, memo);
+                let r = self.partial_of(self.index(rhs), a, expressions, shadow, memo);
                 match self.sort(i) {
                     Sort::Nat => {
                         match op {
@@ -2444,7 +2898,7 @@ impl Arena {
             Node::Nary { op, operands } => {
                 let rebuilt: Vec<u32> = operands
                     .iter()
-                    .map(|o| self.partial_of(self.index(*o), a, shadow, memo))
+                    .map(|o| self.partial_of(self.index(*o), a, expressions, shadow, memo))
                     .collect();
                 match op {
                     NaryOp::All => {
@@ -2483,10 +2937,10 @@ impl Arena {
                 then,
                 otherwise,
             } => {
-                let c_index = self.partial_of(cond.index, a, shadow, memo);
+                let c_index = self.partial_of(cond.index, a, expressions, shadow, memo);
                 let c = self.h(c_index);
-                let t = self.partial_of(self.index(then), a, shadow, memo);
-                let e = self.partial_of(self.index(otherwise), a, shadow, memo);
+                let t = self.partial_of(self.index(then), a, expressions, shadow, memo);
+                let e = self.partial_of(self.index(otherwise), a, expressions, shadow, memo);
                 match self.sort(i) {
                     Sort::Nat => self.nat_select(c, self.h(t), self.h(e)).index,
                     Sort::Int => self.int_select(c, self.h(t), self.h(e)).index,
@@ -2495,8 +2949,8 @@ impl Arena {
                 }
             }
             Node::Cmp { op, lhs, rhs } => {
-                let l = self.partial_of(self.index(lhs), a, shadow, memo);
-                let r = self.partial_of(self.index(rhs), a, shadow, memo);
+                let l = self.partial_of(self.index(lhs), a, expressions, shadow, memo);
+                let r = self.partial_of(self.index(rhs), a, expressions, shadow, memo);
                 match lhs {
                     AnyExpr::Nat(_) => self.nat_cmp(op, self.h(l), self.h(r)).index,
                     AnyExpr::Int(_) => self.int_cmp(op, self.h(l), self.h(r)).index,
@@ -2505,7 +2959,7 @@ impl Arena {
                 }
             }
             Node::In { operand, values } => {
-                let o = self.partial_of(self.index(operand), a, shadow, memo);
+                let o = self.partial_of(self.index(operand), a, expressions, shadow, memo);
                 self.in_node(self.erased(o), &values).index
             }
             Node::Fold {
@@ -2515,8 +2969,8 @@ impl Arena {
                 extent,
                 body,
             } => {
-                let s = self.partial_of(start.index, a, shadow, memo);
-                let e = self.partial_of(extent.index, a, shadow, memo);
+                let s = self.partial_of(start.index, a, expressions, shadow, memo);
+                let e = self.partial_of(extent.index, a, expressions, shadow, memo);
                 let bound: Vec<SymbolId> = self
                     .binder_symbols
                     .get(&binder)
@@ -2524,7 +2978,7 @@ impl Arena {
                     .unwrap_or_default();
                 let before = shadow.len();
                 shadow.extend(bound);
-                let b = self.partial_of(body.index, a, shadow, memo);
+                let b = self.partial_of(body.index, a, expressions, shadow, memo);
                 shadow.truncate(before);
                 self.nat_fold_range(op, binder, self.h(s), self.h(e), self.h(b))
                     .index
@@ -2534,7 +2988,8 @@ impl Arena {
                     .iter()
                     .map(|term| DurationTerm {
                         demand: {
-                            let demand = self.partial_of(term.demand.index, a, shadow, memo);
+                            let demand =
+                                self.partial_of(term.demand.index, a, expressions, shadow, memo);
                             self.h(demand)
                         },
                         lower_numerator: term.lower_numerator,
@@ -2545,8 +3000,8 @@ impl Arena {
                 self.duration(&rebuilt).index
             }
             Node::DurationScale { duration, by } => {
-                let duration = self.partial_of(duration.index, a, shadow, memo);
-                let b = self.partial_of(by.index, a, shadow, memo);
+                let duration = self.partial_of(duration.index, a, expressions, shadow, memo);
+                let b = self.partial_of(by.index, a, expressions, shadow, memo);
                 self.duration_scale(self.h(duration), self.h(b)).index
             }
         };
@@ -2577,9 +3032,39 @@ struct Program {
     reads: Vec<SymbolId>,
 }
 
+impl Program {
+    fn retained_metadata_bytes(&self) -> usize {
+        use std::mem::{size_of, size_of_val};
+        let nested: usize = self
+            .nodes
+            .iter()
+            .map(|node| match node {
+                Node::Nary { operands, .. } => size_of_val(operands.as_ref()),
+                Node::ScalarInteger { operands, .. } => size_of_val(operands.as_ref()),
+                Node::In { values, .. } => size_of_val(values.as_ref()),
+                Node::Duration(terms) => size_of_val(terms.as_ref()),
+                _ => 0,
+            })
+            .sum();
+        size_of::<Self>()
+            + self.nodes.capacity() * size_of::<Node>()
+            + self.sorts.capacity() * size_of::<Sort>()
+            + self.memoizable.capacity()
+            + self.symbol_sorts.capacity() * (size_of::<(SymbolId, SymbolSort)>() + 1)
+            + self.binder_symbols.capacity() * (size_of::<(LoopBinderId, Vec<SymbolId>)>() + 1)
+            + self
+                .binder_symbols
+                .values()
+                .map(|symbols| symbols.capacity() * size_of::<SymbolId>())
+                .sum::<usize>()
+            + self.reads.capacity() * size_of::<SymbolId>()
+            + nested
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Val {
-    Int(i128),
+    Int(BigInt),
     Bool(bool),
     Scalar(ScalarVal),
     Duration {
@@ -2633,6 +3118,16 @@ impl Arena {
         let mut binder_symbols = HashMap::new();
         for &i in &order {
             let node = match self.node(i).clone() {
+                Node::ScalarInteger {
+                    operation,
+                    operands,
+                } => Node::ScalarInteger {
+                    operation,
+                    operands: operands
+                        .iter()
+                        .map(|(dtype, value)| (*dtype, self.h(map[&self.expr_index(*value)])))
+                        .collect(),
+                },
                 Node::Unary { op, operand } => Node::Unary {
                     op,
                     operand: remap(operand),
@@ -2750,10 +3245,10 @@ impl Arena {
         Evaluator::new(&program, &|s| values.get(s)).run(program.root)
     }
 
-    pub(super) fn eval_nat(&self, n: NatExpr, v: &Assignment) -> Result<u64, EvalError> {
+    pub(super) fn eval_nat(&self, n: NatExpr, v: &Assignment) -> Result<BigUint, EvalError> {
         to_nat(self.evaluate(self.expr_index(n), v)?)
     }
-    pub(super) fn eval_int(&self, n: IntExpr, v: &Assignment) -> Result<i64, EvalError> {
+    pub(super) fn eval_int(&self, n: IntExpr, v: &Assignment) -> Result<BigInt, EvalError> {
         to_int(self.evaluate(self.expr_index(n), v)?)
     }
     pub(super) fn eval_bool(&self, n: BoolExpr, v: &Assignment) -> Result<bool, EvalError> {
@@ -2805,13 +3300,19 @@ impl Arena {
         {
             panic!("compiled evaluator retains an unfixed finite decision");
         }
+        let retained_bytes = program
+            .retained_metadata_bytes()
+            .saturating_add(captured.capacity() * std::mem::size_of::<(SymbolId, SymbolValue)>())
+            .saturating_add(captured.iter().fold(0usize, |bytes, (_, value)| bytes.saturating_add(
+                value.retained_metadata_bytes().saturating_sub(std::mem::size_of::<SymbolValue>()))));
         Compiled::new(
             reads,
+            retained_bytes,
             Box::new(move |values| {
                 let value = Evaluator::new(&program, &|symbol| {
                     captured
                         .iter()
-                        .find_map(|(fixed, value)| (*fixed == symbol).then_some(*value))
+                        .find_map(|(fixed, value)| (*fixed == symbol).then(|| value.clone()))
                         .or_else(|| values.get(symbol))
                 })
                 .run(program.root)?;
@@ -2819,10 +3320,10 @@ impl Arena {
             }),
         )
     }
-    pub(super) fn compile_nat(&self, n: NatExpr) -> Compiled<u64> {
+    pub(super) fn compile_nat(&self, n: NatExpr) -> Compiled<BigUint> {
         self.compile(self.expr_index(n), to_nat)
     }
-    pub(super) fn compile_int(&self, n: IntExpr) -> Compiled<i64> {
+    pub(super) fn compile_int(&self, n: IntExpr) -> Compiled<BigInt> {
         self.compile(self.expr_index(n), to_int)
     }
     pub(super) fn compile_bool(&self, n: BoolExpr) -> Compiled<bool> {
@@ -2838,10 +3339,10 @@ impl Arena {
     pub(super) fn compile_duration(&self, n: DurationExpr) -> Compiled<DurationEstimate> {
         self.compile(self.expr_index(n), to_duration)
     }
-    pub(super) fn compile_nat_with(&self, n: NatExpr, fixed: &PartialAssignment) -> Compiled<u64> {
+    pub(super) fn compile_nat_with(&self, n: NatExpr, fixed: &PartialAssignment) -> Compiled<BigUint> {
         self.compile_with(self.expr_index(n), fixed, to_nat)
     }
-    pub(super) fn compile_int_with(&self, n: IntExpr, fixed: &PartialAssignment) -> Compiled<i64> {
+    pub(super) fn compile_int_with(&self, n: IntExpr, fixed: &PartialAssignment) -> Compiled<BigInt> {
         self.compile_with(self.expr_index(n), fixed, to_int)
     }
     pub(super) fn compile_bool_with(
@@ -2860,15 +3361,15 @@ impl Arena {
     }
 }
 
-fn to_nat(v: Val) -> Result<u64, EvalError> {
+fn to_nat(v: Val) -> Result<BigUint, EvalError> {
     match v {
-        Val::Int(i) => u64::try_from(i).map_err(|_| EvalError::Unrepresentable),
+        Val::Int(i) => i.to_biguint().ok_or(EvalError::NegativeNat),
         _ => Err(EvalError::Unrepresentable),
     }
 }
-fn to_int(v: Val) -> Result<i64, EvalError> {
+fn to_int(v: Val) -> Result<BigInt, EvalError> {
     match v {
-        Val::Int(i) => i64::try_from(i).map_err(|_| EvalError::Unrepresentable),
+        Val::Int(i) => Ok(i),
         _ => Err(EvalError::Unrepresentable),
     }
 }
@@ -2910,7 +3411,7 @@ struct Evaluator<'a> {
     lookup: &'a dyn Fn(SymbolId) -> Option<SymbolValue>,
     memo: Vec<Option<Val>>,
     /// Active fold bindings, innermost last.
-    bound: Vec<(SymbolId, i128)>,
+    bound: Vec<(SymbolId, BigInt)>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -2927,14 +3428,79 @@ impl<'a> Evaluator<'a> {
         if let Some(v) = &self.memo[i as usize] {
             return Ok(v.clone());
         }
-        let value = self.compute(i)?;
+        let value = if matches!(
+            self.program.nodes[i as usize],
+            Node::Binary {
+                op: BinaryOp::And | BinaryOp::Or | BinaryOp::Implies,
+                ..
+            }
+        ) {
+            Val::Bool(self.short_circuit(i)?)
+        } else {
+            self.compute(i)?
+        };
         if self.program.memoizable[i as usize] {
             self.memo[i as usize] = Some(value.clone());
         }
         Ok(value)
     }
 
-    fn int(&mut self, e: AnyExpr) -> Result<i128, EvalError> {
+    /// Predicate conjunctions grow with program size. Evaluate their control
+    /// flow on an explicit stack, retaining left-to-right definedness and
+    /// short-circuiting without consuming one host frame per conjunct.
+    fn short_circuit(&mut self, root: u32) -> Result<bool, EvalError> {
+        enum Pending {
+            Left { id: u32, op: BinaryOp, right: u32 },
+            Right(u32),
+        }
+        let mut pending = Vec::new();
+        let mut current = root;
+        'evaluate: loop {
+            let mut value = if let Some(value) = &self.memo[current as usize] {
+                to_bool(value.clone())?
+            } else if let Node::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Or | BinaryOp::Implies),
+                lhs: AnyExpr::Bool(left),
+                rhs: AnyExpr::Bool(right),
+            } = self.program.nodes[current as usize]
+            {
+                pending.push(Pending::Left {
+                    id: current,
+                    op,
+                    right: right.index,
+                });
+                current = left.index;
+                continue;
+            } else {
+                to_bool(self.run(current)?)?
+            };
+            while let Some(frame) = pending.pop() {
+                let id = match frame {
+                    Pending::Left { id, op, right } => {
+                        let needs_right = match op {
+                            BinaryOp::And | BinaryOp::Implies => value,
+                            BinaryOp::Or => !value,
+                            _ => unreachable!(),
+                        };
+                        if needs_right {
+                            pending.push(Pending::Right(id));
+                            current = right;
+                            continue 'evaluate;
+                        }
+                        value = matches!(op, BinaryOp::Or | BinaryOp::Implies);
+                        id
+                    }
+                    Pending::Right(id) => id,
+                };
+                if self.program.memoizable[id as usize] {
+                    self.memo[id as usize] = Some(Val::Bool(value));
+                }
+            }
+            return Ok(value);
+        }
+    }
+
+    fn int(&mut self, e: AnyExpr) -> Result<BigInt, EvalError> {
         match self.run(ordinal(e))? {
             Val::Int(v) => Ok(v),
             _ => Err(EvalError::Unrepresentable),
@@ -2959,12 +3525,12 @@ impl<'a> Evaluator<'a> {
 
     fn symbol(&self, s: SymbolId) -> Result<Val, EvalError> {
         if let Some((_, v)) = self.bound.iter().rev().find(|(b, _)| *b == s) {
-            return Ok(Val::Int(*v));
+            return Ok(Val::Int(v.clone()));
         }
         let sort = self.program.symbol_sorts.get(&s).copied();
         match (sort, (self.lookup)(s)) {
-            (Some(SymbolSort::Nat), Some(SymbolValue::Nat(v))) => Ok(Val::Int(v as i128)),
-            (Some(SymbolSort::Int), Some(SymbolValue::Int(v))) => Ok(Val::Int(v as i128)),
+            (Some(SymbolSort::Nat), Some(SymbolValue::Nat(v))) => Ok(Val::Int(v.into())),
+            (Some(SymbolSort::Int), Some(SymbolValue::Int(v))) => Ok(Val::Int(v.into())),
             (Some(SymbolSort::Scalar(dtype)), Some(value)) => match ScalarVal::from_value(value) {
                 Some(scalar) if scalar.matches(dtype) => Ok(Val::Scalar(scalar)),
                 _ => Err(EvalError::Unbound(s)),
@@ -2976,10 +3542,25 @@ impl<'a> Evaluator<'a> {
     fn compute(&mut self, i: u32) -> Result<Val, EvalError> {
         let node = &self.program.nodes[i as usize];
         Ok(match node {
-            Node::NatConst(v) => Val::Int(*v as i128),
-            Node::IntConst(v) => Val::Int(*v as i128),
+            Node::NatConst(v) => Val::Int((*v).into()),
+            Node::IntConst(v) => Val::Int((*v).into()),
             Node::BoolConst(v) => Val::Bool(*v),
             Node::ScalarConst { dtype, bits } => Val::Scalar(ScalarVal::decode(*dtype, *bits)),
+            Node::ScalarInteger {
+                operation,
+                operands,
+            } => {
+                let operation = *operation;
+                let mut inputs = Vec::with_capacity(operands.len());
+                for (dtype, value) in operands.iter() {
+                    inputs.push(integer_word(*dtype, &self.int((*value).into())?));
+                }
+                let types = inputs.iter().map(|value| value.dtype()).collect::<Vec<_>>();
+                let recipe = reference_math::scalar_recipe(operation, &types);
+                let result =
+                    reference_math::evaluate(&recipe, &inputs).map_err(EvalError::ScalarFailure)?;
+                Val::Int(scalar_integer_value(result).into())
+            }
             Node::Symbol(s) => self.symbol(*s)?,
             Node::Unary { op, operand } => match op {
                 UnaryOp::Not => {
@@ -2990,33 +3571,29 @@ impl<'a> Evaluator<'a> {
                 }
                 UnaryOp::NatFromInt => {
                     let v = self.int(*operand)?;
-                    if v < 0 {
+                    if v.is_negative() {
                         return Err(EvalError::NegativeNat);
                     }
                     Val::Int(v)
                 }
                 UnaryOp::IntFromNat => Val::Int(self.int(*operand)?),
+                UnaryOp::ScalarIntegerDefined => Val::Bool(match self.run(ordinal(*operand)) {
+                    Ok(Val::Int(_)) => true,
+                    Err(EvalError::ScalarFailure(_)) => false,
+                    Err(error) => return Err(error),
+                    _ => unreachable!("scalar definedness refers to an integer recipe"),
+                }),
+                UnaryOp::IntFromScalar => match self.run(ordinal(*operand))? {
+                    Val::Scalar(ScalarVal::I32(value)) => Val::Int(value.into()),
+                    Val::Scalar(ScalarVal::U32(value)) => Val::Int(value.into()),
+                    _ => unreachable!("integer injection is constructed only for I32/U32"),
+                },
             },
             Node::Binary { op, lhs, rhs } => {
                 let (op, lhs, rhs) = (*op, *lhs, *rhs);
                 match op {
-                    BinaryOp::And => {
-                        let (AnyExpr::Bool(a), AnyExpr::Bool(b)) = (lhs, rhs) else {
-                            return Err(EvalError::Unrepresentable);
-                        };
-                        Val::Bool(self.boolean(a)? && self.boolean(b)?)
-                    }
-                    BinaryOp::Or => {
-                        let (AnyExpr::Bool(a), AnyExpr::Bool(b)) = (lhs, rhs) else {
-                            return Err(EvalError::Unrepresentable);
-                        };
-                        Val::Bool(self.boolean(a)? || self.boolean(b)?)
-                    }
-                    BinaryOp::Implies => {
-                        let (AnyExpr::Bool(a), AnyExpr::Bool(b)) = (lhs, rhs) else {
-                            return Err(EvalError::Unrepresentable);
-                        };
-                        Val::Bool(!self.boolean(a)? || self.boolean(b)?)
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Implies => {
+                        unreachable!("short-circuit control is evaluated by the explicit stack")
                     }
                     BinaryOp::Iff => {
                         let (AnyExpr::Bool(a), AnyExpr::Bool(b)) = (lhs, rhs) else {
@@ -3056,10 +3633,10 @@ impl<'a> Evaluator<'a> {
                     Val::Bool(false)
                 }
                 NaryOp::Product => {
-                    let mut acc = 1_i128;
+                    let mut acc = BigInt::one();
                     for o in operands.iter() {
                         let f = self.int(*o)?;
-                        acc = acc.checked_mul(f).ok_or(EvalError::Unrepresentable)?;
+                        acc *= f;
                     }
                     Val::Int(acc)
                 }
@@ -3134,25 +3711,23 @@ impl<'a> Evaluator<'a> {
                     .get(&binder)
                     .cloned()
                     .unwrap_or_default();
-                let mut acc: i128 = match op {
-                    FoldOp::Sum | FoldOp::Max => 0,
-                    FoldOp::Product => 1,
+                let mut acc = match op {
+                    FoldOp::Sum | FoldOp::Max => BigInt::zero(),
+                    FoldOp::Product => BigInt::one(),
                 };
-                let mut k: i128 = 0;
+                let mut k = BigInt::zero();
                 while k < n {
                     let before = self.bound.len();
-                    let value = start.checked_add(k).ok_or(EvalError::Unrepresentable)?;
+                    let value = &start + &k;
                     for s in &symbols {
-                        self.bound.push((*s, value));
+                        self.bound.push((*s, value.clone()));
                     }
                     let term = self.int(AnyExpr::Nat(body));
                     self.bound.truncate(before);
                     let term = term?;
                     acc = match op {
-                        FoldOp::Sum => acc.checked_add(term).ok_or(EvalError::Unrepresentable)?,
-                        FoldOp::Product => {
-                            acc.checked_mul(term).ok_or(EvalError::Unrepresentable)?
-                        }
+                        FoldOp::Sum => acc + term,
+                        FoldOp::Product => acc * term,
                         FoldOp::Max => acc.max(term),
                     };
                     k += 1;
@@ -3226,56 +3801,64 @@ impl<'a> Evaluator<'a> {
     }
 }
 
-fn arith(op: BinaryOp, nat: bool, a: i128, b: i128) -> Result<i128, EvalError> {
+fn integer_word(dtype: DType, value: &BigInt) -> ReferenceScalar {
+    let bits = value.rem_euclid(&(BigInt::one() << 32_u32));
+    let bits = u32::try_from(bits).expect("word residue is within u32");
+    match dtype {
+        DType::I32 => ReferenceScalar::I32(bits as i32),
+        DType::U32 => ReferenceScalar::U32(bits),
+        _ => unreachable!("integer projection has only integer word operands"),
+    }
+}
+fn scalar_integer_value(value: ReferenceScalar) -> i64 {
+    match value {
+        ReferenceScalar::I32(value) => i64::from(value),
+        ReferenceScalar::U32(value) => i64::from(value),
+        _ => unreachable!("integer projection has only integer word results"),
+    }
+}
+
+fn arith(op: BinaryOp, nat: bool, a: BigInt, b: BigInt) -> Result<BigInt, EvalError> {
     Ok(match op {
-        BinaryOp::Add => a.checked_add(b).ok_or(EvalError::Unrepresentable)?,
+        BinaryOp::Add => a + b,
         BinaryOp::Sub => {
-            let r = a.checked_sub(b).ok_or(EvalError::Unrepresentable)?;
-            if nat && r < 0 {
+            let r = a - b;
+            if nat && r.is_negative() {
                 return Err(EvalError::NegativeNat);
             }
             r
         }
-        BinaryOp::Mul => a.checked_mul(b).ok_or(EvalError::Unrepresentable)?,
+        BinaryOp::Mul => a * b,
         BinaryOp::Div => {
-            if b == 0 {
+            if b.is_zero() {
                 return Err(EvalError::DivisionByZero);
             }
-            a.checked_div(b).ok_or(EvalError::Unrepresentable)?
+            a.div_euclid(&b)
         }
-        BinaryOp::CeilDiv => {
-            if b == 0 {
+        BinaryOp::CeilDiv | BinaryOp::AlignUp => {
+            if b.is_zero() {
                 return Err(EvalError::DivisionByZero);
             }
-            let q = a.checked_div(b).ok_or(EvalError::Unrepresentable)?;
-            let r = a.checked_rem(b).ok_or(EvalError::Unrepresentable)?;
-            if r != 0 && ((r > 0) == (b > 0)) {
-                q.checked_add(1).ok_or(EvalError::Unrepresentable)?
-            } else {
-                q
-            }
-        }
-        BinaryOp::Rem => {
-            if b == 0 {
-                return Err(EvalError::DivisionByZero);
-            }
-            a.checked_rem(b).ok_or(EvalError::Unrepresentable)?
-        }
-        BinaryOp::Min => a.min(b),
-        BinaryOp::Max => a.max(b),
-        BinaryOp::AlignUp => {
-            if b == 0 {
-                return Err(EvalError::DivisionByZero);
-            }
-            let q = a.checked_div(b).ok_or(EvalError::Unrepresentable)?;
-            let r = a.checked_rem(b).ok_or(EvalError::Unrepresentable)?;
-            let q = if r != 0 && ((r > 0) == (b > 0)) {
-                q.checked_add(1).ok_or(EvalError::Unrepresentable)?
+            let (q, r) = a.div_rem_euclid(&b);
+            let ceiling = if !r.is_zero() && b.is_positive() {
+                q + 1
             } else {
                 q
             };
-            q.checked_mul(b).ok_or(EvalError::Unrepresentable)?
+            if matches!(op, BinaryOp::AlignUp) {
+                ceiling * b
+            } else {
+                ceiling
+            }
         }
+        BinaryOp::Rem => {
+            if b.is_zero() {
+                return Err(EvalError::DivisionByZero);
+            }
+            a.rem_euclid(&b)
+        }
+        BinaryOp::Min => a.min(b),
+        BinaryOp::Max => a.max(b),
         BinaryOp::And | BinaryOp::Or | BinaryOp::Implies | BinaryOp::Iff => {
             return Err(EvalError::Unrepresentable);
         }

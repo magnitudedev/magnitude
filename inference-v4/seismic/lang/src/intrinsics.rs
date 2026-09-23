@@ -10,6 +10,7 @@
 
 use crate::expr::IntExpr;
 use crate::ids::RepresentationId;
+use crate::reference_math::ReferenceScalar;
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::{DType, Elem, NonEmpty, TensorType, ValueType};
 
@@ -22,7 +23,6 @@ use crate::types::{DType, Elem, NonEmpty, TensorType, ValueType};
 pub enum MathOp {
     Fma,
     Exp,
-    ExpFast,
     Rsqrt,
     Sqrt,
     Log,
@@ -34,10 +34,9 @@ pub enum MathOp {
 }
 
 impl MathOp {
-    pub const ALL: [MathOp; 11] = [
+    pub const ALL: [MathOp; 10] = [
         MathOp::Fma,
         MathOp::Exp,
-        MathOp::ExpFast,
         MathOp::Rsqrt,
         MathOp::Sqrt,
         MathOp::Log,
@@ -52,7 +51,6 @@ impl MathOp {
         match self {
             MathOp::Fma => "fma",
             MathOp::Exp => "exp",
-            MathOp::ExpFast => "exp_fast",
             MathOp::Rsqrt => "rsqrt",
             MathOp::Sqrt => "sqrt",
             MathOp::Log => "log",
@@ -152,14 +150,6 @@ impl AtomicOp {
     }
 }
 
-/// A typed scalar literal.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Constant {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-}
-
 /// The constant of a `zeros_like` / `ones_like` fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FillConstant {
@@ -182,7 +172,7 @@ impl FillConstant {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PrimitiveId {
     /// A typed literal; the node's output type supplies the dtype.
-    Constant(Constant),
+    Constant(ReferenceScalar),
     /// The `i32` value of a symbolic integer expression over the entry's
     /// dimensions, scalar parameters and loop binders, in the program's arena.
     Symbolic(IntExpr),
@@ -254,11 +244,7 @@ pub enum RepresentationTarget {
 impl PrimitiveId {
     pub fn name(&self) -> String {
         match self {
-            PrimitiveId::Constant(c) => match c {
-                Constant::Int(v) => format!("const.{v}"),
-                Constant::Float(v) => format!("const.{v}"),
-                Constant::Bool(v) => format!("const.{v}"),
-            },
+            PrimitiveId::Constant(c) => format!("const.{}.{:08x}", c.dtype(), c.bits()),
             PrimitiveId::Symbolic(e) => format!("symbolic.{e:?}"),
             PrimitiveId::TuplePack => "tuple.pack".into(),
             PrimitiveId::TupleGet(i) => format!("tuple.get.{i}"),
@@ -815,7 +801,7 @@ pub(crate) enum RowOperand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowResult {
     Scalar(DType),
-    Owned(DType, u32),
+    Owned(DType, &'static [crate::registry::IntrinsicResultAxis]),
 }
 
 /// The complete author-visible capability table, in interning order: every
@@ -826,6 +812,10 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
         BackendName, IntrinsicExecution, IntrinsicNumerics, IntrinsicParticipation,
         IntrinsicUniformity,
     };
+    const MATRIX_AXES: &[crate::registry::IntrinsicResultAxis] = &[
+        crate::registry::IntrinsicResultAxis { argument: 0, axis: 0 },
+        crate::registry::IntrinsicResultAxis { argument: 1, axis: 1 },
+    ];
     let mut out = Vec::new();
     for backend in [BackendName::Metal, BackendName::Cuda] {
         // `matrix` sorts before `subgroup`.
@@ -843,7 +833,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     ("left", RowOperand::Readable(elem, 2)),
                     ("right", RowOperand::Readable(elem, 2)),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
@@ -861,7 +851,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     ("right", RowOperand::Readable(elem, 2)),
                     ("accumulator", RowOperand::Readable(DType::F32, 2)),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
@@ -891,7 +881,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                         RowOperand::ReadableRepresentation(representation.name, 2),
                     ),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
@@ -912,7 +902,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     ),
                     ("accumulator", RowOperand::Readable(DType::F32, 2)),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
@@ -939,7 +929,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     ("left_global_scale", RowOperand::Scalar(DType::F32)),
                     ("right_global_scale", RowOperand::Scalar(DType::F32)),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
@@ -965,7 +955,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     ("right_global_scale", RowOperand::Scalar(DType::F32)),
                     ("accumulator", RowOperand::Readable(DType::F32, 2)),
                 ],
-                result: RowResult::Owned(DType::F32, 2),
+                result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,

@@ -16,15 +16,15 @@ impl AnalyticalModelDefinition<Cpu> for CpuAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Cpu as seismic_ir::target::KernelDialect>::Facts,
+        _facts: &<Cpu as seismic_ir::target::PhysicalDialect>::Facts,
         _supported_intrinsics: &std::collections::BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &Kernel<Cpu>,
         emission: &KernelEmissionLayout,
-        _launch: &Launch,
+        _launch: &Launch<Cpu>,
         _locals: &LaunchLocalLayout,
         op: ClosedOpView<'_, Cpu>,
-    ) -> OperationCost<Self::Service> {
-        crate::services::operation_cost(arena, kernel, emission, op)
+    ) -> Result<OperationCost<Self::Service>, seismic_estimator::ModelLimitation> {
+        Ok(crate::services::operation_cost(arena, kernel, emission, op))
     }
 }

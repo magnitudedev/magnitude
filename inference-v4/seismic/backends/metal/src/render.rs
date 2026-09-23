@@ -17,8 +17,8 @@
 
 use crate::Metal;
 use seismic_ir::kernel::ops::{
-    BarrierScope, BinaryOp, BitOp, Block, ClosedOpView, ClosedPlace, ClosedPlaceKind, ClosedValue,
-    CmpOp, ConstantValue, ErasedValue, GeometryValue, LogicOp, LogicalSliceAxis, LogicalTensorMap,
+    BarrierScope, BinaryOp, BitOp, ClosedOpView, ClosedPlace, ClosedPlaceKind, ClosedValue, CmpOp,
+    ConstantValue, ErasedValue, GeometryValue, LogicOp, LogicalSliceAxis, LogicalTensorMap,
     LogicalViewStep, PlaceRef, UnaryOp, ValueType,
 };
 use seismic_ir::kernel::{BlockId, Kernel};
@@ -168,7 +168,6 @@ pub(crate) const SOFTFLOAT_PRELUDE: &str = include_str!("softfloat.metal");
 /// `None` from one of the selectors below means that the operation belongs to
 /// another explicitly typed family (for example strict F16/BF16 arithmetic),
 /// not that rendering falls back heuristically.
-use seismic_ir::metal::*;
 
 #[derive(Debug)]
 pub(crate) struct RenderedKernel {
@@ -254,6 +253,15 @@ impl MetalGeometry for seismic_ir::target::ReadableRepresentationGeometry {
             Self::Packed(geometry) => Some(&geometry.decode),
         }
     }
+}
+
+enum RenderStep {
+    Block {
+        id: BlockId,
+        next: usize,
+        targets: std::rc::Rc<[String]>,
+    },
+    Line(&'static str),
 }
 
 struct Renderer<'a> {
@@ -352,6 +360,7 @@ impl<'a> Renderer<'a> {
         parameters.push("uint3 seismic_tpg [[threads_per_threadgroup]]".into());
         parameters.push("uint3 seismic_tgn [[threadgroups_per_grid]]".into());
         parameters.push("uint seismic_lane [[thread_index_in_simdgroup]]".into());
+        parameters.push("uint seismic_subgroup [[simdgroup_index_in_threadgroup]]".into());
         parameters.push("uint seismic_simd_width [[threads_per_simdgroup]]".into());
 
         let mut body: Vec<String> = Vec::new();
@@ -596,20 +605,65 @@ impl<'a> Renderer<'a> {
     }
 
     fn logical_address(&self, tensor: &LogicalTensorMap, coords: &[String]) -> (String, String) {
-        let coords = self.logical_coords(tensor, coords);
-        self.address(tensor.base, &coords)
+        let (coords, plane) = self.logical_storage_coords(tensor, coords);
+        let (pointer, address) = self.address(tensor.base, &coords);
+        if let Some((ordinal, element)) = plane {
+            let place = self.kernel.closed_place(tensor.base, self.shape);
+            let RepresentationKind::Packed(layout) = &place.geometry.info.kind else {
+                unreachable!("closed plane backing")
+            };
+            let schema = &layout.planes[ordinal as usize];
+            let pointer = format!(
+                "reinterpret_cast<const device {}*>({pointer} + ({address}) + {}ul)",
+                dtype_name(schema.storage_dtype),
+                schema.offset
+            );
+            (pointer, element)
+        } else {
+            (pointer, address)
+        }
     }
 
     fn logical_read_expression(&self, tensor: &LogicalTensorMap, coords: &[String]) -> String {
-        let coords = self.logical_coords(tensor, coords);
+        let (coords, plane) = self.logical_storage_coords(tensor, coords);
         let place = self.kernel.closed_place(tensor.base, self.shape);
-        self.read_expression(&place, &coords)
+        let expression = match plane {
+            Some((plane, element)) => {
+                self.read_plane_storage_expression(&place, plane as usize, &coords, &element)
+            }
+            None => self.read_expression(&place, &coords),
+        };
+        numeric_operand(
+            &ValueType::Scalar(
+                seismic_lang::registry::representation_info(tensor.representation).decoded,
+            ),
+            &expression,
+        )
     }
 
-    fn logical_coords(&self, tensor: &LogicalTensorMap, coords: &[String]) -> Vec<String> {
+    fn logical_storage_coords(
+        &self,
+        tensor: &LogicalTensorMap,
+        coords: &[String],
+    ) -> (Vec<String>, Option<(u32, String)>) {
         let mut coords = coords.to_vec();
+        let mut projection = None;
         for step in tensor.steps.iter().rev() {
             coords = match step {
+                LogicalViewStep::Plane { plane, axis } => {
+                    let place = self.kernel.closed_place(tensor.base, self.shape);
+                    let RepresentationKind::Packed(layout) = &place.geometry.info.kind else {
+                        unreachable!("closed plane backing")
+                    };
+                    let elements = layout.planes[*plane as usize].storage_elements_per_packet();
+                    let coordinate = &coords[*axis as usize];
+                    projection = Some((*plane, format!("(ulong({coordinate}) % {elements}ul)")));
+                    coords[*axis as usize] = format!(
+                        "((ulong({coordinate}) / {elements}ul) * {}ul)",
+                        layout.group
+                    );
+                    coords
+                }
                 LogicalViewStep::Slice(axes) => {
                     let mut logical = coords.iter();
                     axes.iter()
@@ -650,7 +704,7 @@ impl<'a> Renderer<'a> {
                 }
             };
         }
-        coords
+        (coords, projection)
     }
 
     fn read_expression<G: MetalGeometry>(
@@ -757,55 +811,68 @@ impl<'a> Renderer<'a> {
                 dtype_name(*dtype),
                 dtype.bytes()
             ),
-            PlaneEncoding::Packed { bits, .. } => {
-                let bit = format!("(({entry}) * {bits}ul)");
-                let mask = if *bits == 32 {
-                    "0xffffffffu".to_string()
-                } else {
-                    format!("{}u", (1u32 << bits) - 1)
-                };
-                format!(
-                    "((reinterpret_cast<const device uint*>({base})[({bit}) / 32ul] >> uint(({bit}) % 32ul)) & {mask})"
-                )
-            }
+            PlaneEncoding::Packed { bits, .. } => packed_field_expression(&base, &entry, *bits),
             PlaneEncoding::FloatCode { format } => {
-                let bits = format.bits();
-                let bit = format!("(({entry}) * {bits}ul)");
-                let mask = format!("{}u", (1u32 << bits) - 1);
-                format!("((uint({base}[({bit}) / 8ul]) >> uint(({bit}) % 8ul)) & {mask})")
+                packed_field_expression(&base, &entry, format.bits())
             }
         }
     }
 
-    fn read_plane_raw_expression(
+    fn read_plane_storage_expression<G: MetalGeometry>(
         &self,
-        place: &seismic_ir::kernel::ops::ClosedPackedPlace,
+        place: &ClosedPlace<G>,
         plane: usize,
         coords: &[String],
+        element: &str,
     ) -> String {
-        let geometry = &place.geometry;
-        let layout = &geometry.layout;
+        let RepresentationKind::Packed(layout) = &place.geometry.info().kind else {
+            panic!("plane storage requires a packed backing")
+        };
         let schema = &layout.planes[plane];
-        let decoded = self.read_plane_expression(place, layout, plane, coords, 0);
-        match &schema.encoding {
-            PlaneEncoding::Dense(DType::F32 | DType::I32 | DType::U32) => {
-                format!("as_type<uint>({decoded})")
-            }
-            PlaneEncoding::Dense(DType::F16 | DType::BF16) => {
-                format!("uint(as_type<ushort>({decoded}))")
-            }
-            PlaneEncoding::Dense(DType::Bool) => format!("uint({decoded})"),
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => decoded,
+        let (pointer, packet) = self.closed_address(place, coords);
+        let base = format!("({pointer} + ({packet}) + {}ul)", schema.offset);
+        let offset = format!("(ulong({element}) * {}ul)", schema.storage_element_bytes());
+        if let PlaneEncoding::Dense(dtype) = schema.encoding {
+            return format!(
+                "(*reinterpret_cast<const device {}*>({base} + {offset}))",
+                dtype_name(dtype)
+            );
         }
+        let bytes = (0..schema.storage_element_bytes()).map(|i| {
+            format!("((({offset}) + {i}ul < {}ul) ? (uint({base}[({offset}) + {i}ul]) << {}u) : 0u)", schema.bytes_per_group, i * 8)
+        }).collect::<Vec<_>>();
+        format!("({})", bytes.join(" | "))
     }
 
     // -- blocks ---------------------------------------------------------------------
 
     /// Renders a block; `Yield` assigns to `targets`.
     fn render_block(&mut self, block: BlockId, targets: &[String], lines: &mut Vec<String>) {
-        let block: &Block<Metal> = self.kernel.block(block);
-        for op in &block.ops {
-            self.render_op(self.kernel.closed_op(op, self.shape), targets, lines);
+        let mut pending = vec![RenderStep::Block {
+            id: block,
+            next: 0,
+            targets: targets.into(),
+        }];
+        while let Some(step) = pending.pop() {
+            match step {
+                RenderStep::Line(line) => lines.push(line.into()),
+                RenderStep::Block { id, next, targets } => {
+                    let Some(op) = self.kernel.block(id).ops.get(next) else {
+                        continue;
+                    };
+                    pending.push(RenderStep::Block {
+                        id,
+                        next: next + 1,
+                        targets: targets.clone(),
+                    });
+                    self.render_op(
+                        self.kernel.closed_op(op, self.shape),
+                        &targets,
+                        lines,
+                        &mut pending,
+                    );
+                }
+            }
         }
     }
 
@@ -814,6 +881,7 @@ impl<'a> Renderer<'a> {
         op: ClosedOpView<'_, Metal>,
         targets: &[String],
         lines: &mut Vec<String>,
+        pending: &mut Vec<RenderStep>,
     ) {
         let raw = |value: ClosedValue| value.value;
         match op {
@@ -831,6 +899,8 @@ impl<'a> Renderer<'a> {
             ClosedOpView::Unary { op, out, a } => {
                 let name = self.name(raw(a)).to_string();
                 let expression = match (op, scalar_kind(&a.ty)) {
+                    (UnaryOp::Neg, _) if a.ty == ValueType::Index => format!("(0ul - {name})"),
+                    (UnaryOp::Abs, _) if a.ty == ValueType::Index => name.clone(),
                     (UnaryOp::Neg, Kind::Float) => float_sign_op(&a.ty, &name, true),
                     (UnaryOp::Neg, Kind::Int | Kind::Bool) => {
                         format!(
@@ -846,39 +916,47 @@ impl<'a> Renderer<'a> {
             ClosedOpView::Bit { op, out, a, b } => {
                 let ty = a.ty;
                 let name = value_type_name(&ty);
+                let bits = if ty == ValueType::Index {
+                    "ulong"
+                } else {
+                    "uint"
+                };
                 let (a, b) = (self.name(raw(a)).to_string(), self.name(raw(b)).to_string());
                 let expression = match op {
                     BitOp::And => {
-                        format!("as_type<{name}>(as_type<uint>({a}) & as_type<uint>({b}))")
+                        format!("as_type<{name}>(as_type<{bits}>({a}) & as_type<{bits}>({b}))")
                     }
                     BitOp::Or => {
-                        format!("as_type<{name}>(as_type<uint>({a}) | as_type<uint>({b}))")
+                        format!("as_type<{name}>(as_type<{bits}>({a}) | as_type<{bits}>({b}))")
                     }
                     BitOp::Xor => {
-                        format!("as_type<{name}>(as_type<uint>({a}) ^ as_type<uint>({b}))")
+                        format!("as_type<{name}>(as_type<{bits}>({a}) ^ as_type<{bits}>({b}))")
                     }
-                    BitOp::Shl => format!("as_type<{name}>(as_type<uint>({a}) << uint({b}))"),
+                    BitOp::Shl => format!("as_type<{name}>(as_type<{bits}>({a}) << uint({b}))"),
                     BitOp::Shr => {
                         if matches!(ty, ValueType::Scalar(DType::I32)) {
                             format!("as_type<{name}>(as_type<int>({a}) >> uint({b}))")
                         } else {
-                            format!("as_type<{name}>(as_type<uint>({a}) >> uint({b}))")
+                            format!("as_type<{name}>(as_type<{bits}>({a}) >> uint({b}))")
                         }
                     }
                 };
                 self.assign(raw(out), expression, lines);
             }
             ClosedOpView::Fma { out, a, b, c } => {
-                let function = fma_function(&a.ty);
-                let expression = format!(
-                    "{function}({}, {}, {})",
-                    self.name(raw(a)),
-                    self.name(raw(b)),
-                    self.name(raw(c))
+                let expression = numeric_result(
+                    &out.ty,
+                    &format!(
+                        "fma({}, {}, {})",
+                        numeric_operand(&a.ty, self.name(raw(a))),
+                        numeric_operand(&b.ty, self.name(raw(b))),
+                        numeric_operand(&c.ty, self.name(raw(c)))
+                    ),
                 );
                 self.assign(raw(out), expression, lines);
             }
-            ClosedOpView::VectorSplat { .. }
+            ClosedOpView::VectorFromLanes { .. }
+            | ClosedOpView::VectorSplat { .. }
             | ClosedOpView::VectorBinary { .. }
             | ClosedOpView::VectorUnary { .. }
             | ClosedOpView::VectorBit { .. }
@@ -906,6 +984,12 @@ impl<'a> Renderer<'a> {
                     format!("as_type<{}>({})", value_type_name(&to), self.name(raw(a))),
                     lines,
                 );
+            }
+            ClosedOpView::ScalarBits { out, a } => {
+                self.assign(raw(out), format!("uint({})", self.name(raw(a))), lines);
+            }
+            ClosedOpView::ScalarFromBits { out, a } => {
+                self.assign(raw(out), format!("ushort({})", self.name(raw(a))), lines);
             }
             ClosedOpView::Cmp { op, out, a, b } => {
                 let expression = compare_expr(op, &a.ty, self.name(raw(a)), self.name(raw(b)));
@@ -946,17 +1030,17 @@ impl<'a> Renderer<'a> {
                 self.assign(out.value(), expression, lines);
             }
             ClosedOpView::NatArg { out, index, .. } => {
-                let expression = format!(
-                    "uint(seismic_params[{}])",
-                    self.shape.words.nat_first + index
-                );
+                let expression = format!("seismic_params[{}]", self.shape.words.nat_first + index);
                 self.assign(out.value(), expression, lines);
             }
             ClosedOpView::ScalarArg {
-                out, index, dtype, ..
+                out, index, kind, ..
             } => {
                 let word = format!("seismic_params[{}]", self.shape.words.scalar_first + index);
-                let expression = decode_word(dtype, &word);
+                let expression = match kind {
+                    seismic_ir::repr::ScalarKind::Nat64 => word,
+                    seismic_ir::repr::ScalarKind::Scalar(dtype) => decode_word(dtype, &word),
+                };
                 self.assign(raw(out), expression, lines);
             }
             ClosedOpView::Read {
@@ -970,12 +1054,13 @@ impl<'a> Renderer<'a> {
                     .collect::<Vec<_>>();
                 let coords = self.coords(&raw_indices);
                 let expression = self.read_expression(&place, &coords);
-                self.assign(raw(out), expression, lines);
+                self.assign(raw(out), payload_from_storage(&out.ty, &expression), lines);
             }
-            ClosedOpView::ReadPlane {
+            ClosedOpView::ReadPlaneField {
                 out,
                 place,
                 plane,
+                field,
                 indices,
                 ..
             } => {
@@ -984,8 +1069,35 @@ impl<'a> Renderer<'a> {
                     .map(|value| value.value())
                     .collect::<Vec<_>>();
                 let coords = self.coords(&raw_indices);
-                let expression = self.read_plane_raw_expression(&place, plane as usize, &coords);
-                self.assign(raw(out), expression, lines);
+                let expression = self.read_plane_expression(
+                    &place,
+                    &place.geometry.layout,
+                    plane as usize,
+                    &coords,
+                    field,
+                );
+                self.assign(raw(out), payload_from_storage(&out.ty, &expression), lines);
+            }
+            ClosedOpView::ReadPlane {
+                out,
+                place,
+                plane,
+                element,
+                indices,
+                ..
+            } => {
+                let raw_indices = indices
+                    .iter()
+                    .map(|value| value.value())
+                    .collect::<Vec<_>>();
+                let coords = self.coords(&raw_indices);
+                let expression = self.read_plane_storage_expression(
+                    &place,
+                    plane as usize,
+                    &coords,
+                    self.name(element.value()),
+                );
+                self.assign(raw(out), payload_from_storage(&out.ty, &expression), lines);
             }
             ClosedOpView::RepresentationConvertPacket {
                 source,
@@ -1015,18 +1127,17 @@ impl<'a> Renderer<'a> {
                 let (pointer, address) = self.closed_address(&place, &coords);
                 let dtype = place.geometry.dtype;
                 lines.push(format!(
-                    "{pointer}[{address}] = {}({});",
-                    dtype_name(dtype),
-                    self.name(raw(value))
+                    "{pointer}[{address}] = {};",
+                    numeric_operand(&ValueType::Scalar(dtype), self.name(raw(value)))
                 ));
             }
             ClosedOpView::Extent { out, place, axis } => {
                 let expression = match place.kind {
                     ClosedPlaceKind::Global { buffer_ordinal, .. } => {
-                        format!("uint(seismic_e{buffer_ordinal}_{axis})")
+                        format!("seismic_e{buffer_ordinal}_{axis}")
                     }
                     ClosedPlaceKind::Local { index, .. } => {
-                        format!("uint(seismic_le{index}_{axis})")
+                        format!("seismic_le{index}_{axis}")
                     }
                 };
                 self.assign(out.value(), expression, lines);
@@ -1045,11 +1156,16 @@ impl<'a> Renderer<'a> {
             }
             ClosedOpView::StoreSlot {
                 slot,
-                dtype,
+                kind,
                 value,
                 election: seismic_ir::kernel::ops::StoreElection::GlobalLeader,
             } => {
-                let bits = encode_word(dtype, self.name(raw(value)));
+                let bits = match kind {
+                    seismic_ir::repr::ScalarKind::Nat64 => self.name(raw(value)).to_owned(),
+                    seismic_ir::repr::ScalarKind::Scalar(dtype) => {
+                        encode_word(dtype, self.name(raw(value)))
+                    }
+                };
                 lines.push(format!("if (seismic_participant_linear == 0ul) seismic_results[{slot}] = ulong({bits});"));
             }
             ClosedOpView::Barrier(scope) => lines.push(match scope {
@@ -1092,10 +1208,19 @@ impl<'a> Renderer<'a> {
                     names.push(name);
                 }
                 lines.push(format!("if ({}) {{", self.name(condition.value())));
-                self.render_block(then_block, &names, lines);
-                lines.push("} else {".into());
-                self.render_block(else_block, &names, lines);
-                lines.push("}".into());
+                let targets: std::rc::Rc<[String]> = names.into();
+                pending.push(RenderStep::Line("}"));
+                pending.push(RenderStep::Block {
+                    id: else_block,
+                    next: 0,
+                    targets: targets.clone(),
+                });
+                pending.push(RenderStep::Line("} else {"));
+                pending.push(RenderStep::Block {
+                    id: then_block,
+                    next: 0,
+                    targets,
+                });
             }
             ClosedOpView::Repeat {
                 start,
@@ -1116,19 +1241,35 @@ impl<'a> Renderer<'a> {
                 }
                 let binder_name = self.define(binder.value());
                 lines.push(format!(
-                    "for (uint {binder_name} = {}; {binder_name} < {}; {binder_name}++) {{",
+                    "for (ulong {binder_name} = {}; {binder_name} < {}; {binder_name}++) {{",
                     self.name(start.value()),
                     self.name(end.value())
                 ));
                 for (parameter, name) in carry_parameters.iter().zip(&names) {
                     self.names.insert(parameter.value, name.clone());
                 }
-                self.render_block(body, &names, lines);
-                lines.push("}".into());
+                pending.push(RenderStep::Line("}"));
+                pending.push(RenderStep::Block {
+                    id: body,
+                    next: 0,
+                    targets: names.into(),
+                });
             }
             ClosedOpView::Yield { values } => {
-                for (target, value) in targets.iter().zip(values) {
-                    lines.push(format!("{target} = {};", self.name(raw(value))));
+                // Carries can refer to each other: read the complete old state
+                // before publishing any of the next state.
+                let mut snapshots = Vec::with_capacity(values.len());
+                for value in values {
+                    let source = self.name(raw(value)).to_string();
+                    let snapshot = self.temporary();
+                    lines.push(format!(
+                        "{} {snapshot} = {source};",
+                        value_type_name(&value.ty)
+                    ));
+                    snapshots.push(snapshot);
+                }
+                for (target, snapshot) in targets.iter().zip(snapshots) {
+                    lines.push(format!("{target} = {snapshot};"));
                 }
             }
         }
@@ -1224,7 +1365,7 @@ impl<'a> Renderer<'a> {
         let coords = self.coords(index);
         let (pointer, address) = self.closed_address(place, &coords);
         let dtype = place.geometry.dtype;
-        let value = self.name(value).to_string();
+        let value = numeric_operand(&ValueType::Scalar(dtype), self.name(value));
         let name = dtype_name(dtype);
         let space = match place.kind {
             ClosedPlaceKind::Global { .. } => "device",
@@ -1318,7 +1459,7 @@ impl<'a> Renderer<'a> {
                 );
                 self.assign(outs[0], expression, lines);
             }
-            MetalIntrinsic::SubgroupReduce { op, .. } => {
+            MetalIntrinsic::SubgroupReduce { op, dtype } => {
                 let collective = match op {
                     ReduceOp::Sum => "simd_sum",
                     ReduceOp::Max => "simd_max",
@@ -1329,7 +1470,11 @@ impl<'a> Renderer<'a> {
                         )
                     }
                 };
-                let expression = format!("{collective}({})", self.name(args[0]));
+                let ty = ValueType::Scalar(*dtype);
+                let expression = numeric_result(
+                    &ty,
+                    &format!("{collective}({})", numeric_operand(&ty, self.name(args[0]))),
+                );
                 self.assign(outs[0], expression, lines);
             }
             MetalIntrinsic::Matrix {
@@ -1398,6 +1543,26 @@ impl<'a> Renderer<'a> {
             }
         }
     }
+}
+
+/// A field reads only its touched bytes. Conditional byte loads handle arbitrary
+/// packet alignment and fields crossing bytes/words without extending a read
+/// into another field or padding. The fixed little-endian encoding is unchanged.
+fn packed_field_expression(base: &str, entry: &str, bits: u32) -> String {
+    assert!((1..=32).contains(&bits));
+    let bit = format!("(({entry}) * {bits}ul)");
+    let byte = format!("(({bit}) / 8ul)");
+    let shift = format!("(({bit}) % 8ul)");
+    let mut bytes = vec![format!("ulong({base}[{byte}])")];
+    for i in 1..(bits + 7).div_ceil(8) {
+        bytes.push(format!(
+            "((({shift}) + {bits}ul > {}ul) ? (ulong({base}[({byte}) + {i}ul]) << {}ul) : 0ul)",
+            i * 8,
+            i * 8
+        ));
+    }
+    let mask = u32::MAX >> (32 - bits);
+    format!("uint((({}) >> ({shift})) & {mask}ul)", bytes.join(" | "))
 }
 
 fn repack_expression(expression: &RepackExpr, source: &str) -> String {
@@ -1511,8 +1676,9 @@ pub(crate) fn dtype_name(dtype: DType) -> &'static str {
 
 fn value_type_name(ty: &ValueType) -> &'static str {
     match ty {
+        ValueType::Scalar(DType::F16 | DType::BF16) => "ushort",
         ValueType::Scalar(dtype) => dtype_name(*dtype),
-        ValueType::Index => "uint",
+        ValueType::Index => "ulong",
         ValueType::Bool => "bool",
         ValueType::Vector { .. } => panic!(
             "Metal value-type rendering reached a vector although the target advertises no vector support"
@@ -1557,12 +1723,45 @@ fn constant_expr(value: ConstantValue, ty: &ValueType) -> String {
     let name = value_type_name(ty);
     match value {
         ConstantValue::F32(v) => format!("{name}(as_type<float>({:#010x}u))", v.to_bits()),
-        ConstantValue::F16(v) => format!("as_type<half>(ushort({v}u))"),
-        ConstantValue::BF16(v) => format!("as_type<bfloat>(ushort({v}u))"),
+        ConstantValue::F16(v) | ConstantValue::BF16(v) => format!("ushort({v}u)"),
         ConstantValue::I32(v) => format!("{name}({v})"),
         ConstantValue::U32(v) => format!("{name}({v}u)"),
         ConstantValue::Bool(v) => format!("{v}"),
         ConstantValue::Index(v) => format!("{name}({v}ul)"),
+    }
+}
+
+/// Narrow semantic registers carry payload bits. Numeric decoding belongs only
+/// at an explicit physical floating operation or storage-format boundary.
+fn numeric_operand(ty: &ValueType, value: &str) -> String {
+    match ty {
+        ValueType::Scalar(dtype @ (DType::F16 | DType::BF16)) => {
+            format!("as_type<{}>({value})", dtype_name(*dtype))
+        }
+        _ => value.to_owned(),
+    }
+}
+
+fn payload_from_storage(ty: &ValueType, value: &str) -> String {
+    match ty {
+        ValueType::Scalar(DType::F16 | DType::BF16) => format!("as_type<ushort>({value})"),
+        _ => value.to_owned(),
+    }
+}
+
+fn numeric_result(ty: &ValueType, value: &str) -> String {
+    match ty {
+        ValueType::Scalar(dtype @ (DType::F16 | DType::BF16)) => {
+            format!("as_type<ushort>({}({value}))", dtype_name(*dtype))
+        }
+        _ => value.to_owned(),
+    }
+}
+
+fn numeric_type_name(ty: &ValueType) -> &'static str {
+    match ty {
+        ValueType::Scalar(dtype) => dtype_name(*dtype),
+        _ => value_type_name(ty),
     }
 }
 
@@ -1573,37 +1772,36 @@ fn binary_expr(
     b: &str,
     temporary: &mut dyn FnMut() -> String,
 ) -> String {
+    numeric_result(
+        ty,
+        &physical_binary_expr(
+            op,
+            ty,
+            &numeric_operand(ty, a),
+            &numeric_operand(ty, b),
+            temporary,
+        ),
+    )
+}
+
+fn physical_binary_expr(
+    op: BinaryOp,
+    ty: &ValueType,
+    a: &str,
+    b: &str,
+    temporary: &mut dyn FnMut() -> String,
+) -> String {
     let name = value_type_name(ty);
-    let softfloat = match scalar_binary_emission_family(op, ty) {
-        Some(
-            ScalarEmissionFamily::F32AddSub
-            | ScalarEmissionFamily::F32Multiply
-            | ScalarEmissionFamily::F32Divide
-            | ScalarEmissionFamily::F32Remainder
-            | ScalarEmissionFamily::F32MinMax,
-        ) => Some("f32"),
-        _ => match ty {
-            ValueType::Scalar(DType::F16) => Some("f16"),
-            ValueType::Scalar(DType::BF16) => Some("bf16"),
-            _ => None,
-        },
-    };
-    if let Some(prefix) = softfloat {
-        if matches!(op, BinaryOp::Min | BinaryOp::Max) {
-            let operation = if op == BinaryOp::Min { "min" } else { "max" };
-            return format!("{prefix}_{operation}({a}, {b})");
-        }
-        let operation = match op {
-            BinaryOp::Add => Some("add"),
-            BinaryOp::Sub => Some("sub"),
-            BinaryOp::Mul => Some("mul"),
-            BinaryOp::Div => Some("div"),
-            BinaryOp::Rem => Some("rem"),
-            BinaryOp::Min | BinaryOp::Max => None,
+    if matches!(ty, ValueType::Index) {
+        return match op {
+            BinaryOp::Add => format!("({a} + {b})"),
+            BinaryOp::Sub => format!("({a} - {b})"),
+            BinaryOp::Mul => format!("({a} * {b})"),
+            BinaryOp::Div => format!("({a} / {b})"),
+            BinaryOp::Rem => format!("({a} % {b})"),
+            BinaryOp::Min => format!("min({a}, {b})"),
+            BinaryOp::Max => format!("max({a}, {b})"),
         };
-        if let Some(operation) = operation {
-            return format!("{prefix}_{operation}({a}, {b})");
-        }
     }
     match (op, scalar_kind(ty)) {
         (BinaryOp::Add, Kind::Float) => format!("{a} + {b}"),
@@ -1617,36 +1815,43 @@ fn binary_expr(
         (BinaryOp::Div | BinaryOp::Rem, Kind::Int)
             if matches!(ty, ValueType::Scalar(DType::I32)) =>
         {
-            // Euclidean division and remainder (`r` in `0..|rhs|`), exactly
-            // the registry semantics; divisor safety is the kernel's `Check`.
-            let temp = temporary();
-            let remainder = format!(
-                "int {temp} = as_type<int>({a}) % as_type<int>({b}); \
-                 if ({temp} < 0) {temp} += (as_type<int>({b}) < 0 ? -as_type<int>({b}) : as_type<int>({b}));"
+            // Compute Euclidean division from unsigned magnitudes. Both
+            // `-i32::MIN` and `a - corrected_remainder` can exceed I32 even
+            // when the source quotient and remainder are representable.
+            // The raw physical op requires a nonzero divisor and a
+            // representable quotient; source recipes own those failures.
+            let negative_a = temporary();
+            let negative_b = temporary();
+            let magnitude_a = temporary();
+            let magnitude_b = temporary();
+            let remainder = temporary();
+            let setup = format!(
+                "bool {negative_a} = as_type<int>({a}) < 0; \
+                 bool {negative_b} = as_type<int>({b}) < 0; \
+                 uint {magnitude_a} = {negative_a} ? 0u - as_type<uint>({a}) : as_type<uint>({a}); \
+                 uint {magnitude_b} = {negative_b} ? 0u - as_type<uint>({b}) : as_type<uint>({b}); \
+                 uint {remainder} = {magnitude_a} % {magnitude_b};"
             );
             if op == BinaryOp::Div {
+                let quotient = temporary();
                 format!(
-                    "({{ {remainder} int(((as_type<int>({a}) - {temp}) / as_type<int>({b}))); }})"
+                    "({{ {setup} uint {quotient} = {magnitude_a} / {magnitude_b}; \
+                     if ({negative_a} && {remainder} != 0u) {quotient} += 1u; \
+                     if ({negative_a} != {negative_b}) {quotient} = 0u - {quotient}; \
+                     as_type<int>({quotient}); }})"
                 )
             } else {
-                format!("({{ {remainder} {temp}; }})")
+                format!(
+                    "({{ {setup} if ({negative_a} && {remainder} != 0u) \
+                     {remainder} = {magnitude_b} - {remainder}; \
+                     as_type<int>({remainder}); }})"
+                )
             }
         }
         (BinaryOp::Div, _) => format!("{a} / {b}"),
         (BinaryOp::Rem, _) => format!("{a} % {b}"),
         (BinaryOp::Min, _) => format!("min({a}, {b})"),
         (BinaryOp::Max, _) => format!("max({a}, {b})"),
-    }
-}
-
-fn fma_function(ty: &ValueType) -> &'static str {
-    match scalar_fma_emission_family(ty) {
-        Some(ScalarEmissionFamily::F32FusedMultiplyAdd) => "f32_mulAdd",
-        _ => match ty {
-            ValueType::Scalar(DType::F16) => "f16_mulAdd",
-            ValueType::Scalar(DType::BF16) => "bf16_mulAdd",
-            _ => "fma",
-        },
     }
 }
 
@@ -1660,22 +1865,22 @@ fn float_sign_op(ty: &ValueType, value: &str, negate: bool) -> String {
             };
             format!("as_type<float>(as_type<uint>({value}) {op})")
         }
-        ValueType::Scalar(DType::F16) => {
+        ValueType::Scalar(DType::F16 | DType::BF16) => {
             let op = if negate { "^ 0x8000u" } else { "& 0x7fffu" };
-            format!("as_type<half>(ushort(as_type<ushort>({value}) {op}))")
-        }
-        ValueType::Scalar(DType::BF16) => {
-            let op = if negate { "^ 0x8000u" } else { "& 0x7fffu" };
-            format!("as_type<bfloat>(ushort(as_type<ushort>({value}) {op}))")
+            format!("ushort({value} {op})")
         }
         _ => unreachable!("closed float unary operation has a floating scalar type"),
     }
 }
 
 fn math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
+    numeric_result(ty, &physical_math_expr(op, ty, &numeric_operand(ty, a)))
+}
+
+fn physical_math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
     let namespace = "fast";
     let function = match op {
-        MathOp::Exp | MathOp::ExpFast => "exp",
+        MathOp::Exp => "exp",
         MathOp::Rsqrt => "rsqrt",
         MathOp::Sqrt => "sqrt",
         MathOp::Log => "log",
@@ -1702,37 +1907,26 @@ fn math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
 }
 
 fn cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
-    let from_kind = scalar_kind(from);
-    let to_name = value_type_name(to);
-    let emission = scalar_conversion_emission_family(from, to);
-    match emission {
-        Some(ScalarEmissionFamily::F32ToF16) => return format!("f32_to_f16({a})"),
-        Some(ScalarEmissionFamily::F16ToF32) => return format!("f16_to_f32({a})"),
-        Some(ScalarEmissionFamily::F32ToBF16) => return format!("seismic_bf16_narrow({a})"),
-        Some(ScalarEmissionFamily::BF16ToF32) => return format!("seismic_bf16_widen({a})"),
-        Some(ScalarEmissionFamily::F32ToInteger) => {
-            return match to {
-                ValueType::Scalar(DType::I32) => {
-                    format!("int(clamp(trunc(float({a})), -2147483648.0f, 2147483647.0f))")
-                }
-                ValueType::Index | ValueType::Scalar(DType::U32) => {
-                    format!("uint(clamp(trunc(float({a})), 0.0f, 4294967295.0f))")
-                }
-                _ => unreachable!("F32-to-integer emission has an integer destination"),
-            };
-        }
-        Some(ScalarEmissionFamily::IntegerToF32) => return format!("{to_name}({a})"),
-        _ => {}
+    if from == to {
+        return a.to_owned();
     }
+    numeric_result(to, &physical_cast_expr(from, to, &numeric_operand(from, a)))
+}
+
+fn physical_cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
     match (from, to) {
-        (ValueType::Scalar(DType::F16), ValueType::Scalar(DType::BF16)) => {
-            return format!("seismic_bf16_narrow(f16_to_f32({a}))");
+        (ValueType::Index, ValueType::Scalar(DType::I32)) => {
+            return format!("as_type<int>(uint({a}))")
         }
-        (ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::F16)) => {
-            return format!("f32_to_f16(seismic_bf16_widen({a}))");
+        (ValueType::Index, _) | (_, ValueType::Index) => {
+            // IR natural conversions preserve the full natural word. Source
+            // scalar conversion rules apply before entering this internal type.
+            return format!("{}({a})", numeric_type_name(to));
         }
         _ => {}
     }
+    let from_kind = scalar_kind(from);
+    let to_name = numeric_type_name(to);
     match (from_kind, to) {
         (_, ValueType::Bool) | (_, ValueType::Scalar(DType::Bool)) => format!("({a} != 0)"),
         (
@@ -1765,29 +1959,12 @@ fn cmp_symbol(op: CmpOp) -> &'static str {
 }
 
 fn compare_expr(op: CmpOp, ty: &ValueType, a: &str, b: &str) -> String {
-    let prefix = match scalar_comparison_emission_family(ty) {
-        Some(ScalarEmissionFamily::F32Comparison) => Some("f32"),
-        _ => match ty {
-            ValueType::Scalar(DType::F16) => Some("f16"),
-            ValueType::Scalar(DType::BF16) => Some("bf16"),
-            _ => None,
-        },
-    };
-    let Some(prefix) = prefix else {
-        return format!("({a} {} {b})", cmp_symbol(op));
-    };
-    match op {
-        CmpOp::Eq => format!("{prefix}_eq({a}, {b})"),
-        CmpOp::Ne => format!("!{prefix}_eq({a}, {b})"),
-        CmpOp::Lt => format!("{prefix}_lt({a}, {b})"),
-        CmpOp::Le => format!(
-            "!{prefix}_lt({b}, {a}) && !seismic_{prefix}_nan({a}) && !seismic_{prefix}_nan({b})"
-        ),
-        CmpOp::Gt => format!("{prefix}_lt({b}, {a})"),
-        CmpOp::Ge => format!(
-            "!{prefix}_lt({a}, {b}) && !seismic_{prefix}_nan({a}) && !seismic_{prefix}_nan({b})"
-        ),
-    }
+    format!(
+        "({} {} {})",
+        numeric_operand(ty, a),
+        cmp_symbol(op),
+        numeric_operand(ty, b)
+    )
 }
 
 fn axis_component(axis: u8) -> &'static str {
@@ -1804,11 +1981,13 @@ fn geometry_expr(kind: GeometryValue) -> String {
         GeometryValue::LocalId(axis) => format!("seismic_tid.{}", axis_component(axis)),
         GeometryValue::GlobalId(axis) => {
             let c = axis_component(axis);
-            format!("(seismic_tg.{c} * seismic_tpg.{c} + seismic_tid.{c})")
+            format!("(ulong(seismic_tg.{c}) * ulong(seismic_tpg.{c}) + ulong(seismic_tid.{c}))")
         }
         GeometryValue::WorkgroupSize(axis) => format!("seismic_tpg.{}", axis_component(axis)),
         GeometryValue::GridSize(axis) => format!("seismic_tgn.{}", axis_component(axis)),
         GeometryValue::SubgroupLane => "seismic_lane".into(),
+        GeometryValue::SubgroupOrdinal => "seismic_subgroup".into(),
+        GeometryValue::SubgroupSize => "seismic_simd_width".into(),
     }
 }
 
@@ -1816,8 +1995,7 @@ fn geometry_expr(kind: GeometryValue) -> String {
 fn decode_word(dtype: DType, word: &str) -> String {
     match dtype {
         DType::F32 => format!("as_type<float>(uint({word}))"),
-        DType::F16 => format!("as_type<half>(ushort({word}))"),
-        DType::BF16 => format!("as_type<bfloat>(ushort({word}))"),
+        DType::F16 | DType::BF16 => format!("ushort({word})"),
         DType::I32 => format!("as_type<int>(uint({word}))"),
         DType::U32 => format!("uint({word})"),
         DType::Bool => format!("({word} != 0ul)"),
@@ -1828,8 +2006,7 @@ fn decode_word(dtype: DType, word: &str) -> String {
 fn encode_word(dtype: DType, value: &str) -> String {
     match dtype {
         DType::F32 => format!("as_type<uint>({value})"),
-        DType::F16 => format!("uint(as_type<ushort>({value}))"),
-        DType::BF16 => format!("uint(as_type<ushort>({value}))"),
+        DType::F16 | DType::BF16 => format!("uint({value})"),
         DType::I32 => format!("as_type<uint>({value})"),
         DType::U32 => format!("uint({value})"),
         DType::Bool => format!("uint({value})"),
@@ -1841,38 +2018,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_driven_helpers_preserve_msl_spelling() {
-        let f32_ty = ValueType::Scalar(DType::F32);
-        let mut temporary = || "temporary".to_owned();
-        for (op, expected) in [
-            (BinaryOp::Add, "f32_add(a, b)"),
-            (BinaryOp::Sub, "f32_sub(a, b)"),
-            (BinaryOp::Mul, "f32_mul(a, b)"),
-            (BinaryOp::Div, "f32_div(a, b)"),
-            (BinaryOp::Rem, "f32_rem(a, b)"),
-            (BinaryOp::Min, "f32_min(a, b)"),
-            (BinaryOp::Max, "f32_max(a, b)"),
-        ] {
-            assert_eq!(binary_expr(op, &f32_ty, "a", "b", &mut temporary), expected);
+    fn narrow_registers_transport_payloads_without_numeric_conversion() {
+        for dtype in [DType::F16, DType::BF16] {
+            let ty = ValueType::Scalar(dtype);
+            assert_eq!(value_type_name(&ty), "ushort");
+            assert_eq!(decode_word(dtype, "word"), "ushort(word)");
+            assert_eq!(encode_word(dtype, "value"), "uint(value)");
+            assert_eq!(cast_expr(&ty, &ty, "value"), "value");
+            assert_eq!(
+                payload_from_storage(&ty, "loaded"),
+                "as_type<ushort>(loaded)"
+            );
+            assert_eq!(float_sign_op(&ty, "value", true), "ushort(value ^ 0x8000u)");
+            assert_eq!(
+                float_sign_op(&ty, "value", false),
+                "ushort(value & 0x7fffu)"
+            );
         }
-        assert_eq!(fma_function(&f32_ty), "f32_mulAdd");
-        assert_eq!(compare_expr(CmpOp::Eq, &f32_ty, "a", "b"), "f32_eq(a, b)");
-        assert_eq!(compare_expr(CmpOp::Ne, &f32_ty, "a", "b"), "!f32_eq(a, b)");
-        assert_eq!(compare_expr(CmpOp::Lt, &f32_ty, "a", "b"), "f32_lt(a, b)");
-        assert_eq!(compare_expr(CmpOp::Gt, &f32_ty, "a", "b"), "f32_lt(b, a)");
-
-        let f16_ty = ValueType::Scalar(DType::F16);
-        let bf16_ty = ValueType::Scalar(DType::BF16);
-        let i32_ty = ValueType::Scalar(DType::I32);
-        let u32_ty = ValueType::Scalar(DType::U32);
-        assert_eq!(cast_expr(&f32_ty, &f16_ty, "a"), "f32_to_f16(a)");
-        assert_eq!(cast_expr(&f16_ty, &f32_ty, "a"), "f16_to_f32(a)");
-        assert_eq!(cast_expr(&f32_ty, &bf16_ty, "a"), "seismic_bf16_narrow(a)");
-        assert_eq!(cast_expr(&bf16_ty, &f32_ty, "a"), "seismic_bf16_widen(a)");
         assert_eq!(
-            cast_expr(&f32_ty, &i32_ty, "a"),
-            "int(clamp(trunc(float(a)), -2147483648.0f, 2147483647.0f))"
+            constant_expr(ConstantValue::F16(0x7c01), &ValueType::Scalar(DType::F16)),
+            "ushort(31745u)"
         );
-        assert_eq!(cast_expr(&u32_ty, &f32_ty, "a"), "float(a)");
+        assert_eq!(
+            constant_expr(ConstantValue::BF16(0xffc3), &ValueType::Scalar(DType::BF16)),
+            "ushort(65475u)"
+        );
     }
 }

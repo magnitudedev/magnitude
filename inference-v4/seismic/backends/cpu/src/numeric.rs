@@ -1,8 +1,9 @@
 //! Versioned CPU-native numerical helpers. Canonical exact transcendental
 //! semantics expand to ordinary kernel IR in `seismic-compiler`; the host
 //! transcendental calls here are used only by explicitly approximate math
-//! operations. Registry rounding, packed decode, atomics, and team barriers
-//! remain backend-owned native services.
+//! operations. Native physical rounding, packed field extraction, atomics, and
+//! team barriers remain backend-owned native services. Packed decode arithmetic
+//! is instantiated from language recipes before kernel closure.
 
 use seismic_lang::registry::{bf16_round, f16_bits, f16_round, f16_to_f32};
 use seismic_lang::types::DType;
@@ -12,9 +13,9 @@ use std::sync::{Mutex, OnceLock};
 pub const MATH_IDENTITY: &str = "seismic_math";
 pub const MATH_VERSION: u32 = 2;
 
-/// Rounds one binary64 value once at `dtype` (the registry reference
-/// model): narrow floats through the registry rounding, integers by the
-/// saturating conversion, `bool` by non-zero test.
+/// Conversion used by selected native physical operations. Narrow conversion
+/// follows this backend sequence; the language-owned exact recipe defines
+/// source scalar rounding independently of native instruction choices.
 pub fn round_to(dtype: DType, value: f64) -> f64 {
     match dtype {
         DType::F32 => value as f32 as f64,
@@ -83,26 +84,6 @@ extern "C" fn seismic_packed_bits(base: *const u8, bit: u64, bits: u32) -> u32 {
     }
     ((raw >> shift) & ((1u64 << bits) - 1)) as u32
 }
-macro_rules! float_code_helper {
-    ($name:ident, $format:expr) => {
-        extern "C" fn $name(raw: u32) -> f32 {
-            $format.decode(raw)
-        }
-    };
-}
-float_code_helper!(
-    seismic_float_code_e2m1,
-    seismic_lang::registry::FloatCodeFormat::E2M1
-);
-float_code_helper!(
-    seismic_float_code_e4m3,
-    seismic_lang::registry::FloatCodeFormat::E4M3
-);
-float_code_helper!(
-    seismic_float_code_ue4m3,
-    seismic_lang::registry::FloatCodeFormat::UE4M3
-);
-
 #[derive(Clone, Copy)]
 enum AtomicOperation {
     Add,
@@ -302,18 +283,6 @@ pub(crate) fn host_symbols() -> Vec<(&'static str, *const u8)> {
         ("seismic_f16_load", seismic_f16_load as *const u8),
         ("seismic_f16_store", seismic_f16_store as *const u8),
         ("seismic_packed_bits", seismic_packed_bits as *const u8),
-        (
-            "seismic_float_code_e2m1",
-            seismic_float_code_e2m1 as *const u8,
-        ),
-        (
-            "seismic_float_code_e4m3",
-            seismic_float_code_e4m3 as *const u8,
-        ),
-        (
-            "seismic_float_code_ue4m3",
-            seismic_float_code_ue4m3 as *const u8,
-        ),
         (
             "seismic_atomic_add_f32",
             seismic_atomic_add_f32 as *const u8,

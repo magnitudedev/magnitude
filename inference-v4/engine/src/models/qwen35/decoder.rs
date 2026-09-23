@@ -17,7 +17,7 @@ use crate::{
     Error,
 };
 use conditioning::{Conditioning, Overlay};
-use seismic::{DType, Device, Element, Kernel, PrecisionPolicy, Tensor};
+use seismic::{DType, Device, Element, Kernel, PreparationOptions, Tensor};
 use std::{
     collections::{hash_map::Entry as HashEntry, HashMap},
     rc::Rc,
@@ -489,7 +489,7 @@ impl Decoder {
         device: Rc<Device>,
         description: &Description,
         mut import: impl FnMut(&WeightDescriptor, DType) -> Result<ResidentWeight, Error>,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         capacity: DecoderCapacity,
     ) -> Result<Self, Error> {
         let geometry = &description.geometry;
@@ -571,7 +571,7 @@ impl Decoder {
         let embedding = Embedding {
             kernel: kernels::qwen_embedding_rows::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 kernels::qwen_embedding_rows::Elements {
                     EW: table.element(),
                     A: activation_element,
@@ -606,7 +606,7 @@ impl Decoder {
                     let output = import_checked(&weights.output, activation)?;
                     let kernel = kernels::qwen_attention_sequence::for_device_with(
                         &device,
-                        precision.clone(),
+                        preparation.clone(),
                         kernels::qwen_attention_sequence::Elements {
                             NW: input_norm.element(),
                             QW: query_gate.element(),
@@ -665,7 +665,7 @@ impl Decoder {
                     let output = import_checked(&weights.output, activation)?;
                     let kernel = kernels::qwen_recurrent_sequence::for_device_with(
                         &device,
-                        precision.clone(),
+                        preparation.clone(),
                         kernels::qwen_recurrent_sequence::Elements {
                             NW: input_norm.element(),
                             QW: qkv.element(),
@@ -715,7 +715,7 @@ impl Decoder {
                     let down = import_checked(&weights.down, activation)?;
                     let kernel = kernels::qwen_dense_suffix::for_device_with(
                         &device,
-                        precision.clone(),
+                        preparation.clone(),
                         kernels::qwen_dense_suffix::Elements {
                             A: activation_element,
                             NW: norm.element(),
@@ -749,7 +749,7 @@ impl Decoder {
                     let shared_down = import_checked(&weights.shared_down, activation)?;
                     let kernel = kernels::qwen_routed_suffix::for_device_with(
                         &device,
-                        precision.clone(),
+                        preparation.clone(),
                         kernels::qwen_routed_suffix::Elements {
                             A: activation_element,
                             NW: norm.element(),
@@ -797,12 +797,12 @@ impl Decoder {
         let readout = ReadoutKernels {
             rows: kernels::qwen_readout_rows::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 readout_elements(),
             )?,
             selected: kernels::qwen_readout_selected::for_device_with(
                 &device,
-                precision.clone(),
+                preparation.clone(),
                 kernels::qwen_readout_selected::Elements {
                     A: activation_element,
                     NW: output_norm.element(),
@@ -822,8 +822,8 @@ impl Decoder {
         )?;
         let vocabulary = usize::try_from(geometry.vocabulary)
             .map_err(|_| "vocabulary exceeds the host index domain")?;
-        let sampler = Sampler::compile(&device, vocabulary, precision.clone())?;
-        let conditioning = Conditioning::new(&device, precision, geometry.hidden)?;
+        let sampler = Sampler::compile(&device, vocabulary, preparation.clone())?;
+        let conditioning = Conditioning::new(&device, preparation, geometry.hidden)?;
         let mut rows = HashMap::new();
         rows_entry(geometry, &device, &mut rows, 1, 1, context_capacity)?;
         Ok(Self {

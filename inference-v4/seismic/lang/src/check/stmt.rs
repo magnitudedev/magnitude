@@ -2,15 +2,14 @@
 //! emitted as the section-5 checked statement set.
 
 use super::ir::{
-    Block as CheckedBlock, Expr as CheckedExpr, ExprKind as CheckedExprKind, Index as CheckedIndex,
-    LoopKind, Ownership as ParamOwnership, Pattern, Place as CheckedPlace, Stmt as CheckedStmt,
+    Block as CheckedBlock, Expr as CheckedExpr, ExprKind as CheckedExprKind, LoopKind,
+    Ownership as ParamOwnership, Pattern, Place as CheckedPlace, Stmt as CheckedStmt,
     Terminator as BlockTerminator,
 };
 use super::{elem_rounds, Checker, LocalKind, ValueClass};
 use crate::span::Span;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, ExprKind as A};
 use crate::types::{DType, Elem, ValueType};
-use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopCardinality {
@@ -20,16 +19,24 @@ enum LoopCardinality {
 }
 
 impl<'a> Checker<'a> {
+    fn fresh_integer_version(&mut self, local: super::ir::LocalId) -> crate::expr::SymbolId {
+        let symbol = self.fresh_symbol("value");
+        let value = self.arena.int_symbol(symbol);
+        self.scalar_symbols.insert(local, value);
+        symbol
+    }
+
+    fn integer_value_type(ty: &ValueType) -> bool {
+        matches!(ty, ValueType::Integer | ValueType::Index { .. })
+            || ty.scalar_dtype().is_some_and(DType::is_int)
+    }
+
     pub fn push_scope(&mut self) {
         self.scopes.push(Default::default());
     }
 
     pub fn pop_scope(&mut self) {
-        if let Some(scope) = self.scopes.pop() {
-            for variable in scope.values() {
-                self.borrows.remove(variable);
-            }
-        }
+        self.scopes.pop();
     }
 
     /// Check one source block into a checked block with its terminator.
@@ -54,6 +61,8 @@ impl<'a> Checker<'a> {
                     condition,
                     then_body,
                     else_body,
+                    capture_symbols,
+                    join_symbols,
                 })) => {
                     // An `if` whose arms both return ends this path; the arms
                     // carry their own result values.
@@ -63,6 +72,8 @@ impl<'a> Checker<'a> {
                         condition,
                         then_body,
                         else_body,
+                        capture_symbols,
+                        join_symbols,
                     });
                     if both {
                         terminal = true;
@@ -147,13 +158,16 @@ impl<'a> Checker<'a> {
             self.poison(pattern);
             return None;
         }
-        let moved = (matches!(value.ty, ValueType::Tensor(_))
-            && matches!(self.class_of(&value), ValueClass::Owned))
-        .then(|| self.root_var(&value))
-        .flatten();
+        let moves = match self.binding_moves(&value) {
+            Ok(moves) => moves,
+            Err(error) => {
+                self.error(value.span, error);
+                return None;
+            }
+        };
         let pattern = self.destructure(pattern, &value.ty.clone(), &value, state)?;
-        if let Some(root) = moved {
-            self.moved.insert(root);
+        for place in moves {
+            self.consume_place(&place);
         }
         Some(CheckedStmt::Let {
             pattern,
@@ -182,43 +196,62 @@ impl<'a> Checker<'a> {
                     },
                     state,
                 );
-                if matches!(
-                    value.kind,
-                    CheckedExprKind::Primitive {
-                        id: crate::intrinsics::PrimitiveId::TensorAlloc,
-                        ..
-                    }
-                ) {
-                    self.unassigned.insert(id);
-                }
-                // A view binding borrows the storage it selects.
-                if matches!(self.class_of(value), ValueClass::Borrowed) {
-                    if let Some(root) = self.root_var(value) {
-                        let writable = self.writable_root(root);
-                        let exclusive = state && writable;
-                        if self.borrows.values().any(|(borrowed, prior_exclusive)| {
-                            *borrowed == root && (exclusive || *prior_exclusive)
-                        }) {
-                            self.error(
-                                name.span,
-                                format!(
-                                    "tensor borrow of `{}` overlaps a live {} borrow",
-                                    self.locals[root.index()].name,
-                                    if exclusive {
-                                        "mutable"
-                                    } else {
-                                        "exclusive mutable"
-                                    }
-                                ),
-                            );
-                            return None;
+                let mut ownership = self.ownership(value);
+                let mut failure = None;
+                ownership.visit(&mut Vec::new(), &mut |_, leaf| {
+                    if let super::ownership::TensorOwnership::Borrowed { owner, .. } = leaf {
+                        let exclusive = state && self.writable_place(owner);
+                        if self
+                            .live_borrows()
+                            .iter()
+                            .any(|(_, borrowed, prior_exclusive)| {
+                                borrowed.overlaps(owner) && (exclusive || *prior_exclusive)
+                            })
+                        {
+                            failure = Some(format!(
+                                "tensor borrow of `{}` overlaps a live {} borrow",
+                                self.locals[owner.local.index()].name,
+                                if exclusive {
+                                    "mutable"
+                                } else {
+                                    "exclusive mutable"
+                                }
+                            ));
                         }
-                        self.view_roots.insert(id, root);
-                        self.view_bound.insert(id, self.mutated.len());
-                        self.borrows.insert(id, (root, exclusive));
+                    }
+                });
+                if let Some(message) = failure {
+                    self.error(name.span, message);
+                    return None;
+                }
+                fn install(
+                    value: &mut super::ownership::ValueOwnership,
+                    state: bool,
+                    writable: &impl Fn(&super::ownership::LocalPlace) -> bool,
+                ) {
+                    use super::ownership::{TensorOwnership, ValueOwnership};
+                    match value {
+                        ValueOwnership::Tensor(TensorOwnership::Computed) if state => {
+                            *value = ValueOwnership::Tensor(TensorOwnership::Owned { moved: false })
+                        }
+                        ValueOwnership::Tensor(TensorOwnership::Owned { moved }) => *moved = false,
+                        ValueOwnership::Tensor(TensorOwnership::Borrowed { owner, exclusive }) => {
+                            *exclusive = state && writable(owner)
+                        }
+                        ValueOwnership::Tuple(parts) => {
+                            for part in parts {
+                                install(part, state, writable);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                if !state && ty.scalar_dtype() == Some(DType::I32) {
+                install(&mut ownership, state, &|root| self.writable_place(root));
+                self.locals[id.index()].ownership = ownership;
+                if state && Self::integer_value_type(ty) {
+                    let symbol = self.fresh_integer_version(id);
+                    self.locals[id.index()].symbol = Some(symbol);
+                } else if !state && Self::integer_value_type(ty) {
                     match value.sym {
                         Some(sym) => {
                             self.scalar_symbols.insert(id, sym);
@@ -367,23 +400,39 @@ impl<'a> Checker<'a> {
                 }
                 let mut authorities = Vec::new();
                 for (place, _) in &targets {
-                    let root = self.write_place(place, true, target.span)?;
+                    let root = self.write_place(place, target.span)?;
                     authorities.extend(self.exclusive_write_authority(root, place));
                 }
-                let places = targets.into_iter().map(|(p, _)| p).collect();
+                let value_symbols = targets
+                    .iter()
+                    .filter_map(|(place, ty)| match place {
+                        CheckedPlace::Local(root) if Self::integer_value_type(ty) => {
+                            Some((root.local, self.fresh_integer_version(root.local)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let place = CheckedPlace::Tuple(targets.into_iter().map(|(p, _)| p).collect());
+                if let Err(error) = self.assignment_ownership(&place, &value) {
+                    self.error(value.span, error);
+                    return None;
+                }
                 Some(CheckedStmt::Assign {
-                    place: CheckedPlace::Tuple(places),
+                    place,
                     op,
                     value,
+                    value_symbols,
                     authorities,
                 })
             }
             A::Name(name) => {
                 let place = self.state_place(name)?;
-                let ty = match &place {
-                    CheckedPlace::Local(root) => self.locals[root.index()].ty.clone(),
-                    _ => unreachable!(),
-                };
+                let ty = self.locals[self
+                    .lookup(&name.name)
+                    .expect("state place resolved")
+                    .index()]
+                .ty
+                .clone();
                 let value = self.expr(value, Some(&ty))?;
                 if op == AssignOp::Assign {
                     if !self.assignable(&ty, &value.ty) {
@@ -399,26 +448,23 @@ impl<'a> Checker<'a> {
                 } else {
                     self.arith_assign(&ty, &value, op)?;
                 }
-                let moved = (op == AssignOp::Assign
-                    && matches!(value.ty, ValueType::Tensor(_))
-                    && matches!(self.class_of(&value), ValueClass::Owned))
-                .then(|| self.root_var(&value))
-                .flatten();
-                let root = self.write_place(&place, true, target.span)?;
-                if op == AssignOp::Assign && matches!(ty, ValueType::Tensor(_)) {
-                    // Assignment reinitializes owned state, including state that
-                    // was moved earlier on this path.
-                    self.moved.remove(&root);
+                let root = self.write_place(&place, target.span)?;
+                if op == AssignOp::Assign {
+                    if let Err(error) = self.assignment_ownership(&place, &value) {
+                        self.error(value.span, error);
+                        return None;
+                    }
                 }
-                if let Some(source) = moved.filter(|source| *source != root) {
-                    self.moved.insert(source);
-                }
-                self.unassigned.remove(&root);
                 let authorities = self.exclusive_write_authority(root, &place);
+                let value_symbols = Self::integer_value_type(&ty)
+                    .then(|| (root, self.fresh_integer_version(root)))
+                    .into_iter()
+                    .collect();
                 Some(CheckedStmt::Assign {
                     place,
                     op,
                     value,
+                    value_symbols,
                     authorities,
                 })
             }
@@ -453,26 +499,6 @@ impl<'a> Checker<'a> {
                         return None;
                     }
                 }
-                let pending = self
-                    .pending_full_assign
-                    .iter()
-                    .find(|(v, _)| *v == root)
-                    .map(|(_, axes)| axes.clone());
-                if self.unassigned.contains(&root) && pending.is_none() && self.init_loop_depth == 0
-                {
-                    self.error(target.span, format!("`{}` is written element-wise before it is initialized; assign every element through a complete `for … in 0..extent` traversal", self.locals[root.index()].name));
-                    return None;
-                }
-                let covers = op == AssignOp::Assign
-                    && pending.as_ref().is_some_and(|axes| {
-                        indices.len() == axes.len()
-                            && indices.iter().zip(axes).all(|(index, axis)| match index {
-                                CheckedIndex::Point { value: p, .. } => {
-                                    matches!(&p.kind, CheckedExprKind::Local(v) if v == axis)
-                                }
-                                _ => false,
-                            })
-                    });
                 match &selected {
                     ValueType::Scalar(dtype) => {
                         let dtype = *dtype;
@@ -502,21 +528,17 @@ impl<'a> Checker<'a> {
                         } else {
                             self.arith_assign(&ValueType::Scalar(dtype), &value, op)?;
                         }
-                        self.write(root, binding, &indices, false, target.span)?;
+                        self.write(root, binding, target.span)?;
                         let checked_place = CheckedPlace::Element {
-                            root,
+                            root: super::ownership::LocalPlace::root(root),
                             indices: indices.clone(),
                         };
                         let authorities = self.exclusive_write_authority(root, &checked_place);
-                        if covers {
-                            self.unassigned.remove(&root);
-                            self.pending_full_assign
-                                .retain(|(variable, _)| *variable != root);
-                        }
                         Some(CheckedStmt::Assign {
                             place: checked_place,
                             op,
                             value,
+                            value_symbols: Vec::new(),
                             authorities,
                         })
                     }
@@ -545,32 +567,17 @@ impl<'a> Checker<'a> {
                             );
                             return None;
                         }
-                        self.write(root, binding, &indices, false, target.span)?;
+                        self.write(root, binding, target.span)?;
                         let checked_place = CheckedPlace::Element {
-                            root,
+                            root: super::ownership::LocalPlace::root(root),
                             indices: indices.clone(),
                         };
                         let authorities = self.exclusive_write_authority(root, &checked_place);
-                        if covers
-                            || indices.iter().all(|i| {
-                                matches!(
-                                    i,
-                                    CheckedIndex::Range {
-                                        start: None,
-                                        end: None,
-                                        ..
-                                    }
-                                )
-                            })
-                        {
-                            self.unassigned.remove(&root);
-                            self.pending_full_assign
-                                .retain(|(variable, _)| *variable != root);
-                        }
                         Some(CheckedStmt::Assign {
                             place: checked_place,
                             op,
                             value,
+                            value_symbols: Vec::new(),
                             authorities,
                         })
                     }
@@ -594,21 +601,33 @@ impl<'a> Checker<'a> {
     }
 
     /// Record a whole-variable write through a place.
-    fn write_place(
-        &mut self,
-        place: &CheckedPlace,
-        whole: bool,
-        span: Span,
-    ) -> Option<super::ir::LocalId> {
+    fn write_place(&mut self, place: &CheckedPlace, span: Span) -> Option<super::ir::LocalId> {
         match place {
-            CheckedPlace::Local(root) => self.write(*root, *root, &[], whole, span),
-            CheckedPlace::Element { root, indices } => {
-                self.write(*root, *root, indices, whole, span)
+            CheckedPlace::Local(root) => {
+                if self
+                    .logical_parallel
+                    .iter()
+                    .any(|(floor, _)| root.local.index() < *floor)
+                {
+                    self.error(
+                        span,
+                        "a `parallel for` body cannot reassign captured state; use an explicit reduction, participant-local value, or disjoint tensor element writes",
+                    );
+                    return None;
+                }
+                self.write(root.local, root.local, span)
+            }
+            CheckedPlace::Element { root, .. } => {
+                if !self.writable_place(root) {
+                    self.error(span, "tensor place does not permit exclusive writes");
+                    return None;
+                }
+                self.write(root.local, root.local, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;
                 for p in places {
-                    last = self.write_place(p, whole, span);
+                    last = self.write_place(p, span);
                 }
                 last
             }
@@ -641,7 +660,35 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        Some(CheckedPlace::Local(id))
+        fn target(
+            value: &super::ownership::ValueOwnership,
+            place: &mut super::ownership::LocalPlace,
+        ) -> CheckedPlace {
+            use super::ownership::{TensorOwnership, ValueOwnership};
+            match value {
+                ValueOwnership::Tuple(parts) => CheckedPlace::Tuple(
+                    parts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, part)| {
+                            place.path.push(i);
+                            let target = target(part, place);
+                            place.path.pop();
+                            target
+                        })
+                        .collect(),
+                ),
+                ValueOwnership::Tensor(TensorOwnership::Borrowed { .. }) => CheckedPlace::Element {
+                    root: place.clone(),
+                    indices: Vec::new(),
+                },
+                _ => CheckedPlace::Local(place.clone()),
+            }
+        }
+        Some(target(
+            &self.locals[id.index()].ownership,
+            &mut super::ownership::LocalPlace::root(id),
+        ))
     }
 
     fn arith_assign(
@@ -669,6 +716,11 @@ impl<'a> Checker<'a> {
             if DType::promote(a.elem.read_dtype(), v).is_some() {
                 return Some(());
             }
+        }
+        if target.scalar_dtype().is_some_and(DType::is_int)
+            && matches!(value.ty, ValueType::Integer | ValueType::Index { .. })
+        {
+            return Some(());
         }
         let (Some(t), Some(v)) = (target.scalar_dtype(), value.ty.scalar_dtype()) else {
             self.error(
@@ -721,20 +773,32 @@ impl<'a> Checker<'a> {
             }
         }
         let facts_before = self.facts.clone();
-        let unassigned_before = self.unassigned.clone();
-        let pending_before = self.pending_full_assign.clone();
         let symbols_before = self.scalar_symbols.clone();
-        let moved_before = self.moved.clone();
+        let capture_symbols = self
+            .locals
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, local)| {
+                let id = super::ir::LocalId::new(ordinal as u32);
+                let symbol = self.symbols.get(&id).copied().or_else(|| {
+                    symbols_before.get(&id).and_then(|value| match self.arena.view((*value).into()) {
+                        crate::expr::NodeView::Symbol(symbol) => Some(symbol),
+                        _ => None,
+                    })
+                });
+                Self::integer_value_type(&local.ty).then_some(symbol).flatten().map(|symbol| (id, symbol))
+            })
+            .collect::<Vec<_>>();
+        let moved_before = self.moved_snapshot();
         let reads_before = self.reads.clone();
 
         self.assume(&cond, false);
         let then_body = self.scoped_block(then);
         self.facts = facts_before.clone();
-        let unassigned_then = std::mem::replace(&mut self.unassigned, unassigned_before);
-        let symbols_then = std::mem::replace(&mut self.scalar_symbols, symbols_before);
-        let moved_then = std::mem::replace(&mut self.moved, moved_before.clone());
+        let symbols_then = std::mem::replace(&mut self.scalar_symbols, symbols_before.clone());
+        let moved_then = self.moved_snapshot();
+        self.restore_moves(&moved_before);
         let reads_then = std::mem::replace(&mut self.reads, reads_before);
-        self.pending_full_assign = pending_before.clone();
 
         let else_body = match els {
             Some(b) => {
@@ -747,23 +811,29 @@ impl<'a> Checker<'a> {
             },
         };
         self.facts = facts_before;
-        let moved_else = self.moved.clone();
-        self.unassigned.extend(unassigned_then);
+        let moved_else = self.moved_snapshot();
         self.reads.extend(reads_then);
-        self.scalar_symbols
-            .retain(|id, sym| symbols_then.get(id) == Some(sym));
+        let symbols_else = self.scalar_symbols.clone();
+        self.scalar_symbols = symbols_before.clone();
+        let mut join_symbols = Vec::new();
+        for (id, before) in symbols_before {
+            if !self.locals[id.index()].mutable || !Self::integer_value_type(&self.locals[id.index()].ty) {
+                continue;
+            }
+            if symbols_then.get(&id) != Some(&before) || symbols_else.get(&id) != Some(&before) {
+                join_symbols.push((id, self.fresh_integer_version(id)));
+            }
+        }
         // A value is available after an `if` only when it is available on every
         // path. Both arms are checked from `moved_before`, so a move in one arm
         // cannot spuriously poison checking of the other arm.
-        self.moved = moved_then.union(&moved_else).copied().collect();
-        self.pending_full_assign = pending_before
-            .into_iter()
-            .filter(|(v, _)| self.unassigned.contains(v))
-            .collect();
+        self.restore_moves(&moved_then.union(&moved_else).cloned().collect());
         Some(CheckedStmt::If {
             condition: cond,
             then_body,
             else_body,
+            capture_symbols,
+            join_symbols,
         })
     }
 
@@ -865,13 +935,18 @@ impl<'a> Checker<'a> {
                 ((operands[0].clone(), operands[1].clone()), lo, hi)
             }
             _ => {
+                let (_, start_symbol, start) = self.arena.loop_binder();
+                let (_, end_symbol, end) = self.arena.loop_binder();
+                let zero = self.arena.int(0);
+                self.facts.set_range(start_symbol, zero, bound);
+                self.facts.set_range(end_symbol, start, bound);
                 let lo = CheckedExpr::new(
                     CheckedExprKind::Primitive {
                         id: crate::intrinsics::PrimitiveId::RangeStart,
                         operands: vec![range.clone()],
                     },
-                    ValueType::Scalar(DType::I32),
-                    Some(self.arena.int(0)),
+                    ValueType::Integer,
+                    Some(start),
                     iter.span,
                 );
                 let hi = CheckedExpr::new(
@@ -879,11 +954,11 @@ impl<'a> Checker<'a> {
                         id: crate::intrinsics::PrimitiveId::RangeEnd,
                         operands: vec![range.clone()],
                     },
-                    ValueType::Scalar(DType::I32),
-                    Some(bound),
+                    ValueType::Integer,
+                    Some(end),
                     iter.span,
                 );
-                ((lo, hi), Some(self.arena.int(0)), Some(bound))
+                ((lo, hi), Some(start), Some(end))
             }
         };
         let (Some(lo_sym), Some(hi_sym)) = (lo_sym, hi_sym) else {
@@ -897,8 +972,17 @@ impl<'a> Checker<'a> {
             _ => LoopCardinality::RepeatedOrUnknown,
         };
         let floor = self.locals.len();
-        let moved_before = self.moved.clone();
+        let moved_before = self.moved_snapshot();
         let reads_before = self.reads.clone();
+        let symbols_before = self.scalar_symbols.clone();
+        let mut value_symbols = Vec::new();
+        for ordinal in 0..floor {
+            let id = super::ir::LocalId::new(ordinal as u32);
+            if self.locals[ordinal].mutable && Self::integer_value_type(&self.locals[ordinal].ty) {
+                let header = self.fresh_integer_version(id);
+                value_symbols.push((id, header, header));
+            }
+        }
         self.push_scope();
         let binder = self.declare(
             &target.name,
@@ -916,52 +1000,19 @@ impl<'a> Checker<'a> {
         if parallel {
             self.logical_parallel.push((floor, binder));
         }
-        self.loops.push(super::LoopCtx {
-            floor,
-            writes: Vec::new(),
-            whole_writes: Vec::new(),
-            atomics: Vec::new(),
-        });
-        // A complete logical `0..axis` traversal may collectively initialize
-        // uninitialized storage over that axis.
-        let prior_pending = self.pending_full_assign.clone();
-        let mut pending = Vec::new();
-        for tensor in self.unassigned.iter().copied() {
-            let ValueType::Tensor(shaped) = &self.locals[tensor.index()].ty else {
-                continue;
-            };
-            let prefix = prior_pending
-                .iter()
-                .find(|(candidate, _)| *candidate == tensor)
-                .map(|(_, axes)| axes.clone())
-                .unwrap_or_default();
-            let axis = prefix.len();
-            let Some(extent) = shaped.axes.get(axis) else {
-                continue;
-            };
-            if super::prove::is_zero(&self.arena, lo_sym)
-                && super::prove::same(&self.arena, hi_sym, *extent)
-            {
-                let mut axes = prefix;
-                axes.push(binder);
-                pending.push((tensor, axes));
-            }
-        }
-        self.pending_full_assign = pending;
-        self.init_loop_depth += 1;
         self.loop_depth += 1;
         let body_block = self.block(body);
         self.loop_depth -= 1;
-        self.init_loop_depth -= 1;
-        self.pending_full_assign = prior_pending;
-        let ctx = self.loops.pop().expect("loop context is balanced");
         if parallel {
             self.logical_parallel.pop();
         }
         self.pop_scope();
         self.finish_loop_ownership(moved_before, floor, cardinality, iter.span);
         self.reads = reads_before;
-        let _ = ctx;
+        self.scalar_symbols = symbols_before;
+        for (id, _, exit) in &mut value_symbols {
+            *exit = self.fresh_integer_version(*id);
+        }
         let kind = if parallel {
             LoopKind::Independent
         } else {
@@ -973,28 +1024,11 @@ impl<'a> Checker<'a> {
             start: range_exprs.0,
             end: range_exprs.1,
             body: body_block,
+            value_symbols,
+            initialization: crate::initialization::LoopInitialization::empty(
+                crate::initialization::ParameterPath::root(self.sig.params.len() + binder.index()),
+            ),
         };
-        let loop_block = CheckedBlock {
-            statements: vec![checked.clone()],
-            terminator: BlockTerminator::Continue,
-        };
-        let pending: Vec<_> = self.unassigned.iter().copied().collect();
-        for variable in pending {
-            let Some(shaped) = self.locals[variable.index()].ty.shaped().cloned() else {
-                continue;
-            };
-            if super::writes_cover(
-                &mut self.arena,
-                &self.locals,
-                &loop_block,
-                variable,
-                &shaped.axes,
-                &[],
-                &self.facts,
-            ) {
-                self.unassigned.remove(&variable);
-            }
-        }
         Some(checked)
     }
 
@@ -1006,25 +1040,27 @@ impl<'a> Checker<'a> {
     /// single-iteration loop carries its exit state forward.
     fn finish_loop_ownership(
         &mut self,
-        moved_before: HashSet<super::ir::LocalId>,
+        moved_before: std::collections::BTreeSet<super::ownership::LocalPlace>,
         captured_floor: usize,
         cardinality: LoopCardinality,
         span: Span,
     ) {
-        let moved_after = self.moved.clone();
+        let moved_after = self.moved_snapshot();
         match cardinality {
-            LoopCardinality::Zero => self.moved = moved_before,
+            LoopCardinality::Zero => self.restore_moves(&moved_before),
             LoopCardinality::One => {
-                self.moved = moved_after
-                    .into_iter()
-                    .filter(|id| id.index() < captured_floor)
-                    .collect();
+                self.restore_moves(
+                    &moved_after
+                        .into_iter()
+                        .filter(|place| place.local.index() < captured_floor)
+                        .collect(),
+                );
             }
             LoopCardinality::RepeatedOrUnknown => {
                 let mut consumed: Vec<_> = moved_after
                     .difference(&moved_before)
-                    .copied()
-                    .filter(|id| id.index() < captured_floor)
+                    .cloned()
+                    .filter(|place| place.local.index() < captured_floor)
                     .collect();
                 consumed.sort_unstable();
                 for id in consumed {
@@ -1032,13 +1068,13 @@ impl<'a> Checker<'a> {
                         span,
                         format!(
                             "loop may repeat after moving captured owned tensor `{}`; reinitialize it before the iteration ends",
-                            self.locals[id.index()].name
+                            self.locals[id.local.index()].name
                         ),
                     );
                 }
                 // A valid repeated body has the same captured ownership state at
                 // its back-edge as at entry. Body-local bindings do not escape.
-                self.moved = moved_before;
+                self.restore_moves(&moved_before);
             }
         }
     }
@@ -1090,7 +1126,21 @@ impl<'a> Checker<'a> {
             }
             exprs.push(e);
         }
+        let mut returned_places = std::collections::BTreeSet::new();
         for (e, ty) in exprs.iter().zip(&expected) {
+            let (_, places) = match self.owned_consumption(e) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.error(e.span, error);
+                    return None;
+                }
+            };
+            for place in places {
+                if !returned_places.insert(place) {
+                    self.error(e.span, "owned tensor leaf is returned more than once");
+                    return None;
+                }
+            }
             if !self.assignable(ty, &e.ty) {
                 self.error(
                     e.span,

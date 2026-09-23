@@ -5,7 +5,7 @@
 //! compiles nothing.
 use super::{decoder::Decoder, loading::Model};
 use crate::Error;
-use seismic::{Device, PrecisionPolicy};
+use seismic::{Device, PreparationOptions};
 use serde::Serialize;
 use std::{path::Path, rc::Rc, time::Instant};
 
@@ -52,14 +52,14 @@ impl Baseline {
     pub fn load(
         path: impl AsRef<Path>,
         device: Rc<Device>,
-        precision: PrecisionPolicy,
+        preparation: PreparationOptions,
         context_capacity: usize,
     ) -> Result<Self, Error> {
         let start = Instant::now();
         let backend = device.backend().as_str().to_owned();
         let model = Model::open(path)?;
         let artifact = model.description().artifact_identity.to_string();
-        let decoder = model.load(device, precision, context_capacity, 1)?;
+        let decoder = model.load(device, preparation, context_capacity, 1)?;
         Ok(Self {
             decoder,
             artifact,

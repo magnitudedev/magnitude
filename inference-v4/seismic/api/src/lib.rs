@@ -1,5 +1,6 @@
 //! The public Seismic API (spec §14): devices, tensors, prepared kernels,
-//! and the helpers generated bindings compose. This crate re-exports and
+//! runtime-discovered functions, and the helpers generated bindings compose.
+//! This crate re-exports and
 //! composes; it contains no second implementation.
 //!
 //! Consumers import only this crate and `seismic-build`. Nothing here
@@ -8,12 +9,18 @@
 //! allocation (§14.6).
 //!
 //! W9-B owns device/tensor internals, W9-C owns invocation, W9-A owns the
-//! generated-code contract. The surface below is frozen.
+//! generated-code contract. Dynamic callers use [`dynamic`] without implementing
+//! the unsafe generated entry contract.
 
 pub use seismic_compiler::errors::{
     CheckedBundleError, ExecutionError, InvocationError, PreparationError, TargetError,
 };
+pub use seismic_compiler::feedback::{
+    EvaluationMethod, FeedbackOptions, FeedbackReport, InvocationRange, InvocationScope,
+    PreparationOptions,
+};
 pub use seismic_lang::precision::PrecisionPolicy;
+pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::registry::BackendName;
 pub use seismic_lang::types::DType;
 pub use seismic_runtime::api::{
@@ -77,6 +84,9 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn same_device(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
     pub fn info(&self) -> &DeviceInfo {
         self.inner.info()
     }
@@ -328,6 +338,19 @@ pub enum LoadError {
     Preparation(PreparationError),
 }
 
+impl LoadError {
+    fn from_prepare(error: seismic_runtime::api::kernel::PrepareError) -> Self {
+        match error {
+            seismic_runtime::api::kernel::PrepareError::Source(error) => {
+                Self::Source(SourceLoadError::from_internal(error))
+            }
+            seismic_runtime::api::kernel::PrepareError::Preparation(error) => {
+                Self::Preparation(error)
+            }
+        }
+    }
+}
+
 /// A checked source/binding error discovered while instantiating a generated
 /// entry. The checked compiler object and its internal IDs are deliberately
 /// not part of the public API.
@@ -515,6 +538,61 @@ pub struct Kernel<E: Entry> {
     marker: std::marker::PhantomData<E>,
 }
 
+/// Mutable feedback search state. Kernels returned by this preparation own
+/// their executable resources independently and are never changed by continuation.
+pub struct FeedbackPreparation<'device, E: Entry> {
+    inner: seismic_runtime::api::kernel::FeedbackPreparation<'device>,
+    marker: std::marker::PhantomData<E>,
+}
+
+impl<'device, E: Entry> FeedbackPreparation<'device, E> {
+    fn start(
+        device: &'device Device,
+        precision: PrecisionPolicy,
+        options: FeedbackOptions,
+        bindings: seismic_lang::entry::ElementBindings,
+    ) -> Result<(Self, Kernel<E>), LoadError> {
+        let module = E::module().map_err(LoadError::Bundle)?;
+        let entry = E::resolve(module).map_err(LoadError::Bundle)?;
+        let (inner, kernel) = seismic_runtime::api::kernel::start_feedback(
+            module.checked(),
+            entry.id(),
+            bindings,
+            device.inner(),
+            precision,
+            options,
+        )
+        .map_err(LoadError::from_prepare)?;
+        Ok((
+            Self {
+                inner,
+                marker: std::marker::PhantomData,
+            },
+            Kernel {
+                inner: Arc::new(kernel),
+                marker: std::marker::PhantomData,
+            },
+        ))
+    }
+
+    pub fn continue_for(
+        &mut self,
+        additional: std::time::Duration,
+    ) -> Result<Kernel<E>, LoadError> {
+        self.inner
+            .continue_for(additional)
+            .map(|inner| Kernel {
+                inner: Arc::new(inner),
+                marker: std::marker::PhantomData,
+            })
+            .map_err(LoadError::from_prepare)
+    }
+
+    pub fn report(&self) -> &FeedbackReport {
+        self.inner.report()
+    }
+}
+
 /// An explicitly selected, top-level native implementation of one entry.
 /// It has the same typed call contract as [`Kernel`], but intentionally
 /// cannot be enqueued into a workflow or passed through compiler planning.
@@ -589,9 +667,13 @@ impl WorkflowCompletion {
 }
 
 impl<E: Entry> Kernel<E> {
+    pub fn feedback_report(&self) -> Option<&FeedbackReport> {
+        self.inner.feedback_report()
+    }
+
     fn prepare(
         device: &Device,
-        precision: PrecisionPolicy,
+        options: PreparationOptions,
         bindings: seismic_lang::entry::ElementBindings,
     ) -> Result<Self, LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
@@ -601,20 +683,13 @@ impl<E: Entry> Kernel<E> {
             entry.id(),
             bindings,
             device.inner(),
-            precision,
+            options,
         )
         .map(|inner| Self {
             inner: Arc::new(inner),
             marker: std::marker::PhantomData,
         })
-        .map_err(|error| match error {
-            seismic_runtime::api::kernel::PrepareError::Source(error) => {
-                LoadError::Source(SourceLoadError::from_internal(error))
-            }
-            seismic_runtime::api::kernel::PrepareError::Preparation(error) => {
-                LoadError::Preparation(error)
-            }
-        })
+        .map_err(LoadError::from_prepare)
     }
 
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
@@ -643,14 +718,7 @@ impl<E: Entry> NativeKernel<E> {
             inner: Arc::new(inner),
             marker: std::marker::PhantomData,
         })
-        .map_err(|error| match error {
-            seismic_runtime::api::kernel::PrepareError::Source(error) => {
-                LoadError::Source(SourceLoadError::from_internal(error))
-            }
-            seismic_runtime::api::kernel::PrepareError::Preparation(error) => {
-                LoadError::Preparation(error)
-            }
-        })
+        .map_err(LoadError::from_prepare)
     }
 
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
@@ -715,6 +783,22 @@ pub mod generated {
     /// never observe or fabricate compiler entry identifiers.
     pub struct EntryToken(seismic_lang::ids::EntryId);
 
+    pub use seismic_compiler::feedback::InvocationParameter;
+    pub use seismic_lang::expr::SymbolValue;
+
+    pub fn invocation_scope<E: Entry>() -> Result<InvocationScope, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        let stable = module
+            .checked()
+            .entries()
+            .iter()
+            .find(|candidate| candidate.id == entry.id())
+            .expect("resolved entry belongs to module")
+            .stable;
+        Ok(InvocationScope::for_entry(stable))
+    }
+
     impl EntryToken {
         pub(super) fn id(&self) -> seismic_lang::ids::EntryId {
             self.0
@@ -764,10 +848,10 @@ pub mod generated {
         pub fn bool(&mut self, value: bool) {
             self.inner.push_scalar(EncodedScalar::Bool(value));
         }
-        pub fn index(&mut self, value: u64) {
+        pub fn index(&mut self, value: BigUint) {
             self.inner.push_scalar(EncodedScalar::Index(value));
         }
-        pub fn range(&mut self, value: (u64, u64)) {
+        pub fn range(&mut self, value: (BigUint, BigUint)) {
             self.inner.push_scalar(EncodedScalar::Range {
                 start: value.0,
                 end: value.1,
@@ -838,10 +922,10 @@ pub mod generated {
         pub fn bool(&mut self, value: bool) {
             self.inner.push_scalar(EncodedScalar::Bool(value));
         }
-        pub fn index(&mut self, value: u64) {
+        pub fn index(&mut self, value: BigUint) {
             self.inner.push_scalar(EncodedScalar::Index(value));
         }
-        pub fn range(&mut self, value: (u64, u64)) {
+        pub fn range(&mut self, value: (BigUint, BigUint)) {
             self.inner.push_scalar(EncodedScalar::Range {
                 start: value.0,
                 end: value.1,
@@ -877,14 +961,27 @@ pub mod generated {
 
     pub fn prepare<E: Entry>(
         device: &Device,
-        precision: PrecisionPolicy,
+        options: PreparationOptions,
         elements: &[(&str, Element)],
     ) -> Result<Kernel<E>, LoadError> {
         let bindings = elements.iter().fold(
             seismic_lang::entry::ElementBindings::new(),
             |bindings, (name, element)| bindings.bind(name, element.id()),
         );
-        Kernel::prepare(device, precision, bindings)
+        Kernel::prepare(device, options, bindings)
+    }
+
+    pub fn start_feedback<'device, E: Entry>(
+        device: &'device Device,
+        precision: PrecisionPolicy,
+        options: FeedbackOptions,
+        elements: &[(&str, Element)],
+    ) -> Result<(FeedbackPreparation<'device, E>, Kernel<E>), LoadError> {
+        let bindings = elements.iter().fold(
+            seismic_lang::entry::ElementBindings::new(),
+            |bindings, (name, element)| bindings.bind(name, element.id()),
+        );
+        FeedbackPreparation::start(device, precision, options, bindings)
     }
 
     pub fn prepare_native<E: Entry>(
@@ -924,9 +1021,9 @@ pub mod generated {
     scalar_result!(take_i32, I32, i32, |value| value);
     scalar_result!(take_u32, U32, u32, |value| value);
     scalar_result!(take_bool, Bool, bool, |value| value);
-    scalar_result!(take_index, Index, u64, |value| value);
+    scalar_result!(take_index, Index, BigUint, |value| value);
 
-    pub fn take_range(results: &mut DecodedResults) -> (u64, u64) {
+    pub fn take_range(results: &mut DecodedResults) -> (BigUint, BigUint) {
         match results.take_scalar() {
             ArgumentValue::Range { start, end } => (start, end),
             _ => panic!("generated result schema disagrees with prepared kernel"),
@@ -942,4 +1039,15 @@ pub mod generated {
             Err(error) => Err(error.clone()),
         }
     }
+}
+
+/// Checked dynamic integration for runtime-discovered functions.
+pub mod dynamic;
+
+/// Numerical policy values shared by every host language.
+pub mod precision { pub use seismic_lang::precision::*; }
+
+/// Shared numerical comparison primitives for host testing adapters.
+pub mod testing {
+    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }

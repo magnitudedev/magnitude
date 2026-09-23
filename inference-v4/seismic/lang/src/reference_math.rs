@@ -1,12 +1,9 @@
-//! Canonical language definition of unary reference math.
+//! Language-owned scalar semantics as total, typed-bit recipes.
 //!
-//! The recipes are derived from the f32 Sun/FreeBSD algorithms carried by
-//! libm 0.2.16, with a pure-f32/u32 Payne-Hanek reducer for the full finite
-//! f32 trigonometric domain. A recipe is an ordered, closed graph of primitive
-//! operations. The language interpreter evaluates this graph and the compiler
-//! instantiates the same graph into kernel IR; neither owns a second formula.
-//! `Exact` therefore means zero deviation from this versioned recipe, not a
-//! claim that every transcendental is the correctly-rounded real function.
+//! The terminal vocabulary contains only unsigned word arithmetic, comparisons,
+//! Boolean selection and bit-preserving transport. Both interpretation and kernel
+//! construction consume this same graph. Transcendentals preserve the ordered
+//! Sun/FreeBSD f32 recipes; their scalar steps expand through the same owner.
 //!
 //! The exp/log and primary sin/cos polynomials originate in FreeBSD msun:
 //! Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
@@ -14,231 +11,130 @@
 //! copy, modify, and distribute this software is freely granted, provided
 //! that this notice is preserved.
 
+mod primitive;
+
 use crate::intrinsics::MathOp;
+use crate::syntax::ast;
 use crate::types::DType;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-pub const VERSION: &str = "seismic-reference-math-f32-v1";
+pub const VERSION: &str = "seismic-scalar-reference-bits-v2";
 
-pub fn digest() -> [u8; 32] {
-    static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
-    *DIGEST.get_or_init(|| {
-        let mut hash = Sha256::new();
-        hash.update(VERSION.as_bytes());
-        for dtype in [DType::F16, DType::BF16, DType::F32] {
-            for op in [
-                ReferenceMathOp::Exp,
-                ReferenceMathOp::Rsqrt,
-                ReferenceMathOp::Sqrt,
-                ReferenceMathOp::Log,
-                ReferenceMathOp::Sin,
-                ReferenceMathOp::Cos,
-                ReferenceMathOp::Abs,
-            ] {
-                encode_recipe(&mut hash, &recipe(op, dtype));
-            }
-        }
-        hash.finalize().into()
+/// Operation identities describe source semantics, never physical approximations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarOp {
+    Binary(ast::BinaryOp),
+    Unary(ast::UnaryOp),
+    Math(MathOp),
+    Cast(DType),
+}
+
+/// The scalar meaning of an ordinary checked primitive. Structural primitives
+/// have no scalar recipe; their owning source constructor handles them.
+pub fn scalar_operation(primitive: &crate::intrinsics::PrimitiveId) -> Option<ScalarOp> {
+    use crate::intrinsics::PrimitiveId;
+    Some(match primitive {
+        PrimitiveId::Unary(op) => ScalarOp::Unary(*op),
+        PrimitiveId::Binary(op) => ScalarOp::Binary(*op),
+        PrimitiveId::Math(op) => ScalarOp::Math(*op),
+        PrimitiveId::Cast(dtype) => ScalarOp::Cast(*dtype),
+        _ => return None,
     })
 }
 
-fn encode_recipe(hash: &mut Sha256, recipe: &ReferenceRecipe) {
-    fn dtype_tag(dtype: DType) -> u8 {
+/// Payload bits are authoritative, including NaN payloads and signed zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceScalar {
+    F16(u16),
+    BF16(u16),
+    F32(u32),
+    I32(i32),
+    U32(u32),
+    Bool(bool),
+}
+impl ReferenceScalar {
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::F16(_) => DType::F16,
+            Self::BF16(_) => DType::BF16,
+            Self::F32(_) => DType::F32,
+            Self::I32(_) => DType::I32,
+            Self::U32(_) => DType::U32,
+            Self::Bool(_) => DType::Bool,
+        }
+    }
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::F16(x) | Self::BF16(x) => u32::from(x),
+            Self::F32(x) | Self::U32(x) => x,
+            Self::I32(x) => x as u32,
+            Self::Bool(x) => u32::from(x),
+        }
+    }
+    pub fn from_bits(dtype: DType, bits: u32) -> Self {
         match dtype {
-            DType::F16 => 0,
-            DType::BF16 => 1,
-            DType::F32 => 2,
-            DType::I32 => 3,
-            DType::U32 => 4,
-            DType::Bool => 5,
+            DType::F16 => Self::F16(bits as u16),
+            DType::BF16 => Self::BF16(bits as u16),
+            DType::F32 => Self::F32(bits),
+            DType::I32 => Self::I32(bits as i32),
+            DType::U32 => Self::U32(bits),
+            DType::Bool => Self::Bool(bits != 0),
         }
     }
-    fn ty(hash: &mut Sha256, ty: ValueType) {
-        match ty {
-            ValueType::Scalar(dtype) => hash.update([0, dtype_tag(dtype)]),
-            ValueType::Bool => hash.update([1, 0]),
+    /// Diagnostic projection only. Semantic operations consume `bits` instead.
+    pub fn to_f64(self) -> f64 {
+        match self {
+            Self::F16(x) => crate::registry::f16_to_f32(x) as f64,
+            Self::BF16(x) => f32::from_bits(u32::from(x) << 16) as f64,
+            Self::F32(x) => f32::from_bits(x) as f64,
+            Self::I32(x) => f64::from(x),
+            Self::U32(x) => f64::from(x),
+            Self::Bool(x) => f64::from(u8::from(x)),
         }
     }
-    fn value(hash: &mut Sha256, value: ReferenceValue) {
-        hash.update(value.ordinal.to_le_bytes());
-        ty(hash, value.ty);
-    }
-    fn binary_tag(op: BinaryOp) -> u8 {
-        match op {
-            BinaryOp::Add => 0,
-            BinaryOp::Sub => 1,
-            BinaryOp::Mul => 2,
-            BinaryOp::Div => 3,
-        }
-    }
-    fn bit_tag(op: BitOp) -> u8 {
-        match op {
-            BitOp::And => 0,
-            BitOp::Or => 1,
-            BitOp::Shl => 2,
-            BitOp::Shr => 3,
-        }
-    }
-    fn cmp_tag(op: CmpOp) -> u8 {
-        match op {
-            CmpOp::Eq => 0,
-            CmpOp::Ne => 1,
-            CmpOp::Lt => 2,
-            CmpOp::Le => 3,
-            CmpOp::Gt => 4,
-            CmpOp::Ge => 5,
-        }
-    }
-    fn unary_tag(op: UnaryOp) -> u8 {
-        match op {
-            UnaryOp::Neg => 0,
-            UnaryOp::Abs => 1,
-        }
-    }
-
-    hash.update((recipe.nodes.len() as u64).to_le_bytes());
-    for node in recipe.nodes.iter() {
-        match *node {
-            ReferenceNode::Input { dtype } => hash.update([0, dtype_tag(dtype)]),
-            ReferenceNode::Constant {
-                value: constant,
-                ty: value_ty,
-            } => {
-                hash.update([1]);
-                ty(hash, value_ty);
-                match constant {
-                    ConstantValue::F32(bits) => {
-                        hash.update([0]);
-                        hash.update(bits.to_le_bytes());
-                    }
-                    ConstantValue::U32(value) => {
-                        hash.update([1]);
-                        hash.update(value.to_le_bytes());
-                    }
-                    ConstantValue::I32(value) => {
-                        hash.update([2]);
-                        hash.update(value.to_le_bytes());
-                    }
-                }
-            }
-            ReferenceNode::Binary { op, a, b } => {
-                hash.update([2, binary_tag(op)]);
-                value(hash, a);
-                value(hash, b);
-            }
-            ReferenceNode::Bit { op, a, b } => {
-                hash.update([3, bit_tag(op)]);
-                value(hash, a);
-                value(hash, b);
-            }
-            ReferenceNode::Compare { op, a, b } => {
-                hash.update([4, cmp_tag(op)]);
-                value(hash, a);
-                value(hash, b);
-            }
-            ReferenceNode::And { a, b } => {
-                hash.update([5]);
-                value(hash, a);
-                value(hash, b);
-            }
-            ReferenceNode::Not { value: operand } => {
-                hash.update([6]);
-                value(hash, operand);
-            }
-            ReferenceNode::Select { condition, yes, no } => {
-                hash.update([7]);
-                value(hash, condition);
-                value(hash, yes);
-                value(hash, no);
-            }
-            ReferenceNode::Unary { op, value: operand } => {
-                hash.update([8, unary_tag(op)]);
-                value(hash, operand);
-            }
-            ReferenceNode::Cast { value: operand, to } => {
-                hash.update([9]);
-                value(hash, operand);
-                ty(hash, to);
-            }
-            ReferenceNode::Bitcast { value: operand, to } => {
-                hash.update([10]);
-                value(hash, operand);
-                ty(hash, to);
-            }
-        }
-    }
-    value(hash, recipe.output);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReferenceMathOp {
-    Exp,
-    Rsqrt,
-    Sqrt,
-    Log,
-    Sin,
-    Cos,
-    Abs,
-}
-
-impl TryFrom<MathOp> for ReferenceMathOp {
-    type Error = ();
-    fn try_from(value: MathOp) -> Result<Self, Self::Error> {
-        Ok(match value {
-            MathOp::Exp => Self::Exp,
-            MathOp::Rsqrt => Self::Rsqrt,
-            MathOp::Sqrt => Self::Sqrt,
-            MathOp::Log => Self::Log,
-            MathOp::Sin => Self::Sin,
-            MathOp::Cos => Self::Cos,
-            MathOp::Abs => Self::Abs,
-            // `exp_fast` is explicitly approximate. Fma/Min/Max are direct
-            // multi-operand primitives and never enter this unary recipe.
-            MathOp::ExpFast | MathOp::Fma | MathOp::Max | MathOp::Min => return Err(()),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ValueType {
-    Scalar(DType),
-    Bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceValue {
     ordinal: u32,
-    ty: ValueType,
+    ty: DType,
 }
 impl ReferenceValue {
     pub fn ordinal(self) -> usize {
         self.ordinal as usize
     }
-    pub fn ty(self) -> ValueType {
+    pub fn ty(self) -> DType {
         self.ty
     }
 }
 type V = ReferenceValue;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ConstantValue {
-    F32(u32),
-    U32(u32),
-    I32(i32),
-}
+// These are recipe-construction operations. They do not survive as terminals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinaryOp {
+enum BinaryOp {
     Add,
     Sub,
     Mul,
     Div,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BitOp {
+enum BitOp {
     And,
     Or,
+    Shl,
+    Shr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WordOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
     Shl,
     Shr,
 }
@@ -251,461 +147,439 @@ pub enum CmpOp {
     Gt,
     Ge,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnaryOp {
-    Neg,
-    Abs,
-}
 
-#[derive(Clone, Debug, PartialEq)]
+/// There is deliberately no floating terminal, division terminal or source-op
+/// callback: expanding a recipe cannot recursively request another scalar recipe.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceNode {
-    Input {
-        dtype: DType,
-    },
-    Constant {
-        value: ConstantValue,
-        ty: ValueType,
-    },
-    Binary {
-        op: BinaryOp,
-        a: ReferenceValue,
-        b: ReferenceValue,
-    },
-    Bit {
-        op: BitOp,
-        a: ReferenceValue,
-        b: ReferenceValue,
-    },
-    Compare {
-        op: CmpOp,
-        a: ReferenceValue,
-        b: ReferenceValue,
-    },
-    And {
-        a: ReferenceValue,
-        b: ReferenceValue,
-    },
-    Not {
-        value: ReferenceValue,
-    },
-    Select {
-        condition: ReferenceValue,
-        yes: ReferenceValue,
-        no: ReferenceValue,
-    },
-    Unary {
-        op: UnaryOp,
-        value: ReferenceValue,
-    },
-    Cast {
-        value: ReferenceValue,
-        to: ValueType,
-    },
-    Bitcast {
-        value: ReferenceValue,
-        to: ValueType,
-    },
+    Input { operand: u32, dtype: DType },
+    Constant(ReferenceScalar),
+    Word { op: WordOp, a: V, b: V },
+    Compare { op: CmpOp, a: V, b: V },
+    And { a: V, b: V },
+    Not { value: V },
+    Select { condition: V, yes: V, no: V },
+    Bits { value: V },
+    FromBits { value: V, dtype: DType },
 }
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScalarFailure {
+    IntegerDivisionByZero,
+    SignedDivisionOverflow,
+    ShiftCount,
+}
+impl ScalarFailure {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::IntegerDivisionByZero => "integer division by zero",
+            Self::SignedDivisionOverflow => "signed integer division overflow",
+            Self::ShiftCount => "integer shift count must be in 0..32",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceRecipe {
     nodes: Box<[ReferenceNode]>,
     output: V,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ReferenceScalar {
-    F16(u16),
-    BF16(u16),
-    F32(u32),
-    I32(i32),
-    U32(u32),
-    Bool(bool),
-}
-
-impl ReferenceScalar {
-    pub fn dtype(self) -> DType {
-        match self {
-            Self::F16(_) => DType::F16,
-            Self::BF16(_) => DType::BF16,
-            Self::F32(_) => DType::F32,
-            Self::I32(_) => DType::I32,
-            Self::U32(_) => DType::U32,
-            Self::Bool(_) => DType::Bool,
-        }
-    }
-}
-
-/// Evaluates the same ordered primitive graph consumed by compiler lowering.
-/// Every floating primitive is a distinct f32 expression and therefore
-/// rounds before its result is stored in the next recipe slot.
-pub fn evaluate(recipe: &ReferenceRecipe, input: ReferenceScalar) -> ReferenceScalar {
-    let _strict_float = StrictFloatEnvironment::enter();
-    let mut values: Vec<ReferenceScalar> = Vec::with_capacity(recipe.nodes.len());
-    for node in recipe.nodes.iter() {
-        let get = |value: ReferenceValue| values[value.ordinal()];
-        let value = match *node {
-            ReferenceNode::Input { dtype } => {
-                assert_eq!(input.dtype(), dtype, "reference recipe input dtype differs");
-                input
-            }
-            ReferenceNode::Constant { value, .. } => match value {
-                ConstantValue::F32(bits) => ReferenceScalar::F32(bits),
-                ConstantValue::U32(value) => ReferenceScalar::U32(value),
-                ConstantValue::I32(value) => ReferenceScalar::I32(value),
-            },
-            ReferenceNode::Binary { op, a, b } => eval_binary(op, get(a), get(b)),
-            ReferenceNode::Bit { op, a, b } => eval_bit(op, get(a), get(b)),
-            ReferenceNode::Compare { op, a, b } => eval_compare(op, get(a), get(b)),
-            ReferenceNode::And { a, b } => match (get(a), get(b)) {
-                (ReferenceScalar::Bool(a), ReferenceScalar::Bool(b)) => {
-                    ReferenceScalar::Bool(a && b)
-                }
-                _ => unreachable!("closed reference recipe logic types differ"),
-            },
-            ReferenceNode::Not { value } => match get(value) {
-                ReferenceScalar::Bool(value) => ReferenceScalar::Bool(!value),
-                _ => unreachable!("closed reference recipe not operand is not bool"),
-            },
-            ReferenceNode::Select { condition, yes, no } => match get(condition) {
-                ReferenceScalar::Bool(true) => get(yes),
-                ReferenceScalar::Bool(false) => get(no),
-                _ => unreachable!("closed reference recipe select condition is not bool"),
-            },
-            ReferenceNode::Unary { op, value } => eval_unary(op, get(value)),
-            ReferenceNode::Cast { value, to } => eval_cast(get(value), to),
-            ReferenceNode::Bitcast { value, to } => eval_bitcast(get(value), to),
-        };
-        values.push(value);
-    }
-    values[recipe.output.ordinal()]
-}
-
-struct StrictFloatEnvironment {
-    saved: u64,
-}
-impl StrictFloatEnvironment {
-    #[cfg(target_arch = "x86_64")]
-    fn enter() -> Self {
-        let saved = unsafe { core::arch::x86_64::_mm_getcsr() };
-        let strict = saved & !((1 << 6) | (3 << 13) | (1 << 15));
-        unsafe { core::arch::x86_64::_mm_setcsr(strict) };
-        Self {
-            saved: u64::from(saved),
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    fn enter() -> Self {
-        let saved: u64;
-        unsafe { core::arch::asm!("mrs {saved}, fpcr", saved = out(reg) saved) };
-        let strict = saved & !((1 << 19) | (3 << 22) | (1 << 24) | (1 << 25));
-        unsafe { core::arch::asm!("msr fpcr, {strict}", strict = in(reg) strict) };
-        Self { saved }
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn enter() -> Self {
-        // WebAssembly scalar floating operations have fixed IEEE rounding
-        // and gradual-underflow semantics; there is no mutable FP mode.
-        Self { saved: 0 }
-    }
-}
-impl Drop for StrictFloatEnvironment {
-    fn drop(&mut self) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::x86_64::_mm_setcsr(self.saved as u32)
-        };
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("msr fpcr, {saved}", saved = in(reg) self.saved)
-        };
-        #[cfg(target_arch = "wasm32")]
-        let _ = self.saved;
-    }
-}
-
-fn eval_binary(op: BinaryOp, a: ReferenceScalar, b: ReferenceScalar) -> ReferenceScalar {
-    match (a, b) {
-        (ReferenceScalar::F32(a), ReferenceScalar::F32(b)) => {
-            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
-            ReferenceScalar::F32(
-                match op {
-                    BinaryOp::Add => a + b,
-                    BinaryOp::Sub => a - b,
-                    BinaryOp::Mul => a * b,
-                    BinaryOp::Div => a / b,
-                }
-                .to_bits(),
-            )
-        }
-        (ReferenceScalar::U32(a), ReferenceScalar::U32(b)) => ReferenceScalar::U32(match op {
-            BinaryOp::Add => a.wrapping_add(b),
-            BinaryOp::Sub => a.wrapping_sub(b),
-            BinaryOp::Mul => a.wrapping_mul(b),
-            BinaryOp::Div => unreachable!("reference recipe integer division is unconstructible"),
-        }),
-        (ReferenceScalar::I32(a), ReferenceScalar::I32(b)) => ReferenceScalar::I32(match op {
-            BinaryOp::Add => a.wrapping_add(b),
-            BinaryOp::Sub => a.wrapping_sub(b),
-            BinaryOp::Mul => a.wrapping_mul(b),
-            BinaryOp::Div => unreachable!("reference recipe integer division is unconstructible"),
-        }),
-        _ => unreachable!("closed reference recipe binary types differ"),
-    }
-}
-fn eval_bit(op: BitOp, a: ReferenceScalar, b: ReferenceScalar) -> ReferenceScalar {
-    let apply = |a: u32, b: u32| match op {
-        BitOp::And => a & b,
-        BitOp::Or => a | b,
-        BitOp::Shl => a
-            .checked_shl(b)
-            .expect("reference recipe shift is out of range"),
-        BitOp::Shr => a
-            .checked_shr(b)
-            .expect("reference recipe shift is out of range"),
-    };
-    match (a, b) {
-        (ReferenceScalar::U32(a), ReferenceScalar::U32(b)) => ReferenceScalar::U32(apply(a, b)),
-        (ReferenceScalar::I32(a), ReferenceScalar::I32(b)) => {
-            ReferenceScalar::I32(apply(a as u32, b as u32) as i32)
-        }
-        _ => unreachable!("closed reference recipe bit types differ"),
-    }
-}
-fn eval_compare(op: CmpOp, a: ReferenceScalar, b: ReferenceScalar) -> ReferenceScalar {
-    let result = match (a, b) {
-        (ReferenceScalar::F32(a), ReferenceScalar::F32(b)) => {
-            compare(op, f32::from_bits(a), f32::from_bits(b))
-        }
-        (ReferenceScalar::U32(a), ReferenceScalar::U32(b)) => compare(op, a, b),
-        (ReferenceScalar::I32(a), ReferenceScalar::I32(b)) => compare(op, a, b),
-        _ => unreachable!("closed reference recipe comparison types differ"),
-    };
-    ReferenceScalar::Bool(result)
-}
-fn compare<T: PartialEq + PartialOrd>(op: CmpOp, a: T, b: T) -> bool {
-    match op {
-        CmpOp::Eq => a == b,
-        CmpOp::Ne => a != b,
-        CmpOp::Lt => a < b,
-        CmpOp::Le => a <= b,
-        CmpOp::Gt => a > b,
-        CmpOp::Ge => a >= b,
-    }
-}
-fn eval_unary(op: UnaryOp, value: ReferenceScalar) -> ReferenceScalar {
-    match value {
-        ReferenceScalar::F32(bits) => {
-            let value = f32::from_bits(bits);
-            ReferenceScalar::F32(
-                match op {
-                    UnaryOp::Neg => -value,
-                    UnaryOp::Abs => value.abs(),
-                }
-                .to_bits(),
-            )
-        }
-        ReferenceScalar::I32(value) => ReferenceScalar::I32(match op {
-            UnaryOp::Neg => value.wrapping_neg(),
-            UnaryOp::Abs => value.wrapping_abs(),
-        }),
-        _ => unreachable!("closed reference recipe unary type"),
-    }
-}
-fn eval_cast(value: ReferenceScalar, to: ValueType) -> ReferenceScalar {
-    use crate::registry::{bf16_round, f16_bits, f16_to_f32};
-    match (value, to) {
-        (value, ValueType::Scalar(dtype)) if value.dtype() == dtype => value,
-        (ReferenceScalar::F16(bits), ValueType::Scalar(DType::F32)) => {
-            ReferenceScalar::F32(f16_to_f32(bits).to_bits())
-        }
-        (ReferenceScalar::BF16(bits), ValueType::Scalar(DType::F32)) => {
-            ReferenceScalar::F32(u32::from(bits) << 16)
-        }
-        (ReferenceScalar::F32(bits), ValueType::Scalar(DType::F16)) => {
-            ReferenceScalar::F16(f16_bits(f32::from_bits(bits)))
-        }
-        (ReferenceScalar::F32(bits), ValueType::Scalar(DType::BF16)) => {
-            ReferenceScalar::BF16((bf16_round(f32::from_bits(bits)).to_bits() >> 16) as u16)
-        }
-        (ReferenceScalar::F32(bits), ValueType::Scalar(DType::I32)) => {
-            ReferenceScalar::I32(f32::from_bits(bits) as i32)
-        }
-        (ReferenceScalar::F32(bits), ValueType::Scalar(DType::U32)) => {
-            ReferenceScalar::U32(f32::from_bits(bits) as u32)
-        }
-        (ReferenceScalar::I32(value), ValueType::Scalar(DType::F32)) => {
-            ReferenceScalar::F32((value as f32).to_bits())
-        }
-        (ReferenceScalar::U32(value), ValueType::Scalar(DType::F32)) => {
-            ReferenceScalar::F32((value as f32).to_bits())
-        }
-        _ => unreachable!("closed reference recipe cast pair"),
-    }
-}
-fn eval_bitcast(value: ReferenceScalar, to: ValueType) -> ReferenceScalar {
-    match (value, to) {
-        (ReferenceScalar::F32(bits), ValueType::Scalar(DType::U32)) => ReferenceScalar::U32(bits),
-        (ReferenceScalar::U32(bits), ValueType::Scalar(DType::F32)) => ReferenceScalar::F32(bits),
-        _ => unreachable!("closed reference recipe bitcast pair"),
-    }
+    failures: Box<[(V, ScalarFailure)]>,
 }
 impl ReferenceRecipe {
     pub fn nodes(&self) -> &[ReferenceNode] {
         &self.nodes
     }
-    pub fn output(&self) -> ReferenceValue {
+    pub fn output(&self) -> V {
         self.output
     }
-}
-
-const F32_TY: ValueType = ValueType::Scalar(DType::F32);
-const U32_TY: ValueType = ValueType::Scalar(DType::U32);
-const I32_TY: ValueType = ValueType::Scalar(DType::I32);
-
-struct RecipeBuilder {
-    nodes: Vec<ReferenceNode>,
-}
-impl RecipeBuilder {
-    fn push(&mut self, ty: ValueType, node: ReferenceNode) -> V {
-        let ordinal = u32::try_from(self.nodes.len()).expect("reference recipe exceeds u32 nodes");
-        self.nodes.push(node);
-        V { ordinal, ty }
+    /// Failure predicates are evaluated at the owning source operation, after
+    /// total eager evaluation of its bit recipe and before publishing its result.
+    pub fn failures(&self) -> &[(V, ScalarFailure)] {
+        &self.failures
     }
 }
+
+fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> ReferenceScalar {
+    let word = |v| {
+        let ReferenceScalar::U32(x) = get(v) else {
+            panic!("non-word terminal")
+        };
+        x
+    };
+    let boolean = |v| {
+        let ReferenceScalar::Bool(x) = get(v) else {
+            panic!("non-Boolean terminal")
+        };
+        x
+    };
+    match *node {
+        ReferenceNode::Input { .. } => unreachable!("input resolved by recipe invocation"),
+        ReferenceNode::Constant(x) => x,
+        ReferenceNode::Word { op, a, b } => {
+            let (a, b) = (word(a), word(b));
+            ReferenceScalar::U32(match op {
+                WordOp::Add => a.wrapping_add(b),
+                WordOp::Sub => a.wrapping_sub(b),
+                WordOp::And => a & b,
+                WordOp::Or => a | b,
+                WordOp::Xor => a ^ b,
+                WordOp::Shl => a.checked_shl(b).expect("constructed word shift"),
+                WordOp::Shr => a.checked_shr(b).expect("constructed word shift"),
+            })
+        }
+        ReferenceNode::Compare { op, a, b } => {
+            let (a, b) = (word(a), word(b));
+            ReferenceScalar::Bool(match op {
+                CmpOp::Eq => a == b,
+                CmpOp::Ne => a != b,
+                CmpOp::Lt => a < b,
+                CmpOp::Le => a <= b,
+                CmpOp::Gt => a > b,
+                CmpOp::Ge => a >= b,
+            })
+        }
+        ReferenceNode::And { a, b } => ReferenceScalar::Bool(boolean(a) && boolean(b)),
+        ReferenceNode::Not { value } => ReferenceScalar::Bool(!boolean(value)),
+        ReferenceNode::Select { condition, yes, no } => {
+            if boolean(condition) {
+                get(yes)
+            } else {
+                get(no)
+            }
+        }
+        ReferenceNode::Bits { value } => ReferenceScalar::U32(get(value).bits()),
+        ReferenceNode::FromBits { value, dtype } => ReferenceScalar::from_bits(dtype, word(value)),
+    }
+}
+pub fn evaluate(
+    recipe: &ReferenceRecipe,
+    inputs: &[ReferenceScalar],
+) -> Result<ReferenceScalar, ScalarFailure> {
+    assert_eq!(
+        inputs.len(),
+        recipe
+            .nodes
+            .iter()
+            .filter(|node| matches!(node, ReferenceNode::Input { .. }))
+            .count(),
+        "reference operand arity"
+    );
+    let mut values = Vec::with_capacity(recipe.nodes.len());
+    for node in &recipe.nodes {
+        values.push(match *node {
+            ReferenceNode::Input { operand, dtype } => {
+                let value = inputs[operand as usize];
+                assert_eq!(value.dtype(), dtype, "reference operand type");
+                value
+            }
+            _ => terminal(node, |v| values[v.ordinal()]),
+        });
+    }
+    for &(predicate, failure) in &recipe.failures {
+        if values[predicate.ordinal()] == ReferenceScalar::Bool(true) {
+            return Err(failure);
+        }
+    }
+    Ok(values[recipe.output.ordinal()])
+}
+const F32_TY: DType = DType::F32;
+const U32_TY: DType = DType::U32;
+const I32_TY: DType = DType::I32;
+#[derive(Default)]
+struct RecipeBuilder {
+    nodes: Vec<ReferenceNode>,
+    interned: HashMap<ReferenceNode, V>,
+    failures: Vec<(V, ScalarFailure)>,
+}
+impl RecipeBuilder {
+    fn constant(&self, v: V) -> Option<ReferenceScalar> {
+        if let ReferenceNode::Constant(x) = self.nodes[v.ordinal()] {
+            Some(x)
+        } else {
+            None
+        }
+    }
+    fn push(&mut self, ty: DType, mut node: ReferenceNode) -> V {
+        // Constant propagation is performed by the same terminal evaluator; it
+        // never introduces another host implementation of source arithmetic.
+        let operands: Vec<V> = match node {
+            ReferenceNode::Input { .. } | ReferenceNode::Constant(_) => vec![],
+            ReferenceNode::Word { a, b, .. }
+            | ReferenceNode::Compare { a, b, .. }
+            | ReferenceNode::And { a, b } => vec![a, b],
+            ReferenceNode::Not { value }
+            | ReferenceNode::Bits { value }
+            | ReferenceNode::FromBits { value, .. } => vec![value],
+            ReferenceNode::Select { condition, yes, no } => {
+                if yes == no {
+                    return yes;
+                }
+                if let Some(ReferenceScalar::Bool(condition)) = self.constant(condition) {
+                    return if condition { yes } else { no };
+                }
+                vec![condition, yes, no]
+            }
+        };
+        if !operands.is_empty() && operands.iter().all(|&v| self.constant(v).is_some()) {
+            node = ReferenceNode::Constant(terminal(&node, |v| self.constant(v).unwrap()));
+        }
+        if let Some(&v) = self.interned.get(&node) {
+            assert_eq!(v.ty, ty);
+            return v;
+        }
+        let v = V {
+            ordinal: self.nodes.len().try_into().expect("recipe node capacity"),
+            ty,
+        };
+        self.nodes.push(node.clone());
+        self.interned.insert(node, v);
+        v
+    }
+}
+#[derive(Default)]
 struct Recipe {
     builder: RefCell<RecipeBuilder>,
 }
-
 impl Recipe {
-    fn new(dtype: DType) -> (Self, V) {
-        let mut builder = RecipeBuilder { nodes: Vec::new() };
-        let input = builder.push(ValueType::Scalar(dtype), ReferenceNode::Input { dtype });
-        (
-            Self {
-                builder: RefCell::new(builder),
-            },
-            input,
-        )
+    fn input(&self, operand: u32, dtype: DType) -> V {
+        self.push(dtype, ReferenceNode::Input { operand, dtype })
     }
-    fn push(&self, ty: ValueType, node: ReferenceNode) -> V {
+    fn push(&self, ty: DType, node: ReferenceNode) -> V {
         self.builder.borrow_mut().push(ty, node)
     }
-    fn f(&self, bits: u32) -> V {
-        self.push(
-            F32_TY,
-            ReferenceNode::Constant {
-                value: ConstantValue::F32(bits),
-                ty: F32_TY,
-            },
-        )
+    fn constant(&self, v: ReferenceScalar) -> V {
+        self.push(v.dtype(), ReferenceNode::Constant(v))
     }
-    fn u(&self, value: u32) -> V {
-        self.push(
-            U32_TY,
-            ReferenceNode::Constant {
-                value: ConstantValue::U32(value),
-                ty: U32_TY,
-            },
-        )
+    fn f(&self, x: u32) -> V {
+        self.constant(ReferenceScalar::F32(x))
     }
-    fn i(&self, value: i32) -> V {
-        self.push(
-            I32_TY,
-            ReferenceNode::Constant {
-                value: ConstantValue::I32(value),
-                ty: I32_TY,
-            },
-        )
+    fn u(&self, x: u32) -> V {
+        self.constant(ReferenceScalar::U32(x))
     }
-    fn bin(&self, op: BinaryOp, a: V, b: V) -> V {
-        assert_eq!(a.ty, b.ty);
-        if op == BinaryOp::Div {
-            assert_eq!(
-                a.ty, F32_TY,
-                "reference recipe integer division is forbidden"
-            );
+    fn i(&self, x: i32) -> V {
+        self.constant(ReferenceScalar::I32(x))
+    }
+    fn boolean(&self, x: bool) -> V {
+        self.constant(ReferenceScalar::Bool(x))
+    }
+    fn word(&self, op: WordOp, a: V, b: V) -> V {
+        assert_eq!(a.ty, U32_TY);
+        assert_eq!(b.ty, U32_TY);
+        self.push(U32_TY, ReferenceNode::Word { op, a, b })
+    }
+    fn word_cmp(&self, op: CmpOp, a: V, b: V) -> V {
+        assert_eq!(a.ty, U32_TY);
+        assert_eq!(b.ty, U32_TY);
+        self.push(DType::Bool, ReferenceNode::Compare { op, a, b })
+    }
+    fn bits(&self, v: V) -> V {
+        if v.ty == U32_TY {
+            v
+        } else {
+            self.push(U32_TY, ReferenceNode::Bits { value: v })
         }
-        self.push(a.ty, ReferenceNode::Binary { op, a, b })
     }
-    fn bit(&self, op: BitOp, a: V, b: V) -> V {
-        assert_eq!(a.ty, b.ty);
-        assert!(matches!(a.ty, ValueType::Scalar(DType::U32 | DType::I32)));
-        self.push(a.ty, ReferenceNode::Bit { op, a, b })
-    }
-    fn cmp(&self, op: CmpOp, a: V, b: V) -> V {
-        assert_eq!(a.ty, b.ty);
-        self.push(ValueType::Bool, ReferenceNode::Compare { op, a, b })
+    fn typed(&self, v: V, dtype: DType) -> V {
+        assert_eq!(v.ty, U32_TY);
+        if dtype == DType::U32 {
+            v
+        } else {
+            self.push(dtype, ReferenceNode::FromBits { value: v, dtype })
+        }
     }
     fn and(&self, a: V, b: V) -> V {
-        assert_eq!(a.ty, ValueType::Bool);
-        assert_eq!(b.ty, ValueType::Bool);
-        self.push(ValueType::Bool, ReferenceNode::And { a, b })
+        self.push(DType::Bool, ReferenceNode::And { a, b })
+    }
+    fn or(&self, a: V, b: V) -> V {
+        self.not(self.and(self.not(a), self.not(b)))
+    }
+    fn not(&self, value: V) -> V {
+        self.push(DType::Bool, ReferenceNode::Not { value })
     }
     fn select(&self, condition: V, yes: V, no: V) -> V {
-        assert_eq!(condition.ty, ValueType::Bool);
+        assert_eq!(condition.ty, DType::Bool);
         assert_eq!(yes.ty, no.ty);
         self.push(yes.ty, ReferenceNode::Select { condition, yes, no })
     }
-    fn neg(&self, value: V) -> V {
-        self.push(
-            value.ty,
-            ReferenceNode::Unary {
-                op: UnaryOp::Neg,
-                value,
+    fn fail_if(&self, p: V, f: ScalarFailure) {
+        self.builder.borrow_mut().failures.push((p, f));
+    }
+    fn finish(self, output: V) -> ReferenceRecipe {
+        let b = self.builder.into_inner();
+        ReferenceRecipe {
+            nodes: b.nodes.into_boxed_slice(),
+            output,
+            failures: b.failures.into_boxed_slice(),
+        }
+    }
+    fn bin(&self, op: BinaryOp, a: V, b: V) -> V {
+        primitive::binary(
+            self,
+            match op {
+                BinaryOp::Add => ast::BinaryOp::Add,
+                BinaryOp::Sub => ast::BinaryOp::Sub,
+                BinaryOp::Mul => ast::BinaryOp::Mul,
+                BinaryOp::Div => ast::BinaryOp::Div,
             },
+            a,
+            b,
         )
+    }
+    fn bit(&self, op: BitOp, a: V, b: V) -> V {
+        assert_eq!(a.ty, b.ty);
+        let x = self.word(
+            match op {
+                BitOp::And => WordOp::And,
+                BitOp::Or => WordOp::Or,
+                BitOp::Shl => WordOp::Shl,
+                BitOp::Shr => WordOp::Shr,
+            },
+            self.bits(a),
+            self.bits(b),
+        );
+        self.typed(x, a.ty)
+    }
+    fn cmp(&self, op: CmpOp, a: V, b: V) -> V {
+        primitive::compare(self, op, a, b)
+    }
+    fn neg(&self, value: V) -> V {
+        primitive::negate(self, value)
+    }
+    fn cast(&self, value: V, to: DType) -> V {
+        primitive::cast(self, value, to)
     }
     fn fbits(&self, value: V) -> V {
         assert_eq!(value.ty, F32_TY);
-        self.push(U32_TY, ReferenceNode::Bitcast { value, to: U32_TY })
+        self.bits(value)
     }
     fn from_bits(&self, value: V) -> V {
-        assert_eq!(value.ty, U32_TY);
-        self.push(F32_TY, ReferenceNode::Bitcast { value, to: F32_TY })
-    }
-    fn cast(&self, value: V, to: ValueType) -> V {
-        self.push(to, ReferenceNode::Cast { value, to })
-    }
-    fn unary(&self, op: UnaryOp, value: V) -> V {
-        self.push(value.ty, ReferenceNode::Unary { op, value })
-    }
-    fn not(&self, value: V) -> V {
-        assert_eq!(value.ty, ValueType::Bool);
-        self.push(ValueType::Bool, ReferenceNode::Not { value })
+        self.typed(value, DType::F32)
     }
 }
 
-pub fn recipe(op: ReferenceMathOp, dtype: DType) -> ReferenceRecipe {
-    assert!(dtype.is_float(), "reference math requires a floating dtype");
-    let (b, input) = Recipe::new(dtype);
-    let b = &b;
-    let original = input.ty;
-    let x = match original {
-        ValueType::Scalar(DType::F32) => input,
-        ValueType::Scalar(DType::F16 | DType::BF16) => b.cast(input, F32_TY),
-        _ => unreachable!("dtype float check and closed value types agree"),
-    };
-    let result = match op {
-        ReferenceMathOp::Exp => exp(b, x),
-        ReferenceMathOp::Log => log(b, x),
-        ReferenceMathOp::Sin => trig(b, x, false),
-        ReferenceMathOp::Cos => trig(b, x, true),
-        ReferenceMathOp::Sqrt => sqrt(b, x),
-        ReferenceMathOp::Rsqrt => {
-            let root = sqrt(b, x);
-            let one = b.f(0x3f80_0000);
-            b.bin(BinaryOp::Div, one, root)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RecipeKey {
+    Scalar(ScalarOp, Vec<DType>),
+    Code(crate::registry::CodeInterpretation, u32),
+    FloatCode(crate::registry::FloatCodeFormat),
+}
+fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc<ReferenceRecipe> {
+    static RECIPES: OnceLock<Mutex<HashMap<RecipeKey, Arc<ReferenceRecipe>>>> = OnceLock::new();
+    let cache = RECIPES.get_or_init(Mutex::default);
+    if let Some(recipe) = cache.lock().unwrap().get(&key).cloned() {
+        return recipe;
+    }
+    let recipe = Arc::new(build());
+    cache.lock().unwrap().entry(key).or_insert(recipe).clone()
+}
+
+pub fn scalar_recipe(op: ScalarOp, operands: &[DType]) -> Arc<ReferenceRecipe> {
+    cached_recipe(RecipeKey::Scalar(op, operands.to_vec()), || {
+        let b = Recipe::default();
+        let inputs: Vec<_> = operands
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| b.input(i as u32, d))
+            .collect();
+        let output = primitive::operation(&b, op, &inputs);
+        b.finish(output)
+    })
+}
+
+/// Interpret the bits of one registry code. This is the same terminal recipe
+/// consumed by packed reference reads and kernel construction.
+pub fn code_recipe(
+    interpretation: &crate::registry::CodeInterpretation,
+    bits: u32,
+) -> Arc<ReferenceRecipe> {
+    use crate::registry::CodeInterpretation;
+    assert!((1..=32).contains(&bits), "code width is invalid");
+    cached_recipe(RecipeKey::Code(interpretation.clone(), bits), || {
+        let b = Recipe::default();
+        let input = b.input(0, DType::U32);
+        let mask = u32::MAX >> (32 - bits);
+        let raw = b.word(WordOp::And, input, b.u(mask));
+        let word = match interpretation {
+            CodeInterpretation::Unsigned => raw,
+            CodeInterpretation::TwosComplement => {
+                let sign = b.u(1 << (bits - 1));
+                b.word(WordOp::Sub, b.word(WordOp::Xor, raw, sign), sign)
+            }
+            CodeInterpretation::Offset(offset) => b.word(WordOp::Sub, raw, b.u(*offset as u32)),
+            CodeInterpretation::Table(table) => {
+                assert_eq!(
+                    table.len() as u64,
+                    1u64 << bits,
+                    "code table must cover its codes"
+                );
+                let mut value = b.u(table[0] as u32);
+                for (i, &entry) in table.iter().enumerate().skip(1) {
+                    value = b.select(
+                        b.word_cmp(CmpOp::Eq, raw, b.u(i as u32)),
+                        b.u(entry as u32),
+                        value,
+                    );
+                }
+                value
+            }
+        };
+        let out = b.typed(word, DType::I32);
+        b.finish(out)
+    })
+}
+
+/// Floating code formats are finite registry data. Expand their exact payload
+/// table into ordinary word comparisons and selections before kernel closure.
+pub fn float_code_recipe(format: crate::registry::FloatCodeFormat) -> Arc<ReferenceRecipe> {
+    cached_recipe(RecipeKey::FloatCode(format), || {
+        let b = Recipe::default();
+        let input = b.input(0, DType::U32);
+        let count = 1u32 << format.bits();
+        let raw = b.word(WordOp::And, input, b.u(count - 1));
+        let mut out = b.f(format.decode(0).to_bits());
+        for code in 1..count {
+            out = b.select(
+                b.word_cmp(CmpOp::Eq, raw, b.u(code)),
+                b.f(format.decode(code).to_bits()),
+                out,
+            );
         }
-        ReferenceMathOp::Abs => b.unary(UnaryOp::Abs, x),
+        b.finish(out)
+    })
+}
+
+fn transcendental(b: &Recipe, op: MathOp, input: V) -> V {
+    let original = input.ty;
+    let x = b.cast(input, F32_TY);
+    let result = match op {
+        MathOp::Exp => exp(b, x),
+        MathOp::Log => log(b, x),
+        MathOp::Sin => trig(b, x, false),
+        MathOp::Cos => trig(b, x, true),
+        MathOp::Sqrt => sqrt(b, x),
+        MathOp::Rsqrt => b.bin(BinaryOp::Div, b.f(0x3f80_0000), sqrt(b, x)),
+        _ => unreachable!("non-transcendental operation"),
     };
-    let output = if original == F32_TY {
-        result
-    } else {
-        b.cast(result, original)
-    };
-    let nodes = std::mem::take(&mut b.builder.borrow_mut().nodes).into_boxed_slice();
-    ReferenceRecipe { nodes, output }
+    b.cast(result, original)
+}
+
+/// Quantization starts with the lexer's parsed F64 bits, never with F32.
+pub fn float_literal(dtype: DType, value: f64) -> ReferenceScalar {
+    primitive::literal(dtype, value.to_bits())
+}
+pub fn integer_literal(dtype: DType, value: i128) -> ReferenceScalar {
+    primitive::integer_literal(dtype, value)
+}
+
+pub fn digest() -> [u8; 32] {
+    // The semantic revision covers the terminal constructors and finite scalar
+    // algorithms, as well as the ordered transcendental coefficients below.
+    static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        let mut hash = Sha256::new();
+        hash.update(VERSION.as_bytes());
+        hash.update(include_bytes!("reference_math/primitive.rs"));
+        hash.update(include_bytes!("reference_math.rs"));
+        hash.finalize().into()
+    })
 }
 
 // Sun/FreeBSD expf, expressed with explicit f32 operations and a bit-built
@@ -1090,4 +964,383 @@ fn cos_kernel(b: &Recipe, x: V) -> V {
             b.bin(BinaryOp::Mul, b.bin(BinaryOp::Mul, w, z), r),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ast::BinaryOp as B;
+
+    fn apply(op: ScalarOp, args: &[ReferenceScalar]) -> Result<ReferenceScalar, ScalarFailure> {
+        let types: Vec<_> = args.iter().map(|x| x.dtype()).collect();
+        evaluate(&scalar_recipe(op, &types), args)
+    }
+    fn canonical(bits: u32) -> u32 {
+        if bits & 0x7fff_ffff > 0x7f80_0000 {
+            0x7fc0_0000
+        } else {
+            bits
+        }
+    }
+    #[test]
+    fn literal_quantization_rounds_once_from_parsed_f64() {
+        assert_eq!(
+            float_literal(DType::F16, 1.0004882812500002),
+            ReferenceScalar::F16(0x3c01)
+        );
+        assert_eq!(
+            float_literal(DType::F16, -0.0),
+            ReferenceScalar::F16(0x8000)
+        );
+        assert_eq!(
+            float_literal(DType::F32, f64::MAX),
+            ReferenceScalar::F32(0x7f80_0000)
+        );
+        assert_eq!(
+            float_literal(DType::F32, f64::from_bits(1)),
+            ReferenceScalar::F32(0)
+        );
+        assert_eq!(
+            integer_literal(DType::F32, i128::from(i64::MIN)),
+            ReferenceScalar::F32(0xdf00_0000)
+        );
+    }
+    #[test]
+    fn narrow_fma_rounds_the_exact_sum_once() {
+        assert_eq!(
+            apply(
+                ScalarOp::Math(MathOp::Fma),
+                &[
+                    ReferenceScalar::BF16(0x3fc0),
+                    ReferenceScalar::BF16(0x3f81),
+                    ReferenceScalar::BF16(0xb280)
+                ]
+            ),
+            Ok(ReferenceScalar::BF16(0x3fc1))
+        );
+    }
+    #[test]
+    fn exceptional_values_and_remainder_have_one_contract() {
+        let f = |v: f32| ReferenceScalar::F32(v.to_bits());
+        assert_eq!(apply(ScalarOp::Binary(B::Rem), &[f(7.), f(4.)]), Ok(f(3.)));
+        assert_eq!(
+            apply(ScalarOp::Binary(B::Rem), &[f(-8.), f(4.)]),
+            Ok(f(-0.))
+        );
+        assert_eq!(
+            apply(ScalarOp::Binary(B::Mul), &[f(0.), f(f32::INFINITY)]),
+            Ok(ReferenceScalar::F32(0x7fc0_0000))
+        );
+        assert_eq!(
+            apply(
+                ScalarOp::Binary(B::Add),
+                &[ReferenceScalar::F32(0xff80_0001), f(1.)]
+            ),
+            Ok(ReferenceScalar::F32(0x7fc0_0000))
+        );
+        assert_eq!(
+            apply(ScalarOp::Math(MathOp::Min), &[f(0.), f(-0.)]),
+            Ok(f(-0.))
+        );
+        assert_eq!(
+            apply(ScalarOp::Math(MathOp::Max), &[f(-0.), f(0.)]),
+            Ok(f(0.))
+        );
+        assert_eq!(
+            apply(
+                ScalarOp::Math(MathOp::Min),
+                &[ReferenceScalar::F32(0xff80_0001), f(1.)]
+            ),
+            Ok(f(1.))
+        );
+    }
+    #[test]
+    fn source_integer_failures_are_outputs_of_total_recipes() {
+        use ReferenceScalar::{I32, U32};
+        for (a, c, failure) in [
+            (i32::MIN, -1, ScalarFailure::SignedDivisionOverflow),
+            (1, 0, ScalarFailure::IntegerDivisionByZero),
+        ] {
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Div), &[I32(a), I32(c)]),
+                Err(failure)
+            );
+        }
+        for (a, c) in [
+            (i32::MIN, 3),
+            (-1, i32::MIN),
+            (i32::MIN, i32::MIN),
+            (7, -3),
+            (-7, -3),
+        ] {
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Div), &[I32(a), I32(c)]),
+                Ok(I32(a.div_euclid(c)))
+            );
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Rem), &[I32(a), I32(c)]),
+                Ok(I32(a.rem_euclid(c)))
+            );
+        }
+        assert_eq!(
+            apply(ScalarOp::Binary(B::Shl), &[U32(1), U32(32)]),
+            Err(ScalarFailure::ShiftCount)
+        );
+        assert_eq!(
+            apply(ScalarOp::Binary(B::Shr), &[I32(-2), I32(1)]),
+            Ok(I32(-1))
+        );
+        assert_eq!(
+            apply(ScalarOp::Binary(B::Mul), &[U32(u32::MAX), U32(u32::MAX)]),
+            Ok(U32(1))
+        );
+    }
+    #[test]
+    fn narrow_transport_abs_neg_and_identity_preserve_payloads_exhaustively() {
+        for dtype in [DType::F16, DType::BF16] {
+            let abs = scalar_recipe(ScalarOp::Math(MathOp::Abs), &[dtype]);
+            let neg = scalar_recipe(ScalarOp::Unary(ast::UnaryOp::Neg), &[dtype]);
+            let identity = scalar_recipe(ScalarOp::Cast(dtype), &[dtype]);
+            for bits in 0..=u16::MAX {
+                let value = ReferenceScalar::from_bits(dtype, u32::from(bits));
+                assert_eq!(
+                    evaluate(&abs, &[value]).unwrap().bits(),
+                    u32::from(bits & 0x7fff)
+                );
+                assert_eq!(
+                    evaluate(&neg, &[value]).unwrap().bits(),
+                    u32::from(bits ^ 0x8000)
+                );
+                assert_eq!(evaluate(&identity, &[value]).unwrap(), value);
+            }
+        }
+    }
+    #[test]
+    fn finite_f32_recipes_match_independent_ieee_samples() {
+        let ops = [B::Add, B::Sub, B::Mul, B::Div, B::Rem];
+        let recipes: Vec<_> = ops
+            .iter()
+            .map(|&op| scalar_recipe(ScalarOp::Binary(op), &[DType::F32; 2]))
+            .collect();
+        let fma = scalar_recipe(ScalarOp::Math(MathOp::Fma), &[DType::F32; 3]);
+        let mut state = 0x83ac_51a7u32;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let edge = [
+            0,
+            0x8000_0000,
+            1,
+            0x007f_ffff,
+            0x0080_0000,
+            0x3f80_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+        ];
+        for i in 0..300 {
+            let a = if i < 100 { edge[i / 10] } else { random() };
+            let c = if i < 100 { edge[i % 10] } else { random() };
+            let z = random();
+            let (x, y, w) = (f32::from_bits(a), f32::from_bits(c), f32::from_bits(z));
+            for (op, recipe) in ops.iter().zip(&recipes) {
+                let expected = match op {
+                    B::Add => x + y,
+                    B::Sub => x - y,
+                    B::Mul => x * y,
+                    B::Div => x / y,
+                    B::Rem => x % y,
+                    _ => unreachable!(),
+                };
+                let result =
+                    evaluate(recipe, &[ReferenceScalar::F32(a), ReferenceScalar::F32(c)]).unwrap();
+                assert_eq!(
+                    result.bits(),
+                    canonical(expected.to_bits()),
+                    "{op:?}({a:08x},{c:08x})"
+                );
+            }
+            let result = evaluate(
+                &fma,
+                &[
+                    ReferenceScalar::F32(a),
+                    ReferenceScalar::F32(c),
+                    ReferenceScalar::F32(z),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                result.bits(),
+                canonical(x.mul_add(y, w).to_bits()),
+                "fma({a:08x},{c:08x},{z:08x})"
+            );
+        }
+    }
+    #[test]
+    fn saturating_casts_and_narrow_cross_casts_are_explicit() {
+        for value in [
+            f32::NEG_INFINITY,
+            -4294967296.,
+            -2147483648.,
+            -1.9,
+            -0.,
+            0.,
+            1.9,
+            2147483648.,
+            4294967296.,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let input = ReferenceScalar::F32(value.to_bits());
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::I32), &[input]),
+                Ok(ReferenceScalar::I32(value as i32))
+            );
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::U32), &[input]),
+                Ok(ReferenceScalar::U32(value as u32))
+            );
+        }
+        assert_eq!(
+            apply(ScalarOp::Cast(DType::BF16), &[ReferenceScalar::F16(0xfc01)]),
+            Ok(ReferenceScalar::BF16(0x7fc0))
+        );
+        assert_eq!(
+            apply(ScalarOp::Cast(DType::F16), &[ReferenceScalar::BF16(0x8000)]),
+            Ok(ReferenceScalar::F16(0x8000))
+        );
+    }
+    #[test]
+    fn transcendental_recipes_have_only_total_word_terminals() {
+        for op in [
+            MathOp::Exp,
+            MathOp::Log,
+            MathOp::Sin,
+            MathOp::Cos,
+            MathOp::Sqrt,
+            MathOp::Rsqrt,
+        ] {
+            let recipe = scalar_recipe(ScalarOp::Math(op), &[DType::F32]);
+            for bits in [
+                0,
+                0x8000_0000,
+                1,
+                0x3f80_0000,
+                0xbf80_0000,
+                0x7f7f_ffff,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7f80_0001,
+            ] {
+                assert!(
+                    evaluate(&recipe, &[ReferenceScalar::F32(bits)]).is_ok(),
+                    "{op:?}({bits:08x})"
+                );
+            }
+        }
+        assert_eq!(
+            evaluate(
+                &scalar_recipe(ScalarOp::Math(MathOp::Exp), &[DType::F32]),
+                &[ReferenceScalar::F32(0)]
+            )
+            .unwrap(),
+            ReferenceScalar::F32(0x3f80_0000)
+        );
+        assert_eq!(
+            evaluate(
+                &scalar_recipe(ScalarOp::Math(MathOp::Log), &[DType::F32]),
+                &[ReferenceScalar::F32(0x3f80_0000)]
+            )
+            .unwrap(),
+            ReferenceScalar::F32(0)
+        );
+    }
+    #[test]
+    fn division_extrema_exercise_the_full_denominator_bound() {
+        for (dtype, least, largest, infinity) in [
+            (DType::F32, 1, 0x7f7f_ffff, 0x7f80_0000),
+            (DType::BF16, 1, 0x7f7f, 0x7f80),
+            (DType::F16, 1, 0x7bff, 0x7c00),
+        ] {
+            let least = ReferenceScalar::from_bits(dtype, least);
+            let largest = ReferenceScalar::from_bits(dtype, largest);
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Div), &[least, largest])
+                    .unwrap()
+                    .bits(),
+                0
+            );
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Div), &[largest, least])
+                    .unwrap()
+                    .bits(),
+                infinity
+            );
+        }
+        assert_eq!(
+            apply(
+                ScalarOp::Binary(B::Div),
+                &[
+                    ReferenceScalar::U32(u32::MAX),
+                    ReferenceScalar::U32(0x8000_0001)
+                ]
+            ),
+            Ok(ReferenceScalar::U32(1))
+        );
+        assert_eq!(
+            apply(
+                ScalarOp::Binary(B::Rem),
+                &[
+                    ReferenceScalar::U32(u32::MAX),
+                    ReferenceScalar::U32(0x8000_0001)
+                ]
+            ),
+            Ok(ReferenceScalar::U32(0x7fff_fffe))
+        );
+    }
+    #[test]
+    fn code_recipes_preserve_signed_codes_and_floating_specials() {
+        use crate::registry::{CodeInterpretation, FloatCodeFormat};
+        let signed = code_recipe(&CodeInterpretation::TwosComplement, 8);
+        for raw in 0u32..256 {
+            assert_eq!(
+                evaluate(&signed, &[ReferenceScalar::U32(raw)]),
+                Ok(ReferenceScalar::I32(raw as u8 as i8 as i32))
+            );
+        }
+        let shifted = code_recipe(&CodeInterpretation::Offset(32), 6);
+        assert_eq!(
+            evaluate(&shifted, &[ReferenceScalar::U32(0)]),
+            Ok(ReferenceScalar::I32(-32))
+        );
+        assert_eq!(
+            evaluate(&shifted, &[ReferenceScalar::U32(63)]),
+            Ok(ReferenceScalar::I32(31))
+        );
+        for (format, raw, expected) in [
+            (FloatCodeFormat::E2M1, 0, 0),
+            (FloatCodeFormat::E2M1, 8, 0x8000_0000),
+            (FloatCodeFormat::E2M1, 1, 0x3f00_0000),
+            (FloatCodeFormat::E2M1, 7, 0x40c0_0000),
+            (FloatCodeFormat::E4M3, 1, 0x3b00_0000),
+            (FloatCodeFormat::E4M3, 0x7f, 0x7fc0_0000),
+            (FloatCodeFormat::E4M3, 0xff, 0xffc0_0000),
+            (FloatCodeFormat::UE4M3, 0x80, 0),
+        ] {
+            assert_eq!(
+                evaluate(&float_code_recipe(format), &[ReferenceScalar::U32(raw)]),
+                Ok(ReferenceScalar::F32(expected))
+            );
+        }
+    }
+    #[test]
+    #[should_panic(expected = "reference operand arity")]
+    fn malformed_recipe_invocation_is_a_caller_defect() {
+        let recipe = scalar_recipe(ScalarOp::Unary(ast::UnaryOp::Neg), &[DType::F32]);
+        let _ = evaluate(&recipe, &[ReferenceScalar::F32(0), ReferenceScalar::F32(0)]);
+    }
 }

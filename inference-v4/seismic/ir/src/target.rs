@@ -2,7 +2,7 @@
 
 mod dialect;
 pub use crate::identity::IntrinsicIdentityBuilder;
-pub use dialect::KernelDialect;
+pub use dialect::PhysicalDialect;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::types::DType;
 use std::{collections::BTreeSet, fmt};
@@ -153,7 +153,7 @@ pub struct KernelWordLayout {
 impl KernelWordLayout {
     /// Constructs the one canonical dynamic-word schema for a closed kernel.
     /// ABI models, emitters, and executors all consume this exact layout.
-    pub fn for_kernel<B: KernelDialect>(kernel: &crate::kernel::Kernel<B>) -> Self {
+    pub fn for_kernel<B: PhysicalDialect>(kernel: &crate::kernel::Kernel<B>) -> Self {
         let mut next = 0u32;
         let nat_first = next;
         next = next
@@ -375,8 +375,8 @@ pub struct KernelEmissionLayout {
     pub bindings: Vec<BindingEmissionLayout>,
     pub locals: Vec<LocalEmissionLayout>,
     pub addressable_resources: Vec<AddressableResourceEmissionLayout>,
-    pub scalar_args: Vec<DType>,
-    pub result_slots: Vec<(crate::schedule::AnyScalarSlot, DType)>,
+    pub scalar_args: Vec<crate::repr::ScalarKind>,
+    pub result_types: Vec<crate::repr::ScalarKind>,
 }
 
 /// Physical realization of one launch-local address space. This is a
@@ -416,7 +416,7 @@ impl LocalRealizationPolicy {
 
 /// Backend-owned, profile-fixed kernel ABI layout. Planning and native
 /// emission consume this same object; neither may rederive a shadow layout.
-pub trait KernelAbiModel<B: KernelDialect>:
+pub trait KernelAbiModel<B: PhysicalDialect>:
     Clone + fmt::Debug + PartialEq + Send + Sync + 'static
 {
     fn layout(&self, kernel: &crate::kernel::Kernel<B>) -> KernelAbiLayout;

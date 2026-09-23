@@ -1,7 +1,6 @@
 //! The canonical layout of one representation over given extents: the
-//! layout host transfers use and the layout result tensors are reported
-//! in. Derived from the registry's representation facts; owned nowhere
-//! else in this crate.
+//! layout host transfers use, plus actual affine result footprints. Both derive
+//! from the registry's representation facts in this owner.
 
 use seismic_compiler::errors::ExecutionError;
 use seismic_lang::ids::RepresentationId;
@@ -13,7 +12,6 @@ pub(crate) struct Layout {
     pub strides: Vec<u64>,
     pub byte_len: u64,
     pub alignment: u64,
-    storage_unit_bytes: u64,
 }
 
 /// The canonical representation layout. A size beyond `u64` is a real
@@ -34,7 +32,6 @@ pub(crate) fn canonical(
                 strides,
                 byte_len,
                 alignment: u64::from(dtype.bytes()),
-                storage_unit_bytes: u64::from(dtype.bytes()),
             })
         }
         RepresentationKind::Packed(packet) => packet_layout(
@@ -82,13 +79,51 @@ fn packet_layout(
         strides,
         byte_len,
         alignment: u64::from(packet_alignment),
-        storage_unit_bytes: u64::from(packet_size),
     })
 }
 
-/// Validates the exact canonical view geometry used at the call/workflow
-/// boundary. A leading slice may shift the byte offset, but retains canonical
-/// strides and has the canonical footprint for its sliced extents.
+/// Visit canonical host storage bytes in logical order and their corresponding
+/// affine device ranges. Reads and writes use this same representation map.
+pub(crate) fn transfer_ranges(
+    representation: RepresentationId,
+    extents: &[u64],
+    strides: &[u64],
+    mut transfer: impl FnMut(u64, std::ops::Range<usize>) -> Result<(), ExecutionError>,
+) -> Result<(), ExecutionError> {
+    let invalid = || unaddressable(representation_info(representation).name, extents);
+    let canonical = canonical(representation, extents)?;
+    let host_len = usize::try_from(canonical.byte_len).map_err(|_| invalid())?;
+    if host_len == 0 {
+        return Ok(());
+    }
+    seismic_ir::storage::addressed_span_u64(representation, extents, strides).ok_or_else(invalid)?;
+    if strides == canonical.strides {
+        return transfer(0, 0..host_len);
+    }
+    let (units, width) = seismic_ir::storage::concrete_storage_units(representation, extents).ok_or_else(invalid)?;
+    let host_width = usize::try_from(width).map_err(|_| invalid())?;
+    for linear in 0..canonical.byte_len / width {
+        let mut remaining = linear;
+        let mut storage = 0_u64;
+        for axis in (0..units.len()).rev() {
+            let coordinate = remaining % units[axis];
+            remaining /= units[axis];
+            storage = storage
+                .checked_add(coordinate.checked_mul(strides[axis]).ok_or_else(invalid)?)
+                .ok_or_else(invalid)?;
+        }
+        let offset = storage.checked_mul(width).ok_or_else(invalid)?;
+        let host = usize::try_from(linear)
+            .map_err(|_| invalid())?
+            .checked_mul(host_width)
+            .ok_or_else(invalid)?;
+        transfer(offset, host..host + host_width)?;
+    }
+    Ok(())
+}
+
+/// Validate the actual descriptor footprint, retaining noncanonical affine
+/// strides. Buffer-capacity and access-permission checks belong to its binding.
 pub(crate) fn validates_view(
     representation: RepresentationId,
     extents: &[u64],
@@ -96,14 +131,9 @@ pub(crate) fn validates_view(
     byte_offset: u64,
     byte_len: u64,
 ) -> bool {
-    let Ok(layout) = canonical(representation, extents) else {
-        return false;
-    };
-    layout.strides == strides
-        && layout.byte_len == byte_len
-        && layout.storage_unit_bytes != 0
-        && byte_offset % layout.storage_unit_bytes == 0
-        && byte_offset.checked_add(byte_len).is_some()
+    seismic_ir::storage::valid_concrete_view(
+        representation, extents, strides, byte_offset, byte_len,
+    )
 }
 
 pub(crate) struct LeadingSlice {
@@ -124,48 +154,35 @@ pub(crate) fn leading_slice(
     if extents.len() != strides.len() || start > end || end > leading {
         return None;
     }
-    let (relative_offset, byte_len) = match &representation_info(representation).kind {
-        RepresentationKind::Dense(dtype) => {
-            let row = strides[0].checked_mul(u64::from(dtype.bytes()))?;
-            (start.checked_mul(row)?, (end - start).checked_mul(row)?)
-        }
-        RepresentationKind::Packed(packet) if extents.len() == 1 => {
-            let group = u64::from(packet.group);
-            if start % group != 0 || (end != leading && end % group != 0) {
-                return None;
-            }
-            let first = start / group;
-            let last = end.checked_add(group - 1)?.checked_div(group)?;
-            let bytes = u64::from(packet.packet_size);
-            (
-                first.checked_mul(bytes)?,
-                (last - first).checked_mul(bytes)?,
-            )
-        }
+    let (group, width) = match &representation_info(representation).kind {
+        RepresentationKind::Dense(dtype) => (1, u64::from(dtype.bytes())),
         RepresentationKind::Packed(packet) => {
-            let row = strides[0].checked_mul(u64::from(packet.packet_size))?;
-            (start.checked_mul(row)?, (end - start).checked_mul(row)?)
+            (u64::from(packet.group), u64::from(packet.packet_size))
         }
-        RepresentationKind::External(packet) if extents.len() == 1 => {
-            let group = u64::from(packet.logical_group);
-            if start % group != 0 || (end != leading && end % group != 0) {
-                return None;
-            }
-            let first = start / group;
-            let last = end.checked_add(group - 1)?.checked_div(group)?;
-            let bytes = u64::from(packet.packet_size);
-            (
-                first.checked_mul(bytes)?,
-                (last - first).checked_mul(bytes)?,
-            )
-        }
-        RepresentationKind::External(packet) => {
-            let row = strides[0].checked_mul(u64::from(packet.packet_size))?;
-            (start.checked_mul(row)?, (end - start).checked_mul(row)?)
-        }
+        RepresentationKind::External(packet) => (
+            u64::from(packet.logical_group),
+            u64::from(packet.packet_size),
+        ),
     };
+    let packet_axis = extents.len() == 1
+        && !matches!(
+            representation_info(representation).kind,
+            RepresentationKind::Dense(_)
+        );
+    if packet_axis && (start % group != 0 || (end != leading && end % group != 0)) {
+        return None;
+    }
+    let start_unit = if packet_axis { start / group } else { start };
     let mut extents = extents.to_vec();
     extents[0] = end - start;
+    let (byte_len, _) = seismic_ir::storage::addressed_span_u64(representation, &extents, strides)?;
+    // Empty views have no addressed element. Retain the backing's valid anchor
+    // instead of inventing an out-of-allocation one-past strided coordinate.
+    let relative_offset = if byte_len == 0 {
+        0
+    } else {
+        start_unit.checked_mul(strides[0])?.checked_mul(width)?
+    };
     Some(LeadingSlice {
         relative_offset,
         byte_len,
@@ -216,6 +233,57 @@ mod tests {
             slice.relative_offset,
             slice.byte_len
         ));
+    }
+
+    #[test]
+    fn strided_publication_and_leading_slice_use_addressed_span() {
+        let repr = registry::dense(DType::U32);
+        assert!(validates_view(repr, &[3], &[2], 4, 20));
+        assert!(!validates_view(repr, &[3], &[2], 4, 12));
+        let slice = leading_slice(repr, &[3, 2], &[1, 3], 1, 3).unwrap();
+        assert_eq!(slice.relative_offset, 4);
+        assert_eq!(slice.byte_len, 20);
+        assert_eq!(slice.extents, vec![2, 2]);
+        assert!(validates_view(
+            repr,
+            &slice.extents,
+            &slice.strides,
+            slice.relative_offset,
+            slice.byte_len
+        ));
+        let empty = leading_slice(repr, &[3], &[10], 3, 3).unwrap();
+        assert_eq!((empty.relative_offset, empty.byte_len), (0, 0));
+        assert!(!validates_view(repr, &[u64::MAX], &[u64::MAX], 0, 4));
+    }
+
+    #[test]
+    fn host_transfer_preserves_logical_order_and_storage_gaps() {
+        let repr = registry::dense(DType::U32);
+        let source = [1_u32, 2, 3, 4, 5, 6]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let mut host = vec![0; 24];
+        transfer_ranges(repr, &[3, 2], &[1, 3], |offset, range| {
+            host[range.clone()]
+                .copy_from_slice(&source[offset as usize..offset as usize + range.len()]);
+            Ok(())
+        })
+        .unwrap();
+        let words = host
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [1, 4, 2, 5, 3, 6]);
+        let mut sparse = vec![0xff; 20];
+        transfer_ranges(repr, &[3], &[2], |offset, range| {
+            sparse[offset as usize..offset as usize + range.len()].copy_from_slice(&source[range]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(&sparse[4..8], &[0xff; 4]);
+        assert_eq!(&sparse[12..16], &[0xff; 4]);
+        assert_eq!(&sparse[16..20], &3_u32.to_ne_bytes());
     }
 
     #[test]

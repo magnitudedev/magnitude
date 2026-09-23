@@ -25,6 +25,8 @@ crate::analytical_services! {
         Fill => "core.fill",
         ScalarRead => "core.scalar-read",
         ScalarMove => "core.scalar-move",
+        AllocationInstance => "core.allocation-instance",
+        TensorPublication => "core.tensor-publication",
         DataCheck => "core.data-check",
     }
 }
@@ -497,6 +499,14 @@ pub enum ProvenElision {
     CompileTimeOnly,
 }
 
+/// A model cannot price an actual operation from its available semantic facts.
+/// This does not reject the executable or invent a zero-cost contribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelLimitation {
+    DeviceExtent { value: seismic_ir::kernel::ops::ErasedValue },
+    HostQuantityWidth,
+}
+
 /// Total cost transfer for one closed operation.
 #[derive(Clone, Debug)]
 pub enum OperationCost<S = ServiceClassId> {
@@ -736,5 +746,4 @@ pub fn service_contribution<M: ServiceModel + ?Sized>(
 mod execution;
 pub use execution::{
     estimate, AnalyticalModelDefinition, AnalyticalService, AnalyticalServiceState, ExecutionModel,
-    MacroGeneratedAnalyticalService,
 };
