@@ -94,6 +94,18 @@ No suspended-child assignment interval or ordinary-spawn fallback is permitted. 
 selected I/O handles are inherited; the job handle is never inherited. Root exit is observed through
 the retained process handle, while full retirement is proved by the job's active-process count.
 Nested jobs and forced-owner-exit cleanup require native Windows execution, not cross-compilation.
+The Windows foreground CLI launcher owns a serving command in the same kind of atomic job.
+It resides outside the replaceable application payload and never owns application or update locks.
+It resolves the installed payload through the native user known folder, preserves arguments, working
+directory, console and standard streams, and returns the command's exit status. The launcher itself
+moves outside the payload directory before spawning. A reserved startup continuation result permits
+one replacement child only after complete tree retirement and observation of a changed executable
+file identity. It is not permission to restart a running service. Cancellation prevents continuation,
+allows bounded graceful shutdown and then terminates the retained job. Launcher death closes the
+sole job handle and contains descendants without relying on the command runtime. Native acceptance
+must prove repeated installed replacements, command context preservation, cancellation and parent
+loss before release packaging enables this entry point. Explicit desktop launch must remain
+independent of this foreground job: completing `app open` cannot retire the launched desktop.
 Windows named pipes install a protected current-user DACL at creation and reject remote clients.
 The first instance refuses an existing endpoint. Native client PID observation fences child admission.
 Pending accept/read/write operations retain their buffers through confirmed cancellation; close cannot

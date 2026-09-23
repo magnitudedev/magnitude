@@ -161,3 +161,49 @@ The bundled CLI's `service status`, `models status`, and `hardware` succeeded wi
 Closing the real window retained Ready service and CLI model access; `app open` restored the same
 Status page. Model acquisition/loading, full Quit, branch-build UI, and R1–R6 coverage remain pending.
 This records baseline behavior of the installed app, not acceptance of changed branch binaries.
+
+## Windows foreground launcher primitive, 2026-09-23
+
+Parent: `f3762f0b`. Added a native foreground launcher core and a known-folder installation entry
+point, with an independent native build script. It is not wired into release payloads or PATH yet.
+The shared atomic Job Object primitive now supports foreground console/cwd spawning while preserving
+its existing hidden-child behavior. The core retains the original command context, moves its own cwd
+outside the replaceable tree, contains the compiled command, observes complete retirement, and allows
+one continuation only after a changed executable identity. Cancellation prevents continuation.
+
+Executed under the ordinary Windows user, using x64 MSVC `/W4 /WX` and Bun 1.4.2:
+
+- Existing native job suite passed: nested containment, root-versus-tree retirement, parent death,
+  selected handle inheritance, denied breakaway, and creation failure.
+- New launcher native suite passed: force-killed launcher retires its child and ordinary descendant;
+  console Ctrl+Break retires the foreground tree and returns cancellation status.
+- Production NSIS fixture A→B and then B→C passed through the same stable launcher executable in two
+  foreground invocations. Each invocation continued into the installed replacement, preserving an
+  empty argument, spaces, quotes, trailing backslash, Unicode, and cwd. Spoofed LOCALAPPDATA did not
+  redirect installation lookup. Closing input returned success. Unchanged-image continuation failed.
+- The compiled probe loads the real native addon. Its continuation now requests explicit process exit
+  after Effect teardown; an exit-code assignment alone left Bun waiting on its open input stream.
+- Dedicated TypeScript fixture checking passed. These fixtures contain no ACN/ICN or signing proof.
+
+Artifacts: `launcher-acceptance-2/` under the previously recorded Windows test directory. Successful
+probe output is also in the task tool receipt. Both earlier harness errors were corrected: Windows
+PowerShell output decoding needed UTF-8, and the compiled probe needed explicit continuation exit.
+
+**Packaging remains gated.** Ordinary desktop launch cannot inherit the foreground server's kill-on-
+close job: the current CLI starts the desktop as a detached child, which still inherits Windows job
+membership. Finish command dispatch/desktop-launch separation, stable-launcher installation and
+maintenance, PATH ownership, real desktop/CLI regressions, and installation-time cancellation before
+shipping this entry point. The current native entry point is only exercised by the acceptance fixture.
+
+The fixture also reproduced an installer defect: after an update retains a mapped previous image,
+uninstall removes the current payload and registration without retiring the previous tree. The next
+install then refuses recovery because registration is gone. After the successful probe, application
+and uninstall registration are absent, no fixture process remains, and the stage retains fixture B
+(1.2.4). Preserve this evidence until adding an uninstall-recovery regression and fixing transaction
+ordering; never make ordinary installation delete an unverified retained tree.
+
+Linux preparation: installed 0.1.5-46 desktop remains Ready, and its CLI `service status` and
+`models status` work without headless mode. Added GCC/build-essential and unzip in the disposable
+Ubuntu VM, and isolated Bun 1.4.2 at `/home/trg.guest/magnitude-headless.uAol17lC/bun-linux-aarch64/bun`.
+Sparky now has an active user service, unlike the earlier inventory; use a separate profile/port and
+recheck ownership before testing there. Its existing service was not changed.

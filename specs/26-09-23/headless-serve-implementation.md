@@ -212,7 +212,11 @@ allows C to install successfully. The fallback is therefore selected: a small fo
 outside the application payload, with a separate minimal protocol and explicit maintenance policy.
 The waiting-original-CLI approach does not meet repeated-update acceptance. The probe uses the
 production NSIS transaction with an inert application payload; it is not signed-runtime or inference
-acceptance.
+acceptance. The native launcher prototype subsequently passed two installed continuations,
+argument/cwd preservation, parent-loss cleanup and console cancellation. Release integration remains
+gated on launcher maintenance and preserving independent desktop launch from finite CLI commands.
+Also repair uninstall ordering: a retained previous payload must be safely retired or removal must
+defer while installation registration is still available for recovery.
 
 **Verify Linux:** installation helper vs application/shared installation locks; authorized and denied
 sudo flows with the actual deb transaction; helper lifetime under systemd cgroup cleanup. Preserve the

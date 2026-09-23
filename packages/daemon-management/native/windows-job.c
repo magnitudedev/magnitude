@@ -11,8 +11,8 @@ void magnitude_owned_close(magnitude_owned_process *owned) {
   memset(owned, 0, sizeof(*owned));
 }
 
-DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
-    HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+static DWORD spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
+    const WCHAR *directory, DWORD creation_flags, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
   magnitude_owned_process owned = {0};
   STARTUPINFOEXW startup = {0};
   PROCESS_INFORMATION process = {0};
@@ -65,8 +65,8 @@ DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *
   startup.StartupInfo.hStdError = error;
   /* Association occurs inside creation. No create-suspended/assign/resume orphan window. */
   if (!CreateProcessW(executable, command_line, NULL, NULL, TRUE,
-      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-      environment, NULL, &startup.StartupInfo, &process)) {
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | creation_flags,
+      environment, directory, &startup.StartupInfo, &process)) {
     failure = GetLastError(); goto cleanup;
   }
   owned.process = process.hProcess;
@@ -78,6 +78,17 @@ cleanup:
   if (failure) magnitude_owned_close(&owned);
   else *result = owned;
   return failure;
+}
+
+DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
+    HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+  return spawn(executable, command_line, environment, NULL, CREATE_NO_WINDOW, input, output, error, result);
+}
+
+DWORD magnitude_owned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
+    const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+  if (!directory || !*directory) return ERROR_INVALID_PARAMETER;
+  return spawn(executable, command_line, NULL, directory, 0, input, output, error, result);
 }
 
 /* Identity observation follows acquisition so failure cannot discard the cleanup authority. */

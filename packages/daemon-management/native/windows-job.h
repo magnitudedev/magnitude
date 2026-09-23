@@ -15,6 +15,9 @@ typedef struct {
  */
 DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
     HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result);
+/* Foreground commands share the caller's console and use an explicit working directory. */
+DWORD magnitude_owned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
+    const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result);
 DWORD magnitude_owned_creation(const magnitude_owned_process *owned, FILETIME *creation);
 DWORD magnitude_owned_active(const magnitude_owned_process *owned, DWORD *count);
 DWORD magnitude_owned_terminate(const magnitude_owned_process *owned, UINT exit_code);
