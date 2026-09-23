@@ -8,7 +8,6 @@ import { PreparedUpdateInstaller } from "./prepared-update-installation"
 import { hostedUpdateSource, type HostedUpdateSourceOptions } from "./hosted-update-source"
 
 export const makeWindowsUpdateSource = (options: HostedUpdateSourceOptions & {
-  readonly dataDirectory: string
   readonly stateDirectory: string
   readonly applicationPath: string
   readonly cliPath: string

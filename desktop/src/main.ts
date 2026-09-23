@@ -38,7 +38,7 @@ import {
   previousInstallationUpgrade, acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
   OwnedChildSpawner, OwnedChildSpawnFailed, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
-  unixPrivateFilePermissions, windowsPrivateFilePermissions,
+  unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease,
   MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
@@ -140,6 +140,10 @@ const program = Effect.scoped(Effect.gen(function* () {
     : !app.isPackaged ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
     : yield* Effect.gen(function* () {
       const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
+      if (process.platform === "win32") {
+        const retired = yield* recoverWindowsUpdateDirectory(addonPath, dataDir)
+        if (retired) yield* Effect.logWarning("An older update cache was preserved separately. Download the update again.")
+      }
       const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(privateFiles))
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
       const { trustedPublishers, origin } = updateConfiguration.value
@@ -151,7 +155,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       const store = yield* makePreparedUpdateStore({ dataDirectory: dataDir, target, trustedPublishers }).pipe(Effect.provide(privateFiles))
       const options = { origin, metadata, sign: identity.sign, trustedPublishers,
         userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} ${metadata.os}/${process.getSystemVersion()}`,
-        cacheDirectory: join(dataDir, "updates"), dataDirectory: dataDir, stateDirectory: stateDir }
+        dataDirectory: dataDir, stateDirectory: stateDir }
       const platform = yield* Effect.gen(function* () {
         if (process.platform === "linux") return yield* makeLinuxUpdateSource(options)
         if (process.platform === "win32") {
@@ -179,7 +183,10 @@ const program = Effect.scoped(Effect.gen(function* () {
       }
       return yield* makeApplicationUpdate(pending).pipe(
         Effect.provideService(ApplicationUpdateSource, platform.source), Effect.provideService(PreparedUpdateStore, store), Effect.provideService(UpdatePreferences, preferences))
-    }).pipe(Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+    }).pipe(
+      Effect.catchTag("WindowsUpdateDirectoryFailed", error => Effect.succeed(unavailableApplicationUpdate(error.message))),
+      Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))),
+    )
   if (startupUpdateDeferred) return "Quit" as const
   if (startupUpdateStarted) return "RestartUpdate" as const
   const updateSchedule = yield* makeUpdateSchedule(updates.check)

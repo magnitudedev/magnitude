@@ -114,6 +114,18 @@ static napi_value private_directory(napi_env env, napi_callback_info info) {
   if (error) return failure(env, "Unsafe or inaccessible private directory");
   napi_get_undefined(env, &result); return result;
 }
+static napi_value recover_update_directory(napi_env env, napi_callback_info info) {
+  napi_value arg, result; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
+    return failure(env, "Expected an update directory path");
+  WCHAR *path = private_path(env, arg);
+  if (!path) return NULL;
+  BOOL retired = FALSE;
+  DWORD error = magnitude_recover_update_directory(path, &retired);
+  free(path);
+  if (error) return failure(env, "Cannot safely prepare the update directory; existing contents were preserved");
+  napi_get_boolean(env, retired, &result); return result;
+}
 static napi_value private_content(napi_env env, napi_callback_info info) {
   napi_value arg, result; size_t argc = 1;
   if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
@@ -350,6 +362,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"inspectApplicationEndpoint", NULL, inspect_endpoint, NULL, NULL, NULL, napi_default, NULL},
     {"localAppDataDirectory", NULL, local_app_data, NULL, NULL, NULL, napi_default, NULL},
     {"preparePrivateDirectory", NULL, private_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"recoverUpdateDirectory", NULL, recover_update_directory, NULL, NULL, NULL, napi_default, NULL},
     {"createPrivateContent", NULL, create_private_content, NULL, NULL, NULL, napi_default, NULL},
     {"validatePrivateContent", NULL, private_content, NULL, NULL, NULL, napi_default, NULL},
     {"isInteractiveDesktop", NULL, interactive_desktop, NULL, NULL, NULL, napi_default, NULL},

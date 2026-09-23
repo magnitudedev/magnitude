@@ -1,4 +1,4 @@
-# Shared application updates: source review and implementation plan
+# Shared application updates: implementation plan
 
 Status: proposal, not implemented. Reviewed 2026-09-23 against Magnitude `772cfacb`.
 Companion to `/Users/trg/Downloads/headless-serve.md`; does not implement that document.
@@ -19,48 +19,12 @@ Companion to `/Users/trg/Downloads/headless-serve.md`; does not implement that d
 - Startup requiring unavailable authorization defers installation and explains the explicit action.
   Linux system-package installation still requires root; this constraint cannot be abstracted away.
 
-## Recommendation and evidence
+## Implementation approach
 
 Implement a narrow macOS bundle-installation transaction in daemon-management. Reuse the existing
 Windows NSIS transaction and Linux package-manager installation. Extract shared Effect orchestration
-from desktop. Do not implement a general-purpose update framework.
-
-Sparkle is a viable alternative. Its standard integration is not inherently difficult. The additional
-work for Magnitude is reconciling its appcast/signature pipeline, application termination/relaunch,
-helper lifecycle and authorization with our existing signed release protocol and two owner kinds.
-Those integration costs are an inference from the source, not a measured prototype. A native
-prototype is still necessary before claiming our custom approach is smaller overall.
-
-Sources were cloned read-only outside the workspace and inspected at these exact revisions:
-
-### Sparkle `fd34238cbbc5db4a6e8343c62ae4dea939b06ea4`
-
-- [SUPlainInstaller.m](https://github.com/sparkle-project/Sparkle/blob/fd34238cbbc5db4a6e8343c62ae4dea939b06ea4/Autoupdate/SUPlainInstaller.m): stages on the destination volume when necessary, attempts atomic exchange,
-  falls back to sequential moves, handles quarantine and ownership, and conditions exchange on
-  signing identity/custom update security policy. Adopt destination-volume preparation and the
-  signing constraints; do not silently inherit all fallback behavior.
-- [SUFileManager.m](https://github.com/sparkle-project/Sparkle/blob/fd34238cbbc5db4a6e8343c62ae4dea939b06ea4/Sparkle/SUFileManager.m): implements exchange with `RENAME_SWAP`; separate rename paths avoid following
-  symlinks, including descriptor-relative operations. Our native boundary must protect path identity.
-- [SUUpdateValidator.m](https://github.com/sparkle-project/Sparkle/blob/fd34238cbbc5db4a6e8343c62ae4dea939b06ea4/Sparkle/SUUpdateValidator.m): distinguishes archive authentication from extracted-code validation and has
-  extensive key-transition policy. Keep both validation stages, reuse our release trust policy.
-- [AppInstaller.m](https://github.com/sparkle-project/Sparkle/blob/fd34238cbbc5db4a6e8343c62ae4dea939b06ea4/Autoupdate/AppInstaller.m): coordinates extraction, validation, staged installation, agent termination and
-  relaunch. This application-oriented lifecycle is additional integration, not a bare bundle-swap API.
-- Also inspected `Tests/SUFileManagerTest.swift`, installer tests and the framework license.
-
-### Squirrel.Mac `5c9e2133c09d6f8e2e3c5a45c5b0ffc00448c58a`
-
-- [SQRLInstaller.m](https://github.com/Squirrel/Squirrel.Mac/blob/5c9e2133c09d6f8e2e3c5a45c5b0ffc00448c58a/Squirrel/SQRLInstaller.m): privately prepares the update, validates its signature, persists ownership of the
-  displaced bundle, and restores it after interruption. Adopt durable recovery before mutation.
-- [SQRLCodeSignature.m](https://github.com/Squirrel/Squirrel.Mac/blob/5c9e2133c09d6f8e2e3c5a45c5b0ffc00448c58a/Squirrel/SQRLCodeSignature.m): checks the designated requirement through Security.framework, including nested
-  code, strict validation and all architectures. Checking only a displayed Team ID is insufficient.
-- [ShipIt-main.m](https://github.com/Squirrel/Squirrel.Mac/blob/5c9e2133c09d6f8e2e3c5a45c5b0ffc00448c58a/Squirrel/ShipIt-main.m): restores previous state and bounds repeated installation attempts. Magnitude should
-  retain its stricter existing “failed attempt requires explicit retry” behavior.
-- `SQRLUpdater.m`, `SQRLTerminationListener.m` and `SQRLShipItLauncher.m` use running-application
-  identity, application termination observations and launchd jobs. Linking the framework without
-  Electron does not automatically make these assumptions fit a foreground headless owner.
-
-The frameworks' permissive licenses require preserving applicable notices if implementation code
-is reused. This plan borrows behaviors, not source fragments.
+from desktop. A native prototype must validate replacement, recovery, and foreground continuation
+before the backend is integrated.
 
 ## Scope of the custom macOS backend
 
@@ -181,8 +145,7 @@ user, not root. Test systemd cleanup: detaching a helper does not move it out of
 
 ## Windows defect and release order
 
-The reported private-directory failure is confirmed by source inspection. It is independent of
-Squirrel/Sparkle and should be fixed before the broader extraction. See the
+The reported private-directory failure is confirmed by source inspection. It should be fixed before the broader extraction. See the
 [bug investigation](../../bugs/26-09-23/windows-update-directory.md).
 
 1. Fix creation plus existing bad-directory recovery; repair the native end-to-end acceptance path.
@@ -192,7 +155,7 @@ Squirrel/Sparkle and should be fixed before the broader extraction. See the
 4. Implement and validate the macOS native transaction, including failure injection and signed builds.
 5. Pass foreground startup-continuation gates on every supported platform; integrate `serve`.
 6. Remove Electron macOS updater wiring once the custom backend passes acceptance. Exclude/drain a
-   still-active old ShipIt operation during the transition; do not run both installers concurrently.
+   still-active old updater operation during the transition; do not run both installers concurrently.
 
 Update applicable design documents with implementation, including release updates/distribution,
 native ownership, and CLI lifecycle. This proposal does not silently replace their current contracts.
@@ -218,4 +181,4 @@ native ownership, and CLI lifecycle. This proposal does not silently replace the
   accidental privileged service startup.
 
 Research limits: no native Windows reproduction or signed macOS replacement was executed in this
-investigation. Source-derived feasibility is distinguished above from behavior requiring execution.
+investigation. Proposed behavior still requires native execution and verification.

@@ -22,5 +22,13 @@ installation. Failed checks or verification must not be reported as successful u
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.
 
+Transfer scratch storage is separate from the private prepared-update directory. Under exclusive
+application or installation admission, Windows startup may retire an older cache with the known
+inherited current-user/administrator/system ACL and recognized cache entries. Recovery retains the
+directory identity through rename, preserves its contents separately, and creates a fresh private
+cache. It never adopts old bytes as a prepared update or rewrites generic private-directory ACLs.
+Unknown contents, reparse points, ownership, or permissions require explicit repair. Interrupted
+recovery may leave a preserved old cache, but cannot authorize an installation.
+
 Update acceptance covers download, verification, installation, relaunch, and preservation of
 application state.

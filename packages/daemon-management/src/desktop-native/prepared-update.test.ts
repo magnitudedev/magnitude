@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option, Schema } from "effect"
 import { createHash, generateKeyPairSync } from "node:crypto"
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
@@ -90,8 +90,12 @@ describe("one durable prepared update", () => {
     await run(Effect.gen(function* () { const store = yield* make; yield* store.prepare(archive, release); yield* store.discard }))
     await writeFile(join(root, "updates/installer-12345678-1234-1234-1234-123456789abc.tmp"), "partial")
     await writeFile(join(root, "updates/magnitude.deb"), "orphan")
+    await mkdir(join(root, "update-downloads/desktop-update-abc123"), { recursive: true })
+    await writeFile(join(root, "update-downloads/desktop-update-abc123/partial.exe"), "partial")
+    await writeFile(join(root, "update-downloads/unknown"), "preserve")
     await run(Effect.gen(function* () { const store = yield* make; yield* store.removeAbandonedTransfers }))
     expect(await readdir(join(root, "updates"))).toEqual([])
+    expect(await readdir(join(root, "update-downloads"))).toEqual(["unknown"])
     expect(await readFile(join(root, "identity.pem"), "utf8")).toBe("private identity")
     expect(await readFile(join(root, "config.json"), "utf8")).toBe("{}")
   })

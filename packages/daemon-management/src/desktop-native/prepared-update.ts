@@ -133,6 +133,12 @@ export const makePreparedUpdateStore = (options: {
       if (yield* fs.exists(directory)) yield* syncDirectory
     }).pipe(Effect.uninterruptible, Effect.mapError(() => failed("The prepared update could not be removed."))),
     removeAbandonedTransfers: Effect.gen(function* () {
+      const transfers = join(options.dataDirectory, "update-downloads")
+      if (yield* fs.exists(transfers)) {
+        for (const name of yield* fs.readDirectory(transfers)) {
+          if (/^desktop-update-[a-zA-Z0-9]+$/.test(name)) yield* fs.remove(join(transfers, name), { recursive: true, force: true })
+        }
+      }
       if (!(yield* fs.exists(directory))) return
       for (const name of yield* fs.readDirectory(directory)) {
         if (/^(?:update|installer)-[a-f0-9-]{36}\.tmp$/.test(name) || /^desktop-update-[a-zA-Z0-9]+$/.test(name)) {

@@ -31,6 +31,9 @@ Windows lock input names a local drive path (including its extended-length form)
 file must be a disk file with one link. Windows native acquisition creates the final private directory
 and lock with explicit current-user ownership and protected current-user-only ACLs at creation.
 Existing files and directories must satisfy that contract; acquisition does not rewrite unsafe ACLs.
+Update-cache recovery is a separate, owner-admitted operation: it may preserve and retire a recognized
+inherited cache before creating fresh private storage, under the application-update contract. It
+never repairs ownership-lock directories, follows reparse points, or authorizes unverified old bytes.
 The directory handle requests directory read access and is retained without delete sharing until lock release;
 metadata-only access does not establish that sharing protection. Directory reparse points,
 null/broad/inherited ACLs, wrong ownership and invalid file types are failures rather than contention.

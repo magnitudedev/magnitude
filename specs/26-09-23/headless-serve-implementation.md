@@ -279,14 +279,14 @@ deleted starter references. Scan executable code/workflows/docs for obsolete pub
 one timer per owner, automatic-download cancellation, channel policy, verified persistence, explicit
 retry and passive status. Implement the custom macOS transaction from `application-updates.md` using
 the Phase 2 proven primitives. Replace Electron updater installation wiring and its loopback staging
-server; retain bounded observation of a still-active old ShipIt job for migration safety. Update native
+server; retain bounded observation of a still-active old updater job for migration safety. Update native
 signing/build inputs. Generalize installer outcomes away from `showWindow`/desktop-only relaunch.
 
 **Verify:** existing engine tests follow the move, plus clock-driven schedule tests, manual check
 deduplication, preference persistence, cancellation cleanup, bad/tampered archives and interrupted
 attempt records. Native Mac full bundle exchange/recovery at each durable boundary, signature and
 publisher rejection, mixed/wrong version/arch, cross-volume staging, disk-full and sync failures,
-cleanup failures and no accidental reverse exchange. Test old ShipIt coexistence without concurrent
+cleanup failures and no accidental reverse exchange. Test old updater coexistence without concurrent
 mutation. Repeat Windows Phase 1 acceptance after extraction; Linux authorization regressions.
 
 **Gate:** signed packaged Desktop A→B→C with CLI and ACN matching on Mac and Windows; Linux package

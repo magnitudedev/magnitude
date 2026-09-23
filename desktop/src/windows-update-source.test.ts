@@ -5,16 +5,17 @@ import { createHash, generateKeyPairSync } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
-import { makePreparedUpdateStore, PreparedUpdateStore, PrivateFilePermissions, WindowsInstallerVerifier } from "@magnitudedev/daemon-management/desktop-native"
+import { makePreparedUpdateStore, PreparedUpdateStore, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, WindowsInstallerVerifier } from "@magnitudedev/daemon-management/desktop-native"
 import { WindowsInstallerSignatureFailed } from "../../packages/daemon-management/src/desktop-native/windows-update-signature"
 import { UpdateClientMetadata, UpdateManifest } from "@magnitudedev/release/hosted-update"
 import { PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
 import { makeWindowsUpdateSource } from "./windows-update-source"
 
-// File copying is exercised on Windows; native ACL and Authenticode have separate executable tests.
+// Exercise the real private-file adapter; native publisher verification has separate executable tests.
 describe.skipIf(process.platform !== "win32")("Windows installer staging", () => {
-  it.each(["valid", "changed", "unsigned"] as const)("handles a %s installer before allowing handoff", async scenario => {
+  it.each(["valid", "inherited", "changed", "unsigned"] as const)("handles a %s installer before allowing handoff", async scenario => {
     const directory = await mkdtemp(join(tmpdir(), "windows-update-stage-"))
     const archive = join(directory, "download.exe")
     const cli = join(directory, "magnitude.exe")
@@ -31,29 +32,28 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
     try {
       await Effect.runPromise(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
-        const permissions = PrivateFilePermissions.of({
-          prepareDirectory: path => fs.makeDirectory(path, { recursive: true }).pipe(Effect.orDie),
-          createFile: path => fs.writeFileString(path, "", { flag: "wx" }).pipe(Effect.orDie),
-          protectFile: () => Effect.void,
-        })
+        const addon = fileURLToPath(new URL("../../packages/daemon-management/dist/native/win32-x64/desktop-host.node", import.meta.url))
+        const permissions = windowsPrivateFilePermissions(addon)
+        if (scenario === "inherited") yield* fs.makeDirectory(join(directory, "updates"), { mode: 0o700 })
+        expect(yield* recoverWindowsUpdateDirectory(addon, directory)).toBe(scenario === "inherited")
         const store = yield* makePreparedUpdateStore({ dataDirectory: directory, target: manifest.artifact.target,
-          trustedPublishers: new Map([["test", publisher.publicKey]]) }).pipe(Effect.provideService(PrivateFilePermissions, permissions))
+          trustedPublishers: new Map([["test", publisher.publicKey]]) }).pipe(Effect.provide(permissions))
         const windows = yield* makeWindowsUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: new Map(),
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "10", arch: "x64", package: "windows-exe" }),
-          sign: () => Effect.succeed("unused"), userAgent: "fixture", cacheDirectory: join(directory, "cache"), stateDirectory: directory,
+          sign: () => Effect.succeed("unused"), userAgent: "fixture", stateDirectory: directory,
           applicationPath: join(directory, "Magnitude.exe"), cliPath: cli, dataDirectory: directory, addonPath: join(directory, "desktop-host.node"),
-        }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PrivateFilePermissions, permissions), Effect.provideService(WindowsInstallerVerifier, {
+        }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provide(permissions), Effect.provideService(WindowsInstallerVerifier, {
           verify: path => Effect.gen(function* () {
             signatures++
             if (scenario === "unsigned") return yield* new WindowsInstallerSignatureFailed()
           }),
         }))
         const outcome = yield* windows.source.stage(archive, envelope.release).pipe(Effect.either)
-        expect(outcome._tag).toBe(scenario === "valid" ? "Right" : "Left")
+        expect(outcome._tag).toBe((scenario === "valid" || scenario === "inherited") ? "Right" : "Left")
         expect(signatures).toBe(1)
         const pending = yield* store.read
-        expect(pending._tag).toBe(scenario === "valid" ? "Some" : "None")
-        if (scenario === "valid") {
+        expect(pending._tag).toBe((scenario === "valid" || scenario === "inherited") ? "Some" : "None")
+        if (scenario === "valid" || scenario === "inherited") {
           expect(yield* fs.readFileString(join(directory, "updates", "magnitude-setup.exe"))).toBe(bytes.toString())
           expect(yield* fs.exists(join(directory, "update-helpers"))).toBe(false)
         }

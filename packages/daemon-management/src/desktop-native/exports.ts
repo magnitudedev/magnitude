@@ -36,3 +36,5 @@ export { previousInstallationUpgrade } from "./previous-installation-live"
 export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePreferences } from "./appearance-preferences"
 export { ModelStoragePreferences, ModelStoragePreferencesFailed, makeModelStoragePreferences } from "./model-storage-preferences"
 export { NetworkPreferences, NetworkPreferencesFailed, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, type NetworkAccess, type NetworkAccessChange, type NetworkInterfaceAddress, type NetworkInterfaceKind } from "./network-preferences"
+
+export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"

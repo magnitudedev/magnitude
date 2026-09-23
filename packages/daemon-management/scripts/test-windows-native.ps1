@@ -26,6 +26,11 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows pipe acceptance failed.' }
   $addon = Join-Path $testRoot 'desktop-host.node'
   & (Join-Path $PSScriptRoot 'build-windows-native.ps1') -Headers $Headers -NodeLibrary $NodeLibrary -Output $addon
+  $updateDirectoryFixture = Join-Path $packageRoot 'src\desktop-native\fixtures\windows-update-directory.cjs'
+  & node $updateDirectoryFixture $addon
+  if ($LASTEXITCODE -ne 0) { throw 'Node update directory recovery acceptance failed.' }
+  & bun $updateDirectoryFixture $addon
+  if ($LASTEXITCODE -ne 0) { throw 'Bun update directory recovery acceptance failed.' }
   $embeddedFixture = Join-Path $testRoot 'windows-embedded.cjs'
   Copy-Item (Join-Path $packageRoot 'src\desktop-native\fixtures\windows-embedded.cjs') $embeddedFixture
   $embeddedExecutable = Join-Path $testRoot 'embedded-native.exe'

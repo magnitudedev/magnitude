@@ -8,7 +8,7 @@ import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-
 
 export type HostedUpdateSourceOptions = HostedUpdateConnection & {
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
-  readonly cacheDirectory: string
+  readonly dataDirectory: string
 }
 
 /** All native installers consume the same authenticated, checksum-verified transfer. */
@@ -19,8 +19,9 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
   download: (candidate, progress) => Effect.gen(function* () {
     const url = yield* resolveHostedDownload({ ...options, release: candidate })
     const fs = yield* FileSystem.FileSystem
-    yield* fs.makeDirectory(options.cacheDirectory, { recursive: true, mode: 0o700 })
-    const directory = yield* fs.makeTempDirectoryScoped({ directory: options.cacheDirectory, prefix: "desktop-update-" })
+    const transfers = join(options.dataDirectory, "update-downloads")
+    yield* fs.makeDirectory(transfers, { recursive: true, mode: 0o700 })
+    const directory = yield* fs.makeTempDirectoryScoped({ directory: transfers, prefix: "desktop-update-" })
     const downloaded = yield* downloadUpdateArtifact({
       url, destination: join(directory, updateInstallerFilename(yield* Schema.decodeUnknown(ReleaseTarget)({ os: options.metadata.os, arch: options.metadata.arch, package: options.metadata.package }))),
       release: candidate,

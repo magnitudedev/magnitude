@@ -43,7 +43,7 @@ describe("Mac update acquisition and native handoff", () => {
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
         const store = yield* makePreparedUpdateStore({ dataDirectory: root, target: candidate.artifact.target, trustedPublishers: new Map([["test", publisher.publicKey]]) })
-        const platform = yield* macUpdateSource({ origin: "https://magnitude.dev", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root, stateDirectory: join(root, "state"), bundle: join(root, "Magnitude.app"), cliPath: join(root, "cli"), addonPath: join(root, "addon") }).pipe(
+        const platform = yield* macUpdateSource({ origin: "https://magnitude.dev", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", dataDirectory: root, stateDirectory: join(root, "state"), bundle: join(root, "Magnitude.app"), cliPath: join(root, "cli"), addonPath: join(root, "addon") }).pipe(
           Effect.provideService(PreparedUpdateStore, store),
           Effect.provideService(MacUpdateHandoff, { start: () => Effect.succeed({ commit: Effect.sync(() => expect(staged).toBe(true)) }) }),
           Effect.provideService(NativeMacUpdate, {

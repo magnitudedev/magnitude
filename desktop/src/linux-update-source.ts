@@ -5,7 +5,6 @@ import { PreparedUpdateInstaller } from "./prepared-update-installation"
 import { hostedUpdateSource, type HostedUpdateSourceOptions } from "./hosted-update-source"
 
 export const makeLinuxUpdateSource = (options: HostedUpdateSourceOptions & {
-  readonly dataDirectory: string
   readonly stateDirectory: string
 }) => Effect.gen(function* () {
   const store = yield* PreparedUpdateStore

@@ -1,9 +1,9 @@
 # Windows update staging rejects its own download directory
 
-Status: confirmed by code inspection; not fixed here. Native VM evidence was supplied by the user,
-not reproduced in this research task. Magnitude checkout: `772cfacb`.
+Status: repair implemented on `headless`; native and staging tests passed in the Windows VM.
+Full signed packaged upgrade acceptance remains pending. Original investigation source: `772cfacb`.
 
-## Failure
+## Original failure
 
 `desktop/src/main.ts` supplies `<data>/updates` as `cacheDirectory` to the hosted download source.
 `desktop/src/hosted-update-source.ts` creates that path with ordinary `FileSystem.makeDirectory`
@@ -39,7 +39,7 @@ failure. Native security tests deliberately assert refusal to repair broad direc
 - Reinstalling app binaries alone does not repair `<data>/updates`. The fixed client must handle the
   bad directory left by prior attempts, or recovery instructions must explicitly address it.
 
-## Proposed repair
+## Repair requirements
 
 Treat transfer scratch and trusted prepared-update storage as distinct responsibilities.
 
@@ -62,7 +62,7 @@ Treat transfer scratch and trusted prepared-update storage as distinct responsib
 The exact native recovery operation needs Windows acceptance, including paths with junction ancestors
 and rename races. Do not implement it as unchecked JavaScript `exists` + recursive deletion.
 
-## Why current tests miss the composition
+## Original test gaps
 
 - `desktop/src/windows-update-source.test.ts` substitutes ordinary mkdir/write and a no-op protection
   function for native private permissions, creates its archive separately, and directly calls stage.
@@ -85,4 +85,22 @@ and rename races. Do not implement it as unchecked JavaScript `exists` + recursi
   publishing the fix repairs old binaries automatically. A separately validated manual ACL repair
   could enable an old updater, but is not a server-side remedy or the proposed default user workflow.
 
-No product code was changed and no release was published as part of this investigation.
+## Implemented checkpoint
+
+The transfer source now derives separate scratch storage from the profile root. Windows updater
+bootstrap runs narrow native cache recovery before reading prepared state. Recovery recognizes only
+the original inherited user/administrator/system ACL, retains the directory handle through rename,
+preserves recognized contents under an identity-derived sibling, and creates new private storage.
+Generic private-directory validation remains unchanged. Refusal reaches the updater UI as a
+specific directory error rather than the generic setup error.
+
+Native tests passed under the VM's ordinary user, including inherited-cache recovery, explicit/broad
+ACL refusal, unknown-entry preservation, repeat recovery, and root/child junction refusal under both
+Node and Bun. Staging tests now use real native private permissions and cover fresh and inherited
+profiles, corrupt bytes, and publisher-verification failure. Transfer separation and interrupted
+transfer cleanup have regression tests. The hosted acceptance fixture uses current configuration
+paths and starts with an inherited cache to exercise upgrade recovery.
+
+This checkpoint has not published a release or completed the signed hosted upgrade/rollout gates.
+See the [checkpoint ledger](../../specs/26-09-23/headless-checkpoints.md) for executed evidence and
+remaining acceptance work.

@@ -27,7 +27,7 @@ describe("Linux prepared update", () => {
         const store = yield* makePreparedUpdateStore(options)
         const linux = yield* makeLinuxUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: options.trustedPublishers,
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "linux", os_version: "6.1", arch: "arm64", package: "deb" }),
-          sign: () => Effect.succeed("unused"), userAgent: "fixture", cacheDirectory: join(directory, "updates"), dataDirectory: directory,
+          sign: () => Effect.succeed("unused"), userAgent: "fixture", dataDirectory: directory,
           stateDirectory: join(directory, "state") }).pipe(Effect.provideService(PreparedUpdateStore, store))
         yield* linux.source.stage(archive, release)
         expect(yield* installPreparedUpdate({ showWindow: false, allowAuthorizationPrompt: false }).pipe(Effect.provideService(PreparedUpdateStore, store),
