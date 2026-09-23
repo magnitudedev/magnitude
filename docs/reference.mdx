@@ -63,13 +63,12 @@ Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh
 | Command | Purpose |
 | --- | --- |
 | `magnitude app open` | Show the desktop window. |
-| `magnitude service start` | Start the app in the background and wait for its service. |
-| `magnitude service status` | Inspect service and active-model status. |
-| `magnitude service stop` | Stop Magnitude without disabling launch at login. |
-| `magnitude service install` | Enable launch at login and start in the background. |
-| `magnitude service uninstall` | Disable launch at login and stop Magnitude. |
+| `magnitude serve` | Run the service in the foreground without opening Desktop. |
+| `magnitude status` | Observe the owner, service, and active model without starting anything. |
 
-`service uninstall` does **not** uninstall the desktop app or delete your models. The CLI controls the desktop-owned service; it is not a separate server installation.
+Model, catalog, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
+Stop a foreground server with Ctrl+C. Opening Desktop takes over from a foreground server.
+Use **Launch at login** in Desktop Settings for login startup, and **Quit Magnitude** to stop Desktop.
 
 ## Updates
 

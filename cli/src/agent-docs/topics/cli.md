@@ -6,7 +6,9 @@ configure external harnesses. Agents can use the following commands to operate i
 
 ```text
 magnitude update
-magnitude service install|uninstall|start|stop|status
+magnitude app open
+magnitude serve
+magnitude status
 magnitude hardware
 magnitude catalog status
 magnitude catalog list
@@ -21,6 +23,11 @@ magnitude connections sync [harness]
 magnitude connections remove <harness>
 magnitude docs [topic-id]
 ```
+
+Run `magnitude serve` to host inference in the foreground, or open the desktop app.
+Model, catalog, hardware, and connection setup commands require an existing service; they do not
+start one. `magnitude status` observes the owner and runtime without starting anything. Stop a
+foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
 
 Each command prints only the product information relevant to that operation. Collection commands
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.

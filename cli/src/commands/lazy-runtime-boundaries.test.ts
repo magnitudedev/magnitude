@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 const commandFamilies = [
   ["connections", "connections-runtime"],
   ["inference", "inference-runtime"],
-  ["server", "server-runtime"],
+  ["status", "status-runtime"],
   ["serve", "serve-runtime"],
   ["update", "update-runtime"],
 ] as const

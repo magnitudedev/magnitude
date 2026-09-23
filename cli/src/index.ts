@@ -2,7 +2,7 @@ import { Command } from "@commander-js/extra-typings"
 import { registerApplicationCommand } from "./commands/application"
 import { registerDocsCommand } from "./commands/docs"
 import { registerUpdateCommand } from "./commands/update"
-import { registerServiceCommand } from "./commands/server"
+import { registerStatusCommand } from "./commands/status"
 import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
@@ -12,7 +12,10 @@ const program = new Command()
   .option("-v, --version", "Print the Magnitude version")
 
 registerApplicationCommand(program)
-registerServiceCommand(program)
+registerStatusCommand(program)
+// Release probe for the signed CLI's native database and runtime.
+program.command("native-runtime-check", { hidden: true })
+  .action(() => import("./commands/native-runtime-check").then(({ runNativeRuntimeCheck }) => runNativeRuntimeCheck()))
 registerServeCommand(program)
 registerInferenceCommands(program)
 registerConnectionsCommand(program)

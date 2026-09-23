@@ -11,6 +11,3 @@ export const explainError = (error: unknown): string => Schema.is(ConnectionErro
   : error instanceof Error
     ? error.message
     : String(error)
-
-export const explainServiceStartupFailure = (error: unknown): string =>
-  `Magnitude service failed to start:\n${explainError(error)}`

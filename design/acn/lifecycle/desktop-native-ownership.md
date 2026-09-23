@@ -147,7 +147,7 @@ replacement. Retirement releases them only after both zero active members and ro
 application-scope exit can force release without misreporting that as observed retirement. Observers
 cannot take ownership or dispose of the job. Windows process IDs use the same identity type for
 retained process observations and native pipe-client admission.
-CLI Quit observes the Windows application through a scoped read-only process handle acquired before
+Privileged application Quit observes the Windows application through a scoped read-only process handle acquired before
 requesting shutdown. It waits on that same handle rather than repeatedly resolving a PID, and checks
 that the reply identifies the observed application. Observation grants no termination or job rights.
 Permission failures are not process absence; cancellation releases observation without killing the
@@ -186,8 +186,7 @@ public RPC or inference contracts; the service and desktop ship as one matched a
 Login startup is an OS-owned preference, independent of the running service. Application control
 can read or explicitly change that preference; it replies only after the native adapter finishes.
 These requests never dispatch lifecycle intent or create an independent daemon. Errors are typed
-and do not masquerade as successful registration. A cold CLI registration request first ensures the
-desktop in the background; unregistration then requests full application Quit. Development builds
+and do not masquerade as successful registration. Login preference changes are Desktop operations; the CLI does not expose registration commands. Development builds
 report login registration unavailable and never register source executables.
 Linux desktop entries use the system env executable to exec the absolute application path with
 background intent, preserving the environment and process identity without a shell. This permits

@@ -171,13 +171,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows CLI version failed.' }
           & $cli --help
           if ($LASTEXITCODE -ne 0) { throw 'Windows CLI help failed.' }
-          $status = & $cli service status
+          $status = & $cli status
           if ($LASTEXITCODE -ne 0 -or ($status -join "`n") -notmatch 'Runtime\s+Stopped') { throw 'Passive Windows CLI status failed.' }
-          & $cli service stop
-          if ($LASTEXITCODE -ne 0) { throw 'Already-stopped Windows CLI stop failed.' }
           if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Passive commands created application ownership state.' }
           $PSNativeCommandUseErrorActionPreference = $false
-          $start = & $cli service start 2>&1
+          $start = & $cli app open 2>&1
           if ($LASTEXITCODE -eq 0) { throw 'Missing desktop unexpectedly started.' }
           $failure = $start -join "`n"
           if ($failure -notmatch 'Magnitude desktop is not installed at' -or $failure -match 'invalid\\environment-profile') { throw 'CLI did not resolve the missing desktop through the native known folder.' }

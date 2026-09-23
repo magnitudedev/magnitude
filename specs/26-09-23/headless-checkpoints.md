@@ -441,3 +441,75 @@ Continue CLI cutover and shared-update implementation while retaining those expl
 Final targeted daemon-management, CLI and desktop typechecks passed. Corrected the new virtual-clock
 test's separate Effect layer provisions to one combined provision; all six native owner tests passed
 again. No broad regression failures remain in this checkpoint's executed unit suites.
+
+
+### Phase 5 work in progress: connect-only clients and passive status
+
+Removed the SDK CLI starter and its command-specific errors. Pi model commands now explicitly use
+connect-only SDK admission. Ordinary CLI service-backed operations observe the application owner
+before connection and report the agreed no-service message on confirmed absence. Other control
+failures remain errors. Added 14 real subprocess cases for hardware/catalog/model/connection
+operations: each exits 1 with that message and leaves a fresh absent profile untouched.
+
+Replaced the public service namespace with passive status, retaining the hidden native runtime
+probe. Status returns success for absence, displays Desktop/Headless ownership, and omits desktop-only
+tray/login fields for Headless or absence. Existing unavailable active-model presentation is retained.
+The absent-status subprocess fixture initially exceeded the macOS control socket path limit; the
+command correctly rejected that invalid path. Shortening the fixture prefix fixed its test.
+
+Executed on Mac with pinned Bun 1.4.2: SDK 40 tests, Pi 101 tests, CLI 97 tests all passed;
+SDK/Pi/CLI targeted typechecks exited 0 (existing Effect language-service advisory messages remain).
+Pi build exited 0. No remaining SDK/Pi/CLI references to the deleted starter APIs were found.
+
+This is not yet a checkpoint: migrate native desktop acceptance scripts and workflow commands,
+remaining public documentation, and the development Pi launcher before committing Phase 5.
+Broaden passive status coverage to live owners and complete the phase's existing-desktop regression.
+
+
+Phase 5 continuation: migrated public command documentation and the Windows native CLI smoke
+workflow to status/app open. Linux installed lifecycle now exercises explicit Desktop launch,
+passive status, owner Quit, and separate login disable; Windows hosted-update acceptance uses the
+actual tray Quit action before reopening. Both modified JavaScript fixtures passed Node syntax
+checks; these updated installed fixtures still require native execution against new packaged builds.
+
+The Pi development launcher now explicitly ensures its development Desktop before acquiring the
+connect-only client. Its six script tests passed with scripts/vitest.config.ts and the targeted
+scripts/tsconfig.dev-pi.json check exited 0. The initial root test invocation selected no tests;
+it was corrected to use the scripts configuration, not counted as validation.
+
+Live Mac source regression used isolated /tmp/mag-serve-phase4 and port 11164. Foreground serve
+reached Ready; status reported Headless with no tray/login fields and models status succeeded.
+Explicit app open took over and the retained foreground session exited 0. Status then reported
+Desktop, Ready and Registered tray; hardware and models status succeeded against that Desktop.
+Computer use visibly exercised Discover and Settings, selected Light then Dark and restored System.
+Development login/updates correctly remained disabled; no installed login acceptance is claimed.
+The real app Quit shortcut exited the isolated Desktop. Subsequent status reported Stopped/None,
+and models status returned the no-service message without relaunching it. Actual model inference,
+packaged login controls, and cross-platform acceptance remain open gates.
+
+
+### Phase 5 connect-only implementation checkpoint verification
+
+Ubuntu aarch64 and Windows x64 Bun 1.4.2 CLI suites both passed all 97 tests. Native Windows testing
+found the pre-existing subprocess helper used URL.pathname, producing an invalid /C:/ path. Replaced
+it with fileURLToPath and tightened rejected-syntax assertions so entrypoint resolution failures
+cannot pass as command rejection. Mac's corrected 32 subprocess cases passed again. The Windows
+suite passed after correcting the expected Commander excess-argument diagnostic for removed commands.
+
+Built the Windows CLI with the production build function and matched native addon. Compiled status
+returned Stopped and models status returned the exact no-service error; both left a new absent profile
+untouched while LOCALAPPDATA intentionally named an invalid location. Initial temporary harness
+attempts hit PowerShell 5 quoting/stderr handling and a missing native-library environment input;
+corrected harness invocation and final smoke exited 0. No production workaround was introduced.
+
+Mac full Desktop regression: 256 tests passed, six platform/integration tests skipped. Client-common
+connection/lifecycle/presentation: ten tests passed. SDK protocol tests retain exact mismatch rejection
+and connect-only admission. Final CLI targeted typecheck exited 0. Earlier no-tests-selected desktop
+invocation is not counted; the full Desktop suite above is the executed check.
+
+This checkpoint closes the implemented CLI cutover, docs/workflow migration and source/compiled CLI
+checks. Updated Linux installed-lifecycle and Windows hosted-update fixtures remain pending execution
+against the final matched packages; they are not certified by syntax checks or source tests. Full
+packaged regression, real model serving and login acceptance remain tracked by the later gates.
+
+Final targeted client-common and Desktop typechecks also exited 0.

@@ -1,10 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent"
 import { Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Ref, Schema, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import * as NodeCommandExecutor from "@effect/platform-node/NodeCommandExecutor"
-import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import {
-  MagnitudeClient, MagnitudeServiceStarter, ConnectionErrorSchema, ProtocolMismatch, formatConnectionError,
+  MagnitudeClient, ConnectionErrorSchema, ProtocolMismatch, formatConnectionError,
 } from "@magnitudedev/sdk"
 
 class MagnitudeCommandFailed extends Schema.TaggedError<MagnitudeCommandFailed>()("MagnitudeCommandFailed", {
@@ -27,12 +25,10 @@ const commandsLayer = Layer.effect(ModelCommands, Effect.gen(function* () {
 }))
 
 const magnitudeExecutable = () => process.env.MAGNITUDE_CLI?.trim() || "magnitude"
-const clientLayer = () => MagnitudeClient.layer(process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN ? { origin: process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN } : {}).pipe(Layer.provide([
-  FetchHttpClient.layer,
-  MagnitudeServiceStarter.cliLayer({ executable: magnitudeExecutable() }).pipe(
-    Layer.provide(NodeCommandExecutor.layer.pipe(Layer.provide(NodeFileSystem.layer))),
-  ),
-]))
+const clientLayer = () => MagnitudeClient.layer({
+  autoStart: false,
+  ...(process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN ? { origin: process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN } : {}),
+}).pipe(Layer.provide(FetchHttpClient.layer))
 
 /** Pi callbacks are the sole Promise boundary; runtime disposal cancels subprocess work. */
 export const registerMagnitudeCommands = (pi: ExtensionAPI, sdk: Layer.Layer<MagnitudeClient> = clientLayer()): (() => Promise<void>) => {
