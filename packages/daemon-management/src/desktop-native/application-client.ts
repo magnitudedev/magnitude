@@ -58,10 +58,16 @@ export const makeApplicationClient = (options: ApplicationClientOptions) => {
   const request = options.request
   const ensure = (intent: "EnsureRunning" | "ShowWindow" = "EnsureRunning") => Effect.gen(function* () {
     const existing = yield* request(intent).pipe(Effect.map(Option.some), Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())))
-    if (Option.isSome(existing)) return existing.value
-    const observe = request(intent).pipe(
+    if (Option.isSome(existing) && (intent !== "ShowWindow" || existing.value.owner._tag === "Desktop")) return existing.value
+    const observe = Effect.gen(function* () {
+      for (;;) {
+        const snapshot = yield* request(intent)
+        if (intent !== "ShowWindow" || snapshot.owner._tag === "Desktop") return snapshot
+        yield* Effect.sleep("100 millis")
+      }
+    }).pipe(
       Effect.retry({ while: error => error._tag === "ApplicationControlUnavailable", schedule: Schedule.spaced("100 millis") }),
-      Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude did not respond after launch. Open the desktop app to inspect startup." }) }),
+      Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude did not respond after launch. Open the desktop app to inspect startup." }) }),
     )
     return yield* options.launch(intent, observe)
   }).pipe(Effect.flatMap(snapshot => snapshot.service._tag === "Stopping" || snapshot.service._tag === "Stopped"

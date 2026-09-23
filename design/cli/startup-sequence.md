@@ -12,11 +12,20 @@ applies_to:
 
 # Headless CLI startup
 
-The CLI is a finite, noninteractive command surface. Bare invocation prints help. Help, version,
+The CLI is a noninteractive command surface. Commands are finite except foreground `serve`, which
+retains application ownership and its service tree until interruption or cooperative Desktop handoff.
+Bare invocation prints help. Help, version,
 documentation, connection inspection, and service status are observational and never start the
 application. There is no terminal renderer, onboarding preflight, update prompt, or agent harness.
 
 ## Application ownership
+
+`serve` never launches Electron. It acquires the shared native application lock, refuses an existing
+owner, excludes active installation, and starts the matched bundled service. Windows requires native
+parent-job containment; installed Linux serving retains a close-on-exec shared installation lease.
+Headless control reports its owner form, acknowledges Yield before shutdown, rejects login settings,
+and never launches Desktop to handle update requests. Terminal service failure exits nonzero after
+cleanup; normal stop and Yield exit after complete owned-service retirement.
 
 Commands validate argument syntax and supported identifiers before requesting startup.
 Service-backed commands ask the installed desktop application to run in the background and await
@@ -25,7 +34,9 @@ startup. It never shows, restores, or focuses a window. Only explicit `magnitude
 ShowWindow; this does not wait for inference readiness and can open a failed application's Status.
 
 The privileged application client owns installation discovery, launch intent, and local control.
-Only an absent application control endpoint permits a launch attempt. A timeout, permission error,
+An absent application control endpoint permits a launch attempt. Explicit Open may also launch
+Desktop when a Headless owner responds; the new Desktop performs cooperative handoff and Open waits
+for a Desktop snapshot, never treating the Headless reply as proof that a window opened. A timeout, permission error,
 unresponsive owner, or explicit application failure is not absence and must not create another
 owner. Concurrent launches coalesce through the desktop native lifetime lock. A cancelled CLI
 request does not cancel an application that has already started. Cold startup observes launcher
@@ -74,7 +85,7 @@ application semantics.
 
 ## Acceptance
 
-- Every retained command terminates without terminal UI or prompts.
+- Finite commands terminate without terminal UI or prompts; serve remains until owner shutdown.
 - Passive commands neither create a desktop process nor alter login registration.
 - Background cold and concurrent launches preserve window visibility and focus.
 - Service readiness uses the exact application's compatible service, independent of model loading.

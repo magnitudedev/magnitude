@@ -16,6 +16,8 @@ applies_to:
 The existing Electron application is the local inference product. Its retained renderer owns one
 SDK connection and one client-common Effect Query runtime. Electron main owns the tray and service
 supervisor; ACN owns the inference engine. Renderer recreation rereads ACN and never restarts it.
+The application snapshot identifies Desktop ownership with its tray state, separately from Headless
+ownership. Renderer background-activity presentation reads that Desktop variant directly.
 Every platform exposes full Quit in its native application menu, including when no tray host exists.
 Window Close remains hide-only; menu Quit uses the same awaited owner shutdown as tray and CLI.
 Unix SIGTERM requests that same awaited shutdown; it does not bypass child retirement.

@@ -105,7 +105,7 @@ const publicServiceStatus = desktopApplication.observe.pipe(
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      tray: Option.map(snapshot, value => value.tray),
+      tray: Option.flatMap(snapshot, value => value.owner._tag === "Desktop" ? Option.some(value.owner.tray) : Option.none()),
     })))
   }),
 )

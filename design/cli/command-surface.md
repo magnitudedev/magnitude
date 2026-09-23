@@ -24,6 +24,7 @@ The public command vocabulary is:
 ```text
 update [check | status | download | install]
 app open
+serve
 service install | uninstall | start | stop | status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
@@ -40,6 +41,7 @@ plugins call the SDK over RPC instead.
 
 ## Domain ownership
 
+- `serve` owns the foreground application and service tree until shutdown or cooperative Desktop handoff.
 - `service` reports runtime readiness, tray registration, and login-startup intent independently.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
 - `catalog` reports catalog assessment progress, reviewed model choices,

@@ -3,6 +3,7 @@ import { registerApplicationCommand } from "./commands/application"
 import { registerDocsCommand } from "./commands/docs"
 import { registerUpdateCommand } from "./commands/update"
 import { registerServiceCommand } from "./commands/server"
+import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
 
@@ -12,6 +13,7 @@ const program = new Command()
 
 registerApplicationCommand(program)
 registerServiceCommand(program)
+registerServeCommand(program)
 registerInferenceCommands(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)

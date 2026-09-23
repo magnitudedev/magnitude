@@ -313,3 +313,131 @@ This is a tested implementation checkpoint for shared bootstrap extraction, not 
 full Phase 3 visual/package matrix has passed. Actual model interaction, settings persistence/login
 registration in a disposable desktop profile, stronger close/reopen observation, and packaged
 three-platform acceptance remain explicit gates alongside subsequent ownership integration.
+
+### Phase 4 work in progress — owner contract and cooperative arbitration
+
+The SDK snapshot now carries Desktop-with-tray or Headless ownership, and the intent schema includes
+Yield. Existing desktop producers, renderer/CLI readers, control fixtures and loading fixture were
+migrated together, without accepting the previous snapshot shape. Explicit app Open over a Headless
+snapshot launches Desktop and waits for Desktop observation rather than treating Headless as a window.
+
+Acquisition now accepts an explicit Desktop or Headless request. Headless contention fails before
+contacting the incumbent. Desktop observes the current owner, forwards to Desktop or requests Yield
+from Headless, then retries native acquisition under one 60-second bound. Cold/closing missing
+endpoints permit retry; access, malformed-message and other control failures remain errors. No path
+unlinks the lock, signals an incumbent process or treats Yield acknowledgement as transferred ownership.
+
+Mac pinned-runtime evidence: all 35 focused client/control/owner tests passed, including real native
+lock exclusion and Unix IPC handoff, Desktop forwarding, both snapshot schema forms, rejection of the
+old shape, and Windows transport simulation of reply-before-dispatch for Yield. An additional assertion
+proves the newly acquired lock remains held after the contender fiber returns. Daemon-management,
+CLI and desktop targeted typechecks passed. This remains uncommitted Phase 4 work: the serving runtime,
+platform installation admission, signal lifecycle and actual native server takeover are not yet added.
+
+### Phase 4 work in progress — first foreground serving execution
+
+Added lazy public serve registration and its privileged runtime. The runtime composes shared profile
+and resource selection, signal observation, native ownership, installation exclusion, service
+supervision and owner control without Electron. It reports Headless snapshots, rejects login/update
+requests without launching a desktop, acknowledges Yield before stopping, and propagates terminal
+service/cleanup failure. Production Windows admission validates native parent job containment.
+Startup update reconciliation is still a later phase; the interim update refusal is explicit.
+
+Linux gained a separately tagged scoped native shared installation capability, opening the fixed
+root-owned read-only lock with close-on-exec. On the Ubuntu VM, gracefully stopped the previously
+running installed 0.1.5 desktop via its CLI. The VM installation is now stopped. Rebuilt the modified
+addon and ran the native lease fixture with both Node and pinned Bun: shared admission excluded an
+independent exclusive flock; an exec'd child inherited no installation descriptor; forged/cross-kind
+release was rejected; repeated correct release was safe; exclusive flock succeeded after release.
+This is native admission evidence, not installed serve or installer-race acceptance.
+
+Mac source execution used isolated `/tmp/mag-serve-phase4`, port 11164 and the pinned Bun path.
+`magnitude serve` reached Ready without Electron. Source CLI models status read that running service;
+a second serve failed with exit 1 and left the first serving. Ctrl+C requested administrative ACN
+shutdown and the foreground execution exited 0; no profile/port-matching processes remained in the
+subsequent process listing. CLI and daemon-management targeted typechecks passed. Help printed the
+new command without importing its runtime.
+
+Still open before the Phase 4 checkpoint: initial port preflight before supervision, earlier-signal
+admission tests, actual desktop takeover with the rebuilt schema, Windows foreground native execution,
+installed/display-free Linux serve, failure and contention race coverage, full process-identity
+retirement evidence and packaged acceptance. The native Linux installation fixture currently requires
+an installed lock and no active owner; it is not part of the portable unit suite.
+
+### Phase 4 follow-up — actual Mac handoff and display-free Ubuntu serving
+
+Rebuilt the desktop with the new owner schema. Started isolated Mac serve on port 11164, then ran
+source CLI app open against that same profile. The headless execution exited 0 after administrative
+shutdown. Its recorded owner 44966, ACN 44967 and inference 44973 were absent afterward. The desktop
+reported Ready/Registered on the same endpoint; computer-use navigation and screenshot verified the
+actual Status screen. Explicit CLI stop then shut down that isolated desktop. This proves a real
+handoff, though continuous race-timeline instrumentation and packaged takeover remain open.
+
+Separated port preflight from its spawner wrapper. Foreground bootstrap now retires previous installs
+and checks the port before supervision, while Desktop retains supervised admission failures; every
+child attempt still checks the port. A real occupied-port source serve exited 1 with the expected
+message in 0.177 seconds. The 12 focused bootstrap/port/ownership tests passed. Signal observation
+now starts before headless admission and a pending stop can prevent service construction after
+platform checks.
+
+Synced current source to the separate Ubuntu checkout and ran serve with DISPLAY and WAYLAND_DISPLAY
+removed, isolated profile `/tmp/mag-serve-phase4`, port 11164, and the installed 0.1.5 engine manifest
+as an explicit development override. It reached Ready and source CLI models status succeeded.
+Recorded Linux process start identities for owner 31577, ACN 31592, inference 31612 and four planning
+workers. Sent SIGTERM followed immediately by SIGINT to the verified owner. Every recorded identity
+retired within the bounded observation and the retained SSH command exited 0. No GUI owner was
+started. This is source-runtime native coverage, not packaged installed Linux acceptance.
+
+### Phase 4 follow-up — compiled native Windows serving
+
+Built the current CLI/service using the production build functions and rebuilt the native Windows
+launcher. The disposable VM now has a matched serving fixture at the normal Local AppData
+Programs/Magnitude/resources path: compiled magnitude.exe, magnitude-service.exe and desktop-host.node.
+The native launcher remains outside that payload in serve-acceptance. This directory is a serving
+fixture, not a complete installed desktop or a package acceptance receipt; no desktop installer or
+registration was produced in this step.
+
+Normal-user native launcher execution with isolated profile serve-acceptance/profile and port 11164
+reached Ready using the existing 0.1.5 engine manifest as an explicit test override. Compiled CLI
+models status succeeded, a second contained serve exited 1 without replacing the owner, and compiled
+CLI service stop succeeded. Recorded the launcher/CLI/ACN/inference/worker tree before shutdown;
+all 15 recorded processes disappeared. The original launcher test session then completed with exit 0.
+The VM control tool had retained its command session until the long-running child stopped even
+though the PowerShell script had already exited; no duplicate server was started to recover it.
+
+Added lazy-runtime coverage for serve and subprocess coverage for serve help and rejected port,
+data-dir and host flags, proving those paths leave the chosen profile absent. All 21 entrypoint/lazy
+boundary tests passed on the verified pinned Mac runtime. A separate actual Mac serve with a missing
+engine completed bounded restart attempts and exited 1 after 17.27 seconds with its final failure.
+
+Remaining Phase 4 gates still include compiled-owner crash/signal acceptance, continuous contention
+and takeover race evidence, installed Linux admission/race refusal, complete installed Windows
+desktop takeover, and packaged three-platform regression. The new Windows serving fixture is stopped;
+its payload and logs remain for further acceptance work.
+
+### Foreground ownership implementation checkpoint verification
+
+Forced the actual native Windows launcher to exit after the compiled serving payload reached Ready.
+All nine recorded launcher/CLI/service/inference/worker identities retired; comparison included native
+creation dates. The fixture also ensured its exact launcher was terminated on any test failure.
+
+On Mac, eight simultaneous source serve subprocesses shared a fresh isolated profile and port 11167.
+Exactly one remained serving and the seven contenders exited 1. Forced that verified owner to exit;
+its recorded seven-process tree disappeared, including inference planning workers. This exercises
+actual concurrent startup and parent-loss cleanup. It does not substitute for continuous OS event
+coverage of multiple simultaneous desktop takeovers.
+
+Added native lock tests for 32 concurrent acquisition attempts (one admission, 31 refusals) and a
+virtual-clock deadline test retaining an unresponsive incumbent's native lock after the contender
+fails. Full pinned-Bun Mac suites passed: daemon-management 271 (seven platform skips), CLI 77,
+desktop 256 (six platform/integration skips). Existing desktop shell-probe tests remain green.
+
+This is a substantial working-code checkpoint for foreground serving and cooperative takeover.
+The plan remains intentionally open for packaging/launcher integration, native Windows console
+cancellation with the real server, installed three-platform takeover/race acceptance, Linux busy
+installer/marker refusal, actual desktop model/settings/login regressions, and the final full matrix.
+Continue CLI cutover and shared-update implementation while retaining those explicit acceptance gates.
+
+Final targeted daemon-management, CLI and desktop typechecks passed. Corrected the new virtual-clock
+test's separate Effect layer provisions to one combined provision; all six native owner tests passed
+again. No broad regression failures remain in this checkpoint's executed unit suites.

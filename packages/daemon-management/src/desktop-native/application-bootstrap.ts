@@ -7,7 +7,7 @@ import { makeUnixOwnedChildSpawner, OwnedChildSpawner, OwnedChildSpawnFailed, ty
 import { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 import { makeOwnedService } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
-import { requireServicePort } from "./service-port"
+import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
 
 export const ApplicationRuntime = Schema.Union(
@@ -86,6 +86,7 @@ export const makeApplicationService = (options: {
   readonly runtime: ApplicationRuntime; readonly profile: ApplicationProfile
   readonly stateDirectory: string; readonly home: string; readonly environment: Environment
   readonly output: ChildOutputMode
+  readonly admission: "Immediate" | "Supervised"
 }) => Effect.gen(function* () {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
@@ -96,11 +97,16 @@ export const makeApplicationService = (options: {
   const upgrade: Effect.Effect<void, { readonly message: string }> = options.runtime._tag === "Installed" && !options.profile.isolated && process.platform !== "win32"
     ? yield* previousInstallationUpgrade({ home: options.home, dataDirectory: options.profile.dataDirectory, stateDirectory: options.stateDirectory })
     : Effect.void
+  const command = applicationServiceCommand({ ...options, platform: process.platform, architecture: process.arch })
+  if (options.admission === "Immediate") {
+    yield* upgrade.pipe(Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })))
+    yield* checkServicePort(options.profile.port, command.executable)
+  }
   const checked = yield* requireServicePort(options.profile.port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
-  const admitted = OwnedChildSpawner.of({ spawn: command => upgrade.pipe(
+  const admitted = OwnedChildSpawner.of({ spawn: command => (options.admission === "Supervised" ? upgrade : Effect.void).pipe(
     Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
     Effect.zipRight(checked.spawn(command)),
   ) })
-  return yield* makeOwnedService(applicationServiceCommand({ ...options, platform: process.platform, architecture: process.arch }), MAGNITUDE_RPC_VERSION)
+  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION)
     .pipe(Effect.provideService(OwnedChildSpawner, admitted))
 })

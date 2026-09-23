@@ -8,13 +8,33 @@ import { launchApplicationProcess, makeApplicationClient } from "./application-c
 
 const ready = Schema.decodeUnknownSync(ApplicationSnapshot)({
   version: 1, pid: 42, endpoint: "http://127.0.0.1:11101",
-  tray: { _tag: "Registered" },
+  owner: { _tag: "Desktop", tray: { _tag: "Registered" } },
   service: { _tag: "Ready", health: { service: "magnitude-acn", version: "0.0.14", revision: 1, id: "child", pid: 43, rpcVersion: 1, state: { _tag: "Ready" } } },
 })
 const starting = Schema.decodeUnknownSync(ApplicationSnapshot)({ ...ready, service: { _tag: "Starting", attempt: 1 } })
 const stopped = Schema.decodeUnknownSync(ApplicationSnapshot)({ ...ready, service: { _tag: "Stopping" } })
 
 describe("desktop client startup", () => {
+  it("launches desktop for explicit Open over a headless owner and waits for desktop observation", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      let launched = false
+      let observations = 0
+      const client = makeApplicationClient({
+        launch: (intent, observe) => Effect.sync(() => {
+          expect(intent).toBe("ShowWindow")
+          launched = true
+        }).pipe(Effect.zipRight(observe)),
+        request: () => Effect.sync(() => {
+          observations++
+          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const } }
+        }),
+      })
+      expect((yield* client.ensure("ShowWindow")).owner._tag).toBe("Desktop")
+      expect(launched).toBe(true)
+      expect(observations).toBe(3)
+    }))
+  })
+
   it("observes an existing application without launching or showing another instance", async () => {
     await Effect.runPromise(Effect.gen(function* () {
       const launches = yield* Ref.make(0)

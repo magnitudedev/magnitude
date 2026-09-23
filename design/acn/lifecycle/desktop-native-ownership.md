@@ -14,9 +14,15 @@ applies_to:
 
 # Native application ownership
 
-The desktop process owns the service lifetime. A passive kernel lock excludes concurrent desktop
-owners without terminating or replacing an unresponsive owner. A contender forwards intent through
-local application control or reports bounded unavailability. Lock acquisition is not service readiness.
+One application owner holds the service lifetime: Desktop or Headless. Its control snapshot carries
+that owner variant; only Desktop has tray state. A passive kernel lock excludes concurrent owners
+without terminating an unresponsive owner. A second Headless contender fails without contacting or
+stopping the incumbent. Desktop forwards intent to an existing Desktop, or requests Yield from a
+Headless owner and waits for native lock acquisition within one 60-second deadline. Yield replies
+precede teardown and acknowledge the request, not completed retirement. Desktop ignores Yield.
+Only lock acquisition after the predecessor releases ownership permits replacement. Missing control
+during cold startup or teardown permits bounded retry; malformed replies and access failures remain
+errors. Lock acquisition is not service readiness.
 
 The lock file lives in a private local user directory. Never unlink or replace it during recovery.
 The kernel releases ownership when the owning process exits. Child processes must not inherit the
@@ -59,6 +65,11 @@ sibling electron/ directory and must not pre-create the protected state leaf wit
 Desktop, CLI and installer resolve the same application.lock. Update helpers use a separate kernel
 installation lease only to exclude app startup/cleanup during replacement, never to elect a service
 or infer liveness from file presence.
+Installed Linux foreground owners open the root-owned, read-only installation lock themselves and
+retain a nonblocking shared lease. Missing, unsafe or busy admission and an installation marker fail
+before service launch. The lease has a distinct native capability, releases idempotently with its
+scope, and is close-on-exec so children cannot prevent later package installation. It is independent
+of per-user application ownership.
 Cold Windows application launch requires the caller's assigned interactive window station and its
 ordinary desktop. A noninteractive service or SSH session cannot create an unreachable tray owner.
 Native inspection failure is not permission to launch. This checks the assigned desktop rather than

@@ -329,6 +329,49 @@ static napi_value interactive_desktop(napi_env env, napi_callback_info info) {
 #endif
 
 #ifdef __linux__
+static const napi_type_tag installation_lease_tag = { UINT64_C(0x9ea889074de74b31), UINT64_C(0xbd86372f62d16d50) };
+
+/* A foreground host opens its own shared admission; it has no inherited desktop launcher. */
+static napi_value acquire_installation_lease(napi_env env, napi_callback_info info) {
+  (void)info;
+  const char *path = "/var/lib/magnitude-desktop/installation.lock";
+  int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) return failure(env, "Magnitude installation admission is missing or inaccessible; reinstall Magnitude");
+  struct stat opened, installed;
+  if (fstat(descriptor, &opened) != 0 || lstat(path, &installed) != 0 ||
+      !S_ISREG(opened.st_mode) || opened.st_uid != 0 || (opened.st_mode & 0222) || opened.st_nlink != 1 ||
+      opened.st_dev != installed.st_dev || opened.st_ino != installed.st_ino) {
+    close(descriptor); return failure(env, "Magnitude installation admission is unsafe; repair the installation");
+  }
+  if (flock(descriptor, LOCK_SH | LOCK_NB) != 0 ||
+      lstat("/var/lib/magnitude-desktop/installing", &installed) == 0 || errno != ENOENT) {
+    close(descriptor); return failure(env, "Magnitude installation is in progress or needs package-manager repair");
+  }
+  owner_lock *lease = calloc(1, sizeof(*lease));
+  if (!lease) { close(descriptor); return failure(env, "Cannot allocate installation admission"); }
+  lease->fd = descriptor;
+  napi_value result;
+  if (napi_create_object(env, &result) != napi_ok || napi_type_tag_object(env, result, &installation_lease_tag) != napi_ok ||
+      napi_wrap(env, result, lease, finalize_lock, NULL, NULL) != napi_ok) {
+    release_lock(lease); free(lease); return failure(env, "Cannot retain installation admission");
+  }
+  return result;
+}
+
+static napi_value release_installation_lease(napi_env env, napi_callback_info info) {
+  napi_value arg, result;
+  size_t argc = 1;
+  void *data;
+  bool matches = false;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1 ||
+      napi_check_object_type_tag(env, arg, &installation_lease_tag, &matches) != napi_ok || !matches ||
+      napi_unwrap(env, arg, &data) != napi_ok)
+    return failure(env, "Invalid installation admission");
+  release_lock(data);
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 static napi_value adopt_installation_lease(napi_env env, napi_callback_info info) {
   (void)info;
   struct stat inherited, installed;
@@ -355,6 +398,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"releaseLock", NULL, release, NULL, NULL, NULL, napi_default, NULL},
     {"guardParent", NULL, guard, NULL, NULL, NULL, napi_default, NULL},
 #ifdef __linux__
+    {"acquireInstallationLease", NULL, acquire_installation_lease, NULL, NULL, NULL, napi_default, NULL},
+    {"releaseInstallationLease", NULL, release_installation_lease, NULL, NULL, NULL, napi_default, NULL},
     {"adoptInstallationLease", NULL, adopt_installation_lease, NULL, NULL, NULL, napi_default, NULL},
 #endif
 #ifdef _WIN32

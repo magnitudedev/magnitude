@@ -95,7 +95,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     canPresentErrors = true
   }
   const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
-  const owner = yield* acquireApplicationOwner(stateDir, background ? "EnsureRunning" : "ShowWindow")
+  const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
   if (process.platform === "darwin" && app.isPackaged) {
@@ -252,10 +252,10 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* trayHost.changes.pipe(Stream.runForEach(tray.observeHost), Effect.forkScoped)
   }
   const harnessEnvironment = yield* resolveHarnessEnvironment().pipe(Effect.provide(guardedCommandLayer(join(dirname(addonPath), "magnitude-command"))), Effect.forkScoped)
-  const service = yield* makeApplicationService({ output: "DiagnosticTail", runtime: applicationRuntime, profile,
+  const service = yield* makeApplicationService({ output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
     stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide(NodeSqliteDriverLayer))
-  const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, ...value })))
-  const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, tray })))
+  const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
+  const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)
   const control: ApplicationControlOptions = { snapshot, update: action => Effect.gen(function* () {
     if (action === "check") yield* updateSchedule.check
