@@ -98,7 +98,11 @@ complete file/directory membership; unknown files, duplicate names, redirected p
 hard-linked payloads fail inspection without mutation. Replacement retains the previous payload
 until the registered version is durably committed. Rerunning setup restores the previous version
 before that commit or finishes exact owned-file retirement afterward. The previous installation
-is never extraction scratch. Upgrades preserve startup and shortcut preferences. No pre-cutover
+is never extraction scratch. Uninstall retires that previous tree against its inventory before
+changing the current payload, PATH, startup preference or registration. Unknown or mapped previous
+files defer removal while the exact uninstaller and recovery registration remain available. Retrying
+removal after the obstruction is gone must leave no previous payload that could block a fresh install.
+Upgrades preserve startup and shortcut preferences. No pre-cutover
 installation compatibility is implied, and automatic delivery remains gated on native acceptance.
 
 ## Distribution contract

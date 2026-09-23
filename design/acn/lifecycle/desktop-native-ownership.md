@@ -104,8 +104,11 @@ file identity. It is not permission to restart a running service. Cancellation p
 allows bounded graceful shutdown and then terminates the retained job. Launcher death closes the
 sole job handle and contains descendants without relying on the command runtime. Native acceptance
 must prove repeated installed replacements, command context preservation, cancellation and parent
-loss before release packaging enables this entry point. Explicit desktop launch must remain
-independent of this foreground job: completing `app open` cannot retire the launched desktop.
+loss before release packaging enables this entry point. Finite commands retain their ordinary
+process lifetime and may launch an independent desktop: completing `app open` cannot retire it.
+The launcher classifies the root serving command and advertises its continuation protocol only to
+that contained child. Serving admission must independently verify native containment; environment
+values alone cannot authorize an uncontained server. Finite commands cannot request continuation.
 Windows named pipes install a protected current-user DACL at creation and reject remote clients.
 The first instance refuses an existing endpoint. Native client PID observation fences child admission.
 Pending accept/read/write operations retain their buffers through confirmed cancellation; close cannot

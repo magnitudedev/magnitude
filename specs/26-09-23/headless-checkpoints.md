@@ -207,3 +207,48 @@ Linux preparation: installed 0.1.5-46 desktop remains Ready, and its CLI `servic
 Ubuntu VM, and isolated Bun 1.4.2 at `/home/trg.guest/magnitude-headless.uAol17lC/bun-linux-aarch64/bun`.
 Sparky now has an active user service, unlike the earlier inventory; use a separate profile/port and
 recheck ownership before testing there. Its existing service was not changed.
+
+## Windows removal recovery and command lifetimes, 2026-09-23
+
+Parent: `16f27d52`. Fixed uninstall after an update retained a mapped previous payload. After the
+installed uninstaller is matched against its executing self-copy, removal retires the previous tree
+against its inventory before changing current payload or registration. Unknown or still-mapped files
+stop removal and preserve the current installation. Empty remnants use the same bounded retirement
+rule as interrupted-install recovery. Extraction scratch is cleared only after previous retirement.
+
+The foreground launcher now classifies `serve` separately from finite commands. Serving retains the
+atomic kill-on-close job and one startup continuation; finite commands forward ordinary process
+lifetime and cannot request continuation. This preserves an independently launched desktop when
+its CLI caller exits. The serving bootstrap must verify native containment when it is integrated;
+release packaging and stable-launcher maintenance remain pending.
+
+Executed on Windows ARM64 with x64 runtime/launcher and x86 installer helper, ordinary user:
+
+- MSVC `/W4 /WX` builds passed. Native job and launcher tests passed, including an independent process
+  surviving its finite CLI caller and preservation of that caller's nonzero exit status. This is a
+  process-lifetime surrogate, not the required real Electron `app open` regression.
+- The real production NSIS fixture passed A→B→C continuation. Before each continuation, an unknown
+  previous file and the mapped old runtime separately made uninstall fail while preserving current
+  version, PATH and the installed removal record. After continuation, uninstall removed both current
+  and retained payloads. Fresh reinstall and another uninstall then passed.
+- Native interrupted replacement passed after old-directory movement, before registration commit,
+  and after commit. Each scenario also repeated recovery successfully.
+- Installer-rendering suite passed all 29 tests on pinned Bun 1.4.2. No TS production APIs changed.
+
+The uninstall fixture runs a byte-identical self-copy directly with NSIS's explicit installation
+argument, retaining that process's actual result rather than the asynchronous bootstrap's result.
+Each copy has a unique name so immediate retries do not overwrite an image still being released.
+An initial ad-hoc native-test build omitted its current-user manifest and triggered elevation;
+that attempt was cancelled without approval, and the test was rebuilt with the normal asInvoker
+manifest. No acceptance result relies on an elevated test run.
+
+Artifacts are in `removal-acceptance-2/` beneath the previously recorded isolated Windows directory.
+The actual installed app and uninstall registration are absent after acceptance. The subsequent
+native recovery tests may leave an empty private extraction container, which is expected scratch.
+No fixture processes remain. The former retained-payload evidence was removed through a successful
+installer recovery and exact uninstaller operation, not an unverified product cleanup path.
+
+Linux now has a separate source checkout of the prior checkpoint under
+`/home/trg.guest/magnitude-headless.uAol17lC/checkout`; dependency setup is underway independently of
+the running installed baseline. Next implementation work can extract shared bootstrap while remaining
+platform update admission and launcher packaging gates continue to be exercised.

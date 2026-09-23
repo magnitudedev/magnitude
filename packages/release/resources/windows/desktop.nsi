@@ -202,6 +202,12 @@ Function un.onInit
   ${EndIf}
 FunctionEnd
 Section "Uninstall"
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RetirePreviousForRemoval() i .r0'
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Previous application files could not be retired (code $0). Close applications using them and run this uninstaller again. The current installation was preserved." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 1) i .r0'
   ${If} $0 != 0
     SetErrorLevel 1

@@ -18,6 +18,10 @@ DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *
 /* Foreground commands share the caller's console and use an explicit working directory. */
 DWORD magnitude_owned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
     const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result);
+/* Finite CLI commands may intentionally launch an independent desktop. This has
+ * explicit standard-handle inheritance but grants no job/descendant authority. */
+DWORD magnitude_unowned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
+    const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, HANDLE *process);
 DWORD magnitude_owned_creation(const magnitude_owned_process *owned, FILETIME *creation);
 DWORD magnitude_owned_active(const magnitude_owned_process *owned, DWORD *count);
 DWORD magnitude_owned_terminate(const magnitude_owned_process *owned, UINT exit_code);

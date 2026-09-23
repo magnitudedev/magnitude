@@ -12,6 +12,7 @@ EXPORTS
   RollbackReplacement=_RollbackReplacement@0
   FinishReplacement=_FinishReplacement@4
   RecoverReplacement=_RecoverReplacement@8
+  RetirePreviousForRemoval=_RetirePreviousForRemoval@0
   AcquireRemovalExecutable=_AcquireRemovalExecutable@4
   RemovePayload=_RemovePayload@8
   RemoveOwnedStartup=_RemoveOwnedStartup@4

@@ -63,7 +63,7 @@ static DWORD standard_handle(DWORD kind, HANDLE *result) {
       DUPLICATE_SAME_ACCESS) ? ERROR_SUCCESS : GetLastError();
 }
 
-static DWORD run_child(const WCHAR *executable, WCHAR *command, const WCHAR *directory, DWORD *code) {
+static DWORD run_child(const WCHAR *executable, WCHAR *command, const WCHAR *directory, BOOL serving, DWORD *code) {
   HANDLE standard[3] = { NULL, NULL, NULL };
   const DWORD kinds[3] = { STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE };
   magnitude_owned_process owned = {0};
@@ -73,8 +73,9 @@ static DWORD run_child(const WCHAR *executable, WCHAR *command, const WCHAR *dir
     if (failure) goto cleanup;
   }
   if (InterlockedCompareExchange(&stopping, 0, 0)) { failure = ERROR_CANCELLED; goto cleanup; }
-  failure = magnitude_owned_spawn_foreground(executable, command, directory,
-      standard[0], standard[1], standard[2], &owned);
+  failure = serving
+    ? magnitude_owned_spawn_foreground(executable, command, directory, standard[0], standard[1], standard[2], &owned)
+    : magnitude_unowned_spawn_foreground(executable, command, directory, standard[0], standard[1], standard[2], &owned.process);
   if (failure) goto cleanup;
   ULONGLONG cancellation_deadline = 0;
   for (;;) {
@@ -88,6 +89,15 @@ static DWORD run_child(const WCHAR *executable, WCHAR *command, const WCHAR *dir
     Sleep(10);
   }
   if (failure) goto cleanup;
+  if (!serving) {
+    BOOL exited = FALSE;
+    failure = magnitude_owned_exit(&owned, &exited, code);
+    if (!failure && !exited) {
+      if (!TerminateProcess(owned.process, ERROR_CANCELLED)) failure = GetLastError();
+      else if (WaitForSingleObject(owned.process, 10000) != WAIT_OBJECT_0) failure = WAIT_TIMEOUT;
+    }
+    goto cleanup;
+  }
   /* A root cannot leave children behind, including on a continuation request. */
   DWORD active;
   failure = magnitude_owned_active(&owned, &active);
@@ -112,7 +122,7 @@ cleanup:
   return failure;
 }
 
-DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv) {
+DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv, BOOL serving) {
   WCHAR directory[32768], safe_directory[32768], command[32768];
   FILE_ID_INFO before, after;
   DWORD failure = ERROR_SUCCESS, code = 1;
@@ -123,7 +133,7 @@ DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv) {
   if (!length || length >= 32768 || !SetCurrentDirectoryW(safe_directory)) return 1;
   InterlockedExchange(&stopping, 0);
   if (!SetConsoleCtrlHandler(console_control, TRUE)) return 1;
-  if (!SetEnvironmentVariableW(L"MAGNITUDE_CLI_LAUNCHER_PROTOCOL", MAGNITUDE_CLI_LAUNCHER_PROTOCOL)) {
+  if (!SetEnvironmentVariableW(L"MAGNITUDE_CLI_LAUNCHER_PROTOCOL", serving ? MAGNITUDE_CLI_LAUNCHER_PROTOCOL : NULL)) {
     failure = GetLastError(); goto cleanup;
   }
   for (int attempt = 0; attempt < 2; ++attempt) {
@@ -136,8 +146,8 @@ DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv) {
     }
     if (failure) break;
     command[used] = 0;
-    failure = run_child(executable, command, directory, &code);
-    if (failure || code != MAGNITUDE_CLI_CONTINUE || InterlockedCompareExchange(&stopping, 0, 0)) break;
+    failure = run_child(executable, command, directory, serving, &code);
+    if (failure || !serving || code != MAGNITUDE_CLI_CONTINUE || InterlockedCompareExchange(&stopping, 0, 0)) break;
     if (attempt != 0) { failure = ERROR_RETRY; break; }
     failure = identity(executable, &after);
     if (failure) break;

@@ -215,8 +215,9 @@ production NSIS transaction with an inert application payload; it is not signed-
 acceptance. The native launcher prototype subsequently passed two installed continuations,
 argument/cwd preservation, parent-loss cleanup and console cancellation. Release integration remains
 gated on launcher maintenance and preserving independent desktop launch from finite CLI commands.
-Also repair uninstall ordering: a retained previous payload must be safely retired or removal must
-defer while installation registration is still available for recovery.
+Uninstall ordering now retires a retained previous payload or defers while registration remains
+available; native acceptance covers refusal, retry, fresh reinstall and interrupted replacement.
+Finite command lifetime is separated from serving containment; real desktop and packaging tests remain.
 
 **Verify Linux:** installation helper vs application/shared installation locks; authorized and denied
 sudo flows with the actual deb transaction; helper lifetime under systemd cgroup cleanup. Preserve the

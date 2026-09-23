@@ -585,6 +585,54 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
   return error;
 }
 
+/* The inventory is removed last. A retry may find only empty owned directories. */
+static DWORD retire_previous_directory(HANDLE directory) {
+  installation_inventory inventory = {0};
+  DWORD error = read_inventory(directory, &inventory);
+  if (!error) error = retire_inventory(directory, inventory.version);
+  else if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+    inventory_entry resources = {L"resources", TRUE, FALSE};
+    error = retire_entry(directory, &resources);
+    if (!error) {
+      FILE_DISPOSITION_INFO remove = {TRUE};
+      if (!SetFileInformationByHandle(directory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+    }
+  }
+  release_inventory(&inventory);
+  return error;
+}
+
+/* Removal is authorized by the exact installed uninstaller. Retire the previous
+   tree before discarding the current payload or its recovery registration. */
+__declspec(dllexport) DWORD WINAPI RetirePreviousForRemoval(void) {
+  if (!leaseHeld || removalExecutable == INVALID_HANDLE_VALUE || removalDirectory == INVALID_HANDLE_VALUE)
+    return ERROR_INVALID_HANDLE;
+  WCHAR parent[32768], container[32768], payload[32768];
+  DWORD error = stage_paths(parent, container, payload);
+  if (error) return error;
+  HANDLE stage = INVALID_HANDLE_VALUE, previous = INVALID_HANDLE_VALUE;
+  error = open_installation_directory(container, &stage);
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
+  if (error) return error;
+  error = open_without_reparse(stage, L"previous", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &previous);
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) error = ERROR_SUCCESS;
+  else {
+    if (!error) error = magnitude_validate_private_directory(previous);
+    if (!error) error = retire_previous_directory(previous);
+  }
+  if (previous != INVALID_HANDLE_VALUE) CloseHandle(previous);
+  /* Only extraction scratch remains after owned previous-file retirement. */
+  if (!error) error = require_absent_child(stage, L"previous");
+  if (!error) error = clear_scratch(stage, 0);
+  if (!error) {
+    FILE_DISPOSITION_INFO remove = {TRUE};
+    if (!SetFileInformationByHandle(stage, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+  }
+  CloseHandle(stage);
+  return error;
+}
+
 /* DisplayVersion is the commit point. A retained previous tree is either retired
    after that commit or restored before it; it is never extraction scratch. */
 __declspec(dllexport) DWORD WINAPI RecoverReplacement(LPCWSTR path, LPCWSTR registeredVersion) {
@@ -613,17 +661,7 @@ __declspec(dllexport) DWORD WINAPI RecoverReplacement(LPCWSTR path, LPCWSTR regi
   if (!error && !currentMissing) error = read_inventory(replacementDirectory, &current);
   if (!error && !currentMissing) error = inspect_inventory(replacementDirectory, &current, FALSE);
   if (!error && !currentMissing && !wcscmp(current.version, registeredVersion)) {
-    if (!previousRead) error = retire_inventory(previousDirectory, previous.version);
-    else if (previousRead == ERROR_FILE_NOT_FOUND || previousRead == ERROR_PATH_NOT_FOUND) {
-      /* A crash after deleting the inventory can leave only empty directories.
-         Kernel empty-directory removal preserves any unexpected remaining file. */
-      inventory_entry resources = {L"resources", TRUE, FALSE};
-      error = retire_entry(previousDirectory, &resources);
-      if (!error) {
-        FILE_DISPOSITION_INFO remove = {TRUE};
-        if (!SetFileInformationByHandle(previousDirectory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
-      }
-    } else error = previousRead;
+    error = retire_previous_directory(previousDirectory);
   } else if (!error) {
     error = previousRead;
     if (!error && wcscmp(previous.version, registeredVersion)) error = ERROR_INVALID_DATA;

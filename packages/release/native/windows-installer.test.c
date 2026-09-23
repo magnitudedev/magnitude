@@ -108,7 +108,7 @@ static void remove_installation_fixture(LPCWSTR root) {
   memcpy(&variable, &pointer, sizeof(variable)); \
 } while (0)
 static void check_replacement(HMODULE library) {
-  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void);
+  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void), (WINAPI *retire_previous)(void);
   DWORD (WINAPI *create_stage)(LPWSTR, DWORD);
   DWORD (WINAPI *begin)(LPCWSTR, LPCWSTR, LPCWSTR);
   DWORD (WINAPI *finish)(LPCWSTR);
@@ -117,6 +117,8 @@ static void check_replacement(HMODULE library) {
   RESOLVE_FUNCTION(library, create_stage, "CreateStage");
   RESOLVE_FUNCTION(library, begin, "BeginReplacement");
   RESOLVE_FUNCTION(library, rollback, "RollbackReplacement");
+  RESOLVE_FUNCTION(library, retire_previous, "RetirePreviousForRemoval");
+  require(retire_previous() == ERROR_INVALID_HANDLE, "previous removal requires the exact installed uninstaller");
   RESOLVE_FUNCTION(library, finish, "FinishReplacement");
   RESOLVE_FUNCTION(library, validate, "ValidateOwnedInstallation");
   WCHAR originalState[32768];
