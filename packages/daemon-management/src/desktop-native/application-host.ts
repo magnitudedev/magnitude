@@ -53,7 +53,8 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
         Effect.provide(hostNative), Effect.mapError(error => new ApplicationLaunchFailed({ message: error.message })),
       ) : Effect.void
       const argumentsForIntent = intent === "EnsureRunning" ? ["--background"] : []
-      const environment = { ...process.env, MAGNITUDE_SHELL_ENV_INHERITED: "1" }
+      // An inherited ELECTRON_RUN_AS_NODE (e.g. from a VS Code terminal) would start the app as bare Node.
+      const environment = { ...process.env, ELECTRON_RUN_AS_NODE: undefined, MAGNITUDE_SHELL_ENV_INHERITED: "1" }
       if (Option.isSome(developmentRepository)) {
         const repository = developmentRepository.value
         const executable = join(repository, "node_modules/electron/dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : process.platform === "win32" ? "electron.exe" : "electron")
